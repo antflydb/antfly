@@ -34,9 +34,12 @@ pub const LookupResponse = struct {
     json: []u8,
     version: u64,
     expected_content_digest: ?[32]u8 = null,
+    json_null_fields: []const []const u8 = &.{},
 
     pub fn deinit(self: *LookupResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.json);
+        for (self.json_null_fields) |name| alloc.free(name);
+        if (self.json_null_fields.len != 0) alloc.free(self.json_null_fields);
         self.* = undefined;
     }
 };
@@ -173,6 +176,7 @@ pub const RelationalStatementSnapshot = struct {
         owner_proofs: []const @import("range_read_guards.zig").OwnerRangeProof,
     };
     pub const VTable = struct {
+        renew: ?*const fn (*anyopaque, ?u64) anyerror!void = null,
         open: *const fn (*anyopaque, std.mem.Allocator, RelationalStatementScan) anyerror!RelationalReadView,
         /// SQL mutation consumers require this stronger entry point. An
         /// owner-local snapshot without a route-fenced commit proof is useful
@@ -196,9 +200,21 @@ pub const RelationalStatementSnapshot = struct {
         try @import("range_read_guards.zig").validate(result.owner_proofs);
         return result;
     }
+    pub fn renew(self: @This(), deadline_ns: ?u64) !void {
+        const callback = self.vtable.renew orelse return;
+        return Abi.call("renew", self.boundary_dispatch, callback, .{ self.ptr, deadline_ns });
+    }
     pub fn deinit(self: @This()) void {
         Abi.call("close", self.boundary_dispatch, self.vtable.close, .{self.ptr}) catch unreachable;
     }
+};
+
+/// Complete native table cohort selected before publishing a transaction cut.
+/// Bounds apply to targets and aggregate owners, not to rows in those tables.
+pub const RelationalSnapshotTarget = struct {
+    table: []const u8,
+    schema_version: u32,
+    table_id: ?u64 = null,
 };
 
 pub const TableReadSource = struct {
@@ -245,8 +261,12 @@ pub const TableReadSource = struct {
     route_fence: ?metadata_api.CatalogRouteFence = null,
 
     pub const VTable = struct {
+        /// Read-index/topology admission only: no primary lookup, RLS
+        /// evaluation, row materialization, or retained mutation fence.
+        admit_statement_read_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8) anyerror!void = null,
         /// Optional owner-local dynamic read set. A distributed router must
         /// not implement this with independently captured shard snapshots.
+        open_relational_snapshot_cohort: ?*const fn (*anyopaque, std.mem.Allocator, []const RelationalSnapshotTarget, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
         open_relational_statement_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
         open_relational_statement_snapshot_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
         open_relational_statement: ?*const fn (*anyopaque, std.mem.Allocator, []const RelationalStatementScan, read_gate.ReadConsistency) anyerror!RelationalStatementRead = null,
@@ -598,6 +618,15 @@ pub const TableReadSource = struct {
         return BoundaryAbi.call("open_relational_statement", self.boundary_dispatch, callback, .{ self.ptr, alloc, scans, consistency });
     }
 
+    /// Providers must capture every target while the entire owner cohort is
+    /// fenced. Falling back to independent per-table snapshots is unsafe.
+    pub fn openRelationalSnapshotCohort(self: TableReadSource, alloc: std.mem.Allocator, targets: []const RelationalSnapshotTarget, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
+        if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
+        if (targets.len > 256) return error.SqlProgramLimitExceeded;
+        const callback = self.vtable.open_relational_snapshot_cohort orelse return error.SqlStatementSnapshotRequired;
+        return BoundaryAbi.call("open_relational_snapshot_cohort", self.boundary_dispatch, callback, .{ self.ptr, alloc, targets, consistency, cancellation, deadline_ns });
+    }
+
     pub fn openRelationalStatementSnapshot(self: TableReadSource, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
         if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
         const callback = self.vtable.open_relational_statement_snapshot orelse return error.SqlStatementSnapshotRequired;
@@ -900,6 +929,12 @@ pub const TableReadSource = struct {
         }
         const fn_ptr = self.vtable.lookup_group_local orelse return null;
         return try BoundaryAbi.call("lookup_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, key, opts, consistency });
+    }
+
+    pub fn admitStatementReadGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
+        const fence = self.route_fence orelse return error.CatalogRouteFenceRequired;
+        const admit = self.vtable.admit_statement_read_group_local_routed orelse return error.SqlStatementSnapshotRequired;
+        return BoundaryAbi.call("admit_statement_read_group_local_routed", self.boundary_dispatch, admit, .{ self.ptr, alloc, fence, group_id, table_name });
     }
 
     pub fn scanGroupLocal(

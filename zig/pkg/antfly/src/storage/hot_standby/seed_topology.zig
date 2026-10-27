@@ -52,6 +52,7 @@ pub const PortableAuthSeed = struct {
 
 pub const LogicalCatalog = struct {
     epoch: u64,
+    native_checkpoint: ?@import("../../system_catalog/projection.zig").Export.NativeCheckpoint = null,
     // Optional only for reading v3 seeds. V4 always carries the catalog.
     system_catalog: ?@import("antfly_local_sources").system_catalog_domain.State = null,
     policy_install_snapshots: []const @import("antfly_local_sources").system_catalog_policies.InstallSnapshot = &.{},
@@ -61,6 +62,24 @@ pub const LogicalCatalog = struct {
     installed_extensions: []const extensions.InstalledExtension = &.{},
     extension_members: []const extensions.ExtensionMember = &.{},
     extension_dependencies: []const extensions.ExtensionDependency = &.{},
+
+    /// Borrow the complete already-pinned export until topology encoding.
+    /// Active policy programs are independent of mutable catalog drafts and
+    /// must travel with their publication, not default to an empty manifest.
+    pub fn fromExport(source: @import("../../system_catalog/projection.zig").Export) LogicalCatalog {
+        return .{
+            .epoch = source.epoch,
+            .native_checkpoint = source.native_checkpoint,
+            .system_catalog = source.system_catalog,
+            .policy_install_snapshots = source.policy_install_snapshots,
+            .tables = source.tables,
+            .ranges = source.ranges,
+            .extension_packages = source.extension_packages,
+            .installed_extensions = source.installed_extensions,
+            .extension_members = source.extension_members,
+            .extension_dependencies = source.extension_dependencies,
+        };
+    }
 };
 
 pub const ReplicaSnapshot = struct {
@@ -125,6 +144,7 @@ pub fn validate(
     for (topology.native_restore_owners, 0..) |owner, index| if (index != 0 and topology.native_restore_owners[index - 1].scope.target_namespace.shard_id >= owner.scope.target_namespace.shard_id) return error.NonCanonicalSeedTopology;
     const all_tables = try std.mem.concat(proof_alloc, topology_records.TableRecord, &.{ placed_tables, native_projection.tables });
     const all_ranges = try std.mem.concat(proof_alloc, topology_records.RangeRecord, &.{ placed_ranges, native_projection.ranges });
+    try validateCatalogCheckpoint(topology);
     if (topology.restore_terminals) |artifact| {
         if (!std.mem.eql(u8, artifact.path, @import("restore_owner_contract.zig").terminal_artifact_name) or artifact.size_bytes < 8 or artifact.size_bytes > max_file_bytes or !isCanonicalSha256(artifact.sha256)) return error.InvalidRestoreTerminal;
         const path = try std.fs.path.join(proof_alloc, &.{ raw_root, artifact.path });
@@ -374,6 +394,16 @@ fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usiz
     return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
 }
 
+/// The logical projection cannot stand in for its allocator/history artifact,
+/// even when there are no live sequences left to reveal the dependency.
+pub fn validateCatalogCheckpoint(topology: Topology) !void {
+    const reference = topology.catalog.native_checkpoint orelse return;
+    const artifact = topology.standalone_metadata orelse return error.InvalidStandaloneMetadataCheckpoint;
+    const hex = std.fmt.bytesToHex(reference.sha256, .lower);
+    if (topology.catalog.system_catalog == null or reference.size_bytes < 8 or
+        reference.size_bytes != artifact.size_bytes or !std.mem.eql(u8, &hex, artifact.sha256)) return error.InvalidStandaloneMetadataCheckpoint;
+}
+
 pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCatalog) !void {
     if (version >= 4 and catalog.system_catalog == null) return error.InvalidSeedTopology;
     if (catalog.system_catalog) |state| {
@@ -386,6 +416,7 @@ pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCa
         var index = try domain.StateIndex.init(alloc, state);
         defer index.deinit(alloc);
         for (state.resources) |resource| {
+            if (resource.kind == .sequence and catalog.native_checkpoint == null) return error.InvalidSeedTopology;
             try domain.validateResourceName(resource.kind, resource.name);
             if (resource.id == 0 or (resource.kind != .table and resource.id >= state.next_id)) return error.InvalidSeedTopology;
             switch (resource.kind) {

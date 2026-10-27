@@ -58,12 +58,34 @@ fn boundedControl(request: RequestContext) !RequestContext {
     return result;
 }
 
+fn authorizedLookupOptions(control: RequestContext, alloc: Allocator, table: []const u8, options: types.LookupOptions) !types.LookupOptions {
+    var result = options;
+    // Batched observations delegate to the same full-primary reader inside
+    // the owner. Carry its scoped integrity proof through that envelope too;
+    // metadata-only job selectors do not turn it into mutation authority.
+    if (types.supportsIntegrityReadProof(options.include_primary_digest, options.relational_integrity_jobs_json)) if (control.row_policy_integrity_read) |authority| {
+        if (try authority.authorize(authority.ptr, alloc, table)) |proof| {
+            result.row_policy_principal_proof = proof.token;
+            result.row_policy_database = proof.database;
+        }
+    };
+    return result;
+}
+
 pub fn requiresCoordination(alloc: Allocator, schema_json: []const u8) !bool {
     if (schema_json.len == 0) return false;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
+    if (hasSequenceDefaults(parsed)) return true;
     return (if (parsed.unique_constraints) |values| values.value.len != 0 else false) or
         (if (parsed.foreign_keys) |values| values.value.len != 0 else false);
+}
+
+fn hasSequenceDefaults(parsed: anytype) bool {
+    if (parsed.column_defaults) |defaults| if (defaults.value == .array) for (defaults.value.array.items) |entry| {
+        if (entry == .object and entry.object.contains("sequence")) return true;
+    };
+    return false;
 }
 
 /// Row-local CHECK enforcement does not add fanout to ordinary mutations.
@@ -72,9 +94,12 @@ pub fn requiresActivation(alloc: Allocator, schema_json: []const u8) !bool {
     if (schema_json.len == 0) return false;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
-    return (if (parsed.unique_constraints) |values| values.value.len != 0 else false) or
-        (if (parsed.foreign_keys) |values| values.value.len != 0 else false) or
-        (if (parsed.checks) |values| values.value.len != 0 else false);
+    if ((if (parsed.unique_constraints) |values| values.value.len != 0 else false) or
+        (if (parsed.foreign_keys) |values| values.value.len != 0 else false)) return true;
+    if (parsed.checks) |values| for (values.value) |check| {
+        if (!(check.not_valid orelse false)) return true;
+    };
+    return false;
 }
 
 /// Public schema epochs are fences, not evidence that dependency expansion
@@ -152,9 +177,11 @@ pub const Prepared = struct {
 };
 
 const Loaded = struct {
+    table_id: u64,
     name: []const u8,
     view: registry.SchemaView,
     catalog: catalog.Catalog,
+    catalog_digest: [32]u8,
     uniques: []const native.UniqueConstraint,
     foreign: []const native.ForeignKey,
     plan: ?planner.Plan = null,
@@ -165,6 +192,7 @@ const Work = struct {
     key: []const u8,
     before: ?reads.LookupResponse,
     after: ?[]const u8,
+    after_json_null_fields: []const []const u8 = &.{},
     observed_version: u64 = 0,
     observed_digest: ?[32]u8 = null,
     assignments: std.StringHashMapUnmanaged(std.json.Value) = .empty,
@@ -210,6 +238,47 @@ test "distributed txn cascade scalar equality uses row coercions without losing 
     try std.testing.expectError(error.InvalidIntegrityRecord, scalarAssignmentEqual(.datetime, .{ .string = "invalid" }, .{ .integer = 0 }));
 }
 
+fn temporalProbeQuery(alloc: Allocator, address: planner.storage.Address, schema_version: u32, generation_set: planner.storage.Digest, batches: []const []const planner.storage.Command) ![]u8 {
+    const Query = struct {
+        address: planner.storage.Address,
+        schema_version: u32,
+        generation_set: planner.storage.Digest,
+        batches: []const []const planner.storage.Command,
+        pub fn jsonStringify(value: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            try stream.beginObject();
+            try stream.objectField("kind");
+            try stream.write("temporal_probe");
+            try stream.objectField("address");
+            try stream.write(value.address);
+            try stream.objectField("schema_version");
+            try stream.write(value.schema_version);
+            try stream.objectField("generation_set");
+            try stream.write(value.generation_set);
+            try stream.objectField("batches");
+            try @import("../storage/db/relational_integrity_json.zig").write(value.batches, stream);
+            try stream.endObject();
+        }
+    };
+    return std.json.Stringify.valueAlloc(alloc, Query{ .address = address, .schema_version = schema_version, .generation_set = generation_set, .batches = batches }, .{});
+}
+
+test "SQL range temporal probes retain arbitrary binary command bytes" {
+    const a = std.testing.allocator;
+    const tuple = "equality\x00\xff\x80";
+    const address = try planner.storage.Address.init(@splat(7), tuple);
+    const claim: @import("../storage/db/temporal_integrity_contract.zig").Claim = .{ .tuple = tuple, .parent_table = "products", .parent_key = "row\xff", .schema_version = 3, .period = .{ .kind = .numrange, .bytes = "\x00\xff\x80" } };
+    const commands = [_]planner.storage.Command{.{ .address = address, .operation = .{ .establish_interval = claim } }};
+    const encoded = try temporalProbeQuery(a, address, 3, @splat(9), &.{&commands});
+    defer a.free(encoded);
+    var decoded = try std.json.parseFromSlice(struct { kind: []const u8, address: planner.storage.Address, schema_version: u32, generation_set: planner.storage.Digest, batches: []const []const planner.storage.Command }, a, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("temporal_probe", decoded.value.kind);
+    const actual = decoded.value.batches[0][0].operation.establish_interval;
+    try std.testing.expectEqualStrings(claim.tuple, actual.tuple);
+    try std.testing.expectEqualStrings(claim.parent_key, actual.parent_key);
+    try std.testing.expectEqualStrings(claim.period.bytes, actual.period.bytes);
+}
+
 fn observationQuery(alloc: Allocator, keys: []const []const u8, schema_version: u32, generation_set: planner.storage.Digest) ![]u8 {
     const Query = struct {
         keys: []const []const u8,
@@ -219,6 +288,8 @@ fn observationQuery(alloc: Allocator, keys: []const []const u8, schema_version: 
             try stream.beginObject();
             try stream.objectField("kind");
             try stream.write("observations");
+            try stream.objectField("typed_nulls");
+            try stream.write(true);
             try stream.objectField("keys");
             try @import("../storage/db/relational_integrity_json.zig").write(value.keys, stream);
             try stream.objectField("schema_version");
@@ -254,6 +325,8 @@ const Builder = struct {
     partial_rechecks: std.ArrayList(FinalPartial) = .empty,
     prepared_bytes: usize = 0,
     control: RequestContext = .{},
+    preparation_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
+    preparation_transaction: ?@import("../sql/statement_clock.zig").Instant = null,
     repair_tables: []const []const u8 = &.{},
     repair_admission: ?RepairAdmission = null,
     discovered_repairs: std.StringHashMapUnmanaged(bool) = .empty,
@@ -261,13 +334,13 @@ const Builder = struct {
     constraint_timing: []const native.ConstraintTiming = &.{},
     previous: []const contract.TableCommitRequest = &.{},
 
-    fn previousRow(self: *Builder, table: []const u8, key: []const u8) ?struct { value: ?[]const u8 } {
+    fn previousRow(self: *Builder, table: []const u8, key: []const u8) ?struct { value: ?[]const u8, json_null_fields: []const []const u8 = &.{} } {
         for (self.previous) |request| if (std.mem.eql(u8, request.table_name, table)) {
             for (request.deletes) |deleted| if (std.mem.eql(u8, deleted, key)) return .{ .value = null };
             var i = request.writes.len;
             while (i != 0) {
                 i -= 1;
-                if (std.mem.eql(u8, request.writes[i].key, key)) return .{ .value = request.writes[i].value };
+                if (std.mem.eql(u8, request.writes[i].key, key)) return .{ .value = request.writes[i].value, .json_null_fields = request.writes[i].json_null_fields };
             }
         };
         return null;
@@ -303,6 +376,7 @@ const Builder = struct {
         opts.execution_deadline_ns = self.control.deadline_ns;
         opts.execution_io = self.control.deadline_io;
         opts.cancellation = self.control.cancellation;
+        opts = try authorizedLookupOptions(self.control, self.alloc, table, opts);
         return self.source.lookup(self.alloc, table, key, opts, .read_index) catch |err| {
             if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs())) std.log.warn("preparation lookup failed catalog={} jobs={} work={d} class={s}", .{ opts.relational_integrity_catalog, opts.relational_integrity_jobs_json.len != 0, self.work.items.len, @errorName(err) });
             return err;
@@ -442,6 +516,12 @@ const Builder = struct {
         for (after.values) |witness| try self.appendCommand(dependency.definition.parent_table, .{ .address = witness.address, .operation = .{ .attach = dependency.reference } });
     }
 
+    fn chargeJsonNullFields(self: *Builder, fields: []const []const u8) !void {
+        var bytes = std.math.mul(usize, fields.len, @sizeOf([]const u8)) catch return error.TransactionTooLarge;
+        for (fields) |name| bytes = std.math.add(usize, bytes, name.len) catch return error.TransactionTooLarge;
+        try self.charge(bytes);
+    }
+
     fn rowIdentity(self: *Builder, table: []const u8, key: []const u8) ![]const u8 {
         return std.fmt.allocPrint(self.alloc, "{d}:{s}{s}", .{ table.len, table, key });
     }
@@ -450,6 +530,10 @@ const Builder = struct {
         const identity = try self.rowIdentity(table.name, key);
         if (self.by_row.get(identity)) |existing| return existing;
         if (self.work.items.len >= 4096) return error.TransactionTooLarge;
+        if (self.source.strict_read_index_absence) {
+            try self.observeWork(table, &.{key});
+            return self.by_row.get(identity) orelse error.InvalidIntegrityRecord;
+        }
         return self.recordWork(table, key, try self.lookup(table.name, key, .{}));
     }
 
@@ -465,14 +549,39 @@ const Builder = struct {
         if (self.previousRow(table.name, key)) |overlay| {
             const version = if (old) |row| row.version else 0;
             const digest = if (old) |row| row.expected_content_digest else null;
-            old = if (overlay.value) |json| .{ .json = try self.alloc.dupe(u8, json), .version = version, .expected_content_digest = digest } else null;
+            old = if (overlay.value) |json| .{ .json = try self.alloc.dupe(u8, json), .version = version, .expected_content_digest = digest, .json_null_fields = try types.cloneJsonNullFields(self.alloc, overlay.json_null_fields) } else null;
         }
         try self.charge(key.len + if (old) |row| row.json.len else @as(usize, 0));
+        if (old) |row| try self.chargeJsonNullFields(row.json_null_fields);
         const item = try self.alloc.create(Work);
-        item.* = .{ .table = table, .key = try self.alloc.dupe(u8, key), .before = old, .after = if (old) |row| row.json else null, .observed_version = observed_version, .observed_digest = observed_digest };
+        item.* = .{ .table = table, .key = try self.alloc.dupe(u8, key), .before = old, .after = if (old) |row| row.json else null, .after_json_null_fields = if (old) |row| row.json_null_fields else &.{}, .observed_version = observed_version, .observed_digest = observed_digest };
         try self.work.append(self.alloc, item);
         try self.by_row.put(self.alloc, identity, item);
         return item;
+    }
+
+    fn observeWork(self: *Builder, table: *Loaded, keys: []const []const u8) !void {
+        const query = try observationQuery(self.alloc, keys, table.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog));
+        try self.observeWorkQuery(table, keys, query);
+    }
+
+    fn observeWorkQuery(self: *Builder, table: *Loaded, keys: []const []const u8, query: []const u8) !void {
+        var response = (try self.lookup(table.name, keys[0], .{ .relational_integrity_jobs_json = query })) orelse return error.InvalidIntegrityRecord;
+        defer response.deinit(self.alloc);
+        const Observation = struct {
+            json: []u8,
+            version: ?u64 = null,
+            expected_content_digest: ?[32]u8 = null,
+            json_null_fields: []const []const u8,
+        };
+        const Item = struct { key: []const u8, row: ?Observation };
+        const result = try std.json.parseFromSliceLeaky(struct { observations: []const Item }, self.alloc, response.json, .{ .allocate = .alloc_always });
+        if (result.observations.len != keys.len) return error.InvalidIntegrityRecord;
+        for (result.observations, keys) |item, key| {
+            if (!std.mem.eql(u8, item.key, key)) return error.InvalidIntegrityRecord;
+            const row: ?reads.LookupResponse = if (item.row) |value| .{ .json = value.json, .version = value.version orelse return error.MissingPrimaryObservation, .expected_content_digest = value.expected_content_digest, .json_null_fields = value.json_null_fields } else null;
+            _ = try self.recordWork(table, key, row);
+        }
     }
 
     fn preloadOwnerObservations(self: *Builder, table: *Loaded, keys: []const []const u8) !bool {
@@ -506,16 +615,7 @@ const Builder = struct {
                     query = try observationQuery(self.alloc, bucket.keys.items[offset..end], table.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog));
                 }
                 if (query.len > 4096) return error.TransactionTooLarge;
-                var response = (try self.lookup(table.name, bucket.keys.items[offset], .{ .relational_integrity_jobs_json = query })) orelse return error.InvalidIntegrityRecord;
-                defer response.deinit(self.alloc);
-                const Item = struct { key: []const u8, row: ?types.LookupResult };
-                const result = try std.json.parseFromSliceLeaky(struct { observations: []const Item }, self.alloc, response.json, .{ .allocate = .alloc_always });
-                if (result.observations.len != end - offset) return error.InvalidIntegrityRecord;
-                for (result.observations, bucket.keys.items[offset..end]) |item, key| {
-                    if (!std.mem.eql(u8, item.key, key)) return error.InvalidIntegrityRecord;
-                    const row: ?reads.LookupResponse = if (item.row) |value| .{ .json = value.json, .version = value.version orelse return error.MissingPrimaryObservation, .expected_content_digest = value.expected_content_digest } else null;
-                    _ = try self.recordWork(table, key, row);
-                }
+                try self.observeWorkQuery(table, bucket.keys.items[offset..end], query);
                 offset = end;
             }
         }
@@ -527,6 +627,11 @@ const Builder = struct {
     /// results and publishing predicates on the caller, including on failure.
     fn preloadWork(self: *Builder, table: *Loaded, keys: []const []const u8) !void {
         if (try self.preloadOwnerObservations(table, keys)) return;
+        if (self.source.strict_read_index_absence) {
+            var offset: usize = 0;
+            while (offset < keys.len) : (offset += 1) try self.observeWork(table, keys[offset .. offset + 1]);
+            return;
+        }
         const borrow = self.control.fanout_io orelse self.control.deadline_io orelse return;
         if (keys.len < 2) return;
         const Slot = struct {
@@ -534,7 +639,11 @@ const Builder = struct {
             row: ?reads.LookupResponse = null,
             failure: ?anyerror = null,
             fn run(slot: *@This(), source: reads.TableReadSource, name: []const u8, key: []const u8, control: RequestContext) void {
-                slot.row = source.lookup(slot.arena.allocator(), name, key, .{ .include_primary_digest = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }, .read_index) catch |err| {
+                const options = authorizedLookupOptions(control, slot.arena.allocator(), name, .{ .include_primary_digest = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }) catch |err| {
+                    slot.failure = err;
+                    return;
+                };
+                slot.row = source.lookup(slot.arena.allocator(), name, key, options, .read_index) catch |err| {
                     slot.failure = err;
                     return;
                 };
@@ -579,6 +688,7 @@ const Builder = struct {
                 if (owned) |*row| {
                     if (row.json.len > 16 * 1024 * 1024 -| self.prepared_bytes) return error.TransactionTooLarge;
                     row.json = try self.alloc.dupe(u8, row.json);
+                    row.json_null_fields = try types.cloneJsonNullFields(self.alloc, row.json_null_fields);
                 }
                 _ = try self.recordWork(table, key, owned);
             }
@@ -599,6 +709,29 @@ const Builder = struct {
         if (self.queue.items.len > 16_384) return error.TransactionTooLarge;
     }
 
+    fn preparationValidator(self: *Builder, compiled: schema_api.CompiledTableValidator, table: *const Loaded) !schema_api.CompiledTableValidator {
+        // The request owns this borrowed receiver. Never attach mutable runtime
+        // state to the immutable schema view or retain it in prepared rows.
+        if (self.preparation_receiver == null) {
+            if (self.control.fanout_io orelse self.control.deadline_io) |borrow| {
+                self.preparation_receiver = try borrow.receive();
+            }
+        }
+        if (self.preparation_receiver) |*receiver| {
+            const expressions = @import("../schema/relational_expression.zig");
+            if (self.preparation_transaction == null) if (self.control.sql_transaction_micros) |micros| {
+                const instant = try @import("../sql/statement_clock.zig").Instant.init(micros);
+                if (instant.infinity() != 0) return error.InvalidTransactionClock;
+                self.preparation_transaction = instant;
+            };
+            const required = if (compiled.execution.expressions) |set| set.table.requires_clock_defaults else false;
+            const runtime = try (expressions.PreparationRuntime{ .io = receiver.io(), .transaction_start = self.preparation_transaction, .sequences = self.control.column_sequences, .sequence_scope = .{ .table_id = table.table_id, .schema_version = table.view.version(), .storage_name = table.name } }).withClock(required);
+            self.preparation_transaction = runtime.transaction_start;
+            return compiled.forPreparation(runtime);
+        }
+        return compiled;
+    }
+
     fn expandWork(self: *Builder, item: *Work) !planner.Expansion {
         if (item.expansion) |expansion| return expansion;
         const plan = try self.bindingPlan(item.table);
@@ -606,9 +739,9 @@ const Builder = struct {
         var scratch = std.heap.ArenaAllocator.init(self.scratch_alloc orelse self.alloc);
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.init(temporary, item.key, row.json, null, view.tableSchema().*, view.physicalLayout()) else null;
+        var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, row.json, null, view.tableSchema().*, view.physicalLayout(), row.json_null_fields, true) else null;
         defer if (before) |*row| row.deinit(temporary);
-        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.init(temporary, item.key, json, view.validator(), view.tableSchema().*, view.physicalLayout()) else null;
+        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, json, if (view.validator()) |validator| try self.preparationValidator(validator, item.table) else null, view.tableSchema().*, view.physicalLayout(), item.after_json_null_fields, false) else null;
         defer if (after) |*row| row.deinit(temporary);
         if (after) |*row| if (view.validator()) |validator| if (validator.execution.expressions) |expressions| if (expressions.bindings.len != 0 or expressions.modifier_ordinals.len != 0) {
             // Cascading parent assignments and final participant writes must
@@ -616,6 +749,8 @@ const Builder = struct {
             const normalized = try std.json.Stringify.valueAlloc(self.alloc, row.parsedValue(), .{});
             try self.charge(normalized.len);
             item.after = normalized;
+            item.after_json_null_fields = try (try row.typedView(view.tableSchema().*, view.physicalLayout())).jsonNullFieldsAlloc(self.alloc);
+            try self.chargeJsonNullFields(item.after_json_null_fields);
         };
         item.expansion = try plan.expand(self.alloc, &.{.{ .key = item.key, .before = if (before) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .after = if (after) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .repair = self.repairing(item.table.name) }});
         try self.charge(item.expansion.?.arena.queryCapacity());
@@ -629,7 +764,7 @@ const Builder = struct {
         // contradictory cascades are detected rather than silently skipped.
         const json = if (final_row) after else if (item.explicit) item.explicit_after orelse return false else if (item.before) |before| before.json else after;
         const view = item.table.view;
-        var row = try mapper.PreparedRelationalWrite.init(self.alloc, item.key, json, if (item.explicit) view.validator() else null, view.tableSchema().*, view.physicalLayout());
+        var row = try mapper.PreparedRelationalWrite.init(self.alloc, item.key, json, null, view.tableSchema().*, view.physicalLayout());
         defer row.deinit(self.alloc);
         const keys = try self.alloc.alloc(native.RelationalIndexKey, definition.child_columns.len);
         for (keys, definition.child_columns) |*key, column| key.* = .{ .column = column };
@@ -753,7 +888,7 @@ const Builder = struct {
                 .compare_claim, .check_owner => 1,
                 .release, .repair_release => 2,
                 .establish => 3,
-                .attach => 4,
+                .attach, .attach_historical => 4,
                 else => return error.InvalidIntegrityCommand,
             };
             if (phase != command_phase) continue;
@@ -786,6 +921,7 @@ const Builder = struct {
                     };
                     state.claim = claim;
                 },
+                .attach_historical => return error.InvalidIntegrityCommand,
                 .attach => |reference| {
                     if (validate and !try self.deferredReference(reference)) {
                         const claim = state.claim orelse return error.ForeignKeyParentMissing;
@@ -831,11 +967,45 @@ const Builder = struct {
         return state;
     }
 
+    fn temporalProbe(self: *Builder, table: []const u8, address: planner.storage.Address, commands: []const planner.storage.Command, schema_version: ?u32, generation_set: ?planner.storage.Digest) !void {
+        var batches: std.ArrayList([]const planner.storage.Command) = .empty;
+        for (self.previous) |previous| {
+            if (!std.mem.eql(u8, previous.table_name, table)) continue;
+            const batch = try temporalGroupCommands(self.alloc, address, previous.integrity_commands);
+            if (batch.len != 0) try batches.append(self.alloc, batch);
+        }
+        const current = try temporalGroupCommands(self.alloc, address, commands);
+        if (current.len == 0) return error.InvalidIntegrityCommand;
+        try batches.append(self.alloc, current);
+        const definition = try self.load(table);
+        const query = try temporalProbeQuery(self.alloc, address, schema_version orelse definition.view.version(), generation_set orelse @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(definition.catalog), batches.items);
+        try self.charge(query.len);
+        var response = (try self.lookup(table, &address.routing, .{ .relational_integrity_jobs_json = query })) orelse return error.IntegrityCatalogUnavailable;
+        defer response.deinit(self.alloc);
+        try self.charge(response.json.len);
+        const result = try std.json.parseFromSliceLeaky(struct { validated: bool, address: planner.storage.Address }, self.alloc, response.json, .{});
+        if (!result.validated or !std.meta.eql(result.address, address)) return error.InvalidIntegrityRecord;
+    }
+
+    fn temporalGroupCommands(a: Allocator, address: planner.storage.Address, input: []const planner.storage.Command) ![]const planner.storage.Command {
+        var selected: std.ArrayList(planner.storage.Command) = .empty;
+        for (input) |command| {
+            if (!std.meta.eql(command.address, address)) continue;
+            if (!command.isTemporal()) return error.InvalidIntegrityCommand;
+            try selected.append(a, command);
+        }
+        return selected.toOwnedSlice(a);
+    }
+
     fn validateStatement(self: *Builder) !void {
         var seen: std.AutoHashMapUnmanaged(planner.storage.Address, void) = .empty;
         for (self.output.items, self.command_lists.items) |table, commands| for (commands.items) |command| {
             if ((try seen.getOrPut(self.alloc, command.address)).found_existing) continue;
             if (try self.deferredUnique(table.table_name, command.address)) continue;
+            if (command.isTemporal()) {
+                try self.temporalProbe(table.table_name, command.address, commands.items, null, null);
+                continue;
+            }
             var state = try self.statementState(table.table_name, command.address);
             try self.applyStatementCommands(&state, command.address, commands.items, true);
         };
@@ -938,7 +1108,7 @@ const Builder = struct {
         var schema_digest: planner.storage.Digest = undefined;
         std.crypto.hash.Blake3.hash(native_schema, &schema_digest, .{});
         if (!std.mem.eql(u8, &schema_digest, &bindings.schema_digest)) return error.PreparedGenerationChanged;
-        const checks_digest: [32]u8 = if (view.validator().?.execution.checks) |checks| checks.fingerprint() else @splat(0);
+        const checks_digest: [32]u8 = if (view.validator().?.execution.checks) |checks| checks.validationFingerprint() else @splat(0);
         if (!std.mem.eql(u8, &checks_digest, &bindings.checks_digest)) return error.PreparedGenerationChanged;
         const expected = try declarations.definitionFingerprints(self.alloc, view.validator().?.schema, view.tableSchema().*);
         defer declarations.freeDefinitions(self.alloc, expected);
@@ -950,7 +1120,9 @@ const Builder = struct {
         table.* = .{
             .name = try self.alloc.dupe(u8, record.name),
             .view = view,
+            .table_id = record.table_id,
             .catalog = bindings,
+            .catalog_digest = @import("../storage/db/relational_schema_owner_contract.zig").hash(bytes),
             .uniques = try view.validator().?.schema.relationalUniqueDefinitions(self.alloc),
             .foreign = try view.validator().?.schema.relationalForeignKeyDefinitions(self.alloc),
         };
@@ -968,6 +1140,10 @@ const Builder = struct {
     }
 
     fn bindingPlanFiltered(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Progress) !planner.Plan {
+        return self.bindingPlanSelection(table, with_unique, with_foreign, retirement, null);
+    }
+
+    fn bindingPlanSelection(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Progress, validation_names: ?[]const []const u8) !planner.Plan {
         const unique_defs = if (with_unique) table.uniques else &.{};
         const foreign_defs = if (with_foreign) table.foreign else &.{};
         var uniques = std.ArrayList(planner.UniqueBinding).empty;
@@ -978,6 +1154,12 @@ const Builder = struct {
         }
         var foreign = std.ArrayList(planner.ForeignBinding).empty;
         for (foreign_defs) |definition| {
+            if (validation_names) |names| {
+                const selected = for (names) |name| {
+                    if (std.mem.eql(u8, name, definition.name)) break true;
+                } else false;
+                if (!selected) continue;
+            }
             const generation = (table.catalog.find(.foreign_key, definition.name) orelse return error.PreparedGenerationChanged).generation;
             if (retirement) |selection| if (!selection.includes(generation)) continue;
             const parent = try self.load(definition.parent_table);
@@ -1029,7 +1211,7 @@ const Builder = struct {
             } else old.expected_content_digest = digest;
             return;
         };
-        try predicates.append(self.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest });
+        try predicates.append(self.alloc, .{ .key = try self.alloc.dupe(u8, key), .expected_version = version, .expected_content_digest = digest });
     }
 };
 
@@ -1086,7 +1268,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (record.schema_json.len == 0) continue;
         var declaration = try schema_api.parseValidatedTableSchema(builder.alloc, record.schema_json);
         defer declaration.deinit(builder.alloc);
-        if (declaration.unique_constraints == null and declaration.foreign_keys == null and ((repair_tables.len == 0 and repair_admission == null) or declaration.checks == null)) continue;
+        if (!hasSequenceDefaults(declaration) and declaration.unique_constraints == null and declaration.foreign_keys == null and ((repair_tables.len == 0 and repair_admission == null) or declaration.checks == null)) continue;
         if (request.transforms.len != 0) return error.UnsupportedOperation;
         const table = try builder.load(request.table_name);
         if (request.relational_integrity_generation_set) |expected| {
@@ -1094,8 +1276,8 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
             if (!std.mem.eql(u8, &expected, &current)) return error.CatalogGenerationChanged;
         }
         _ = try builder.outputIndex(table.name, table.view.version());
-        var writes = std.StringHashMapUnmanaged(?[]const u8).empty;
-        for (request.writes) |write| try writes.put(builder.alloc, write.key, write.value);
+        var writes = std.StringHashMapUnmanaged(?types.TransactionWrite).empty;
+        for (request.writes) |write| try writes.put(builder.alloc, write.key, write);
         for (request.deletes) |key| try writes.put(builder.alloc, key, null);
         if (writes.count() > 4096) return error.TransactionTooLarge;
         const keys = try builder.alloc.alloc([]const u8, writes.count());
@@ -1106,7 +1288,13 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         while (it.next()) |entry| {
             const item = try builder.getWork(table, entry.key_ptr.*);
             item.explicit = true;
-            item.after = entry.value_ptr.*;
+            item.after = if (entry.value_ptr.*) |write| write.value else null;
+            item.after_json_null_fields = if (entry.value_ptr.*) |write| write.json_null_fields else &.{};
+            try builder.enqueue(item);
+            // Materialize volatile defaults before visiting any FK edge. The
+            // cached expansion, explicit assignments and final writes all use
+            // this same normalized afterimage, regardless of traversal order.
+            _ = try builder.expandWork(item);
             item.explicit_after = item.after;
             if (item.after) |json| {
                 try builder.charge(json.len);
@@ -1131,7 +1319,6 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
                     try item.assignments.put(builder.alloc, field.key_ptr.*, field.value_ptr.*);
                 }
             }
-            try builder.enqueue(item);
         }
     }
     // Discover the complete bounded cascade closure before beginning 2PC.
@@ -1162,7 +1349,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (!item.dirty) continue;
         const i = try builder.outputIndex(item.table.name, item.table.view.version());
         try builder.appendPredicate(i, item.key, item.observed_version, item.observed_digest);
-        if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json }) else try final_deletes[i].append(builder.alloc, item.key);
+        if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json, .json_null_fields = item.after_json_null_fields }) else try final_deletes[i].append(builder.alloc, item.key);
         // This arena is owned transitively by the returned request arena.
         const expansion = try builder.expandWork(item);
         for (expansion.commands) |command| try builder.appendCommand(command.table_name, command.command);
@@ -1271,13 +1458,18 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (record.schema_json.len == 0) continue;
         var declaration = try schema_api.parseValidatedTableSchema(scratch.allocator(), record.schema_json);
         defer declaration.deinit(scratch.allocator());
-        if (declaration.unique_constraints == null and declaration.foreign_keys == null) continue;
+        if (declaration.unique_constraints == null and declaration.foreign_keys == null and declaration.checks == null) continue;
         // Namespace names need enumeration, but native authority reads and
         // compiled tuple plans are required only for matching declarations.
         var matches = false;
         var named_uniques: std.StringHashMapUnmanaged(void) = .empty;
         defer named_uniques.deinit(scratch.allocator());
-        for (names) |name| {
+        for (names, 0..) |name, name_index| {
+            if (declaration.checks) |checks| for (checks.value) |check| {
+                if (!std.mem.eql(u8, name, check.name)) continue;
+                if (deferred) return error.ConstraintNotDeferrable;
+                found[name_index] = true;
+            };
             if (declaration.unique_constraints) |uniques| for (uniques.value) |unique| {
                 if ((unique.origin orelse .constraint) != .index and std.mem.eql(u8, name, unique.name)) {
                     matches = true;
@@ -1328,9 +1520,27 @@ test "distributed txn constraint timing excludes index ownership without native 
         try std.testing.expectError(error.SqlConstraintNotFound, resolveConstraintTiming(std.testing.allocator, source, &metadata, &.{"access_key"}, deferred, .{}));
     }
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    const a = std.testing.allocator;
+    var check_schema = try std.json.parseFromSlice(std.json.Value, a, declaration, .{});
+    defer check_schema.deinit();
+    const temporary = check_schema.arena.allocator();
+    const check_json = try std.json.Stringify.valueAlloc(temporary, .{
+        .{ .name = "immediate_check", .column = "id", .op = "gt", .value = 0 },
+    }, .{});
+    const checks = try std.json.parseFromSliceLeaky(std.json.Value, temporary, check_json, .{});
+    try check_schema.value.object.put(temporary, "checks", checks);
+    const with_check = try std.json.Stringify.valueAlloc(a, check_schema.value, .{});
+    defer a.free(with_check);
+    const check_metadata = [_]TableRecord{.{ .table_id = 1, .name = "rows", .schema_json = with_check }};
+    const modes = try resolveConstraintTiming(a, source, &check_metadata, &.{"immediate_check"}, false, .{});
+    defer a.free(modes);
+    try std.testing.expectEqual(@as(usize, 0), modes.len);
+    const deferred = resolveConstraintTiming(a, source, &check_metadata, &.{"immediate_check"}, true, .{});
+    try std.testing.expectError(error.ConstraintNotDeferrable, deferred);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
-pub const BackfillRow = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 = null };
+pub const BackfillRow = @import("../storage/db/relational_integrity_activation_contract.zig").Row;
 
 /// Request-owned arbiter proof. SQL carries this opaque envelope to its native
 /// commit adapter; only this existing integrity authority understands claims.
@@ -1436,11 +1646,15 @@ pub fn ensureUniqueCoverage(alloc: Allocator, source: reads.TableReadSource, met
 }
 
 fn ensureUniqueCoverageControlled(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, table_names: []const []const u8, request_control: RequestContext) !void {
-    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request_control) };
     defer builder.deinit();
+    return requireUniqueCoverageFor(&builder, ranges, table_names);
+}
+
+fn requireUniqueCoverageFor(builder: *Builder, ranges: []const RangeRecord, table_names: []const []const u8) !void {
+    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
     var checked = std.StringHashMapUnmanaged(void).empty;
     for (table_names) |name| {
         if ((try checked.getOrPut(builder.alloc, name)).found_existing) continue;
@@ -1586,6 +1800,10 @@ pub fn rejectDefiniteConflicts(alloc: Allocator, source: reads.TableReadSource, 
         var command_it = by_address.iterator();
         while (command_it.next()) |entry| {
             const address = entry.key_ptr.*;
+            if (entry.value_ptr.items.items.len != 0 and entry.value_ptr.items.items[0].isTemporal()) {
+                try builder.temporalProbe(table.table_name, address, entry.value_ptr.items.items, table.relational_schema_version, table.relational_integrity_generation_set);
+                continue;
+            }
             // Releases need the full reference set to prove RESTRICT. Other
             // commands need only the claim, never its potentially large fanout.
             if (entry.value_ptr.needs_references) {
@@ -1708,6 +1926,7 @@ pub fn prepareRetirementPage(alloc: Allocator, source: reads.TableReadSource, me
         for (expansion.partials) |dependency| if (progress.includes(dependency.reference.constraint_generation)) try builder.appendPartial(dependency);
         for (expansion.commands) |command| switch (command.command.operation) {
             .repair_detach => |reference| if (progress.includes(reference.constraint_generation)) try builder.appendCommand(command.table_name, command.command),
+            .release_interval => if (progress.includes(command.command.address.generation)) try builder.appendCommand(command.table_name, command.command),
             else => {},
         };
         for (expansion.parents) |parent| if (progress.includes(parent.address.generation)) try builder.appendCommand(parent.table_name, .{
@@ -1821,12 +2040,92 @@ test "distributed txn activation failure guards absence and abandons repaired pa
 }
 
 fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, phase: BackfillPhase, request: RequestContext) !Prepared {
+    return prepareBackfillMode(alloc, source, metadata, table_name, rows, phase, null, null, request);
+}
+
+/// Selected historical validation uses ordinary attachment, with the same
+/// exact primary observations and parent participants as activation. It never
+/// rewrites the child row or grants historical missing-parent exemptions.
+pub const ForeignKeyValidationSource = struct {
+    arena: std.heap.ArenaAllocator,
+    value: @import("../storage/db/relational_schema_owner_contract.zig").ForeignKeySource,
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Capture selected live parent generations through the same typed catalog and
+/// comparison checks used by ordinary mutations. One pinned route view and the
+/// builder cache amortize reads across constraints sharing a parent. This is
+/// preparation only: each later parent effect still has its ordinary 2PC guard.
+pub fn captureForeignKeyValidationSource(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, names: []const []const u8, request: RequestContext) !ForeignKeyValidationSource {
+    const owner = @import("../storage/db/relational_schema_owner_contract.zig");
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var builder: Builder = .{ .alloc = scratch.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request) };
+    defer builder.deinit();
+    const child = try builder.load(table_name);
+    try requireForeignKeyValidationSelection(child, names);
+    var plan = try builder.bindingPlanSelection(child, false, true, null, names);
+    defer plan.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const parents = try a.alloc(owner.ForeignKeyParent, names.len);
+    for (names, parents) |name, *target| {
+        try builder.control.ensureActive();
+        const binding = for (plan.foreign) |foreign| {
+            if (std.mem.eql(u8, foreign.definition.name, name)) break foreign;
+        } else return error.InvalidSchemaValidationJob;
+        const parent = try builder.load(binding.definition.parent_table);
+        const record = try builder.metadataTable(parent.name);
+        const unique = parent.catalog.findGeneration(binding.parent_generation) orelse return error.PreparedGenerationChanged;
+        target.* = .{
+            .constraint_name = try a.dupe(u8, name),
+            .declared_parent = try a.dupe(u8, binding.definition.parent_table),
+            .parent_table = try a.dupe(u8, parent.name),
+            .parent_table_id = record.table_id,
+            .parent_schema_version = parent.view.version(),
+            .parent_schema = parent.catalog.schema_digest,
+            .parent_public = owner.hash(record.schema_json),
+            .parent_catalog = parent.catalog_digest,
+            .parent_unique = try a.dupe(u8, unique.definition.name),
+            .parent_generation = binding.parent_generation,
+            .parent_definition = unique.definition.fingerprint,
+        };
+    }
+    const value: owner.ForeignKeySource = .{ .table_name = try a.dupe(u8, table_name), .parents = parents };
+    try value.validate();
+    return .{ .arena = arena, .value = value };
+}
+
+pub fn prepareForeignKeyValidationPage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, table_name: []const u8, rows: []const BackfillRow, names: []const []const u8, request: RequestContext) !Prepared {
+    return prepareBackfillMode(alloc, source, metadata, table_name, rows, .foreign_key, names, ranges, request);
+}
+
+fn requireForeignKeyValidationSelection(table: *Loaded, names: []const []const u8) !void {
+    if (names.len == 0 or names.len > 256) return error.InvalidSchemaValidationJob;
+    var bytes: usize = 0;
+    for (names, 0..) |name, i| {
+        bytes = std.math.add(usize, bytes, name.len) catch return error.InvalidSchemaValidationJob;
+        if (name.len == 0 or name.len > 4096 or bytes > 1024 * 1024 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSchemaValidationJob;
+        for (names[0..i]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidSchemaValidationJob;
+        const selected = for (table.foreign) |definition| {
+            if (std.mem.eql(u8, name, definition.name)) break definition;
+        } else return error.SqlConstraintNotFound;
+        if (!selected.not_valid or selected.match == .partial) return error.InvalidSchemaValidationJob;
+    }
+}
+
+fn prepareBackfillMode(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, phase: BackfillPhase, validation_names: ?[]const []const u8, coverage_ranges: ?[]const RangeRecord, request: RequestContext) !Prepared {
     if (rows.len > 4096) return error.TransactionTooLarge;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request) };
     defer builder.deinit();
     const table = try builder.load(table_name);
+    if (validation_names) |names| try requireForeignKeyValidationSelection(table, names);
     const row_table_index = try builder.outputIndex(table_name, table.view.version());
     // An empty native page has no claims, references, or parent observations.
     // Its source catalog is still validated above, and the caller commits the
@@ -1837,22 +2136,54 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         const owned_result_tables = try builder.output.toOwnedSlice(builder.alloc);
         return .{ .arena = arena, .tables = owned_result_tables };
     }
-    var plan = try builder.bindingPlanSelected(table, phase == .unique, phase == .foreign_key);
+    var plan = try builder.bindingPlanSelection(table, phase == .unique, phase == .foreign_key, null, validation_names);
     defer plan.deinit();
     var selected_fields: std.ArrayList([]const u8) = .empty;
     for (plan.uniques) |binding| try selected_fields.appendSlice(builder.alloc, try declarations.uniqueFields(builder.alloc, table.view.tableSchema().*, table.view.physicalLayout(), binding.definition));
     for (plan.foreign) |binding| try selected_fields.appendSlice(builder.alloc, binding.definition.child_columns);
     var validation_failure: ?[]const u8 = null;
     var backfill_partial = false;
+    const expressions = @import("../schema/relational_expression.zig");
+    var expression_bytes: usize = expressions.max_allocated_bytes;
+    var execution = expressions.Execution.init(builder.alloc, &expression_bytes);
+    execution.numeric.ptr = &builder.control;
+    execution.numeric.checkpoint = struct {
+        fn poll(ptr: ?*anyopaque) anyerror!void {
+            const control: *RequestContext = @ptrCast(@alignCast(ptr.?));
+            try control.ensureActive();
+        }
+    }.poll;
     for (rows) |row| {
+        try builder.control.ensureActive();
         try builder.charge(row.key.len + row.json.len);
         if (row.expected_content_digest == null) return error.MissingPrimaryObservation;
         try builder.appendPredicate(row_table_index, row.key, row.version, row.expected_content_digest);
         if (phase == .check) {
             const checks = table.view.validator().?.execution.checks orelse return error.ConstraintNotFound;
-            var parsed = try std.json.parseFromSlice(std.json.Value, builder.alloc, row.json, .{ .allocate = .alloc_always, .parse_numbers = false });
+            // Retained parent-arena capacity and work are admitted across the
+            // whole page, not reset for each projected row or CHECK plan.
+            var scratch: expressions.ExecutionScratch = undefined;
+            scratch.init(&execution);
+            defer scratch.deinit();
+            try execution.charge(row.json.len);
+            var parsed = std.json.parseFromSlice(std.json.Value, execution.alloc, row.json, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| return scratch.failure(err);
             defer parsed.deinit();
-            if (try checks.firstFailureJson(builder.alloc, parsed.value)) |failure| {
+            if (parsed.value != .object) return error.InvalidBatchRequest;
+            const columns = table.view.tableSchema().relational_columns;
+            for (row.json_null_fields) |name| {
+                try execution.charge(1 +| name.len);
+                try builder.charge(name.len +| @sizeOf([]const u8));
+                const ordinal = table.view.physicalLayout().ordinalForName(columns, name) orelse return error.InvalidBatchRequest;
+                if (columns[ordinal].column_type != .json) return error.InvalidBatchRequest;
+                const value = parsed.value.object.get(name) orelse return error.InvalidBatchRequest;
+                if (value != .null) return error.InvalidBatchRequest;
+            }
+            var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+            nulls.initRegion(execution.alloc, expression_bytes, &execution.numeric);
+            defer nulls.deinit();
+            nulls.bindAdmission(&expression_bytes) catch |err| return scratch.failure(err);
+            nulls.import(row.json_null_fields) catch |err| return if (err == error.InvalidSqlProgram) error.InvalidBatchRequest else scratch.failure(err);
+            if (try checks.firstFailureTypedJsonWithExecution(&execution, parsed.value, &nulls)) |failure| {
                 validation_failure = try std.fmt.allocPrint(builder.alloc, "CHECK {s}: {s}", .{ checks.definitions[failure.index].name, @errorName(failure.reason) });
                 break;
             }
@@ -1860,8 +2191,9 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         }
         var prepared = try mapper.PreparedRelationalProjection.init(builder.alloc, row.json, table.view.tableSchema().*, table.view.physicalLayout(), selected_fields.items);
         defer prepared.deinit();
-        const expansion = plan.expand(builder.alloc, &.{.{ .key = row.key, .after = prepared.view }}) catch |err| switch (err) {
-            error.ForeignKeyMatchFullViolation => {
+        const mutations = [_]planner.Mutation{.{ .key = row.key, .after = prepared.view }};
+        const expansion = (if (validation_names != null) plan.expand(builder.alloc, &mutations) else plan.expandHistorical(builder.alloc, &mutations)) catch |err| switch (err) {
+            error.ForeignKeyMatchFullViolation, error.TemporalEmptyRange => {
                 validation_failure = @errorName(err);
                 break;
             },
@@ -1873,8 +2205,8 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         };
         for (expansion.commands) |command| {
             const selected = switch (command.command.operation) {
-                .establish => phase == .unique,
-                .attach => phase == .foreign_key,
+                .establish, .establish_interval => phase == .unique,
+                .attach, .attach_historical => phase == .foreign_key,
                 else => false,
             };
             if (selected) try builder.appendCommand(command.table_name, command.command);
@@ -1884,6 +2216,11 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         _ = try planner.storage.validateCommandAdmission(commands.items);
         table_request.integrity_commands = if (validation_failure == null) commands.items else &.{};
         table_request.predicates = predicates.items;
+    }
+    if (coverage_ranges) |ranges| {
+        var parents: std.ArrayList([]const u8) = .empty;
+        for (builder.output.items) |table_request| if (table_request.integrity_commands.len != 0) try parents.append(builder.alloc, table_request.table_name);
+        try requireUniqueCoverageFor(&builder, ranges, parents.items);
     }
     const owned_result_tables = try builder.output.toOwnedSlice(builder.alloc);
     return .{ .arena = arena, .tables = owned_result_tables, .validation_failure = validation_failure, .backfill_partial = backfill_partial };
@@ -2139,7 +2476,7 @@ pub fn testCatalogEnvelope(alloc: Allocator, table_id: u64, json: []const u8) ![
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
     const definitions = try declarations.definitionFingerprints(alloc, parsed, runtime);
     defer declarations.freeDefinitions(alloc, definitions);
-    var update = try catalog.prepare(alloc, null, try catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions);
+    var update = try catalog.prepareWithChecks(alloc, null, try catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions, try declarations.checksFingerprint(alloc, parsed));
     defer update.deinit();
     const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(update.value.len));
     defer alloc.free(encoded);
@@ -2523,6 +2860,69 @@ test "distributed txn expression partial unique declarations bind activation ret
     }
 }
 
+test "distributed txn CHECK activation authenticates projected JSON nulls and shares page admission" {
+    const a = std.testing.allocator;
+    const declaration =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"j":{"type":"json"},"unrelated":{"type":"integer"}},"required":["n","unrelated"],"additionalProperties":false}}}}
+    ;
+    const envelope = try testCatalogEnvelope(a, 1, declaration);
+    defer a.free(envelope);
+    const Fixture = struct {
+        envelope: []const u8,
+        fn lookup(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!opts.relational_integrity_catalog) return error.UnexpectedNativeRead;
+            return .{ .json = try alloc.dupe(u8, self.envelope), .version = 0 };
+        }
+    };
+    var fixture: Fixture = .{ .envelope = envelope };
+    const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } };
+    const metadata = [_]TableRecord{.{ .table_id = 1, .name = "rows", .schema_json = declaration }};
+    const good: BackfillRow = .{ .key = "r", .json = "{\"n\":1,\"j\":null}", .version = 7, .expected_content_digest = @splat(9), .json_null_fields = &.{"j"} };
+    const Run = struct {
+        fn run(alloc: Allocator, reader: reads.TableReadSource, tables: []const TableRecord, row: BackfillRow) !void {
+            var prepared = try prepareBackfill(alloc, reader, tables, "rows", &.{row}, .check);
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(?[]const u8, null), prepared.validation_failure);
+            try std.testing.expectEqual(@as(usize, 1), prepared.tables[0].predicates.len);
+            try std.testing.expectEqual(@as(u64, 7), prepared.tables[0].predicates[0].expected_version);
+            try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(9)), &prepared.tables[0].predicates[0].expected_content_digest.?);
+            try std.testing.expectEqual(@as(usize, 0), prepared.tables[0].writes.len);
+        }
+    };
+    try Run.run(a, source, &metadata, good);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ source, &metadata, good });
+    for ([_][]const []const u8{ &.{"missing"}, &.{"n"}, &.{ "j", "j" } }) |markers| {
+        var bad = good;
+        bad.json_null_fields = markers;
+        try std.testing.expectError(error.InvalidBatchRequest, prepareBackfill(a, source, &metadata, "rows", &.{bad}, .check));
+    }
+    var nonnull = good;
+    nonnull.json = "{\"n\":1,\"j\":{}}";
+    try std.testing.expectError(error.InvalidBatchRequest, prepareBackfill(a, source, &metadata, "rows", &.{nonnull}, .check));
+    var violated = good;
+    violated.json = "{\"n\":-1,\"j\":null}";
+    var invalid = try prepareBackfill(a, source, &metadata, "rows", &.{violated}, .check);
+    defer invalid.deinit();
+    try std.testing.expectEqualStrings("CHECK positive: RelationalCheckViolation", invalid.validation_failure.?);
+    try std.testing.expectEqual(@as(usize, 1), invalid.tables[0].predicates.len);
+    // Each row fits independently, but accumulated retained parse/cache
+    // capacity cannot repeatedly spend a fresh 4 MiB allowance on one page.
+    const text = try a.alloc(u8, 128 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    const large_json = try std.fmt.allocPrint(a, "{{\"n\":1,\"j\":\"{s}\"}}", .{text});
+    defer a.free(large_json);
+    var large = good;
+    large.json = large_json;
+    large.json_null_fields = &.{};
+    try Run.run(a, source, &metadata, large);
+    var page: [48]BackfillRow = undefined;
+    @memset(&page, large);
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, prepareBackfill(a, source, &metadata, "rows", &page, .check));
+}
+
 test "distributed txn activation projection validates selected fields without full row required fields" {
     const alloc = std.testing.allocator;
     const public_schema =
@@ -2611,6 +3011,52 @@ test "distributed txn activation projection validates selected fields without fu
     var layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, runtime);
     defer layout.deinit();
     try std.testing.expectError(error.InvalidBatchRequest, mapper.PreparedRelationalWrite.init(alloc, "row", "{\"id\":1}", null, runtime, &layout));
+}
+
+test "distributed txn UUID defaults materialize once before integrity traversal" {
+    const alloc = std.testing.allocator;
+    var compiled = try @import("../sql/compiler.zig").compile(alloc, "CREATE TABLE events (id UUID PRIMARY KEY DEFAULT uuidv7(), amount INTEGER)", .{});
+    defer compiled.deinit();
+    const schema_json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(alloc, compiled.statement.create_table);
+    defer alloc.free(schema_json);
+    const envelope = try testCatalogEnvelope(alloc, 1, schema_json);
+    defer alloc.free(envelope);
+    const Fixture = struct {
+        envelope: []const u8,
+        var random_calls: usize = 0;
+        fn lookup(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (opts.relational_integrity_catalog) .{ .json = try a.dupe(u8, self.envelope), .version = 0 } else null;
+        }
+        fn random(_: ?*anyopaque, output: []u8) std.Io.RandomSecureError!void {
+            random_calls += 1;
+            @memset(output, @intCast(random_calls));
+        }
+    };
+    Fixture.random_calls = 0;
+    defer Fixture.random_calls = 0;
+    var fixture: Fixture = .{ .envelope = envelope };
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Fixture.random;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } };
+    const metadata = [_]TableRecord{.{ .table_id = 1, .name = "events", .placement_role = "data", .schema_json = schema_json }};
+    const requests = [_]contract.TableCommitRequest{.{ .table_name = "events", .writes = &.{ .{ .key = "one", .value = "{\"amount\":1}" }, .{ .key = "two", .value = "{\"amount\":2}" } } }};
+    var prepared = try prepareControlled(alloc, source, &metadata, &requests, .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) });
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 2), Fixture.random_calls);
+    try std.testing.expectEqual(@as(usize, 2), prepared.tables[0].writes.len);
+    var first_id: ?[]const u8 = null;
+    for (prepared.tables[0].writes) |write| {
+        const row = try std.json.parseFromSlice(std.json.Value, alloc, write.value, .{});
+        defer row.deinit();
+        const id = row.value.object.get("id").?.string;
+        try std.testing.expectEqual(@as(?u4, 7), @import("../common/uuid.zig").version(try @import("../common/uuid.zig").parse(id)));
+        if (first_id) |previous| {
+            defer alloc.free(previous);
+            try std.testing.expect(!std.mem.eql(u8, previous, id));
+        } else first_id = try alloc.dupe(u8, id);
+    }
 }
 
 test "distributed txn public integrity adapter enlists generated parent commands and guarded child writes" {
@@ -2873,9 +3319,9 @@ fn testNativeCascade(generated: bool) !void {
     var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 500, .shard_id = 501 }, .primary_backend = .{ .lsm = .{} } });
     defer db.close();
     const declaration = if (generated)
-        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"id","expression":{"op":"add","args":[{"op":"column","column":"seed"},{"op":"literal","type":"integer","value":"1"}]}}],"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"seed":{"type":"integer"},"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"id","expression":{"op":"add","args":[{"op":"column","column":"seed"},{"op":"literal","type":"integer","value":"1"}]}}],"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"seed":{"type":"integer"},"id":{"type":"integer"},"parent":{"type":"integer","nullable":true},"payload":{"type":"json","x-antfly-sql-type":"jsonb","nullable":true}},"additionalProperties":false}}}}
     else
-        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true},"payload":{"type":"json","x-antfly-sql-type":"jsonb","nullable":true}},"additionalProperties":false}}}}
     ;
     try db.setSchemaJson(alloc, declaration);
     const Fixture = struct {
@@ -2920,7 +3366,7 @@ fn testNativeCascade(generated: bool) !void {
     const ranges = [_]RangeRecord{.{ .group_id = 501, .table_id = 500, .start_key = "" }};
     var inserted = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{
         .{ .key = "p", .value = if (generated) "{\"seed\":0,\"parent\":null}" else "{\"id\":1,\"parent\":null}" },
-        .{ .key = "c", .value = if (generated) "{\"seed\":1,\"parent\":1}" else "{\"id\":2,\"parent\":1}" },
+        .{ .key = "c", .value = if (generated) "{\"seed\":1,\"parent\":1,\"payload\":null}" else "{\"id\":2,\"parent\":1,\"payload\":null}", .json_null_fields = &.{"payload"} },
     } }});
     defer inserted.deinit();
     try std.testing.expectEqual(@as(usize, 1), fixture.observation_batches);
@@ -2929,6 +3375,12 @@ fn testNativeCascade(generated: bool) !void {
     try rejectDefiniteConflicts(alloc, source, &tables, &ranges, inserted.tables, .{});
     try std.testing.expectEqual(@as(usize, 1), fixture.claim_batches);
     try Fixture.commit(&db, inserted, 1);
+    {
+        var observed = (try db.lookup(alloc, "c", .{ .include_json_null_fields = true })).?;
+        defer observed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), observed.json_null_fields.len);
+        try std.testing.expectEqualStrings("payload", observed.json_null_fields[0]);
+    }
     var duplicate = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "duplicate", .value = if (generated) "{\"seed\":0,\"parent\":null}" else "{\"id\":1,\"parent\":null}" }} }});
     defer duplicate.deinit();
     try std.testing.expectError(error.UniqueConstraintViolation, rejectDefiniteConflicts(alloc, source, &tables, &ranges, duplicate.tables, .{}));
@@ -2952,8 +3404,10 @@ fn testNativeCascade(generated: bool) !void {
         var updated = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "p", .value = "{\"seed\":9007199254740993,\"parent\":null}" }} }});
         defer updated.deinit();
         try Fixture.commit(&db, updated, 2);
-        const child = (try db.lookup(alloc, "c", .{})).?;
-        defer alloc.free(child.json);
+        var child = (try db.lookup(alloc, "c", .{ .include_json_null_fields = true })).?;
+        defer child.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), child.json_null_fields.len);
+        try std.testing.expectEqualStrings("payload", child.json_null_fields[0]);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, child.json, .{ .parse_numbers = false });
         defer parsed.deinit();
         try std.testing.expectEqualStrings("9007199254740994", parsed.value.object.get("parent").?.number_string);
@@ -3090,4 +3544,110 @@ test "distributed txn MATCH PARTIAL nullable witnesses survive alternate deletio
             return error.TestExpectedError;
         }
     }
+}
+
+test "foreign key validation pages select pending constraints retain row guards and reuse parent preparation" {
+    const a = std.testing.allocator;
+    const children =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"keep","child_columns":["a"],"parent_table":"parents","parent_columns":["id"],"not_valid":true},{"name":"other","child_columns":["b","c"],"parent_table":"unavailable","parent_columns":["x","y"],"match":"full","not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true},"c":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const parents =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const F = struct {
+        child_envelope: []const u8,
+        parent_envelope: []const u8,
+        status: []const u8,
+        parent_reads: usize = 0,
+        fn lookup(ptr: *anyopaque, backing: Allocator, name: []const u8, _: []const u8, options: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const value = if (options.relational_integrity_catalog) block: {
+                if (std.mem.eql(u8, name, "children")) break :block self.child_envelope;
+                if (!std.mem.eql(u8, name, "parents")) return error.UnexpectedCall;
+                self.parent_reads += 1;
+                break :block self.parent_envelope;
+            } else if (std.mem.eql(u8, name, "parents") and options.relational_activation_json.len != 0) self.status else return error.UnexpectedCall;
+            return .{ .json = try backing.dupe(u8, value), .version = 0 };
+        }
+        fn run(backing: Allocator, fixture_value: @This(), tables: []const TableRecord, ranges: []const RangeRecord) !void {
+            var fixture = fixture_value;
+            const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = lookup, .scan = undefined, .query = undefined } };
+            var row_key: [1]u8 = .{'c'};
+            var prepared = try prepareForeignKeyValidationPage(backing, source, tables, ranges, "children", &.{.{ .key = &row_key, .json = "{\"a\":7,\"b\":1,\"c\":null}", .version = 17, .expected_content_digest = @splat(9) }}, &.{"keep"}, .{});
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(usize, 2), prepared.tables.len);
+            try std.testing.expectEqual(@as(usize, 1), fixture.parent_reads);
+            const child = prepared.tables[0];
+            row_key[0] = 'x';
+            try std.testing.expectEqualStrings("c", child.predicates[0].key);
+            try std.testing.expectEqualStrings("c", prepared.tables[1].integrity_commands[0].operation.attach.child_key);
+            try std.testing.expectEqual(@as(usize, 1), child.predicates.len);
+            try std.testing.expectEqual(@as(u64, 17), child.predicates[0].expected_version);
+            try std.testing.expectEqual(@as(?[32]u8, @splat(9)), child.predicates[0].expected_content_digest);
+            try std.testing.expectEqual(@as(usize, 0), child.integrity_commands.len);
+            const parent = prepared.tables[1];
+            try std.testing.expectEqual(@as(usize, 1), parent.integrity_commands.len);
+            try std.testing.expect(parent.integrity_commands[0].operation == .attach);
+            try std.testing.expectEqualStrings("keep", parent.integrity_commands[0].operation.attach.constraint_name);
+            for (prepared.tables) |request| {
+                try std.testing.expectEqual(@as(usize, 0), request.writes.len);
+                try std.testing.expectEqual(@as(usize, 0), request.deletes.len);
+                try std.testing.expect(request.relational_activation == null);
+                try std.testing.expect(request.relational_integrity_generation_set != null);
+            }
+        }
+    };
+    const child_envelope = try testCatalogEnvelope(a, 71, children);
+    defer a.free(child_envelope);
+    const parent_envelope = try testCatalogEnvelope(a, 88, parents);
+    defer a.free(parent_envelope);
+    var parent_schema = try schema_api.PreparedSchemaDefinition.init(a, parents);
+    defer parent_schema.deinit(a);
+    var parent_catalog = try declarations.compileCatalog(a, parent_schema.public_schema, 88, null);
+    defer parent_catalog.deinit();
+    const status = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 1), .schema_digest = parent_catalog.catalog.schema_digest, .generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(parent_catalog.catalog), .owner = @as([32]u8, @splat(5)), .range_start = "", .range_end = "", .unique_covered = true, .state = "enforced", .phase = "foreign_key", .rows_scanned = @as(u64, 1), .failure = "" }, .{});
+    defer a.free(status);
+    const fixture: F = .{ .child_envelope = child_envelope, .parent_envelope = parent_envelope, .status = status };
+    const tables = [_]TableRecord{ .{ .table_id = 71, .name = "children", .schema_json = children }, .{ .table_id = 88, .name = "parents", .schema_json = parents } };
+    const ranges = [_]RangeRecord{.{ .table_id = 88, .group_id = 881, .start_key = "" }};
+    try F.run(a, fixture, &tables, &ranges);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, F.run, .{ fixture, &tables, &ranges });
+    var observed = fixture;
+    const source: reads.TableReadSource = .{ .ptr = &observed, .vtable = &.{ .lookup = F.lookup, .scan = undefined, .query = undefined } };
+    try std.testing.expectError(error.InvalidSchemaValidationJob, prepareForeignKeyValidationPage(a, source, &tables, &ranges, "children", &.{}, &.{}, .{}));
+    try std.testing.expectError(error.InvalidSchemaValidationJob, prepareForeignKeyValidationPage(a, source, &tables, &ranges, "children", &.{}, &.{ "keep", "keep" }, .{}));
+    try std.testing.expectError(error.SqlConstraintNotFound, prepareForeignKeyValidationPage(a, source, &tables, &ranges, "children", &.{}, &.{"missing"}, .{}));
+    try std.testing.expectError(error.MissingPrimaryObservation, prepareForeignKeyValidationPage(a, source, &tables, &ranges, "children", &.{.{ .key = "c", .json = "{\"a\":7}", .version = 17 }}, &.{"keep"}, .{}));
+    try std.testing.expectError(error.ConstraintActivationPending, prepareForeignKeyValidationPage(a, source, &tables, &.{}, "children", &.{.{ .key = "c", .json = "{\"a\":7}", .version = 17, .expected_content_digest = @splat(9) }}, &.{"keep"}, .{}));
+    var empty = try prepareForeignKeyValidationPage(a, source, &tables, &.{}, "children", &.{}, &.{"keep"}, .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 1), empty.tables.len);
+}
+
+test "SQL drop retirement integrity observations retain scoped native read authority" {
+    const Authority = struct {
+        calls: usize = 0,
+        denied: bool = false,
+        fn authorize(ptr: *anyopaque, _: Allocator, table: []const u8) !?@import("operation.zig").RowPolicyIntegrityRead.Proof {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("parent", table);
+            if (self.denied) return error.Forbidden;
+            return .{ .token = "scoped-read-proof", .database = "tenant" };
+        }
+    };
+    var authority: Authority = .{};
+    const context: RequestContext = .{ .row_policy_integrity_read = .{ .ptr = &authority, .authorize = Authority.authorize } };
+    const original: types.LookupOptions = .{ .relational_integrity_jobs_json = "{\"kind\":\"observations\"}" };
+    const authorized = try authorizedLookupOptions(context, std.testing.allocator, "parent", original);
+    try std.testing.expectEqualStrings("scoped-read-proof", authorized.row_policy_principal_proof);
+    try std.testing.expectEqualStrings("tenant", authorized.row_policy_database);
+    try std.testing.expect(!authorized.include_primary_digest);
+    const catalog_options = try authorizedLookupOptions(context, std.testing.allocator, "parent", .{ .relational_integrity_catalog = true });
+    try std.testing.expectEqual(@as(usize, 0), catalog_options.row_policy_principal_proof.len);
+    try std.testing.expectEqual(@as(usize, 1), authority.calls);
+    const untrusted = try authorizedLookupOptions(.{}, std.testing.allocator, "parent", original);
+    try std.testing.expectEqual(@as(usize, 0), untrusted.row_policy_principal_proof.len);
+    authority.denied = true;
+    try std.testing.expectError(error.Forbidden, authorizedLookupOptions(context, std.testing.allocator, "parent", original));
 }

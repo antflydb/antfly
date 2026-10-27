@@ -94,6 +94,16 @@ statement before any mutation.
   schema-version-conditional column/default changes and multicolumn covering
   indexes. Unique declarations await native constraint activation; a durable
   pending receipt is not a successful CREATE acknowledgement.
+  UNIQUE constraints and indexes retain PostgreSQL NULLS DISTINCT (default)
+  versus NULLS NOT DISTINCT semantics in native integrity declarations. The
+  clause follows UNIQUE for constraints and INCLUDE for indexes; covering
+  columns remain outside the unique key. Nonunique indexes accept the clause
+  without becoming unique. Public/lifecycle qualification remains case-specific.
+  ALTER COLUMN SET/DROP NOT NULL preserves type domains, defaults and generated
+  expressions; primary-key columns cannot drop NOT NULL. Server tightening
+  requires metadata-owned staged validation/publication, while relaxation uses
+  the guarded schema CAS. The embedded CAS-only adapter rejects tightening;
+  matching no-ops do not publish a new schema epoch.
 - `BEGIN`/`START TRANSACTION` isolation/read modes, `COMMIT`, `ROLLBACK`, named
   SAVEPOINT/ROLLBACK TO/RELEASE, backed by durable native session ownership.
 - Deferrable UNIQUE and `SET CONSTRAINTS ... IMMEDIATE/DEFERRED`, with durable
@@ -216,6 +226,14 @@ String literals assigned to JSON columns are interpreted as JSON input text;
 typed JSON parameters remain values. Numeric JSON text is retained losslessly.
 Identical JSON literals share one immutable parsed tree in the binding; Execute
 reuses that tree rather than parsing the literal again after validation.
+JSON path operators `#>` and `#>>` accept typed `text[]` paths, including
+parameters, non-default bounds and multidimensional paths. They use the same
+borrowed JSON extraction kernel as the path functions; paths are consumed by
+ordinal without expanding compact arrays or reconstructing the source JSON.
+Path components share the execution work/cancellation budget. JSON extraction
+retains JSON null, while text extraction maps JSON null to SQL NULL. The JSON
+operators use PostgreSQL's generic-operator precedence, including composition
+with JSON concatenation.
 Native typed reads and expression results carry separate SQL-null flags through
 HTTP and pgwire, including binary portals. Mutations carry explicit JSON-null
 field provenance into native validation and row preparation, so a JSON null

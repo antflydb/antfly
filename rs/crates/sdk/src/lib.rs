@@ -20,6 +20,38 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_ARTIFACT_SOURCES: usize = 64;
 
+#[test]
+fn sql_catalog_recovery_preserves_unknown_receipts_and_exact_integer_strings() {
+    let receipt = serde_json::json!({
+        "kind": "sequence", "operation": "create", "database": "postgres",
+        "namespace": "public", "name": "counter", "state": "unknown",
+        "recovery_token": "retained-operation", "object_id": "18446744073709551615",
+        "generation": "9007199254740993",
+        "diagnostic": {"code": "40003", "message": "observe only", "retryable": false}
+    });
+    let value: types::SqlCatalogOperationReceipt = serde_json::from_value(receipt.clone()).unwrap();
+    assert_eq!(serde_json::to_value(value).unwrap(), receipt);
+    let response = serde_json::json!({
+        "columns": [], "rows": [], "rows_affected": 0, "command_tag": "DDL PENDING",
+        "catalog_receipt": receipt
+    });
+    let failure: types::SqlExecutionFailure = serde_json::from_value(response).unwrap();
+    let restored = serde_json::to_value(failure).unwrap();
+    assert_eq!(
+        restored["catalog_receipt"]["recovery_token"],
+        "retained-operation"
+    );
+    assert_eq!(
+        restored["catalog_receipt"]["object_id"],
+        "18446744073709551615"
+    );
+    let failure: types::SqlExecutionFailure = serde_json::from_value(serde_json::json!({
+        "code": "42501", "message": "denied", "retryable": false
+    }))
+    .unwrap();
+    assert_eq!(serde_json::to_value(failure).unwrap()["code"], "42501");
+}
+
 /// A successful metadata mutation. `Committed` is not a failed write: observe
 /// table/schema status instead of replaying the mutation. ResponseValue retains
 /// the HTTP status and headers, including the schema ETag.
@@ -804,6 +836,24 @@ impl types::CreateIndexError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relational_json_null_expression_round_trip() {
+        for with_value in [false, true] {
+            let mut source = serde_json::json!({
+                "op": "literal", "type": "json", "json_null": true
+            });
+            if with_value {
+                source["value"] = serde_json::Value::Null;
+            }
+            let expression: super::types::RelationalScalarExpression =
+                serde_json::from_value(source).unwrap();
+            let restored = serde_json::to_value(expression).unwrap();
+            assert_eq!(restored["type"], "json");
+            assert_eq!(restored["json_null"], true);
+            assert!(restored.get("value").is_none_or(serde_json::Value::is_null));
+        }
+    }
+
     #[test]
     fn relational_array_literal_round_trip() {
         for identity in [

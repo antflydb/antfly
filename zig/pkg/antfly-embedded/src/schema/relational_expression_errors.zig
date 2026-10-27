@@ -18,6 +18,7 @@
 pub const Error = error{
     SqlFeatureNotSupported,
     SqlArraySubscriptError,
+    SqlInvalidPowerArgument,
     RelationalExpressionOverflow,
     RelationalExpressionDivisionByZero,
     RelationalExpressionBudgetExceeded,

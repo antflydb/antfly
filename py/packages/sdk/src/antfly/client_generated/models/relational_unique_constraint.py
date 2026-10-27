@@ -30,9 +30,15 @@ class RelationalUniqueConstraint:
                 ownership.
             primary (bool | Unset): SQL primary-key identity. At most one per relational table; all key columns must be
                 required and nonnullable.
+            include_columns (list[str] | Unset): Non-key payload columns for this constraint's covering ordered index. They
+                never participate in uniqueness, foreign-key target identity, or primary-key nullability. Only column-key,
+                constraint-owned declarations support INCLUDE.
             columns (list[str] | Unset):
             keys (list[RelationalIndexKey] | Unset): Typed native unique keys. Specify either columns or keys.
             where (list[RelationalIndexPredicate] | Unset): Conjunction restricting uniqueness to matching rows.
+            without_overlaps_column (str | Unset): Range-valued final key column for PostgreSQL WITHOUT OVERLAPS. Other key
+                columns define equality groups; nonempty ranges within each group must be disjoint. The column remains in
+                columns. Temporal keys are not equality-only foreign-key targets or ON CONFLICT arbiters.
             nulls_not_distinct (bool | Unset): When true, NULL components compare equal for uniqueness.
             deferrable (bool | Unset): Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT
                 arbiter or a referenced foreign key target.
@@ -47,9 +53,11 @@ class RelationalUniqueConstraint:
     name: str
     origin: RelationalUniqueConstraintOrigin | Unset = UNSET
     primary: bool | Unset = UNSET
+    include_columns: list[str] | Unset = UNSET
     columns: list[str] | Unset = UNSET
     keys: list[RelationalIndexKey] | Unset = UNSET
     where: list[RelationalIndexPredicate] | Unset = UNSET
+    without_overlaps_column: str | Unset = UNSET
     nulls_not_distinct: bool | Unset = UNSET
     deferrable: bool | Unset = UNSET
     timing: ForeignKeyTiming | Unset = UNSET
@@ -62,6 +70,10 @@ class RelationalUniqueConstraint:
             origin = self.origin.value
 
         primary = self.primary
+
+        include_columns: list[str] | Unset = UNSET
+        if not isinstance(self.include_columns, Unset):
+            include_columns = self.include_columns
 
         columns: list[str] | Unset = UNSET
         if not isinstance(self.columns, Unset):
@@ -80,6 +92,8 @@ class RelationalUniqueConstraint:
             for where_item_data in self.where:
                 where_item = where_item_data.to_dict()
                 where.append(where_item)
+
+        without_overlaps_column = self.without_overlaps_column
 
         nulls_not_distinct = self.nulls_not_distinct
 
@@ -100,12 +114,16 @@ class RelationalUniqueConstraint:
             field_dict["origin"] = origin
         if primary is not UNSET:
             field_dict["primary"] = primary
+        if include_columns is not UNSET:
+            field_dict["include_columns"] = include_columns
         if columns is not UNSET:
             field_dict["columns"] = columns
         if keys is not UNSET:
             field_dict["keys"] = keys
         if where is not UNSET:
             field_dict["where"] = where
+        if without_overlaps_column is not UNSET:
+            field_dict["without_overlaps_column"] = without_overlaps_column
         if nulls_not_distinct is not UNSET:
             field_dict["nulls_not_distinct"] = nulls_not_distinct
         if deferrable is not UNSET:
@@ -132,6 +150,8 @@ class RelationalUniqueConstraint:
 
         primary = d.pop("primary", UNSET)
 
+        include_columns = cast(list[str], d.pop("include_columns", UNSET))
+
         columns = cast(list[str], d.pop("columns", UNSET))
 
         _keys = d.pop("keys", UNSET)
@@ -152,6 +172,8 @@ class RelationalUniqueConstraint:
 
                 where.append(where_item)
 
+        without_overlaps_column = d.pop("without_overlaps_column", UNSET)
+
         nulls_not_distinct = d.pop("nulls_not_distinct", UNSET)
 
         deferrable = d.pop("deferrable", UNSET)
@@ -167,9 +189,11 @@ class RelationalUniqueConstraint:
             name=name,
             origin=origin,
             primary=primary,
+            include_columns=include_columns,
             columns=columns,
             keys=keys,
             where=where,
+            without_overlaps_column=without_overlaps_column,
             nulls_not_distinct=nulls_not_distinct,
             deferrable=deferrable,
             timing=timing,

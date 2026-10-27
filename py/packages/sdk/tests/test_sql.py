@@ -39,6 +39,75 @@ from antfly import (
 from antfly.client_generated.models.sql_numeric_modifier import SQLNumericModifier
 
 
+def test_catalog_recovery_retains_unknown_receipt_without_replaying():
+    token = "opaque-retained-operation"
+    receipt = {
+        "kind": "sequence",
+        "operation": "create",
+        "database": "postgres",
+        "namespace": "public",
+        "name": "counter",
+        "state": "unknown",
+        "recovery_token": token,
+        "diagnostic": {"code": "40003", "message": "observe only", "retryable": False},
+    }
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        assert request.method == "POST"
+        if request.url.path == "/db/v1/sql":
+            assert len(calls) == 1
+            return httpx.Response(
+                409, json={"columns": [], "rows": [], "command_tag": "DDL PENDING", "catalog_receipt": receipt}
+            )
+        assert request.url.path == "/db/v1/sql/operations/status"
+        assert json.loads(request.content) == {"recovery_token": token}
+        return httpx.Response(
+            200,
+            json={
+                **receipt,
+                "state": "committed",
+                "object_id": "18446744073709551615",
+                "generation": "9007199254740993",
+            },
+        )
+
+    client = AntflyClient(base_url="http://sql.test")
+    with httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond)) as http:
+        client._client.set_httpx_client(http)
+        with pytest.raises(SQLExecutionError) as error:
+            client.execute_sql(SQLRequest(statement="CREATE SEQUENCE counter"))
+        assert error.value.catalog_receipt.recovery_token == token
+        assert error.value.diagnostic.retryable is False
+        result = client.get_sql_catalog_operation(error.value.catalog_receipt.recovery_token)
+        assert result.object_id == "18446744073709551615"
+        assert result.generation == "9007199254740993"
+        with pytest.raises(AntflyException, match="recovery token"):
+            client.get_sql_catalog_operation("")
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("status", [307, 403, 503])
+def test_catalog_recovery_never_redirects_or_retries(status):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(
+            status,
+            headers={"Location": "/replayed"},
+            json={"code": "42501" if status == 403 else "40003", "message": "observe only", "retryable": False},
+        )
+
+    client = AntflyClient(base_url="http://sql.test")
+    with httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond), follow_redirects=True) as http:
+        client._client.set_httpx_client(http)
+        with pytest.raises(SQLExecutionError):
+            client.get_sql_catalog_operation("opaque-retained-operation")
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("kind", list(SQLArrayElementType))
 def test_array_column_schema_exports_explicit_element_identity_and_transport_constraints(kind):
     schema = SQLArrayColumnSchema(
@@ -210,6 +279,16 @@ def test_sql_bound_parameters_and_exact_integer_results():
     assert json.loads(request.call_args.kwargs["content"])["parameters"] == [9223372036854775807]
     assert request.call_args.kwargs["follow_redirects"] is False
     assert request.call_args.kwargs["_max_response_bytes"] == 16 << 20
+
+
+@pytest.mark.parametrize("with_value", [False, True])
+def test_public_json_null_expression_round_trip(with_value):
+    source = {"op": "literal", "type": "json", "json_null": True}
+    if with_value:
+        source["value"] = None
+    expression = RelationalScalarExpression.from_dict(source)
+    assert expression.json_null is True
+    assert expression.to_dict() == source
 
 
 def test_public_numeric_schema_expression_round_trip_retains_exact_literal_text():

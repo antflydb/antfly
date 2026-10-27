@@ -35,7 +35,8 @@ fn fail(index: u8) anyerror!u64 {
         5 => error.EmbeddingIdentityMismatch,
         6 => error.InvalidChunkPolicy,
         7 => error.InvalidChunkReplay,
-        8 => error.DocumentTokenLimitExceeded,
+        8 => error.RelationalCheckViolation,
+        9 => error.DocumentTokenLimitExceeded,
         else => 42,
     };
 }
@@ -59,9 +60,9 @@ test "model-aware chunk failures cross independent native error domains" {
     const method: @FieldType(Methods, "fail") = @ptrCast(@alignCast(provider.fail));
     var distinct = false;
     for ([_][]const u8{
-        "StaleChunkContinuation",     "IncompleteChunkCoverage",   "SourceVersionChanged", "MemoryBudgetExceeded",
-        "UnsupportedChunkMediaType",  "EmbeddingIdentityMismatch", "InvalidChunkPolicy",   "InvalidChunkReplay",
-        "DocumentTokenLimitExceeded",
+        "StaleChunkContinuation",    "IncompleteChunkCoverage",    "SourceVersionChanged", "MemoryBudgetExceeded",
+        "UnsupportedChunkMediaType", "EmbeddingIdentityMismatch",  "InvalidChunkPolicy",   "InvalidChunkReplay",
+        "RelationalCheckViolation",  "DocumentTokenLimitExceeded",
     }, 0..) |name, index| {
         const expected = @import("storage_engine_errors").fromName(name);
         const code: u8 = @intCast(index);

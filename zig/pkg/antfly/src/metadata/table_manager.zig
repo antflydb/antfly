@@ -25,6 +25,31 @@ const group_ids = @import("antfly_local_sources").common_group_ids;
 const topology_records = @import("antfly_local_sources").common_topology_records;
 const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
 const dense_native_storage_phase = @import("antfly_local_sources").common_dense_native_storage_phase;
+pub const SchemaReaderCapabilities = @import("antfly_local_sources").common_schema_readers.ReaderCapabilities;
+pub const SchemaReaderFloor = @import("antfly_local_sources").common_schema_readers.ReaderFloor;
+
+pub fn requireSchemaReaderAtFloor(floor: SchemaReaderFloor, incoming: StoreRecord) !void {
+    if (!floor.valid()) return error.InvalidSchemaReaderRequirements;
+    if (!incoming.schema_reader.validForReporter(incoming.reporter_incarnation)) return error.InvalidStoreReporterFence;
+    if (storeServesTableData(incoming.role) and !floor.admits(incoming.schema_reader, incoming.reporter_incarnation))
+        return error.SchemaReaderUpgradeRequired;
+}
+
+test "system catalog schema reader admission covers custom data roles without conflating metadata roles" {
+    const floor: SchemaReaderFloor = .{ .semantic_version = 30, .encoding_version = 31 };
+    var record: StoreRecord = .{ .store_id = 1, .node_id = 1, .role = "ssd", .reporter_incarnation = 7 };
+    try requireSchemaReaderAtFloor(.{}, record);
+    try std.testing.expectError(error.SchemaReaderUpgradeRequired, requireSchemaReaderAtFloor(floor, record));
+    record.role = "metadata";
+    try requireSchemaReaderAtFloor(floor, record);
+    record.role = "ssd";
+    record.schema_reader = SchemaReaderCapabilities.current;
+    try requireSchemaReaderAtFloor(floor, record);
+    record.reporter_incarnation = 0;
+    try std.testing.expectError(error.InvalidStoreReporterFence, requireSchemaReaderAtFloor(floor, record));
+    record.role = "metadata";
+    try std.testing.expectError(error.InvalidSchemaReaderRequirements, requireSchemaReaderAtFloor(.{ .semantic_version = 30 }, record));
+}
 const transition_state = @import("transition_state.zig");
 
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
@@ -44,7 +69,9 @@ pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.T
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+    return std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
+        (if (lhs.full_text_read_index) |name| if (rhs.full_text_read_index) |other| std.mem.eql(u8, name, other) else false else rhs.full_text_read_index == null) and
+        @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.engine == rhs.storage.engine and
         lhs.object_storage_generation == rhs.object_storage_generation and
         std.mem.eql(u8, &lhs.object_storage_identity, &rhs.object_storage_identity) and
@@ -103,6 +130,13 @@ fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const 
 pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-table-definition-v1");
+    if (table.schema_reader_requirements) |requirements| {
+        hashTableDefinitionPart(&hasher, "schema-reader-requirements-v1");
+        var versions: [8]u8 = undefined;
+        std.mem.writeInt(u32, versions[0..4], requirements.semantic_version, .little);
+        std.mem.writeInt(u32, versions[4..8], requirements.encoding_version, .little);
+        hasher.update(&versions);
+    }
     if (table.storage_migration) |migration| {
         hashTableDefinitionPart(&hasher, "vector-migration-v1");
         hashTableDefinitionPart(&hasher, migration.request.job_id);
@@ -463,6 +497,10 @@ pub const NodeRecord = struct {
 };
 
 pub const StoreRecord = struct {
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyReaderReport(self, writer);
+    }
+
     store_id: u64,
     node_id: u64,
     /// Random non-zero process incarnation established by store registration.
@@ -484,6 +522,9 @@ pub const StoreRecord = struct {
     native_generation_restore_version: u16 = 0,
     dense_native_storage_protocol_version: u16 = 0,
     relational_topology_protocol_version: u16 = 0,
+    /// Schema interpretation/ASCH decoding, independent of data-Raft support.
+    /// Missing capabilities remain unknown during a rolling upgrade.
+    schema_reader: SchemaReaderCapabilities = .{},
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -830,7 +871,12 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 pub const store_runtime_reference_header = "X-Antfly-Store-Runtime-Reference";
 
 pub const StoreStatusReport = struct {
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyReaderReport(self, writer);
+    }
+
     relational_topology_protocol_version: u16 = 0,
+    schema_reader: SchemaReaderCapabilities = .{},
     store_id: u64,
     /// Internal heartbeat endpoint only: retain committed runtime observations
     /// for this exact reporter incarnation and status generation.
@@ -861,6 +907,23 @@ pub const StoreStatusReport = struct {
     group_statuses: []GroupStatusReport = &.{},
     runtime_statuses: []RuntimeGroupStatusReport = &.{},
 };
+
+fn stringifyReaderReport(record: anytype, writer: anytype) !void {
+    try writer.beginObject();
+    inline for (@typeInfo(@TypeOf(record)).@"struct".field_names) |name| {
+        // Keep legacy JSON envelopes byte-for-byte unchanged when unknown.
+        if (comptime std.mem.eql(u8, name, "schema_reader")) {
+            if (record.schema_reader.known()) {
+                try writer.objectField(name);
+                try writer.write(@field(record, name));
+            }
+        } else {
+            try writer.objectField(name);
+            try writer.write(@field(record, name));
+        }
+    }
+    try writer.endObject();
+}
 
 /// Generation zero is valid before the first snapshot, but a generation can
 /// never exist without the process incarnation that gives it meaning.
@@ -1055,6 +1118,8 @@ pub const RuntimeGroupStatusReport = struct {
     /// storage-owner observation as index and identity facts. Zero is unknown
     /// for older runtime-status wire profiles, not proof of an empty schema.
     schema_epoch: u32 = 0,
+    /// Same-root durable owner observation; null is an unknown legacy fact.
+    source_authority: ?@import("antfly_local_sources").storage_source_authority.State = null,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -2553,6 +2618,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .native_generation_restore_version = record.native_generation_restore_version,
         .dense_native_storage_protocol_version = record.dense_native_storage_protocol_version,
         .relational_topology_protocol_version = record.relational_topology_protocol_version,
+        .schema_reader = record.schema_reader,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -2696,6 +2762,7 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .target_observation_revision = record.target_observation_revision,
         .target_observation_complete = record.target_observation_complete,
         .schema_epoch = record.schema_epoch,
+        .source_authority = record.source_authority,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,

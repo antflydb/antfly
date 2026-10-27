@@ -198,6 +198,7 @@ pub const CommitConflict = @import("antfly_local_sources").api_local_transaction
 
 pub const ParticipantPhase = contract.ParticipantPhase;
 pub const CommitOutcome = @import("antfly_local_sources").api_local_transaction_contract.CommitOutcome;
+pub const commitVersion = @import("antfly_local_sources").api_local_transaction_contract.commitVersion;
 
 pub const PreDecisionContext = @import("antfly_local_sources").api_local_transaction_contract.PreDecisionContext;
 
@@ -1643,7 +1644,7 @@ fn executeMultiTableCommitOnce(
                     // Preserve a typed retryable result without claiming
                     // not-proposed for the individual participant RPC. An
                     // uncertain abort above retains AbortDecisionNotDurable.
-                    return if (err == error.StorageReadTemporarilyUnavailable)
+                    return if (err == error.StorageReadTemporarilyUnavailable or err == error.ConstraintActivationInProgress)
                         error.TransactionPrepareAbortedUnavailable
                     else
                         err;
@@ -2393,18 +2394,28 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
 
 pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest) ![]u8 {
     try validateRestorePlan(req.req.restore_staging_scope, req.req.restore_staging_plan_id);
+    const policy = try validatePreparePolicyAuthority(req.req.row_policy_principal_proof, req.req.row_policy_database, req.req.row_policy_admitted_at_seconds);
     const txn_hex = encodeTxnIdHex(req.txn_id);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     const guarded = req.req.range_guards.len != 0;
     const row_semantics = @import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
-    if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
+    if (policy) try out.appendSlice(alloc, "[\"row-policy-prepare-v1\",") else if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"topology_epoch\":");
     const epoch = try std.fmt.allocPrint(alloc, "{d}", .{req.topology_epoch});
     defer alloc.free(epoch);
     try out.appendSlice(alloc, epoch);
+    if (policy) {
+        const encoded = try std.fmt.allocPrint(alloc, ",\"row_policy_principal_proof\":{f},\"row_policy_database\":{f},\"row_policy_admitted_at_seconds\":{d}", .{
+            std.json.fmt(req.req.row_policy_principal_proof, .{}),
+            std.json.fmt(req.req.row_policy_database, .{}),
+            req.req.row_policy_admitted_at_seconds,
+        });
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     if (req.route_fence) |fence| {
         const bytes = try std.json.Stringify.valueAlloc(alloc, fence, .{});
         defer alloc.free(bytes);
@@ -2473,6 +2484,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
             .expected_version = predicate.expected_version,
             .unique_absence = if (predicate.unique_absence) @as(?bool, true) else null,
             .expected_content_digest = if (predicate.expected_content_digest != null) @as(?[]const u8, &digest_hex) else null,
+            .row_policy_requirement = if (predicate.row_policy_requirement != .native) @as(?@TypeOf(predicate.row_policy_requirement), predicate.row_policy_requirement) else null,
         }, .{ .emit_null_optional_fields = false });
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
@@ -2524,7 +2536,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         try out.appendSlice(alloc, encoded);
     }
     try out.append(alloc, '}');
-    if (guarded or row_semantics) try out.append(alloc, ']');
+    if (policy or guarded or row_semantics) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2689,15 +2701,28 @@ pub fn freeTxnBeginRequest(alloc: std.mem.Allocator, req: *TxnBeginRequest) void
     req.* = undefined;
 }
 
+// A versioned envelope makes older owners reject security-bearing prepares
+// instead of silently discarding authority they do not understand.
+fn validatePreparePolicyAuthority(proof: []const u8, database: []const u8, admitted_at: i64) !bool {
+    if (proof.len == 0 and database.len == 0 and admitted_at == 0) return false;
+    const authority = @import("../usermgr/mod.zig").row_policy_authority;
+    if (proof.len == 0 or proof.len > authority.maximum_token_bytes or
+        database.len == 0 or database.len > authority.maximum_name_bytes or admitted_at <= 0)
+        return error.InvalidTxnRequest;
+    return true;
+}
+
 pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPrepareRequest {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
     const wrapped = parsed.value == .array;
     var row_semantics = false;
+    var policy = false;
     const root = if (wrapped) blk: {
         const entries = parsed.value.array.items;
         if (entries.len != 2 or entries[0] != .string) return error.InvalidTxnRequest;
-        row_semantics = std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
+        policy = std.mem.eql(u8, entries[0].string, "row-policy-prepare-v1");
+        row_semantics = policy or std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
         if (!row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
         break :blk entries[1];
     } else parsed.value;
@@ -2705,6 +2730,25 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    const proof_value = obj.get("row_policy_principal_proof");
+    const database_value = obj.get("row_policy_database");
+    const admitted_value = obj.get("row_policy_admitted_at_seconds");
+    if (policy != (proof_value != null and database_value != null and admitted_value != null)) return error.InvalidTxnRequest;
+    if (!policy and (proof_value != null or database_value != null or admitted_value != null)) return error.InvalidTxnRequest;
+    const proof = if (proof_value) |value| switch (value) {
+        .string => |s| s,
+        else => return error.InvalidTxnRequest,
+    } else "";
+    const database = if (database_value) |value| switch (value) {
+        .string => |s| s,
+        else => return error.InvalidTxnRequest,
+    } else "";
+    const admitted_at: i64 = if (admitted_value != null) std.math.cast(i64, try optionalU64(obj, "row_policy_admitted_at_seconds")) orelse return error.InvalidTxnRequest else 0;
+    if (policy != try validatePreparePolicyAuthority(proof, database, admitted_at)) return error.InvalidTxnRequest;
+    const owned_proof = try alloc.dupe(u8, proof);
+    errdefer alloc.free(owned_proof);
+    const owned_database = try alloc.dupe(u8, database);
+    errdefer alloc.free(owned_database);
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const writes = try parseTxnWrites(alloc, obj.get("writes") orelse return error.InvalidTxnRequest);
     errdefer freeTxnWrites(alloc, writes);
@@ -2754,6 +2798,9 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
+            .row_policy_principal_proof = owned_proof,
+            .row_policy_database = owned_database,
+            .row_policy_admitted_at_seconds = admitted_at,
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
@@ -2780,6 +2827,8 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
 }
 
 pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) void {
+    alloc.free(req.req.row_policy_principal_proof);
+    alloc.free(req.req.row_policy_database);
     if (req.range_guards_owner) |*owner| owner.deinit();
     freeTxnWrites(alloc, req.req.writes);
     freeTxnDeletes(alloc, req.req.deletes);
@@ -2791,6 +2840,56 @@ pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) 
     if (req.relational_retirement_owner) |*owner| owner.deinit();
     if (req.relational_index_maintenance_owner) |*owner| owner.deinit();
     req.* = undefined;
+}
+
+test "distributed txn prepare retains policy authority and row provenance without downgrade" {
+    const alloc = std.testing.allocator;
+    const request: TxnPrepareRequest = .{ .txn_id = @splat(1), .req = .{
+        .row_policy_principal_proof = "v1:opaque:signature",
+        .row_policy_database = "tenant db",
+        .row_policy_admitted_at_seconds = 123,
+        .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }},
+        .predicates = &.{.{ .key = "row", .expected_version = 0, .row_policy_requirement = .insert_select }},
+    } };
+    const bytes = try encodeTxnPrepareRequest(alloc, request);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "[\"row-policy-prepare-v1\","));
+    var parsed = try parseTxnPrepareRequest(alloc, bytes);
+    defer freeTxnPrepareRequest(alloc, &parsed);
+    try std.testing.expectEqualStrings(request.req.row_policy_principal_proof, parsed.req.row_policy_principal_proof);
+    try std.testing.expectEqualStrings(request.req.row_policy_database, parsed.req.row_policy_database);
+    try std.testing.expectEqual(@as(i64, 123), parsed.req.row_policy_admitted_at_seconds);
+    try std.testing.expectEqual(.insert_select, parsed.req.predicates[0].row_policy_requirement);
+    try std.testing.expectEqualStrings("j", parsed.req.writes[0].json_null_fields[0]);
+    // Removing/changing the envelope must not silently strip signed authority.
+    const object = bytes[std.mem.indexOfScalar(u8, bytes, '{').? .. bytes.len - 1];
+    try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, object));
+    const downgrade = try std.fmt.allocPrint(alloc, "[\"row-semantics-prepare-v1\",{s}]", .{object});
+    defer alloc.free(downgrade);
+    try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, downgrade));
+    var incomplete = request;
+    incomplete.req.row_policy_database = "";
+    try std.testing.expectError(error.InvalidTxnRequest, encodeTxnPrepareRequest(alloc, incomplete));
+    incomplete = request;
+    incomplete.req.row_policy_admitted_at_seconds = 0;
+    try std.testing.expectError(error.InvalidTxnRequest, encodeTxnPrepareRequest(alloc, incomplete));
+}
+
+test "distributed txn policy prepare unwinds every allocation failure" {
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const bytes = try encodeTxnPrepareRequest(alloc, .{ .txn_id = @splat(1), .req = .{
+                .row_policy_principal_proof = "v1:opaque:signature",
+                .row_policy_database = "tenant",
+                .row_policy_admitted_at_seconds = 123,
+                .writes = &.{.{ .key = "row", .value = "{}" }},
+            } });
+            defer alloc.free(bytes);
+            var parsed = try parseTxnPrepareRequest(alloc, bytes);
+            defer freeTxnPrepareRequest(alloc, &parsed);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 test "distributed txn prepare preserves exact numeric row and transform payloads" {
@@ -3361,11 +3460,16 @@ fn parseTxnPredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
             content_digest = digest;
         }
         const unique_absence = if (obj.get("unique_absence")) |flag| if (flag == .bool and (expected_version == 0 or !flag.bool)) flag.bool else return error.InvalidTxnRequest else false;
+        const policy_requirement: @import("../usermgr/mod.zig").row_policy_authority.MutationRequirement = if (obj.get("row_policy_requirement")) |flag| requirement: {
+            if (flag != .string) return error.InvalidTxnRequest;
+            break :requirement std.meta.stringToEnum(@import("../usermgr/mod.zig").row_policy_authority.MutationRequirement, flag.string) orelse return error.InvalidTxnRequest;
+        } else .native;
         out[i] = .{
             .key = try alloc.dupe(u8, requireString(obj, "key")),
             .expected_version = expected_version,
             .expected_content_digest = content_digest,
             .unique_absence = unique_absence,
+            .row_policy_requirement = policy_requirement,
         };
         initialized += 1;
     }
@@ -6262,15 +6366,17 @@ fn consumerTests() type {
                     try std.testing.expectError(error.AbortDecisionNotDurable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
                 }
             }
-            recorder.prepare_failure = error.StorageReadTemporarilyUnavailable;
-            recorder.abort_failure = false;
-            recorder.observed_status = .aborted;
-            recorder.resolves.clearRetainingCapacity();
-            try std.testing.expectError(error.TransactionPrepareAbortedUnavailable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
-            try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
-            recorder.abort_failure = true;
-            recorder.observed_status = .pending;
-            try std.testing.expectError(error.AbortDecisionNotDurable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
+            for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.ConstraintActivationInProgress }) |prepare_failure| {
+                recorder.prepare_failure = prepare_failure;
+                recorder.abort_failure = false;
+                recorder.observed_status = .aborted;
+                recorder.resolves.clearRetainingCapacity();
+                try std.testing.expectError(error.TransactionPrepareAbortedUnavailable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
+                try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
+                recorder.abort_failure = true;
+                recorder.observed_status = .pending;
+                try std.testing.expectError(error.AbortDecisionNotDurable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
+            }
         }
 
         test "distributed txn coordinator never restarts a transaction id on topology change" {

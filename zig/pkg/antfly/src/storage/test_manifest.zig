@@ -22,9 +22,15 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("antfly_local_sources").storage_db_native_backup_origin;
+    _ = @import("antfly_local_sources").storage_db_relational_schema_apply_outcome;
+    _ = @import("antfly_local_sources").storage_db_relational_schema_audit_cache;
+    _ = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+    _ = @import("antfly_local_sources").storage_document_projection;
     _ = @import("antfly_local_sources").storage_engine;
     _ = @import("antfly_local_sources").storage_logical_source;
-    _ = @import("antfly_local_sources").storage_document_projection;
+    _ = @import("antfly_local_sources").storage_transaction_cohort_proof;
+    _ = @import("antfly_local_sources").storage_transaction_debt;
     _ = @import("antfly_local_sources").storage_db_artifact_graph_completion;
     _ = @import("antfly_local_sources").storage_db_artifact_input_test;
     _ = @import("antfly_local_sources").storage_db_entity_alias_curation;
@@ -102,6 +108,18 @@ comptime {
     _ = @import("hot_standby/graph_endpoint_cleanup_test.zig");
     _ = @import("antfly_local_sources").storage_portable_wal;
     _ = @import("antfly_local_sources").storage_relational_index;
+    _ = @import("antfly_local_sources").storage_db_relational_catalog_benchmark;
+    _ = @import("antfly_local_sources").storage_db_relational_index_cancellation_intent;
+    _ = @import("antfly_local_sources").storage_db_relational_index_candidate;
+    _ = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+    _ = @import("antfly_local_sources").storage_db_relational_index_owner_job;
+    _ = @import("antfly_local_sources").storage_db_relational_index_predicate;
+    _ = @import("antfly_local_sources").storage_db_relational_index_private_claims;
+    _ = @import("antfly_local_sources").storage_db_relational_index_publication_progress;
+    _ = @import("antfly_local_sources").storage_db_relational_index_release;
+    _ = @import("antfly_local_sources").storage_db_relational_index_validation;
+    _ = @import("antfly_local_sources").storage_db_relational_nullability;
+    _ = @import("antfly_local_sources").storage_db_relational_rows;
     _ = @import("antfly_local_sources").storage_db_relational_index_keys;
     _ = @import("antfly_local_sources").storage_db_relational_index_plan;
     _ = @import("antfly_local_sources").storage_db_relational_index_catalog;

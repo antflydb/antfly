@@ -21,6 +21,40 @@ const schema = @import("table_schema_impl.zig");
 const native = @import("../storage/schema.zig");
 const catalog = @import("../storage/db/relational_integrity_catalog.zig");
 
+/// Coverage is explicit in durable plans; legacy entries retain their identity.
+pub const CatalogCoverage = enum { legacy, checks_v1 };
+
+pub fn compileCatalog(alloc: std.mem.Allocator, parsed: schema.TableSchema, table_id: u64, previous: ?[]const u8) !catalog.Update {
+    return compileCatalogWithCoverage(alloc, parsed, table_id, previous, .checks_v1);
+}
+
+pub fn compileCatalogWithCoverage(alloc: std.mem.Allocator, parsed: schema.TableSchema, table_id: u64, previous: ?[]const u8, coverage: CatalogCoverage) !catalog.Update {
+    const schema_api = @import("mod.zig");
+    const native_schema = native;
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer native_schema.freeSchema(alloc, runtime);
+    const bytes = try native_schema.serializeSchema(alloc, runtime);
+    defer alloc.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    const definitions = try definitionFingerprints(alloc, parsed, runtime);
+    defer freeDefinitions(alloc, definitions);
+    const checks_digest = if (coverage == .checks_v1) try checksFingerprint(alloc, parsed) else @as([32]u8, @splat(0));
+    return catalog.prepareWithChecks(alloc, previous, try catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions, checks_digest);
+}
+
+/// Compile only CHECKs, using the exact layout/compiler used by the owner
+/// validator. No row parsing or full property/regex validator is needed.
+pub fn checksFingerprint(alloc: std.mem.Allocator, public: schema.TableSchema) ![32]u8 {
+    const definitions = public.checks orelse return @splat(0);
+    if (definitions.value.len == 0) return @splat(0);
+    const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, public);
+    errdefer native.freeSchema(alloc, runtime);
+    const checks = try @import("relational_checks.zig").Set.createOwned(alloc, runtime, definitions.value);
+    defer checks.deinit();
+    return checks.validationFingerprint();
+}
+
 pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSchema, runtime: native.TableSchema) ![]catalog.Definition {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
@@ -38,6 +72,20 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
     defer if (layout) |*value| value.deinit();
     for (uniques, definitions[0..uniques.len]) |unique, *definition| {
         if (unique.timing == .deferred and !unique.deferrable) return error.InvalidSchemaUpdateRequest;
+        if (unique.without_overlaps_column) |period| {
+            definition.* = try definitionAlloc(alloc, .unique, unique.name, .{
+                .domain = "antfly temporal unique declaration v1 ordered intervals",
+                .name = unique.name,
+                .columns = unique.columns,
+                .column_types = try columnTypesMode(arena, runtime, unique.columns, true),
+                .without_overlaps_column = period,
+                .nulls_not_distinct = unique.nulls_not_distinct,
+                .deferrable = unique.deferrable,
+                .timing = @tagName(unique.timing),
+            });
+            initialized += 1;
+            continue;
+        }
         if (unique.keys.len == 0 and unique.where.len == 0 and !unique.deferrable) {
             definition.* = try definitionAlloc(alloc, .unique, unique.name, .{
                 .domain = "antfly unique declaration v2 null witnesses",
@@ -89,7 +137,7 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
                 if (!column.allows_null) return error.InvalidSchemaUpdateRequest;
             }
         }
-        definition.* = try definitionAlloc(alloc, .foreign_key, foreign_key.name, .{
+        definition.* = try foreignDefinitionAlloc(alloc, foreign_key.name, foreign_key.not_valid, .{
             .domain = "antfly foreign key declaration v1",
             .name = foreign_key.name,
             .child_columns = foreign_key.child_columns,
@@ -127,11 +175,15 @@ pub fn uniqueFields(alloc: std.mem.Allocator, runtime: native.TableSchema, layou
             } else try fields.append(alloc, runtime.relational_columns[key.ordinal].name);
         }
     }
-    for (unique.where) |condition| try fields.append(alloc, condition.field);
+    for (unique.where) |condition| if (condition.constant == null) try fields.append(alloc, condition.field);
     return fields.toOwnedSlice(alloc);
 }
 
 fn columnTypes(alloc: std.mem.Allocator, runtime: native.TableSchema, names: []const []const u8) ![]const []const u8 {
+    return columnTypesMode(alloc, runtime, names, false);
+}
+
+fn columnTypesMode(alloc: std.mem.Allocator, runtime: native.TableSchema, names: []const []const u8, temporal: bool) ![]const []const u8 {
     const types = try alloc.alloc([]const u8, names.len);
     for (names, types) |name, *kind| {
         const column = for (runtime.relational_columns) |column| {
@@ -139,6 +191,7 @@ fn columnTypes(alloc: std.mem.Allocator, runtime: native.TableSchema, names: []c
         } else return error.InvalidSchemaUpdateRequest;
         switch (column.column_type) {
             .string, .blob, .boolean, .datetime, .integer, .number => {},
+            .numrange, .daterange, .tsrange, .tstzrange => if (!temporal) return error.InvalidSchemaUpdateRequest,
             else => return error.InvalidSchemaUpdateRequest,
         }
         kind.* = @tagName(column.column_type);
@@ -187,4 +240,18 @@ test "relational declarations own arrays and fingerprint logical identity" {
     const moved = try definitionFingerprints(alloc, parsed, reordered);
     defer freeDefinitions(alloc, moved);
     try std.testing.expectEqualSlices(u8, &deferred[0].fingerprint, &moved[0].fingerprint);
+}
+
+/// Keep existing validated declarations byte-identical. NOT VALID is an
+/// explicit different generation; old ready coverage cannot certify it later.
+fn foreignDefinitionAlloc(alloc: std.mem.Allocator, name: []const u8, not_valid: bool, value: anytype) !catalog.Definition {
+    var definition = try definitionAlloc(alloc, .foreign_key, name, value);
+    errdefer alloc.free(definition.payload);
+    if (not_valid) {
+        const payload = try std.fmt.allocPrint(alloc, "{s},\"not_valid\":true}}", .{definition.payload[0 .. definition.payload.len - 1]});
+        alloc.free(definition.payload);
+        definition.payload = payload;
+        std.crypto.hash.Blake3.hash(payload, &definition.fingerprint, .{});
+    }
+    return definition;
 }

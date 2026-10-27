@@ -591,6 +591,43 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     try std.testing.expectError(error.OnlineSourceScopeChanged, Call.run(transfer.Status, &target, .{ .write = .{ .descriptor = descriptor, .offset = 0, .data_base64 = first_retry.value.data_base64, .digest = first_retry.value.digest } }));
 }
 
+test "opaque owner runtime source authority crosses compiled boundary and survives reopen" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const authority = local.storage_source_authority;
+    const namespace: local.storage_db_doc_identity.Namespace = .{ .table_id = 71, .shard_id = 7101, .range_id = 7101 };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    for ([_]authority.Kind{ .native, .raft }) |kind| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/status-{s}", .{ root, @tagName(kind) });
+        defer alloc.free(path);
+        for (0..2) |_| {
+            var owner = try client.Owner.open(.{
+                .path = .fromSlice(path),
+                .table_name = .fromSlice("docs"),
+                .group_id = 7101,
+                .has_identity_namespace = 1,
+                .identity_table_id = namespace.table_id,
+                .identity_shard_id = namespace.shard_id,
+                .identity_range_id = namespace.range_id,
+                .online_source_authority = @backingInt(kind),
+                .schema_json = .fromSlice("{}"),
+            });
+            defer owner.deinit();
+            var response = try ownerStatusEventually(&owner);
+            defer response.deinit();
+            var parsed = try std.json.parseFromSlice(struct { metadata: struct { source_authority: ?authority.State = null } }, alloc, response.bytes(), .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const state = parsed.value.metadata.source_authority orelse return error.MissingOwnerSourceAuthority;
+            try std.testing.expectEqual(kind, state.kind);
+            try std.testing.expectEqual(@as(u64, 0), state.sequence);
+            try std.testing.expectEqualDeep(local.storage_db_online_source_contract.namespaceBytes(namespace), state.namespace);
+        }
+    }
+}
+
 test "opaque owner online source controls and status survive compiled boundary restart" {
     const alloc = std.testing.allocator;
     const contract = @import("antfly_local_sources").api_local_query_contract;
@@ -1309,6 +1346,89 @@ const TestWalOptions = struct {
     }
 };
 
+test "opaque schema owner observation preserves native root scope without creating a job" {
+    const alloc = std.testing.allocator;
+    const job = @import("antfly_local_sources").storage_db_relational_nullability_job;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var owner = try client.Owner.open(.{
+        .context = context.handle,
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("rows"),
+        .group_id = 72,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 172,
+        .identity_range_id = 272,
+        .online_source_authority = 2,
+    });
+    defer owner.deinit();
+    const binding: job.Binding = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner = @splat(3),
+        .fence = .{ .transition_id = 4, .attempt = 1, .admission_epoch = 1, .owner_group_id = 72, .peer_group_id = 72, .namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 }, .catalog_digest = @splat(5), .role = .schema_validation },
+        .authority = .native,
+        .before_version = 1,
+        .after_version = 2,
+        .columns = 1,
+        .before_schema = @splat(6),
+        .after_schema = @splat(7),
+        .before_public = @splat(8),
+        .after_public = @splat(9),
+        .after_catalog = @splat(10),
+        .physical_catalog = @splat(11),
+        .inputs = @splat(12),
+        .projection_identity = @splat(13),
+    };
+    const first = try owner.nativeSchemaOwnerObservation("rows", binding, .{});
+    try std.testing.expect(first.header == null and !first.replication_pending);
+    try std.testing.expectEqual(@as(u64, 0), first.sequence);
+    try std.testing.expect(first.physical_root_incarnation != 0);
+    const second = try owner.nativeSchemaOwnerObservation("rows", binding, .{});
+    try std.testing.expectEqualDeep(first, second);
+    var foreign = binding;
+    foreign.fence.namespace.range_id += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, owner.nativeSchemaOwnerObservation("rows", foreign, .{}));
+    try std.testing.expectError(error.DeadlineExceeded, owner.nativeSchemaOwnerObservation("rows", binding, .{ .execution_deadline_ns = 0 }));
+    const json = try std.json.Stringify.valueAlloc(alloc, binding, .{});
+    defer alloc.free(json);
+    var output: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_native_schema_observation_json(owner.handle, &.{ .version = abi.abi_version - 1 }, &output));
+    try std.testing.expect(output.ptr == null);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_native_schema_observation_json(owner.handle, &.{ .table_name = .{ .len = 4 }, .binding_json = .fromSlice(json) }, &output));
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_native_schema_observation_json(owner.handle, &.{ .table_name = .fromSlice("rows"), .binding_json = .fromSlice(json), .control = .{ ._reserved0 = 1 } }, &output));
+    const unknown = try std.fmt.allocPrint(alloc, "{{\"unexpected\":true,{s}", .{json[1..]});
+    defer alloc.free(unknown);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_native_schema_observation_json(owner.handle, &.{ .table_name = .fromSlice("rows"), .binding_json = .fromSlice(unknown) }, &output));
+    try std.testing.expect(output.ptr == null);
+    try std.testing.expectEqualDeep(first, try owner.nativeSchemaOwnerObservation("rows", binding, .{}));
+}
+
+test "opaque schema owner acknowledgement owns bounded diagnostics without changing committed truth" {
+    var result: client.Owner.NativeSchemaOwnerOutcome = .{ .header = null, .position = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .sequence = 4 }, .duplicate = false, .replication_pending = true };
+    var diagnostic: [600]u8 = @splat('x');
+    result.copyDiagnostic(&diagnostic);
+    @memset(&diagnostic, 'z');
+    try std.testing.expect(result.replication_pending and result.failure_name_truncated);
+    try std.testing.expectEqual(@as(usize, 256), result.errorName().?.len);
+    try std.testing.expectEqual(@as(u8, 'x'), result.errorName().?[0]);
+    var unicode: [603]u8 = undefined;
+    for (0..201) |i| @memcpy(unicode[i * 3 ..][0..3], "\xe2\x82\xac");
+    result.copyDiagnostic(&unicode);
+    try std.testing.expect(result.failure_name_truncated);
+    try std.testing.expectEqual(@as(usize, 255), result.errorName().?.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.errorName().?));
+    result.copyDiagnostic("");
+    try std.testing.expect(result.errorName() == null and !result.failure_name_truncated);
+    try std.testing.expectEqual(@as(u64, 4), result.position.sequence);
+}
+
 test "opaque WAL preserves durable operations and exact failure identity" {
     const root = "/tmp/antfly-storage-kernel-wal-owner";
     const path = root ++ "/wal";
@@ -1321,6 +1441,11 @@ test "opaque WAL preserves durable operations and exact failure identity" {
     defer std.testing.allocator.free(path_z);
     var wal = try wal_client.WAL.open(path_z.ptr, TestWalOptions{});
     defer wal.close();
+    try wal.admitAppendBytes(5);
+    try std.testing.expectError(error.WalRecordTooLarge, wal.admitAppendBytes(std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(u64, 0), wal.lastLsn());
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_wal_admit_append_bytes(wal.handle, abi.abi_version - 1, 5));
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_wal_admit_append_bytes(null, abi.abi_version, 5));
     try std.testing.expectEqual(@as(u64, 1), try wal.append("alpha"));
     try std.testing.expectEqual(@as(u64, 2), try wal.append("beta"));
     try std.testing.expectEqual(@as(u64, 2), wal.lastLsn());
@@ -1363,6 +1488,7 @@ test "opaque WAL preserves durable operations and exact failure identity" {
     }
     var read_only = try wal_client.WAL.open(read_only_z.ptr, TestWalOptions{ .read_only = true });
     defer read_only.close();
+    try std.testing.expectError(error.ReadOnly, read_only.admitAppendBytes(5));
     try std.testing.expectError(error.ReadOnly, read_only.append("rejected"));
 
     try std.testing.expectError(
@@ -2856,7 +2982,9 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     response.deinit();
     var source = try data_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = raw_source_path, .context = context.handle });
     defer source.deinit();
-    const barrier = "{\"table\":\"rows\",\"protocol_barrier\":10,\"batch\":null}";
+    const protocol = @import("../common/data_raft_protocol.zig");
+    const snapshot_protocol = if (protocol.batch_protocol_version >= protocol.native_snapshot_origin_protocol_version) protocol.native_snapshot_origin_protocol_version else protocol.batch_native_snapshot_protocol_version;
+    const barrier = std.fmt.comptimePrint("{{\"table\":\"rows\",\"protocol_barrier\":{d},\"batch\":null}}", .{snapshot_protocol});
     var log: [25 + barrier.len]u8 = undefined;
     std.mem.writeInt(u32, log[0..4], 1, .little);
     std.mem.writeInt(u64, log[4..12], 2, .little);
@@ -2885,6 +3013,10 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     later.deinit();
     var artifact = try prepared.materializeFile(alloc);
     defer artifact.deinit(alloc);
+    // Current cohorts still emit legacy native streams, never silently mint
+    // a provenance receipt merely because this binary has its decoder.
+    if (snapshot_protocol < protocol.native_snapshot_origin_protocol_version)
+        try std.testing.expectEqual(@as(usize, 0), artifact.application_manifest.len);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.path, alloc, .limited(artifact.size + 1));
     defer alloc.free(bytes);
     var target = try data_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = raw_target_path, .context = context.handle });
@@ -3036,6 +3168,22 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
         if (recovered.completedAppliedIndex() == 7) break;
     } else return error.SnapshotRecoveryDidNotComplete;
     try std.testing.expectEqual(@as(usize, 1), recovery.installs);
+    {
+        const local = @import("antfly_local_sources");
+        const snapshots = @import("../raft/storage/native_snapshot.zig");
+        const source_root = try local.storage_db_root_identity.load(alloc, std.testing.io, source_path);
+        const destination_root = try local.storage_db_root_identity.load(alloc, std.testing.io, target_path);
+        const ns = local.storage_db_online_source_contract.namespaceBytes(.{ .table_id = 81, .shard_id = 8181, .range_id = 8181 });
+        const installed = try snapshots.loadInstalledOrigin(alloc, std.testing.io, target_path, 8181, ns, destination_root.incarnation);
+        if (protocol.nativeSnapshotOriginEnabled(snapshot_protocol)) {
+            const value = installed orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(source_root.incarnation, value.source.physical_root_incarnation);
+            try std.testing.expectEqual(destination_root.incarnation, value.destination_root_incarnation);
+            try std.testing.expectEqual(@as(u64, 5), value.source.applied.?.index);
+            try std.testing.expectEqual(@as(u64, 7), value.through_index);
+        } else try std.testing.expect(installed == null);
+        try std.testing.expect(source_root.incarnation != destination_root.incarnation);
+    }
     try reads.noteApplied(8181, recovered.completedAppliedIndex());
     try std.testing.expect(reads.takeCompleted(read.token));
     target_options = published_options;
@@ -3117,6 +3265,49 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     try std.testing.expectEqual(@as(usize, 1), legacy_recovery.installs);
     try std.testing.expectEqual(@as(usize, 1), legacy_recovery.batches);
     try std.testing.expect(reads.takeCompleted(latest_read.token));
+}
+
+test "opaque data raft committed entry point reads retain exact term bytes and bounds" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const payload = "retained\x00\xffentry";
+    {
+        var seed = try data_apply_client.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer seed.deinit();
+        const entries = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(a, &.{
+            .{ .term = 3, .index = 8, .entry_type = .normal, .data = @constCast(payload) },
+            .{ .term = 4, .index = 9, .entry_type = .normal, .data = @constCast("") },
+            .{ .term = 4, .index = 10, .entry_type = .conf_change, .data = @constCast("member") },
+        });
+        defer a.free(entries);
+        try seed.applyBatch(81, 10, entries);
+    }
+    var store = try data_apply_client.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    const before = (try store.latestBatch(81)).?;
+    var entry = try store.committedNormalEntry(81, 3, 8, payload.len);
+    defer entry.deinit();
+    try std.testing.expectEqualSlices(u8, payload, entry.bytes());
+    var empty = try store.committedNormalEntry(81, 4, 9, 1);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.bytes().len);
+    try std.testing.expectError(error.ConflictingDataApplyBatch, store.committedNormalEntry(81, 4, 8, payload.len));
+    try std.testing.expectError(error.ConflictingDataApplyBatch, store.committedNormalEntry(81, 4, 10, 1024));
+    try std.testing.expectError(error.NotFound, store.committedNormalEntry(81, 4, 11, 1024));
+    try std.testing.expectError(error.NotFound, store.committedNormalEntry(82, 3, 8, 1024));
+    try std.testing.expectError(error.InvalidDataApplyBatch, store.committedNormalEntry(81, 3, 8, payload.len - 1));
+    try std.testing.expectError(error.InvalidDataApplyBatch, store.committedNormalEntry(81, 3, 8, 0));
+    try std.testing.expectError(error.InvalidDataApplyBatch, store.committedNormalEntry(81, 0, 8, 1024));
+    try std.testing.expectError(error.InvalidDataApplyBatch, store.committedNormalEntry(81, 3, 0, 1024));
+    var response: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_data_apply_store_projection(store.handle, &.{ .version = abi.abi_version - 1, .kind = .committed_normal_entry }, &response));
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_data_apply_store_projection(store.handle, &.{ .kind = .committed_normal_entry, .group_id = 81, .after_sequence = 8, .through_sequence = 3, .max_bytes = 1024, .max_entries = 1 }, &response));
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_data_apply_store_projection(store.handle, &.{ .kind = .committed_normal_entry, .group_id = 81, .after_sequence = 8, .through_sequence = 3, .max_bytes = 1024, .expected = .{ .last_entry_index = 8 } }, &response));
+    try std.testing.expect(response.ptr == null and response.len == 0);
+    try std.testing.expectEqual(before, (try store.latestBatch(81)).?);
 }
 
 test "opaque data raft apply owner preserves batch snapshot and placement lifecycle" {
@@ -3657,6 +3848,213 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     }
 }
 
+test "opaque metadata schema validation reads cross compiled projection without activation" {
+    const a = std.testing.allocator;
+    const read = @import("../metadata/schema_validation_read.zig");
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    const incarnation = "11111111111111111111111111111111".*;
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+    const revision = try store.standaloneRevision();
+    const lookup: read.Lookup = .{ .group = group, .table = 7, .id = @splat(1), .metadata_incarnation = incarnation, .plan_digest = @splat(2) };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.schemaValidationOwnerControlJson(a, group, lookup, 0, .begin));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.schemaValidationOwnerInputBytes(a, group, lookup, 0));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.schemaValidationReceiptJson(a, group, .{ .lookup = lookup, .expected = .admission }));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.schemaValidationPreflightJson(a, group, "{}"));
+    try std.testing.expectError(error.InvalidGenerationPublication, store.schemaValidationPreflightJson(a, group, ""));
+    try std.testing.expectError(error.InvalidGenerationPublication, store.schemaValidationOwnerControlJson(a, group + 1, lookup, 0, .begin));
+    try std.testing.expectError(error.InvalidGenerationPublication, store.schemaValidationOwnerInputBytes(a, group, lookup, 4096));
+    try std.testing.expectEqual(revision, try store.standaloneRevision());
+}
+
+test "opaque metadata relational index controls cross compiled projection without mutation" {
+    const alloc = std.testing.allocator;
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const protocol = @import("../metadata/topology_protocol.zig");
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const plan = try publication.testing.plan(arena.allocator());
+    var prepared = try plan.prepare(alloc);
+    defer prepared.deinit();
+    const incarnation = "11111111111111111111111111111111".*;
+    const begin: publication.BeginRequest = .{ .metadata_incarnation = incarnation, .begin = .{ .plan = plan } };
+    const observation = try begin.observation(&prepared);
+    {
+        var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path, .no_sync = true });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.relationalIndexAdmissionStatusJson(alloc, group, observation));
+        const activation = try std.json.Stringify.valueAlloc(alloc, protocol.Activation{ .version = protocol.index_publication_head_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+        defer alloc.free(activation);
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        const revision = try store.standaloneRevision();
+        const bytes = try store.relationalIndexAdmissionStatusJson(alloc, group, observation);
+        defer alloc.free(bytes);
+        var status = try std.json.parseFromSlice(publication.AdmissionStatus, alloc, bytes, .{});
+        defer status.deinit();
+        try std.testing.expect(!try status.value.isAdmitted(observation));
+        const decide: publication.DecidePublish = .{ .table_id = observation.table_id, .id = observation.id, .expected_revision = 1 };
+        const cancel: publication.CancelDecision = .{ .table_id = decide.table_id, .id = decide.id, .expected_revision = 1, .failure = .requested };
+        try std.testing.expectError(error.GenerationPublicationNotFound, store.relationalIndexPublicationDecisionStatusJson(alloc, group, decide));
+        try std.testing.expectError(error.GenerationPublicationNotFound, store.relationalIndexCancellationStatusJson(alloc, group, cancel));
+        try std.testing.expectError(error.CatalogOccupancyNotReady, store.validateRelationalIndexPublicationDecision(group, decide));
+        try std.testing.expectError(error.CatalogOccupancyNotReady, store.validateRelationalIndexCancellation(group, cancel));
+        try std.testing.expectError(error.CatalogOccupancyNotReady, store.validateRelationalIndexBegin(group, begin, &prepared));
+        try std.testing.expectError(error.CatalogOccupancyNotReady, store.relationalIndexPrepareCutJson(alloc, group, .{ .guard = plan.table_guard, .index_name = plan.index_name }));
+        try std.testing.expectError(error.CatalogOccupancyNotReady, store.relationalIndexStatusJson(alloc, group, .{ .guard = plan.table_guard, .index_name = plan.index_name, .admission = observation }));
+        var foreign = begin;
+        foreign.metadata_incarnation[0] = '2';
+        try std.testing.expectError(error.MetadataIncarnationMismatch, store.validateRelationalIndexBegin(group, foreign, &prepared));
+        try std.testing.expectEqual(revision, try store.standaloneRevision());
+    }
+    var recovered = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path, .no_sync = true });
+    defer recovered.deinit();
+    const bytes = try recovered.relationalIndexAdmissionStatusJson(alloc, group, observation);
+    defer alloc.free(bytes);
+    var status = try std.json.parseFromSlice(publication.AdmissionStatus, alloc, bytes, .{});
+    defer status.deinit();
+    try std.testing.expect(!try status.value.isAdmitted(observation));
+}
+
+test "opaque metadata sequence catalog outcomes cross checked owner and cold reopen" {
+    const a = std.testing.allocator;
+    const sequences = @import("../system_catalog/sequence_catalog.zig");
+    const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+    const control = @import("../metadata/relation_reconciliation_command.zig");
+    const protocol = @import("../metadata/topology_protocol.zig");
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    const T = struct {
+        fn reconcile(store: *metadata_apply_client.RaftApplyStore, command: control.Command) !void {
+            const bytes = try command.encodeAlloc(a);
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = bytes });
+        }
+        fn mutate(store: *metadata_apply_client.RaftApplyStore, request: sequences.Mutation) !void {
+            const bytes = try std.json.Stringify.valueAlloc(a, sequences.command(request), .{});
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = bytes });
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var original: sequences.Mutation = undefined;
+    var committed: sequences.Outcome = undefined;
+    var invalid: sequences.Mutation = undefined;
+    for (0..2) |pass| {
+        var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        if (pass == 0) {
+            try std.testing.expectError(error.InvalidMetadataIncarnation, store.sqlSequenceAdmissionHead(group));
+            const identity = "11111111111111111111111111111111".*;
+            const activation: protocol.Activation = .{ .version = protocol.current_version, .incarnation = identity, .member_count = 1, .membership_fingerprint = @splat(7) };
+            const bytes = try std.json.Stringify.valueAlloc(a, activation, .{});
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = bytes });
+            var proof = activation;
+            proof.version = protocol.constraint_occupancy_version;
+            try T.reconcile(&store, .{ .adopt = proof });
+            try std.testing.expectEqual(@as(u64, 0), try store.sqlSequenceAdmissionHead(group));
+            const work = try store.relationReconciliationWork(group);
+            const initial = try r.State.initWithCoverage(group, try r.nextJobId(null), work.epoch.?, .constraint_names);
+            try T.reconcile(&store, .{ .start = .{ .next = initial } });
+            for (0..8) |_| {
+                const current = (try store.relationReconciliationWork(group)).current.?;
+                if (current.phase == .ready) break;
+                try T.reconcile(&store, .{ .advance = current });
+            }
+            const ready = (try store.relationReconciliationWork(group)).current.?;
+            try std.testing.expectEqual(r.Phase.ready, ready.phase);
+            // Use the compiled owner's normal immutable publication proof.
+            var evidence: ?@import("../metadata/storage/raft_apply_contract.zig").RelationPublicationEvidence = null;
+            for (0..16) |_| {
+                evidence = try store.stepRelationPublicationProof(ready, @import("antfly_platform").time.monotonicNs());
+                if (evidence != null) break;
+            }
+            try std.testing.expect(evidence != null);
+            try T.reconcile(&store, .{ .publish = .{ .state = ready, .activation = proof } });
+            original = .{ .admission = .{ .nonce = @splat(1), .head = 0 }, .target = .{ .table = "counter" }, .namespace_id = 2, .incarnation = work.epoch.?.incarnation, .operation = .{ .create = .{ .options = .{ .start = 7 } } } };
+            const preview = try store.prepareSystemCatalogResult(a, group, sequences.command(original));
+            defer a.free(preview);
+            const typed_preview = try store.sqlSequencePreflight(a, group, original);
+            try std.testing.expect(typed_preview == .success);
+            try std.testing.expectEqual(@as(u64, 0), try store.sqlSequenceAdmissionHead(group));
+            try T.mutate(&store, original);
+            committed = try store.sqlSequenceOutcome(a, group, original);
+            var rename = original;
+            rename.admission = .{ .nonce = @splat(2), .head = try store.sqlSequenceAdmissionHead(group) };
+            rename.operation = .{ .rename = .{ .expected = (try committed.result()).identity.?, .name = "renamed" } };
+            try T.mutate(&store, rename);
+            invalid = original;
+            invalid.admission = .{ .nonce = @splat(3), .head = try store.sqlSequenceAdmissionHead(group) };
+            invalid.target.table = "invalid";
+            invalid.operation.create.options.cache = 0;
+            try std.testing.expectError(error.InvalidSequenceDefinition, (try store.sqlSequencePreflight(a, group, invalid)).result());
+            try std.testing.expectEqual(@as(u64, 2), try store.sqlSequenceAdmissionHead(group));
+            try T.mutate(&store, invalid);
+        }
+        try std.testing.expectEqual(@as(u64, 3), try store.sqlSequenceAdmissionHead(group));
+        try std.testing.expectEqualDeep(committed, try store.sqlSequenceOutcome(a, group, original));
+        try std.testing.expectError(error.InvalidSequenceDefinition, (try store.sqlSequenceOutcome(a, group, invalid)).result());
+        try std.testing.expectError(error.InvalidSequenceDefinition, (try store.sqlSequencePreflight(a, group, invalid)).result());
+        try T.mutate(&store, original);
+        try std.testing.expectEqual(@as(u64, 3), try store.sqlSequenceAdmissionHead(group));
+        try std.testing.expectEqual(@as(u64, 2), (try store.systemCatalogMeta(a, group)).revision);
+        {
+            const checkpoint_path = try std.fmt.allocPrint(a, "{s}/paired-{d}.bin", .{ path, pass });
+            defer a.free(checkpoint_path);
+            const captured = try store.captureHotStandbyCatalogCheckpoint(a, std.testing.io, group, checkpoint_path);
+            defer captured.deinit(a);
+            var logical = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").Export, a, captured.catalog_json, .{});
+            defer logical.deinit();
+            try std.testing.expectEqualDeep(captured.checkpoint, logical.value.native_checkpoint.?);
+            try std.testing.expectError(error.SequenceCatalogStateRequired, store.exportSystemCatalog(a, group));
+            const destination = try std.fmt.allocPrint(a, "{s}/paired-restored-{d}", .{ path, pass });
+            defer a.free(destination);
+            var restored = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = destination });
+            defer restored.deinit();
+            try restored.importHotStandbyCheckpoint(std.testing.io, checkpoint_path, captured.checkpoint.size_bytes);
+            const projected = try restored.projectHotStandbyCheckpointCatalog(a, group, captured.checkpoint);
+            defer a.free(projected);
+            try std.testing.expectEqualStrings(captured.catalog_json, projected);
+            try std.testing.expectEqualDeep(committed, try restored.sqlSequenceOutcome(a, group, original));
+            try std.testing.expectError(error.InvalidSequenceDefinition, (try restored.sqlSequenceOutcome(a, group, invalid)).result());
+        }
+        const lookup: sequences.SnapshotRequest = .{ .targets = &.{ .{ .table = "counter" }, .{ .table = "renamed" }, .{ .namespace = "missing", .table = "counter" } } };
+        {
+            const bytes = try store.sqlSequenceSnapshot(a, group, lookup, .{});
+            defer a.free(bytes);
+            var cut = try std.json.parseFromSlice(sequences.Snapshot, a, bytes, .{});
+            defer cut.deinit();
+            try cut.value.validate(lookup);
+            try std.testing.expectEqual(@as(u64, 3), cut.value.head);
+            try std.testing.expectEqual(@as(u64, 2), cut.value.revision);
+            try std.testing.expect(cut.value.entries[0].value == .absent);
+            try std.testing.expectEqual((try committed.result()).identity.?.id, cut.value.entries[1].value.sequence.id);
+            try std.testing.expect(cut.value.entries[2].value == .missing_namespace);
+        }
+        try std.testing.expectError(error.DeadlineExceeded, store.sqlSequenceSnapshot(a, group, lookup, .{ .deadline_ns = 0 }));
+        var canceled = std.atomic.Value(bool).init(true);
+        try std.testing.expectError(error.Canceled, store.sqlSequenceSnapshot(a, group, lookup, .{ .cancellation = @import("antfly_local_sources").api_operation.CancellationToken.fromAtomic(&canceled) }));
+        var mismatched = original;
+        mismatched.target.table = "forged";
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, store.sqlSequenceOutcome(a, group, mismatched));
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, store.prepareSystemCatalogResult(a, group, sequences.command(mismatched)));
+    }
+}
+
 test "opaque metadata relation reconciliation work retains owned cuts across progress and reopen" {
     const a = std.testing.allocator;
     const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
@@ -3789,6 +4187,46 @@ test "opaque metadata snapshot retries retain later committed prefix across reop
     try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().installSnapshot(a, group, 11, changed));
     try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().installSnapshot(a, group, 12, snapshot));
     try std.testing.expectEqual(@as(u64, 12), (try store.latestCheckpoint(group)).?.commit_index);
+}
+
+test "opaque metadata reader projections preserve revision pairs capabilities and admission errors" {
+    const a = std.testing.allocator;
+    const group: u64 = 91;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    try std.testing.expect(!(try store.getSchemaReaderFloor(group)).active());
+    try std.testing.expectEqual(@as(u64, 0), (try store.standaloneRevisionState()).revision);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.validateStoreRootEnrollmentProtocol(group));
+    try std.testing.expectError(error.InvalidGenerationPublication, store.validateRelationalIndexOwnerAck(group, ""));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.validateRelationalIndexOwnerAck(group, "{}"));
+    const identity = "0123456789abcdef0123456789abcdef".*;
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+    const activation = try std.json.Stringify.valueAlloc(a, @import("../metadata/topology_protocol.zig").Activation{
+        .version = @import("../metadata/topology_protocol.zig").schema_reader_capability_version,
+        .incarnation = identity,
+        .member_count = 1,
+        .membership_fingerprint = @splat(7),
+    }, .{});
+    defer a.free(activation);
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+    try store.validateStoreRootEnrollmentProtocol(group);
+    const tables = @import("../metadata/table_manager.zig");
+    try store.applyStandaloneCommand(group, .{ .register_store = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .schema_reader = tables.SchemaReaderCapabilities.current } });
+    const observed = (try store.readStore(a, group, 1, false)).?;
+    defer tables.freeStore(a, observed);
+    try std.testing.expectEqualDeep(tables.SchemaReaderCapabilities.current, observed.schema_reader);
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "reader_projection_rows", .schema_json = "{}" } });
+    const revision = try store.standaloneRevisionState();
+    try std.testing.expect(revision.revision > 0);
+    try std.testing.expectEqual(try store.standaloneRevision(), revision.revision);
+    try std.testing.expectEqual(revision.revision, revision.projection_revision);
+    try std.testing.expectError(error.InvalidSchemaReaderRequirements, store.applyStandaloneCommand(group, .{ .apply_system_catalog = "{\"table\":{\"schema_reader_requirements\":{\"semantic_version\":30,\"encoding_version\":0}}}" }));
+    try std.testing.expectEqualDeep(revision, try store.standaloneRevisionState());
+    try std.testing.expect(!(try store.getSchemaReaderFloor(group)).active()); // Advertisement alone never activates a schema floor.
 }
 
 test "opaque metadata apply owner preserves semantic error identity" {
@@ -4460,6 +4898,14 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
 }
 
 test "opaque metadata durable job state reads preserve group cursor and ownership" {
+    // These identities are published on main, independent of SQL's appended
+    // schema validation operations and private ABI version.
+    try std.testing.expectEqual(@as(u32, 72), @backingInt(abi.MetadataProjectionKind.job_state));
+    try std.testing.expectEqual(@as(u32, 73), @backingInt(abi.MetadataProjectionKind.job_state_scan));
+    try std.testing.expectEqual(@as(u32, 74), @backingInt(abi.MetadataProjectionKind.job_owner_count));
+    try std.testing.expectEqual(@as(u32, 838), @backingInt(abi.Status.unsupported_exact_sort));
+    try std.testing.expectEqual(@as(u32, 839), @backingInt(abi.Status.invalid_document_checkpoint));
+    try std.testing.expectEqual(@as(u32, 840), @backingInt(abi.Status.too_many_active_jobs));
     const a = std.testing.allocator;
     const contract = @import("../metadata/job_state.zig");
     var tmp = std.testing.tmpDir(.{});

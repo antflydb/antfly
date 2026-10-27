@@ -37,17 +37,36 @@ pub const Record = struct {
     namespace: []const u8,
     state: State = .idle,
     active_txn: ?[16]u8 = null,
+    sequence_epoch: u64 = 1,
+    sequence_state: @import("antfly_local_sources").sql_sequence_session.Snapshot = .{},
     overlay: []const settings.OverlayEntry = &.{},
+    baseline: []const settings.OverlayEntry = &.{},
+    principal_instance: ?[16]u8 = null,
+    statement_timeout_ms: ?u32 = null,
+    lookup_path: ?@import("../pgwire/search_path.zig").Path = null,
 
     pub fn validate(self: Record) !void {
+        try self.sequence_state.validate();
+        if (self.lookup_path) |path| try path.validate();
         // Node zero is the standalone-local owner sentinel when no session
         // router is configured. It remains distinct from every routed node.
-        if (self.generation == 0 or self.revision == 0 or self.expires_at_ms == 0 or
+        if (self.sequence_epoch == 0 or self.generation == 0 or self.revision == 0 or self.expires_at_ms == 0 or
             self.principal.len > 4096 or self.database.len == 0 or self.database.len > 256 or
-            self.namespace.len == 0 or self.namespace.len > 256 or self.overlay.len > max_overlay_entries)
+            self.namespace.len == 0 or self.namespace.len > 256 or self.overlay.len > max_overlay_entries or self.baseline.len > 1024)
             return error.InvalidSqlConnection;
         if ((self.state != .idle) != (self.active_txn != null))
             return error.InvalidSqlConnection;
+        if (self.principal_instance) |instance| if (std.mem.allEqual(u8, &instance, 0)) return error.InvalidSqlConnection;
+        if (self.statement_timeout_ms) |milliseconds| if (milliseconds > std.math.maxInt(i32)) return error.InvalidSqlConnection;
+    }
+
+    /// Query receipt time, not the end of connection-store I/O, starts the
+    /// configured SQL budget. Zero never removes the operator's hard limit.
+    pub fn statementDeadline(self: Record, start_ns: u64, hard: ?u64) ?u64 {
+        const milliseconds = self.statement_timeout_ms orelse return hard;
+        if (milliseconds == 0) return hard;
+        const soft = start_ns +| @as(u64, milliseconds) * std.time.ns_per_ms;
+        return if (hard) |limit| @min(soft, limit) else soft;
     }
 
     pub fn requireOwner(self: Record, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64) !void {
@@ -115,4 +134,13 @@ test "HTTP connection record binds principal, owner and transaction fence" {
     var decoded = try std.json.parseFromSlice(Record, alloc, encoded, .{});
     defer decoded.deinit();
     try std.testing.expectEqual(State.uncertain, decoded.value.state);
+}
+
+test "HTTP role default timeout retains hard limits and includes connection lookup time" {
+    var value: Record = .{ .id = @splat('a'), .principal = "alice", .owner_node_id = 1, .expires_at_ms = 1000, .database = "main", .namespace = "public", .statement_timeout_ms = 1 };
+    try std.testing.expectEqual(@as(?u64, 1_000_100), value.statementDeadline(100, null));
+    try std.testing.expectEqual(@as(?u64, 500), value.statementDeadline(100, 500));
+    value.statement_timeout_ms = 0;
+    try std.testing.expectEqual(@as(?u64, 500), value.statementDeadline(100, 500));
+    try std.testing.expect(value.statementDeadline(100, null) == null);
 }

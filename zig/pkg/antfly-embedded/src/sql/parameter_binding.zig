@@ -25,6 +25,7 @@ const frames = @import("parameter_frame.zig");
 const A = std.mem.Allocator;
 
 pub const Invocation = struct {
+    sequence_resolver: ?@import("sequence_effects.zig").Resolver = null,
     allocator: A,
     descriptors: []scalar.Type,
     fallbacks: []const ?ast.ColumnType = &.{},
@@ -65,12 +66,13 @@ pub const Invocation = struct {
             try scalar.validateParameterType(hint);
             if (hint.kind == null) continue;
             if (descriptor.kind) |kind| {
-                if (kind != hint.kind or (descriptor.element_type != null and hint.element_type != null and descriptor.element_type != hint.element_type) or descriptor.nullable != hint.nullable) return error.ConflictingSqlParameterTypes;
+                if (kind != hint.kind or (descriptor.element_type != null and hint.element_type != null and descriptor.element_type != hint.element_type) or descriptor.nullable != hint.nullable or (kind == .datetime and (descriptor.temporal_kind orelse .timestamp_tz) != (hint.temporal_kind orelse .timestamp_tz))) return error.ConflictingSqlParameterTypes;
             }
             if (self.phase != .binding) {
                 if (!std.meta.eql(descriptor.*, hint)) return error.ConflictingSqlParameterTypes;
             } else {
                 descriptor.kind = hint.kind;
+                descriptor.temporal_kind = hint.temporal_kind;
                 if (hint.element_type != null) descriptor.element_type = hint.element_type;
                 descriptor.nullable = hint.nullable;
             }
@@ -99,7 +101,7 @@ pub const Invocation = struct {
             if (descriptor.kind == null) return error.UnknownSqlParameterType;
             try scalar.validateParameterType(descriptor);
             const prior = self.descriptors[slot];
-            if (prior.kind != null and (prior.kind != descriptor.kind or (prior.element_type != null and prior.element_type != descriptor.element_type) or prior.nullable != descriptor.nullable)) return error.ConflictingSqlParameterTypes;
+            if (prior.kind != null and (prior.kind != descriptor.kind or (prior.element_type != null and prior.element_type != descriptor.element_type) or prior.nullable != descriptor.nullable or (prior.kind == .datetime and (prior.temporal_kind orelse .timestamp_tz) != (descriptor.temporal_kind orelse .timestamp_tz)))) return error.ConflictingSqlParameterTypes;
             if (self.frame != null) {
                 if (!std.meta.eql(prior, descriptor)) return error.ConflictingSqlParameterTypes;
             } else self.descriptors[slot] = descriptor;
@@ -137,8 +139,7 @@ pub const Invocation = struct {
             // execution transport's logical type instead of forcing a numeric
             // unused argument through a text decoder. Describe stays unknown.
             if (descriptor.kind == null) descriptor.* = .{ .kind = if (index < self.fallbacks.len) self.fallbacks[index] orelse .string else .string };
-            try scalar.validateParameterType(descriptor.*);
-            if (descriptor.kind != .datetime and descriptor.element_type == null) descriptor.element_type = try scalar.parameterElementType(descriptor.*);
+            descriptor.* = try scalar.normalizeParameterType(descriptor.*);
         }
     }
 

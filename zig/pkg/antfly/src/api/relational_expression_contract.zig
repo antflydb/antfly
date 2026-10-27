@@ -102,6 +102,11 @@ fn visit(value: std.json.Value, depth: usize, nodes: *usize) bool {
     }
     if (op == .array and value.object.get("sql_type") == null) return false;
     switch (op) {
+        .uuidv4, .uuidv7 => {
+            if (value.object.get("shift")) |shift| {
+                if (shift != .string or shift.string.len == 0 or shift.string.len > 128) return false;
+            }
+        },
         .literal => {
             const kind = value.object.get("type") orelse return false;
             if (!validType(kind)) return false;
@@ -239,8 +244,14 @@ fn canonicalizeExpressionValue(alloc: std.mem.Allocator, expression: *std.json.V
 pub fn canonicalizeOwnedSchema(alloc: std.mem.Allocator, schema: *wire.TableSchema) !void {
     var columns: ColumnTypes = .{ .alloc = alloc, .source = .{ .public = schema } };
     defer columns.deinit();
-    if (schema.column_defaults) |items| for (@constCast(items)) |*item| try canonicalizeOwnedExpression(alloc, &item.expression);
-    if (schema.generated_columns) |items| for (@constCast(items)) |*item| try canonicalizeOwnedExpression(alloc, &item.expression);
+    if (schema.column_defaults) |items| for (@constCast(items)) |*item| {
+        if ((item.expression != null) == (item.sequence != null)) return error.InvalidRelationalExpression;
+        if (item.expression) |*expression| try canonicalizeOwnedExpression(alloc, expression);
+    };
+    if (schema.generated_columns) |items| for (@constCast(items)) |*item| {
+        if (item.sequence != null) return error.InvalidRelationalExpression;
+        try canonicalizeOwnedExpression(alloc, if (item.expression) |*expression| expression else return error.InvalidRelationalExpression);
+    };
     if (schema.checks) |items| for (@constCast(items)) |*item| {
         if (item.expression) |*expression| try canonicalizeOwnedExpression(alloc, expression);
         if (item.column) |column| {
@@ -250,7 +261,9 @@ pub fn canonicalizeOwnedSchema(alloc: std.mem.Allocator, schema: *wire.TableSche
     if (schema.relational_indexes) |indexes| for (@constCast(indexes)) |*index| {
         for (@constCast(index.keys)) |*key| if (key.expression) |*expression| try canonicalizeOwnedExpression(alloc, expression);
         if (index.where) |conditions| for (@constCast(conditions)) |*condition| {
-            if (condition.value) |value| condition.value = try columns.canonicalValue(alloc, condition.column, value);
+            if (condition.column) |column| {
+                if (condition.value) |value| condition.value = try columns.canonicalValue(alloc, column, value);
+            }
         };
     };
 }
@@ -292,6 +305,10 @@ test "relational declarations public array casts preserve typed NULL and NUMERIC
 test "relational declarations public expression grammar shares typed array numeric CASE and IN shapes" {
     const a = std.testing.allocator;
     for ([_][]const u8{
+        \\{"op":"round","sql_type":"numeric","args":[{"op":"literal","type":"numeric","value":"9007199254740993.255"},{"op":"literal","type":"integer","sql_type":"int32","value":2}]}
+        ,
+        \\{"op":"sqrt","sql_type":"numeric","args":[{"op":"literal","type":"numeric","value":"2"}]}
+        ,
         \\{"op":"array","sql_type":"int32","args":[]}
         ,
         \\{"op":"array","sql_type":"numeric","args":[{"op":"literal","type":"numeric","sql_type":"numeric","value":"12.345"},{"op":"literal","type":"numeric","sql_type":"numeric","value":null}]}
@@ -310,7 +327,7 @@ test "relational declarations public expression grammar shares typed array numer
         defer parsed.deinit();
         try std.testing.expect(valid(parsed.value));
         const op = parsed.value.object.get("op").?.string;
-        const expected: ColumnKind = if (std.mem.eql(u8, op, "cast")) .numeric else if (std.mem.eql(u8, op, "literal") or std.mem.eql(u8, op, "array")) .sql_array else if (std.mem.eql(u8, op, "case_when")) .integer else .boolean;
+        const expected: ColumnKind = if (std.mem.eql(u8, op, "cast") or std.mem.eql(u8, op, "round") or std.mem.eql(u8, op, "sqrt")) .numeric else if (std.mem.eql(u8, op, "literal") or std.mem.eql(u8, op, "array")) .sql_array else if (std.mem.eql(u8, op, "case_when")) .integer else .boolean;
         var plan = try expressions.Plan.init(a, .{}, parsed.value, expected);
         defer plan.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
@@ -342,6 +359,46 @@ test "relational declarations public expression grammar shares typed array numer
     }
     inline for (@typeInfo(wire.RelationalExpressionOp).@"enum".field_names) |name| {
         try std.testing.expect(std.meta.stringToEnum(expressions.Op, name) != null);
+    }
+}
+
+test "system catalog canonical schema preserves columnless constant index predicates" {
+    var predicates = [_]wire.RelationalIndexPredicate{
+        .{ .constant = true },
+        .{ .constant = false },
+        .{ .column = "id", .op = .eq, .value = .{ .number_string = "9007199254740993" } },
+    };
+    var indexes = [_]wire.RelationalIndexDefinition{
+        .{ .name = "id_idx", .keys = &.{.{ .column = "id" }}, .where = &predicates },
+    };
+    var schema: wire.TableSchema = .{ .relational_indexes = &indexes };
+    try canonicalizeOwnedSchema(std.testing.allocator, &schema);
+    try std.testing.expectEqual(@as(?bool, true), predicates[0].constant);
+    try std.testing.expectEqual(@as(?bool, false), predicates[1].constant);
+    try std.testing.expect(predicates[0].column == null and predicates[0].value == null);
+    try std.testing.expectEqualStrings("9007199254740993", predicates[2].value.?.number_string);
+}
+
+test "relational declarations public UUID defaults retain closed argument and shift shapes" {
+    for ([_][]const u8{
+        "{\"op\":\"uuidv4\"}",
+        "{\"op\":\"uuidv7\"}",
+        "{\"op\":\"uuidv7\",\"shift\":\"1 mon 2 days 03:00:00\"}",
+    }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(valid(parsed.value));
+    }
+    for ([_][]const u8{
+        "{\"op\":\"uuidv4\",\"shift\":\"1 day\"}",
+        "{\"op\":\"uuidv7\",\"shift\":null}",
+        "{\"op\":\"uuidv7\",\"shift\":\"\"}",
+        "{\"op\":\"uuidv7\",\"args\":[]}",
+        "{\"op\":\"uuidv7\",\"sql_type\":\"uuid\"}",
+    }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!valid(parsed.value));
     }
 }
 

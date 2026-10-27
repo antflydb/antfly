@@ -2114,7 +2114,10 @@ pub const Store = struct {
             .destination_authorization_fingerprint = current.destination_authorization_fingerprint,
             .destination_authorization_principal = current.destination_authorization_principal,
             .result_json = update.result_json orelse current.result_json,
-            .last_error = if (update.phase == .succeeded) null else update.last_error orelse current.last_error,
+            // Cleanup/retry wrappers must not replace an already durable
+            // staging cause by a generic transport/integrity failure. Read
+            // current state here, not the worker's potentially older snapshot.
+            .last_error = if (update.phase == .succeeded) null else if (update.phase == .failed and (update.staging_failure orelse current.staging_failure).len != 0) (update.staging_failure orelse current.staging_failure) else update.last_error orelse current.last_error,
             .created_at_ms = current.created_at_ms,
             .updated_at_ms = nowMillis(),
             .expires_at_ms = if (isTerminal(update.phase) and !isTerminal(current.phase))
@@ -2607,6 +2610,50 @@ fn rangesContainRange(ranges: []const TableIndexRange, candidate: TableIndexRang
 
 pub fn stagingNeedsResolution(state: JobState) bool {
     return state.staging_attempt_id != 0 and state.staging_resolution == .active;
+}
+
+test "restore staging terminal failures preserve durable causes through cleanup and recovery" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |emergency| {
+        var persistence = TestReplicatedPersistence.init(alloc);
+        defer persistence.deinit();
+        var store = Store.initWithIo(alloc, std.testing.io);
+        defer store.deinit();
+        try store.attachReplicated(persistence.persistence());
+        const initial = try store.start(alloc, .{ .scope = .cluster, .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive-reader", .idempotency_namespace = "principal:admin:cluster" });
+        defer alloc.free(initial);
+        var admitted = try std.json.parseFromSlice(JobState, alloc, initial, .{});
+        defer admitted.deinit();
+        const job_id = admitted.value.job_id;
+        const running = (try store.begin(alloc, job_id)).?;
+        defer alloc.free(running);
+        var worker = try std.json.parseFromSlice(JobState, alloc, running, .{});
+        defer worker.deinit();
+        const staging = try store.ensureStagingAttempt(alloc, job_id, worker.value.attempt_id);
+        defer alloc.free(staging);
+        const failure = try store.recordStagingFailure(alloc, job_id, worker.value.attempt_id, "ConstraintActivationFailed");
+        defer alloc.free(failure);
+        const cleanup = try store.recordStagingResolution(alloc, job_id, worker.value.attempt_id, worker.value.attempt_id, .canceled);
+        defer alloc.free(cleanup);
+        // The worker predates the failure checkpoint; both finalizers must
+        // consult the current durable cause rather than its wrapper error.
+        if (emergency) {
+            try std.testing.expect(try store.failRunningAttempt(alloc, job_id, worker.value.attempt_id, "BackupIntegrityFailure"));
+        } else {
+            const terminal = try store.fail(alloc, worker.value, "BackupIntegrityFailure");
+            alloc.free(terminal);
+        }
+        var reopened = Store.initWithIo(alloc, std.testing.io);
+        defer reopened.deinit();
+        try reopened.attachReplicated(persistence.persistence());
+        const bytes = (try reopened.load(alloc, job_id)).?;
+        defer alloc.free(bytes);
+        var result = try std.json.parseFromSlice(JobState, alloc, bytes, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(Phase.failed, result.value.phase);
+        try std.testing.expectEqualStrings("ConstraintActivationFailed", result.value.staging_failure);
+        try std.testing.expectEqualStrings("ConstraintActivationFailed", result.value.last_error.?);
+    }
 }
 
 test "restore staging incarnation survives retries and cancellation waits for owner cleanup" {

@@ -32,8 +32,8 @@ pub const Response = struct {
     }
 };
 
-pub const Database = struct { database_id: u64, name: []const u8, settings_json: []const u8 = "{}", tablespace_name: ?[]const u8 = null };
-pub const Namespace = struct { namespace_id: u64, database_id: u64, database_name: []const u8, name: []const u8, tablespace_name: ?[]const u8 = null };
+pub const Database = struct { database_id: u64, name: []const u8, description: ?[]const u8 = null, settings_json: []const u8 = "{}", tablespace_name: ?[]const u8 = null };
+pub const Namespace = struct { namespace_id: u64, database_id: u64, database_name: []const u8, name: []const u8, description: ?[]const u8 = null, tablespace_name: ?[]const u8 = null };
 pub const Tablespace = struct { tablespace_id: u64, name: []const u8, location_json: []const u8, placement_policy_json: []const u8 };
 
 pub fn context() operation.RequestContext {
@@ -57,6 +57,7 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
     if (action) |mutation_action| {
         var mutation: domain.Mutation = .{ .action = mutation_action, .kind = route.kind, .name = route.name orelse return failure(alloc, error.InvalidCatalogName), .database = route.database, .namespace = route.namespace };
         switch (mutation_action) {
+            .alter, .comment => return failure(alloc, error.InvalidCatalogMutation),
             .create => if (route.kind == .query_source) {
                 const Input = struct { source: std.json.Value };
                 const input = std.json.parseFromSliceLeaky(Input, a, body, .{}) catch return failure(alloc, error.InvalidCatalogMutation);
@@ -101,11 +102,11 @@ fn projectMutation(alloc: std.mem.Allocator, a: std.mem.Allocator, kind: domain.
     if (resource.kind != kind) return error.InvalidCatalogRecord;
     const status: u16 = if (action == .create) 201 else 200;
     return switch (kind) {
-        .database => response(alloc, status, Database{ .database_id = resource.id, .name = resource.name, .tablespace_name = result.tablespace_name }),
-        .namespace => response(alloc, status, Namespace{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = result.database_name orelse return error.InvalidCatalogRecord, .name = resource.name, .tablespace_name = result.tablespace_name }),
+        .database => response(alloc, status, Database{ .database_id = resource.id, .name = resource.name, .description = resource.description, .tablespace_name = result.tablespace_name }),
+        .namespace => response(alloc, status, Namespace{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = result.database_name orelse return error.InvalidCatalogRecord, .name = resource.name, .description = resource.description, .tablespace_name = result.tablespace_name }),
         .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
         .query_source => response(alloc, status, try sourceValue(a, resource)),
-        .table => error.InvalidCatalogMutation,
+        .table, .view, .sequence => error.InvalidCatalogMutation,
     };
 }
 
@@ -133,7 +134,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             .namespace => response(alloc, status, try namespaceValue(&index, resource)),
             .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
             .query_source => response(alloc, status, try sourceValue(a, resource)),
-            .table => failure(alloc, error.InvalidCatalogMutation),
+            .table, .view, .sequence => failure(alloc, error.InvalidCatalogMutation),
         };
     }
     switch (route.kind) {
@@ -172,7 +173,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             for (state.resources) |r| if (r.kind == .query_source) try out.append(a, try sourceValue(a, r));
             return response(alloc, status, out.items);
         },
-        .table => return failure(alloc, error.InvalidCatalogMutation),
+        .table, .view, .sequence => return failure(alloc, error.InvalidCatalogMutation),
     }
 }
 
@@ -181,10 +182,10 @@ fn bindingName(state: *const domain.StateIndex, resource: domain.Resource) ?[]co
     return if (state.byId(.tablespace, resource.tablespace_id)) |r| r.name else null;
 }
 fn databaseValue(state: *const domain.StateIndex, resource: domain.Resource) Database {
-    return .{ .database_id = resource.id, .name = resource.name, .tablespace_name = bindingName(state, resource) };
+    return .{ .database_id = resource.id, .name = resource.name, .description = resource.description, .tablespace_name = bindingName(state, resource) };
 }
 fn namespaceValue(state: *const domain.StateIndex, resource: domain.Resource) !Namespace {
-    return .{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = (state.byId(.database, resource.parent_id) orelse return error.InvalidCatalogRecord).name, .name = resource.name, .tablespace_name = bindingName(state, resource) };
+    return .{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = (state.byId(.database, resource.parent_id) orelse return error.InvalidCatalogRecord).name, .name = resource.name, .description = resource.description, .tablespace_name = bindingName(state, resource) };
 }
 fn tablespaceValue(alloc: std.mem.Allocator, resource: domain.Resource) !Tablespace {
     return .{ .tablespace_id = resource.id, .name = resource.name, .location_json = resource.location_json, .placement_policy_json = try std.json.Stringify.valueAlloc(alloc, resource.placement_policy, .{ .emit_null_optional_fields = false }) };

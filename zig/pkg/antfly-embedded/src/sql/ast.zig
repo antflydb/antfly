@@ -36,6 +36,7 @@ pub const Scalar = union(enum) {
     cast: struct {
         operand: *const Scalar,
         type: ColumnType,
+        temporal_kind: ?@import("temporal_value.zig").Kind = null,
         element_type: ?@import("array_value.zig").ElementType = null,
         numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
         /// Coercion origin controls binding diagnostics, not execution identity.
@@ -55,7 +56,7 @@ pub const Scalar = union(enum) {
     pub const Ordering = struct { descending: bool = false, nulls_first: ?bool = null };
     /// Cold metadata is indirect: ordinary scalar nodes must not retain a
     /// slice/optional discriminator for a rarely used aggregate clause.
-    pub const WithinGroup = struct { orders: []const Ordering };
+    pub const WithinGroup = struct { orders: []const Ordering, ordinary: bool = false };
 };
 
 pub const Name = struct {
@@ -117,6 +118,9 @@ pub const Window = struct {
     pub const Frame = struct { mode: enum { rows, range, groups }, start: Bound, end: Bound = .current, exclusion: Exclusion = .no_others };
 };
 pub const Select = struct {
+    /// null is a bag; an empty list is DISTINCT over output slots; otherwise
+    /// the expressions identify PostgreSQL DISTINCT ON's first-row groups.
+    distinct: ?[]const *const Scalar = null,
     /// Compiler-owned INSERT VALUES source, bounded by max_insert_rows. Its
     /// additional relation nodes must not raise the budget for user SQL.
     generated_values: bool = false,
@@ -182,6 +186,15 @@ pub const Cte = struct {
 };
 pub const Search = struct { request: Value, limit: ?Value = null };
 pub const Relation = union(enum) {
+    /// FROM UNNEST expands typed arrays in storage order, zipping multiple
+    /// arguments with SQL NULL padding. Function inputs are implicitly lateral.
+    unnest: struct {
+        args: []const *const Scalar,
+        alias: ?[]const u8 = null,
+        columns: []const []const u8 = &.{},
+        ordinality: bool = false,
+        qualified: bool = false,
+    },
     table: struct {
         name: Name,
         search: ?*const Search = null,
@@ -208,6 +221,10 @@ pub const Relation = union(enum) {
         left: *const Relation,
         right: *const Relation,
         condition: ?*const Scalar = null,
+        /// Schema-bound keys, lowered to equality predicates and a merged
+        /// projection by relation binding. Never combined with an ON clause.
+        keys: union(enum) { none, using: []const []const u8, natural } = .none,
+        using_alias: ?[]const u8 = null,
         /// Compiler-only left-domain demand. A masked LEFT LATERAL producer
         /// is not opened or evaluated for an undemanded row.
         demand: ?*const Scalar = null,
@@ -220,6 +237,9 @@ pub const Relation = union(enum) {
 };
 pub const JoinKind = enum { inner, left, right, full, cross };
 pub const Insert = struct {
+    /// Target names are derived from the pinned relational declaration order.
+    implicit_columns: bool = false,
+    overriding: enum { none, system, user } = .none,
     alias: ?[]const u8 = null,
     conflict: ?Conflict = null,
     returning: ?[]const Projection = null,
@@ -236,6 +256,10 @@ pub const Insert = struct {
     values_source_rows: []const []const Value = &.{},
     /// Aligned with rows/cells. Literal cells keep the direct binding path.
     expressions: []const []const ?*const Scalar = &.{},
+
+    pub fn ignoresIdentity(self: Insert, column: @import("catalog.zig").Column) bool {
+        return self.overriding == .user and if (column.sequence_default) |binding| binding.generation != .serial else false;
+    }
 
     pub fn isDefault(self: Insert, row: usize, cell: usize) bool {
         return self.defaults.len != 0 and self.defaults[row][cell];
@@ -281,7 +305,20 @@ pub const Merge = struct {
 };
 /// Array element identity belongs to the accompanying binding descriptor;
 /// an array is never represented as a JSON column or an unknown NULL type.
-pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array };
+pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array, numrange, daterange, tsrange, tstzrange };
+pub const ForeignKey = struct {
+    not_valid: bool = false,
+    name: []const u8,
+    name_generated: bool = false,
+    columns: []const []const u8,
+    parent: []const u8,
+    parent_columns: []const []const u8,
+    on_delete: []const u8 = "no_action",
+    on_update: []const u8 = "no_action",
+    match: []const u8 = "simple",
+    deferrable: bool = false,
+    timing: []const u8 = "immediate",
+};
 pub const Column = struct {
     name: []const u8,
     type: ColumnType,
@@ -293,12 +330,57 @@ pub const Column = struct {
     nullable: bool = true,
     default_expression: ?*const Scalar = null,
     generated_expression: ?*const Scalar = null,
+    sequence: ?@import("../system_catalog/column_sequences.zig").Creation = null,
+    references: ?ForeignKey = null,
 };
-pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null };
+/// Native document schema declarations are deliberately separate from SQL row
+/// columns: neither representation may silently discard the other's contract.
+pub const DocumentTable = struct {
+    default_type: ?[]const u8 = null,
+    enforce_types: bool = false,
+    schemas: []const struct { name: []const u8, schema_json: []const u8 },
+};
+pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false };
+/// Immutable SQL intent, not a catalog identity. OWNED BY names must bind to
+/// stable relation/attribute IDs in the authoritative catalog transaction.
+pub const SequenceOptions = struct {
+    values: @import("../system_catalog/sequences.zig").Options = .{},
+    data_type: ?Name = null,
+    /// Quoted "integer" is a type name, not the INTEGER grammar alias.
+    data_type_quoted: bool = false,
+    cache: ?i64 = null,
+    owned_by: union(enum) {
+        unchanged,
+        none,
+        column: struct { table: Name, column: []const u8 },
+    } = .unchanged,
+
+    /// Only the transaction-pinned catalog resolver may supply owner IDs.
+    /// Neither a name nor a column ordinal is an allocation credential.
+    pub fn bind(self: SequenceOptions, resolved: struct {
+        integer: ?@import("../system_catalog/sequences.zig").Integer = null,
+        owner: ?@import("../system_catalog/sequences.zig").OwnedBy = null,
+    }) !@import("../system_catalog/sequences.zig").Options {
+        if (self.values.owned_by != .unchanged or self.values.integer != null or self.values.cache != null) return error.InvalidSequenceDefinition;
+        if ((self.data_type != null) != (resolved.integer != null) or (self.data_type_quoted and self.data_type == null)) return error.InvalidSequenceDefinition;
+        var options = self.values;
+        options.integer = resolved.integer;
+        // Value validation belongs after object lookup, not in the parser:
+        // ALTER of a missing sequence must not become a CACHE-value error.
+        if (self.cache) |count| options.cache = @import("std").math.cast(u64, count) orelse return error.InvalidSequenceDefinition;
+        options.owned_by = switch (self.owned_by) {
+            .unchanged => if (resolved.owner == null) .unchanged else return error.InvalidSequenceDefinition,
+            .none => if (resolved.owner == null) .none else return error.InvalidSequenceDefinition,
+            .column => .{ .column = resolved.owner orelse return error.InvalidSequenceDefinition },
+        };
+        if (resolved.owner) |owner| try owner.validate();
+        return options;
+    }
+};
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index },
-    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate },
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence },
+    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence },
     name: Name,
     new_name: ?[]const u8 = null,
     tablespace: ?[]const u8 = null,
@@ -312,29 +394,51 @@ pub const CatalogDdl = struct {
     index_table: ?Name = null,
     index_targets: []const Name = &.{},
     concurrently: bool = false,
+    view_definition: ?ViewDefinition = null,
+    role_setting: ?struct { name: []const u8, database: ?[]const u8, value: ?Value } = null,
+    comment_value: ?[]const u8 = null,
+    comment_column: ?[]const u8 = null,
+    sequence_options: ?SequenceOptions = null,
+    sequence_targets: []const Name = &.{},
+};
+/// Compiler-owned view intent. The parsed query is reused for semantic
+/// preparation; retained text is for durable definition/rebinding, not execution.
+pub const ViewDefinition = struct {
+    query: *const Select,
+    query_sql: []const u8,
+    columns: []const []const u8 = &.{},
+    replace: bool = false,
+    security_invoker: bool = false,
+    security_barrier: bool = false,
 };
 pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,
+    rename_constraint: struct { name: []const u8, new_name: []const u8 },
     validate_constraint: []const u8,
-    add_unique: struct { name: []const u8, columns: []const []const u8, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", generated_name: bool = false },
-    add_check: struct { name: []const u8, expression: *const Scalar },
-    add_foreign_key: struct {
-        name: []const u8,
-        columns: []const []const u8,
-        parent: []const u8,
-        parent_columns: []const []const u8,
-        on_delete: []const u8 = "no_action",
-        on_update: []const u8 = "no_action",
-        match: []const u8 = "simple",
-        deferrable: bool = false,
-        timing: []const u8 = "immediate",
-    },
-    create_index: struct { name: []const u8, keys: []const Order, include_columns: []const []const u8 = &.{}, unique: bool = false, predicate: ?*const Scalar = null },
+    add_unique: struct { name: []const u8, columns: []const []const u8, without_overlaps_column: ?[]const u8 = null, include_columns: []const []const u8 = &.{}, name_generated: bool = false, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", nulls_not_distinct: bool = false },
+    add_check: struct { name: []const u8, expression: *const Scalar, name_generated: bool = false, not_valid: bool = false },
+    add_foreign_key: ForeignKey,
+    create_index: struct { name: []const u8, keys: []const Order, include_columns: []const []const u8 = &.{}, unique: bool = false, predicate: ?*const Scalar = null, nulls_not_distinct: bool = false },
     drop_index: []const u8,
     add_column: Column,
     drop_column: []const u8,
+    rename_column: struct { name: []const u8, new_name: []const u8 },
     set_default: struct { column: []const u8, expression: *const Scalar },
     drop_default: []const u8,
+    set_nullability: struct { column: []const u8, nullable: bool },
+    set_type: struct { column: Column, using: *const Scalar },
+
+    /// Provenance is internal compiler data, never inferred from the spelling
+    /// of an identifier or persisted as an editable public-schema attribute.
+    pub fn generatedConstraintName(self: SchemaChange) ?[]const u8 {
+        return switch (self) {
+            .add_unique => |rule| if (rule.name_generated) rule.name else null,
+            .add_check => |rule| if (rule.name_generated) rule.name else null,
+            .add_foreign_key => |rule| if (rule.name_generated) rule.name else null,
+            .add_column => |column| if (column.references) |rule| (if (rule.name_generated) rule.name else null) else null,
+            else => null,
+        };
+    }
 };
 pub const PolicyDdl = struct {
     action: enum { create, alter, drop, enable, disable },
@@ -350,8 +454,131 @@ pub const PolicyDdl = struct {
     with_check: ?*const Scalar = null,
     check_specified: bool = false,
 };
+pub const CopyOptions = struct {
+    format: enum { text, csv, binary } = .text,
+    delimiter: ?u8 = null,
+    null_string: ?[]const u8 = null,
+    quote: ?u8 = null,
+    escape: ?u8 = null,
+    header: bool = false,
+    header_match: bool = false,
+    force_null_all: bool = false,
+    force_not_null_all: bool = false,
+    force_null_columns: []const []const u8 = &.{},
+    force_not_null_columns: []const []const u8 = &.{},
+    default_string: ?[]const u8 = null,
+    on_error: enum { stop, ignore } = .stop,
+    reject_limit: ?u64 = null,
+    log_verbosity: enum { default, verbose, silent } = .default,
+    force_quote_all: bool = false,
+    force_quote_columns: []const []const u8 = &.{},
+
+    /// Leaky clone into the caller's description/portal arena. Plan-cache
+    /// leases need not outlive Parse/Describe results.
+    pub fn clone(self: @This(), allocator: @import("std").mem.Allocator) !@This() {
+        var result = self;
+        if (self.null_string) |text| result.null_string = try allocator.dupe(u8, text);
+        const columns = try allocator.alloc([]const u8, self.force_quote_columns.len);
+        for (columns, self.force_quote_columns) |*out, column| out.* = try allocator.dupe(u8, column);
+        result.force_quote_columns = columns;
+        inline for (.{ "force_null_columns", "force_not_null_columns" }) |field| {
+            const names = try allocator.alloc([]const u8, @field(self, field).len);
+            for (names, @field(self, field)) |*out, name| out.* = try allocator.dupe(u8, name);
+            @field(result, field) = names;
+        }
+        if (self.default_string) |text| result.default_string = try allocator.dupe(u8, text);
+        return result;
+    }
+
+    pub fn delimiterByte(self: @This()) u8 {
+        return self.delimiter orelse if (self.format == .csv) ',' else '\t';
+    }
+    pub fn nullBytes(self: @This()) []const u8 {
+        return self.null_string orelse if (self.format == .csv) "" else "\\N";
+    }
+    pub fn quoteByte(self: @This()) u8 {
+        return self.quote orelse '"';
+    }
+    pub fn escapeByte(self: @This()) u8 {
+        return self.escape orelse self.quoteByte();
+    }
+    pub fn validate(self: @This()) !void {
+        const std = @import("std");
+        if (self.format == .binary and (self.delimiter != null or self.null_string != null or self.header or self.quote != null or self.escape != null or self.force_quote_all or self.force_quote_columns.len != 0)) return error.SqlInvalidParameterValue;
+        if (self.format != .csv and (self.quote != null or self.escape != null or self.force_quote_all or self.force_quote_columns.len != 0)) return error.SqlInvalidParameterValue;
+        if (self.format == .binary and (self.header_match or self.default_string != null or self.on_error != .stop)) return error.InvalidSqlSyntax;
+        if (self.format != .csv and (self.force_null_all or self.force_not_null_all or self.force_null_columns.len != 0 or self.force_not_null_columns.len != 0)) return error.UnsupportedSqlShape;
+        if (self.reject_limit) |limit| if (limit == 0 or self.on_error != .ignore) return error.SqlInvalidParameterValue;
+        if (self.default_string) |marker| {
+            if (std.mem.eql(u8, marker, self.nullBytes())) return error.UnsupportedSqlShape;
+            if (marker.len > 1024 or std.mem.indexOfAny(u8, marker, "\x00\n\r") != null or !std.unicode.utf8ValidateSlice(marker)) return error.SqlInvalidParameterValue;
+            if (std.mem.indexOfScalar(u8, marker, self.delimiterByte()) != null or (self.format == .csv and std.mem.indexOfScalar(u8, marker, self.quoteByte()) != null)) return error.SqlInvalidParameterValue;
+        }
+        const delimiter = self.delimiterByte();
+        if (delimiter == 0 or delimiter >= 128 or delimiter == '\n' or delimiter == '\r') return error.SqlInvalidParameterValue;
+        if (self.format == .text and (delimiter == '\\' or delimiter == '.' or std.ascii.isDigit(delimiter) or std.ascii.isLower(delimiter))) return error.SqlInvalidParameterValue;
+        if (self.quoteByte() == 0 or self.quoteByte() >= 128 or self.escapeByte() == 0 or self.escapeByte() >= 128 or (self.format == .csv and delimiter == self.quoteByte())) return error.SqlInvalidParameterValue;
+        const nulls = self.nullBytes();
+        if (nulls.len > 1024 or std.mem.indexOfAny(u8, nulls, "\x00\n\r") != null or !std.unicode.utf8ValidateSlice(nulls)) return error.SqlInvalidParameterValue;
+        if (std.mem.indexOfScalar(u8, nulls, delimiter) != null) return error.SqlInvalidParameterValue;
+        if (self.format == .csv and std.mem.indexOfScalar(u8, nulls, self.quoteByte()) != null) return error.SqlInvalidParameterValue;
+    }
+};
+
+pub const Begin = struct {
+    isolation: @import("session.zig").Isolation = .read_committed,
+    mode: @import("session.zig").ReadMode = .read_write,
+    isolation_specified: bool = false,
+    mode_specified: bool = false,
+    deferrable: ?bool = null,
+    syntax: enum { begin, start_transaction } = .begin,
+
+    pub fn options(self: Begin) @import("session.zig").Begin {
+        return .{ .isolation = self.isolation, .mode = self.mode, .deferrable = self.deferrable orelse false };
+    }
+
+    pub fn commandTag(self: Begin) []const u8 {
+        return switch (self.syntax) {
+            .begin => "BEGIN",
+            .start_transaction => "START TRANSACTION",
+        };
+    }
+};
+
+/// Execution options are independent: per-node timing, total summary time,
+/// planner estimates and measured buffer work must not imply each other.
+pub const Explain = struct {
+    statement: *const Statement,
+    format: enum { text, json } = .text,
+    verbose: bool = false,
+    analyze: bool = false,
+    costs: bool = true,
+    buffers: ?bool = null,
+    timing: ?bool = null,
+    summary: ?bool = null,
+    settings: bool = false,
+    wal: bool = false,
+    pub fn timingEnabled(self: Explain) bool {
+        return self.timing orelse self.analyze;
+    }
+    pub fn summaryEnabled(self: Explain) bool {
+        return self.summary orelse self.analyze;
+    }
+    pub fn buffersEnabled(self: Explain) bool {
+        return self.buffers orelse self.analyze;
+    }
+    pub fn validate(self: Explain) !void {
+        if (!self.analyze and (self.wal or self.timingEnabled())) return error.SqlInvalidParameterValue;
+    }
+};
+
 pub const Statement = union(enum) {
-    explain: struct { statement: *const Statement, format: enum { text, json } = .text, verbose: bool = false, analyze: bool = false, costs: bool = false },
+    /// Read plan plus output contract. Ordinary execute must never silently
+    /// expose this as SELECT; the COPY-capable stream owns protocol framing.
+    copy_to: struct { query: *const Select, options: CopyOptions, implicit_columns: bool = false },
+    /// Input belongs to a transactional client stream, never ordinary execute.
+    copy_from: struct { table: Name, columns: []const []const u8, options: CopyOptions, predicate: ?*const Predicate = null },
+    explain: Explain,
     select: Select,
     insert: Insert,
     update: Update,
@@ -361,11 +588,59 @@ pub const Statement = union(enum) {
     drop_table: DropTable,
     catalog_ddl: CatalogDdl,
     policy_ddl: PolicyDdl,
-    begin: @import("session.zig").Begin,
+    begin: Begin,
     commit,
     rollback,
     savepoint: []const u8,
     rollback_to_savepoint: []const u8,
     release_savepoint: []const u8,
     set_constraints: struct { names: []const []const u8, deferred: bool },
+    set_transaction: @import("session.zig").Characteristics,
 };
+
+/// Only target postimages need a reserved write stamp. DELETE retains its
+/// captured preimage; SELECT and literal strings never start a transaction.
+pub fn returningWriteVersion(statement: Statement) bool {
+    const projections = switch (statement) {
+        .insert => |v| v.returning,
+        .update => |v| v.returning,
+        .merge => |v| v.returning,
+        else => return false,
+    } orelse return false;
+    for (projections) |projection| {
+        if (projection.expression) |expression| {
+            if (versionExpression(expression)) return true;
+        } else if (!projection.wildcard and versionName(projection.field)) return true;
+    }
+    return false;
+}
+
+fn versionName(name: []const u8) bool {
+    const std = @import("std");
+    return std.mem.eql(u8, name, "_version") or std.mem.endsWith(u8, name, "\x00_version");
+}
+
+fn versionExpression(expression: *const Scalar) bool {
+    return switch (expression.*) {
+        .literal => false,
+        .column => |name| versionName(name),
+        .cast => |v| versionExpression(v.operand),
+        .unary => |v| versionExpression(v.operand),
+        .binary => |v| versionExpression(v.left) or versionExpression(v.right),
+        .call => |v| blk: {
+            for (v.args) |arg| if (versionExpression(arg)) break :blk true;
+            if (v.filter) |filter| if (versionExpression(filter)) break :blk true;
+            // Scalar subqueries own captured read versions, not target images.
+            break :blk false;
+        },
+        .case_when => |v| blk: {
+            for (v.branches) |branch| if (versionExpression(branch.condition) or versionExpression(branch.value)) break :blk true;
+            break :blk if (v.otherwise) |other| versionExpression(other) else false;
+        },
+        .in_list => |v| blk: {
+            if (versionExpression(v.operand)) break :blk true;
+            for (v.values) |item| if (versionExpression(item)) break :blk true;
+            break :blk false;
+        },
+    };
+}

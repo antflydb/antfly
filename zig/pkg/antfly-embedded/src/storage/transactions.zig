@@ -37,6 +37,7 @@ const tracing = @import("../tracing/antfly_trace_writer.zig");
 const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
 const retained_effects = @import("retained_effects.zig");
+pub const topology_debt = @import("transaction_debt.zig");
 
 // ============================================================================
 // Key prefixes
@@ -97,6 +98,132 @@ const hot_standby_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 
 pub const TxnId = [16]u8;
 
+fn optionalTopologyValue(view: anytype, key: []const u8) !?[]const u8 {
+    return view.get(key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+fn topologyDebtTxnId(key: []const u8) ?TxnId {
+    inline for (.{ records_prefix, participants_prefix, resolved_participants_prefix, participant_index_prefix }) |prefix| {
+        if (key.len == prefix.len + 16 and std.mem.startsWith(u8, key, prefix)) return key[prefix.len..][0..16].*;
+    }
+    return null;
+}
+
+const TopologyDebtClassifier = struct {
+    pub fn fast(view: anytype, id: TxnId) !?topology_debt.Kind {
+        const raw_record = (try optionalTopologyValue(view, &makeRecordKey(id))) orelse return null;
+        const record = try decodeRecord(raw_record);
+        if (record.status == .pending) return .blocked;
+        const raw_index = (try optionalTopologyValue(view, &makeSidecarKey(participant_index_prefix, id))) orelse return .dirty;
+        const indexed = try ParticipantIndex.decode(raw_index);
+        if (try optionalTopologyValue(view, &makeSidecarKey(resolved_participants_prefix, id)) != null) return .dirty;
+        return if (indexed.enlisted != indexed.resolved) .blocked else null;
+    }
+
+    /// One list element or one resolution-directory entry per call. Full
+    /// cohorts are neither cloned nor reparsed on the serialized apply lane.
+    pub fn step(read: anytype, points: anytype, id: TxnId, page: *topology_debt.Page) !topology_debt.Classification {
+        if (try optionalTopologyValue(read, &makeRecordKey(id)) == null) return error.InvalidTxnRecord;
+        const progress = &page.next.progress;
+        if (progress.phase == .none) {
+            const kind = try fast(read, id);
+            if (kind != .dirty) return .{ .done = kind };
+            if (try optionalTopologyValue(read, &makeSidecarKey(participant_index_prefix, id))) |raw| {
+                const index = try ParticipantIndex.decode(raw);
+                progress.enlisted = index.enlisted;
+                progress.indexed_expected = index.resolved;
+                progress.expected = index.resolved;
+                progress.phase = .indexed;
+            } else progress.phase = .enlisted;
+            return .more;
+        }
+        if (progress.phase == .indexed) {
+            const prefix = makeSidecarKey(resolved_index_prefix, id);
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var key: [prefix.len + 32]u8 = undefined;
+            @memcpy(key[0..prefix.len], &prefix);
+            @memcpy(key[prefix.len..], &progress.after_member);
+            const row = if (progress.seen == 0) try cursor.seekAtOrAfter(&prefix) else blk: {
+                const found = try cursor.seekAtOrAfter(&key);
+                break :blk if (found != null and std.mem.eql(u8, found.?.key, &key)) try cursor.next() else found;
+            };
+            if (row == null or !std.mem.startsWith(u8, row.?.key, &prefix)) {
+                if (progress.seen != progress.indexed_expected) return error.InvalidTxnRecord;
+                progress.phase = .indexed_legacy;
+                progress.offset = 0;
+                progress.seen = 0;
+                progress.expected = 0;
+                return .more;
+            }
+            const member = row.?;
+            if (member.value.len == 0 or !std.mem.eql(u8, member.key, &makeParticipantIndexKey(resolved_index_prefix, id, member.value))) return error.InvalidTxnRecord;
+            const enlisted = (try optionalTopologyValue(points, &makeParticipantIndexKey(participant_index_prefix, id, member.value))) orelse return error.InvalidTxnRecord;
+            if (!std.mem.eql(u8, enlisted, member.value)) return error.InvalidTxnRecord;
+            progress.after_member = member.key[prefix.len..][0..32].*;
+            progress.seen = std.math.add(u64, progress.seen, 1) catch return error.InvalidTxnRecord;
+            progress.resolved = progress.seen;
+            if (progress.seen > progress.expected or progress.resolved > progress.enlisted) return error.InvalidTxnRecord;
+            return .more;
+        }
+        if (progress.phase != .enlisted and progress.phase != .resolved and progress.phase != .indexed_legacy) return error.InvalidTxnRecord;
+        const raw = if (progress.phase == .enlisted) try optionalTopologyValue(read, &makeSidecarKey(participants_prefix, id)) else try optionalTopologyValue(read, &makeSidecarKey(resolved_participants_prefix, id));
+        if (raw == null) {
+            if (progress.offset != 0) return error.InvalidTxnRecord;
+            finishList(progress);
+            return .more;
+        }
+        const bytes = raw.?;
+        if (bytes.len < 4) return error.InvalidTxnRecord;
+        if (progress.offset == 0) {
+            progress.expected = std.mem.readInt(u32, bytes[0..4], .little);
+            progress.offset = 4;
+        }
+        if (progress.offset > bytes.len or progress.seen > progress.expected) return error.InvalidTxnRecord;
+        if (progress.seen == progress.expected) {
+            if (progress.offset != bytes.len) return error.InvalidTxnRecord;
+            finishList(progress);
+            return .more;
+        }
+        const offset: usize = @intCast(progress.offset);
+        if (bytes.len - offset < 4) return error.InvalidTxnRecord;
+        const length = std.mem.readInt(u32, bytes[offset..][0..4], .little);
+        if (length > bytes.len - offset - 4) return error.InvalidTxnRecord;
+        const name = bytes[offset + 4 ..][0..length];
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(name, &digest, .{});
+        if (progress.phase == .enlisted) {
+            if (!try page.markSeen(points, 1, digest)) progress.enlisted = std.math.add(u64, progress.enlisted, 1) catch return error.InvalidTxnRecord;
+        } else {
+            const indexed = progress.phase == .indexed_legacy;
+            if (indexed) {
+                const enlisted = (try optionalTopologyValue(points, &makeParticipantIndexKey(participant_index_prefix, id, name))) orelse return error.InvalidTxnRecord;
+                if (!std.mem.eql(u8, enlisted, name)) return error.InvalidTxnRecord;
+            } else if (!try page.wasEnlisted(points, digest)) return error.InvalidTxnRecord;
+            if (!try page.markSeen(points, 2, digest)) {
+                const existing = if (indexed) try optionalTopologyValue(points, &makeParticipantIndexKey(resolved_index_prefix, id, name)) else null;
+                if (existing) |value| {
+                    if (!std.mem.eql(u8, value, name)) return error.InvalidTxnRecord;
+                } else progress.resolved = std.math.add(u64, progress.resolved, 1) catch return error.InvalidTxnRecord;
+            }
+            if (progress.resolved > progress.enlisted) return error.InvalidTxnRecord;
+        }
+        progress.offset += 4 + @as(u64, length);
+        progress.seen += 1;
+        return .more;
+    }
+    fn finishList(progress: *topology_debt.Progress) void {
+        progress.phase = if (progress.phase == .enlisted) .resolved else .cleanup;
+        if (progress.phase == .cleanup) progress.indexed_expected = 0;
+        progress.offset = 0;
+        progress.seen = 0;
+        progress.expected = 0;
+        progress.after_member = @splat(0);
+    }
+};
+
 pub const TxnStatus = enum(u8) {
     pending = 0,
     committed = 1,
@@ -104,6 +231,7 @@ pub const TxnStatus = enum(u8) {
 };
 
 pub const WriteIntent = struct {
+    row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     key: []const u8,
     value: ?[]const u8, // null for deletes
     /// Borrowed logical typing metadata; must be consumed by canonical AROW
@@ -119,6 +247,7 @@ pub const WriteIntent = struct {
 };
 
 pub const IntentValue = struct {
+    row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     value: ?[]const u8,
     prepared_row: ?[]const u8 = null,
 
@@ -132,6 +261,14 @@ pub const IntentValue = struct {
                 const length = std.mem.readInt(u32, bytes[1..5], .little);
                 if (length > bytes.len - 5 or length == bytes.len - 5) return error.InvalidTxnRecord;
                 break :blk .{ .value = bytes[5..][0..length], .prepared_row = bytes[5 + length ..] };
+            },
+            3 => blk: {
+                if (bytes.len < 3 or bytes[2] > 2) return error.InvalidTxnRecord;
+                const requirement = std.enums.fromInt(@import("../usermgr/row_policy_authority.zig").MutationRequirement, bytes[1]) orelse return error.InvalidTxnRecord;
+                if (requirement == .native) return error.InvalidTxnRecord;
+                var value = try decode(bytes[2..]);
+                value.row_policy_requirement = requirement;
+                break :blk value;
             },
             else => error.InvalidTxnRecord,
         };
@@ -160,6 +297,8 @@ fn isRawMetadataIntentKey(key: []const u8) bool {
         range_protection.indexCounterDigest(key) != null or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
+        std.mem.eql(u8, key, @import("db/relational_integrity_activation_contract.zig").validation_key) or
+        std.mem.eql(u8, key, @import("db/relational_integrity_activation_contract.zig").validation_inputs_key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
@@ -550,6 +689,63 @@ pub const TxnManager = struct {
         self.* = undefined;
     }
 
+    pub fn prepareTopologyDebtPage(self: *TxnManager, scope: topology_debt.Scope, control: anytype) !?topology_debt.Page {
+        var read = try self.store.beginRead();
+        defer read.abort();
+        var points = try read.openReadScope(self.alloc);
+        defer points.close();
+        return try topology_debt.preparePage(&read, &points, scope, records_prefix, TopologyDebtClassifier, control);
+    }
+
+    /// Only the schema owner holding the admitted upgraded-writer fence may
+    /// call this. The initial page examines at most 64 fixed-size records;
+    /// legacy cohort work is explicitly deferred to prepared control pages.
+    pub fn stageTopologyDebtBegin(txn: anytype, scope: topology_debt.Scope) !void {
+        if (try topology_debt.load(txn)) |existing| if (existing.scope.eql(scope)) {
+            if (existing.phase == .retired) return error.SchemaValidationJobChanged;
+            return;
+        };
+        _ = try topology_debt.initialize(txn, scope);
+        const Control = struct {
+            pub fn ensureActive(_: @This()) !void {}
+        };
+        if (try topology_debt.preparePage(txn, txn, scope, records_prefix, TopologyDebtClassifier, Control{})) |page| try page.stage(txn);
+    }
+
+    pub fn hasPhysicalTopologyDebt(view: anytype) !bool {
+        inline for (.{ intents_prefix, intent_locks_prefix, read_guards_prefix, read_members_prefix, schema_leases_prefix, hot_standby_batch_outbox_prefix, hot_standby_replay_outbox_prefix }) |prefix|
+            if (try topology_debt.hasPrefix(view, prefix)) return true;
+        return false;
+    }
+
+    pub fn hasQualifiedTopologyDebt(view: anytype, scope: topology_debt.Scope) !bool {
+        return !try topology_debt.drained(view, scope) or try hasPhysicalTopologyDebt(view);
+    }
+
+    const SnapshotApi = struct {
+        pub const records = records_prefix;
+        pub const participants = participants_prefix;
+        pub const resolved = resolved_participants_prefix;
+        pub const members = participant_index_prefix;
+        pub const acks = resolved_index_prefix;
+        pub const record = decodeRecord;
+        pub const index = ParticipantIndex.decode;
+        pub const recordKey = makeRecordKey;
+        pub const sidecarKey = makeSidecarKey;
+        pub const memberKey = makeParticipantIndexKey;
+    };
+    pub fn TopologySnapshotAudit(comptime Read: type) type {
+        return @import("transaction_snapshot.zig").Audit(Read, SnapshotApi);
+    }
+    pub fn validateTopologyDebtSnapshot(alloc: Allocator, read: anytype, expected: ?topology_debt.Scope, options: @import("../spill_sort.zig").Options) !topology_debt.SnapshotStats {
+        var points = try read.openReadScope(alloc);
+        defer points.close();
+        const control = options.cancellation orelse @import("antfly_cancellation").CancellationToken.none;
+        const stats = try topology_debt.validateSnapshot(read, &points, expected, control);
+        try @import("transaction_snapshot.zig").validate(alloc, read, try topology_debt.load(&points), options, SnapshotApi);
+        return stats;
+    }
+
     /// Create a new pending transaction record.
     pub fn initTransaction(self: *TxnManager, txn_id: TxnId, timestamp: u64) !void {
         try self.initTransactionWithParticipants(txn_id, timestamp, &.{});
@@ -671,6 +867,24 @@ pub const TxnManager = struct {
         if (participant_value) |value| {
             try writes.append(self.alloc, .{ .key = &participant_key, .value = value });
         }
+        // New transactions start with an immutable membership index. Later
+        // ACKs and local resolution can update one bounded counter/member
+        // pair, rather than rewriting and decoding a growing cohort list.
+        const member_keys = try self.alloc.alloc([participant_index_prefix.len + 48]u8, participants.len);
+        defer self.alloc.free(member_keys);
+        var unique: std.StringHashMapUnmanaged(void) = .empty;
+        defer unique.deinit(self.alloc);
+        for (participants, 0..) |participant, i| {
+            if (participant.len == 0) return error.InvalidParticipant;
+            const slot = try unique.getOrPut(self.alloc, participant);
+            if (slot.found_existing) continue;
+            member_keys[i] = makeParticipantIndexKey(participant_index_prefix, txn_id, participant);
+            try writes.append(self.alloc, .{ .key = &member_keys[i], .value = participant });
+        }
+        const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+        var index_value: [17]u8 = undefined;
+        (ParticipantIndex{ .enlisted = unique.count() }).encode(&index_value);
+        try writes.append(self.alloc, .{ .key = &index_key, .value = &index_value });
         try writes.appendSlice(self.alloc, extra_batch.writes);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
@@ -778,7 +992,7 @@ pub const TxnManager = struct {
             for (previous.owned_entries.?) |entry| {
                 const key = entry.key[intents_prefix.len + 17 ..];
                 const decoded = try IntentValue.decode(entry.value);
-                const previous_intent: WriteIntent = .{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row };
+                const previous_intent: WriteIntent = .{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row, .row_policy_requirement = decoded.row_policy_requirement };
                 const cost = try intentAdmissionBytes(previous_intent);
                 const retained = try retainedIntentBytes(self.alloc, previous_intent);
                 admission.count += 1;
@@ -876,24 +1090,32 @@ pub const TxnManager = struct {
             const intent_key = try self.makeIntentKey(txn_id, intent.key);
             try appendOwnedBytes(self.alloc, &write_keys, intent_key);
 
-            // Intent value: [is_delete:u8][value_bytes]
+            // SQL provenance prefixes the existing immutable value envelope.
+            // It is committed atomically with the prepare vote and survives
+            // journal replay, restart and replacement of the same intent key.
             var val: []u8 = undefined;
+            const prefix: usize = if (intent.row_policy_requirement == .native) 0 else 2;
             if (intent.value) |v| {
                 if (intent.prepared_row) |row| {
                     const json_len = std.math.cast(u32, v.len) orelse return error.TransactionTooLarge;
-                    val = try self.alloc.alloc(u8, 5 + v.len + row.len);
-                    val[0] = 2;
-                    std.mem.writeInt(u32, val[1..5], json_len, .little);
-                    @memcpy(val[5..][0..v.len], v);
-                    @memcpy(val[5 + v.len ..], row);
+                    val = try self.alloc.alloc(u8, prefix + 5 + v.len + row.len);
+                    const payload = val[prefix..];
+                    payload[0] = 2;
+                    std.mem.writeInt(u32, payload[1..5], json_len, .little);
+                    @memcpy(payload[5..][0..v.len], v);
+                    @memcpy(payload[5 + v.len ..], row);
                 } else {
-                    val = try self.alloc.alloc(u8, 1 + v.len);
-                    val[0] = 0;
-                    @memcpy(val[1..], v);
+                    val = try self.alloc.alloc(u8, prefix + 1 + v.len);
+                    val[prefix] = 0;
+                    @memcpy(val[prefix + 1 ..], v);
                 }
             } else {
-                val = try self.alloc.alloc(u8, 1);
-                val[0] = 1; // is a delete
+                val = try self.alloc.alloc(u8, prefix + 1);
+                val[prefix] = 1; // is a delete
+            }
+            if (prefix != 0) {
+                val[0] = 3;
+                val[1] = @backingInt(intent.row_policy_requirement);
             }
             try appendOwnedBytes(self.alloc, &write_vals, val);
 
@@ -954,34 +1176,37 @@ pub const TxnManager = struct {
         var resolved_participant_key: [resolved_participants_prefix.len + 16]u8 = undefined;
         var resolved_participant_value: ?[]u8 = null;
         defer if (resolved_participant_value) |value| self.alloc.free(value);
+        var indexed_ack: IndexedResolutionAck = .{};
         if (extra_batch.resolved_participant) |participant| {
-            const participants = try self.getParticipants(self.alloc, txn_id);
-            defer freeParticipantList(self.alloc, participants);
-            var enlisted = false;
-            for (participants) |existing| {
-                if (std.mem.eql(u8, existing, participant)) {
-                    enlisted = true;
-                    break;
+            if (!try indexed_ack.prepare(self, txn_id, participant)) {
+                const participants = try self.getParticipants(self.alloc, txn_id);
+                defer freeParticipantList(self.alloc, participants);
+                var enlisted = false;
+                for (participants) |existing| {
+                    if (std.mem.eql(u8, existing, participant)) {
+                        enlisted = true;
+                        break;
+                    }
                 }
-            }
-            if (!enlisted) return error.InvalidParticipant;
+                if (!enlisted) return error.InvalidParticipant;
 
-            const resolved = try self.getResolvedParticipants(self.alloc, txn_id);
-            defer freeParticipantList(self.alloc, resolved);
-            var already_resolved = false;
-            for (resolved) |existing| {
-                if (std.mem.eql(u8, existing, participant)) {
-                    already_resolved = true;
-                    break;
+                const resolved = try self.getResolvedParticipants(self.alloc, txn_id);
+                defer freeParticipantList(self.alloc, resolved);
+                var already_resolved = false;
+                for (resolved) |existing| {
+                    if (std.mem.eql(u8, existing, participant)) {
+                        already_resolved = true;
+                        break;
+                    }
                 }
-            }
-            if (!already_resolved) {
-                const next = try self.alloc.alloc([]const u8, resolved.len + 1);
-                defer self.alloc.free(next);
-                for (resolved, 0..) |existing, i| next[i] = existing;
-                next[resolved.len] = participant;
-                resolved_participant_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-                resolved_participant_value = try encodeParticipantList(self.alloc, next);
+                if (!already_resolved) {
+                    const next = try self.alloc.alloc([]const u8, resolved.len + 1);
+                    defer self.alloc.free(next);
+                    for (resolved, 0..) |existing, i| next[i] = existing;
+                    next[resolved.len] = participant;
+                    resolved_participant_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+                    resolved_participant_value = try encodeParticipantList(self.alloc, next);
+                }
             }
         }
         if (extra_batch.expected_intent_revision) |expected| {
@@ -1006,6 +1231,7 @@ pub const TxnManager = struct {
             var completion_writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
             defer completion_writes.deinit(self.alloc);
             try completion_writes.appendSlice(self.alloc, extra_batch.completion_writes);
+            try indexed_ack.append(self.alloc, &completion_writes);
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
@@ -1058,6 +1284,7 @@ pub const TxnManager = struct {
             defer completion_writes.deinit(self.alloc);
             try completion_writes.append(self.alloc, .{ .key = &rec_key, .value = marker_value });
             try completion_writes.appendSlice(self.alloc, extra_batch.completion_writes);
+            try indexed_ack.append(self.alloc, &completion_writes);
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
@@ -1187,6 +1414,7 @@ pub const TxnManager = struct {
         try writes.append(self.alloc, .{ .key = &rec_key, .value = rec_val });
         try writes.appendSlice(self.alloc, extra_batch.writes);
         try writes.appendSlice(self.alloc, extra_batch.completion_writes);
+        try indexed_ack.append(self.alloc, &writes);
         if (resolved_participant_value) |value| {
             try writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
         }
@@ -1452,16 +1680,22 @@ pub const TxnManager = struct {
     pub fn hasTopologySensitiveTransactions(self: *TxnManager) !bool {
         var read = try self.store.beginRead();
         defer read.abort();
+        return hasTopologySensitiveTransactionsInView(self.alloc, &read);
+    }
+
+    /// Reuse the caller's pinned snapshot or writer view. Schema publication
+    /// must not validate its directory against a second, differently cut read.
+    pub fn hasTopologySensitiveTransactionsInView(alloc: Allocator, read: anytype) !bool {
 
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
         // than opening an intent cursor for every retained terminal record.
-        if (try readHasPrefix(&read, intents_prefix) or
-            try readHasPrefix(&read, intent_locks_prefix) or
-            try readHasPrefix(&read, read_guards_prefix) or
-            try readHasPrefix(&read, read_members_prefix) or
-            try readHasPrefix(&read, hot_standby_batch_outbox_prefix) or
-            try readHasPrefix(&read, hot_standby_replay_outbox_prefix))
+        if (try readHasPrefix(read, intents_prefix) or
+            try readHasPrefix(read, intent_locks_prefix) or
+            try readHasPrefix(read, read_guards_prefix) or
+            try readHasPrefix(read, read_members_prefix) or
+            try readHasPrefix(read, hot_standby_batch_outbox_prefix) or
+            try readHasPrefix(read, hot_standby_replay_outbox_prefix))
         {
             return true;
         }
@@ -1486,16 +1720,16 @@ pub const TxnManager = struct {
                         else => return err,
                     };
                     if (legacy != null) {
-                        const members = try resolvedParticipantsInRead(self.alloc, &read, txn_id);
-                        defer freeParticipantList(self.alloc, members);
+                        const members = try resolvedParticipantsInRead(alloc, read, txn_id);
+                        defer freeParticipantList(alloc, members);
                         if (members.len > indexed.enlisted) return error.InvalidTxnRecord;
                         if (members.len != indexed.enlisted) return true;
                     } else if (indexed.resolved != indexed.enlisted) return true;
                     entry = try cursor.next();
                     continue;
                 } else |err| if (err != error.NotFound) return err;
-                const participant_count = try participantListCountInRead(&read, &participant_key);
-                const resolved_count = try participantListCountInRead(&read, &resolved_key);
+                const participant_count = try participantListCountInRead(read, &participant_key);
+                const resolved_count = try participantListCountInRead(read, &resolved_key);
                 if (resolved_count > participant_count) return TxnError.InvalidTxnRecord;
                 // markParticipantResolved only appends unique, enlisted members,
                 // so equal validated counts prove that the participant set is
@@ -2380,10 +2614,14 @@ pub const TxnManager = struct {
         if (try self.loadIntentAdmission(alloc, txn_id)) |admission| {
             const prefix = try makeIntentMemberKey(alloc, txn_id, "");
             defer alloc.free(prefix);
-            var keys = std.ArrayListUnmanaged([]u8).empty;
+            // Admission already owns the exact member count. Allocate once,
+            // avoiding growth and a backend/address-dependent shrink/remap.
+            const count = std.math.cast(usize, admission.count) orelse return error.InvalidTxnRecord;
+            const keys = try alloc.alloc([]u8, count);
+            var initialized: usize = 0;
             errdefer {
-                for (keys.items) |key| alloc.free(key);
-                keys.deinit(alloc);
+                for (keys[0..initialized]) |key| alloc.free(key);
+                alloc.free(keys);
             }
             var scan = try self.store.beginCurrentScan();
             defer scan.abort();
@@ -2392,13 +2630,13 @@ pub const TxnManager = struct {
             var entry = try cursor.seekAtOrAfter(prefix);
             while (entry) |item| {
                 if (!std.mem.startsWith(u8, item.key, prefix)) break;
-                const key = try alloc.dupe(u8, item.key[prefix.len..]);
-                errdefer alloc.free(key);
-                try keys.append(alloc, key);
+                if (initialized == keys.len) return error.IntentSnapshotChanged;
+                keys[initialized] = try alloc.dupe(u8, item.key[prefix.len..]);
+                initialized += 1;
                 entry = try cursor.next();
             }
-            if (keys.items.len != admission.count) return error.IntentSnapshotChanged;
-            return try keys.toOwnedSlice(alloc);
+            if (initialized != keys.len) return error.IntentSnapshotChanged;
+            return keys;
         }
         const key = makeSidecarKey(intent_keys_prefix, txn_id);
         const raw = self.getAlloc(alloc, &key) catch |err| switch (err) {
@@ -2610,10 +2848,7 @@ pub const TxnManager = struct {
     }
 
     fn putValue(self: *TxnManager, key: []const u8, value: []const u8) !void {
-        var txn = try self.store.beginWrite();
-        errdefer txn.abort();
-        try txn.put(key, value);
-        try txn.commit();
+        try self.applyBatch(&.{.{ .key = key, .value = value }}, &.{}, null);
     }
 
     fn applyMutationExtraBatch(self: *TxnManager, extra_batch: MutationExtraBatch) !void {
@@ -2631,9 +2866,49 @@ pub const TxnManager = struct {
     }
 
     fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !void {
+        // Transaction extras are not a directory initialization/repair API.
+        for (writes) |kv| if (std.mem.startsWith(u8, kv.key, topology_debt.family_prefix)) return error.InvalidCommitMetadata;
+        for (deletes) |key| if (std.mem.startsWith(u8, key, topology_debt.family_prefix)) return error.InvalidCommitMetadata;
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
-        if (participant) |observer| try batch.setCommitParticipant(observer);
+        var directory = try topology_debt.load(&batch);
+        const CommitGuard = struct {
+            original: @import("commit_participant.zig").Participant,
+            protected: bool,
+            fn reset(ptr: *anyopaque) void {
+                const observer: *@This() = @ptrCast(@alignCast(ptr));
+                observer.original.reset(observer.original.ptr);
+            }
+            fn observe(ptr: *anyopaque, key: []const u8, value: ?[]const u8) void {
+                const observer: *@This() = @ptrCast(@alignCast(ptr));
+                observer.original.observe(observer.original.ptr, key, value);
+            }
+            fn stage(ptr: *anyopaque, view: @import("commit_participant.zig").View, position: []const u8) anyerror!void {
+                const observer: *@This() = @ptrCast(@alignCast(ptr));
+                const GuardedView = struct {
+                    original: @import("commit_participant.zig").View,
+                    fn get(raw: *anyopaque, key: []const u8) ![]const u8 {
+                        const guard: *@This() = @ptrCast(@alignCast(raw));
+                        return guard.original.get(key);
+                    }
+                    fn put(raw: *anyopaque, key: []const u8, value: []const u8) !void {
+                        const guard: *@This() = @ptrCast(@alignCast(raw));
+                        // Final callbacks cannot change transaction evidence
+                        // after its directory update or mint a ready marker.
+                        if (std.mem.startsWith(u8, key, "\x00\x00__txn_") or std.mem.startsWith(u8, key, topology_debt.family_prefix)) return error.InvalidCommitMetadata;
+                        try guard.original.put(key, value);
+                    }
+                };
+                if (!observer.protected) return observer.original.stage(observer.original.ptr, view, position);
+                var guarded: GuardedView = .{ .original = view };
+                try observer.original.stage(observer.original.ptr, .{ .ptr = &guarded, .get_fn = GuardedView.get, .put_fn = GuardedView.put }, position);
+            }
+        };
+        var commit_guard: CommitGuard = undefined;
+        if (participant) |observer| {
+            commit_guard = .{ .original = observer, .protected = directory != null and directory.?.phase != .retired };
+            try batch.setCommitParticipant(.{ .ptr = &commit_guard, .reset = CommitGuard.reset, .observe = CommitGuard.observe, .stage = CommitGuard.stage });
+        }
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
         for (deletes) |key| {
             batch.delete(key) catch |err| switch (err) {
@@ -2644,6 +2919,27 @@ pub const TxnManager = struct {
         for (writes) |kv| {
             try batch.put(kv.key, kv.value);
         }
+        if (directory) |*header| if (header.phase != .retired) {
+            var changed = false;
+            for (deletes) |key| if (topologyDebtTxnId(key)) |id| {
+                try topology_debt.setMember(&batch, header, id, try TopologyDebtClassifier.fast(&batch, id));
+                changed = true;
+            };
+            for (writes) |kv| if (topologyDebtTxnId(kv.key)) |id| {
+                try topology_debt.setMember(&batch, header, id, try TopologyDebtClassifier.fast(&batch, id));
+                changed = true;
+            };
+            if (changed) {
+                if (header.phase == .dirty and header.pending == null and !try topology_debt.hasPrefix(&batch, &topology_debt.dirtyPrefix(header.scope.generation))) {
+                    header.phase = .gc;
+                    header.after = null;
+                }
+                if (header.phase == .gc and !try topology_debt.hasPrefix(&batch, &topology_debt.orphanPrefix(header.scope.generation)) and
+                    !try topology_debt.hasPrefix(&batch, &topology_debt.seenPrefix(header.scope.generation))) header.phase = .ready;
+                try header.bump();
+                try topology_debt.save(&batch, header.*);
+            }
+        };
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
         try batch.commit();
     }
@@ -2815,6 +3111,47 @@ fn makeSidecarKey(comptime prefix: []const u8, txn_id: TxnId) [prefix.len + 16]u
     return key_buf;
 }
 
+// Local intent resolution publishes its ACK with the row effects. Keep the
+// normal indexed path independent of cohort size; predecessor sidecars still
+// use the compatibility merge below until their indexed migration commits.
+const IndexedResolutionAck = struct {
+    index_key: [participant_index_prefix.len + 16]u8 = undefined,
+    member_key: [resolved_index_prefix.len + 48]u8 = undefined,
+    index_value: [17]u8 = undefined,
+    participant: ?[]const u8 = null,
+
+    fn prepare(self: *@This(), manager: *TxnManager, id: TxnId, participant: []const u8) !bool {
+        // Resolution is serialized by the owning apply fence. These immediate
+        // point probes must not clone the LSM memtable into a bound snapshot.
+        var read = try manager.store.beginProbe();
+        defer read.abort();
+        self.index_key = makeSidecarKey(participant_index_prefix, id);
+        const raw = (try optionalTopologyValue(&read, &self.index_key)) orelse return false;
+        var index = try ParticipantIndex.decode(raw);
+        if (try optionalTopologyValue(&read, &makeSidecarKey(resolved_participants_prefix, id)) != null) return false;
+        if (participant.len == 0) return error.InvalidParticipant;
+        const member = (try optionalTopologyValue(&read, &makeParticipantIndexKey(participant_index_prefix, id, participant))) orelse return error.InvalidParticipant;
+        if (!std.mem.eql(u8, member, participant)) return error.InvalidTxnRecord;
+        self.member_key = makeParticipantIndexKey(resolved_index_prefix, id, participant);
+        if (try optionalTopologyValue(&read, &self.member_key)) |resolved| {
+            if (!std.mem.eql(u8, resolved, participant)) return error.InvalidTxnRecord;
+            return true;
+        }
+        if (index.resolved >= index.enlisted) return error.InvalidTxnRecord;
+        index.resolved += 1;
+        index.encode(&self.index_value);
+        self.participant = participant;
+        return true;
+    }
+
+    fn append(self: *const @This(), alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore.KVPair)) !void {
+        if (self.participant) |participant| {
+            try writes.append(alloc, .{ .key = &self.member_key, .value = participant });
+            try writes.append(alloc, .{ .key = &self.index_key, .value = &self.index_value });
+        }
+    }
+};
+
 const ParticipantIndex = struct {
     enlisted: u64 = 0,
     resolved: u64 = 0,
@@ -2839,7 +3176,7 @@ fn makeParticipantIndexKey(comptime prefix: []const u8, txn_id: TxnId, participa
     return key;
 }
 
-fn resolvedParticipantsInRead(alloc: Allocator, read: *backend_erased.ReadTxn, txn_id: TxnId) ![][]u8 {
+fn resolvedParticipantsInRead(alloc: Allocator, read: anytype, txn_id: TxnId) ![][]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -2885,7 +3222,7 @@ fn resolvedParticipantsInRead(alloc: Allocator, read: *backend_erased.ReadTxn, t
     return result;
 }
 
-fn readHasPrefix(read: *backend_erased.ReadTxn, prefix: []const u8) !bool {
+fn readHasPrefix(read: anytype, prefix: []const u8) !bool {
     var cursor = try read.openCursor();
     defer cursor.close();
     const entry = (try cursor.seekAtOrAfter(prefix)) orelse return false;
@@ -2893,7 +3230,7 @@ fn readHasPrefix(read: *backend_erased.ReadTxn, prefix: []const u8) !bool {
 }
 
 fn participantListCountInRead(
-    read: *backend_erased.ReadTxn,
+    read: anytype,
     key: []const u8,
 ) !usize {
     const raw = read.get(key) catch |err| switch (err) {
@@ -2977,6 +3314,7 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return TxnError.InvalidTxnRecord;
     if (raw.len == txn_record_v6_size) {
         if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1 or raw[52] > 1) return TxnError.InvalidTxnRecord;
         return .{
@@ -3091,8 +3429,12 @@ fn participantListsEqual(a: []const []const u8, b: []const []const u8) bool {
 }
 
 fn encodeParticipantList(alloc: Allocator, participants: []const []const u8) ![]u8 {
+    if (participants.len > std.math.maxInt(u32)) return error.TransactionTooLarge;
     var total: usize = 4;
-    for (participants) |participant| total += 4 + participant.len;
+    for (participants) |participant| {
+        if (participant.len > std.math.maxInt(u32)) return error.TransactionTooLarge;
+        total = std.math.add(usize, total, std.math.add(usize, 4, participant.len) catch return error.TransactionTooLarge) catch return error.TransactionTooLarge;
+    }
     const buf = try alloc.alloc(u8, total);
     var count_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buf, @intCast(participants.len), .little);
@@ -4791,6 +5133,696 @@ test "transaction participants track unresolved members" {
     try std.testing.expectEqualStrings("shard-b", unresolved_after[0]);
 }
 
+const DebtTestControl = struct {
+    pub fn ensureActive(_: @This()) !void {}
+};
+fn reconcileDebtForTest(manager: *TxnManager, store: *DocStore, scope: topology_debt.Scope) !usize {
+    _ = try validateDebtForTest(manager, scope);
+    var pages: usize = 0;
+    while (try manager.prepareTopologyDebtPage(scope, DebtTestControl{})) |page| {
+        if (pages >= 2048) return error.TestUnexpectedResult;
+        try std.testing.expect(page.units <= topology_debt.max_page_units);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try page.stage(&txn);
+            try txn.commit();
+        }
+        _ = try validateDebtForTest(manager, scope);
+        pages += 1;
+    }
+    return pages;
+}
+
+fn validateDebtForTest(manager: *TxnManager, scope: ?topology_debt.Scope) !topology_debt.SnapshotStats {
+    var read = try manager.store.beginRead();
+    defer read.abort();
+    return TxnManager.validateTopologyDebtSnapshot(std.testing.allocator, &read, scope, .{ .io = std.Options.debug_io, .directory = ".zig-cache", .chunk_records = 17, .chunk_bytes = 4096 });
+}
+
+test "transaction debt record audit hashes binary names in bounded windows on one immutable image" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-record-audit-names");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const name_len = 16 * 1024 + 7;
+    const bytes = try alloc.alloc(u8, name_len * 3);
+    defer alloc.free(bytes);
+    @memset(bytes, 0xf3);
+    var names: [3][]const u8 = undefined;
+    for (&names, 0..) |*name, i| {
+        const value = bytes[i * name_len ..][0..name_len];
+        value[17] = 0;
+        value[name_len - 1] = @intCast(i);
+        name.* = value;
+    }
+    const id: TxnId = @splat(71);
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 1, 1, &names, true, true);
+    try manager.resolveIntents(id, .committed, 2);
+    try manager.markParticipantsResolvedExtraBatch(id, &names, .{});
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const Audit = TxnManager.TopologySnapshotAudit(@TypeOf(&read));
+    const request_path = try alloc.dupe(u8, path);
+    var request_path_owned = true;
+    defer if (request_path_owned) alloc.free(request_path);
+    var canceled = std.atomic.Value(bool).init(true);
+    var audit = try Audit.init(alloc, &read, .{ .io = std.testing.io, .directory = request_path, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled) }, @import("antfly_cancellation").CancellationToken.none);
+    defer audit.deinit();
+    @memset(request_path, 'x');
+    alloc.free(request_path);
+    request_path_owned = false;
+    try std.testing.expectEqualStrings(path, audit.options.directory);
+    try std.testing.expect(audit.options.cancellation == null);
+    const member_key = makeParticipantIndexKey(participant_index_prefix, id, names[0]);
+    // The retained image must not observe this later raw corruption.
+    try store.put(&member_key, "wrong indexed participant");
+    const Noop = @import("antfly_cancellation").CancellationToken.none;
+    var paused = false;
+    for (0..512) |_| {
+        const complete = try audit.step(.{ .units = 1 }, Noop);
+        try std.testing.expect(audit.last_units <= 1);
+        if (audit.active) |*record| {
+            try std.testing.expect(record.last_hashed_bytes <= 4096);
+            try std.testing.expect(record.last_compared_bytes <= 4096);
+            if (!paused and record.stage == .hash and record.hashed != 0 and record.hashed < record.name.len) {
+                const offset = record.hashed;
+                try std.testing.expectError(error.Canceled, audit.step(.{ .units = 1 }, @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled)));
+                try std.testing.expect(!audit.invalid);
+                try std.testing.expectEqual(offset, record.hashed);
+                paused = true;
+            }
+        }
+        if (complete) break;
+    } else return error.TestUnexpectedResult;
+    const stats = try audit.result();
+    try std.testing.expect(paused);
+    try std.testing.expectEqual(@as(u64, 1), stats.records);
+    try std.testing.expectEqual(@as(u64, 9 * name_len), stats.hashed_bytes);
+    try std.testing.expectEqual(@as(u64, 3 * name_len), stats.compared_bytes);
+    var fresh = try store.beginReadTxn();
+    defer fresh.abort();
+    var corrupt = try TxnManager.TopologySnapshotAudit(@TypeOf(&fresh)).init(alloc, &fresh, .{ .io = std.testing.io, .directory = path }, Noop);
+    defer corrupt.deinit();
+    var rejected = false;
+    for (0..512) |_| {
+        const complete = corrupt.step(.{ .units = 1 }, Noop) catch |err| {
+            try std.testing.expectEqual(error.InvalidTxnRecord, err);
+            rejected = true;
+            break;
+        };
+        try std.testing.expect(!complete);
+    }
+    try std.testing.expect(rejected and corrupt.invalid);
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, corrupt.result());
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, corrupt.step(.{}, Noop));
+    var partial = try Audit.init(alloc, &read, .{ .io = std.testing.io, .directory = path }, Noop);
+    defer partial.deinit();
+    for (0..64) |_| {
+        _ = try partial.step(.{ .units = 1 }, Noop);
+        if (partial.active) |*record| if (record.stage == .hash and record.hashed != 0 and record.hashed < record.name.len) break;
+    } else return error.TestUnexpectedResult;
+    const Fail = struct {
+        calls: usize = 0,
+        pub fn check(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls >= 6) return error.Canceled;
+        }
+    };
+    var failure: Fail = .{};
+    const before = partial.stats.hashed_bytes;
+    try std.testing.expectError(error.Canceled, partial.step(.{}, &failure));
+    try std.testing.expectEqual(before + 4096, partial.stats.hashed_bytes);
+    try std.testing.expect(partial.invalid);
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, partial.result());
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, partial.step(.{}, Noop));
+}
+
+test "transaction debt record audit yields through legacy lists and large retained proofs" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-record-audit-legacy");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const names = try alloc.alloc([]u8, 600);
+    defer alloc.free(names);
+    var initialized: usize = 0;
+    defer for (names[0..initialized]) |name| alloc.free(name);
+    var total_bytes: u64 = 0;
+    for (names, 0..) |*name, i| {
+        name.* = try std.fmt.allocPrint(alloc, "replica-{d}", .{i});
+        initialized += 1;
+        total_bytes += name.len;
+    }
+    const id: TxnId = @splat(72);
+    try manager.initTransactionWithParticipants(id, 1, names);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(&makeSidecarKey(participant_index_prefix, id));
+        for (names) |name| try txn.delete(&makeParticipantIndexKey(participant_index_prefix, id, name));
+        try txn.commit();
+    }
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const Noop = @import("antfly_cancellation").CancellationToken.none;
+    var audit = try TxnManager.TopologySnapshotAudit(@TypeOf(&read)).init(alloc, &read, .{ .io = std.testing.io, .directory = path, .chunk_records = 7, .fan_in = 3 }, Noop);
+    defer audit.deinit();
+    var spilled = false;
+    var merge_passes: usize = 0;
+    for (0..100_000) |_| {
+        const complete = try audit.step(.{ .units = 1 }, Noop);
+        try std.testing.expect(audit.last_units <= 1);
+        if (audit.active) |*record| {
+            try std.testing.expect(record.last_hashed_bytes <= 4096);
+            if (record.proof.sort) |sort| {
+                spilled = true;
+                merge_passes = @max(merge_passes, sort.base.merge_passes);
+                try std.testing.expect(sort.last_units <= 1);
+            }
+        }
+        if (complete) break;
+    } else return error.TestUnexpectedResult;
+    const stats = try audit.result();
+    try std.testing.expect(spilled and merge_passes > 1);
+    try std.testing.expectEqual(@as(u64, 1), stats.records);
+    try std.testing.expectEqual(total_bytes, stats.hashed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.compared_bytes);
+    _ = try TxnManager.validateTopologyDebtSnapshot(alloc, &read, null, .{ .io = std.testing.io, .directory = path });
+}
+
+test "transaction debt retained audit owns and cleans every failed scope initialization" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-record-audit-alloc");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const Read = @TypeOf(&read);
+    const Check = struct {
+        fn run(a: Allocator, snapshot: Read, directory: []const u8) !void {
+            const control = @import("antfly_cancellation").CancellationToken.none;
+            var audit = try TxnManager.TopologySnapshotAudit(@TypeOf(snapshot)).init(a, snapshot, .{ .io = std.testing.io, .directory = directory }, control);
+            defer audit.deinit();
+            while (!try audit.step(.{ .units = 1 }, control)) {}
+            try std.testing.expectEqual(@as(u64, 0), (try audit.result()).records);
+        }
+    };
+    var stable = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{ &read, path });
+}
+
+test "transaction debt snapshot audit retains one cursor across bounded turns and live writes" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-debt-snapshot-turns");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const scope: topology_debt.Scope = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .generation = @splat(4), .epoch = 1 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var header = try topology_debt.initialize(&txn, scope);
+        for (0..257) |i| {
+            var id: TxnId = @splat(0);
+            std.mem.writeInt(u64, id[8..16], @intCast(i), .big);
+            try topology_debt.setMember(&txn, &header, id, .blocked);
+        }
+        try topology_debt.save(&txn, header);
+        try txn.commit();
+    }
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    var points = try read.openReadScope(alloc);
+    defer points.close();
+    const Cursor = @typeInfo(@TypeOf(read.openCursor())).error_union.payload;
+    const Counted = struct {
+        read: *@TypeOf(read),
+        opens: usize = 0,
+        pub fn openCursor(self: *@This()) !Cursor {
+            self.opens += 1;
+            return self.read.openCursor();
+        }
+    };
+    var counted: Counted = .{ .read = &read };
+    const control = @import("antfly_cancellation").CancellationToken.none;
+    var audit = try topology_debt.SnapshotAudit(*Counted).init(&counted, &points, scope, control);
+    defer audit.deinit();
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, audit.result());
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var header = try topology_debt.require(&txn, scope);
+        try topology_debt.setMember(&txn, &header, @splat(0), null);
+        try topology_debt.save(&txn, header);
+        try txn.commit();
+    }
+    var changed_read = try store.beginReadTxn();
+    defer changed_read.abort();
+    var changed_points = try changed_read.openReadScope(alloc);
+    defer changed_points.close();
+    var mixed = try topology_debt.SnapshotAudit(@TypeOf(&read)).init(&read, &points, scope, control);
+    defer mixed.deinit();
+    try std.testing.expectError(error.SchemaValidationJobChanged, mixed.step(&changed_points, .{}, control));
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, mixed.step(&points, .{}, control));
+    var turns: usize = 0;
+    while (true) {
+        turns += 1;
+        if (turns > 260) return error.TestUnexpectedResult;
+        const complete = try audit.step(&points, .{ .records = 1 }, control);
+        try std.testing.expect(audit.last_units <= 1);
+        if (complete) break;
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, audit.result());
+    }
+    try std.testing.expectEqual(@as(usize, 259), turns);
+    try std.testing.expectEqual(@as(usize, 1), counted.opens);
+    const summary = try audit.result();
+    try std.testing.expectEqual(@as(u64, 257), summary.members);
+    try std.testing.expectEqualDeep(summary, try topology_debt.validateSnapshot(&read, &points, scope, control));
+    try std.testing.expectEqual(@as(u64, 256), (try topology_debt.validateSnapshot(&changed_read, &changed_points, scope, control)).members);
+}
+
+test "transaction debt snapshot audit never qualifies rejected EOF or cancelled partial counters" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-debt-snapshot-faults");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const scope: topology_debt.Scope = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .generation = @splat(4), .epoch = 1 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var header = try topology_debt.initialize(&txn, scope);
+        header.debt = 1; // Structurally canonical, physically missing its member.
+        try topology_debt.save(&txn, header);
+        try txn.commit();
+    }
+    const Noop = @import("antfly_cancellation").CancellationToken.none;
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var points = try read.openReadScope(alloc);
+        defer points.close();
+        var audit = try topology_debt.SnapshotAudit(@TypeOf(&read)).init(&read, &points, scope, Noop);
+        defer audit.deinit();
+        try std.testing.expect(!try audit.step(&points, .{ .records = 1 }, Noop));
+        try std.testing.expectError(error.InvalidTxnRecord, audit.step(&points, .{ .records = 1 }, Noop));
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, audit.step(&points, .{}, Noop));
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, audit.result());
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var header = try topology_debt.require(&txn, scope);
+        header.debt = 0;
+        try topology_debt.setMember(&txn, &header, @splat(1), .blocked);
+        try topology_debt.setMember(&txn, &header, @splat(2), .blocked);
+        try topology_debt.save(&txn, header);
+        try txn.commit();
+    }
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    var points = try read.openReadScope(alloc);
+    defer points.close();
+    const Control = struct {
+        calls: usize = 0,
+        limit: usize = std.math.maxInt(usize),
+        pub fn check(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls >= self.limit) return error.Canceled;
+        }
+    };
+    var control: Control = .{};
+    var audit = try topology_debt.SnapshotAudit(@TypeOf(&read)).init(&read, &points, scope, &control);
+    defer audit.deinit();
+    control.limit = control.calls + 1;
+    try std.testing.expectError(error.Canceled, audit.step(&points, .{}, &control));
+    try std.testing.expect(!audit.invalid and !audit.started);
+    control.limit = control.calls + 4;
+    try std.testing.expectError(error.Canceled, audit.step(&points, .{}, &control));
+    try std.testing.expectEqual(@as(usize, 2), audit.last_units);
+    control.limit = std.math.maxInt(usize);
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, audit.step(&points, .{}, &control));
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, audit.result());
+}
+
+test "transaction debt atomically retains coordinator ACKs and rejects foreign generations" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-qualified-debt");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const scope: topology_debt.Scope = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .generation = @splat(4), .epoch = 1 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try TxnManager.stageTopologyDebtBegin(&txn, scope);
+        try txn.commit();
+    }
+    const id: TxnId = @splat(7);
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 10, 10, &.{ "local", "remote" }, true, true);
+    try manager.resolveIntents(id, .committed, 20);
+    _ = try reconcileDebtForTest(&manager, &store, scope);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(!try topology_debt.drained(&read, scope));
+        try std.testing.expectEqual(@as(u64, 1), (try topology_debt.require(&read, scope)).debt);
+    }
+    try manager.markParticipantsResolvedExtraBatch(id, &.{"remote"}, .{});
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(!try topology_debt.drained(&read, scope));
+    }
+    const receipt_key = "\x00\x00__metadata__:debt_test_ack";
+    try std.testing.expectError(error.InvalidParticipant, manager.resolveIntentsWithExtraBatch(id, .committed, 20, .{ .resolved_participant = "outsider" }));
+    _ = try manager.resolveIntentsWithExtraBatch(id, .committed, 20, .{
+        .resolved_participant = "local",
+        .completion_writes = &.{.{ .key = receipt_key, .value = "durable" }},
+    });
+    // Replaying local completion neither grows the ACK count nor reintroduces
+    // the legacy list (which would force a cohort-sized reconciliation).
+    _ = try manager.resolveIntentsWithExtraBatch(id, .committed, 20, .{ .resolved_participant = "local" });
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try topology_debt.drained(&read, scope));
+        try std.testing.expectEqualStrings("durable", try read.get(receipt_key));
+        const index = try ParticipantIndex.decode(try read.get(&makeSidecarKey(participant_index_prefix, id)));
+        try std.testing.expectEqual(@as(u64, 2), index.resolved);
+        try std.testing.expectError(error.NotFound, read.get(&makeSidecarKey(resolved_participants_prefix, id)));
+        var foreign = scope;
+        foreign.epoch += 1;
+        try std.testing.expectError(error.SchemaValidationJobChanged, topology_debt.drained(&read, foreign));
+    }
+    try std.testing.expectError(error.InvalidCommitMetadata, manager.markParticipantsResolvedExtraBatch(id, &.{"local"}, .{ .writes = &.{.{ .key = topology_debt.head_key, .value = "forged-empty" }} }));
+    try std.testing.expect(!try manager.hasTopologySensitiveTransactions());
+}
+
+test "transaction debt local ACK shares commit abort and predecessor completion batches" {
+    const alloc = std.testing.allocator;
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        for (0..3) |mode| {
+            var backend = mem_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(alloc, .{});
+            defer runtime.deinit();
+            var manager = try TxnManager.init(alloc, &runtime);
+            defer manager.deinit();
+            const id: TxnId = @splat(29);
+            try manager.initTransactionWithParticipants(id, 10, &.{ "local", "remote", "local" });
+            if (mode == 0) try manager.writeIntents(id, &.{.{ .key = "row", .value = "value" }}, &.{});
+            if (mode == 2) {
+                // A predecessor already decided, but has not persisted the
+                // completed-intent marker. Exercise that completion branch.
+                var record = try manager.loadTransactionRecord(id);
+                record.status = status;
+                record.intents_resolved = false;
+                const bytes = try manager.encodeRecord(record);
+                defer alloc.free(bytes);
+                try manager.putValue(&makeRecordKey(id), bytes);
+            }
+            const receipt_key = "\x00\x00__metadata__:local_ack_receipt";
+            _ = try manager.resolveIntentsWithExtraBatch(id, status, 20, .{
+                .resolved_participant = "local",
+                .completion_writes = &.{.{ .key = receipt_key, .value = "committed" }},
+            });
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            const index = try ParticipantIndex.decode(try read.get(&makeSidecarKey(participant_index_prefix, id)));
+            try std.testing.expectEqual(@as(u64, 2), index.enlisted);
+            try std.testing.expectEqual(@as(u64, 1), index.resolved);
+            try std.testing.expectEqualStrings("local", try read.get(&makeParticipantIndexKey(resolved_index_prefix, id, "local")));
+            try std.testing.expectEqualStrings("committed", try read.get(receipt_key));
+            try std.testing.expectError(error.NotFound, read.get(&makeSidecarKey(resolved_participants_prefix, id)));
+            try std.testing.expectEqual(status, (try manager.loadTransactionRecord(id)).status);
+        }
+    }
+}
+
+test "transaction debt pages legacy cohorts and GCs invalidated work without hiding ACK debt" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-debt-legacy-pages");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(11);
+    var names: [300][16]u8 = undefined;
+    var participants: [300][]const u8 = undefined;
+    for (&participants, 0..) |*name, index| name.* = try std.fmt.bufPrint(&names[index], "member-{d}", .{index});
+    try manager.initTransactionWithParticipants(id, 10, &participants);
+    try manager.resolveIntents(id, .committed, 20);
+    // A released predecessor image has the list sidecars but no indexed
+    // membership/header. Do not accidentally test only new-write fast paths.
+    {
+        const prefix = makeSidecarKey(participant_index_prefix, id);
+        const old = try backend_scan.scanPrefix(alloc, &manager.store, &prefix);
+        defer backend_scan.freeResults(alloc, old);
+        for (old) |entry| try store.delete(entry.key);
+    }
+    const scope: topology_debt.Scope = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .generation = @splat(12), .epoch = 2 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try TxnManager.stageTopologyDebtBegin(&txn, scope);
+        try txn.commit();
+    }
+    const first = (try manager.prepareTopologyDebtPage(scope, DebtTestControl{})).?;
+    try std.testing.expectEqual(@as(usize, topology_debt.max_page_units), first.units);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try first.stage(&txn);
+        try txn.commit();
+    }
+    const stale = (try manager.prepareTopologyDebtPage(scope, DebtTestControl{})).?;
+    {
+        const original = try store.get(alloc, topology_debt.head_key);
+        defer alloc.free(original);
+        var bad = try topology_debt.Header.decode(original);
+        bad.progress.enlisted += 1;
+        try store.put(topology_debt.head_key, &try bad.encode());
+        try std.testing.expectError(error.InvalidTxnRecord, validateDebtForTest(&manager, scope));
+        try store.put(topology_debt.head_key, original);
+        bad = try topology_debt.Header.decode(original);
+        bad.progress.offset += 1;
+        try store.put(topology_debt.head_key, &try bad.encode());
+        try std.testing.expectError(error.InvalidTxnRecord, validateDebtForTest(&manager, scope));
+        try store.put(topology_debt.head_key, original);
+    }
+    try manager.markParticipantResolved(id, participants[0]);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.SchemaValidationPreparationChanged, stale.stage(&txn));
+    }
+    const pages = try reconcileDebtForTest(&manager, &store, scope);
+    try std.testing.expect(pages > 8);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(!try topology_debt.drained(&read, scope));
+        try std.testing.expectEqual(@as(u64, 1), (try topology_debt.require(&read, scope)).debt);
+        try std.testing.expect(!try topology_debt.hasPrefix(&read, &topology_debt.orphanPrefix(scope.generation)));
+        try std.testing.expect(!try topology_debt.hasPrefix(&read, &topology_debt.seenPrefix(scope.generation)));
+    }
+    var offset: usize = 0;
+    while (offset < participants.len) {
+        const end = @min(participants.len, offset + 64);
+        try manager.markParticipantsResolvedExtraBatch(id, participants[offset..end], .{});
+        offset = end;
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expect(try topology_debt.drained(&txn, scope));
+        try topology_debt.retire(&txn, scope);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.SchemaValidationJobChanged, TxnManager.stageTopologyDebtBegin(&txn, scope));
+    }
+}
+
+test "transaction debt snapshot rejects canonical empty claims and orphan members" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(31);
+    try manager.initTransactionWithParticipants(id, 10, &.{"local"});
+    {
+        _ = try validateDebtForTest(&manager, null);
+        const key = makeSidecarKey(participant_index_prefix, id);
+        const original = try manager.getAlloc(alloc, &key);
+        defer alloc.free(original);
+        var forged_index: [17]u8 = undefined;
+        (ParticipantIndex{ .enlisted = 1, .resolved = 1 }).encode(&forged_index);
+        try manager.putValue(&key, &forged_index);
+        try std.testing.expectError(error.InvalidTxnRecord, validateDebtForTest(&manager, null));
+        try manager.putValue(&key, original);
+    }
+    const scope: topology_debt.Scope = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .generation = @splat(32), .epoch = 3 };
+    {
+        var txn = try manager.store.beginBatch();
+        errdefer txn.abort();
+        try TxnManager.stageTopologyDebtBegin(&txn, scope);
+        try txn.commit();
+    }
+    _ = try validateDebtForTest(&manager, scope);
+    const head_bytes = try manager.getAlloc(alloc, topology_debt.head_key);
+    defer alloc.free(head_bytes);
+    var forged = try topology_debt.Header.decode(head_bytes);
+    forged.phase = .ready;
+    forged.after = null;
+    forged.debt = 0;
+    {
+        var txn = try manager.store.beginBatch();
+        errdefer txn.abort();
+        try txn.delete(&topology_debt.memberKey(scope.generation, id));
+        try topology_debt.save(&txn, forged);
+        try txn.commit();
+    }
+    // Header/count/directory are internally canonical, but the retained
+    // pending coordinator disproves the apparent empty/ready claim.
+    try std.testing.expectError(error.InvalidTxnRecord, validateDebtForTest(&manager, scope));
+    {
+        var txn = try manager.store.beginBatch();
+        errdefer txn.abort();
+        try txn.put(topology_debt.head_key, head_bytes);
+        try txn.put(&topology_debt.memberKey(scope.generation, id), &.{1});
+        try txn.commit();
+    }
+    const index_key = makeSidecarKey(participant_index_prefix, id);
+    var invalid_index: [17]u8 = undefined;
+    (ParticipantIndex{ .enlisted = 1, .resolved = 1 }).encode(&invalid_index);
+    const old_index = try manager.getAlloc(alloc, &index_key);
+    defer alloc.free(old_index);
+    try manager.putValue(&index_key, &invalid_index);
+    try std.testing.expectError(error.InvalidTxnRecord, validateDebtForTest(&manager, scope));
+    try manager.putValue(&index_key, old_index);
+    {
+        var txn = try manager.store.beginBatch();
+        errdefer txn.abort();
+        var h = try topology_debt.Header.decode(head_bytes);
+        h.debt += 1;
+        try topology_debt.save(&txn, h);
+        try txn.put(&topology_debt.memberKey(scope.generation, @splat(33)), &.{1});
+        try txn.commit();
+    }
+    try std.testing.expectError(error.InvalidTxnRecord, validateDebtForTest(&manager, scope));
+}
+
+test "transaction debt dirty predecessors invalidate later partial work and reopen GC" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-earlier-dirty");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const first: TxnId = @splat(1);
+    const later: TxnId = @splat(2);
+    const names = [_][]const u8{ "a", "b", "c", "d" };
+    try manager.initTransactionWithParticipants(first, 10, &names);
+    try manager.resolveIntents(first, .committed, 20);
+    try manager.markParticipantsResolvedExtraBatch(first, &names, .{});
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const participants = try arena.allocator().alloc([]const u8, 300);
+    for (participants, 0..) |*name, i| name.* = try std.fmt.allocPrint(arena.allocator(), "p-{d}", .{i});
+    try manager.initTransactionWithParticipants(later, 10, participants);
+    try manager.resolveIntents(later, .committed, 20);
+    try removeParticipantIndexForTest(&manager, later);
+    const scope: topology_debt.Scope = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .generation = @splat(34), .epoch = 4 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try TxnManager.stageTopologyDebtBegin(&txn, scope);
+        try txn.commit();
+    }
+    {
+        const page = (try manager.prepareTopologyDebtPage(scope, DebtTestControl{})).?;
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try page.stage(&txn);
+        try txn.commit();
+    }
+    const legacy_key = makeSidecarKey(resolved_participants_prefix, first);
+    const legacy = try encodeParticipantList(alloc, &.{"a"});
+    defer alloc.free(legacy);
+    try manager.putValue(&legacy_key, legacy);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const h = try topology_debt.require(&read, scope);
+        try std.testing.expect(h.pending == null);
+        try std.testing.expect(try topology_debt.hasPrefix(&read, &topology_debt.orphanPrefix(scope.generation)));
+    }
+    _ = try reconcileDebtForTest(&manager, &store, scope);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var h = try topology_debt.require(&txn, scope);
+        try std.testing.expectEqual(@as(u64, 1), h.debt);
+        h.phase = .gc; // A valid GC turn after its last orphan was reclaimed.
+        try topology_debt.save(&txn, h);
+        try txn.commit();
+    }
+    try manager.putValue(&legacy_key, legacy);
+    _ = try reconcileDebtForTest(&manager, &store, scope);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const h = try topology_debt.require(&read, scope);
+        try std.testing.expectEqual(topology_debt.Phase.ready, h.phase);
+        try std.testing.expectEqual(@as(u64, 1), h.debt);
+        try std.testing.expect(try topology_debt.member(&read, scope.generation, first) == null);
+    }
+}
+
+test "transaction debt malformed released status tags remain typed corruption" {
+    for ([_]usize{ txn_record_v0_size, txn_record_v1_size, txn_record_v2_size, txn_record_v3_size, txn_record_v4_size, txn_record_v5_size, txn_record_v6_size }) |size| {
+        var bytes: [txn_record_v6_size]u8 = @splat(0);
+        for ([_]u8{ 3, 127, 255 }) |status| {
+            bytes[0] = status;
+            try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(bytes[0..size]));
+        }
+    }
+}
+
 test "topology fence retains committed coordinator recovery obligations" {
     const alloc = std.testing.allocator;
     const path = try tempTestPath(alloc, "txn-topology-recovery-fence");
@@ -4969,6 +6001,15 @@ test "retained terminal transactions honor the extended retry cutoff" {
     try std.testing.expectEqual(@as(usize, 0), resolved.len);
 }
 
+fn removeParticipantIndexForTest(manager: *TxnManager, id: TxnId) !void {
+    const entries = try manager.scanPrefix(manager.alloc, &makeSidecarKey(participant_index_prefix, id));
+    defer backend_scan.freeResults(manager.alloc, entries);
+    const deletes = try manager.alloc.alloc([]const u8, entries.len);
+    defer manager.alloc.free(deletes);
+    for (entries, 0..) |entry, i| deletes[i] = entry.key;
+    try manager.applyBatch(&.{}, deletes, null);
+}
+
 test "transaction participant batch migrates legacy evidence atomically and cleans indexed membership" {
     const alloc = std.testing.allocator;
     var backend = mem_backend.Backend.init(alloc, .{});
@@ -4979,6 +6020,8 @@ test "transaction participant batch migrates legacy evidence atomically and clea
     defer mgr.deinit();
     const txn: TxnId = @splat(41);
     try mgr.initTransactionWithParticipants(txn, 100, &.{ "a", "b", "c" });
+    // Model a released predecessor, not a newly indexed BEGIN.
+    try removeParticipantIndexForTest(&mgr, txn);
     try mgr.markParticipantResolved(txn, "a");
     try std.testing.expectError(error.InvalidParticipant, mgr.markParticipantsResolvedExtraBatch(txn, &.{ "b", "absent" }, .{}));
     const index_key = makeSidecarKey(participant_index_prefix, txn);
@@ -5019,6 +6062,7 @@ test "transaction participant batch releases migration allocations on every fail
             defer mgr.deinit();
             const txn: TxnId = @splat(42);
             try mgr.initTransactionWithParticipants(txn, 100, &.{ "a", "b", "c" });
+            try removeParticipantIndexForTest(&mgr, txn);
             try mgr.markParticipantResolved(txn, "a");
             mgr.alloc = failing;
             defer mgr.alloc = alloc;

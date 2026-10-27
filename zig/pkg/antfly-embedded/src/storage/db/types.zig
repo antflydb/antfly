@@ -401,6 +401,8 @@ pub const BatchRequest = struct {
     relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
     relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
+    /// Private ordered owner control. Never admitted from public batch JSON.
+    relational_index_owner_control: ?@import("relational_index_raft_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
@@ -1419,6 +1421,13 @@ pub const Query = union(enum) {
     graph: graph_query_mod.GraphQuery,
 };
 
+/// A scoped integrity proof may authorize full-primary observations directly
+/// or inside a bounded integrity-job batch. Transport still requires explicit
+/// service authentication; native row reads verify the signed owner/purpose.
+pub fn supportsIntegrityReadProof(include_primary_digest: bool, jobs_json: []const u8) bool {
+    return include_primary_digest or jobs_json.len != 0;
+}
+
 pub const LookupOptions = struct {
     /// Local output allocation policy; never parsed from public requests.
     /// Raw copies and flat native projections already allocate exact bodies.
@@ -1434,6 +1443,8 @@ pub const LookupOptions = struct {
     /// Private optimistic observation: captures version and SHA256 of the
     /// exact primary bytes from one snapshot, regardless of JSON projection.
     include_primary_digest: bool = false,
+    /// Internal typed observation only; the outer owner job carries provenance in its bounded body.
+    include_json_null_fields: bool = false,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
     /// Authenticated group-local control read; never accepted by public lookup parsing.
@@ -1476,9 +1487,12 @@ pub const LookupResult = struct {
     json: []u8,
     version: ?u64 = null,
     expected_content_digest: ?[32]u8 = null,
+    json_null_fields: []const []const u8 = &.{},
 
     pub fn deinit(self: *LookupResult, alloc: Allocator) void {
         alloc.free(self.json);
+        for (self.json_null_fields) |name| alloc.free(name);
+        if (self.json_null_fields.len != 0) alloc.free(self.json_null_fields);
         self.* = undefined;
     }
 };
@@ -1526,6 +1540,7 @@ pub const ColumnarScanStats = struct {
 /// Borrowed typed request for native callers. Encoded only at an archive or
 /// network boundary; fields and JSON operands must outlive the synchronous scan.
 pub const RelationalRowQuery = struct {
+    pub const ExpressionEquality = @import("../relational_index.zig").ExpressionEqualityHint;
     pub const Bound = struct { values: []const std.json.Value, inclusive: bool = true };
     pub const Condition = struct {
         column: []const u8,
@@ -1533,6 +1548,23 @@ pub const RelationalRowQuery = struct {
         value: ?std.json.Value = null,
         collation: ?[]const u8 = null,
     };
+    /// Exact, unranked SQL predicate. Every owner must understand this field;
+    /// retained-read admission requires an explicit predicate digest from
+    /// every owner before rows. No LIMIT/top-K bound is part of membership.
+    pub const TextFilter = struct {
+        query: []const u8,
+        index: ?[]const u8 = null,
+        config_hash: ?u64 = null,
+        memory_bytes: usize = 32 * 1024 * 1024,
+    };
+    text_filter: ?TextFilter = null,
+    /// Private mutation preparation: exposed RETURNING postimages must pass
+    /// the same owner-side SELECT policy and mandatory filter as a read.
+    /// Ordinary write normalization deliberately does not require visibility.
+    require_normalized_visibility: bool = false,
+    /// Internal normalization context captured by the SQL transaction owner.
+    /// Never replaces read authority, schema fences or the authenticated policy.
+    normalization_transaction_micros: ?i64 = null,
     /// Retained typed readers bound bytes as well as rows. Transported with
     /// the query so every owner uses the same requested page envelope.
     page_bytes: usize = 16 * 1024 * 1024,
@@ -1546,6 +1578,10 @@ pub const RelationalRowQuery = struct {
     lower: ?Bound = null,
     upper: ?Bound = null,
     conditions: []const Condition = &.{},
+    /// Internal access hints, not filters. The caller must retain the logical
+    /// predicate, including when no READY matching index exists. Ignoring a
+    /// hint always leaves a correct primary scan with that residual predicate.
+    expression_equalities: []const ExpressionEquality = &.{},
     schema_version: ?u32 = null,
 };
 
@@ -1741,6 +1777,8 @@ pub const TransactionWrite = struct {
 };
 
 pub const TransactionVersionPredicate = struct {
+    /// Private SQL command provenance; public batch parsers never populate it.
+    row_policy_requirement: @import("../../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     key: []const u8,
     expected_version: u64,
     /// Internal observation guard. TTL timestamps need not change on updates.

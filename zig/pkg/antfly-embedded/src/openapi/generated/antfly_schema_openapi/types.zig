@@ -62,6 +62,9 @@ pub const AntflyType = enum {
     }
 };
 
+/// Document SQL alias declared by x-antfly-column-name on a JSON Schema property. Nested aliases bind literal object-key segments, including keys containing dots or slashes. Aliases do not create stored fields. Names must be unique across physical roots and aliases within a document type and must resolve to the same path across document types. Reserved _id, _doc and _version names are not allowed. Aliases require a fixed property path; array-item, pattern-property and conditional-schema aliases are rejected. Physical root columns remain available alongside aliases. Ancestor and descendant columns cannot be assigned together in one SQL mutation.
+pub const DocumentColumnName = []const u8;
+
 /// Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
 pub const DocumentFieldMapping = struct {
     type: ?FieldMappingType = null,
@@ -700,6 +703,8 @@ pub const LakeCatalogConfig = struct {
 
 /// A typed CHECK. Supply either expression or column and op (with optional value and collation), never both forms. Expressions must return boolean and use the shared bounded immutable scalar expression vocabulary. New writes are checked from schema publication; existing rows are validated separately. SQL UNKNOWN satisfies CHECK. Comparison values must match the column type. Integer values may also use exact decimal strings to avoid client-side floating-point rounding.
 pub const RelationalCheckConstraint = struct {
+    /// Enforce this CHECK on every new or changed row without asserting that historical rows satisfy it. Explicit validation clears this declaration only after an unpublished generation has validated all rows and atomically replaced the active generation. Disposable background scan coverage does not change this declaration.
+    not_valid: ?bool = null,
     name: []const u8,
     column: ?[]const u8 = null,
     op: ?RelationalComparisonOp = null,
@@ -711,6 +716,7 @@ pub const RelationalCheckConstraint = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "not_valid", "not_valid", true },
         .{ "name", "name", false },
         .{ "column", "column", true },
         .{ "op", "op", true },
@@ -729,6 +735,10 @@ pub const RelationalCheckConstraint = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.not_valid) |value| {
+            try jw.objectField("not_valid");
+            try jw.write(value);
+        }
         try jw.objectField("name");
         try jw.write(self.name);
         if (self.column) |value| {
@@ -755,9 +765,83 @@ pub const RelationalCheckConstraint = struct {
     }
 };
 
+/// Exactly one of expression or the backend-bound sequence reference is required. Sequence references are column defaults only and cannot define stored generated columns.
 pub const RelationalColumnExpression = struct {
     column: []const u8,
-    expression: RelationalScalarExpression,
+    expression: ?RelationalScalarExpression = null,
+    sequence: ?RelationalColumnSequence = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", false },
+        .{ "expression", "expression", true },
+        .{ "sequence", "sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("column");
+        try jw.write(self.column);
+        if (self.expression) |value| {
+            try jw.objectField("expression");
+            try jw.write(value);
+        }
+        if (self.sequence) |value| {
+            try jw.objectField("sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Backend-bound owned-sequence default, assigned atomically with the table and stable attribute identity. Names are descriptive; allocation uses the exact catalog incarnation and native 64-bit identities. Requires reader capability 37. Preparation allocates only for absent inputs; explicit NULL never requests a new value. Restore preserves stored values and never consumes the sequence. Clients cannot mint ownership by copying a descriptor onto a different table or column. Bulk mutation APIs preserve explicit identity values, like PostgreSQL COPY; SQL enforces ALWAYS and OVERRIDING rules. Implicit identity allocation uses table write authority; serial defaults and explicit sequence functions require sequence privileges.
+pub const RelationalColumnSequence = struct {
+    generation: RelationalColumnSequenceGeneration,
+    incarnation: []const u8,
+    sequence_id: []const u8,
+    namespace_id: []const u8,
+    table_id: []const u8,
+    column_id: []const u8,
+    database: []const u8,
+    namespace: []const u8,
+    name: []const u8,
+};
+
+/// SQL owned-sequence default policy. Serial defaults preserve explicit values even under OVERRIDING USER VALUE; identity defaults obey PostgreSQL overriding rules.
+pub const RelationalColumnSequenceGeneration = enum {
+    serial,
+    by_default,
+    always,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .serial => "serial",
+            .by_default => "by_default",
+            .always => "always",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "serial", .serial },
+            .{ "by_default", .by_default },
+            .{ "always", .always },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const RelationalComparisonOp = enum {
@@ -872,6 +956,22 @@ pub const RelationalExpressionOp = enum {
     in_list,
     not_in_list,
     array,
+    replace,
+    md5,
+    abs,
+    ceil,
+    floor,
+    round,
+    trunc,
+    sign,
+    sqrt,
+    jsonb_typeof,
+    jsonb_array_length,
+    jsonb_extract_path,
+    jsonb_extract_path_text,
+    uuidv4,
+    uuidv7,
+    transaction_timestamp,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -905,6 +1005,22 @@ pub const RelationalExpressionOp = enum {
             .in_list => "in_list",
             .not_in_list => "not_in_list",
             .array => "array",
+            .replace => "replace",
+            .md5 => "md5",
+            .abs => "abs",
+            .ceil => "ceil",
+            .floor => "floor",
+            .round => "round",
+            .trunc => "trunc",
+            .sign => "sign",
+            .sqrt => "sqrt",
+            .jsonb_typeof => "jsonb_typeof",
+            .jsonb_array_length => "jsonb_array_length",
+            .jsonb_extract_path => "jsonb_extract_path",
+            .jsonb_extract_path_text => "jsonb_extract_path_text",
+            .uuidv4 => "uuidv4",
+            .uuidv7 => "uuidv7",
+            .transaction_timestamp => "transaction_timestamp",
         };
         try jw.write(s);
     }
@@ -945,6 +1061,22 @@ pub const RelationalExpressionOp = enum {
             .{ "in_list", .in_list },
             .{ "not_in_list", .not_in_list },
             .{ "array", .array },
+            .{ "replace", .replace },
+            .{ "md5", .md5 },
+            .{ "abs", .abs },
+            .{ "ceil", .ceil },
+            .{ "floor", .floor },
+            .{ "round", .round },
+            .{ "trunc", .trunc },
+            .{ "sign", .sign },
+            .{ "sqrt", .sqrt },
+            .{ "jsonb_typeof", .jsonb_typeof },
+            .{ "jsonb_array_length", .jsonb_array_length },
+            .{ "jsonb_extract_path", .jsonb_extract_path },
+            .{ "jsonb_extract_path_text", .jsonb_extract_path_text },
+            .{ "uuidv4", .uuidv4 },
+            .{ "uuidv7", .uuidv7 },
+            .{ "transaction_timestamp", .transaction_timestamp },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -959,6 +1091,11 @@ pub const RelationalExpressionType = enum {
     number,
     numeric,
     sql_array,
+    json,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -970,6 +1107,11 @@ pub const RelationalExpressionType = enum {
             .number => "number",
             .numeric => "numeric",
             .sql_array => "sql_array",
+            .json => "json",
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
         };
         try jw.write(s);
     }
@@ -988,13 +1130,20 @@ pub const RelationalExpressionType = enum {
             .{ "number", .number },
             .{ "numeric", .numeric },
             .{ "sql_array", .sql_array },
+            .{ "json", .json },
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-/// Composite foreign key. Child and parent columns correspond by position and must have the same physical comparison types. The parent columns must identify a unique key. Existing-row validation is independent of new-write enforcement and is never client-writable. Enforcement and referential actions share the bounded distributed transaction path, including TTL expiry. Partial matching uses ordered support indexes on the parent; activation waits until these are ready. SET NULL requires every child column to accept explicit NULL.
+/// Composite foreign key. Child and parent columns correspond by position and must have the same physical comparison types. The parent columns must identify a unique key. Existing-row validation is independent of new-write enforcement. Clearing NOT VALID requires coordinated historical validation. Enforcement and referential actions share the bounded distributed transaction path, including TTL expiry. Partial matching uses ordered support indexes on the parent; activation waits until these are ready. SET NULL requires every child column to accept explicit NULL.
 pub const RelationalForeignKeyConstraint = struct {
+    /// Retain historical references without requiring their parents to exist. New writes and parent referential actions remain enforced. Setting false on an existing unvalidated declaration requires coordinated validation before publication; it cannot certify coverage itself.
+    not_valid: ?bool = null,
     name: []const u8,
     child_columns: []const []const u8,
     /// Literal parent table name in the child table's database and namespace. Resolved to an immutable table identity when the constraint is declared; renaming a parent preserves the reference. Public schemas show its current name.
@@ -1008,6 +1157,7 @@ pub const RelationalForeignKeyConstraint = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "not_valid", "not_valid", true },
         .{ "name", "name", false },
         .{ "child_columns", "child_columns", false },
         .{ "parent_table", "parent_table", false },
@@ -1029,6 +1179,10 @@ pub const RelationalForeignKeyConstraint = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.not_valid) |value| {
+            try jw.objectField("not_valid");
+            try jw.write(value);
+        }
         try jw.objectField("name");
         try jw.write(self.name);
         try jw.objectField("child_columns");
@@ -1330,21 +1484,24 @@ pub const RelationalIndexOwnerKind = enum {
     }
 };
 
-/// A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+/// A typed partial-index conjunct. Specify either a constant truth value, or a column and comparison operation, never both. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. A constant false conjunct represents an empty index without inventing a column dependency.
 pub const RelationalIndexPredicate = struct {
-    column: []const u8,
-    op: RelationalComparisonOp,
+    column: ?[]const u8 = null,
+    op: ?RelationalComparisonOp = null,
     /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
     value: ?std.json.Value = null,
     /// String comparison collation with the same semantics as ordered keys.
     collation: ?[]const u8 = null,
+    /// Constant membership truth. SQL UNKNOWN is normalized to false for index membership. Requires reader capability version 26.
+    constant: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "column", "column", false },
-        .{ "op", "op", false },
+        .{ "column", "column", true },
+        .{ "op", "op", true },
         .{ "value", "value", true },
         .{ "collation", "collation", true },
+        .{ "constant", "constant", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1357,10 +1514,14 @@ pub const RelationalIndexPredicate = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("column");
-        try jw.write(self.column);
-        try jw.objectField("op");
-        try jw.write(self.op);
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.op) |value| {
+            try jw.objectField("op");
+            try jw.write(value);
+        }
         if (self.value) |value| {
             try jw.objectField("value");
             try jw.write(value);
@@ -1369,11 +1530,15 @@ pub const RelationalIndexPredicate = struct {
             try jw.objectField("collation");
             try jw.write(value);
         }
+        if (self.constant) |value| {
+            try jw.objectField("constant");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
 
-/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19.
+/// Typed scalar expression, limited to 128 nodes and 16 levels. CHECK, generated-column and index expressions must be immutable. UUIDv4 and UUIDv7 generation are permitted only in column defaults and require reader capability version 33. They run once during owned row preparation, never during schema publication or restore verification. Transaction-clock defaults require reader capability version 34 and use the transaction owner's captured instant, shared across rows and statements in an explicit transaction. Stored values are preserved on restore. The uuidv4, uuidv7 and transaction_timestamp operations take no args; uuidv7 may specify shift and transaction_timestamp may specify precision. A literal requires type; omitted value means typed null. A column requires column; other operations except uuidv4, uuidv7 and transaction_timestamp require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. Volatile operations are restricted to column defaults. Allocated results are bounded to 1 MiB each. The replace operation takes three text arguments and performs literal, non-overlapping replacement; an empty search string leaves the input unchanged. md5 takes one text argument and returns 32 lowercase hex characters (a SQL compatibility fingerprint, not a security primitive). Both are strict in SQL NULL and require reader capability version 27, including when nested inside scalar/boolean expressions. Literal search patterns are prepared with immutable plans; matching, copies and dynamic pattern preparation share invocation work/cancellation admission. Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require reader capability version 28, even when nested in boolean programs. They take one NUMERIC or float64 argument; abs also preserves integer widths and float32. round and trunc optionally accept an int32 scale as a second argument only for NUMERIC. Operands must already have their resolved SQL types; SQL lowering inserts required promotions. NUMERIC round uses ties away from zero; float64 round uses ties to even. All selected arguments evaluate before strict NULL propagation. NUMERIC execution never converts through float and shares invocation admission. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19. JSON expressions require reader capability version 30. The json type carries JSONB semantics, including exact numeric values and display scale. jsonb_typeof and jsonb_array_length take one JSON argument; array length rejects a non-array value. jsonb_extract_path and jsonb_extract_path_text take a JSON argument followed by 1 to 31 text path components. Negative array ordinals count from the end; a missing path returns SQL NULL. JSON extraction retains JSON null; text extraction converts JSON null to SQL NULL. Arguments are evaluated strictly, while enclosing CASE/coalesce retain their short-circuit semantics.
 pub const RelationalScalarExpression = struct {
     op: RelationalExpressionOp,
     type: ?RelationalExpressionType = null,
@@ -1383,6 +1548,12 @@ pub const RelationalScalarExpression = struct {
     numeric_modifier: ?SQLNumericModifier = null,
     /// Typed literal value, including null.
     value: OpenApiOptionalNullable(std.json.Value) = .absent,
+    /// Canonical PostgreSQL interval text, accepted only on a uuidv7 default operation. SQL lowering resolves and binds calendar months, days, and microseconds before publication. Omission generates an unshifted UUID; SQL NULL shifts lower to a NULL literal instead. Infinite intervals remain representable declarations but fail when evaluated.
+    shift: ?[]const u8 = null,
+    /// Fractional-second precision (omission means 6), accepted only on a transaction_timestamp column default. Rounding uses the shared PostgreSQL timestamp semantics. Requires reader capability version 34.
+    precision: ?i64 = null,
+    /// For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30.
+    json_null: ?bool = null,
     column: ?[]const u8 = null,
     /// Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes.
     collation: ?[]const u8 = null,
@@ -1395,6 +1566,9 @@ pub const RelationalScalarExpression = struct {
         .{ "sql_type", "sql_type", true },
         .{ "numeric_modifier", "numeric_modifier", true },
         .{ "value", "value", false },
+        .{ "shift", "shift", true },
+        .{ "precision", "precision", true },
+        .{ "json_null", "json_null", true },
         .{ "column", "column", true },
         .{ "collation", "collation", true },
         .{ "args", "args", true },
@@ -1435,6 +1609,18 @@ pub const RelationalScalarExpression = struct {
                 try jw.write(value);
             },
         }
+        if (self.shift) |value| {
+            try jw.objectField("shift");
+            try jw.write(value);
+        }
+        if (self.precision) |value| {
+            try jw.objectField("precision");
+            try jw.write(value);
+        }
+        if (self.json_null) |value| {
+            try jw.objectField("json_null");
+            try jw.write(value);
+        }
         if (self.column) |value| {
             try jw.objectField("column");
             try jw.write(value);
@@ -1457,11 +1643,15 @@ pub const RelationalUniqueConstraint = struct {
     origin: ?RelationalUniqueConstraintOrigin = null,
     /// SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
     primary: ?bool = null,
+    /// Non-key payload columns for this constraint's covering ordered index. They never participate in uniqueness, foreign-key target identity, or primary-key nullability. Only column-key, constraint-owned declarations support INCLUDE.
+    include_columns: ?[]const []const u8 = null,
     columns: ?[]const []const u8 = null,
     /// Typed native unique keys. Specify either columns or keys.
     keys: ?[]const RelationalIndexKey = null,
     /// Conjunction restricting uniqueness to matching rows.
     where: ?[]const RelationalIndexPredicate = null,
+    /// Range-valued final key column for PostgreSQL WITHOUT OVERLAPS. Other key columns define equality groups; nonempty ranges within each group must be disjoint. The column remains in columns. Temporal keys are not equality-only foreign-key targets or ON CONFLICT arbiters.
+    without_overlaps_column: ?[]const u8 = null,
     /// When true, NULL components compare equal for uniqueness.
     nulls_not_distinct: ?bool = null,
     /// Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target.
@@ -1473,9 +1663,11 @@ pub const RelationalUniqueConstraint = struct {
         .{ "name", "name", false },
         .{ "origin", "origin", true },
         .{ "primary", "primary", true },
+        .{ "include_columns", "include_columns", true },
         .{ "columns", "columns", true },
         .{ "keys", "keys", true },
         .{ "where", "where", true },
+        .{ "without_overlaps_column", "without_overlaps_column", true },
         .{ "nulls_not_distinct", "nulls_not_distinct", true },
         .{ "deferrable", "deferrable", true },
         .{ "timing", "timing", true },
@@ -1501,6 +1693,10 @@ pub const RelationalUniqueConstraint = struct {
             try jw.objectField("primary");
             try jw.write(value);
         }
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
         if (self.columns) |value| {
             try jw.objectField("columns");
             try jw.write(value);
@@ -1511,6 +1707,10 @@ pub const RelationalUniqueConstraint = struct {
         }
         if (self.where) |value| {
             try jw.objectField("where");
+            try jw.write(value);
+        }
+        if (self.without_overlaps_column) |value| {
+            try jw.objectField("without_overlaps_column");
             try jw.write(value);
         }
         if (self.nulls_not_distinct) |value| {
@@ -1709,6 +1909,43 @@ pub const SQLNumericModifier = struct {
     scale: i64,
 };
 
+/// A relational PostgreSQL range column. JSON ingress and SQL results use PostgreSQL range text. The declared subtype supplies identity even for NULL, empty and unbounded values. Packed rows retain canonical binary endpoints, inclusive/exclusive flags and exact NUMERIC precision. Empty ranges, omitted bounds, subtype infinities and SQL NULL are distinct. DATE ranges canonicalize finite endpoints to [lower,upper). Timestamp endpoints use the execution's UTC zone. Requires schema reader capability version 35.
+pub const SQLRangeColumnSchema = struct {
+    type: []const u8,
+    nullable: ?bool = null,
+    description: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "nullable", "nullable", true },
+        .{ "description", "description", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.nullable) |value| {
+            try jw.objectField("nullable");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
@@ -1718,7 +1955,7 @@ pub const TableSchema = struct {
     base_source: ?ExternalLakeTableSource = null,
     /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
     column_defaults: ?[]const RelationalColumnExpression = null,
-    /// Stored immutable generated columns, evaluated in dependency order on writes before validation and indexing. Cycles are rejected. Generated columns are output-only; submitted values are replaced by the computed value. Omission or [] declares none. Defaults and generated declarations together are limited to 256 columns, 4096 expression nodes, and 4 MiB of literal data. Evaluation has a shared 4 MiB allocation budget across all column expressions. Restore verifies stored results instead of silently recomputing them. Changing, adding, or removing generated semantics through an existing table's schema update requires explicit rewrite=true on the PUT or PATCH schema route. This returns a durable restore job and replaces the complete authorized dependency cohort only after distributed transformation and validation. Ordinary schema updates reject these changes, even when a table appears empty. Declaration reordering and default-only changes remain allowed. Relational tables only.
+    /// Stored immutable generated columns, evaluated in dependency order on writes before validation and indexing. Cycles are rejected. Generated columns are output-only; submitted values are replaced by the computed value. Omission or [] declares none. Defaults and generated declarations together are limited to 256 columns, 4096 expression nodes, and 4 MiB of literal data. Evaluation has a shared 4 MiB allocation budget across all column expressions. Restore verifies stored results instead of silently recomputing them. On relational tables, changing, adding, or removing generated semantics through a schema update requires explicit rewrite=true on the PUT or PATCH schema route. This returns a durable restore job and replaces the complete authorized dependency cohort only after distributed transformation and validation. Ordinary schema updates reject these changes, even when a table appears empty. Declaration reordering and default-only changes remain allowed. Supported by relational and document tables. Document declarations require one enforced document type and target declared root fields. Expressions may read persisted declared roots; SQL virtual fields and transport directives cannot be expression sources. SQL NULL removes the generated member; a JSON null datum remains present. Unknown members are preserved. SQL column assignments to generated roots or their aliases are rejected, while whole-document writes replace submitted generated members with computed values. Document producer definitions are immutable through schema-update routes, including rewrite=true. Changing these definitions requires a replacement table and explicit data migration; ordinary restore preserves and verifies existing computed values.
     generated_columns: ?[]const RelationalColumnExpression = null,
     /// Named scalar CHECK constraints for a relational schema. This is part of the complete schema: omission or [] declares no checks. New writes enforce every check. Existing-row validation status is maintained separately and is never accepted from the client.
     checks: ?[]const RelationalCheckConstraint = null,

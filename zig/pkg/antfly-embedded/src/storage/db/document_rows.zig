@@ -30,6 +30,8 @@ const scalar = @import("../../sql/scalar.zig");
 const View = @import("../relational_read_view.zig").View;
 
 pub const Session = struct {
+    text: ?*@import("text_rows.zig").Owner = null,
+    preparation_runtime: ?@import("../../schema/relational_expression.zig").PreparationRuntime = null,
     row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     range_proofs: ?[]const @import("../range_protection.zig").Proof = null,
     alloc: std.mem.Allocator,
@@ -62,6 +64,13 @@ pub const Session = struct {
 
     /// Takes ownership of txn on every outcome; clones the borrowed epoch.
     pub fn openSnapshot(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64) !*Session {
+        return openSnapshotImpl(alloc, store, txn, schema, range, from, to, opts, now_ns, null);
+    }
+    /// Selection transfers only on success; txn transfers on every outcome.
+    pub fn openTextSnapshot(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64, text: *@import("text_rows.zig").Owner) !*Session {
+        return openSnapshotImpl(alloc, store, txn, schema, range, from, to, opts, now_ns, text);
+    }
+    fn openSnapshotImpl(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64, text: ?*@import("text_rows.zig").Owner) !*Session {
         var read = txn;
         errdefer read.abort();
         if (schema) |view| if (view.storageMode() != .document) return error.UnsupportedSqlExecution;
@@ -73,10 +82,15 @@ pub const Session = struct {
         const input = opts.relational_query orelse try std.json.parseFromSliceLeaky(types.RelationalRowQuery, owned, opts.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false, .ignore_unknown_fields = true });
         if (input.page_bytes == 0 or input.page_bytes > 16 * 1024 * 1024) return error.InvalidRelationalRowsRequest;
         if (input.fields.len > 256 or input.conditions.len > 256 or input.index != null or input.after != null or input.lower != null or input.upper != null) return error.InvalidRelationalRowsRequest;
+        if (input.text_filter) |filter| {
+            if (text == null or !text.?.matches(filter)) return error.InvalidTextFilterOwner;
+            if (!input.auto_index) return error.UnsupportedSqlExecution;
+        } else if (text != null) return error.InvalidTextFilterOwner;
         const version = if (schema) |view| view.version() else 0;
         if (input.schema_version) |expected| if (expected != version) return error.PreparedGenerationChanged;
-        const columns = if (schema) |view| if (view.validator()) |validator| try document.deriveColumns(owned, validator.schema) else &.{} else &.{};
-        const table: catalog.Table = .{ .id = 0, .physical_name = "", .schema_version = version, .storage_mode = .document, .columns = columns };
+        const layout = if (schema) |view| if (view.validator()) |validator| validator.document_layout else null else null;
+        const columns = if (layout) |value| value.columns else &.{};
+        const table: catalog.Table = .{ .id = 0, .physical_name = "", .schema_version = version, .storage_mode = .document, .columns = columns, .column_index = if (layout) |value| &value.by_name else null };
         const projection = try document.Projection.init(owned, table, input.fields);
         const condition_fields = try owned.alloc([]const u8, input.conditions.len);
         for (input.conditions, condition_fields) |condition, *field| {
@@ -93,7 +107,7 @@ pub const Session = struct {
         for (input.conditions, conditions) |condition, *copy| {
             copy.* = condition;
             copy.column = try owned.dupe(u8, condition.column);
-            copy.collation = if (condition.collation) |text| try owned.dupe(u8, text) else null;
+            copy.collation = if (condition.collation) |collation| try owned.dupe(u8, collation) else null;
             copy.value = if (condition.value) |value| try @import("../typed_json.zig").clone(owned, value) else null;
         }
         var filter = if (opts.filter_query_json.len != 0) try graph.PreparedPatternFilter.init(alloc, opts.filter_query_json) else null;
@@ -103,6 +117,7 @@ pub const Session = struct {
         const session = try alloc.create(Session);
         errdefer alloc.destroy(session);
         session.* = .{
+            .text = text,
             .range_proofs = if (opts.include_range_proofs) try @import("../range_protection.zig").capture(owned, &read, lower_raw, upper_raw) else null,
             .alloc = alloc,
             .arena = undefined,
@@ -138,6 +153,7 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionDeinit", .{self}) catch @panic("incompatible storage owner");
+        if (self.text) |text| text.deinit();
         if (self.row_policy_lease) |*lease| lease.release();
         self.txn.abort();
         if (self.schema) |*schema| schema.release();
@@ -180,7 +196,7 @@ pub const Session = struct {
             if (value != .object) return error.InvalidBatchRequest;
             // A JSON column's SQL NULL is represented by absence, whereas a
             // JSON null datum is an explicit null member in document storage.
-            for (self.table.columns) |column| if (column.type == .json) {
+            for (self.table.columns) |column| if (column.document_path.len == 0 and column.type == .json) {
                 if (value.object.get(column.path)) |cell| if (cell == .null) {
                     const explicit = for (write.json_null_fields) |name| {
                         if (std.mem.eql(u8, name, column.path)) break true;
@@ -188,10 +204,23 @@ pub const Session = struct {
                     if (!explicit) _ = value.object.orderedRemove(column.path);
                 };
             };
-            if (self.schema) |view| if (view.validator()) |validator| try validator.prepareValue(temporary, temporary, &value);
+            var authoritative_nulls: ?[]const []const u8 = null;
+            if (self.schema) |view| if (view.validator()) |validator| {
+                const preparation = if (self.preparation_runtime) |runtime| validator.forPreparation(runtime) else validator;
+                const prepared = try preparation.prepareTypedValueWithNulls(temporary, temporary, &value, write.json_null_fields, false);
+                authoritative_nulls = prepared.fields;
+            };
+            var null_set: std.StringHashMapUnmanaged(void) = .empty;
+            if (authoritative_nulls) |names| for (names) |name| try null_set.put(temporary, name, {});
             var json_nulls: std.ArrayList([]const u8) = .empty;
             for (self.table.columns) |column| if (column.type == .json) {
-                if (value.object.get(column.path)) |cell| if (cell == .null) try json_nulls.append(alloc, try alloc.dupe(u8, column.path));
+                if (value.object.get(column.path)) |cell| if (cell == .null) {
+                    if (authoritative_nulls != null and !null_set.contains(column.path)) {
+                        // Generated SQL NULL remains absence in document
+                        // storage, not an accidental JSON null datum.
+                        _ = value.object.orderedRemove(column.path);
+                    } else try json_nulls.append(alloc, try alloc.dupe(u8, column.path));
+                };
             };
             const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
             total = std.math.add(usize, total, bytes.len +| write.key.len) catch return error.RelationalRowResultTooLarge;
@@ -321,11 +350,63 @@ pub const Session = struct {
             }
         };
         var context = Context{ .session = self, .owned = owned, .scratch = &scratch, .limit = limit, .begin = time.monotonicNs() };
-        try self.store.scanDocumentRowsReadTxnWithContext(&self.txn, lower, self.upper, &context, Context.admit, Context.visit);
+        if (self.text) |text| {
+            var candidates = std.heap.ArenaAllocator.init(alloc);
+            defer candidates.deinit();
+            while (true) {
+                try self.checkpoint();
+                if (context.visited != 0 and (context.rows.items.len >= limit or context.visited >= 1024 or context.bytes >= self.page_bytes or time.monotonicNs() -| context.begin >= 5 * std.time.ns_per_ms)) {
+                    context.more = true;
+                    break;
+                }
+                if (text.position == text.count) {
+                    if (text.exhausted) break;
+                    const page = try text.cursor.?.nextPage(&text.pending, 4);
+                    text.count = page.len;
+                    text.position = 0;
+                    text.exhausted = page.exhausted;
+                    if (page.len == 0) {
+                        context.more = !page.exhausted;
+                        break;
+                    }
+                }
+                _ = candidates.reset(.retain_capacity);
+                const ca = candidates.allocator();
+                const stored = try text.cursor.?.key(ca, text.pending[text.position]);
+                const key = if (internal.isStoredDocumentRowKey(stored)) (try internal.decodePrimaryDocumentKeyAlloc(ca, stored)) orelse return error.InvalidInternalUserKey else stored;
+                const from_order = std.mem.order(u8, key, self.from);
+                const to_order = std.mem.order(u8, key, self.to);
+                if (!self.range.contains(key) or (self.from.len != 0 and (from_order == .lt or (from_order == .eq and !self.inclusive_from))) or
+                    (self.to.len != 0 and (to_order == .gt or (to_order == .eq and self.exclusive_to))))
+                {
+                    context.visited += 1;
+                    text.position += 1;
+                    continue;
+                }
+                const physical = try internal.documentKeyAlloc(ca, key);
+                if (try Context.admit(&context, physical) == .stop) break;
+                const raw = self.txn.get(physical) catch |err| switch (err) {
+                    error.NotFound => {
+                        text.position += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+                // A subsequent timestamp lookup may retire a borrowed point
+                // value. Keep the body in this candidate's resettable scratch.
+                if (raw.len > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
+                const bytes = try context.scratch.allocator().dupe(u8, raw);
+                if (try Context.visit(&context, physical, bytes) == .stop) break;
+                text.position += 1;
+            }
+        } else try self.store.scanDocumentRowsReadTxnWithContext(&self.txn, lower, self.upper, &context, Context.admit, Context.visit);
         try self.checkpoint();
         self.done = !context.more;
         const owned_result_rows = try context.rows.toOwnedSlice(owned);
-        const owned_result_after = if (context.more) try owned.dupe(u8, self.after.items) else null;
+        const owned_result_after = if (context.more) if (self.text) |text| progress: {
+            text.page_sequence = std.math.add(u64, text.page_sequence, 1) catch return error.SqlProgramLimitExceeded;
+            break :progress try std.fmt.allocPrint(owned, "text:{d}", .{text.page_sequence});
+        } else try owned.dupe(u8, self.after.items) else null;
         return .{ .arena = arena, .rows = owned_result_rows, .after = owned_result_after };
     }
 };

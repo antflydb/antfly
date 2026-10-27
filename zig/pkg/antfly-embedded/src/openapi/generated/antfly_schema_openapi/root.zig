@@ -4,6 +4,7 @@
 pub const types = @import("types.zig");
 
 pub const AntflyType = types.AntflyType;
+pub const DocumentColumnName = types.DocumentColumnName;
 pub const DocumentFieldMapping = types.DocumentFieldMapping;
 pub const DocumentSchema = types.DocumentSchema;
 pub const DocumentSubfieldMapping = types.DocumentSubfieldMapping;
@@ -18,6 +19,8 @@ pub const ForeignKeyTiming = types.ForeignKeyTiming;
 pub const LakeCatalogConfig = types.LakeCatalogConfig;
 pub const RelationalCheckConstraint = types.RelationalCheckConstraint;
 pub const RelationalColumnExpression = types.RelationalColumnExpression;
+pub const RelationalColumnSequence = types.RelationalColumnSequence;
+pub const RelationalColumnSequenceGeneration = types.RelationalColumnSequenceGeneration;
 pub const RelationalComparisonOp = types.RelationalComparisonOp;
 pub const RelationalConstraintValidationState = types.RelationalConstraintValidationState;
 pub const RelationalExpressionOp = types.RelationalExpressionOp;
@@ -38,6 +41,7 @@ pub const SQLArrayColumnSchema = types.SQLArrayColumnSchema;
 pub const SQLArrayElementType = types.SQLArrayElementType;
 pub const SQLBuiltinType = types.SQLBuiltinType;
 pub const SQLNumericModifier = types.SQLNumericModifier;
+pub const SQLRangeColumnSchema = types.SQLRangeColumnSchema;
 pub const TableSchema = types.TableSchema;
 pub const TableStorageMode = types.TableStorageMode;
 pub const TemplateFieldMapping = types.TemplateFieldMapping;

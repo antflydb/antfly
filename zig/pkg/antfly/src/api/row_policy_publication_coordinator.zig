@@ -32,7 +32,7 @@ pub const Port = struct {
 pub const Step = enum { installed_owner, advanced_phase, complete };
 
 pub fn beginCommand(revision: u64, table_id: u64, schema_version: u32, schema_digest: [32]u8, prior: ?policies.Publication, has_policies: bool, owners: []const policies.Publication.OwnerIdentity) !?policies.PublicationCommand {
-    if (table_id == 0 or schema_version == 0 or owners.len == 0) return error.InvalidRowPolicyPublication;
+    if (table_id == 0 or std.mem.allEqual(u8, &schema_digest, 0) or owners.len == 0) return error.InvalidRowPolicyPublication;
     if (prior) |previous| {
         try previous.validateShape();
         if (previous.table_id != table_id or (previous.phase != .active and previous.phase != .disabled)) return error.RowPolicyCatalogChanged;
@@ -115,6 +115,13 @@ pub fn advance(alloc: std.mem.Allocator, table_name: []const u8, revision: u64, 
     };
     try port.mutate(port.ptr, alloc, .{ .expected_revision = revision, .change = .{ .promote = .{ .table_id = publication.table_id, .generation = publication.generation, .phase = next } } });
     return .advanced_phase;
+}
+
+test "row policy coordinator admits native zero schema epoch with a nonzero digest" {
+    const owners = [_]policies.Publication.OwnerIdentity{.{ .group_id = 7, .descriptor_digest = @splat(1) }};
+    const command = (try beginCommand(3, 7, 0, @splat(2), null, true, &owners)).?;
+    try std.testing.expectEqual(@as(u32, 0), command.change.begin.schema_version);
+    try std.testing.expectError(error.InvalidRowPolicyPublication, beginCommand(3, 7, 0, @splat(0), null, true, &owners));
 }
 
 test "row policy coordinator selects exact unacknowledged owner and holds final publication" {

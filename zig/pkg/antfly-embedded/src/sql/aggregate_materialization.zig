@@ -117,6 +117,7 @@ pub fn fromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Recipe {
 }
 
 fn recipeFromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Recipe {
+    if (bound.collections.len != 0) return null;
     const keys = try a.alloc(Key, bound.group_count);
     errdefer a.free(keys);
     for (keys, bound.input.projections[0..keys.len]) |*key, program| {

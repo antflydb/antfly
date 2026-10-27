@@ -92,6 +92,9 @@ pub const Cell = struct {
     /// Element identity is supplied by the pinned immutable layout, not read
     /// from an untrusted payload or inferred from JSON shape.
     sql_array_element_type: ?@import("../../../common/sql_builtin_type.zig").Type = null,
+    /// Range identity is pinned by the immutable column layout; payload bytes
+    /// never infer their subtype or become a JSON string by accident.
+    sql_range_kind: ?@import("../../../sql/range_value.zig").Kind = null,
     /// Distinguishes an explicitly stored JSON null from an absent column.
     /// `value_type` retains the declared physical type; `value` is ignored.
     is_null: bool = false,
@@ -342,7 +345,8 @@ fn serializeOrdinalInternal(
             cell.is_json != column.is_json or
             cell.is_dense_vector != (column.column_type == .dense_vector) or
             cell.is_numeric != (column.column_type == .numeric) or
-            cell.sql_array_element_type != (if (column.column_type == .sql_array) column.sql_element_type else null))
+            cell.sql_array_element_type != (if (column.column_type == .sql_array) column.sql_element_type else null) or
+            cell.sql_range_kind != @import("../../../sql/range_value.zig").kindFromType(column.column_type))
             return error.InvalidRelationalRow;
         if (validate_json_cells) try validateCell(alloc, cell);
         try validateSqlCell(column, cell, true);
@@ -772,7 +776,7 @@ pub fn validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(
             const column = table_schema.relational_columns[cell.ordinal];
             const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
             if (cell.is_json and !cell.is_null) {
-                const canonical = try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
+                const canonical = if (table_schema.requires_jsonb_display) try document_content_hash.canonicalJsonStorageValueAlloc(root_alloc, logical) else try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
                 if (!std.mem.eql(u8, canonical, cell.value.bytes_val)) return error.NonCanonicalRelationalRow;
             }
             try root.object.put(root_alloc, try root_alloc.dupe(u8, column.name), logical);
@@ -783,7 +787,7 @@ pub fn validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(
                 return std.mem.lessThan(u8, columns[lhs.ordinal].name, columns[rhs.ordinal].name);
             }
         }.lessThan);
-        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonical(cells, table_schema);
+        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonical(alloc, cells, table_schema);
         if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
     } else {
         const cells = try alloc.alloc(?Cell, table_schema.relational_columns.len);
@@ -794,7 +798,7 @@ pub fn validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(
             const column = table_schema.relational_columns[cell.ordinal];
             const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
             if (cell.is_json and !cell.is_null) {
-                const canonical = try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
+                const canonical = if (table_schema.requires_jsonb_display) try document_content_hash.canonicalJsonStorageValueAlloc(root_alloc, logical) else try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
                 if (!std.mem.eql(u8, canonical, cell.value.bytes_val)) return error.NonCanonicalRelationalRow;
             }
             try root.object.put(root_alloc, try root_alloc.dupe(u8, column.name), logical);
@@ -901,6 +905,7 @@ fn jsonValueFromCellAlloc(
             break :blk try @import("../../../sql/array_wire.zig").toJsonLeaky(alloc, decoded.value, .{});
         },
         .numeric => try @import("../../../sql/numeric_storage.zig").jsonValueAlloc(alloc, cell.value.bytes_val),
+        .numrange, .daterange, .tsrange, .tstzrange => try @import("../../../sql/range_storage.zig").jsonValueAlloc(alloc, @import("../../../sql/range_value.zig").kindFromType(column.column_type).?, cell.value.bytes_val),
         .datetime => if (cell.value.u64_val <= std.math.maxInt(i64))
             .{ .integer = @intCast(cell.value.u64_val) }
         else
@@ -1240,6 +1245,19 @@ pub const OrdinalRowView = struct {
         return self.layout.ordinalForName(self.table_schema.relational_columns, name);
     }
 
+    /// SQL NULL is absence or an explicit null bit, never a JSON null datum.
+    /// The view constructor authenticates this metadata before exposing it.
+    /// This probes no value payload and does not certify unread payload bytes;
+    /// decoding, whole-row validation and restore keep their existing checks.
+    pub fn isSqlNull(self: OrdinalRowView, ordinal: usize) !bool {
+        if (ordinal >= self.table_schema.relational_columns.len) return error.RelationalRowSchemaMismatch;
+        if (self.parsed.capabilities & capability_sparse_slots != 0) {
+            const entry = sparseEntryIndex(self.parsed, ordinal) orelse return true;
+            return sparseEntryIsNull(self.parsed, entry);
+        }
+        return !bitmapBit(self.parsed.present, ordinal) or bitmapBit(self.parsed.nulls, ordinal);
+    }
+
     pub fn findCell(self: OrdinalRowView, ordinal: usize) !?Cell {
         if (ordinal >= self.table_schema.relational_columns.len) return null;
         if (self.checksum_groups) |groups| {
@@ -1486,34 +1504,50 @@ pub const OrdinalRowView = struct {
             const slot = if (output) |layout| layout.ordinals.get(self.table_schema.relational_columns[ordinal].name) orelse continue else index;
             const value = &values[slot];
             const present = &presence[slot];
-            const cell = (try self.findCell(ordinal)) orelse {
+            const datum = (try self.sqlDatumAlloc(alloc, ordinal)) orelse {
                 value.* = .{};
                 present.* = false;
                 continue;
             };
             present.* = true;
-            value.* = .{};
-            if (cell.is_null) continue;
-            const column = self.table_schema.relational_columns[ordinal];
-            value.* = switch (column.column_type) {
-                .sql_array => blk: {
-                    const array = try alloc.create(@import("../../../sql/array_value.zig").Value);
-                    array.* = try @import("../../../sql/array_storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
-                    break :blk Datum.typedArray(array);
-                },
-                .numeric => blk: {
-                    const numeric = @import("../../../sql/numeric_value.zig");
-                    var context: numeric.Context = .{ .alloc = alloc };
-                    var decoded = try @import("../../../sql/numeric_binary.zig").decodeCanonical(&context, cell.value.bytes_val);
-                    errdefer decoded.deinit();
-                    const number = try alloc.create(numeric.Value);
-                    number.* = decoded.value;
-                    break :blk Datum.typedNumeric(number);
-                },
-                else => Datum.json(try self.materializeCellAlloc(alloc, cell)),
-            };
+            value.* = datum;
         }
         return .{ .values = values, .presence = presence };
+    }
+
+    /// The same selective typed decoder serves projected query pages and RLS.
+    /// Single-cell consumers reuse their existing vector instead of allocating
+    /// an intermediate projection/presence vector for every candidate row.
+    pub fn sqlDatumAlloc(self: OrdinalRowView, alloc: Allocator, ordinal: usize) !?@import("../../../sql/scalar.zig").Datum {
+        const Datum = @import("../../../sql/scalar.zig").Datum;
+        if (ordinal >= self.table_schema.relational_columns.len) return error.RelationalRowSchemaMismatch;
+        const cell = (try self.findCell(ordinal)) orelse return null;
+        if (cell.is_null) return Datum{};
+        const column = self.table_schema.relational_columns[ordinal];
+        return switch (column.column_type) {
+            .sql_array => blk: {
+                const array = try alloc.create(@import("../../../sql/array_value.zig").Value);
+                array.* = try @import("../../../sql/array_storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
+                break :blk Datum.typedArray(array);
+            },
+            .numrange, .daterange, .tsrange, .tstzrange => blk: {
+                const ranges = @import("../../../sql/range_value.zig");
+                var context: ranges.Context = .{ .alloc = alloc };
+                const range = try alloc.create(ranges.Value);
+                range.* = try ranges.decodeCanonicalLeaky(&context, ranges.kindFromType(column.column_type).?, cell.value.bytes_val);
+                break :blk Datum.typedRange(range);
+            },
+            .numeric => blk: {
+                const numeric = @import("../../../sql/numeric_value.zig");
+                var context: numeric.Context = .{ .alloc = alloc };
+                var decoded = try @import("../../../sql/numeric_binary.zig").decodeCanonical(&context, cell.value.bytes_val);
+                errdefer decoded.deinit();
+                const number = try alloc.create(numeric.Value);
+                number.* = decoded.value;
+                break :blk Datum.typedNumeric(number);
+            },
+            else => Datum.json(try self.materializeCellAlloc(alloc, cell)),
+        };
     }
 
     pub const TypedProjection = struct {
@@ -1957,6 +1991,7 @@ fn ordinalCellFromPayloadWithValidation(
         .is_dense_vector = column.column_type == .dense_vector,
         .is_numeric = column.column_type == .numeric,
         .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
+        .sql_range_kind = @import("../../../sql/range_value.zig").kindFromType(column.column_type),
         .is_null = is_null,
         .value = typed_value,
     };
@@ -1975,6 +2010,8 @@ fn ordinalCellFromPayloadWithValidation(
                 _ = try @import("../../../sql/array_storage.zig").validateCanonical(std.heap.page_allocator, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
         } else if (column.column_type == .numeric) {
             _ = try @import("../../../common/sql_numeric_layout.zig").View.open(cell.value.bytes_val, .{});
+        } else if (@import("../../../sql/range_value.zig").kindFromType(column.column_type)) |kind| {
+            try @import("../../../sql/range_storage.zig").validateCanonical(std.heap.page_allocator, kind, cell.value.bytes_val);
         } else if (column.column_type == .dense_vector) {
             try validateDenseVectorBytes(cell.value.bytes_val);
         } else if (column.is_json) {
@@ -2199,13 +2236,13 @@ fn columnValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.Va
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => .bytes_val,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => .bytes_val,
     };
 }
 
 fn isVariableColumn(column: runtime_schema.RelationalColumn) bool {
     return switch (column.column_type) {
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => true,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => true,
         .datetime, .integer, .number, .boolean, .geopoint => false,
     };
 }
@@ -2215,7 +2252,7 @@ fn fixedColumnWidth(column: runtime_schema.RelationalColumn) usize {
         .datetime, .integer, .number => 8,
         .boolean => 1,
         .geopoint => 16,
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => 0,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => 0,
     };
 }
 
@@ -2369,7 +2406,7 @@ test "relational index system SQL array restore checks canonical JSONB beyond va
     std.mem.writeInt(u32, frame[8..12], 1, .little);
     std.mem.writeInt(i32, frame[12..16], 1, .little);
     std.mem.writeInt(u32, frame[21..25], 3, .little);
-    @memcpy(frame[25..], "1.0");
+    @memcpy(frame[25..], "1e0");
     const cell: Cell = .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .jsonb, .value = .{ .bytes_val = &frame } };
     try std.testing.expectError(error.NonCanonicalSqlArrayStorage, serializeOrdinal(alloc, 1, &.{column}, &.{cell}, @splat(0)));
     const checksummed = try serializePreparedOrdinalWithLayout(alloc, 1, &.{column}, &.{cell}, @splat(0), &layout);
@@ -2727,6 +2764,12 @@ pub const JsonMode = enum { physical, logical };
 
 pub fn writeCellValue(scratch: Allocator, writer: *std.Io.Writer, cell: Cell, mode: JsonMode) !void {
     if (cell.is_null) return writer.writeAll("null");
+    if (cell.sql_range_kind) |kind| {
+        if (cell.value_type != .bytes_val) return error.InvalidRelationalRow;
+        const value = try @import("../../../sql/range_storage.zig").jsonValueAlloc(scratch, kind, cell.value.bytes_val);
+        defer scratch.free(value.string);
+        return std.json.Stringify.value(value, .{}, writer);
+    }
     switch (cell.value_type) {
         .datetime_ns => return error.InvalidRelationalRow,
         .f64_val => if (mode == .physical) try writer.print("{d}", .{cell.value.f64_val}) else try std.json.Stringify.value(cell.value.f64_val, .{}, writer),
@@ -3000,6 +3043,55 @@ test "ordinal checksum groups skip unrelated fixed slots but verify distant offs
     @memcpy(corrupted, raw);
     corrupted[fixed_start + layout.fixed_len] ^= 1;
     try std.testing.expectError(error.RelationalRowChecksumMismatch, ordinalRowViewSelective(corrupted, table, &layout));
+}
+
+test "relational nullness probes authenticate metadata without reading dense or sparse payloads" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 5, 128 }) |width| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const columns = try owned.alloc(runtime_schema.RelationalColumn, width);
+        for (columns, 0..) |*column, i| {
+            const name = try std.fmt.allocPrint(owned, "c{d}", .{i});
+            column.* = .{ .name = name, .path = name, .column_type = .string, .allows_null = true };
+        }
+        columns[0].column_type = .boolean;
+        columns[1].column_type = .json;
+        columns[1].is_json = true;
+        const table = runtime_schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = columns };
+        var layout = try PhysicalLayout.init(a, table);
+        defer layout.deinit();
+        const payload = try owned.alloc(u8, 256 * 1024);
+        @memset(payload, 'x');
+        const cells = [_]Cell{
+            .{ .ordinal = 0, .path = "c0", .value_type = .bool_val, .value = .{ .bool_val = false } },
+            .{ .ordinal = 1, .path = "c1", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "null" } },
+            .{ .ordinal = 2, .path = "c2", .value_type = .bytes_val, .is_null = true, .value = .{ .bytes_val = "" } },
+            .{ .ordinal = 4, .path = "c4", .value_type = .bytes_val, .value = .{ .bytes_val = payload } },
+        };
+        const encoded = try serializeOrdinal(a, 1, columns, &cells, @splat(0));
+        defer a.free(encoded);
+        const row = try ordinalRowViewSelective(encoded, table, &layout);
+        try std.testing.expectEqual(width == 128, row.parsed.capabilities & capability_sparse_slots != 0);
+        try std.testing.expect(!(try row.isSqlNull(0)));
+        try std.testing.expect(!(try row.isSqlNull(1))); // JSON null is a datum.
+        try std.testing.expect(try row.isSqlNull(2));
+        try std.testing.expect(try row.isSqlNull(3)); // Absent.
+        try std.testing.expect(!(try row.isSqlNull(4)));
+        try std.testing.expectError(error.RelationalRowSchemaMismatch, row.isSqlNull(width));
+        try std.testing.expect(row.checksum_groups != null);
+        const body = (try row.findCell(4)).?.value.bytes_val;
+        encoded[@intFromPtr(body.ptr) - @intFromPtr(encoded.ptr) + body.len - 1] ^= 1;
+        const selective = try ordinalRowViewSelective(encoded, table, &layout);
+        // Nullness observes only the authenticated metadata. Reading the value
+        // or the complete row must still detect the damaged, unread body.
+        try std.testing.expect(!(try selective.isSqlNull(4)));
+        try std.testing.expectError(error.RelationalRowChecksumMismatch, selective.findCell(4));
+        try std.testing.expectError(error.RelationalRowChecksumMismatch, validateOrdinalWithLayout(encoded, table, &layout));
+        encoded[ordinal_write_timestamp_offset] ^= 1;
+        try std.testing.expectError(error.RelationalRowChecksumMismatch, ordinalRowViewSelective(encoded, table, &layout));
+    }
 }
 
 test "ordinal rows bind layout support projection checksum and canonical bytes" {

@@ -449,7 +449,8 @@ pub const Operations = struct {
         const writes = self.writes orelse return error.NotFound;
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(request, table_name, input.writes) catch |err| switch (err) {
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.TableNotFound => return error.NotFound,
             error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -468,7 +469,8 @@ pub const Operations = struct {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
             error.IntegrityTopologyChanged, error.IntegrityTopologyCompleted, error.IntegrityTopologyFenceMissing, error.IntegrityCatalogChanged => return error.TopologyChanged,
@@ -509,7 +511,8 @@ pub const Operations = struct {
         try request.ensureActive();
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(request, table_name, input.writes) catch |err| switch (err) {
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             // The sender's catalog can lead this replica's projection during
             // provisioning/restart. Validation has not called the writer, so
             // preserve the explicit not-proposed availability response.
@@ -648,7 +651,8 @@ pub const Operations = struct {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
             error.IntegrityTopologyChanged, error.IntegrityTopologyCompleted, error.IntegrityTopologyFenceMissing, error.IntegrityCatalogChanged => return error.TopologyChanged,
@@ -700,7 +704,8 @@ pub const Operations = struct {
         }) catch |err| switch (err) {
             error.RetainedEffectsFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -739,7 +744,8 @@ pub const Operations = struct {
         if (input.req.restore_staging_scope == null) {
             const validator = self.txn_validator orelse return error.Unavailable;
             validator.validate(request, table_name, input.req.writes) catch |err| switch (err) {
-                error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+                error.InvalidBatchRequest => return error.InvalidArgument,
+                error.RelationalCheckViolation => return error.RelationalCheckViolation,
                 error.TableNotFound => return error.NotFound,
                 error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
                 error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
@@ -760,7 +766,8 @@ pub const Operations = struct {
             error.RetainedEffectsFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -1507,6 +1514,7 @@ fn consumerTests() type {
         test "distributed txn internal operations preserve every semantic participant rejection" {
             const Source = struct {
                 failure: anyerror,
+                validation_failure: ?anyerror = null,
                 fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
                     return error.UnexpectedTestCall;
                 }
@@ -1514,7 +1522,10 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     return self.failure;
                 }
-                pub fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+                pub fn validate(ptr: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.validation_failure) |failure| return failure;
+                }
             };
             var source = Source{ .failure = error.UnexpectedTestCall };
             const operations = Operations{
@@ -1532,6 +1543,8 @@ fn consumerTests() type {
                 source.failure = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
+            source.validation_failure = error.RelationalCheckViolation;
+            try std.testing.expectError(error.RelationalCheckViolation, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
         }
 
         test "internal transaction operations preserve pre-decision leader unavailability" {

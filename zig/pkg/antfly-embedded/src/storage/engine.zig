@@ -245,6 +245,8 @@ pub const VTable = struct {
     batchNativeFkGenerationApply: *const fn (self: *DB, req: types.BatchRequest) Outcome(void),
     pinTransferablePrimarySnapshot: *const fn (self: *DB) Outcome(DB.TransferablePrimarySnapshot),
     verifyTransferablePrimarySnapshot: *const fn (self: *DB, namespace: [24]u8, receipt: ?db.OrderedApplyReceipt) Outcome(void),
+    verifyTransferablePrimarySnapshotWithOrigin: *const fn (self: *DB, namespace: [24]u8, receipt: ?db.OrderedApplyReceipt, origin: @import("db/native_backup.zig").Origin) Outcome(void),
+    stepSchemaOwnerRowAudit: *const fn (self: *DB, owner_group: u64, binding: @import("db/relational_schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("db/relational_rows.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../api/operation.zig").RequestContext) Outcome(@import("db/relational_schema_audit_checkpoint.zig").Result),
     orderedMutationAlreadyApplied: *const fn (self: *DB, identity: db.OrderedApplyReceipt) Outcome(bool),
     loadRowPolicyReceipt: *const fn (self: *DB, generation: u64, phase: @import("../system_catalog/policies.zig").Publication.Phase) Outcome(@import("db/row_policy_bundle.zig").Receipt),
     listArtifactRepairIssues: *const fn (self: *DB, alloc: std.mem.Allocator, artifact_kind: ?types.ArtifactRepairKind, index_name: ?[]const u8, limit: usize) Outcome([]types.ArtifactRepairIssue),
@@ -318,6 +320,7 @@ pub const VTable = struct {
     stats: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(types.DBStats),
     runtimeStatusStatsConsistent: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(types.DBStats),
     runtimeStatusStatsConsistentIfAvailable: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(?types.DBStats),
+    runtimeStatusObservationConsistentIfAvailable: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(?DB.RuntimeStatusObservation),
     reassignIdentityNamespaceForInternalTransition: *const fn (self: *DB, namespace: @import("db/doc_identity.zig").Namespace) Outcome(void),
     attachRestoreStagingReplicationMirror: *const fn (self: *DB, mirror: ?db.ReplicationAsyncEffectMirror) Outcome(void),
     reserveRestoreStagingScoped: *const fn (self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Scope) Outcome(void),
@@ -361,6 +364,7 @@ pub const VTable = struct {
     captureRelationalStatementSnapshot: *const fn (self: *DB) Outcome(DB.RelationalStatementSnapshot),
     beginRelationalRows: *const fn (self: *DB, alloc: std.mem.Allocator, request: @import("db/relational_rows.zig").Request) Outcome(@import("db/relational_rows.zig").Reader),
     openDocumentReadSession: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(*DB.DocumentReadSession),
+    openDocumentReadSessionAtSnapshot: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) Outcome(*DB.DocumentReadSession),
     openRelationalReadSessionAtSnapshot: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) Outcome(*DB.RelationalReadSession),
     tryStatementReadFence: *const fn (self: *DB) Outcome(?DB.StatementReadFence),
     tryEmbeddedBackupReadFence: *const fn (self: *DB) Outcome(?DB.StatementReadFence),
@@ -531,7 +535,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 29,
+    version: u32 = 38,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -603,7 +607,7 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
-extern fn antfly_storage_engine_get_descriptor_v29() callconv(.c) *const Descriptor;
+extern fn antfly_storage_engine_get_descriptor_v37() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
@@ -631,11 +635,11 @@ test "logical query engine allocator normalization preserves custom quotas" {
 }
 
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_descriptor_v29();
+    const descriptor = antfly_storage_engine_get_descriptor_v37();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
     // A global table would retain every physical operation in every consumer.
-    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v29" });
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v37" });
     const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Args = std.meta.ArgsTuple(Function);
@@ -670,10 +674,10 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_descriptor_v29();
+    return antfly_storage_engine_get_descriptor_v37();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 29 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 38 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

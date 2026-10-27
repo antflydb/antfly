@@ -54,6 +54,28 @@ pub const ReadSafetyBarrier = struct {
         wait_read_safe_controlled: ?*const fn (*anyopaque, u64, []const u8, Controls) anyerror!void = null,
         capture_frozen: ?*const fn (*anyopaque, u64) anyerror!FrozenProof = null,
         validate_frozen: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("antfly_cancellation").CancellationToken) anyerror!void = null,
+        /// Immutable images need a quorum-completed prefix, not a freeze of
+        /// today's moving commit tip. Returns the ACTUAL completed boundary.
+        certify_completed_prefix: ?*const fn (*anyopaque, u64, u64, u64, ?u64, @import("antfly_cancellation").CancellationToken) anyerror!FrozenProof = null,
+    };
+
+    pub const CompletedPrefix = struct {
+        incarnation: u128,
+        replica_epoch: u64,
+        term: u64,
+        minimum_index: u64,
+
+        /// Caller supplies a correlated ReadState and the shared installation/
+        /// apply completion cursor under the host lock. A raw Raft applied or
+        /// commit cursor is NOT a substitute. Unrelated later commits cannot
+        /// invalidate an immutable prefix which has actually completed.
+        pub fn qualify(self: @This(), incarnation: u128, replica_epoch: ?u64, term: u64, is_leader: bool, quorum_index: ?u64, completed_index: u64) !?FrozenProof {
+            if (self.incarnation == 0 or self.replica_epoch == 0 or self.term == 0 or self.minimum_index == 0) return error.InvalidControlReceiptPosition;
+            if (!is_leader or incarnation != self.incarnation or replica_epoch != self.replica_epoch or term != self.term) return error.NotLeader;
+            const quorum = quorum_index orelse return null;
+            if (completed_index < @max(self.minimum_index, quorum)) return null;
+            return .{ .incarnation = incarnation, .term = term, .applied_index = completed_index };
+        }
     };
 
     /// Relative budget: the caller and quorum owner may use different clocks.
@@ -73,6 +95,16 @@ pub const ReadSafetyBarrier = struct {
         incarnation: u128,
         term: u64,
         applied_index: u64,
+
+        /// A retained immutable root was certified while capture was frozen.
+        /// Later opens require a newly quorum-completed prefix on the same
+        /// owner/term, which may include subsequent writes. Never use this to
+        /// validate a live capture fence or fabricate completion from Raft tips.
+        pub fn validateRetained(self: @This(), completed: FrozenProof) !void {
+            if (self.incarnation == 0 or self.term == 0 or self.applied_index == 0) return error.InvalidControlReceiptPosition;
+            if (completed.incarnation != self.incarnation or completed.term != self.term) return error.NotLeader;
+            if (completed.applied_index < self.applied_index) return error.ReadUnavailable;
+        }
 
         pub fn validate(self: @This(), incarnation: u128, term: u64, is_leader: bool, quorum_index: u64) !void {
             if (!is_leader or incarnation != self.incarnation or term != self.term) return error.NotLeader;

@@ -80,6 +80,11 @@ pub const TableWriteSource = struct {
     /// Transaction-ID commits enforce owner-routed range guards atomically
     /// with primary writes, including read-only guard participants.
     supports_sql_range_guards: bool = false,
+    /// Trusted backend capability, never a request hint: row defaults,
+    /// generated values, schema and CHECK validation share the atomic native
+    /// preparation/commit boundary. Ingress must not evaluate volatile defaults
+    /// in a disposable validation copy before invoking that owner.
+    prepares_rows_atomically: bool = false,
 
     pub const VTable = struct {
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,

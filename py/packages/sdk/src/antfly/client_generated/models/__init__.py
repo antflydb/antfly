@@ -901,7 +901,12 @@ from .index_mutation_conflict_error import IndexMutationConflictError
 from .index_mutation_conflict_error_error import IndexMutationConflictErrorError
 from .index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
 from .index_mutation_service_unavailable_error_error import IndexMutationServiceUnavailableErrorError
+from .index_publication_failure import IndexPublicationFailure
+from .index_publication_phase import IndexPublicationPhase
 from .index_publication_policy import IndexPublicationPolicy
+from .index_publication_state import IndexPublicationState
+from .index_publication_status import IndexPublicationStatus
+from .index_publication_status_index_type import IndexPublicationStatusIndexType
 from .index_readiness_reason import IndexReadinessReason
 from .index_readiness_state import IndexReadinessState
 from .index_readiness_status import IndexReadinessStatus
@@ -2059,6 +2064,8 @@ from .reauthorize_table_destinations_response_200_status import ReauthorizeTable
 from .regexp_query import RegexpQuery
 from .relational_check_constraint import RelationalCheckConstraint
 from .relational_column_expression import RelationalColumnExpression
+from .relational_column_sequence import RelationalColumnSequence
+from .relational_column_sequence_generation import RelationalColumnSequenceGeneration
 from .relational_comparison_op import RelationalComparisonOp
 from .relational_constraint_activation_phase import RelationalConstraintActivationPhase
 from .relational_constraint_conflict_reason import RelationalConstraintConflictReason
@@ -2222,6 +2229,10 @@ from .runtime_decl_mode import RuntimeDeclMode
 from .runtime_resolver_suppression import RuntimeResolverSuppression
 from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
+from .schema_validation_failure import SchemaValidationFailure
+from .schema_validation_phase import SchemaValidationPhase
+from .schema_validation_state import SchemaValidationState
+from .schema_validation_status import SchemaValidationStatus
 from .scoped_linear_merge_page import ScopedLinearMergePage
 from .scoped_linear_merge_page_key_range import ScopedLinearMergePageKeyRange
 from .scoped_linear_merge_page_records import ScopedLinearMergePageRecords
@@ -2256,6 +2267,11 @@ from .sql_array_dimension import SQLArrayDimension
 from .sql_array_element_type import SQLArrayElementType
 from .sql_array_value import SQLArrayValue
 from .sql_builtin_type import SQLBuiltinType
+from .sql_catalog_object_kind import SQLCatalogObjectKind
+from .sql_catalog_operation_kind import SQLCatalogOperationKind
+from .sql_catalog_operation_receipt import SQLCatalogOperationReceipt
+from .sql_catalog_operation_state import SQLCatalogOperationState
+from .sql_catalog_recovery_request import SQLCatalogRecoveryRequest
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
@@ -2267,6 +2283,8 @@ from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
+from .sql_range_column_schema import SQLRangeColumnSchema
+from .sql_range_column_schema_type import SQLRangeColumnSchemaType
 from .sql_request import SQLRequest
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
@@ -2278,6 +2296,7 @@ from .sql_setting_role_default import SqlSettingRoleDefault
 from .sql_setting_value_type_0 import SqlSettingValueType0
 from .sql_setting_value_type_1 import SqlSettingValueType1
 from .sql_setting_value_type_2 import SqlSettingValueType2
+from .sql_temporal_kind import SQLTemporalKind
 from .sql_transaction_status import SQLTransactionStatus
 from .sqlddl_receipt import SQLDDLReceipt
 from .sqlddl_receipt_state import SQLDDLReceiptState
@@ -3366,7 +3385,12 @@ __all__ = (
     "IndexMutationConflictErrorError",
     "IndexMutationServiceUnavailableError",
     "IndexMutationServiceUnavailableErrorError",
+    "IndexPublicationFailure",
+    "IndexPublicationPhase",
     "IndexPublicationPolicy",
+    "IndexPublicationState",
+    "IndexPublicationStatus",
+    "IndexPublicationStatusIndexType",
     "IndexReadinessReason",
     "IndexReadinessState",
     "IndexReadinessStatus",
@@ -4306,6 +4330,8 @@ __all__ = (
     "RegexpQuery",
     "RelationalCheckConstraint",
     "RelationalColumnExpression",
+    "RelationalColumnSequence",
+    "RelationalColumnSequenceGeneration",
     "RelationalComparisonOp",
     "RelationalConstraintActivationPhase",
     "RelationalConstraintConflictReason",
@@ -4469,6 +4495,10 @@ __all__ = (
     "RuntimeResolverSuppression",
     "SavedQuerySource",
     "ScanKeysRequest",
+    "SchemaValidationFailure",
+    "SchemaValidationPhase",
+    "SchemaValidationState",
+    "SchemaValidationStatus",
     "ScopedLinearMergePage",
     "ScopedLinearMergePageKeyRange",
     "ScopedLinearMergePageRecords",
@@ -4503,6 +4533,11 @@ __all__ = (
     "SQLArrayElementType",
     "SQLArrayValue",
     "SQLBuiltinType",
+    "SQLCatalogObjectKind",
+    "SQLCatalogOperationKind",
+    "SQLCatalogOperationReceipt",
+    "SQLCatalogOperationState",
+    "SQLCatalogRecoveryRequest",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",
@@ -4516,6 +4551,8 @@ __all__ = (
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",
     "SQLPrepareRequest",
+    "SQLRangeColumnSchema",
+    "SQLRangeColumnSchemaType",
     "SQLRequest",
     "SQLResponse",
     "SqlSettingDatabaseDefault",
@@ -4527,6 +4564,7 @@ __all__ = (
     "SqlSettingValueType0",
     "SqlSettingValueType1",
     "SqlSettingValueType2",
+    "SQLTemporalKind",
     "SQLTransactionStatus",
     "SSEError",
     "SSEErrorReason",

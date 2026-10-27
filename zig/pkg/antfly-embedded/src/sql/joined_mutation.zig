@@ -150,10 +150,15 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     const alias = (if (deleting) compiled.statement.delete.alias else compiled.statement.update.alias) orelse name.table;
     const assignments: []const ast.Assignment = if (deleting) &.{} else compiled.statement.update.assignments;
     const returning = if (deleting) compiled.statement.delete.returning else compiled.statement.update.returning;
+    var root_assignment = false;
+    for (assignments) |assignment| if (table.isDocumentRoot(assignment.field)) {
+        root_assignment = true;
+        if (assignment.use_default) return error.SqlNotNullViolation;
+    };
+    if (root_assignment and assignments.len != 1) return error.UnsupportedSqlShape;
     for (assignments, 0..) |assignment, i| {
-        const field = try table.column(assignment.field);
+        const field = try table.updateTarget(assignment.field);
         if (field.generated and !assignment.use_default) return error.SqlGeneratedColumnWrite;
-        if (std.mem.eql(u8, field.name, "_id")) return error.UnsupportedSqlExecution;
         for (assignments[0..i]) |prior| if (std.mem.eql(u8, prior.field, field.name)) return error.DuplicateSqlColumn;
     }
     var projections: std.ArrayList(ast.Projection) = .empty;
@@ -165,7 +170,8 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     var fields: std.ArrayList(catalog.Column) = .empty;
     var preserve: std.ArrayList(bool) = .empty;
     var default_paths: std.ArrayList([]const u8) = .empty;
-    for (table.columns) |field| {
+    const update_fields = if (root_assignment) try alloc.dupe(catalog.Column, &.{try table.column("_doc")}) else table.columns;
+    for (update_fields) |field| {
         if (deleting and returning == null) continue;
         if (!deleting and field.generated) continue;
         var expression: ?*const ast.Scalar = null;
@@ -184,7 +190,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
             continue;
         }
         if (!deleting and table.storage_mode == .document and expression == null) continue;
-        const required: scalar.Type = .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier };
+        const required: scalar.Type = scalar.columnType(field);
         try projections.append(alloc, .{ .expression = if (expression) |assigned| try scalar.assignmentExpression(alloc, assigned, required) else try column(alloc, alias, field.name) });
         try expected.append(alloc, required);
         try fields.append(alloc, field);
@@ -217,7 +223,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     const input = try alloc.create(describe.BoundStatement);
     input.* = try describe.bind(alloc, adapter.iface(), &selected, parameters);
     for (input.columns, expected.items) |actual, required| {
-        if (!actual.untyped_null and actual.type != required.kind and !(actual.type == .integer and required.kind == .number)) return if (required.kind == .array) error.SqlAssignmentTypeMismatch else error.SqlTypeMismatch;
+        if (!actual.untyped_null and actual.type != required.kind and required.kind != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(actual.type, required.kind orelse return error.InvalidSqlBackendResponse)) return if (required.kind == .array) error.SqlAssignmentTypeMismatch else error.SqlTypeMismatch;
         if (actual.type == .array and required.kind == .array and !@import("builtin_cast.zig").assignmentAllowed(actual.element_type orelse return error.SqlAssignmentTypeMismatch, required.element_type orelse return error.SqlAssignmentTypeMismatch)) return error.SqlAssignmentTypeMismatch;
     }
     // FROM/USING columns also participate in RETURNING name resolution.
@@ -239,7 +245,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
         {
             scope = relation.root.columns;
             const slots = try alloc.alloc(scalar.Column, scope.len);
-            for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier };
+            for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier, .temporal_kind = field.temporal_kind };
             const authorized_scope = scope;
             var required = try alloc.alloc(bool, scope.len);
             @memset(required, false);
@@ -273,6 +279,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
             var source_ordinals: std.ArrayList(usize) = .empty;
             for (scope, slots, required, 0..) |field, slot, used, ordinal| {
                 if (!used) continue;
+                // A prepared postimage does not own the eventual commit
+                // version. Other joined sources and DELETE preimages retain
+                // their pinned versions; an updated target needs a receipt.
+                if (!deleting and table.storage_mode == .document and std.mem.eql(u8, field.qualifier, alias) and std.mem.eql(u8, field.name, "_version")) return error.UnsupportedSqlShape;
                 try dense_scope.append(alloc, field);
                 try dense_slots.append(alloc, slot);
                 try source_ordinals.append(alloc, ordinal);
@@ -440,7 +450,8 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
             const present = try presenceDirectory(temporary, values[4].value.string);
             var object: std.json.ObjectMap = .empty;
             var json_null_fields: std.ArrayList([]const u8) = .empty;
-            if (!bound.deleting and table.storage_mode == .document) {
+            const replaces_document = bound.fields.len == 1 and table.isDocumentRoot(bound.fields[0].name);
+            if (!bound.deleting and table.storage_mode == .document and !replaces_document) {
                 if (values[3].sql_null or values[3].value != .object) return error.InvalidSqlBackendResponse;
                 var iter = values[3].value.object.iterator();
                 while (iter.next()) |member| {
@@ -469,9 +480,15 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
                 old.typed_cells.?.presence = presence;
                 break :blk old;
             } else null;
-            if (!bound.deleting) for (bound.fields, bound.preserve, values[5..][0..bound.fields.len]) |field, preserve, datum| {
+            if (!bound.deleting) for (bound.fields, bound.preserve, values[5..][0..bound.fields.len], bound.input.columns[5..][0..bound.fields.len]) |field, preserve, datum, source_column| {
                 if (preserve and !present.contains(field.name)) continue;
-                try object.put(context.arena, field.path, try context.storageDatum(datum, field));
+                const stored = try context.storageDatumTyped(datum, field, scalar.assignmentSourceIdentity(source_column.type, source_column.element_type));
+                if (table.isDocumentRoot(field.name)) {
+                    if (datum.sql_null) return error.SqlNotNullViolation;
+                    if (stored != .object) return error.SqlTypeMismatch;
+                    object = stored.object;
+                    try json_null_fields.appendSlice(context.arena, try table.documentRootNulls(context.arena, stored));
+                } else try field.assignStorageValue(context.arena, &object, stored, datum.sql_null);
                 if (field.type == .json and !datum.sql_null and datum.value == .null) try json_null_fields.append(context.arena, field.path);
             };
             try mutations.append(context.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest, .row = if (bound.deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous });
@@ -522,7 +539,7 @@ fn relationalReturningOutput(context: runtime.Context, bound: Bound, input: []co
         name.* = field.internal;
         if (std.mem.eql(u8, field.qualifier, bound.target_qualifier)) try fields.append(context.arena, field.name);
     }
-    const images = try runtime.Context.ReturningImages.init(context.arena, context.binding.table.?, fields.items);
+    const images = try runtime.Context.ReturningImages.initAtVersion(context.arena, context.binding.table.?, fields.items, context.backend.write_version);
     const layout = try catalog.Row.TypedLayout.init(context.arena, names);
     const Cursor = @import("result_cursor.zig").Cursor;
     const rows = if (context.spill) |manager| try Cursor.create(context.alloc, manager, names.len) else try Cursor.createMemory(context.alloc, names.len, context.limits.retained_bytes / 2);
@@ -572,7 +589,7 @@ fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutati
     for (bound.returning_scope, required) |field, needed| if (needed and std.mem.eql(u8, field.qualifier, bound.target_qualifier)) {
         try fields.append(context.arena, field.name);
     };
-    const images = try runtime.Context.ReturningImages.init(context.arena, context.binding.table.?, fields.items);
+    const images = try runtime.Context.ReturningImages.initAtVersion(context.arena, context.binding.table.?, fields.items, context.backend.write_version);
     const rows = try context.arena.alloc([]const std.json.Value, input.len);
     const nulls = try context.arena.alloc([]const bool, input.len);
     const native_rows = if (context.limits.native_result) try context.arena.alloc([]const scalar.Datum, input.len) else null;
@@ -606,11 +623,9 @@ fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutati
             end += 1;
             if (full) break;
         }
-        const evaluated = try a.alloc([]const scalar.Datum, plan.programs.len);
-        for (plan.programs, evaluated) |*program, *column_| column_.* = try decisions.evaluateBatchWithLimits(a, context.backend.decision_provider, program, page.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
+        const evaluated = try decisions.evaluateProgramsBatchWithLimits(a, context.backend.decision_provider, plan.programs, page.items, context.parameters, decisions.limitsFor(context.backend));
         for (first..end) |index| {
-            const values = try a.alloc(scalar.Datum, plan.programs.len);
-            for (evaluated, values) |column_values, *value| value.* = column_values[index - first];
+            const values = evaluated[index - first];
             const row = try context.resultRow(values, plan.columns);
             rows[index] = row.json;
             nulls[index] = row.nulls;

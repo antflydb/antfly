@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-test {
+// Discover the owned tests even when a caller's compile filter does not match
+// the anonymous reachability test itself.
+comptime {
     _ = @import("pgwire/mod.zig");
 }
 

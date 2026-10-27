@@ -97,11 +97,12 @@ test "distributed txn activation worker adapts pages and atomically publishes na
     const tuples = @import("antfly_local_sources").storage_db_relational_index_keys;
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
-    inline for (.{ 0, 1, 2, 3, 4 }) |scenario| {
+    inline for (.{ 0, 1, 2, 3, 4, 5 }) |scenario| {
         const duplicate = scenario == 1;
         const singleton_too_large = scenario == 2;
         const source_too_large = scenario == 3;
         const wide_unrelated = scenario == 4;
+        const expression_fault = scenario == 5;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -130,10 +131,17 @@ test "distributed txn activation worker adapts pages and atomically publishes na
             db: *db_mod.DB,
             attempts: u8 = 0,
             reduced: bool = false,
+            quota_once: bool = expression_fault,
+            quota_failures: usize = 0,
             fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: read_gate.ReadConsistency) !?reads.LookupResponse {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 try std.testing.expectEqual(read_gate.ReadConsistency.read_index, consistency);
                 try std.testing.expect(opts.execution_deadline_ns != null);
+                if (opts.relational_integrity_catalog and self.quota_once) {
+                    self.quota_once = false;
+                    self.quota_failures += 1;
+                    return error.RelationalExpressionBudgetExceeded;
+                }
                 if (opts.relational_activation_json.len != 0) {
                     var request = try std.json.parseFromSlice(struct { mode: []const u8, max_rows: u32 = 128 }, allocator, opts.relational_activation_json, .{ .ignore_unknown_fields = true });
                     defer request.deinit();
@@ -156,6 +164,7 @@ test "distributed txn activation worker adapts pages and atomically publishes na
                 try cancellation.check();
                 try std.testing.expectEqual(@as(usize, 1), requests.len);
                 const request = requests[0];
+                if (expression_fault) try std.testing.expect((try activation.Progress.decode(request.relational_activation.?.next)).state != .invalid);
                 if (!request.relational_repair) {
                     try std.testing.expect(request.relational_activation != null);
                     try std.testing.expectEqual(@as(usize, 0), request.writes.len);
@@ -191,8 +200,19 @@ test "distributed txn activation worker adapts pages and atomically publishes na
         const tables = [_]records.TableRecord{.{ .table_id = 300, .name = "rows", .placement_role = "data", .schema_json = declaration }};
         const owners = [_]records.RangeRecord{.{ .group_id = 301, .table_id = 300, .start_key = "" }};
         for (0..8) |_| {
-            if (!try runPage(alloc, reader, writer, &tables, &owners, owners[0])) break;
+            const progressed = runPage(alloc, reader, writer, &tables, &owners, owners[0]) catch |err| {
+                // Native time slicing may return a singleton before shrink.
+                // Its admission failure must leave the checkpoint untouched
+                // and be retried on the next supervisor invocation.
+                if (expression_fault and err == error.RelationalExpressionBudgetExceeded) {
+                    try std.testing.expectEqual(@as(u8, 0), fixture.attempts);
+                    continue;
+                }
+                return err;
+            };
+            if (!progressed) break;
         } else return error.ActivationDidNotConverge;
+        if (expression_fault) try std.testing.expectEqual(@as(usize, 1), fixture.quota_failures);
         const raw_progress = (try db.core.getStoreValue(alloc, activation.key)).?;
         defer alloc.free(raw_progress);
         const progress = try activation.Progress.decode(raw_progress);
@@ -398,9 +418,14 @@ test "distributed txn CHECK activation shares durable repair retry and physical 
             db: *db_mod.DB,
             race_repair: bool,
             attempts: u8 = 0,
+            quota_once: bool = false,
             fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: read_gate.ReadConsistency) !?reads.LookupResponse {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 try std.testing.expectEqual(read_gate.ReadConsistency.read_index, consistency);
+                if (opts.relational_integrity_catalog and self.quota_once) {
+                    self.quota_once = false;
+                    return error.RelationalExpressionBudgetExceeded;
+                }
                 const result = (try self.db.lookup(allocator, key, opts)) orelse return null;
                 return .{ .json = result.json, .version = result.version orelse try self.db.getTimestamp(allocator, key), .expected_content_digest = result.expected_content_digest };
             }
@@ -443,6 +468,14 @@ test "distributed txn CHECK activation shares durable repair retry and physical 
         const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = undefined, .commit_batch_with_cancellation = Fixture.commit } };
         const tables = [_]records.TableRecord{.{ .table_id = 700, .name = "rows", .placement_role = "data", .schema_json = checked }};
         const owners = [_]records.RangeRecord{.{ .group_id = 701, .table_id = 700, .start_key = "" }};
+        const before_quota = (try db.core.getStoreValue(alloc, activation.key)).?;
+        defer alloc.free(before_quota);
+        fixture.quota_once = true;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, runPage(alloc, reader, writer, &tables, &owners, owners[0]));
+        const after_quota = (try db.core.getStoreValue(alloc, activation.key)).?;
+        defer alloc.free(after_quota);
+        try std.testing.expectEqualSlices(u8, before_quota, after_quota);
+        try std.testing.expectEqual(@as(u8, 0), fixture.attempts);
         if (race_repair) {
             try std.testing.expectError(error.VersionConflict, runPage(alloc, reader, writer, &tables, &owners, owners[0]));
         } else {

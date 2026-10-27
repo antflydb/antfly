@@ -18,6 +18,12 @@
 //! changes from forcing code generation for every storage and search test.
 
 const http_server = @import("api/http_server.zig");
+test {
+    _ = @import("api/relational_expression_contract.zig");
+    _ = @import("api/row_policy_publication_coordinator.zig");
+    _ = @import("api/retained_read_rpc.zig");
+    _ = @import("antfly_local_sources").api_batch;
+}
 const httpx_handler = @import("api/httpx_handler.zig");
 const indexes = @import("api/indexes.zig");
 const kernel_abi = @import("api/kernel_abi.zig");
@@ -39,9 +45,12 @@ test {
     _ = @import("api/protected_future.zig");
     _ = @import("api/sql_connection_record.zig");
     _ = @import("api/sql_connections.zig");
+    _ = @import("api/sql_execution.zig");
     _ = @import("api/kernel_owner_source.zig");
     _ = @import("api/sql_execution.zig");
     _ = @import("api/sql_pgwire.zig");
+    _ = @import("api/sql_catalog_campaign_test.zig");
+    _ = @import("api/sql_conflict_scope_test.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
     _ = @import("api/table_reads.zig").document_hydration_tests;
@@ -78,6 +87,15 @@ test "system catalog routing and transport discovery" {
     _ = @import("api/table_catalog.zig");
     _ = @import("api/distributed_candidate_source.zig");
     _ = @import("api/distributed_entity_sink.zig");
+}
+
+test "system catalog schema validation submission discovery" {
+    _ = @import("api/schema_validation_recovery.zig");
+    _ = @import("api/schema_validation_admission.zig");
+    _ = @import("metadata/http_client.zig");
+    _ = @import("metadata/http_server.zig");
+    _ = @import("system_catalog/operations.zig");
+    _ = @import("system_catalog/server_call.zig");
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

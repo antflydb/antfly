@@ -92,6 +92,8 @@ pub const DataOperation = union(enum) {
     set_raft_batch_protocol: u16,
     /// Source effects execute only in the native delegate, after this guard.
     require_source_pin_protocol: void,
+    /// Synthesized by the committed decoder, never a caller-selected barrier.
+    require_raft_batch_protocol: struct { version: u16, owner_group_id: ?u64 = null },
     topology_guard: @import("online_topology_arbitration.zig").Guard,
     topology_end: void,
     /// Internal apply boundary. Split deltas use the committed Raft index as
@@ -240,17 +242,21 @@ pub fn currentRaftBatchProtocolVersion(
     return version;
 }
 
-pub fn snapshotRequiresNativePrimary(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) !bool {
+pub fn snapshotProtocolVersion(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) !u16 {
     const key = try groupRaftBatchProtocolKeyAlloc(alloc, group_id);
     defer alloc.free(key);
     const raw = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return false,
+        error.NotFound => return 0,
         else => return err,
     };
     if (raw.len != 2) return error.InvalidRaftBatchProtocolVersion;
     const version = std.mem.readInt(u16, raw[0..2], .little);
     if (version == 0 or version > data_raft_protocol.batch_protocol_version) return error.InvalidRaftBatchProtocolVersion;
-    return version >= data_raft_protocol.batch_native_snapshot_protocol_version;
+    return version;
+}
+
+pub fn snapshotRequiresNativePrimary(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) !bool {
+    return try snapshotProtocolVersion(txn, alloc, group_id) >= data_raft_protocol.batch_native_snapshot_protocol_version;
 }
 
 fn dupeRangeAlloc(alloc: std.mem.Allocator, byte_range: AppliedDataRange) !AppliedDataRange {
@@ -2795,7 +2801,7 @@ pub fn appendOperationEffects(
     defer if (merge_receiver_state) |*state| state.deinit(alloc);
     var needs_raft_batch_protocol = false;
     for (operations) |op| switch (op) {
-        .set_raft_batch_protocol, .require_source_pin_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence, .merge_page_fence => needs_raft_batch_protocol = true,
+        .set_raft_batch_protocol, .require_source_pin_protocol, .require_raft_batch_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence, .merge_page_fence => needs_raft_batch_protocol = true,
         else => {},
     };
     var raft_batch_protocol_version: u16 = if (needs_raft_batch_protocol)
@@ -2862,6 +2868,10 @@ pub fn appendOperationEffects(
                 }
             },
             .require_source_pin_protocol => if (raft_batch_protocol_version < data_raft_protocol.batch_source_pin_protocol_version) return error.UnsupportedBatchProtocolVersion,
+            .require_raft_batch_protocol => |required| {
+                if (required.owner_group_id) |expected| if (expected != group_id) return error.PrivateIndexOwnerJobChanged;
+                if (required.version == 0 or required.version > data_raft_protocol.batch_protocol_version or raft_batch_protocol_version < required.version) return error.UnsupportedBatchProtocolVersion;
+            },
             .merge_page_fence => |encoded| {
                 var parsed = try std.json.parseFromSlice(db_types.BatchRequest, alloc, encoded, .{});
                 defer parsed.deinit();

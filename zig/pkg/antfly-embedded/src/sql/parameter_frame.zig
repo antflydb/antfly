@@ -467,8 +467,9 @@ test "SQL datetime parameters preserve signed epoch instants across JSON and tex
                 defer json.deinit();
                 var text_frame = try Frame.prepare(a, &.{.{ .kind = .datetime }}, &.{.{ .text = input }}, .{});
                 defer text_frame.deinit();
-                try std.testing.expectEqualStrings("1969-12-31T23:59:59.999000000Z", json.values[0].value.string);
-                try std.testing.expectEqualStrings(json.values[0].value.string, text_frame.values[0].value.string);
+                const actual = json.values[0].temporal().?;
+                try std.testing.expectEqual(@as(?i128, -1_000_000), actual.timestamp_tz.unixNanoseconds());
+                try std.testing.expectEqual(std.math.Order.eq, try @import("temporal_ops.zig").compare(actual.*, text_frame.values[0].temporal().?.*));
             }
         }
     };
@@ -733,9 +734,10 @@ fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, l
     }
     try work.consume(inputs.len);
     const types = try a.dupe(scalar.Type, descriptors);
-    for (types) |*descriptor| if (descriptor.kind != .datetime and descriptor.element_type == null) {
-        descriptor.element_type = try scalar.parameterElementType(descriptor.*);
-    };
+    for (types) |*descriptor| {
+        descriptor.* = try scalar.normalizeParameterType(descriptor.*);
+        if (descriptor.kind == null) return error.UnknownSqlParameterType;
+    }
     const values = try a.alloc(scalar.Datum, inputs.len);
     for (types, inputs, values, 1..) |descriptor, input, *value, index| {
         value.* = decodeInput(a, descriptor, input, limits, &work, &wire_bytes) catch |err| {
@@ -748,22 +750,66 @@ fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, l
     return .{ .descriptors = types, .values = values, .work = limits.work - work.remaining };
 }
 
+test "SQL temporal parameter ingress validates payloads before NULL normalization" {
+    const temporal = @import("temporal_value.zig");
+    const valid: temporal.Value = .{ .timestamp_tz = .{ .micros = 0 } };
+    const invalid: temporal.Value = .{ .time = .{ .micros = -1 } };
+    var null_payload = scalar.Datum.typedTemporal(&valid);
+    null_payload.sql_null = true;
+    var missing_payload = scalar.Datum.typedTemporal(&valid);
+    missing_payload.extension = null;
+    var mixed_payload = scalar.Datum.typedTemporal(&valid);
+    mixed_payload.value = .{ .integer = 1 };
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var work: arrays.Budget = .{ .remaining = 8 };
+    var wire_bytes: usize = 0;
+    for ([_]scalar.Datum{ null_payload, missing_payload, mixed_payload }) |datum| {
+        try std.testing.expectError(error.SqlTypeMismatch, decodeInput(none.allocator(), .{ .kind = .json, .nullable = true }, .{ .datum = datum }, .{}, &work, &wire_bytes));
+    }
+    try std.testing.expectError(error.TemporalOutOfRange, decodeInput(none.allocator(), .{ .kind = .json }, .{ .datum = scalar.Datum.typedTemporal(&invalid) }, .{}, &work, &wire_bytes));
+    try std.testing.expectEqual(@as(usize, 0), wire_bytes);
+}
+
 fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work: *arrays.Budget, wire_bytes: *usize) !scalar.Datum {
-    if (input == .datum and input.datum.patterns != null) return error.SqlTypeMismatch;
+    if (input == .datum) try input.datum.validateTemporal();
+    if (input == .datum and input.datum.patterns() != null) return error.SqlTypeMismatch;
     if (input == .sql_null or (input == .datum and input.datum.sql_null)) {
         if (!descriptor.nullable) return error.InvalidSqlParameters;
-        if (input == .datum and (input.datum.array != null or input.datum.numeric != null or input.datum.patterns != null or input.datum.value != .null)) return error.SqlTypeMismatch;
+        if (input == .datum and (input.datum.array != null or input.datum.numeric != null or input.datum.patterns() != null or input.datum.value != .null)) return error.SqlTypeMismatch;
         return .{};
     }
-    if (descriptor.kind == .datetime) {
+    const ranges = @import("range_value.zig");
+    if (descriptor.kind) |tag| if (ranges.kindFromType(tag)) |range_kind| {
         if (input == .array_envelope) return error.SqlTypeMismatch;
-        if (input == .binary) return error.UnsupportedSqlShape;
-        const raw = if (input == .text) input.text else if (input.datum.array == null and input.datum.value == .string) input.datum.value.string else return error.SqlTypeMismatch;
-        if (!std.unicode.utf8ValidateSlice(raw) or std.mem.indexOfScalar(u8, raw, 0) != null) return error.SqlInvalidTextEncoding;
-        try work.consume(raw.len);
-        const datetime = @import("../datetime.zig");
-        const ns = datetime.parseDateTimeToSignedNs(raw) orelse return error.SqlInvalidDateTime;
-        return scalar.Datum.json(.{ .string = try datetime.formatDateTimeSignedNsAlloc(a, ns) });
+        var context = work.numericContext(a);
+        const initial = context.remaining;
+        defer work.remaining -|= @intCast(initial - context.remaining);
+        context.max_output_bytes = @min(context.max_output_bytes, limits.bytes);
+        if (input == .datum) if (input.datum.range()) |range| {
+            if (range.kind != range_kind) return error.ConflictingSqlParameterTypes;
+            const canonical = try ranges.canonical(&context, range.*);
+            _ = try ranges.encodedSize(&context, canonical);
+            return operators.cloneDatum(a, scalar.Datum.typedRange(&canonical));
+        };
+        const raw = if (input == .text) input.text else if (input == .binary) input.binary else if (input.datum.array == null and input.datum.numeric == null and input.datum.temporal() == null and input.datum.value == .string) input.datum.value.string else return error.SqlTypeMismatch;
+        const owned = try a.create(ranges.Value);
+        owned.* = if (input == .binary) try ranges.decodeInputLeaky(&context, range_kind, raw) else try ranges.parseLeaky(&context, range_kind, raw);
+        return scalar.Datum.typedRange(owned);
+    };
+    if (input == .datum and input.datum.range() != null) return error.SqlTypeMismatch;
+    if (descriptor.temporal_kind orelse (if (descriptor.kind == .datetime) @as(?@import("temporal_value.zig").Kind, .timestamp_tz) else null)) |temporal_kind| {
+        if (input == .array_envelope) return error.SqlTypeMismatch;
+        const temporal = @import("temporal_value.zig");
+        const owned = try a.create(temporal.Value);
+        if (input == .datum and input.datum.temporal() != null) {
+            if (input.datum.temporal().?.kind() != temporal_kind) return error.ConflictingSqlParameterTypes;
+            owned.* = input.datum.temporal().?.*;
+        } else {
+            const raw = if (input == .text) input.text else if (input == .binary) input.binary else if (input.datum.array == null and input.datum.value == .string) input.datum.value.string else return error.SqlTypeMismatch;
+            try work.consume(raw.len);
+            owned.* = if (input == .binary) try temporal.decode(temporal_kind, raw) else try @import("temporal_text.zig").parseInput(temporal_kind, raw);
+        }
+        return scalar.Datum.typedTemporal(owned);
     }
     const kind = try scalar.parameterElementType(descriptor);
     if (descriptor.kind == .array) {
@@ -771,7 +817,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             const value = input.datum;
             const array = value.array orelse return error.SqlTypeMismatch;
             if (array.element_type != kind) return error.ConflictingSqlParameterTypes;
-            if (value.patterns != null or value.numeric != null or value.value != .null) return error.SqlTypeMismatch;
+            if (value.patterns() != null or value.numeric != null or value.value != .null) return error.SqlTypeMismatch;
             const admitted = try array.validateWithBudget(.{ .bytes = limits.bytes, .elements = limits.elements }, work);
             if (array.stored != null and limits.payload_owner != null) return value;
             // Clone the admitted header so caller-provided sizing metadata is
@@ -800,7 +846,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         .text => |bytes| try text.decodeElementLeaky(a, kind, bytes, work),
         .binary => |bytes| try binary.decodeElementLeaky(a, kind, bytes, work),
         .datum => |datum| {
-            if (datum.array != null or datum.patterns != null) return error.SqlTypeMismatch;
+            if (datum.array != null or datum.patterns() != null) return error.SqlTypeMismatch;
             var owned = datum;
             if (kind == .numeric and datum.numeric == null) {
                 if (datum.value == .float) {

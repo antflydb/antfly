@@ -42,10 +42,16 @@ fn optional(txn: anytype, key: []const u8) !?[]const u8 {
 pub fn current(txn: anytype) !?Fence {
     const bytes = (try optional(txn, fence_key)) orelse return null;
     const fence = try Fence.decode(bytes);
+    if (fence.role == .index_build) try @import("relational_index_owner_job.zig").requireActive(txn, fence);
+    if (fence.role == .schema_validation) try @import("relational_nullability_job.zig").requireActive(txn, fence);
     // Range publication can atomically close admission by writing the exact
     // completion receipt in its existing metadata batch. The stale physical
     // fence is harmless and is overwritten by a later higher-epoch begin.
-    if (try optional(txn, receipt_key)) |receipt| if ((try Fence.decode(receipt)).eql(fence)) return null;
+    if (try optional(txn, receipt_key)) |receipt| if ((try Fence.decode(receipt)).eql(fence)) {
+        if (fence.role == .index_build) return error.PrivateIndexPublicationRequired;
+        if (fence.role == .schema_validation) return error.SchemaValidationPublicationRequired;
+        return null;
+    };
     return fence;
 }
 
@@ -63,6 +69,8 @@ pub fn completed(txn: anytype) !?Fence {
 pub fn nextEpoch(txn: anytype) !u64 {
     var epoch: u64 = 0;
     if (try current(txn)) |fence| epoch = fence.admission_epoch;
+    if (try optional(txn, @import("relational_integrity_activation_contract.zig").validation_key)) |bytes|
+        epoch = @max(epoch, (try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(bytes)).binding.fence.admission_epoch);
     if (try optional(txn, receipt_key)) |bytes| epoch = @max(epoch, (try Fence.decode(bytes)).admission_epoch);
     return std.math.add(u64, epoch, 1) catch error.IntegrityTopologyEpochExhausted;
 }
@@ -89,7 +97,62 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
 }
 
 pub fn stageBeginWithHandoff(txn: anytype, fence: Fence, handoff: ?@import("relational_integrity_topology_contract.zig").GenerationHandoffIntent) !void {
+    if (fence.role == .index_build) return error.PrivateIndexJobRequired;
+    if (fence.role == .schema_validation) return error.SchemaValidationJobRequired;
+    return stageBeginImpl(txn, fence, handoff);
+}
+
+/// Called only after the exact owner job binding is staged in this transaction.
+/// Generic topology commands cannot acquire or release private-index authority.
+pub fn stagePrivateIndexBegin(txn: anytype, fence: Fence) !void {
+    if (fence.role != .index_build) return error.InvalidIntegrityTopologyFence;
+    try @import("relational_index_owner_job.zig").requireFencing(txn, fence);
+    return stageBeginImpl(txn, fence, null);
+}
+
+/// Schema validation is a distinct admitted owner job. Generic topology
+/// callers cannot acquire or release this authority through an unrelated role.
+pub fn stageSchemaValidationBegin(txn: anytype, fence: Fence) !void {
+    if (fence.role != .schema_validation) return error.InvalidIntegrityTopologyFence;
+    try @import("relational_nullability_job.zig").requireFencing(txn, fence);
+    try stageBeginImpl(txn, fence, null);
+}
+
+pub fn stageSchemaValidationCancellation(txn: anytype, manager: *transactions.TxnManager, fence: Fence) !void {
+    try @import("relational_nullability_job.zig").requireCanceling(txn, fence);
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
+    if (try current(txn)) |actual| {
+        if (!actual.eql(fence)) return error.IntegrityTopologyBusy;
+        try requireDrained(txn, manager, fence);
+        try txn.delete(fence_key);
+    }
+    try stageReceipt(txn, fence);
+}
+
+/// A never-visited cancellation closes ordinary admission before schema-sized
+/// inputs are fetched. Its durable intent is exact owner authority, not a job
+/// absence ACK. Generic begin/release/cancel remain unable to bypass it.
+pub fn stagePrivateIndexCancellationIntent(txn: anytype, record: @import("relational_index_cancellation_intent.zig").Record) !void {
+    const fence = record.intent.fence;
+    if (fence.role != .index_build) return error.InvalidIntegrityTopologyFence;
+    try @import("relational_index_cancellation_intent.zig").requireStaged(txn, record);
+    return stageBeginImpl(txn, fence, null);
+}
+
+fn stageBeginImpl(txn: anytype, fence: Fence, handoff: ?@import("relational_integrity_topology_contract.zig").GenerationHandoffIntent) !void {
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    if (try optional(txn, @import("relational_integrity_activation_contract.zig").validation_key)) |bytes| {
+        const validation = try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(bytes);
+        if (validation.progress.state != .invalid and fence.role != .backup_snapshot) {
+            const validation_handoff = fence.role == .schema_validation and fence.eql(validation.binding.fence);
+            const generation_handoff = fence.role == .child_generation_source and
+                fence.transition_id == validation.binding.fence.transition_id and fence.namespace.eql(validation.binding.fence.namespace) and
+                std.mem.eql(u8, &fence.catalog_digest, &validation.binding.fence.catalog_digest) and
+                fence.admission_epoch > validation.binding.fence.admission_epoch;
+            if (validation.progress.state != .enforced or (!validation_handoff and !generation_handoff)) return error.IntegrityTopologyBusy;
+        }
+    }
     if (handoff != null and fence.role != .rewrite_source) return error.InvalidGenerationHandoff;
     _ = try fence.encode();
     const abort_key = abortedKey(fence);
@@ -106,6 +169,7 @@ pub fn stageBeginWithHandoff(txn: anytype, fence: Fence, handoff: ?@import("rela
     try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
     try @import("relational_integrity_generation_retirement.zig").requireActivationAcknowledged(txn);
     try @import("relational_integrity_generation_admission.zig").requireAcknowledged(txn);
+    try @import("relational_integrity_generation_admission.zig").requireReferenceCoverageAcknowledged(txn);
     // Split/merge transfer the durable generation tombstones through the
     // integrity handoff stream. Rewrite has a different copy protocol and
     // remains fenced until it transfers the same authority.
@@ -184,16 +248,35 @@ pub fn admitPrepare(txn: anytype, manager: *transactions.TxnManager, alloc: Allo
     if (try manager.loadSchemaBinding(alloc, txn_id) == null) return error.IntegrityTopologyBusy;
 }
 
-pub fn requireUnfenced(txn: anytype) !void {
+/// Ordinary writes keep using the existing physical write fence. Semantic FK
+/// validation pins definition/topology changes while allowing enforced DML.
+pub fn requireWriteUnfenced(txn: anytype) !void {
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     if (try current(txn) != null) return error.IntegrityTopologyBusy;
+}
+
+pub fn requireNoActiveValidation(txn: anytype) !void {
+    if (try optional(txn, @import("relational_integrity_activation_contract.zig").validation_key)) |bytes| {
+        const validation = try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(bytes);
+        if (validation.progress.state != .invalid) return error.IntegrityTopologyBusy;
+    }
+}
+
+pub fn requireUnfenced(txn: anytype) !void {
+    try requireWriteUnfenced(txn);
+    try requireNoActiveValidation(txn);
 }
 
 /// Runtime reconciliation of an already-published identical producer catalog
 /// is harmless while frozen; delayed *changes* may not create new callbacks.
 pub fn requireUnfencedOrUnchanged(txn: anytype, key: []const u8, candidate: []const u8) !void {
     if (try @import("artifact_reconcile_intent.zig").permitCatalog(std.heap.page_allocator, txn, key, candidate)) return;
-    if (try current(txn) == null and try @import("online_integrity_shadow.zig").rawRange(txn) == null) return;
+    var validation_active = false;
+    requireNoActiveValidation(txn) catch |err| {
+        if (err != error.IntegrityTopologyBusy) return err;
+        validation_active = true;
+    };
+    if (!validation_active and try current(txn) == null and try @import("online_integrity_shadow.zig").rawRange(txn) == null) return;
     const existing = (try optional(txn, key)) orelse return error.IntegrityTopologyBusy;
     if (!std.mem.eql(u8, existing, candidate)) return error.IntegrityTopologyBusy;
 }
@@ -203,12 +286,22 @@ pub fn requireUnfencedOrUnchanged(txn: anytype, key: []const u8, candidate: []co
 pub fn requireDrained(txn: anytype, manager: *transactions.TxnManager, expected: Fence) !void {
     const actual = (try current(txn)) orelse return error.IntegrityTopologyFenceMissing;
     if (!actual.eql(expected)) return error.IntegrityTopologyChanged;
+    if (expected.role == .schema_validation) {
+        const header = (try @import("relational_nullability_job.zig").load(txn)) orelse return error.SchemaValidationJobRequired;
+        if (try transactions.TxnManager.hasQualifiedTopologyDebt(txn, try transactions.topology_debt.Scope.fromBinding(header.binding))) return error.TransactionTopologyBusy;
+        // Admitted writers maintain this exact generation atomically. Shared
+        // snapshot import independently verifies the directory and retained
+        // cohort evidence before publication; no history scan belongs here.
+        return;
+    }
     if (try manager.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
 }
 
 /// Final release must share the ownership/cutover transaction. Persist a
 /// checksummed receipt so delayed control commands cannot resurrect a fence.
 pub fn stageRelease(txn: anytype, expected: Fence) !void {
+    if (expected.role == .index_build) return error.PrivateIndexPublicationRequired;
+    if (expected.role == .schema_validation) return error.SchemaValidationPublicationRequired;
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     // Publication must activate the exact pending parent generations before
     // lifting the write fence. Until that path exists, release fails closed.
@@ -225,9 +318,59 @@ pub fn stageRelease(txn: anytype, expected: Fence) !void {
     }
 }
 
+/// Index publication is not an ordinary topology release. Require the exact
+/// actual installed cut before the terminal owner transaction can lift it.
+pub fn stageInstalledIndexRelease(alloc: std.mem.Allocator, txn: anytype, installed: @import("relational_index_validation.zig").Installed) !void {
+    const binding = installed.command.validation.command.binding;
+    const actual = (try @import("relational_index_validation.zig").Installed.load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired;
+    if (!std.meta.eql(actual, installed)) return error.InvalidPrivateIndexNativeReceipt;
+    try actual.requireCurrent(alloc, txn);
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
+    if (try optional(txn, receipt_key)) |bytes| if ((try Fence.decode(bytes)).admission_epoch >= binding.fence.admission_epoch) return error.IntegrityTopologyCompleted;
+    try stageReceipt(txn, binding.fence);
+    try txn.delete(fence_key);
+}
+
+/// Dedicated terminal cancellation gate: the actual cleanup checkpoint,
+/// complete local retirement and drained source must agree in this transaction.
+pub fn stageCanceledIndexRelease(txn: anytype, manager: *transactions.TxnManager, canceled: @import("relational_index_owner_job.zig").Canceled) !void {
+    const actual = (try @import("relational_index_owner_job.zig").Canceled.load(txn)) orelse return error.PrivateIndexCancellationPending;
+    if (!std.meta.eql(actual, canceled)) return error.PrivateIndexOwnerJobChanged;
+    try actual.requireCurrent(txn);
+    try requireDrained(txn, manager, canceled.binding.fence);
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
+    if (try optional(txn, receipt_key)) |bytes| if ((try Fence.decode(bytes)).admission_epoch >= canceled.binding.fence.admission_epoch) return error.IntegrityTopologyCompleted;
+    try stageReceipt(txn, canceled.binding.fence);
+    try txn.delete(fence_key);
+}
+
+/// Dedicated schema publication release, joined to the exact terminal owner
+/// header. Generic topology commands remain unable to lift this fence. The
+/// outer owner authenticates metadata's decision; this checks physical truth.
+pub fn stageSchemaValidationRelease(txn: anytype, released: @import("relational_nullability_job.zig").Header) !void {
+    try released.validate();
+    if (released.phase != .released) return error.SchemaValidationPublicationRequired;
+    const stored = (try @import("relational_nullability_job.zig").load(txn)) orelse return error.SchemaValidationJobRequired;
+    if (!std.meta.eql(stored, released)) return error.SchemaValidationJobChanged;
+    // current() deliberately rejects a released job retaining a fence. Read
+    // the raw fence only in this indivisible terminal transaction.
+    const raw = (try optional(txn, fence_key)) orelse return error.IntegrityTopologyFenceMissing;
+    const fence = try Fence.decode(raw);
+    if (!fence.eql(released.binding.fence)) return error.IntegrityTopologyChanged;
+    if (try completed(txn)) |done| if (done.admission_epoch >= fence.admission_epoch) return error.IntegrityTopologyCompleted;
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
+    try stageReceipt(txn, fence);
+    try txn.delete(fence_key);
+}
+
 /// Cancelling an ambiguously delivered begin consumes its epoch even if the
 /// begin has not arrived yet. Never releases another live lifecycle owner.
 pub fn stageCancel(txn: anytype, expected: Fence) !void {
+    if (expected.role == .index_build) return error.PrivateIndexCancellationRequired;
+    if (expected.role == .schema_validation) return error.SchemaValidationCancellationRequired;
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     _ = try expected.encode();
     if (try current(txn)) |actual| {

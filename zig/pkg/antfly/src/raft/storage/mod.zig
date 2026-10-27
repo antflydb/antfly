@@ -26,6 +26,7 @@ pub const FileSnapshotStoreConfig = file_snapshot_store.FileSnapshotStoreConfig;
 pub const SnapshotArtifactPolicy = file_snapshot_store.SnapshotArtifactPolicy;
 pub const wal_replica_state = @import("wal_replica_state.zig");
 pub const snapshot_payload_store = @import("snapshot_payload_store.zig");
+pub const snapshot_metadata = @import("snapshot_metadata.zig");
 pub const file_snapshot_artifact = @import("file_snapshot_artifact.zig");
 pub const backup_restore = @import("backup_restore.zig");
 pub const WalReplicaState = wal_replica_state.WalReplicaState;

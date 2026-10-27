@@ -147,6 +147,10 @@ pub fn build(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.
 }
 
 pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype, policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies) !stages.Plan {
+    return buildWithPoliciesAndConstraintNameGuard(alloc, id, selected, all_ranges, table_name, proposed, observer, policies, null);
+}
+
+pub fn buildWithPoliciesAndConstraintNameGuard(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype, policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !stages.Plan {
     // Source ownership must stay fixed throughout the rewrite cohort. Check
     // every member before issuing any source reads or admitting a durable job.
     for (selected) |table| if (table.storage_migration != null) return error.TableTransitionActive;
@@ -239,10 +243,10 @@ pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []co
         defer programs.deinit();
         table.table_id = table_id;
         table.min_ranges = @intCast(ranges.len);
-        target.* = .{ .source_table_id = before.table_id, .table = table, .ranges = ranges, .generation_handoffs = handoffs, .rewrite = .{ .preserve_document = document, .default_columns = target_policies.default_columns, .allow_column_drops = !document and target_policies.dropped_columns == .allow, .source_schemas = source_schemas, .target_schema = table.schema_json, .target_read_schema = if (document) table.read_schema_json else "", .program_digest = programs.identity }, .rewrite_sources = scopes, .replace = .{ .table = try metadata.cloneTable(alloc, before), .ranges = original_ranges.items, .fences = fences } };
+        target.* = .{ .source_table_id = before.table_id, .table = table, .ranges = ranges, .generation_handoffs = handoffs, .rewrite = .{ .version = if (target_policies.default_clock_micros != null) 4 else if (target_policies.column_transforms.len == 0) 2 else 3, .preserve_document = document, .default_columns = target_policies.default_columns, .default_clock_micros = target_policies.default_clock_micros, .allow_column_drops = !document and target_policies.dropped_columns == .allow, .expression_schema = target_policies.expression_schema, .column_transforms = target_policies.column_transforms, .source_schemas = source_schemas, .target_schema = table.schema_json, .target_read_schema = if (document) table.read_schema_json else "", .program_digest = programs.identity }, .rewrite_sources = scopes, .replace = .{ .table = try metadata.cloneTable(alloc, before), .ranges = original_ranges.items, .fences = fences } };
     }
     try stages.prepareEmptyGenerationHandoffMappingsAlloc(alloc, targets);
-    var result: stages.Plan = .{ .id = id, .cohort_digest = @splat(0), .targets = targets, .preparing_sources = true };
+    var result: stages.Plan = .{ .id = id, .cohort_digest = @splat(0), .targets = targets, .preparing_sources = true, .constraint_name_guard = if (guard) |value| try value.clone(alloc) else null };
     result.cohort_digest = try result.rewriteIntentDigest(alloc);
     try result.validate(alloc);
     return result;

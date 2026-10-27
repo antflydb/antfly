@@ -135,6 +135,13 @@ pub const Source = struct {
         if (row.layout != self.layout or row.table_schema.relational_columns.ptr != self.columns.ptr or row.table_schema.relational_columns.len != self.columns.len)
             return error.RelationalRowSchemaMismatch;
         scratch.clearRetainingCapacity();
+        // Nullness needs only authenticated presence/null metadata, not a
+        // potentially multi-megabyte encoded comparison key. Plan.init binds
+        // exactly one ordinary column; historical absence remains SQL NULL.
+        if (self.plan.op == .is_null or self.plan.op == .is_not_null) {
+            const has_null = if (self.tuple) |tuple| try row.isSqlNull(tuple.keys[0].ordinal) else true;
+            return self.plan.compare(&.{}, has_null);
+        }
         const has_null = if (self.tuple) |tuple| try tuple.append(alloc, scratch, row) else true;
         return self.plan.compare(scratch.items, has_null);
     }
@@ -184,6 +191,37 @@ test "relational predicate exact integers null truth and historical absence" {
     defer historical.deinit();
     try std.testing.expect(historical.tuple == null);
     try std.testing.expectError(error.RelationalRowSchemaMismatch, historical.evaluate(alloc, &scratch, row));
+}
+
+test "relational nullness predicates do not allocate comparison payloads" {
+    const a = std.testing.allocator;
+    const columns = [_]schema.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string, .allows_null = true }};
+    const table = schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const payload = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 0); // Worst-case tuple escaping, irrelevant to nullness.
+    var plan = try Plan.init(a, table, &layout, .{ .column = "body", .op = .is_null });
+    defer plan.deinit();
+    var source = try plan.projectSource(a, table, &layout);
+    defer source.deinit();
+    var scratch: std.ArrayList(u8) = .empty;
+    var backing: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    defer scratch.deinit(fixed.allocator());
+    for (0..3) |kind| {
+        const cells = [_]codec.Cell{.{ .ordinal = 0, .path = "body", .value_type = .bytes_val, .is_null = kind == 1, .value = .{ .bytes_val = payload } }};
+        const raw = try codec.serializeOrdinal(a, 1, &columns, if (kind == 2) &.{} else &cells, @splat(0));
+        defer a.free(raw);
+        const row = try codec.ordinalRowViewSelective(raw, table, &layout);
+        plan.op = .is_null;
+        try std.testing.expectEqual(truth(kind != 0), try source.evaluate(fixed.allocator(), &scratch, row));
+        plan.op = .is_not_null;
+        try std.testing.expectEqual(truth(kind == 0), try source.evaluate(fixed.allocator(), &scratch, row));
+        try std.testing.expectEqual(@as(usize, 0), scratch.capacity);
+        try std.testing.expectEqual(@as(usize, 0), fixed.end_index);
+    }
 }
 
 test "relational residual comparisons admit large row values without expanding stored index keys" {

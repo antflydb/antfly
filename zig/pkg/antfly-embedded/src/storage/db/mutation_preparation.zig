@@ -2130,7 +2130,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .alloc = allocator_guard.allocator(),
                 .scratch_child = allocator_guard.allocator(),
                 .writes = writes,
-                .validator = validator,
+                .validator = if (validator) |compiled| (if (!preserve_logical_values and io != null) compiled.forPreparation(try (@import("../../schema/relational_expression.zig").PreparationRuntime{ .io = io.? }).withClock(table_schema.requires_clock_defaults)) else compiled) else null,
                 .table_schema = table_schema,
                 .physical_layout = physical_layout,
                 .db = db,

@@ -19,9 +19,8 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-// Version 84 adds durable job-state, scheduling and owner-quota projections.
-// Older owners must reject their operation identifiers before dispatch.
-pub const abi_version: u32 = 84;
+// Main owns published job projections 72..74. Schema preflight appends at 75.
+pub const abi_version: u32 = 109;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -602,11 +601,14 @@ pub const MetadataProjectionKind = enum(u32) {
     resolver_namespace_replacement_matches = 69,
     resolver_catalog_read = 70,
     resolver_projection_valid = 71,
+    /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
+    secret_collection = 42,
     job_state = 72,
     job_state_scan = 73,
     job_owner_count = 74,
-    /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
-    secret_collection = 42,
+    /// Raw binary schema-publication command; read-only preflight returns JSON
+    /// acceptance intent. No ASVI frame is escaped into a JSON envelope.
+    schema_validation_preflight = 75,
 };
 
 pub const MetadataHABindRequest = extern struct {
@@ -745,6 +747,7 @@ pub const DataApplyPreparedSnapshotResult = extern struct {
     _reserved0: u32 = 0,
     path: OwnedBytes = .{},
     size: u64 = 0,
+    application_manifest: OwnedBytes = .{},
 };
 
 pub const DataApplyGroupRequest = extern struct {
@@ -789,6 +792,8 @@ pub const DataApplyProjectionKind = enum(u32) {
     group_state_keys_page = 7,
     topology_rejection = 8,
     merge_membership = 9,
+    /// Raw retained normal entry; after_sequence=index, through_sequence=term.
+    committed_normal_entry = 10,
 };
 
 /// One bounded projection read. Fields unused by `kind` must remain zero.
@@ -1122,6 +1127,14 @@ pub const RestoreAdmission = extern struct {
     native_manifest_sha256: BorrowedBytes = .{},
 };
 
+pub const OwnerCatalogMode = enum(u8) {
+    descriptor = 0,
+    /// Existing durable catalog only, unpublished and without autonomous
+    /// replay/derived workers. No schema/index/bootstrap hints are accepted.
+    durable_only = 1,
+    _,
+};
+
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -1153,7 +1166,8 @@ pub const OpenRequest = extern struct {
     /// Optional result: the physical owner opened for exact topology control
     /// while current-catalog index reconciliation remains fence-deferred.
     owner_catalog_deferred_out: ?*u8 = null,
-    _restore_reserved: [4]u8 = @splat(0),
+    catalog_mode: OwnerCatalogMode = .descriptor,
+    _restore_reserved: [3]u8 = @splat(0),
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
     runtime_hooks: RuntimeHooksConfig = .{},
@@ -1205,6 +1219,301 @@ pub const NativeFkGenerationControlRequest = extern struct {
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
 };
+
+/// Private compiled-owner entry point. The receiving server independently
+/// obtains metadata permission; this bounded observation is read-only and
+/// contains only facts from one actual Raft owner snapshot.
+pub const RaftIndexOwnerObservationRequest = extern struct {
+    pub const operation: u32 = 1;
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    identity_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+
+pub extern fn antfly_storage_owner_raft_index_observation_json(
+    owner: ?*anyopaque,
+    request: *const RaftIndexOwnerObservationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+/// Private compiled-owner entry point. The receiving server independently
+/// authenticates the coordinator and obtains a fresh metadata owner decision.
+/// Admission supplies raw immutable inputs; physical IDs are chosen locally.
+pub const NativeIndexOwnerOperation = enum(u32) { admit = 1, fence = 2, reserve = 3, inspect = 4, receipt = 5, cancel_intent = 6, cancel_cleanup = 7, cancel_gc_page = 8, cancel_admit = 9, cancel_fence = 10, cancel_reserve = 11, cancel_inspect = 12, cancel_claim_gc_page = 13, claims = 14, build = 15, source = 16, consume = 17, install = 18, release = 19, cancel_complete = 20, cancel_release = 21, _ };
+
+/// Read-only preparation; accepts raw bounded immutable inputs, not physical
+/// IDs or caller positions. The result neither reserves nor admits a job.
+pub const RaftIndexOwnerPreparationRequest = extern struct {
+    pub const operation: u32 = 2;
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    admission_json: BorrowedBytes = .{},
+    manifest: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+
+pub extern fn antfly_storage_owner_raft_index_preparation_json(
+    owner: ?*anyopaque,
+    request: *const RaftIndexOwnerPreparationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+/// Read-only bounded page preparation or retained progress. No apply cut or
+/// permission bit crosses this boundary; consensus proposal is server-owned.
+pub const RaftIndexOwnerBuildRequest = extern struct {
+    pub const operation: u32 = 3;
+    version: u32 = abi_version,
+    prepare: u32 = 1,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    /// Mode 2 performs a bounded root-local audit; only its receiving server
+    /// supplies this local signing-root scope, never a public RPC body.
+    audit_root_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_index_build_json(
+    owner: ?*anyopaque,
+    request: *const RaftIndexOwnerBuildRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub const RaftIndexOwnerSourceRequest = extern struct {
+    pub const operation: u32 = 4;
+    version: u32 = abi_version,
+    consumed_only: u8 = 0,
+    _reserved: [3]u8 = @splat(0),
+    table_name: BorrowedBytes = .{},
+    identity_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_index_source_json(
+    owner: ?*anyopaque,
+    request: *const RaftIndexOwnerSourceRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub const RaftIndexOwnerClaimsRequest = extern struct {
+    pub const operation: u32 = 5;
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    command_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_index_claims_json(
+    owner: ?*anyopaque,
+    request: *const RaftIndexOwnerClaimsRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub const RaftIndexOwnerLifecycleRequest = extern struct {
+    pub const operation: u32 = 6;
+    version: u32 = abi_version,
+    prepare: u32 = 1,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    audit_root_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_index_lifecycle_json(owner: ?*anyopaque, request: *const RaftIndexOwnerLifecycleRequest, out_response: *OwnedBytes, out_failure: *FailureIdentity) callconv(.c) Status;
+
+pub const NativeIndexOwnerControlRequest = extern struct {
+    version: u32 = abi_version,
+    operation: NativeIndexOwnerOperation,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    /// Raw immutable inputs for admission; bounded host-selected AuditRoot
+    /// JSON for validation/installation. Remote callers never select this filesystem scope.
+    manifest: BorrowedBytes = .{},
+    /// Used by bounded build/source/consume/install operations; callbacks are never retained.
+    control: ControlledJsonOperationRequest = .{},
+};
+
+pub const RaftIndexOwnerCancellationRequest = extern struct {
+    pub const operation: u32 = 7;
+    version: u32 = abi_version,
+    prepare: u32 = 1,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_index_cancellation_json(owner: ?*anyopaque, request: *const RaftIndexOwnerCancellationRequest, out_response: *OwnedBytes, out_failure: *FailureIdentity) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_native_index_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeIndexOwnerControlRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Trusted committed-entry ingress only. Command bytes carry no position;
+/// term/index are supplied by the applying state machine, never ordinary RPC.
+pub const RaftSchemaOwnerApplyRequest = extern struct {
+    pub const operation: u32 = 3;
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    command: BorrowedBytes = .{},
+    term: u64 = 0,
+    index: u64 = 0,
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_apply_raft_schema_control(
+    owner: ?*anyopaque,
+    request: *const RaftSchemaOwnerApplyRequest,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+/// Control-lane preparation owns all retained command data and pins the exact
+/// owner generation. Only one outstanding preparation per owner is admitted.
+/// Call destroy on the control lane BEFORE closing/releasing that owner. The
+/// prepare request's callbacks are borrowed only for the prepare invocation.
+pub const RaftSchemaOwnerPreparationResult = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    prepared: ?*anyopaque = null,
+    root_generation: u64 = 0,
+    physical_root_incarnation_le: [16]u8 = @splat(0),
+};
+pub extern fn antfly_storage_owner_prepare_raft_schema_control(
+    owner: ?*anyopaque,
+    request: *const RaftSchemaOwnerApplyRequest,
+    out_prepared: *RaftSchemaOwnerPreparationResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub const RaftSchemaOwnerPreparedApplyRequest = extern struct {
+    pub const operation: u32 = 4;
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    prepared: ?*anyopaque = null,
+    /// Must match the actual committed entry used for preparation. A ticket
+    /// cannot be rebound to a different entry, owner, or physical generation.
+    term: u64 = 0,
+    index: u64 = 0,
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_apply_prepared_raft_schema_control(
+    owner: ?*anyopaque,
+    request: *const RaftSchemaOwnerPreparedApplyRequest,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+/// Idempotent for stale/foreign IDs. Waits for entered apply invocations;
+/// potentially large prepared-buffer destruction never runs on node progress.
+pub extern fn antfly_storage_owner_destroy_raft_schema_preparation(prepared: ?*anyopaque) callconv(.c) void;
+
+/// Read-only native schema progress. No caller-selected root, receipt position,
+/// publication flag or opaque mutation payload is accepted by this port.
+pub const NativeSchemaOwnerObservationRequest = extern struct {
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    binding_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_native_schema_observation_json(
+    owner: ?*anyopaque,
+    request: *const NativeSchemaOwnerObservationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Actual committed owner observation; no request watermark or root identity.
+/// ABI 98 also decodes the terminal schema-publication release control.
+pub const RaftSchemaOwnerObservationRequest = extern struct {
+    pub const operation: u32 = 8;
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    binding_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_schema_observation_json(
+    owner: ?*anyopaque,
+    request: *const RaftSchemaOwnerObservationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+/// Trusted native owner control. Descriptor and raw immutable payload are
+/// separate so schema-sized inputs never become JSON/base64 byte arrays.
+/// Empty page payload asks the owner to prepare one bounded page locally.
+pub const NativeSchemaOwnerControlRequest = extern struct {
+    pub const operation: u32 = 9;
+    version: u32 = abi_version,
+    records: u32 = 1024,
+    time_ns: u64 = 5_000_000,
+    table_name: BorrowedBytes = .{},
+    descriptor_json: BorrowedBytes = .{},
+    payload: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+/// Read-only independently compiled candidate and actual owner cut. Raw ASVI
+/// inputs are separate from the bounded descriptor, never JSON/base64 arrays.
+pub const SchemaOwnerPreparationRequest = extern struct {
+    pub const operation: u32 = 10;
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    descriptor_json: BorrowedBytes = .{},
+    inputs: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+/// Read-only preparation of a deterministic Raft page/debt command. No term,
+/// index, row payload or caller-selected commit position is accepted.
+pub const SchemaOwnerProposalRequest = extern struct {
+    pub const operation: u32 = 12;
+    version: u32 = abi_version,
+    records: u32 = 1024,
+    time_ns: u64 = 5_000_000,
+    table_name: BorrowedBytes = .{},
+    descriptor_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub const SchemaOwnerProposalResult = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    root_generation: u64 = 0,
+    physical_root_incarnation_le: [16]u8 = @splat(0),
+    /// Owned raw ASVR bytes, not JSON/base64. Empty means reconciliation has
+    /// no outstanding page; the caller must reobserve, never invent progress.
+    command: OwnedBytes = .{},
+};
+pub extern fn antfly_storage_owner_prepare_schema_proposal(
+    owner: ?*anyopaque,
+    request: *const SchemaOwnerProposalRequest,
+    out_response: *SchemaOwnerProposalResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_schema_preparation_json(
+    owner: ?*anyopaque,
+    request: *const SchemaOwnerPreparationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+/// Bounded full-image audit. Only the trusted owner adapter selects the local
+/// signing root; raw immutable inputs never become JSON/base64 byte arrays.
+pub const SchemaOwnerAuditRequest = extern struct {
+    pub const operation: u32 = 11;
+    version: u32 = abi_version,
+    records: u32 = 1024,
+    time_ns: u64 = 5_000_000,
+    table_name: BorrowedBytes = .{},
+    binding_json: BorrowedBytes = .{},
+    inputs: BorrowedBytes = .{},
+    signing_root_dir: BorrowedBytes = .{},
+    signing_root_incarnation_le: [16]u8 = @splat(0),
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_schema_audit_json(
+    owner: ?*anyopaque,
+    request: *const SchemaOwnerAuditRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_native_schema_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeSchemaOwnerControlRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_native_fk_generation_control_json(
     owner: ?*anyopaque,
@@ -2292,6 +2601,13 @@ pub extern fn antfly_storage_wal_open(
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_wal_close(wal: ?*anyopaque) callconv(.c) void;
+
+/// Static append admission; does not reserve space or advance the WAL.
+pub extern fn antfly_storage_wal_admit_append_bytes(
+    wal: ?*anyopaque,
+    version: u32,
+    data_len: u64,
+) callconv(.c) Status;
 
 pub extern fn antfly_storage_wal_append(
     wal: ?*anyopaque,

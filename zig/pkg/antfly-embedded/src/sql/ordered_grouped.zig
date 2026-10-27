@@ -33,12 +33,13 @@ pub const Collector = struct {
     sorts: []spill.Sort = &.{},
     representatives: []usize = &.{},
     summaries: ?spill.Sort = null,
+    collections: []@import("collection_aggregate.zig").Stream = &.{},
     key_buffer: []Datum = &.{},
     prepared: bool = false,
 
     pub fn init(grouped: *operators.Grouped, bound: *const binding.Bound, manager: *spill.Manager, bytes: usize) !Collector {
         var self: Collector = .{ .grouped = grouped, .bound = bound, .manager = manager };
-        if (bound.ordered.len == 0) return self;
+        if (bound.ordered.len == 0 and bound.collections.len == 0) return self;
         const a = manager.allocator();
         self.key_buffer = try a.alloc(Datum, bound.group_count + 1);
         errdefer a.free(self.key_buffer);
@@ -54,7 +55,7 @@ pub const Collector = struct {
         };
         // Grouped state uses half the budget; ordered domains and summaries
         // divide the remainder, irrespective of group or request counts.
-        const per_sort = bytes / (bound.ordered_class_count + 1);
+        const per_sort = bytes / (bound.ordered_class_count + bound.collections.len + 1);
         for (self.sorts, 0..) |*sort, class| {
             const orders = try a.alloc(operators.Order, bound.group_count + 1);
             @memset(orders, .{});
@@ -65,6 +66,14 @@ pub const Collector = struct {
             };
             sort.* = spill.Sort.init(a, manager, orders, per_sort);
             initialized += 1;
+        }
+        self.collections = try a.alloc(@import("collection_aggregate.zig").Stream, bound.collections.len);
+        errdefer a.free(self.collections);
+        var collection_count: usize = 0;
+        errdefer for (self.collections[0..collection_count]) |*stream| stream.deinit();
+        for (bound.collections, self.collections) |plan, *stream| {
+            stream.* = try @import("collection_aggregate.zig").Stream.init(manager, plan, bound.group_count, per_sort);
+            collection_count += 1;
         }
         const orders = try a.alloc(operators.Order, bound.group_count);
         @memset(orders, .{});
@@ -80,6 +89,8 @@ pub const Collector = struct {
             a.free(orders);
         }
         a.free(self.sorts);
+        for (self.collections) |*stream| stream.deinit();
+        a.free(self.collections);
         a.free(self.representatives);
         a.free(self.key_buffer);
         if (self.summaries) |*sort| {
@@ -89,6 +100,14 @@ pub const Collector = struct {
         }
     }
 
+    pub fn addCollection(self: *Collector, index: usize, context: anytype, a: A, source: []const Datum, groups: []const Datum) !Datum {
+        if (index >= self.collections.len) return error.InvalidSqlBackendResponse;
+        return self.collections[index].add(context, a, source, groups, self.bound.input.projections);
+    }
+    pub fn addCollectionValues(self: *Collector, index: usize, values: []const Datum, groups: []const Datum) !Datum {
+        if (index >= self.collections.len) return error.InvalidSqlBackendResponse;
+        return self.collections[index].addValues(values, groups);
+    }
     fn capture(self: *Collector, keys: []const Datum, inputs: []const Datum) !void {
         if (self.sorts.len == 0) return;
         @memcpy(self.key_buffer[0..keys.len], keys);
@@ -194,6 +213,7 @@ pub const Collector = struct {
         const summary = (try summaries.next(a)) orelse {
             // Counts and sorted payloads must agree, including empty groups.
             for (self.sorts) |*sort| if (try sort.next(a) != null) return error.InvalidSqlSpill;
+            for (self.collections) |*stream| if (try stream.sort.next(a) != null) return error.InvalidSqlSpill;
             return null;
         };
         const width = summary.keys.len + summary.values.len;
@@ -243,6 +263,12 @@ pub const Collector = struct {
                 }
                 cells[summary.keys.len + slot.aggregate] = value;
             }
+        }
+        for (self.collections) |*stream| {
+            const value = summary.values[stream.plan.aggregate_index];
+            if (value.sql_null or value.value != .integer or value.value.integer < 0) return error.InvalidSqlSpill;
+            const count = std.math.cast(usize, value.value.integer) orelse return error.InvalidSqlSpill;
+            cells[summary.keys.len + stream.plan.aggregate_index] = try stream.finish(a, summary.keys, count);
         }
         return .{ .keys = summary.keys, .aggregates = cells[summary.keys.len..width], .ordinal = summary.ordinal };
     }
@@ -299,5 +325,83 @@ test "SQL grouped ordered streams spill once per domain and release every alloca
         }
     };
     try Fixture.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.fault, .{});
+}
+
+test "SQL collection aggregates spill typed tuples and unwind every allocation failure" {
+    const Fixture = struct {
+        invocation_constants: []const Datum = &.{},
+        fn checkpoint(_: *anyopaque) !void {}
+        pub fn evaluate(_: @This(), a: A, program: scalar.Program, cells: []const Datum) !Datum {
+            return @import("decision_eval.zig").evaluate(a, null, &program, cells, &.{});
+        }
+        fn run(a: A, disk: bool, quota: bool) !void {
+            var compiled = try @import("compiler.zig").compile(a, "SELECT g,string_agg(v,d ORDER BY n DESC),array_agg(v ORDER BY n DESC),string_agg(DISTINCT v,':' ORDER BY v),sum(n ORDER BY n) FROM t GROUP BY g", .{});
+            defer compiled.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const table: @import("catalog.zig").Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{
+                .{ .name = "g", .path = "g", .type = .integer },
+                .{ .name = "v", .path = "v", .type = .string, .nullable = true },
+                .{ .name = "d", .path = "d", .type = .string, .nullable = true },
+                .{ .name = "n", .path = "n", .type = .integer, .element_type = .int32 },
+            } };
+            const bound = try binding.bind(arena.allocator(), table, compiled.statement.select, &.{});
+            var marker: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = if (disk) std.testing.io else .failing, .context = &marker, .checkpoint = checkpoint, .async_writes = false, .buffer_bytes = 128, .max_bytes = if (quota) 1 else if (disk) 8 * 1024 * 1024 else 0 };
+            defer manager.deinit();
+            const grouped = try operators.Grouped.create(a, bound.specs, .{ .bytes = 128 * 1024, .spill = &manager });
+            defer grouped.deinit();
+            var collector = try Collector.init(grouped, &bound, &manager, if (disk) 16 * 1024 else 1024 * 1024);
+            defer collector.deinit();
+            try std.testing.expectEqual(@as(usize, 4), collector.collections.len);
+            // DISTINCT retains the text as a key, not another payload copy.
+            try std.testing.expectEqual(@as(usize, 0), collector.collections[2].payload.len);
+            const groups: usize = if (disk) 128 else 1;
+            var row_arena = std.heap.ArenaAllocator.init(a);
+            defer row_arena.deinit();
+            for (0..8) |n| for (0..groups) |g| {
+                _ = row_arena.reset(.retain_capacity);
+                const scratch = row_arena.allocator();
+                const cells = try scratch.alloc(Datum, bound.input.columns.len);
+                for (cells, bound.input.columns) |*cell, column| {
+                    cell.* = .{};
+                    if (std.mem.eql(u8, column.name, "g")) cell.* = Datum.json(.{ .integer = @intCast(groups - g - 1) });
+                    if (std.mem.eql(u8, column.name, "n")) cell.* = Datum.json(.{ .integer = @intCast(n) });
+                    if (std.mem.eql(u8, column.name, "v") and n != 2) cell.* = Datum.json(.{ .string = switch (n % 3) {
+                        0 => "0",
+                        1 => "1",
+                        else => "2",
+                    } });
+                    if (std.mem.eql(u8, column.name, "d") and n % 2 == 1) cell.* = Datum.json(.{ .string = ":" });
+                }
+                const keys = [_]Datum{Datum.json(.{ .integer = @intCast(groups - g - 1) })};
+                const inputs = try scratch.alloc(Datum, bound.specs.len);
+                for (bound.collections, 0..) |plan, index| inputs[plan.aggregate_index] = try collector.addCollection(index, @This(){}, scratch, cells, &keys);
+                try collector.add(&keys, inputs);
+            };
+            var result_arena = std.heap.ArenaAllocator.init(a);
+            defer result_arena.deinit();
+            for (0..groups) |g| {
+                _ = result_arena.reset(.retain_capacity);
+                const result = (try collector.nextResult(@This(){}, result_arena.allocator())).?;
+                try std.testing.expectEqual(@as(i64, @intCast(g)), result.keys[0].value.integer);
+                try std.testing.expectEqualStrings("10:21:0:10", result.aggregates[0].value.string);
+                const array = result.aggregates[1].array.?;
+                try std.testing.expectEqual(@as(usize, 8), array.cardinality());
+                try std.testing.expectEqualStrings("1", array.flatCell(0).value.string);
+                try std.testing.expect(array.flatCell(5).sql_null);
+                try std.testing.expectEqualStrings("0:1:2", result.aggregates[2].value.string);
+                try std.testing.expectEqual(@as(i64, 28), result.aggregates[3].value.integer);
+            }
+            try std.testing.expect(try collector.nextResult(@This(){}, result_arena.allocator()) == null);
+            if (disk) try std.testing.expect(manager.written_bytes != 0);
+        }
+        fn fault(a: A) !void {
+            try run(a, false, false);
+        }
+    };
+    try Fixture.run(std.testing.allocator, true, false);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Fixture.run(std.testing.allocator, true, true));
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.fault, .{});
 }

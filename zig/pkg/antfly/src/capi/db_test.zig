@@ -1166,6 +1166,1561 @@ test "capi system write cursor sees pending catalog rows and preserves abort" {
     try std.testing.expectError(error.NotFound, read.get("catalog:b"));
 }
 
+test "storage owner native index rejects prior ABI before dereferencing request fields" {
+    for ([_]u32{ 0, kernel_owner_abi.abi_version - 1 }) |version| for ([_]kernel_owner_abi.NativeIndexOwnerOperation{ .build, .install, .release }) |operation| {
+        var response: kernel_owner_abi.OwnedBytes = .{ .ptr = @ptrFromInt(1), .len = 1 };
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, server_api.storageOwnerNativeIndexControlJson(null, &.{
+            .version = version,
+            .operation = operation,
+            .table_name = .{ .ptr = @ptrFromInt(1), .len = 1 },
+            .request_json = .{ .ptr = @ptrFromInt(1), .len = 1 },
+            .manifest = .{ .ptr = @ptrFromInt(1), .len = 1 },
+            .control = .{ .version = version, .request_json = .{ .ptr = @ptrFromInt(1), .len = 1 }, .cancellation_ctx = @ptrFromInt(1) },
+        }, &response));
+        try std.testing.expect(response.ptr == null);
+        try std.testing.expectEqual(@as(u64, 0), response.len);
+    };
+}
+
+/// Isolated kernel-interface qualification, not metadata permission or restore
+/// adoption. Copy logical KV fixtures only; never copy identity/audit files.
+fn testNativeIndexInstallationInterface(source: *db_mod.DB, intent: @import("antfly_local_sources").storage_db_relational_index_validation.InstallIntent) !void {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const native = local.storage_db_relational_index_owner_control;
+    var directory = try TestDirectory.init("native-index-install-capi");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = intent.validation.command.binding.fence.namespace };
+    var handle: Handle = .{ .alloc = a, .db = try db_mod.DB.open(a, directory.path(), options), .storage_owner_table_name = @constCast("items"), .storage_owner_group_id = 11 };
+    var opened = true;
+    defer if (opened) handle.db.close();
+    {
+        var read = try source.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var txn = try handle.db.core.store.runtime_store.beginWrite();
+        errdefer txn.abort();
+        var item = try cursor.first();
+        while (item) |entry| : (item = try cursor.next()) try txn.put(entry.key, entry.value);
+        try txn.commit();
+    }
+    handle.db.close();
+    opened = false;
+    handle.db = try db_mod.DB.open(a, directory.path(), options);
+    opened = true;
+    try std.testing.expect(handle.db.root_incarnation != source.root_incarnation);
+    const id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(id);
+    const signer = try local.storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, directory.path());
+    const root: native.AuditRoot = .{ .root_dir = directory.path(), .root_incarnation = signer.root_incarnation };
+    const root_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    defer a.free(root_json);
+    const installation: native.InstallationRequest = .{ .intent = intent, .budget = .{ .records = 1, .time_ns = std.time.ns_per_s } };
+    const encoded = try std.json.Stringify.valueAlloc(a, installation, .{});
+    defer a.free(encoded);
+    var request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{ .operation = .install, .table_name = .fromSlice("items"), .request_json = .fromSlice(encoded), .manifest = .fromSlice(root_json), .control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 } };
+    var response: kernel_owner_abi.OwnedBytes = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.control = .{};
+    request.manifest = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = native.AuditRoot.max_wire_bytes + 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .fromSlice(root_json);
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    {
+        var wrong_root = root;
+        wrong_root.root_incarnation ^= 1;
+        const wrong_json = try std.json.Stringify.valueAlloc(a, wrong_root, .{});
+        defer a.free(wrong_json);
+        var rejected = request;
+        rejected.manifest = .fromSlice(wrong_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        try std.testing.expect(response.ptr == null);
+        try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
+    }
+    var committed: ?native.InstallOutcome = null;
+    var incomplete: usize = 0;
+    for (0..64) |_| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const output = response;
+        defer freeRawBuffer(output.ptr, output.len);
+        var result = try std.json.parseFromSlice(native.InstallationResponse, a, output.slice(), .{ .ignore_unknown_fields = false });
+        defer result.deinit();
+        try result.value.validateFor(installation);
+        try std.testing.expectEqual(handle.db.root_incarnation, result.value.physicalAudit().audit.physical_root_incarnation);
+        if (result.value == .installed) {
+            try std.testing.expect(incomplete > 0);
+            try std.testing.expect(!result.value.installed.logical.duplicate);
+            try std.testing.expect(result.value.installed.logical.receipt != null);
+            committed = result.value.installed.logical;
+            break;
+        }
+        incomplete += 1;
+        try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
+    }
+    try std.testing.expect(committed != null);
+    try std.testing.expectEqual(@as(u32, 2), handle.db.core.schema.?.version);
+    handle.db.close();
+    opened = false;
+    handle.db = try db_mod.DB.open(a, directory.path(), options);
+    opened = true;
+    for (0..2) |_| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const output = response;
+        defer freeRawBuffer(output.ptr, output.len);
+        var result = try std.json.parseFromSlice(native.InstallationResponse, a, output.slice(), .{ .ignore_unknown_fields = false });
+        defer result.deinit();
+        try result.value.validateFor(installation);
+        try std.testing.expect(result.value == .installed);
+        try std.testing.expect(result.value.installed.logical.duplicate);
+        try std.testing.expectEqualDeep(committed.?.receipt.?, result.value.installed.logical.receipt.?);
+        try std.testing.expectEqual(committed.?.position, result.value.installed.logical.position);
+    }
+    // Kernel-interface qualification only: metadata authorization and signing
+    // are independently qualified by the server receiver and ACK tests.
+    const release_intent: @FieldType(native.ReleaseOutcome, "intent") = .{ .installed = .{ .command = committed.?.command, .position = .{ .native = committed.?.position } }, .metadata_decision = @splat(88) };
+    const release_json = try std.json.Stringify.valueAlloc(a, release_intent, .{});
+    defer a.free(release_json);
+    request.operation = .release;
+    request.request_json = .fromSlice(release_json);
+    request.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.control = .{};
+    request.manifest = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = native.AuditRoot.max_wire_bytes + 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .fromSlice(root_json);
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    {
+        var wrong_root = root;
+        wrong_root.root_incarnation ^= 1;
+        const wrong_json = try std.json.Stringify.valueAlloc(a, wrong_root, .{});
+        defer a.free(wrong_json);
+        var rejected = request;
+        rejected.manifest = .fromSlice(wrong_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        try std.testing.expect(response.ptr == null);
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try local.storage_db_relational_integrity_topology.current(&read) != null);
+    }
+    var released: ?native.ReleaseOutcome = null;
+    for (0..3) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        {
+            const output = response;
+            defer freeRawBuffer(output.ptr, output.len);
+            var result = try std.json.parseFromSlice(native.ReleaseOutcome, a, output.slice(), .{ .ignore_unknown_fields = false });
+            defer result.deinit();
+            try result.value.validate();
+            try std.testing.expectEqualDeep(release_intent, result.value.intent);
+            try std.testing.expectEqual(attempt != 0, result.value.duplicate);
+            try std.testing.expect(!result.value.replication_pending);
+            try std.testing.expectEqual(committed.?.position.sequence + 1, result.value.position.sequence);
+            if (released) |prior| try std.testing.expectEqualDeep(prior.receipt.?, result.value.receipt.?) else released = result.value;
+        }
+        handle.db.close();
+        opened = false;
+        handle.db = try db_mod.DB.open(a, directory.path(), options);
+        opened = true;
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try local.storage_db_relational_integrity_topology.current(&read) == null);
+        try std.testing.expect(try local.storage_db_relational_index_owner_job.load(&read) == null);
+        try std.testing.expectEqual(@as(u32, 2), handle.db.core.schema.?.version);
+    }
+}
+
+test "storage owner native index receipt snapshot guards every durable outbox form" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const outboxes = local.storage_db_durable_outbox;
+    const pending = local.storage_db_durable_outbox_store;
+    var directory = try TestDirectory.init("native-index-receipt-snapshot");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{
+        .start_optional_runtimes = false,
+        .primary_backend = .{ .lsm = .{} },
+    });
+    defer db.close();
+    const versioned = try outboxes.durableReplicationOutboxKeyAlloc(a, .restore_batch, 7, 1, "pending");
+    defer a.free(versioned);
+    for ([_][]const u8{ outboxes.replication_batch_outbox_key, outboxes.replication_replay_outbox_key, outboxes.replication_schema_outbox_key, versioned }) |key| {
+        var before = try db.core.store.beginReadTxn();
+        defer before.abort();
+        try std.testing.expect(!try pending.hasPendingTxn(&before));
+        // Even corrupt/empty obligations fail closed; presence must not require
+        // allocating or decoding the potentially schema-sized payload.
+        try db.core.store.putBatch(&.{.{ .key = key, .value = "" }}, &.{});
+        try std.testing.expect(!try pending.hasPendingTxn(&before));
+        var during = try db.core.store.beginReadTxn();
+        defer during.abort();
+        try std.testing.expect(try pending.hasPendingTxn(&during));
+        try db.core.store.putBatch(&.{}, &.{key});
+        try std.testing.expect(try pending.hasPendingTxn(&during));
+        var after = try db.core.store.beginReadTxn();
+        defer after.abort();
+        try std.testing.expect(!try pending.hasPendingTxn(&after));
+    }
+}
+
+test "storage owner Raft index observations preserve coherent cuts and reject caller positions" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const Integrity = local.storage_db_relational_integrity_contract;
+    const contract = local.storage_db_relational_index_raft_contract;
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
+    ;
+    var directory = try TestDirectory.init("raft-index-observation-capi");
+    defer directory.cleanup();
+    var handle: Handle = .{ .alloc = a, .db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 } }), .storage_owner_table_name = @constCast("items"), .storage_owner_group_id = 11 };
+    defer handle.db.close();
+    const id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(id);
+    try handle.db.setSchemaJson(a, before);
+    var schema = try local.schema_mod.parseValidatedTableSchema(a, before);
+    defer schema.deinit(a);
+    var prior = try local.schema_relational_declarations.compileCatalog(a, schema, 101, null);
+    defer prior.deinit();
+    try handle.db.core.store.putBatch(&.{.{ .key = local.storage_db_relational_integrity_catalog.key, .value = prior.value }}, &.{});
+    var candidate = try local.storage_db_relational_index_candidate.Candidate.prepare(a, 101, before, after, prior.value, "email_idx");
+    defer candidate.deinit();
+    // Supplied-entry storage/ABI qualification, not metadata authorization or
+    // consensus. Physical binding and cuts are nevertheless real store state.
+    const header: contract.Admission = .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = handle.db.core.identity_namespace, .catalog_digest = local.storage_db_relational_index_inputs.digest(prior.value) }, .candidate_digest = local.storage_db_relational_index_inputs.digest(candidate.next.value), .reservation_digest = local.storage_db_relational_index_inputs.digest(candidate.reservation.value) };
+    const identity: contract.Identity = .{ .id = header.id, .plan_digest = header.plan_digest, .owner_digest = header.owner_digest, .ordinal = header.ordinal, .namespace = header.fence.namespace, .owner_group_id = 11 };
+    const encoded = try std.json.Stringify.valueAlloc(a, identity, .{});
+    defer a.free(encoded);
+    const request: kernel_owner_abi.RaftIndexOwnerObservationRequest = .{ .table_name = .fromSlice("items"), .identity_json = .fromSlice(encoded) };
+    const Read = struct {
+        fn run(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerObservationRequest, expected: contract.Identity) !contract.Observation {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexObservationJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expect(response.len <= contract.Observation.max_json_bytes);
+            var parsed = try std.json.parseFromSlice(contract.Observation, std.testing.allocator, response.slice(), .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            try parsed.value.validate(expected);
+            return parsed.value;
+        }
+        fn reject(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerObservationRequest, name: []const u8) !void {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexObservationJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expect(status != .ok);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expectEqualStrings(name, failure.errorName());
+            try std.testing.expect(response.ptr == null and response.len == 0);
+        }
+    };
+    const empty = try Read.run(id, request, identity);
+    try std.testing.expect(empty.binding == null and empty.applied == null and empty.fenced == null and empty.reserved == null);
+    var bad = request;
+    bad.version = 0;
+    bad.identity_json = .{ .ptr = @ptrFromInt(1), .len = std.math.maxInt(u64) };
+    try Read.reject(null, bad, "InvalidAbiVersion");
+    bad = request;
+    bad.identity_json = .{ .ptr = @ptrFromInt(1), .len = contract.Identity.max_json_bytes + 1 };
+    try Read.reject(id, bad, "InvalidArgument");
+    bad = request;
+    bad.table_name = .fromSlice("other");
+    try Read.reject(id, bad, "InvalidArgument");
+    bad = request;
+    bad.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try Read.reject(id, bad, "DeadlineExceeded");
+    const Cancel = struct {
+        calls: usize = 0,
+        at: usize,
+        fn check(ptr: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            return @intFromBool(self.calls >= self.at);
+        }
+    };
+    for ([_]usize{ 1, 2, 3 }) |at| {
+        var cancel: Cancel = .{ .at = at };
+        bad = request;
+        bad.control.cancellation_ctx = &cancel;
+        bad.control.cancellation_fn = Cancel.check;
+        try Read.reject(id, bad, "Canceled");
+    }
+    const caller_position = try std.fmt.allocPrint(a, "{s},\"applied\":{{\"raft\":{{\"term\":7,\"index\":9}}}}}}", .{encoded[0 .. encoded.len - 1]});
+    defer a.free(caller_position);
+    var caller_tree = try std.json.parseFromSlice(std.json.Value, a, caller_position, .{});
+    defer caller_tree.deinit();
+    bad = request;
+    bad.identity_json = .fromSlice(caller_position);
+    try Read.reject(id, bad, "InvalidArgument");
+    try std.testing.expect(try handle.db.orderedApplyReceipt() == null);
+    const header_json = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(header_json);
+    const prepare_request: kernel_owner_abi.RaftIndexOwnerPreparationRequest = .{ .table_name = .fromSlice("items"), .admission_json = .fromSlice(header_json), .manifest = .fromSlice(candidate.inputs.bytes) };
+    const Prepare = struct {
+        fn call(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerPreparationRequest, expected: contract.Admission, digest: [32]u8) !contract.AdmissionPreparation {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexPreparationJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expect(response.len <= contract.AdmissionPreparation.max_json_bytes);
+            var parsed = try std.json.parseFromSlice(contract.AdmissionPreparation, std.testing.allocator, response.slice(), .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            try parsed.value.validate(expected, digest);
+            return parsed.value;
+        }
+        fn reject(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerPreparationRequest, name: []const u8) !void {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexPreparationJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expect(status != .ok);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expectEqualStrings(name, failure.errorName());
+            try std.testing.expectEqual(kernel_owner_abi.RaftIndexOwnerPreparationRequest.operation, failure.operation);
+            try std.testing.expect(response.ptr == null and response.len == 0);
+        }
+    };
+    const manifest_digest = local.storage_db_relational_index_inputs.digest(candidate.inputs.bytes);
+    const preparation = try Prepare.call(id, prepare_request, header, manifest_digest);
+    var bad_prepare = prepare_request;
+    bad_prepare.version = 0;
+    bad_prepare.manifest = .{ .ptr = @ptrFromInt(1), .len = std.math.maxInt(u64) };
+    try Prepare.reject(null, bad_prepare, "InvalidAbiVersion");
+    bad_prepare = prepare_request;
+    bad_prepare.manifest = .{ .ptr = @ptrFromInt(1), .len = contract.AdmissionPreparation.max_manifest_bytes + 1 };
+    try Prepare.reject(id, bad_prepare, "InvalidArgument");
+    bad_prepare = prepare_request;
+    bad_prepare.admission_json = .{ .ptr = @ptrFromInt(1), .len = contract.AdmissionPreparation.max_header_json_bytes + 1 };
+    try Prepare.reject(id, bad_prepare, "InvalidArgument");
+    bad_prepare = prepare_request;
+    bad_prepare.table_name = .fromSlice("other");
+    try Prepare.reject(id, bad_prepare, "InvalidArgument");
+    bad_prepare = prepare_request;
+    bad_prepare.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try Prepare.reject(id, bad_prepare, "DeadlineExceeded");
+    for ([_]usize{ 1, 2, 3 }) |at| {
+        var cancel: Cancel = .{ .at = at };
+        bad_prepare = prepare_request;
+        bad_prepare.control.cancellation_ctx = &cancel;
+        bad_prepare.control.cancellation_fn = Cancel.check;
+        try Prepare.reject(id, bad_prepare, "Canceled");
+    }
+    bad_prepare = prepare_request;
+    bad_prepare.manifest = .fromSlice("invalid");
+    try Prepare.reject(id, bad_prepare, "InvalidPrivateIndexInputs");
+    const smuggled = try std.fmt.allocPrint(a, "{s},\"index\":42}}", .{header_json[0 .. header_json.len - 1]});
+    defer a.free(smuggled);
+    bad_prepare = prepare_request;
+    bad_prepare.admission_json = .fromSlice(smuggled);
+    try Prepare.reject(id, bad_prepare, "InvalidArgument");
+    var altered_preparation = preparation;
+    altered_preparation.binding.authority = .native;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, altered_preparation.validate(header, manifest_digest));
+    try std.testing.expectError(error.InvalidPrivateIndexInputs, preparation.validate(header, @splat(1)));
+    try std.testing.expect(try handle.db.orderedApplyReceipt() == null);
+    const still_empty = try Read.run(id, request, identity);
+    try std.testing.expect(still_empty.binding == null and still_empty.applied == null);
+    var admission = try handle.db.prepareRaftIndexOwnerAdmission(header, candidate.inputs.bytes);
+    defer admission.deinit();
+    try std.testing.expectEqualDeep(admission.command.binding, preparation.binding);
+    try handle.db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 1 });
+    const admitted = try Read.run(id, request, identity);
+    try std.testing.expectEqualDeep(admission.command.binding, admitted.binding.?);
+    try std.testing.expect(admitted.fenced == null and admitted.reserved == null);
+    for ([_]contract.Effect{ .fenced, .reserved }, 0..) |effect, ordinal| {
+        var prepared = try handle.db.prepareRaftIndexOwnerControl(.{ .effect = effect, .binding = admission.command.binding });
+        defer prepared.deinit();
+        try handle.db.applyCommittedRaftIndexOwnerControl(&prepared, 11, .{ .term = 2, .index = ordinal + 2 });
+    }
+    const observed = try Read.run(id, request, identity);
+    try std.testing.expectEqual(.reserved, observed.binding.?.phase);
+    try std.testing.expectEqual(@as(u64, 2), observed.fenced.?.position.raft.index);
+    try std.testing.expectEqual(@as(u64, 3), observed.reserved.?.position.raft.index);
+    try std.testing.expectEqualDeep(observed.reserved.?.position, observed.applied.?);
+    var altered = observed;
+    altered.applied = .{ .native = .{ .namespace = identity.namespace, .sequence = 3 } };
+    try std.testing.expectError(error.InvalidControlReceiptPosition, altered.validate(identity));
+    altered = observed;
+    altered.fenced = null;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, altered.validate(identity));
+    altered = observed;
+    altered.reserved.?.position = observed.fenced.?.position;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, altered.validate(identity));
+    altered = observed;
+    altered.reserved.?.evidence_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, altered.validate(identity));
+    var retry = try handle.db.prepareRaftIndexOwnerControl(.{ .effect = .reserved, .binding = admission.command.binding });
+    defer retry.deinit();
+    try handle.db.applyCommittedRaftIndexOwnerControl(&retry, 11, .{ .term = 3, .index = 4 });
+    const recovered = try Read.run(id, request, identity);
+    try std.testing.expectEqualDeep(observed.reserved, recovered.reserved);
+    try std.testing.expectEqualDeep(observed.fenced, recovered.fenced);
+    try std.testing.expectEqual(@as(u64, 4), recovered.applied.?.raft.index);
+    const build_request = try contract.BuildRequest.initRaft(identity, recovered.binding.?, .{ .records = 1, .time_ns = std.time.ns_per_s });
+    const build_json = try std.json.Stringify.valueAlloc(a, build_request, .{});
+    defer a.free(build_json);
+    const Build = struct {
+        fn call(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerBuildRequest, expected: contract.BuildRequest) !std.json.Parsed(contract.BuildPreparation) {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexBuildJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expect(response.len < 32 * 1024);
+            var parsed = try std.json.parseFromSlice(contract.BuildPreparation, std.testing.allocator, response.slice(), .{ .ignore_unknown_fields = false });
+            errdefer parsed.deinit();
+            try parsed.value.validateFor(expected);
+            return parsed;
+        }
+        fn reject(req: kernel_owner_abi.RaftIndexOwnerBuildRequest, name: []const u8) !void {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexBuildJson(null, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expect(status != .ok and response.ptr == null and response.len == 0);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expectEqual(kernel_owner_abi.RaftIndexOwnerBuildRequest.operation, failure.operation);
+            try std.testing.expectEqualStrings(name, failure.errorName());
+        }
+    };
+    const build_input: kernel_owner_abi.RaftIndexOwnerBuildRequest = .{ .table_name = .fromSlice("items"), .request_json = .fromSlice(build_json) };
+    var bad_build = build_input;
+    bad_build.request_json = .{ .ptr = @ptrFromInt(1), .len = contract.BuildPreparation.max_request_bytes + 1 };
+    try Build.reject(bad_build, "InvalidArgument");
+    bad_build = build_input;
+    bad_build.prepare = 2;
+    try Build.reject(bad_build, "InvalidArgument");
+    bad_build = build_input;
+    bad_build.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try Build.reject(bad_build, "DeadlineExceeded");
+    var page = try Build.call(id, build_input, build_request);
+    defer page.deinit();
+    try std.testing.expect(page.value == .page);
+    try std.testing.expectEqual(@as(u64, 4), (try handle.db.orderedApplyReceipt()).?.index);
+    var replay = try local.storage_db_relational_index_owner_control.PreparedBuild.replayPrepared(a, handle.db.core, page.value.page);
+    defer replay.deinit();
+    try handle.db.applyCommittedRaftIndexBuild(&replay, 11, .{ .term = 3, .index = 5 });
+    var complete = try Build.call(id, build_input, build_request);
+    defer complete.deinit();
+    try std.testing.expect(complete.value == .progress);
+    try std.testing.expectEqual(.ready, complete.value.progress.state);
+    try std.testing.expectEqual(@as(u64, 5), complete.value.progress.position.?.raft.index);
+    try std.testing.expectEqual(@as(u64, 1), handle.db.native_index_build_cache.compilations);
+    var read_input = build_input;
+    read_input.prepare = 0;
+    var reread = try Build.call(id, read_input, build_request);
+    defer reread.deinit();
+    try std.testing.expectEqualDeep(complete.value.progress, reread.value.progress);
+    const SourceRead = struct {
+        fn call(owner: ?*anyopaque, input: kernel_owner_abi.RaftIndexOwnerSourceRequest, expected: contract.Identity) !std.json.Parsed(local.storage_db_relational_index_owner_control.SourceWire) {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexSourceJson(owner, &input, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            if (input.consumed_only != 0) try std.testing.expect(response.len < 32 * 1024);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            var parsed = try std.json.parseFromSlice(local.storage_db_relational_index_owner_control.SourceWire, std.testing.allocator, response.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+            errdefer parsed.deinit();
+            try parsed.value.requireRaftIdentity(expected);
+            return parsed;
+        }
+        fn reject(input: kernel_owner_abi.RaftIndexOwnerSourceRequest, name: []const u8) !void {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexSourceJson(null, &input, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expect(status != .ok and response.ptr == null and response.len == 0);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expectEqual(kernel_owner_abi.RaftIndexOwnerSourceRequest.operation, failure.operation);
+            try std.testing.expectEqualStrings(name, failure.errorName());
+        }
+    };
+    const source_input: kernel_owner_abi.RaftIndexOwnerSourceRequest = .{ .table_name = .fromSlice("items"), .identity_json = .fromSlice(encoded) };
+    var bad_source = source_input;
+    bad_source.consumed_only = 2;
+    try SourceRead.reject(bad_source, "InvalidArgument");
+    bad_source = source_input;
+    bad_source.identity_json = .{ .ptr = @ptrFromInt(1), .len = contract.Identity.max_json_bytes + 1 };
+    try SourceRead.reject(bad_source, "InvalidArgument");
+    bad_source = source_input;
+    bad_source.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try SourceRead.reject(bad_source, "DeadlineExceeded");
+    var source_wire = try SourceRead.call(id, source_input, identity);
+    defer source_wire.deinit();
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, source_wire.value.requireIdentity(identity));
+    var decoded_source = try source_wire.value.decodeRaft(a, identity);
+    defer decoded_source.deinit();
+    try decoded_source.requireRaftIdentity(identity);
+    try std.testing.expectEqual(@as(usize, 0), decoded_source.batch.?.rows().len);
+    try std.testing.expectEqual(@as(u64, 5), (try decoded_source.batch.?.header.orderedPosition()).raft.index);
+    try std.testing.expectEqual(@as(u64, 5), (try handle.db.orderedApplyReceipt()).?.index);
+    _ = try decoded_source.digest();
+    // Supplied-entry target qualification, not a complete source closure.
+    const native = local.storage_db_relational_index_owner_control;
+    const claim_command: native.ClaimCommand = .{ .binding = recovered.binding.?, .claims = &.{.{ .tuple = "target-tuple", .parent_table = "items", .parent_key = "row", .schema_version = 2 }} };
+    const claim_json = try std.json.Stringify.valueAlloc(a, claim_command, .{});
+    defer a.free(claim_json);
+    const Claims = struct {
+        fn call(owner: ?*anyopaque, input: kernel_owner_abi.RaftIndexOwnerClaimsRequest, expected: native.ClaimCommand) !?native.DeliveredClaims {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexClaimsJson(owner, &input, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            var parsed = try std.json.parseFromSlice(?native.DeliveredClaims, std.testing.allocator, response.slice(), .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            if (parsed.value) |outcome| try outcome.validateFor(expected);
+            return parsed.value;
+        }
+    };
+    const claim_input: kernel_owner_abi.RaftIndexOwnerClaimsRequest = .{ .table_name = .fromSlice("items"), .command_json = .fromSlice(claim_json) };
+    try std.testing.expect(try Claims.call(id, claim_input, claim_command) == null);
+    try std.testing.expectEqual(@as(u64, 5), (try handle.db.orderedApplyReceipt()).?.index);
+    var claims = try handle.db.prepareNativeIndexOwnerClaims(claim_command);
+    defer claims.deinit();
+    try handle.db.applyCommittedRaftIndexClaims(&claims, 11, .{ .term = 3, .index = 6 });
+    const delivered = (try Claims.call(id, claim_input, claim_command)).?;
+    try std.testing.expect(delivered.duplicate and delivered.claims_added == 0);
+    try std.testing.expectEqual(@as(u64, 6), delivered.position.raft.index);
+    try handle.db.applyCommittedRaftIndexClaims(&claims, 11, .{ .term = 4, .index = 7 });
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    const retained_delivery = (try Claims.call(id, claim_input, claim_command)).?;
+    try std.testing.expectEqualDeep(delivered, retained_delivery);
+    try std.testing.expectEqual(@as(u64, 7), (try handle.db.orderedApplyReceipt()).?.index);
+    // Synthetic accepted metadata qualifies actual consumption/recovery, not
+    // the receiver's separate live metadata authorization.
+    const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
+    const eof = decoded_source.batch.?.header;
+    var accepted: Source.Accepted = .{ .metadata_incarnation = @splat('1'), .binding_digest = local.storage_db_relational_integrity_contract.hash(&try recovered.binding.?.encode()), .scope_digest = eof.bytes[40..72].*, .ordinal = 1, .rows = 0, .batch_rows = 0, .source_sequence = 5, .batch_digest = eof.digest(), .logical_digest = @splat(1), .previous_decision = @splat(0), .decision_digest = @splat(0), .state = .ready };
+    accepted.decision_digest = accepted.computedDigest();
+    var consumption = try handle.db.prepareNativeIndexSourceConsumption(.{ .binding = recovered.binding.?, .accepted = accepted });
+    defer consumption.deinit();
+    try handle.db.applyCommittedRaftIndexConsumption(&consumption, 11, .{ .term = 4, .index = 8 });
+    var projected_input = source_input;
+    projected_input.consumed_only = 1;
+    var consumed = try SourceRead.call(id, projected_input, identity);
+    defer consumed.deinit();
+    try std.testing.expect(consumed.value.header == null and consumed.value.payload_b64 == null);
+    const retained_consumption = consumed.value.consumed.?;
+    try std.testing.expectEqual(@as(u64, 8), retained_consumption.position.raft.index);
+    try handle.db.applyCommittedRaftIndexConsumption(&consumption, 11, .{ .term = 5, .index = 9 });
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    var consumed_retry = try SourceRead.call(id, projected_input, identity);
+    defer consumed_retry.deinit();
+    try std.testing.expectEqualDeep(retained_consumption, consumed_retry.value.consumed.?);
+    try std.testing.expectEqual(@as(u64, 9), (try handle.db.orderedApplyReceipt()).?.index);
+    var validation_request = build_request;
+    const expected = expected: {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        const address = try Integrity.Address.init(decoded_source.batch.?.scope.generation, "target-tuple");
+        const claim = try Integrity.Claim.decode(&address.claimKey(), try read.get(&address.claimKey()));
+        const head = (try Source.load(&read, recovered.binding.?)).?;
+        break :expected local.storage_db_relational_index_owner_job.private_claims.TargetExpectation{ .metadata_incarnation = accepted.metadata_incarnation, .binding_digest = accepted.binding_digest, .generation = address.generation, .completion_revision = 1, .source_consumption_digest = try retained_consumption.prefix().digest(), .source_progress_digest = head.progress_digest, .table_name_digest = Integrity.hash("items"), .rows = 1, .inventory_xor = claim.memberDigest(), .provenance = @splat(9) };
+    };
+    validation_request.target_expectation = expected;
+    const validation_json = try std.json.Stringify.valueAlloc(a, validation_request, .{});
+    defer a.free(validation_json);
+    const validation_input: kernel_owner_abi.RaftIndexOwnerBuildRequest = .{ .table_name = .fromSlice("items"), .request_json = .fromSlice(validation_json) };
+    var next_index: u64 = 10;
+    var validation_turns: usize = 0;
+    while (validation_turns < 32) : (validation_turns += 1) {
+        var validation_step = try Build.call(id, validation_input, validation_request);
+        defer validation_step.deinit();
+        const entry: local.storage_db_apply_receipts.OrderedApplyReceipt = .{ .term = 6, .index = next_index };
+        switch (validation_step.value) {
+            .inventory_page => |command| {
+                const batch = batch: {
+                    var read = try handle.db.core.store.beginReadTxn();
+                    defer read.abort();
+                    break :batch try local.storage_db_relational_index_owner_job.private_claims.InventoryValidation.Prepared.replay(a, &read, command);
+                };
+                var prepared: native.PreparedInventoryValidation = .{ .alloc = a, .batch = batch };
+                defer prepared.deinit();
+                try handle.db.applyCommittedRaftIndexInventory(&prepared, 11, entry);
+            },
+            .generation_page => |command| {
+                var prepared = try native.PreparedGenerationValidation.replay(a, handle.db.core, command);
+                defer prepared.deinit();
+                try handle.db.applyCommittedRaftIndexGeneration(&prepared, 11, entry);
+            },
+            .validation => |progress| {
+                try progress.requireReady();
+                break;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        next_index += 1;
+    }
+    try std.testing.expect(validation_turns < 32);
+    var audit_dir = try TestDirectory.init("raft-index-capi-audit");
+    defer audit_dir.cleanup();
+    const root = try local.storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, audit_dir.path());
+    const root_json = try std.json.Stringify.valueAlloc(a, native.AuditRoot{ .root_dir = audit_dir.path(), .root_incarnation = root.root_incarnation }, .{});
+    defer a.free(root_json);
+    var audit_input = validation_input;
+    audit_input.prepare = 2;
+    audit_input.audit_root_json = .fromSlice(root_json);
+    var audit_turns: usize = 0;
+    const logical = audited: while (audit_turns < 32) : (audit_turns += 1) {
+        var audit_step = try Build.call(id, audit_input, validation_request);
+        defer audit_step.deinit();
+        if (audit_step.value.audit.outcome.audit.generation) |fields| if (fields.phase == .ready) break :audited try audit_step.value.audit.outcome.logicalCommand();
+    } else return error.TestUnexpectedResult;
+    var seal: native.PreparedValidationSeal = .{ .alloc = a, .command = logical };
+    defer seal.deinit();
+    try handle.db.applyCommittedRaftIndexValidation(&seal, 11, .{ .term = 7, .index = next_index });
+    var sealed = try Build.call(id, audit_input, validation_request);
+    defer sealed.deinit();
+    try std.testing.expectEqual(@as(u64, next_index), sealed.value.audit.seal.?.position.raft.index);
+    try handle.db.applyCommittedRaftIndexValidation(&seal, 11, .{ .term = 8, .index = next_index + 1 });
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    var sealed_retry = try Build.call(id, audit_input, validation_request);
+    defer sealed_retry.deinit();
+    try std.testing.expectEqualDeep(sealed.value.audit, sealed_retry.value.audit);
+    for ([_]bool{ false, true }) |visited_owner| {
+        const CancellationProbe = struct {
+            fn call(owner: ?*anyopaque, work: contract.CancellationRequest, prepare_work: bool) !std.json.Parsed(contract.CancellationPreparation) {
+                const cancel_encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, work, .{});
+                defer std.testing.allocator.free(cancel_encoded);
+                var cancel_output: kernel_owner_abi.OwnedBytes = .{};
+                defer freeRawBuffer(cancel_output.ptr, cancel_output.len);
+                var cancel_failure: kernel_owner_abi.FailureIdentity = .{};
+                try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerRaftIndexCancellationJson(owner, &.{ .table_name = .fromSlice("items"), .request_json = .fromSlice(cancel_encoded), .prepare = @intFromBool(prepare_work) }, &cancel_output, &cancel_failure));
+                var cancel_parsed = try std.json.parseFromSlice(contract.CancellationPreparation, std.testing.allocator, cancel_output.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+                errdefer cancel_parsed.deinit();
+                try cancel_parsed.value.validateFor(work);
+                return cancel_parsed;
+            }
+        };
+        var cancel_directory = try TestDirectory.init("raft-index-capi-cancel");
+        defer cancel_directory.cleanup();
+        const cancel_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace };
+        {
+            var seed = try db_mod.DB.open(a, cancel_directory.path(), cancel_options);
+            defer seed.close();
+            if (visited_owner) {
+                var source_read = try handle.db.core.store.beginReadTxn();
+                defer source_read.abort();
+                var source_cursor = try source_read.openCursor();
+                defer source_cursor.close();
+                var destination = try seed.core.store.runtime_store.beginWrite();
+                errdefer destination.abort();
+                var item = try source_cursor.first();
+                while (item) |kv| : (item = try source_cursor.next()) try destination.put(kv.key, kv.value);
+                try destination.commit();
+            } else {
+                try seed.setSchemaJson(a, before);
+                try seed.core.store.putBatch(&.{.{ .key = local.storage_db_relational_integrity_catalog.key, .value = prior.value }}, &.{});
+            }
+        }
+        var cancel_handle: Handle = .{ .alloc = a, .db = try db_mod.DB.open(a, cancel_directory.path(), cancel_options), .storage_owner_table_name = @constCast("items"), .storage_owner_group_id = 11 };
+        defer cancel_handle.db.close();
+        const cancel_id = try registerTestHandle(&cancel_handle);
+        defer unregisterTestHandle(cancel_id);
+        const cancel_input: contract.CancellationRequest = .{ .cancel = header };
+        var cancel_index = next_index + 2;
+        var cancel_turns: usize = 0;
+        const canceled_record = completed: while (cancel_turns < 32) : (cancel_turns += 1) {
+            var cancel_step = try CancellationProbe.call(cancel_id, cancel_input, true);
+            defer cancel_step.deinit();
+            if (cancel_step.value.progress.cancel.completed) |record| break :completed record;
+            const selected = cancel_step.value.command orelse cold: {
+                try std.testing.expect(cancel_step.value.progress.cancel.intent != null and cancel_step.value.progress.cancel.binding == null);
+                const cold_preparation = try Prepare.call(cancel_id, prepare_request, header, local.storage_db_relational_index_inputs.digest(candidate.inputs.bytes));
+                break :cold contract.Command{ .cancel_control = .{ .effect = .admitted, .binding = cold_preparation.binding, .inputs_b64 = admission.command.inputs_b64 } };
+            };
+            try @import("../storage/server_db_adapter.zig").applyOrderedGroup(&cancel_handle.db, 11, .{ .relational_index_owner_control = selected }, .{ .term = 20, .index = cancel_index });
+            cancel_index += 1;
+            if (cancel_turns == 0) {
+                cancel_handle.db.close();
+                cancel_handle.db = try db_mod.DB.open(a, cancel_directory.path(), cancel_options);
+            }
+        } else return error.TestUnexpectedResult;
+        try std.testing.expect(cancel_turns > 2);
+        const cancel_release_input: contract.CancellationRequest = .{ .release = .{ .canceled = canceled_record, .metadata_decision = @splat(13) } };
+        var terminal_step = try CancellationProbe.call(cancel_id, cancel_release_input, true);
+        defer terminal_step.deinit();
+        const terminal_command = terminal_step.value.command orelse return error.TestUnexpectedResult;
+        try @import("../storage/server_db_adapter.zig").applyOrderedGroup(&cancel_handle.db, 11, .{ .relational_index_owner_control = terminal_command }, .{ .term = 20, .index = cancel_index });
+        cancel_handle.db.close();
+        cancel_handle.db = try db_mod.DB.open(a, cancel_directory.path(), cancel_options);
+        try @import("../storage/server_db_adapter.zig").applyOrderedGroup(&cancel_handle.db, 11, .{ .relational_index_owner_control = terminal_command }, .{ .term = 21, .index = cancel_index + 1 });
+        var terminal_retry = try CancellationProbe.call(cancel_id, cancel_release_input, false);
+        defer terminal_retry.deinit();
+        try std.testing.expectEqual(cancel_index, terminal_retry.value.progress.release.?.position.raft.index);
+        try std.testing.expect(terminal_retry.value.command == null);
+    }
+    const Lifecycle = struct {
+        fn call(owner: ?*anyopaque, work: contract.LifecycleRequest, prepare: bool, root_bytes: []const u8) !std.json.Parsed(contract.LifecyclePreparation) {
+            const lifecycle_encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, work, .{});
+            defer std.testing.allocator.free(lifecycle_encoded);
+            var lifecycle_output: kernel_owner_abi.OwnedBytes = .{};
+            defer freeRawBuffer(lifecycle_output.ptr, lifecycle_output.len);
+            var lifecycle_failure: kernel_owner_abi.FailureIdentity = .{};
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerRaftIndexLifecycleJson(owner, &.{ .table_name = .fromSlice("items"), .request_json = .fromSlice(lifecycle_encoded), .prepare = @intFromBool(prepare), .audit_root_json = .fromSlice(root_bytes) }, &lifecycle_output, &lifecycle_failure));
+            var lifecycle_parsed = try std.json.parseFromSlice(contract.LifecyclePreparation, std.testing.allocator, lifecycle_output.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+            errdefer lifecycle_parsed.deinit();
+            try lifecycle_parsed.value.validateFor(work);
+            return lifecycle_parsed;
+        }
+    };
+    const install_request: contract.LifecycleRequest = .{ .install = .{ .intent = .{ .validation = sealed_retry.value.audit.seal.?, .metadata_decision = @splat(12) }, .budget = .{ .records = 1, .time_ns = std.time.ns_per_s } } };
+    var installation_step = try Lifecycle.call(id, install_request, true, root_json);
+    defer installation_step.deinit();
+    const install_command = installation_step.value.progress.install.command orelse return error.TestUnexpectedResult;
+    try std.testing.expect(installation_step.value.progress.install.installed == null);
+    var installation = try native.PreparedInstall.init(a, handle.db.core, install_command, .{});
+    defer installation.deinit();
+    const install_index = next_index + 2;
+    try handle.db.applyCommittedRaftIndexInstallation(&installation, 11, .{ .term = 9, .index = install_index });
+    var installed_step = try Lifecycle.call(id, install_request, false, "");
+    defer installed_step.deinit();
+    try std.testing.expectEqual(install_index, installed_step.value.progress.install.installed.?.position.raft.index);
+    try std.testing.expect(installed_step.value.progress.install.physical == null);
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    var installed_retry = try Lifecycle.call(id, install_request, true, root_json);
+    defer installed_retry.deinit();
+    try std.testing.expectEqualDeep(installed_step.value.progress.install.installed, installed_retry.value.progress.install.installed);
+    try std.testing.expectEqualDeep(install_command, installed_retry.value.progress.install.command.?);
+    const release_request: contract.LifecycleRequest = .{ .release = .{ .installed = installed_retry.value.progress.install.installed.?, .metadata_decision = @splat(13) } };
+    var release_step = try Lifecycle.call(id, release_request, true, "");
+    defer release_step.deinit();
+    try std.testing.expect(release_step.value.progress.release.record == null);
+    var releasing = try native.PreparedRelease.init(a, handle.db.core, release_request.release, .{});
+    defer releasing.deinit();
+    const release_index = install_index + 1;
+    try handle.db.applyCommittedRaftIndexRelease(&releasing, 11, .{ .term = 10, .index = release_index });
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    var gc_index = release_index + 1;
+    var gc_turns: usize = 0;
+    while (gc_turns < 16) : (gc_turns += 1) {
+        var gc_step = try Lifecycle.call(id, release_request, true, "");
+        defer gc_step.deinit();
+        try std.testing.expectEqual(release_index, gc_step.value.progress.release.record.?.position.raft.index);
+        if (gc_step.value.progress.release.retired) break;
+        var prepared_gc: native.PreparedReleaseGc = .{ .alloc = a, .command = gc_step.value.gc orelse return error.TestUnexpectedResult };
+        defer prepared_gc.deinit();
+        try handle.db.applyCommittedRaftIndexReleaseGc(&prepared_gc, 11, .{ .term = 11, .index = gc_index });
+        gc_index += 1;
+    }
+    try std.testing.expect(gc_turns > 0 and gc_turns < 16);
+    var released_step = try Lifecycle.call(id, release_request, false, "");
+    defer released_step.deinit();
+    try std.testing.expect(released_step.value.progress.release.retired);
+    try std.testing.expect(released_step.value.gc == null);
+    try std.testing.expectEqual(release_index, released_step.value.progress.release.record.?.position.raft.index);
+}
+
+test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
+    ;
+    var directory = try TestDirectory.init("native-index-capi");
+    defer directory.cleanup();
+    var handle: Handle = .{
+        .alloc = a,
+        .db = try db_mod.DB.open(a, directory.path(), .{
+            .start_optional_runtimes = false,
+            .primary_backend = .{ .lsm = .{} },
+            .online_source_authority = .native,
+            .identity_namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 },
+        }),
+        .storage_owner_table_name = @constCast("items"),
+        .storage_owner_group_id = 11,
+    };
+    defer handle.db.close();
+    const id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(id);
+    try handle.db.setSchemaJson(a, before);
+    var schema = try local.schema_mod.parseValidatedTableSchema(a, before);
+    defer schema.deinit(a);
+    var prior = try local.schema_relational_declarations.compileCatalog(a, schema, 101, null);
+    defer prior.deinit();
+    try handle.db.core.store.putBatch(&.{.{ .key = local.storage_db_relational_integrity_catalog.key, .value = prior.value }}, &.{});
+    var candidate = try local.storage_db_relational_index_candidate.Candidate.prepare(a, 101, before, after, prior.value, "email_idx");
+    defer candidate.deinit();
+    var prior_digest: [32]u8 = undefined;
+    var candidate_digest: [32]u8 = undefined;
+    var reservation_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(prior.value, &prior_digest, .{});
+    std.crypto.hash.Blake3.hash(candidate.next.value, &candidate_digest, .{});
+    std.crypto.hash.Blake3.hash(candidate.reservation.value, &reservation_digest, .{});
+    const header: db_mod.DB.NativeIndexOwnerAdmission = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner_digest = @splat(3),
+        .ordinal = 0,
+        .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = handle.db.core.identity_namespace, .catalog_digest = prior_digest },
+        .candidate_digest = candidate_digest,
+        .reservation_digest = reservation_digest,
+    };
+    const json = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(json);
+    const identity: db_mod.DB.NativeIndexOwnerIdentity = .{
+        .id = header.id,
+        .plan_digest = header.plan_digest,
+        .owner_digest = header.owner_digest,
+        .ordinal = header.ordinal,
+        .namespace = header.fence.namespace,
+        .owner_group_id = header.fence.owner_group_id,
+    };
+    const identity_json = try std.json.Stringify.valueAlloc(a, identity, .{});
+    defer a.free(identity_json);
+    var response: kernel_owner_abi.OwnedBytes = .{};
+    const inspection: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
+        .operation = .inspect,
+        .table_name = .fromSlice("items"),
+        .request_json = .fromSlice(identity_json),
+    };
+    {
+        var status_request = inspection;
+        status_request.operation = .cancel_inspect;
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &status_request, &response));
+        const status_response = response;
+        defer freeRawBuffer(status_response.ptr, status_response.len);
+        var status = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationState, a, status_response.slice(), .{});
+        defer status.deinit();
+        try std.testing.expectEqual(.native, status.value.source.kind);
+        try std.testing.expect(status.value.intent == null and status.value.binding == null and status.value.cleanup == null);
+    }
+    // An absent job cannot attest native mode in a Raft-owned namespace.
+    {
+        const authority = local.storage_source_authority;
+        var txn = try handle.db.core.store.beginReadTxn();
+        const original = (try authority.load(&txn)).?;
+        txn.abort();
+        var raft = original;
+        raft.kind = .raft;
+        try handle.db.core.store.putBatch(&.{.{ .key = authority.key, .value = &raft.encode() }}, &.{});
+        try std.testing.expectError(error.OnlineSourceScopeChanged, handle.db.nativeIndexOwnerState(identity));
+        try std.testing.expect(server_api.storageOwnerNativeIndexControlJson(id, &inspection, &response) != .ok);
+        try std.testing.expect(response.ptr == null);
+        try handle.db.core.store.putBatch(&.{.{ .key = authority.key, .value = &original.encode() }}, &.{});
+    }
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &inspection, &response));
+    try std.testing.expectEqualStrings("null", response.slice());
+    freeRawBuffer(response.ptr, response.len);
+    var request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
+        .operation = .admit,
+        .table_name = .fromSlice("wrong-table"),
+        .request_json = .fromSlice(json),
+        .manifest = .fromSlice(candidate.inputs.bytes),
+    };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.table_name = .fromSlice("items");
+    request.operation = @fromBackingInt(@intCast(99));
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.operation = .admit;
+    const manifest = request.manifest;
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = std.math.maxInt(u64) };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = manifest;
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    var admitted = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerOutcome, a, response.slice(), .{});
+    defer admitted.deinit();
+    freeRawBuffer(response.ptr, response.len);
+    try std.testing.expect(!admitted.value.duplicate);
+    try std.testing.expect(admitted.value.receipt == null);
+    try std.testing.expectEqual(@as(u64, 1), admitted.value.position.sequence);
+    const binding = admitted.value.binding;
+    for ([_]kernel_owner_abi.NativeIndexOwnerOperation{ .fence, .reserve }, 2..) |operation, sequence| {
+        const command: db_mod.DB.NativeIndexOwnerCommand = .{ .effect = if (operation == .fence) .fenced else .reserved, .binding = binding };
+        const command_json = try std.json.Stringify.valueAlloc(a, command, .{});
+        defer a.free(command_json);
+        request.operation = operation;
+        request.request_json = .fromSlice(command_json);
+        // Non-admission controls must not introduce replacement schema inputs.
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        request.manifest = .{};
+        handle.storage_owner_group_id = 99;
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        handle.storage_owner_group_id = 11;
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const effect_response = response;
+        defer freeRawBuffer(effect_response.ptr, effect_response.len);
+        var outcome = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerOutcome, a, response.slice(), .{});
+        defer outcome.deinit();
+        try std.testing.expect(!outcome.value.duplicate);
+        try std.testing.expectEqual(@as(u64, sequence), outcome.value.position.sequence);
+        try std.testing.expect(outcome.value.receipt != null);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &inspection, &response));
+        const state_response = response;
+        defer freeRawBuffer(state_response.ptr, state_response.len);
+        const Binding = @TypeOf(binding);
+        var observed = try std.json.parseFromSlice(?Binding, a, response.slice(), .{});
+        defer observed.deinit();
+        try std.testing.expectEqual(if (operation == .fence) local.storage_db_relational_index_owner_job.Phase.fencing else .reserved, observed.value.?.phase);
+        try std.testing.expectEqual(binding.inputs_digest, observed.value.?.inputs_digest);
+        const receipt_json = try std.json.Stringify.valueAlloc(a, db_mod.DB.NativeIndexOwnerReceiptRequest{
+            .identity = identity,
+            .effect = if (operation == .fence) .fenced else .reserved,
+        }, .{});
+        defer a.free(receipt_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &.{
+            .operation = .receipt,
+            .table_name = .fromSlice("items"),
+            .request_json = .fromSlice(receipt_json),
+        }, &response));
+        const recovered_response = response;
+        defer freeRawBuffer(recovered_response.ptr, recovered_response.len);
+        var recovered = try std.json.parseFromSlice(?db_mod.DB.NativeIndexOwnerOutcome, a, recovered_response.slice(), .{});
+        defer recovered.deinit();
+        try std.testing.expect(recovered.value.?.duplicate);
+        try std.testing.expect(!recovered.value.?.replication_pending);
+        try std.testing.expectEqual(outcome.value.position, recovered.value.?.position);
+        try std.testing.expectEqual(try outcome.value.receipt.?.digest(), try recovered.value.?.receipt.?.digest());
+        request.manifest = .fromSlice(candidate.inputs.bytes);
+    }
+    // Exercise the actual ordered DB path and normalized standby ingress.
+    // This does not authenticate/activate a mounted distributed producer.
+    {
+        var reserved_binding = binding;
+        reserved_binding.phase = .reserved;
+        const tuple = "compiled\x00\xff\x80-owner-claim";
+        var text = tuple.*;
+        var prepared_claims = try handle.db.prepareNativeIndexOwnerClaims(.{
+            .binding = reserved_binding,
+            .claims = &.{.{
+                .tuple = &text,
+                .parent_table = "items",
+                .parent_key = "claim-owner",
+                .schema_version = binding.physical_candidate.schema_version,
+            }},
+        });
+        defer prepared_claims.deinit();
+        @memset(&text, 'x');
+        try prepared_claims.preparePayload();
+        const encoded = try std.json.Stringify.valueAlloc(a, prepared_claims.command, .{});
+        defer a.free(encoded);
+        var claim_request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
+            .operation = .claims,
+            .table_name = .fromSlice("items"),
+            .request_json = .fromSlice(encoded),
+        };
+        var claim_response: kernel_owner_abi.OwnedBytes = .{};
+        claim_request.manifest = .fromSlice("not-permitted");
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        try std.testing.expect(claim_response.ptr == null);
+        claim_request.manifest = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        const claimed_buffer = claim_response;
+        defer freeRawBuffer(claimed_buffer.ptr, claimed_buffer.len);
+        var parsed_claimed = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerClaimOutcome, a, claimed_buffer.slice(), .{});
+        defer parsed_claimed.deinit();
+        const claimed = parsed_claimed.value;
+        try claimed.validateFor(prepared_claims.command);
+        var invalid_receipt = claimed;
+        invalid_receipt.claims_digest[0] ^= 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        invalid_receipt = claimed;
+        invalid_receipt.position.namespace.range_id += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        invalid_receipt = claimed;
+        invalid_receipt.duplicate = true;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        invalid_receipt = claimed;
+        invalid_receipt.replication_pending = true;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        try std.testing.expect(!claimed.duplicate and !claimed.replication_pending);
+        try std.testing.expectEqual(@as(usize, 1), claimed.claims_added);
+        try std.testing.expectEqual(@as(u64, 4), claimed.position.sequence);
+        const duplicate = try handle.db.applyPreparedNativeIndexOwnerClaims(&prepared_claims, null);
+        try std.testing.expect(duplicate.duplicate);
+        try std.testing.expectEqual(claimed.position, duplicate.position);
+        {
+            var stale = prepared_claims.command;
+            stale.binding.id[0] ^= 1;
+            const rejected = try std.json.Stringify.valueAlloc(a, stale, .{});
+            defer a.free(rejected);
+            claim_request.request_json = .fromSlice(rejected);
+            try std.testing.expectEqual(kernel_owner_abi.Status.private_index_owner_job_changed, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+            stale.binding = prepared_claims.command.binding;
+            stale.binding.fence.owner_group_id += 1;
+            const wrong_owner = try std.json.Stringify.valueAlloc(a, stale, .{});
+            defer a.free(wrong_owner);
+            claim_request.request_json = .fromSlice(wrong_owner);
+            try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+        }
+        {
+            var different = prepared_claims.command.claims[0];
+            different.parent_key = "conflicting-owner";
+            const rejected = try std.json.Stringify.valueAlloc(a, db_mod.DB.NativeIndexOwnerClaimCommand{ .binding = reserved_binding, .claims = &.{different} }, .{});
+            defer a.free(rejected);
+            claim_request.request_json = .fromSlice(rejected);
+            try std.testing.expectEqual(kernel_owner_abi.Status.unique_constraint_violation, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+        }
+        {
+            const forged = try std.json.Stringify.valueAlloc(a, .{ .binding = reserved_binding, .claims = prepared_claims.command.claims, .position = claimed.position }, .{});
+            defer a.free(forged);
+            claim_request.request_json = .fromSlice(forged);
+            try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+        }
+        // Claim bodies have their own bounded lane, not the fixed 32-KiB
+        // control-header limit. Oversized lengths fail before pointer access.
+        claim_request.request_json = .{ .len = local.storage_db_relational_index_owner_control.max_claim_wire_bytes + 1 };
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        try std.testing.expect(claim_response.ptr == null);
+        claim_request.request_json = .{ .len = 1 };
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        try std.testing.expect(claim_response.ptr == null);
+        const padded = try a.alloc(u8, 32 * 1024 + encoded.len);
+        defer a.free(padded);
+        @memset(padded[0 .. 32 * 1024], ' ');
+        @memcpy(padded[32 * 1024 ..], encoded);
+        claim_request.request_json = .fromSlice(padded);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        const retried_buffer = claim_response;
+        defer freeRawBuffer(retried_buffer.ptr, retried_buffer.len);
+        var retried = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerClaimOutcome, a, retried_buffer.slice(), .{});
+        defer retried.deinit();
+        try std.testing.expect(retried.value.duplicate);
+        try std.testing.expectEqual(claimed.position, retried.value.position);
+        const Frame = local.storage_db_relational_index_owner_control.Frame;
+        var wire = try std.json.parseFromSlice(struct { schema_version: u32, request: struct {}, index_owner_control: Frame }, a, try prepared_claims.finalizePayload(claimed.position), .{});
+        defer wire.deinit();
+        try std.testing.expectEqualSlices(u8, tuple, wire.value.index_owner_control.effect.claims.claims[0].tuple);
+        try handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = wire.value.index_owner_control, .receipt = .{ .native = claimed.position } }, 1);
+        try handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = wire.value.index_owner_control, .receipt = .{ .native = claimed.position } }, 1);
+        var corrupt_frame = wire.value.index_owner_control;
+        corrupt_frame.position.sequence += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = corrupt_frame, .receipt = .{ .native = corrupt_frame.position } }, 2));
+        try std.testing.expectEqual(@as(u64, 1), try handle.db.replicationAppliedSequence());
+    }
+    var foreign = identity;
+    foreign.id[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, handle.db.nativeIndexOwnerState(foreign));
+    foreign = identity;
+    foreign.namespace.range_id += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, handle.db.nativeIndexOwnerState(foreign));
+    try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
+
+    var build_position: @FieldType(db_mod.DB.NativeIndexOwnerOutcome, "position") = undefined;
+    {
+        var reserved_binding = binding;
+        reserved_binding.phase = .reserved;
+        const build = try db_mod.DB.NativeIndexOwnerBuildRequest.init(identity, reserved_binding, .{});
+        const encoded = try std.json.Stringify.valueAlloc(a, build, .{});
+        defer a.free(encoded);
+        var build_request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{ .operation = .build, .table_name = .fromSlice("items"), .request_json = .fromSlice(encoded), .control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 } };
+        var built: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &build_request, &built));
+        try std.testing.expect(built.ptr == null);
+        build_request.control = .{};
+        handle.storage_owner_group_id = 99;
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &build_request, &built));
+        handle.storage_owner_group_id = 11;
+        {
+            var invalid_budget = build;
+            invalid_budget.budget.records = 0;
+            const rejected = try std.json.Stringify.valueAlloc(a, invalid_budget, .{});
+            defer a.free(rejected);
+            var rejected_request = build_request;
+            rejected_request.request_json = .fromSlice(rejected);
+            try std.testing.expectEqual(kernel_owner_abi.Status.invalid_relational_index_budget, server_api.storageOwnerNativeIndexControlJson(id, &rejected_request, &built));
+            try std.testing.expect(built.ptr == null);
+        }
+        for (0..2) |attempt| {
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &build_request, &built));
+            const raw = built;
+            defer freeRawBuffer(raw.ptr, raw.len);
+            var decoded = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerBuildResponse, a, raw.slice(), .{});
+            defer decoded.deinit();
+            try decoded.value.validateFor(build);
+            if (attempt == 0) {
+                try std.testing.expectEqual(@as(u64, 5), decoded.value.advanced.position.sequence);
+                build_position = decoded.value.advanced.position;
+            } else {
+                try std.testing.expectEqual(.ready, decoded.value.complete.state);
+                try std.testing.expectEqual(@as(u64, 0), decoded.value.complete.rows_scanned);
+                try std.testing.expectEqual(build_position, decoded.value.complete.position);
+            }
+        }
+        try std.testing.expectEqual(@as(u64, 1), handle.db.native_index_build_cache.compilations);
+        try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
+    }
+    {
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        const encoded = try std.json.Stringify.valueAlloc(a, identity, .{});
+        defer a.free(encoded);
+        var source_request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{ .operation = .source, .table_name = .fromSlice("items"), .request_json = .fromSlice(encoded), .control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 } };
+        var source_response: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &source_request, &source_response));
+        try std.testing.expect(source_response.ptr == null);
+        source_request.control = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &source_request, &source_response));
+        defer freeRawBuffer(source_response.ptr, source_response.len);
+        var wire = try std.json.parseFromSlice(native.SourceWire, a, source_response.slice(), .{});
+        defer wire.deinit();
+        var source_read = try wire.value.decode(a, identity);
+        defer source_read.deinit();
+        try std.testing.expectEqual(@as(usize, 0), source_read.batch.?.rows().len);
+        try std.testing.expectEqual(build_position, try source_read.batch.?.header.position());
+        try std.testing.expectEqual(try source_read.digest(), try wire.value.headerCommitment());
+        try std.testing.expectEqual(@as(u64, 1), handle.db.native_index_build_cache.compilations);
+        // Synthetic metadata acceptance qualifies the compiled storage path,
+        // not distributed authorization. Consume the actual empty EOF source.
+        const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
+        const Integrity = local.storage_db_relational_integrity_contract;
+        const eof = source_read.batch.?.header;
+        var accepted: Source.Accepted = .{ .metadata_incarnation = @splat('1'), .binding_digest = Integrity.hash(&try source_read.binding.encode()), .scope_digest = eof.bytes[40..72].*, .ordinal = std.mem.readInt(u64, eof.bytes[104..112], .little), .rows = 0, .batch_rows = 0, .source_sequence = (try eof.position()).sequence, .batch_digest = eof.digest(), .logical_digest = try source_read.digest(), .previous_decision = @splat(0), .decision_digest = @splat(0), .state = .ready };
+        accepted.decision_digest = accepted.computedDigest();
+        try accepted.requireFor(source_read.binding, eof);
+        const consume: native.ConsumeCommand = .{ .binding = source_read.binding, .accepted = accepted };
+        const consume_json = try std.json.Stringify.valueAlloc(a, consume, .{});
+        defer a.free(consume_json);
+        var consumed_bytes: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &.{ .operation = .consume, .table_name = .fromSlice("items"), .request_json = .fromSlice(consume_json) }, &consumed_bytes));
+        defer freeRawBuffer(consumed_bytes.ptr, consumed_bytes.len);
+        var consumed = try std.json.parseFromSlice(native.ConsumeOutcome, a, consumed_bytes.slice(), .{});
+        defer consumed.deinit();
+        try consumed.value.validateFor(consume);
+        const expected: local.storage_db_relational_index_owner_job.private_claims.TargetExpectation = expected: {
+            var read = try handle.db.core.store.beginReadTxn();
+            defer read.abort();
+            const address = try Integrity.Address.init(source_read.batch.?.scope.generation, "compiled\x00\xff\x80-owner-claim");
+            const claim = try Integrity.Claim.decode(&address.claimKey(), try read.get(&address.claimKey()));
+            const head = (try Source.load(&read, source_read.binding)).?;
+            break :expected .{ .metadata_incarnation = accepted.metadata_incarnation, .binding_digest = accepted.binding_digest, .generation = address.generation, .completion_revision = 1, .source_consumption_digest = try consumed.value.record.?.prefix().digest(), .source_progress_digest = head.progress_digest, .table_name_digest = Integrity.hash("items"), .rows = 1, .inventory_xor = claim.memberDigest(), .provenance = @splat(9) };
+        };
+        var validation = try native.BuildRequest.init(identity, source_read.binding, .{ .records = 1 });
+        validation.target_expectation = expected;
+        const validation_json = try std.json.Stringify.valueAlloc(a, validation, .{});
+        defer a.free(validation_json);
+        // The provisioned signing authority can own many physical DB roots.
+        var signing_directory = try TestDirectory.init("native-index-signing-root");
+        defer signing_directory.cleanup();
+        const root_key = try local.storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, signing_directory.path());
+        try std.testing.expect(root_key.root_incarnation != handle.db.root_incarnation);
+        const root: native.AuditRoot = .{ .root_dir = signing_directory.path(), .root_incarnation = root_key.root_incarnation };
+        const root_json = try std.json.Stringify.valueAlloc(a, root, .{});
+        defer a.free(root_json);
+        var validate_request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{ .operation = .build, .table_name = .fromSlice("items"), .request_json = .fromSlice(validation_json) };
+        var validated: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+        validate_request.manifest = .{ .ptr = @ptrFromInt(1), .len = native.AuditRoot.max_wire_bytes + 1 };
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+        validate_request.manifest = .fromSlice(root_json);
+        var canonical_ready = false;
+        var audited = false;
+        var logical_receipt: ?local.storage_db_relational_index_publication_progress.Receipt = null;
+        var physical_digest: ?[32]u8 = null;
+        for (0..32) |_| {
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+            const buffer = validated;
+            defer freeRawBuffer(buffer.ptr, buffer.len);
+            var result = try std.json.parseFromSlice(native.BuildResponse, a, buffer.slice(), .{});
+            defer result.deinit();
+            try result.value.validateFor(validation);
+            switch (result.value) {
+                .inventory => |value| {
+                    try std.testing.expect(value.record.fields.phase != .failed);
+                    build_position = value.position;
+                },
+                .generation => |value| {
+                    try std.testing.expect(value.record.fields.phase != .failed);
+                    build_position = value.position;
+                    if (value.record.fields.phase == .ready) {
+                        try std.testing.expect(!value.duplicate);
+                        canonical_ready = true;
+                        var wrong = root;
+                        wrong.root_incarnation ^= 1;
+                        const wrong_json = try std.json.Stringify.valueAlloc(a, wrong, .{});
+                        defer a.free(wrong_json);
+                        var rejected = validate_request;
+                        rejected.manifest = .fromSlice(wrong_json);
+                        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &validated));
+                        try std.testing.expect(validated.ptr == null);
+                    }
+                },
+                .audit => |value| {
+                    try std.testing.expect(canonical_ready);
+                    try value.audit.validateFor(expected, root.root_incarnation);
+                    try std.testing.expectEqual(handle.db.root_incarnation, value.audit.physical_root_incarnation);
+                    var read = try handle.db.core.store.beginReadTxn();
+                    defer read.abort();
+                    try std.testing.expectEqual(build_position.sequence, (try local.storage_source_authority.load(&read)).?.sequence);
+                    if (value.audit.generation) |fields| {
+                        try std.testing.expect(fields.phase != .failed);
+                        try std.testing.expect(fields.phase != .ready);
+                    }
+                },
+                .validated => |value| {
+                    try std.testing.expect(canonical_ready);
+                    try std.testing.expectEqual(handle.db.root_incarnation, value.physical.audit.physical_root_incarnation);
+                    try std.testing.expectEqual(@as(u64, 1), value.physical.audit.inventory.rows);
+                    try std.testing.expectEqual(@as(?u64, 0), value.physical.audit.source_members);
+                    try std.testing.expectEqualDeep(@as([3]u64, @splat(0)), value.physical.audit.generation.?.counts);
+                    try std.testing.expect(!value.logical.duplicate);
+                    try std.testing.expect(value.logical.receipt != null);
+                    try std.testing.expect(value.logical.position.sequence > build_position.sequence);
+                    logical_receipt = value.logical.receipt;
+                    physical_digest = try value.physical.readyDigest();
+                    build_position = value.logical.position;
+                    var changed = value.physical;
+                    changed.audit.inventory_canonical_digest[0] ^= 1;
+                    try std.testing.expectError(error.InvalidRelationalIndexValidation, handle.db.sealNativeIndexOwnerValidationAudited(validation, changed, .{}));
+                    changed = value.physical;
+                    changed.audit.physical_root_incarnation ^= 1;
+                    try std.testing.expectError(error.PrivateIndexAuditScopeChanged, handle.db.sealNativeIndexOwnerValidationAudited(validation, changed, .{}));
+                    audited = true;
+                    break;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        try std.testing.expect(audited);
+        {
+            var sealed_read = try handle.db.core.store.beginReadTxn();
+            defer sealed_read.abort();
+            const sealed = (try local.storage_db_relational_index_validation.Seal.load(a, &sealed_read, source_read.binding)).?;
+            try testNativeIndexInstallationInterface(&handle.db, .{ .validation = sealed, .metadata_decision = @splat(7) });
+        }
+        {
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+            defer freeRawBuffer(validated.ptr, validated.len);
+            var duplicate = try std.json.parseFromSlice(native.BuildResponse, a, validated.slice(), .{});
+            defer duplicate.deinit();
+            try duplicate.value.validateFor(validation);
+            try std.testing.expect(duplicate.value == .validated and duplicate.value.validated.logical.duplicate);
+            try std.testing.expectEqualDeep(logical_receipt.?, duplicate.value.validated.logical.receipt.?);
+        }
+        {
+            // Privileged physical-incarnation replacement, not a snapshot
+            // import test. Keep the primary/canonical bytes and parent key,
+            // replace only the actual DB identity while it is closed, and
+            // prove that the old ready checkpoint cannot skip the new audit.
+            const Identity = local.storage_db_root_identity;
+            var replacement = try TestDirectory.init("native-index-replacement-identity");
+            defer replacement.cleanup();
+            const next = try Identity.loadOrCreate(a, std.testing.io, replacement.path());
+            const next_path = try Identity.checkpointPathAlloc(a, replacement.path());
+            defer a.free(next_path);
+            const live_path = try Identity.checkpointPathAlloc(a, directory.path());
+            defer a.free(live_path);
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, next_path, a, .limited(1024));
+            defer a.free(bytes);
+            try std.testing.expect(next.incarnation != handle.db.root_incarnation);
+            handle.db.close();
+            _ = try local.storage_db_native_backup.writeFileDurable(std.testing.io, live_path, bytes);
+            handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = header.fence.namespace });
+            try std.testing.expectEqual(next.incarnation, handle.db.root_incarnation);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+            defer freeRawBuffer(validated.ptr, validated.len);
+            var fresh = try std.json.parseFromSlice(native.BuildResponse, a, validated.slice(), .{});
+            defer fresh.deinit();
+            try fresh.value.validateFor(validation);
+            try std.testing.expect(fresh.value == .audit);
+            try std.testing.expectEqual(root.root_incarnation, fresh.value.audit.audit.root_incarnation);
+            try std.testing.expectEqual(next.incarnation, fresh.value.audit.audit.physical_root_incarnation);
+            try std.testing.expectEqual(.scanning, fresh.value.audit.audit.inventory.phase);
+            try std.testing.expectEqual(@as(u64, 0), fresh.value.audit.audit.inventory.rows);
+            try std.testing.expect(fresh.value.audit.audit.generation == null);
+            {
+                var read = try handle.db.core.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectEqual(build_position.sequence, (try local.storage_source_authority.load(&read)).?.sequence);
+            }
+            var renewed = false;
+            for (0..32) |_| {
+                var output: kernel_owner_abi.OwnedBytes = .{};
+                try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &output));
+                defer freeRawBuffer(output.ptr, output.len);
+                var result = try std.json.parseFromSlice(native.BuildResponse, a, output.slice(), .{});
+                defer result.deinit();
+                try result.value.validateFor(validation);
+                if (result.value == .validated) {
+                    const value = result.value.validated;
+                    try std.testing.expect(value.logical.duplicate);
+                    try std.testing.expectEqualDeep(logical_receipt.?, value.logical.receipt.?);
+                    try std.testing.expectEqual(next.incarnation, value.physical.audit.physical_root_incarnation);
+                    try std.testing.expect(!std.mem.eql(u8, &physical_digest.?, &try value.physical.readyDigest()));
+                    renewed = true;
+                    break;
+                }
+                try std.testing.expect(result.value == .audit);
+            }
+            try std.testing.expect(renewed);
+        }
+    }
+    request.operation = .cancel_intent;
+    request.request_json = .fromSlice(json);
+    // Cancellation has a fixed identity header, never replacement inputs.
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{};
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    var cancel_position: @FieldType(db_mod.DB.NativeIndexOwnerCancellationOutcome, "position") = undefined;
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const cancel_response = response;
+        defer freeRawBuffer(cancel_response.ptr, cancel_response.len);
+        // Strict decoding also proves no publication receipt was returned.
+        var canceled = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationOutcome, a, cancel_response.slice(), .{});
+        defer canceled.deinit();
+        try std.testing.expectEqual(attempt != 0, canceled.value.duplicate);
+        try std.testing.expect(!canceled.value.replication_pending);
+        try std.testing.expectEqual(build_position.sequence + 1, canceled.value.position.sequence);
+        cancel_position = canceled.value.position;
+    }
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{
+        .start_optional_runtimes = false,
+        .primary_backend = .{ .lsm = .{} },
+        .online_source_authority = .native,
+        .identity_namespace = header.fence.namespace,
+    });
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    const recovered_cancel_response = response;
+    defer freeRawBuffer(recovered_cancel_response.ptr, recovered_cancel_response.len);
+    var recovered_cancel = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationOutcome, a, recovered_cancel_response.slice(), .{});
+    defer recovered_cancel.deinit();
+    try std.testing.expect(recovered_cancel.value.duplicate);
+    try std.testing.expectEqual(cancel_position, recovered_cancel.value.position);
+    var late = try handle.db.prepareNativeIndexOwnerControl(.{ .effect = .reserved, .binding = binding });
+    defer late.deinit();
+    try std.testing.expectError(error.PrivateIndexPublicationCanceled, handle.db.applyPreparedNativeIndexOwnerControl(&late, null));
+    {
+        var reserved_binding = binding;
+        reserved_binding.phase = .reserved;
+        const encoded = try std.json.Stringify.valueAlloc(a, db_mod.DB.NativeIndexOwnerClaimCommand{
+            .binding = reserved_binding,
+            .claims = &.{.{ .tuple = "late-claim", .parent_table = "items", .parent_key = "late-owner", .schema_version = binding.physical_candidate.schema_version }},
+        }, .{});
+        defer a.free(encoded);
+        var rejected: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_publication_canceled, server_api.storageOwnerNativeIndexControlJson(id, &.{ .operation = .claims, .table_name = .fromSlice("items"), .request_json = .fromSlice(encoded) }, &rejected));
+        try std.testing.expect(rejected.ptr == null);
+    }
+    request.operation = .cancel_cleanup;
+    request.request_json = .fromSlice(identity_json);
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const cleanup_response = response;
+        defer freeRawBuffer(cleanup_response.ptr, cleanup_response.len);
+        var cleanup = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCleanupOutcome, a, cleanup_response.slice(), .{});
+        defer cleanup.deinit();
+        try std.testing.expectEqual(attempt != 0, cleanup.value.duplicate);
+        try std.testing.expect(!cleanup.value.replication_pending);
+        try std.testing.expectEqual(cancel_position.sequence + 1, cleanup.value.position.sequence);
+        try std.testing.expectEqual(binding.index, cleanup.value.binding.index);
+    }
+    const Denied = struct {
+        fn check(_: *const anyopaque) anyerror!void {
+            return error.WriteAdmissionRejected;
+        }
+    };
+    var denied_context: u8 = 0;
+    handle.db.local_execution.replication_write_gate = .{ .borrowed = .{
+        .ptr = &denied_context,
+        .check_fn = Denied.check,
+        .allows_background_work = false,
+    } };
+    defer handle.db.local_execution.replication_write_gate = null;
+    try std.testing.expectError(error.WriteAdmissionRejected, handle.db.collectRelationalIndexGarbageStep());
+    request.operation = .cancel_gc_page;
+    request.manifest = .fromSlice("not-permitted");
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.manifest = .{};
+    for (0..3) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const gc_response = response;
+        defer freeRawBuffer(gc_response.ptr, gc_response.len);
+        var progress = try std.json.parseFromSlice(db_mod.DB.NativeIndexCleanupMaintenanceOutcome, a, gc_response.slice(), .{});
+        defer progress.deinit();
+        try std.testing.expectEqual(attempt < 2, progress.value.advanced);
+        try std.testing.expectEqual(attempt > 0, progress.value.artifacts_retired);
+    }
+    try std.testing.expectError(error.WriteAdmissionRejected, handle.db.collectRelationalIndexGarbageStep());
+    request.operation = .cancel_claim_gc_page;
+    request.manifest = .fromSlice("not-permitted");
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.manifest = .{};
+    for (0..3) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const claim_response = response;
+        defer freeRawBuffer(claim_response.ptr, claim_response.len);
+        var progress = try std.json.parseFromSlice(db_mod.DB.NativeIndexClaimCleanupMaintenanceOutcome, a, claim_response.slice(), .{});
+        defer progress.deinit();
+        try std.testing.expectEqual(attempt == 0, progress.value.advanced);
+        try std.testing.expect(progress.value.claims_retired);
+    }
+    {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        const authority = local.storage_source_authority;
+        const clock = try authority.require(&read, .native, local.storage_db_online_source_contract.namespaceBytes(header.fence.namespace));
+        try std.testing.expectEqual(cancel_position.sequence + 1, clock.sequence);
+    }
+    request.operation = .cancel_inspect;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    const status_response = response;
+    defer freeRawBuffer(status_response.ptr, status_response.len);
+    var status = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationState, a, status_response.slice(), .{});
+    defer status.deinit();
+    try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);
+    try std.testing.expect(status.value.claims_retired);
+    try std.testing.expect(status.value.claim_allocation != null);
+    try std.testing.expectEqual(cancel_position.sequence + 1, status.value.cleanup.?.sequence);
+    try status.value.validate(identity);
+    try std.testing.expect(status.value.intent.?.position == .native);
+    try std.testing.expectEqual(cancel_position, status.value.intent.?.position.native);
+    try std.testing.expect(status.value.completed == null);
+    const completion_native = local.storage_db_relational_index_owner_control;
+    const signer = try local.storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, directory.path());
+    const completion_root: completion_native.AuditRoot = .{ .root_dir = directory.path(), .root_incarnation = signer.root_incarnation };
+    const completion_root_json = try std.json.Stringify.valueAlloc(a, completion_root, .{});
+    defer a.free(completion_root_json);
+    request.operation = .cancel_complete;
+    request.manifest = .fromSlice(completion_root_json);
+    request.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.control = .{ .version = kernel_owner_abi.abi_version - 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.control = .{};
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = completion_native.AuditRoot.max_wire_bytes + 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .fromSlice(completion_root_json);
+    {
+        var completion_foreign = identity;
+        completion_foreign.owner_group_id += 1;
+        const encoded = try std.json.Stringify.valueAlloc(a, completion_foreign, .{});
+        defer a.free(encoded);
+        var rejected = request;
+        rejected.request_json = .fromSlice(encoded);
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        var different = completion_root;
+        different.root_incarnation = if (completion_root.root_incarnation == 1) 2 else 1;
+        const different_json = try std.json.Stringify.valueAlloc(a, different, .{});
+        defer a.free(different_json);
+        rejected = request;
+        rejected.manifest = .fromSlice(different_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        try std.testing.expect(response.ptr == null);
+    }
+    // The raw ABI cannot bypass the writer gate, even with genuine retired
+    // artifacts and a valid host signing-root scope.
+    try std.testing.expect(server_api.storageOwnerNativeIndexControlJson(id, &request, &response) != .ok);
+    try std.testing.expect(response.ptr == null);
+    const before_complete = try handle.db.nativeIndexOwnerCancellationState(identity);
+    try std.testing.expect(before_complete.completed == null);
+    try std.testing.expectEqual(cancel_position.sequence + 1, before_complete.source.sequence);
+    handle.db.local_execution.replication_write_gate = null;
+    var completed: ?local.storage_db_relational_index_owner_job.Canceled = null;
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const completion_response = response;
+        defer freeRawBuffer(completion_response.ptr, completion_response.len);
+        var outcome = try std.json.parseFromSlice(completion_native.CancellationCompletionOutcome, a, completion_response.slice(), .{ .ignore_unknown_fields = false });
+        defer outcome.deinit();
+        try outcome.value.validate();
+        try std.testing.expectEqual(attempt != 0, outcome.value.duplicate);
+        try std.testing.expectEqual(cancel_position.sequence + 2, outcome.value.position.sequence);
+        try std.testing.expectEqual(.canceled, outcome.value.receipt.?.action);
+        if (completed) |previous| try std.testing.expectEqualDeep(previous, outcome.value.record.?) else completed = outcome.value.record;
+    }
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = header.fence.namespace });
+    const recovered_state = try handle.db.nativeIndexOwnerCancellationState(identity);
+    try recovered_state.validate(identity);
+    try std.testing.expectEqualDeep(completed, recovered_state.completed);
+    {
+        var completion_read = try handle.db.core.store.beginReadTxn();
+        defer completion_read.abort();
+        try std.testing.expect((try local.storage_db_relational_integrity_topology.current(&completion_read)).?.eql(header.fence));
+        try std.testing.expect(try local.storage_db_relational_integrity_topology.completed(&completion_read) == null);
+    }
+    const release_intent: @FieldType(completion_native.CancellationReleaseOutcome, "intent") = .{ .canceled = completed.?, .metadata_decision = @splat(9) };
+    const release_json = try std.json.Stringify.valueAlloc(a, release_intent, .{});
+    defer a.free(release_json);
+    request.operation = .cancel_release;
+    request.request_json = .fromSlice(release_json);
+    request.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.control = .{ .version = kernel_owner_abi.abi_version - 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.control = .{};
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = completion_native.AuditRoot.max_wire_bytes + 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .fromSlice(completion_root_json);
+    {
+        var foreign_intent = release_intent;
+        foreign_intent.canceled.binding.fence.owner_group_id += 1;
+        const foreign_json = try std.json.Stringify.valueAlloc(a, foreign_intent, .{});
+        defer a.free(foreign_json);
+        var rejected = request;
+        rejected.request_json = .fromSlice(foreign_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        var wrong_scope = completion_root;
+        wrong_scope.root_incarnation = if (wrong_scope.root_incarnation == 1) 2 else 1;
+        const wrong_json = try std.json.Stringify.valueAlloc(a, wrong_scope, .{});
+        defer a.free(wrong_json);
+        rejected = request;
+        rejected.manifest = .fromSlice(wrong_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+    }
+    handle.db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &denied_context, .check_fn = Denied.check, .allows_background_work = false } };
+    try std.testing.expect(server_api.storageOwnerNativeIndexControlJson(id, &request, &response) != .ok);
+    try std.testing.expect(response.ptr == null);
+    handle.db.local_execution.replication_write_gate = null;
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const released_response = response;
+        defer freeRawBuffer(released_response.ptr, released_response.len);
+        var released = try std.json.parseFromSlice(completion_native.CancellationReleaseOutcome, a, released_response.slice(), .{ .ignore_unknown_fields = false });
+        defer released.deinit();
+        try released.value.validate();
+        try std.testing.expectEqual(attempt != 0, released.value.duplicate);
+        try std.testing.expect(completed.?.position == .native);
+        try std.testing.expectEqual(completed.?.position.native.sequence + 1, released.value.position.sequence);
+        try std.testing.expectEqual(.cancel_released, released.value.receipt.?.action);
+    }
+}
+
 test "storage owner open rejects prior ABI before reading expanded request fields" {
     var owner: ?*anyopaque = @ptrFromInt(1);
     const old_request: kernel_owner_abi.OpenRequest = .{
@@ -1985,6 +3540,92 @@ test "capi SQL array mutations retain native cells and returning provenance" {
     }
 }
 
+test "capi SQL ranked cursor releases writers and hydrates the captured primary cut" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-search-captured");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"alpha\",\"payload\":{\"state\":\"before\"}}" }}, .timestamp_ns = 42 });
+    try database.runUntilIdle();
+    const local = @import("antfly_local_sources");
+    const sql = local.capi_sql;
+    var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const backend = adapter.backend();
+    var compiled = try sql.compiler.compile(a, "SELECT _id,payload FROM antfly_search('rows','body:alpha',100)", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const binding = try local.sql_describe.bind(arena.allocator(), backend, &compiled, &.{});
+    const scans = try local.sql_relation_runtime.bindSearchScans(arena.allocator(), binding.relation.?.scans, &.{});
+    var replaced = scans[0];
+    replaced.table.id ^= 1;
+    try std.testing.expectError(error.PreparedGenerationChanged, backend.vtable.open_statement.?(backend.ptr, a, &.{replaced}));
+    replaced = scans[0];
+    replaced.table.storage_mode = .document;
+    try std.testing.expectError(error.PreparedGenerationChanged, backend.vtable.open_statement.?(backend.ptr, a, &.{replaced}));
+    const captured = try backend.vtable.open_statement.?(backend.ptr, a, scans);
+    var open = true;
+    defer if (open) captured.close(captured.ptr);
+    try std.testing.expectEqual(@as(usize, 1), captured.cursors.len);
+    // Prove writer admission without a blocking write on a leaked read fence.
+    try std.testing.expect(database.core.tryLockApplyExclusive());
+    database.core.unlockApplyExclusive();
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"beta\",\"payload\":{\"state\":\"after\"}}" }}, .timestamp_ns = 43 });
+    var current = (try database.lookup(a, "a", .{})).?;
+    defer current.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, current.json, "after") != null);
+    var page = try captured.cursors[0].next(captured.cursors[0].ptr, a, 1);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualStrings("before", (try page.rows[0].cell("payload")).value.object.get("state").?.string);
+    captured.close(captured.ptr);
+    open = false;
+    try std.testing.expectEqualStrings("a", page.rows[0].id);
+    try std.testing.expectEqualStrings("before", (try page.rows[0].cell("payload")).value.object.get("state").?.string);
+}
+
+test "capi SQL document ranked projections retain JSON null metadata and highlights" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-search-document-projection");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"text"},"payload":{"type":"object","nullable":true,"additionalProperties":true},"cold":{"type":"string"}},"additionalProperties":true}}}}
+    );
+    try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"alpha\",\"payload\":null,\"cold\":\"unused\",\"_highlights\":null,\"score\":999}" }}, .timestamp_ns = 42 });
+    try database.runUntilIdle();
+    const sql = @import("antfly_local_sources").capi_sql;
+    var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "docs" };
+    for ([_][]const u8{
+        "SELECT _id FROM antfly_search('docs','body:alpha')",
+        "SELECT _id FROM antfly_search('docs','{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"alpha\"}},\"highlight\":{\"fields\":[\"body\"]}}')",
+    }) |statement| {
+        var compiled = try sql.compiler.compile(a, statement, .{});
+        defer compiled.deinit();
+        var result = try sql.runtime.execute(a, adapter.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("a", result.output.rows[0][0].string);
+    }
+    var compiled = try sql.compiler.compile(a, "SELECT payload,payload IS NULL,_highlights IS NULL,score>0 FROM antfly_search('docs','body:alpha')", .{});
+    defer compiled.deinit();
+    var result = try sql.runtime.execute(a, adapter.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expect(result.output.rows[0][0] == .null);
+    try std.testing.expect(!result.output.sql_nulls.?[0][0]);
+    try std.testing.expect(!result.output.rows[0][1].bool);
+    try std.testing.expect(result.output.rows[0][2].bool);
+    try std.testing.expect(result.output.rows[0][3].bool);
+}
+
 test "capi SQL relational search highlight values own captured text and match public JSON" {
     const a = std.testing.allocator;
     const sql = @import("antfly_local_sources").capi_sql;
@@ -2051,7 +3692,7 @@ test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
         try std.testing.expect(hits.output.rows[0][5] == .object);
         try std.testing.expectEqualStrings("2", hits.output.rows[0][6].string);
         try std.testing.expectEqualStrings("9007199254740993.1200", hits.output.rows[2][7].string);
-        try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
+        try std.testing.expectEqualStrings("9007199254740993.0", hits.output.rows[2][3].string);
         try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
     }
     // A delivered ranked page owns its identities, layouts and values after

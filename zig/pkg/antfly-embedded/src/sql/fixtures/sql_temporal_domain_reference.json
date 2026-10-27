@@ -1,0 +1,1461 @@
+{
+  "format": 1,
+  "entries": [
+    {
+      "id": "sql-0201",
+      "source_id": "sql-0201",
+      "sql": "SELECT id, CAST(created_at AS timestamptz) AS created_at_ts FROM usage_records WHERE CAST(created_at AS timestamptz) >= $1 ORDER BY CAST(created_at AS timestamptz) DESC LIMIT 5",
+      "parameters": [
+        1735689600000000000
+      ],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,email TEXT UNIQUE,created_at TEXT,updated_at_ns BIGINT)",
+      "seed": "INSERT INTO usage_records(id,email,created_at,updated_at_ns) VALUES('u1','a@example.test','2025-01-01T00:00:00Z',10),('u9','z@example.test','2025-01-02T00:00:00Z',20)",
+      "read": "SELECT id,email,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "output": null,
+      "final": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "sqlstate": "42883",
+      "affected": 0,
+      "cold": [
+        {
+          "sql": "SELECT id,created_at::timestamptz AS instant FROM usage_records WHERE created_at::timestamptz >= TIMESTAMPTZ '2025-01-01' ORDER BY instant DESC,id",
+          "output": {
+            "columns": [
+              "id",
+              "instant"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u9",
+                "2025-01-02 00:00:00+00"
+              ],
+              [
+                "u1",
+                "2025-01-01 00:00:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "email",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              20
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "2025-01-01T00:00:00Z",
+                10
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "2025-01-02T00:00:00Z",
+                20
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "SELECT id,created_at::timestamptz + INTERVAL '1 month 1 day 01:30:00' AS shifted FROM usage_records ORDER BY id",
+          "output": {
+            "columns": [
+              "id",
+              "shifted"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "2025-02-02 01:30:00+00"
+              ],
+              [
+                "u9",
+                "2025-02-03 01:30:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "email",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              20
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "2025-01-01T00:00:00Z",
+                10
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "2025-01-02T00:00:00Z",
+                20
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES('u2','a@example.test',3700000000000) ON CONFLICT(email) DO UPDATE SET updated_at_ns=usage_records.updated_at_ns+1000000000 RETURNING id,updated_at_ns",
+          "output": {
+            "columns": [
+              "id",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              20
+            ],
+            "rows": [
+              [
+                "u1",
+                1000000010
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "email",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              20
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "2025-01-01T00:00:00Z",
+                1000000010
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "2025-01-02T00:00:00Z",
+                20
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,email,updated_at_ns) VALUES('u2','a@example.test',3700000000000) ON CONFLICT(email) DO UPDATE SET updated_at_ns=excluded.updated_at_ns RETURNING id,updated_at_ns",
+          "output": {
+            "columns": [
+              "id",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              20
+            ],
+            "rows": [
+              [
+                "u1",
+                3700000000000
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "email",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              20
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "2025-01-01T00:00:00Z",
+                3700000000000
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "2025-01-02T00:00:00Z",
+                20
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "UPDATE usage_records u SET updated_at_ns=u.updated_at_ns+1 FROM(SELECT DATE '2024-02-29' AS day,TIME '12:34:56.123456' AS clock,TIMETZ '12:34:56+01:30' AS zoned,TIMESTAMP '2024-02-29 12:34:56' AS local,INTERVAL '1 month 2 days 03:04:05' AS span) s WHERE u.id='u1' RETURNING u.id,s.day,s.clock,s.zoned,s.local,s.span",
+          "output": {
+            "columns": [
+              "id",
+              "day",
+              "clock",
+              "zoned",
+              "local",
+              "span"
+            ],
+            "column_oids": [
+              25,
+              1082,
+              1083,
+              1266,
+              1114,
+              1186
+            ],
+            "rows": [
+              [
+                "u1",
+                "2024-02-29",
+                "12:34:56.123456",
+                "12:34:56+01:30",
+                "2024-02-29 12:34:56",
+                "1 mon 2 days 03:04:05"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "email",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              20
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "2025-01-01T00:00:00Z",
+                3700000000001
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "2025-01-02T00:00:00Z",
+                20
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "MERGE INTO usage_records u USING(SELECT DATE '2024-02-29' AS day,TIME '12:34:56.123456' AS clock,TIMETZ '12:34:56+01:30' AS zoned,TIMESTAMP '2024-02-29 12:34:56' AS local,INTERVAL '1 month 2 days 03:04:05' AS span) s ON u.id='u1' WHEN MATCHED THEN UPDATE SET updated_at_ns=u.updated_at_ns+1 RETURNING u.id,s.day,s.clock,s.zoned,s.local,s.span",
+          "output": {
+            "columns": [
+              "id",
+              "day",
+              "clock",
+              "zoned",
+              "local",
+              "span"
+            ],
+            "column_oids": [
+              25,
+              1082,
+              1083,
+              1266,
+              1114,
+              1186
+            ],
+            "rows": [
+              [
+                "u1",
+                "2024-02-29",
+                "12:34:56.123456",
+                "12:34:56+01:30",
+                "2024-02-29 12:34:56",
+                "1 mon 2 days 03:04:05"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "email",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              20
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "2025-01-01T00:00:00Z",
+                3700000000002
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "2025-01-02T00:00:00Z",
+                20
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          }
+        }
+      ],
+      "parameter_descriptors": [
+        {
+          "kind": "integer",
+          "element_type": "int64"
+        }
+      ]
+    },
+    {
+      "id": "sql-0592",
+      "source_id": "sql-0592",
+      "sql": "SELECT created_at + INTERVAL '1 hour 30 minutes' AS expires_at FROM usage_records WHERE created_at + INTERVAL '1 hour' > $1 ORDER BY created_at - INTERVAL '7 days' ASC LIMIT 5",
+      "parameters": [
+        1700000000000000000
+      ],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,email TEXT UNIQUE,created_at TEXT,updated_at_ns BIGINT)",
+      "seed": "INSERT INTO usage_records(id,email,created_at,updated_at_ns) VALUES('u1','a@example.test','2025-01-01T00:00:00Z',10),('u9','z@example.test','2025-01-02T00:00:00Z',20)",
+      "read": "SELECT id,email,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "output": null,
+      "final": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "sqlstate": "42883",
+      "affected": 0,
+      "cold": [],
+      "parameter_descriptors": []
+    },
+    {
+      "id": "bigint-domain-sql-1403",
+      "source_id": "sql-1403",
+      "sql": "INSERT INTO usage_records (id, email, updated_at_ns) VALUES ('u2', 'a@example.test', 10) ON CONFLICT (email) DO UPDATE SET updated_at_ns = updated_at_ns + INTERVAL '1 second' RETURNING id, updated_at_ns",
+      "parameters": [],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,email TEXT UNIQUE,created_at TEXT,updated_at_ns BIGINT)",
+      "seed": "INSERT INTO usage_records(id,email,created_at,updated_at_ns) VALUES('u1','a@example.test','2025-01-01T00:00:00Z',10),('u9','z@example.test','2025-01-02T00:00:00Z',20)",
+      "read": "SELECT id,email,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "output": null,
+      "final": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "sqlstate": "42702",
+      "affected": 0,
+      "cold": [],
+      "parameter_descriptors": []
+    },
+    {
+      "id": "bigint-domain-sql-1468",
+      "source_id": "sql-1468",
+      "sql": "INSERT INTO usage_records (id, email, updated_at_ns) VALUES ('u2', 'a@example.test', 3700000000000) ON CONFLICT (email) DO UPDATE SET updated_at_ns = date_bin(INTERVAL '1 hour', excluded.updated_at_ns, 0) RETURNING updated_at_ns",
+      "parameters": [],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,email TEXT UNIQUE,created_at TEXT,updated_at_ns BIGINT)",
+      "seed": "INSERT INTO usage_records(id,email,created_at,updated_at_ns) VALUES('u1','a@example.test','2025-01-01T00:00:00Z',10),('u9','z@example.test','2025-01-02T00:00:00Z',20)",
+      "read": "SELECT id,email,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "output": null,
+      "final": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "sqlstate": "42883",
+      "affected": 0,
+      "cold": [],
+      "parameter_descriptors": []
+    },
+    {
+      "id": "bigint-domain-sql-1469",
+      "source_id": "sql-1469",
+      "sql": "INSERT INTO usage_records (id, email, updated_at_ns) VALUES ('u2', 'a@example.test', 3700000000000) ON CONFLICT (email) DO UPDATE SET updated_at_ns = TIMESTAMPTZ '2025-01-01T01:30:00+01:30' RETURNING updated_at_ns",
+      "parameters": [],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,email TEXT UNIQUE,created_at TEXT,updated_at_ns BIGINT)",
+      "seed": "INSERT INTO usage_records(id,email,created_at,updated_at_ns) VALUES('u1','a@example.test','2025-01-01T00:00:00Z',10),('u9','z@example.test','2025-01-02T00:00:00Z',20)",
+      "read": "SELECT id,email,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "output": null,
+      "final": {
+        "columns": [
+          "id",
+          "email",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          20
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "2025-01-01T00:00:00Z",
+            10
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "2025-01-02T00:00:00Z",
+            20
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "sqlstate": "42804",
+      "affected": 0,
+      "cold": [],
+      "parameter_descriptors": []
+    }
+  ],
+  "assignment_vectors": [
+    {
+      "expression": "DATE '2024-02-29'",
+      "target": {
+        "kind": "integer",
+        "element_type": "int64"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "DATE '2024-02-29'",
+      "target": {
+        "kind": "number",
+        "element_type": "numeric"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "DATE '2024-02-29'",
+      "target": {
+        "kind": "boolean",
+        "element_type": "boolean"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "DATE '2024-02-29'",
+      "target": {
+        "kind": "uuid",
+        "element_type": "uuid"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "DATE '2024-02-29'",
+      "target": {
+        "kind": "json",
+        "element_type": "jsonb"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "DATE '2024-02-29'",
+      "target": {
+        "kind": "numrange",
+        "element_type": null
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "DATE '2024-02-29'",
+      "target": {
+        "kind": "string",
+        "element_type": "text"
+      },
+      "result": "2024-02-29",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '12:34:56.123456'",
+      "target": {
+        "kind": "integer",
+        "element_type": "int64"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIME '12:34:56.123456'",
+      "target": {
+        "kind": "number",
+        "element_type": "numeric"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIME '12:34:56.123456'",
+      "target": {
+        "kind": "boolean",
+        "element_type": "boolean"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIME '12:34:56.123456'",
+      "target": {
+        "kind": "uuid",
+        "element_type": "uuid"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIME '12:34:56.123456'",
+      "target": {
+        "kind": "json",
+        "element_type": "jsonb"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIME '12:34:56.123456'",
+      "target": {
+        "kind": "numrange",
+        "element_type": null
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIME '12:34:56.123456'",
+      "target": {
+        "kind": "string",
+        "element_type": "text"
+      },
+      "result": "12:34:56.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMETZ '12:34:56+01:30'",
+      "target": {
+        "kind": "integer",
+        "element_type": "int64"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMETZ '12:34:56+01:30'",
+      "target": {
+        "kind": "number",
+        "element_type": "numeric"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMETZ '12:34:56+01:30'",
+      "target": {
+        "kind": "boolean",
+        "element_type": "boolean"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMETZ '12:34:56+01:30'",
+      "target": {
+        "kind": "uuid",
+        "element_type": "uuid"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMETZ '12:34:56+01:30'",
+      "target": {
+        "kind": "json",
+        "element_type": "jsonb"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMETZ '12:34:56+01:30'",
+      "target": {
+        "kind": "numrange",
+        "element_type": null
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMETZ '12:34:56+01:30'",
+      "target": {
+        "kind": "string",
+        "element_type": "text"
+      },
+      "result": "12:34:56+01:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-02-29 12:34:56'",
+      "target": {
+        "kind": "integer",
+        "element_type": "int64"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMP '2024-02-29 12:34:56'",
+      "target": {
+        "kind": "number",
+        "element_type": "numeric"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMP '2024-02-29 12:34:56'",
+      "target": {
+        "kind": "boolean",
+        "element_type": "boolean"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMP '2024-02-29 12:34:56'",
+      "target": {
+        "kind": "uuid",
+        "element_type": "uuid"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMP '2024-02-29 12:34:56'",
+      "target": {
+        "kind": "json",
+        "element_type": "jsonb"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMP '2024-02-29 12:34:56'",
+      "target": {
+        "kind": "numrange",
+        "element_type": null
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMP '2024-02-29 12:34:56'",
+      "target": {
+        "kind": "string",
+        "element_type": "text"
+      },
+      "result": "2024-02-29 12:34:56",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-02-29 12:34:56+01:30'",
+      "target": {
+        "kind": "integer",
+        "element_type": "int64"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-02-29 12:34:56+01:30'",
+      "target": {
+        "kind": "number",
+        "element_type": "numeric"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-02-29 12:34:56+01:30'",
+      "target": {
+        "kind": "boolean",
+        "element_type": "boolean"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-02-29 12:34:56+01:30'",
+      "target": {
+        "kind": "uuid",
+        "element_type": "uuid"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-02-29 12:34:56+01:30'",
+      "target": {
+        "kind": "json",
+        "element_type": "jsonb"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-02-29 12:34:56+01:30'",
+      "target": {
+        "kind": "numrange",
+        "element_type": null
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-02-29 12:34:56+01:30'",
+      "target": {
+        "kind": "string",
+        "element_type": "text"
+      },
+      "result": "2024-02-29 11:04:56+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "INTERVAL '1 month 2 days 03:04:05'",
+      "target": {
+        "kind": "integer",
+        "element_type": "int64"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "INTERVAL '1 month 2 days 03:04:05'",
+      "target": {
+        "kind": "number",
+        "element_type": "numeric"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "INTERVAL '1 month 2 days 03:04:05'",
+      "target": {
+        "kind": "boolean",
+        "element_type": "boolean"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "INTERVAL '1 month 2 days 03:04:05'",
+      "target": {
+        "kind": "uuid",
+        "element_type": "uuid"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "INTERVAL '1 month 2 days 03:04:05'",
+      "target": {
+        "kind": "json",
+        "element_type": "jsonb"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "INTERVAL '1 month 2 days 03:04:05'",
+      "target": {
+        "kind": "numrange",
+        "element_type": null
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "INTERVAL '1 month 2 days 03:04:05'",
+      "target": {
+        "kind": "string",
+        "element_type": "text"
+      },
+      "result": "1 mon 2 days 03:04:05",
+      "sqlstate": null
+    },
+    {
+      "expression": "NULL::timestamp",
+      "target": {
+        "kind": "integer",
+        "element_type": "int64"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "NULL::timestamp",
+      "target": {
+        "kind": "number",
+        "element_type": "numeric"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "NULL::timestamp",
+      "target": {
+        "kind": "boolean",
+        "element_type": "boolean"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "NULL::timestamp",
+      "target": {
+        "kind": "uuid",
+        "element_type": "uuid"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "NULL::timestamp",
+      "target": {
+        "kind": "json",
+        "element_type": "jsonb"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "NULL::timestamp",
+      "target": {
+        "kind": "numrange",
+        "element_type": null
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "NULL::timestamp",
+      "target": {
+        "kind": "string",
+        "element_type": "text"
+      },
+      "result": null,
+      "sqlstate": null
+    },
+    {
+      "expression": "'42'::text",
+      "target": {
+        "kind": "integer",
+        "element_type": "int64"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "'42'::text",
+      "target": {
+        "kind": "number",
+        "element_type": "numeric"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "'42'::text",
+      "target": {
+        "kind": "boolean",
+        "element_type": "boolean"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "'42'::text",
+      "target": {
+        "kind": "uuid",
+        "element_type": "uuid"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "'42'::text",
+      "target": {
+        "kind": "json",
+        "element_type": "jsonb"
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "'42'::text",
+      "target": {
+        "kind": "numrange",
+        "element_type": null
+      },
+      "result": null,
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "'42'::text",
+      "target": {
+        "kind": "string",
+        "element_type": "text"
+      },
+      "result": "42",
+      "sqlstate": null
+    }
+  ]
+}

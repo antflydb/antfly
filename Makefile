@@ -182,7 +182,8 @@ minikube-restart: minikube-delete minikube-start ## Delete and recreate Minikube
 # SQL Extraction Audits (intentionally outside default build/test gates)
 # ====================================================================================
 
-.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check
+.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check sql-catalog-lifecycle-oracle-check sql-default-lifecycle-oracle-check sql-table-creation-oracle-check
+.PHONY: sql-expression-index-oracle-check
 
 sql-parity-inventory-check: ## Audit SQL parity inventory.
 	python3 scripts/check_sql_parity_inventory.py
@@ -192,3 +193,15 @@ sql-parity-evidence-check: ## Audit SQL parity evidence.
 
 sql-parity-release-check: ## Audit SQL parity release readiness.
 	python3 scripts/check_sql_parity_inventory.py --release
+
+sql-catalog-lifecycle-oracle-check: ## Check PostgreSQL catalog lifecycle contracts.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_catalog_lifecycle.py
+
+sql-default-lifecycle-oracle-check: ## Check exact PostgreSQL default DDL and future mutation contracts.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_default_lifecycle.py
+
+sql-table-creation-oracle-check: ## Check PostgreSQL generated/default CREATE and complete mutation postimages.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_table_creation_lifecycle.py
+
+sql-expression-index-oracle-check: ## Check PostgreSQL expression/partial index volatility and mutation postimages.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_expression_index_lifecycle.py

@@ -15,8 +15,10 @@
 
 pub const antfly_sources = @import("source_owner_physical.zig");
 test {
+    _ = @import("storage/relational_read_set.zig");
     _ = @import("antfly_local_sources").storage_rewrite_tail_spool;
     _ = @import("antfly_local_sources").storage_db_relational_integrity;
+    _ = @import("antfly_local_sources").storage_db_relational_integrity_range;
     _ = @import("antfly_local_sources").storage_db_relational_index_system_test;
     _ = @import("antfly_local_sources").storage_db_relational_index_cover_system_test;
     _ = @import("antfly_local_sources").storage_db_relational_expression_system_test;

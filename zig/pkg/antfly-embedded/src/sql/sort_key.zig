@@ -36,7 +36,20 @@ pub fn encode(values: []const Datum, orders: anytype) ?Key {
     if (values.len != orders.len or values.len > 16) return null;
     var key: Key = .{};
     for (values, orders, 0..) |value, order, index| {
-        if (value.array != null) return null;
+        // Extension payloads are not JSON nulls. Range endpoints may exceed
+        // this bounded prefix; retain the authoritative typed comparator.
+        if (value.array != null or value.range() != null) return null;
+        if (value.temporal()) |temporal| {
+            value.validateTemporal() catch return null;
+            const codec = @import("temporal_ops.zig");
+            var scratch: [codec.key_size]u8 = undefined;
+            const bytes = codec.key(temporal.*, &scratch) catch return null;
+            key.types |= @as(u64, 7 + @as(u8, @backingInt(temporal.kind()))) << @as(u6, @intCast(index * 4));
+            const null_first = order.nulls_first orelse order.descending;
+            key.push(if (value.sql_null) if (null_first) 0 else 2 else 1, false);
+            for (bytes) |byte| key.push(byte, order.descending);
+            continue;
+        }
         if (value.numeric) |number| {
             const numeric = @import("numeric_value.zig");
             const keys = @import("numeric_key.zig");

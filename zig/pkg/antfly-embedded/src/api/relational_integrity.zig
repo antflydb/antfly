@@ -40,7 +40,8 @@ pub const ForeignBinding = struct {
     parent: registry.SchemaView,
     parent_unique: native.UniqueConstraint,
 };
-const BoundUnique = struct { generation: storage.Generation, definition: native.UniqueConstraint, tuple: tuples.TuplePlan, predicate: ?partial_predicate.Plan = null };
+const PeriodColumn = struct { name: []const u8, kind: @import("../sql/range_value.zig").Kind };
+const BoundUnique = struct { generation: storage.Generation, definition: native.UniqueConstraint, tuple: tuples.TuplePlan, predicate: ?partial_predicate.Plan = null, period: ?PeriodColumn = null };
 const BoundForeign = struct { generation: storage.Generation, parent_generation: storage.Generation, definition: native.ForeignKey, tuple: tuples.TuplePlan };
 
 pub const Mutation = struct {
@@ -104,11 +105,18 @@ pub const Plan = struct {
         for (uniques, bound_uniques) |binding, *bound| {
             const def = binding.definition;
             if (std.mem.allEqual(u8, &binding.generation, 0) or (def.columns.len == 0 and def.keys.len == 0) or (def.columns.len != 0 and def.keys.len != 0) or def.expressions.len != 0 or
-                def.include_columns.len != 0 or def.where_expressions.len != 0 or
-                def.without_overlaps_period != null or (def.timing == .deferred and !def.deferrable)) return error.UnsupportedIntegrityDefinition;
+                def.include_columns.len > 256 or def.where_expressions.len != 0 or
+                (def.timing == .deferred and !def.deferrable)) return error.UnsupportedIntegrityDefinition;
             var copied = def;
             copied.name = try owned.dupe(u8, def.name);
             copied.columns = try copyColumns(owned, def.columns);
+            // INCLUDE is a physical projection, never an equality-key input.
+            // Its ordered access generation is compiled from the same schema;
+            // retain owned names here without widening claims or FK identity.
+            for (def.include_columns) |column| {
+                if (view.physicalLayout().ordinalForName(view.tableSchema().relational_columns, column) == null) return error.RelationalIndexColumnNotFound;
+            }
+            copied.include_columns = try copyColumns(owned, def.include_columns);
             const keys = try owned.dupe(native.RelationalIndexKey, def.keys);
             for (keys) |*key| {
                 key.column = try owned.dupe(u8, key.column);
@@ -124,9 +132,17 @@ pub const Plan = struct {
                 if (source.collation) |collation| predicate.collation = try owned.dupe(u8, collation);
             }
             copied.where = copied_where;
-            const tuple = if (keys.len != 0) try tuples.TuplePlan.init(owned, view.tableSchema().*, view.physicalLayout(), keys) else try bindTuple(owned, view, def.columns);
+            const period: ?PeriodColumn = if (def.without_overlaps_column) |name| blk: {
+                if (def.keys.len != 0 or def.columns.len == 0 or !std.mem.eql(u8, def.columns[def.columns.len - 1], name) or def.where.len != 0) return error.UnsupportedIntegrityDefinition;
+                const ordinal = view.physicalLayout().ordinalForName(view.tableSchema().relational_columns, name) orelse return error.RelationalIndexColumnNotFound;
+                const kind = @import("../sql/range_value.zig").kindFromType(view.tableSchema().relational_columns[ordinal].column_type) orelse return error.UnsupportedIntegrityDefinition;
+                copied.without_overlaps_column = try owned.dupe(u8, name);
+                break :blk .{ .name = copied.without_overlaps_column.?, .kind = kind };
+            } else null;
+            const equality_columns = if (period != null) def.columns[0 .. def.columns.len - 1] else def.columns;
+            const tuple = if (keys.len != 0) try tuples.TuplePlan.init(owned, view.tableSchema().*, view.physicalLayout(), keys) else if (equality_columns.len == 0) try tuples.TuplePlan.emptyEqualityGroup(owned, view.tableSchema().*, view.physicalLayout()) else try bindTuple(owned, view, equality_columns);
             const predicate = if (def.where.len != 0) try partial_predicate.Plan.init(alloc, view.tableSchema().*, view.physicalLayout(), def.where) else null;
-            bound.* = .{ .generation = binding.generation, .definition = copied, .tuple = tuple, .predicate = predicate };
+            bound.* = .{ .generation = binding.generation, .definition = copied, .tuple = tuple, .predicate = predicate, .period = period };
             initialized_uniques += 1;
         }
         const bound_foreign = try owned.alloc(BoundForeign, foreign.len);
@@ -136,7 +152,7 @@ pub const Plan = struct {
                 def.child_columns.len == 0 or def.child_columns.len != def.parent_columns.len or
                 def.child_period != null or def.parent_period != null or (def.timing == .deferred and !def.deferrable))
                 return error.UnsupportedIntegrityDefinition;
-            if (binding.parent_unique.deferrable or binding.parent_unique.timing != .immediate or binding.parent_unique.where.len != 0 or binding.parent_unique.keys.len != 0) return error.ForeignKeyTargetNotUnique;
+            if (binding.parent_unique.without_overlaps_column != null or binding.parent_unique.deferrable or binding.parent_unique.timing != .immediate or binding.parent_unique.where.len != 0 or binding.parent_unique.keys.len != 0) return error.ForeignKeyTargetNotUnique;
             if (!sameColumns(def.parent_columns, binding.parent_unique.columns)) return error.ForeignKeyTargetNotUnique;
             var parent_tuple = try bindTuple(owned, binding.parent, def.parent_columns);
             defer parent_tuple.deinit();
@@ -153,6 +169,27 @@ pub const Plan = struct {
         }
         const owned_name = try owned.dupe(u8, table_name);
         return .{ .arena = arena, .view = view.clone(), .table_name = owned_name, .uniques = bound_uniques, .foreign = bound_foreign };
+    }
+
+    fn intervalClaim(self: *const Plan, a: Allocator, unique: BoundUnique, optional_row: ?codec.OrdinalRowView, row_key: []const u8) !?@import("../storage/db/temporal_integrity_contract.zig").Claim {
+        const row = optional_row orelse return null;
+        const period = unique.period orelse return error.InvalidIntegrityDefinition;
+        const ordinal = row.ordinalForName(period.name) orelse return error.RelationalIndexColumnNotFound;
+        const cell = (try row.findCell(ordinal)) orelse return null;
+        if (cell.is_null) return null;
+        if (cell.value != .bytes_val or cell.sql_range_kind != period.kind) return error.RelationalIndexColumnTypeMismatch;
+        const tuple = if (unique.tuple.keys.len == 0) try a.dupe(u8, &.{0}) else (try encodeUnique(a, unique.tuple, row, unique.definition.nulls_not_distinct, row_key)).?;
+        const result: @import("../storage/db/temporal_integrity_contract.zig").Claim = .{
+            .tuple = tuple,
+            .parent_table = try a.dupe(u8, self.table_name),
+            .parent_key = try a.dupe(u8, row_key),
+            .schema_version = self.view.version(),
+            .period = .{ .kind = period.kind, .bytes = try a.dupe(u8, cell.value.bytes_val) },
+        };
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var context: @import("../sql/range_value.zig").Context = .{ .alloc = none.allocator() };
+        _ = try result.view(&context);
+        return result;
     }
 
     pub fn deinit(self: *Plan) void {
@@ -179,6 +216,7 @@ pub const Plan = struct {
     pub fn bindNamedConflict(self: *const Plan, alloc: Allocator, name: []const u8) ![]const usize {
         for (self.uniques, 0..) |unique, index| {
             if (!std.mem.eql(u8, unique.definition.name, name)) continue;
+            if (unique.period != null) return error.UnsupportedSqlShape;
             if (unique.definition.deferrable) return error.DeferrableConflictArbiter;
             return alloc.dupe(usize, &.{index});
         }
@@ -193,6 +231,9 @@ pub const Plan = struct {
     }
 
     pub fn bindConflictExpressions(self: *const Plan, alloc: Allocator, columns: []const []const u8, expressions: []const native.RelationalIndexKey, arbiter_predicate: []const native.UniquePredicate) ![]const usize {
+        if (columns.len == 0 and expressions.len == 0) for (self.uniques) |unique| {
+            if (unique.period != null) return error.UnsupportedSqlShape;
+        };
         const target_count = columns.len + expressions.len;
         if (target_count > 32) return error.InvalidIntegrityDefinition;
         const keys = try alloc.alloc(native.RelationalIndexKey, target_count);
@@ -209,6 +250,7 @@ pub const Plan = struct {
         var target_plan: ?partial_predicate.Plan = if (arbiter_predicate.len != 0) try partial_predicate.Plan.init(alloc, self.view.tableSchema().*, self.view.physicalLayout(), arbiter_predicate) else null;
         defer if (target_plan) |*plan| plan.deinit();
         for (self.uniques, 0..) |unique, index| {
+            if (unique.period != null) continue;
             if (target_count == 0) {
                 if (unique.definition.deferrable) return error.DeferrableConflictArbiter;
                 try selected.append(alloc, index);
@@ -266,6 +308,15 @@ pub const Plan = struct {
     }
 
     pub fn expand(self: *const Plan, alloc: Allocator, mutations: []const Mutation) !Expansion {
+        return self.expandMode(alloc, mutations, false);
+    }
+
+    pub fn expandHistorical(self: *const Plan, alloc: Allocator, mutations: []const Mutation) !Expansion {
+        for (mutations) |mutation| if (mutation.before != null or mutation.repair) return error.InvalidIntegrityCommand;
+        return self.expandMode(alloc, mutations, true);
+    }
+
+    fn expandMode(self: *const Plan, alloc: Allocator, mutations: []const Mutation, historical: bool) !Expansion {
         if (mutations.len > 4096) return error.TransactionTooLarge;
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -279,6 +330,18 @@ pub const Plan = struct {
             if (mutation.after) |after| if (after.layout != self.view.physicalLayout() or
                 after.table_schema.relational_columns.ptr != self.view.tableSchema().relational_columns.ptr) return error.PreparedGenerationChanged;
             for (self.uniques) |unique| {
+                if (unique.period != null) {
+                    const before = try self.intervalClaim(owned, unique, mutation.before, key);
+                    const after = try self.intervalClaim(owned, unique, mutation.after, key);
+                    const unchanged = if (before) |old| if (after) |next| std.mem.eql(u8, old.tuple, next.tuple) and old.period.kind == next.period.kind and std.mem.eql(u8, old.period.bytes, next.period.bytes) else false else after == null;
+                    if (unchanged and !mutation.repair) {
+                        if (after) |claim| try commands.append(owned, .{ .table_name = table_name, .command = .{ .address = try storage.Address.init(unique.generation, claim.tuple), .operation = .{ .check_interval = claim } } });
+                        continue;
+                    }
+                    if (before) |claim| try commands.append(owned, .{ .table_name = table_name, .command = .{ .address = try storage.Address.init(unique.generation, claim.tuple), .operation = .{ .release_interval = .{ .claim = claim, .repair = mutation.repair } } } });
+                    if (after) |claim| try commands.append(owned, .{ .table_name = table_name, .command = .{ .address = try storage.Address.init(unique.generation, claim.tuple), .operation = .{ .establish_interval = claim } } });
+                    continue;
+                }
                 const before_member = try uniqueMatches(owned, self.view, unique, mutation.before);
                 const after_member = try uniqueMatches(owned, self.view, unique, mutation.after);
                 const before = try encodeUnique(owned, unique.tuple, if (before_member) mutation.before else null, unique.definition.nulls_not_distinct, key);
@@ -297,6 +360,13 @@ pub const Plan = struct {
                 } });
             }
             for (self.foreign) |foreign| {
+                if (!historical and foreign.definition.not_valid and mutation.before != null and mutation.after != null) {
+                    // PostgreSQL checks changed FK keys, not unrelated UPDATEs.
+                    // Compare the full canonical tuple, including mixed NULLs.
+                    const old_key = try encode(owned, foreign.tuple, mutation.before, false, false);
+                    const new_key = try encode(owned, foreign.tuple, mutation.after, false, false);
+                    if (sameTuple(old_key, new_key)) continue;
+                }
                 if (foreign.definition.match == .partial) {
                     const encoded = try std.json.Stringify.valueAlloc(owned, foreign.definition, .{});
                     const definition = try std.json.parseFromSliceLeaky(native.ForeignKey, owned, encoded, .{ .allocate = .alloc_always });
@@ -310,8 +380,8 @@ pub const Plan = struct {
                     });
                     continue;
                 }
-                const before = try encode(owned, foreign.tuple, mutation.before, true, foreign.definition.match == .full and !mutation.repair);
-                const after = try encode(owned, foreign.tuple, mutation.after, true, foreign.definition.match == .full);
+                const before = try encode(owned, foreign.tuple, mutation.before, true, foreign.definition.match == .full and !mutation.repair and !foreign.definition.not_valid);
+                const after = try encode(owned, foreign.tuple, mutation.after, true, foreign.definition.match == .full and !(historical and foreign.definition.not_valid));
                 const reference: storage.Reference = .{
                     .child_table = table_name,
                     .child_key = key,
@@ -319,8 +389,8 @@ pub const Plan = struct {
                     .constraint_generation = foreign.generation,
                 };
                 const parent_table = try owned.dupe(u8, foreign.definition.parent_table);
-                if (!sameTuple(before, after)) if (before) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = if (mutation.repair) .{ .repair_detach = reference } else .{ .detach = reference } } });
-                if (after) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = .{ .attach = reference } } });
+                if (!sameTuple(before, after)) if (before) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = if (mutation.repair or foreign.definition.not_valid) .{ .repair_detach = reference } else .{ .detach = reference } } });
+                if (after) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = if (historical and foreign.definition.not_valid) .{ .attach_historical = reference } else .{ .attach = reference } } });
             }
             if (commands.items.len + parents.items.len > storage.max_commands) return error.TransactionTooLarge;
         }
@@ -394,16 +464,10 @@ pub fn encodeUnique(alloc: Allocator, current: tuples.TuplePlan, optional_row: ?
     const row = optional_row orelse return null;
     var projected = if (row.layout == current.layout) current else try current.projectSource(alloc, row.table_schema, row.layout);
     defer if (row.layout != current.layout) projected.deinit();
-    var result = try projected.encodeAlloc(alloc, row);
-    if (!result.has_null or nulls_not_distinct) return result.bytes;
-    defer result.deinit(alloc);
-    var output: std.Io.Writer.Allocating = .init(alloc);
-    errdefer output.deinit();
-    try output.writer.writeAll(result.bytes);
-    try output.writer.writeAll("partial-null-witness-v1");
-    try output.writer.writeInt(u32, std.math.cast(u32, row_key.len) orelse return error.TransactionTooLarge, .big);
-    try output.writer.writeAll(row_key);
-    return try output.toOwnedSlice();
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(alloc);
+    try projected.appendUnique(alloc, &output, row, nulls_not_distinct, row_key);
+    return try output.toOwnedSlice(alloc);
 }
 
 test "distributed txn typed integrity expansion matches composite parent claim without float conversion" {
@@ -484,6 +548,97 @@ test "distributed txn typed integrity expansion matches composite parent claim w
     try std.testing.expectError(error.ForeignKeyMatchFullViolation, child.expand(alloc, &.{.{ .key = "c2", .after = partial_row }}));
 }
 
+fn sqlUniqueNullClaims(alloc: Allocator, not_distinct: bool) !void {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const sql = if (not_distinct)
+        "CREATE TABLE items (tenant BIGINT, email TEXT, UNIQUE NULLS NOT DISTINCT (tenant, email))"
+    else
+        "CREATE TABLE items (tenant BIGINT, email TEXT, UNIQUE NULLS DISTINCT (tenant, email))";
+    var compiled = try @import("../sql/compiler.zig").compile(alloc, sql, .{});
+    defer compiled.deinit();
+    const json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(alloc, compiled.statement.create_table);
+    defer alloc.free(json);
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, json);
+    defer parsed.deinit(alloc);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(a, parsed);
+    const definitions = try parsed.relationalUniqueDefinitions(a);
+    try std.testing.expectEqual(@as(usize, 1), definitions.len);
+    try std.testing.expectEqual(not_distinct, definitions[0].nulls_not_distinct);
+    var view = registry.SchemaView{ .epoch = try registry.Epoch.createCloned(alloc, schema) };
+    defer view.release();
+    var plan = try Plan.init(alloc, "items", view, &.{.{ .generation = @splat(7), .definition = definitions[0] }}, &.{});
+    defer plan.deinit();
+    // Both rows have the same logical tuple containing NULLs. Their physical
+    // primary identities differ; only DISTINCT permits separate witnesses.
+    const bytes = try codec.serializeOrdinal(alloc, view.version(), view.tableSchema().relational_columns, &.{}, @splat(0));
+    defer alloc.free(bytes);
+    const row = try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+    var first = try plan.expand(alloc, &.{.{ .key = "first", .after = row }});
+    defer first.deinit();
+    var second = try plan.expand(alloc, &.{.{ .key = "second", .after = row }});
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.commands.len);
+    try std.testing.expectEqual(@as(usize, 1), second.commands.len);
+    try std.testing.expectEqual(not_distinct, std.mem.eql(u8, first.commands[0].command.operation.establish.tuple, second.commands[0].command.operation.establish.tuple));
+    const selected = try plan.bindConflictTarget(alloc, &.{ "tenant", "email" }, &.{});
+    defer alloc.free(selected);
+    const addresses = try plan.conflictAddresses(alloc, selected, row);
+    defer {
+        for (addresses) |address| alloc.free(address.tuple);
+        alloc.free(addresses);
+    }
+    try std.testing.expectEqual(@as(usize, @intFromBool(not_distinct)), addresses.len);
+    if (not_distinct) try std.testing.expectEqualSlices(u8, first.commands[0].command.operation.establish.tuple, addresses[0].tuple);
+}
+
+test "SQL UNIQUE null clauses share distributed claims and conflict arbiters" {
+    for ([_]bool{ false, true }) |not_distinct| {
+        try sqlUniqueNullClaims(std.testing.allocator, not_distinct);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, sqlUniqueNullClaims, .{not_distinct});
+    }
+}
+
+test "SQL covering constraint integrity claims exclude payload columns" {
+    const a = std.testing.allocator;
+    var view = registry.SchemaView{ .epoch = try registry.Epoch.createCloned(a, .{
+        .version = 1,
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .column_type = .integer },
+            .{ .name = "label", .path = "label", .column_type = .string },
+        },
+    }) };
+    defer view.release();
+    var payload_name = "label".*;
+    var plan = try Plan.init(a, "items", view, &.{.{ .generation = @splat(7), .definition = .{ .name = "covered", .columns = &.{"id"}, .include_columns = &.{&payload_name} } }}, &.{});
+    defer plan.deinit();
+    @memset(&payload_name, 'x');
+    try std.testing.expectEqualStrings("label", plan.uniques[0].definition.include_columns[0]);
+    const inferred = try plan.bindConflictTarget(a, &.{"id"}, &.{});
+    defer a.free(inferred);
+    try std.testing.expectEqual(@as(usize, 1), inferred.len);
+    try std.testing.expectError(error.ConflictArbiterNotFound, plan.bindConflictTarget(a, &.{ "id", "label" }, &.{}));
+    var first_tuple: ?[]u8 = null;
+    defer if (first_tuple) |bytes| a.free(bytes);
+    for ([_][]const u8{ "before", "after" }) |label| {
+        const bytes = try codec.serializeOrdinal(a, view.version(), view.tableSchema().relational_columns, &.{
+            .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 1 } },
+            .{ .ordinal = 1, .path = "label", .value_type = .bytes_val, .value = .{ .bytes_val = label } },
+        }, @splat(0));
+        defer a.free(bytes);
+        const row = try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+        const addresses = try plan.conflictAddresses(a, inferred, row);
+        defer {
+            for (addresses) |address| a.free(address.tuple);
+            a.free(addresses);
+        }
+        try std.testing.expectEqual(@as(usize, 1), addresses.len);
+        if (first_tuple) |first| try std.testing.expectEqualSlices(u8, first, addresses[0].tuple) else first_tuple = try a.dupe(u8, addresses[0].tuple);
+    }
+}
+
 test "distributed txn partial unique integrity claims and SQL inference share typed membership proofs" {
     const alloc = std.testing.allocator;
     const schema = @import("../storage/schema.zig");
@@ -544,4 +699,56 @@ test "distributed txn partial unique integrity claims and SQL inference share ty
     defer enters_partial_index.deinit();
     try std.testing.expectEqual(@as(usize, 1), enters_partial_index.commands.len);
     try std.testing.expectEqual(@as(usize, 0), enters_partial_index.parents.len);
+}
+
+test "distributed txn NOT VALID history is separate from new-write and unchanged-key preparation" {
+    const a = std.testing.allocator;
+    const schema = @import("../storage/schema.zig");
+    const columns = [_]schema.RelationalColumn{.{ .name = "id", .path = "id", .column_type = .integer }};
+    var view = registry.SchemaView{ .epoch = try registry.Epoch.createCloned(a, .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns }) };
+    defer view.release();
+    const unique: native.UniqueConstraint = .{ .name = "pk", .columns = &.{"id"} };
+    const fk: native.ForeignKey = .{ .name = "fk", .child_columns = &.{"id"}, .parent_table = "parent", .parent_columns = &.{"id"}, .not_valid = true };
+    var plan = try Plan.init(a, "child", view, &.{}, &.{.{ .generation = @splat(2), .parent_generation = @splat(1), .definition = fk, .parent = view, .parent_unique = unique }});
+    defer plan.deinit();
+    const bytes = try codec.serializeOrdinal(a, 1, &columns, &.{.{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 9 } }}, @splat(0));
+    defer a.free(bytes);
+    const row = try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+    var ordinary = try plan.expand(a, &.{.{ .key = "c", .after = row }});
+    defer ordinary.deinit();
+    try std.testing.expect(ordinary.commands[0].command.operation == .attach);
+    var historical = try plan.expandHistorical(a, &.{.{ .key = "c", .after = row }});
+    defer historical.deinit();
+    try std.testing.expect(historical.commands[0].command.operation == .attach_historical);
+    var unchanged = try plan.expand(a, &.{.{ .key = "c", .before = row, .after = row }});
+    defer unchanged.deinit();
+    try std.testing.expectEqual(@as(usize, 0), unchanged.commands.len);
+    var deleted = try plan.expand(a, &.{.{ .key = "c", .before = row }});
+    defer deleted.deinit();
+    try std.testing.expect(deleted.commands[0].command.operation == .repair_detach);
+}
+
+test "SQL range temporal expansion derives canonical claims from projected JSON rows" {
+    const a = std.testing.allocator;
+    var view = registry.SchemaView{ .epoch = try registry.Epoch.createCloned(a, .{ .version = 0, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &.{
+        .{ .name = "sku", .path = "sku", .column_type = .string },
+        .{ .name = "valid_at", .path = "valid_at", .column_type = .numrange },
+    } }) };
+    defer view.release();
+    var plan = try Plan.init(a, "prices", view, &.{.{ .generation = @splat(7), .definition = .{ .name = "period_key", .columns = &.{ "sku", "valid_at" }, .without_overlaps_column = "valid_at" } }}, &.{});
+    defer plan.deinit();
+    var row = try @import("../storage/db/document_mapper.zig").PreparedRelationalProjection.init(a, "{\"sku\":\"sku:a\",\"valid_at\":\"[1,10)\"}", view.tableSchema().*, view.physicalLayout(), &.{ "sku", "valid_at" });
+    defer row.deinit();
+    var expanded = try plan.expand(a, &.{.{ .key = "row:1", .after = row.view }});
+    defer expanded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), expanded.commands.len);
+    const command = expanded.commands[0].command;
+    const claim = command.operation.establish_interval;
+    try std.testing.expectEqualStrings("prices", claim.parent_table);
+    try std.testing.expectEqualStrings("row:1", claim.parent_key);
+    const key = try claim.keyAlloc(a, command.address);
+    defer a.free(key);
+    const value = try claim.encode(a, command.address);
+    defer a.free(value);
+    _ = try @import("../storage/db/temporal_integrity_contract.zig").Claim.decode(key, value);
 }

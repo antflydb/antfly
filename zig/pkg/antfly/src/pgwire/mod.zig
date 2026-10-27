@@ -20,9 +20,13 @@ pub const Config = server.Config;
 pub const Server = server.Server;
 pub const start = server.start;
 
-test {
-    _ = @import("budget.zig");
-    _ = @import("values.zig");
-    _ = @import("protocol_test.zig");
-    _ = server;
+comptime {
+    if (@import("builtin").is_test) {
+        _ = @import("budget.zig");
+        _ = @import("values.zig");
+        _ = @import("copy_out.zig");
+        _ = @import("copy_in.zig");
+        _ = @import("protocol_test.zig");
+        _ = server;
+    }
 }

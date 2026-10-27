@@ -1,0 +1,262 @@
+{
+  "id": "sql-0736",
+  "source_setup": [
+    "CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text);",
+    "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;"
+  ],
+  "original_sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_user_id_fkey;",
+  "steps": [
+    {
+      "sql": "SELECT id::text,user_id FROM usage_records ORDER BY id",
+      "sqlstate": null,
+      "tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "id",
+          "user_id"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "missing"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "known"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT convalidated FROM pg_constraint WHERE conname='usage_records_user_id_fkey'",
+      "sqlstate": null,
+      "tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "convalidated"
+        ],
+        "column_oids": [
+          16
+        ],
+        "rows": [
+          [
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_user_id_fkey;",
+      "sqlstate": "23503",
+      "tag": null,
+      "output": null
+    },
+    {
+      "sql": "SELECT id::text,user_id FROM usage_records ORDER BY id",
+      "sqlstate": null,
+      "tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "id",
+          "user_id"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "missing"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "known"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT convalidated FROM pg_constraint WHERE conname='usage_records_user_id_fkey'",
+      "sqlstate": null,
+      "tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "convalidated"
+        ],
+        "column_oids": [
+          16
+        ],
+        "rows": [
+          [
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "UPDATE usage_records SET user_id='known' WHERE id='00000000-0000-0000-0000-000000000001'",
+      "sqlstate": null,
+      "tag": "UPDATE 1",
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_user_id_fkey;",
+      "sqlstate": null,
+      "tag": "ALTER TABLE",
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT id::text,user_id FROM usage_records ORDER BY id",
+      "sqlstate": null,
+      "tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "id",
+          "user_id"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "known"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "known"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT convalidated FROM pg_constraint WHERE conname='usage_records_user_id_fkey'",
+      "sqlstate": null,
+      "tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "convalidated"
+        ],
+        "column_oids": [
+          16
+        ],
+        "rows": [
+          [
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "INSERT INTO usage_records(id,user_id) VALUES('00000000-0000-0000-0000-000000000003','missing')",
+      "sqlstate": "23503",
+      "tag": null,
+      "output": null
+    },
+    {
+      "sql": "DELETE FROM users WHERE id='known'",
+      "sqlstate": "23503",
+      "tag": null,
+      "output": null
+    },
+    {
+      "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_user_id_fkey;",
+      "sqlstate": null,
+      "tag": "ALTER TABLE",
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT id::text,user_id FROM usage_records ORDER BY id",
+      "sqlstate": null,
+      "tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "id",
+          "user_id"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "known"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "known"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT convalidated FROM pg_constraint WHERE conname='usage_records_user_id_fkey'",
+      "sqlstate": null,
+      "tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "convalidated"
+        ],
+        "column_oids": [
+          16
+        ],
+        "rows": [
+          [
+            true
+          ]
+        ]
+      }
+    }
+  ],
+  "cast_labels": {
+    "columns": [
+      "id",
+      "id",
+      "id",
+      "lower",
+      "explicit_name"
+    ],
+    "column_oids": [
+      25,
+      25,
+      25,
+      25,
+      25
+    ],
+    "rows": [
+      [
+        "known",
+        "known",
+        "known",
+        "known",
+        "known"
+      ],
+      [
+        "spare",
+        "spare",
+        "spare",
+        "spare",
+        "spare"
+      ]
+    ]
+  }
+}

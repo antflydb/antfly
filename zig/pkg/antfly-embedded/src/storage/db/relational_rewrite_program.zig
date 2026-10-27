@@ -21,7 +21,7 @@ const transform = @import("relational_row_transform.zig");
 const staging = @import("restore_staging_contract.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const Allocator = std.mem.Allocator;
-pub const LogicalRow = struct { json: []u8, timestamp: u64, json_null_fields: []const []const u8 = &.{} };
+pub const LogicalRow = struct { json: []u8, timestamp: u64, json_null_fields: []const []const u8 = &.{}, packed_row: ?[]const u8 = null };
 
 /// Preserve the legacy digest for rows without provenance, while binding the
 /// extra SQL/JSON distinction whenever JSON reconstruction needs it.
@@ -78,7 +78,8 @@ pub const ProgramSet = struct {
 
     pub fn init(alloc: Allocator, source_schemas: []const []const u8, target_schema: []const u8, policies: transform.Policies) !ProgramSet {
         if (source_schemas.len == 0 or source_schemas.len > contract.max_source_schemas) return error.InvalidRestoreStagingCommand;
-        var bytes = target_schema.len;
+        var bytes = target_schema.len +| policies.expression_schema.len;
+        for (policies.column_transforms) |rule| bytes +|= rule.column.len +| rule.expression_json.len;
         for (source_schemas) |source| bytes = std.math.add(usize, bytes, source.len) catch return error.InvalidRestoreStagingCommand;
         if (bytes > contract.max_schema_bytes) return error.InvalidRestoreStagingCommand;
         const programs = try alloc.alloc(transform.Program, source_schemas.len);
@@ -109,7 +110,10 @@ pub const ProgramSet = struct {
         try intent.validate();
         var value = if (intent.preserve_document) try initDocumentPreservationWithRead(alloc, intent.target_schema, intent.target_read_schema) else try init(alloc, intent.source_schemas, intent.target_schema, .{
             .default_columns = intent.default_columns,
+            .default_clock_micros = intent.default_clock_micros,
             .dropped_columns = if (intent.allow_column_drops) .allow else .reject,
+            .expression_schema = intent.expression_schema,
+            .column_transforms = intent.column_transforms,
         });
         errdefer value.deinit();
         if (!std.mem.eql(u8, &value.identity, &intent.program_digest)) return error.RestoreStagingScopeChanged;
@@ -158,18 +162,29 @@ pub const ProgramSet = struct {
         }
     }
 
+    pub fn requiresMaterializedDefaults(self: *const ProgramSet) bool {
+        return self.programs.len != 0 and self.programs[0].requires_materialized_defaults;
+    }
+
     pub fn transformJson(self: *const ProgramSet, alloc: Allocator, row: []const u8) !LogicalRow {
+        return self.transformJsonPrepared(alloc, row, null, null);
+    }
+
+    pub fn transformJsonPrepared(self: *const ProgramSet, alloc: Allocator, row: []const u8, runtime: ?@import("../../schema/relational_expression.zig").PreparationRuntime, previous_target: ?[]const u8) !LogicalRow {
         if (self.document_validator != null) return error.InvalidRestoreStagingCommand;
         const version = try codec.rowSchemaVersion(row);
         const program = for (self.programs) |*candidate| {
             if (candidate.source.version() == version) break candidate;
         } else return error.UnknownSchemaVersion;
-        var result = try program.transform(alloc, row);
-        defer result.deinit(alloc);
+        var result = try program.transformPrepared(alloc, row, runtime, previous_target);
+        var retained = false;
+        defer if (!retained) result.deinit(alloc);
         const typed = try codec.ordinalRowViewSelective(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
         const json = try typed.reconstructValueAlloc(alloc);
         errdefer alloc.free(json);
-        return .{ .json = json, .timestamp = typed.writeTimestampNs(), .json_null_fields = try typed.jsonNullFieldsAlloc(alloc) };
+        const null_fields = try typed.jsonNullFieldsAlloc(alloc);
+        retained = self.requiresMaterializedDefaults();
+        return .{ .json = json, .timestamp = typed.writeTimestampNs(), .json_null_fields = null_fields, .packed_row = if (retained) result.packed_row else null };
     }
 
     pub fn preserveDocument(self: *const ProgramSet, alloc: Allocator, json: []const u8) ![]u8 {

@@ -633,6 +633,10 @@ fn openDocumentReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []cons
     return .{ .value = self.openDocumentReadSession(alloc, from_key, to_key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn openDocumentReadSessionAtSnapshot(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) engine.Outcome(*DB.DocumentReadSession) {
+    return .{ .value = self.openDocumentReadSessionAtSnapshot(alloc, from_key, to_key, opts, statement) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) engine.Outcome(*DB.RelationalReadSession) {
     return .{ .value = self.openRelationalReadSessionAtSnapshot(alloc, from_key, to_key, opts, statement) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -885,6 +889,14 @@ fn pinTransferablePrimarySnapshot(self: *DB) engine.Outcome(DB.TransferablePrima
 
 fn verifyTransferablePrimarySnapshot(self: *DB, namespace: [24]u8, receipt: ?db.OrderedApplyReceipt) engine.Outcome(void) {
     return .{ .value = self.verifyTransferablePrimarySnapshot(namespace, receipt) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn verifyTransferablePrimarySnapshotWithOrigin(self: *DB, namespace: [24]u8, receipt: ?db.OrderedApplyReceipt, origin: @import("db/native_backup.zig").Origin) engine.Outcome(void) {
+    return .{ .value = self.verifyTransferablePrimarySnapshotWithOrigin(namespace, receipt, origin) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn stepSchemaOwnerRowAudit(self: *DB, owner_group: u64, binding: @import("db/relational_schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("db/relational_rows.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../api/operation.zig").RequestContext) engine.Outcome(@import("db/relational_schema_audit_checkpoint.zig").Result) {
+    return .{ .value = self.stepSchemaOwnerRowAudit(owner_group, binding, inputs, budget, signing_root_dir, signing_root_incarnation, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn orderedMutationAlreadyApplied(self: *DB, identity: db.OrderedApplyReceipt) engine.Outcome(bool) {
@@ -1189,6 +1201,10 @@ fn runtimeStatusStatsConsistent(self: *DB, alloc: std.mem.Allocator) engine.Outc
 
 fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: std.mem.Allocator) engine.Outcome(?types.DBStats) {
     return .{ .value = self.runtimeStatusStatsConsistentIfAvailable(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runtimeStatusObservationConsistentIfAvailable(self: *DB, alloc: std.mem.Allocator) engine.Outcome(?DB.RuntimeStatusObservation) {
+    return .{ .value = self.runtimeStatusObservationConsistentIfAvailable(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: @import("db/doc_identity.zig").Namespace) engine.Outcome(void) {
@@ -2125,13 +2141,13 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v29", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v37", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v29", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v37", .visibility = .hidden });
     @export(&getCAllocator, .{ .name = "antfly_storage_engine_c_allocator_v1", .visibility = .hidden });
 }

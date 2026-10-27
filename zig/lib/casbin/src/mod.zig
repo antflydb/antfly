@@ -198,10 +198,24 @@ pub const MemoryAdapter = struct {
     fn addPolicies(ptr: *anyopaque, alloc: Allocator, rules: []const Rule) !void {
         const self: *MemoryAdapter = @ptrCast(@alignCast(ptr));
         _ = alloc;
+        var prepared: std.ArrayList(Rule) = .empty;
+        defer {
+            for (prepared.items) |*rule| rule.deinit(self.alloc);
+            prepared.deinit(self.alloc);
+        }
         for (rules) |rule| {
             if (self.contains(rule)) continue;
-            try self.rules.append(self.alloc, try rule.clone(self.alloc));
+            const duplicate = for (prepared.items) |prior| {
+                if (rulesEqual(prior, rule)) break true;
+            } else false;
+            if (duplicate) continue;
+            var owned = try rule.clone(self.alloc);
+            errdefer owned.deinit(self.alloc);
+            try prepared.append(self.alloc, owned);
         }
+        try self.rules.ensureUnusedCapacity(self.alloc, prepared.items.len);
+        self.rules.appendSliceAssumeCapacity(prepared.items);
+        prepared.clearRetainingCapacity();
     }
 
     fn removePolicies(ptr: *anyopaque, rules: []const Rule) !void {
@@ -296,7 +310,6 @@ pub const Enforcer = struct {
     }
 
     pub fn addNamedPolicies(self: *Enforcer, ptype: []const u8, rules: []const []const []const u8) !bool {
-        var added_any = false;
         var new_rules = std.ArrayList(Rule).empty;
         defer {
             for (new_rules.items) |*rule| rule.deinit(self.alloc);
@@ -304,19 +317,26 @@ pub const Enforcer = struct {
         }
 
         for (rules) |fields| {
-            const rule = try Rule.initOwned(self.alloc, ptype, fields);
-            if (self.contains(rule)) {
-                var owned = rule;
-                owned.deinit(self.alloc);
+            var rule = try Rule.initOwned(self.alloc, ptype, fields);
+            errdefer rule.deinit(self.alloc);
+            const duplicate = for (new_rules.items) |prior| {
+                if (rulesEqual(prior, rule)) break true;
+            } else false;
+            if (self.contains(rule) or duplicate) {
+                rule.deinit(self.alloc);
                 continue;
             }
-            try self.policies.append(self.alloc, try rule.clone(self.alloc));
             try new_rules.append(self.alloc, rule);
-            added_any = true;
         }
-
-        if (added_any and self.auto_save) try self.adapter.addPolicies(self.alloc, new_rules.items);
-        return added_any;
+        if (new_rules.items.len == 0) return false;
+        // Reserve all memory before crossing the durable adapter boundary.
+        // A failed save cannot publish a partial grant, and successful commit
+        // is followed only by infallible ownership transfer, not allocation.
+        try self.policies.ensureUnusedCapacity(self.alloc, new_rules.items.len);
+        if (self.auto_save) try self.adapter.addPolicies(self.alloc, new_rules.items);
+        self.policies.appendSliceAssumeCapacity(new_rules.items);
+        new_rules.clearRetainingCapacity();
+        return true;
     }
 
     pub fn removeFilteredPolicy(self: *Enforcer, field_index: usize, field_values: []const []const u8) !bool {
@@ -328,6 +348,11 @@ pub const Enforcer = struct {
     }
 
     pub fn removeFilteredNamedPolicy(self: *Enforcer, ptype: []const u8, field_index: usize, field_values: []const []const u8) !bool {
+        const present = for (self.policies.items) |rule| {
+            if (ruleMatchesFilter(rule, ptype, field_index, field_values)) break true;
+        } else false;
+        if (!present) return false;
+        if (self.auto_save) _ = try self.adapter.removeFilteredPolicy(ptype, field_index, field_values);
         var removed_any = false;
         var i: usize = 0;
         while (i < self.policies.items.len) {
@@ -339,7 +364,6 @@ pub const Enforcer = struct {
             _ = self.policies.swapRemove(i);
             removed_any = true;
         }
-        if (removed_any and self.auto_save) _ = try self.adapter.removeFilteredPolicy(ptype, field_index, field_values);
         return removed_any;
     }
 
@@ -595,6 +619,79 @@ test "enforcer remove filtered policy mirrors Go user deletion shape" {
     try std.testing.expect(try enforcer.removeFilteredPolicy(0, &.{"alice"}));
     try std.testing.expect(!(try enforcer.enforce("alice", "table", "docs", "read")));
     try std.testing.expect(try enforcer.enforce("bob", "table", "docs", "read"));
+}
+
+test "enforcer publishes grants and revocations only after durable adapter success" {
+    const alloc = std.testing.allocator;
+    const Failing = struct {
+        store: MemoryAdapter,
+        fail: bool = false,
+        fn load(ptr: *anyopaque, allocator: Allocator) ![]Rule {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.store.iface().loadPolicies(allocator);
+        }
+        fn add(ptr: *anyopaque, allocator: Allocator, rules: []const Rule) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.InjectedPolicyPersistenceFailure;
+            return self.store.iface().addPolicies(allocator, rules);
+        }
+        fn remove(ptr: *anyopaque, rules: []const Rule) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.InjectedPolicyPersistenceFailure;
+            return self.store.iface().removePolicies(rules);
+        }
+        fn filtered(ptr: *anyopaque, ptype: []const u8, index: usize, values: []const []const u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.InjectedPolicyPersistenceFailure;
+            return self.store.iface().removeFilteredPolicy(ptype, index, values);
+        }
+    };
+    var backing: Failing = .{ .store = MemoryAdapter.init(alloc) };
+    defer backing.store.deinit();
+    const raw =
+        \\[request_definition]
+        \\r = sub, typ, obj, act
+        \\[policy_definition]
+        \\p = sub, typ, obj, act
+        \\[role_definition]
+        \\g = _, _
+        \\[matchers]
+        \\m = g(r.sub, p.sub) && (r.typ == p.typ || p.typ == "*") && (r.obj == p.obj || p.obj == "*") && (r.act == p.act || p.act == "*")
+    ;
+    var enforcer = try Enforcer.init(alloc, try Model.fromString(alloc, raw), .{ .ptr = &backing, .vtable = &.{ .load_policies = Failing.load, .add_policies = Failing.add, .remove_policies = Failing.remove, .remove_filtered_policy = Failing.filtered } });
+    defer enforcer.deinit();
+    enforcer.enableAutoSave(true);
+    _ = try enforcer.addPolicy(&.{ "reader", "table", "docs", "read" });
+    _ = try enforcer.addNamedPolicy("g", &.{ "alice", "reader" });
+    backing.fail = true;
+    try std.testing.expectError(error.InjectedPolicyPersistenceFailure, enforcer.addNamedPolicies("g", &.{ &.{ "bob", "reader" }, &.{ "carol", "reader" } }));
+    try std.testing.expectEqual(@as(usize, 2), enforcer.policies.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backing.store.rules.items.len);
+    try std.testing.expect(!try enforcer.enforce("bob", "table", "docs", "read"));
+    try std.testing.expectError(error.InjectedPolicyPersistenceFailure, enforcer.removeFilteredGroupingPolicy(0, &.{"alice"}));
+    try std.testing.expect(try enforcer.enforce("alice", "table", "docs", "read"));
+    backing.fail = false;
+    _ = try enforcer.addNamedPolicies("g", &.{ &.{ "bob", "reader" }, &.{ "bob", "reader" } });
+    try std.testing.expectEqual(@as(usize, 3), enforcer.policies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), backing.store.rules.items.len);
+    try std.testing.expect(try enforcer.removeFilteredGroupingPolicy(0, &.{"alice"}));
+    try std.testing.expect(!try enforcer.enforce("alice", "table", "docs", "read"));
+    try std.testing.expectEqual(@as(usize, 2), backing.store.rules.items.len);
+}
+
+test "memory policy adapter preserves a complete preimage at every batch allocation failure" {
+    const Trial = struct {
+        fn run(alloc: Allocator) !void {
+            var adapter = MemoryAdapter.init(alloc);
+            defer adapter.deinit();
+            adapter.iface().addPolicies(alloc, &.{ .{ .ptype = @constCast("g"), .fields = @constCast(&[_][]u8{ @constCast("alice"), @constCast("reader") }) }, .{ .ptype = @constCast("g"), .fields = @constCast(&[_][]u8{ @constCast("bob"), @constCast("reader") }) } }) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), adapter.rules.items.len);
+                return err;
+            };
+            try std.testing.expectEqual(@as(usize, 2), adapter.rules.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Trial.run, .{});
 }
 
 test "enforcer returns Go-shaped permission tuples" {

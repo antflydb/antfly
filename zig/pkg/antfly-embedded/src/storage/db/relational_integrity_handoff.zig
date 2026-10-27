@@ -93,8 +93,8 @@ fn contains(manifest: Manifest, key: []const u8) bool {
 }
 
 /// Source producer runs under the source apply fence and verifies its durable
-/// topology fence/drain separately before opening this current cursor. Three
-/// bounded prefix seeks visit only the transferred logical range, not every
+/// topology fence/drain separately before opening this current cursor. Bounded
+/// prefix seeks visit only the transferred logical range, not every
 /// claim/reference in the source table when splitting a small tail range.
 pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest, progress: Progress) !Page {
     try requireRange(manifest.lower, manifest.upper);
@@ -104,13 +104,14 @@ pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest,
     defer cursor.close();
     var records: std.ArrayList(Record) = .empty;
     var bytes: usize = 0;
-    var next_buf: [integrity.key_len + 32]u8 = undefined;
+    var next_buf: std.ArrayList(u8) = .empty;
+    defer next_buf.deinit(alloc);
     var next: []const u8 = progress.cursor;
     var exhausted = true;
     const resuming_retirements = std.mem.startsWith(u8, progress.cursor, generation_retirement.active_prefix);
     const resuming_admissions = std.mem.startsWith(u8, progress.cursor, generation_admission.prefix);
     const initial_kind = if (progress.cursor.len != 0 and !resuming_retirements and !resuming_admissions) (try integrity.parseKey(progress.cursor)).kind else integrity.Kind.claim;
-    outer: for ([_]integrity.Kind{ .claim, .reference, .job }) |kind| {
+    outer: for ([_]integrity.Kind{ .claim, .reference, .job, .interval }) |kind| {
         if (resuming_retirements or resuming_admissions) break;
         if (@backingInt(kind) < @backingInt(initial_kind)) continue;
         var prefix: [integrity.namespace.len + 1]u8 = undefined;
@@ -137,8 +138,9 @@ pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest,
             bytes += size;
             _ = try integrity.validateTransferRecord(entry.key, entry.value);
             try records.append(alloc, .{ .key = try alloc.dupe(u8, entry.key), .value = try alloc.dupe(u8, entry.value) });
-            @memcpy(next_buf[0..entry.key.len], entry.key);
-            next = next_buf[0..entry.key.len];
+            try next_buf.resize(alloc, entry.key.len);
+            @memcpy(next_buf.items, entry.key);
+            next = next_buf.items[0..entry.key.len];
         }
     }
     if (exhausted and !resuming_retirements) {
@@ -161,8 +163,9 @@ pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest,
             }
             bytes += size;
             try records.append(alloc, .{ .key = try alloc.dupe(u8, entry.key), .value = try alloc.dupe(u8, entry.value) });
-            @memcpy(next_buf[0..entry.key.len], entry.key);
-            next = next_buf[0..entry.key.len];
+            try next_buf.resize(alloc, entry.key.len);
+            @memcpy(next_buf.items, entry.key);
+            next = next_buf.items[0..entry.key.len];
         }
     }
     if (exhausted) {
@@ -185,8 +188,9 @@ pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest,
             }
             bytes += size;
             try records.append(alloc, .{ .key = try alloc.dupe(u8, entry.key), .value = try alloc.dupe(u8, entry.value) });
-            @memcpy(next_buf[0..entry.key.len], entry.key);
-            next = next_buf[0..entry.key.len];
+            try next_buf.resize(alloc, entry.key.len);
+            @memcpy(next_buf.items, entry.key);
+            next = next_buf.items[0..entry.key.len];
         }
     }
     return .{ .sequence = std.math.add(u64, progress.sequence, 1) catch return error.IntegrityHandoffTooLarge, .previous_digest = progress.digest, .after = try alloc.dupe(u8, progress.cursor), .next_cursor = try alloc.dupe(u8, next), .records = try records.toOwnedSlice(alloc), .exhausted = exhausted };
@@ -255,7 +259,7 @@ pub fn apply(alloc: Allocator, txn: anytype, fence: topology.Fence, command: Com
             try saveProgress(alloc, txn, .{ .manifest_digest = hash(raw_manifest) });
         },
         .page => |page| {
-            if (page.records.len > max_records or page.after.len > integrity.key_len + 32 or page.next_cursor.len > integrity.key_len + 32) return error.IntegrityRecordTooLarge;
+            if (page.records.len > max_records or page.after.len > @import("temporal_integrity_contract.zig").max_key_bytes or page.next_cursor.len > @import("temporal_integrity_contract.zig").max_key_bytes) return error.IntegrityRecordTooLarge;
             var admission_bytes: usize = 0;
             for (page.records) |record| {
                 const size = try recordBudgetBytes(record.key, record.value.len);
@@ -307,6 +311,7 @@ pub fn apply(alloc: Allocator, txn: anytype, fence: topology.Fence, command: Com
             // can refer to an action job sorted after all reference records.
             // Each retry verifies one bounded cursor page, never a full scan.
             if (state.value.ready) return;
+            const transfer_view = try integrity.TransferView.init(txn);
             var cursor = try txn.openCursor();
             var cursor_closed = false;
             defer if (!cursor_closed) cursor.close();
@@ -318,7 +323,8 @@ pub fn apply(alloc: Allocator, txn: anytype, fence: topology.Fence, command: Com
             var verified_bytes: usize = 0;
             var verified_parents: std.AutoHashMapUnmanaged([integrity.key_len]u8, void) = .empty;
             defer verified_parents.deinit(alloc);
-            var next_buf: [integrity.key_len + 32]u8 = undefined;
+            var next_buf: std.ArrayList(u8) = .empty;
+            defer next_buf.deinit(alloc);
             var next = state.value.verification_cursor;
             state.value.ready = true;
             while (item) |entry| : (item = try cursor.next()) {
@@ -334,9 +340,11 @@ pub fn apply(alloc: Allocator, txn: anytype, fence: topology.Fence, command: Com
                 const parent = try verified_parents.getOrPut(alloc, parsed_key.address.claimKey());
                 if (parent.found_existing and parsed_key.kind == .reference) {
                     _ = try integrity.validateTransferRecord(entry.key, entry.value);
-                } else try integrity.validateTransferredCompanions(txn, entry.key, entry.value);
-                @memcpy(next_buf[0..entry.key.len], entry.key);
-                next = next_buf[0..entry.key.len];
+                    try transfer_view.validateCompanion(txn, parsed_key, @splat(0));
+                } else try integrity.validateTransferredCompanionsWithScratch(alloc, txn, entry.key, entry.value, transfer_view);
+                try next_buf.resize(alloc, entry.key.len);
+                @memcpy(next_buf.items, entry.key);
+                next = next_buf.items[0..entry.key.len];
                 inspected += 1;
             }
             state.value.verification_cursor = next;

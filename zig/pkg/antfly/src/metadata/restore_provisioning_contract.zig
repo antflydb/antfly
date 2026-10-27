@@ -42,6 +42,7 @@ pub const SourceArtifact = struct {
 
 pub const ProvisioningProjection = struct {
     pub const InitialFkOwner = struct {
+        catalog_coverage: @import("antfly_local_sources").schema_relational_declarations.CatalogCoverage = .legacy,
         plan_id: [16]u8,
         plan_digest: [32]u8,
         child_table_id: u64,
@@ -51,6 +52,17 @@ pub const ProvisioningProjection = struct {
         schema_digest: [32]u8,
         public_schema_json_digest: [32]u8,
         catalog_digest: [32]u8,
+
+        pub fn jsonStringify(self: InitialFkOwner, writer: anytype) !void {
+            try writer.beginObject();
+            inline for (@typeInfo(InitialFkOwner).@"struct".field_names) |field| {
+                if (!std.mem.eql(u8, field, "catalog_coverage") or self.catalog_coverage != .legacy) {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            }
+            try writer.endObject();
+        }
     };
     tables: []records.TableRecord,
     ranges: []records.RangeRecord,

@@ -27,6 +27,10 @@ const Allocator = std.mem.Allocator;
 pub const prefix = "\x00\x00__metadata__:relational_index_retired:";
 const max_cursor = 1024 * 1024;
 pub const max_pending_generations: usize = 2 * catalog.max_index_count;
+// One extra generation may be queued by the sole canceled private owner job.
+// Its exact intent, burned binding and durable admission marker guard retries;
+// ordinary churn cannot consume this cancellation-only headroom.
+pub const max_total_pending_generations: usize = max_pending_generations + 1;
 
 /// Admission is bounded independently of table size. The caller's catalog
 /// transaction owns the queue decision and its insertions atomically. Refuse
@@ -101,8 +105,56 @@ fn decodeProgress(id: records.Id, value: []const u8) !Progress {
 }
 
 pub const Page = struct {
+    /// Fixed leader selection. Replay owns the same interval/count rather
+    /// than treating the follower's clock as part of the replicated command.
+    pub const Replay = struct {
+        pub const max_wire_bytes = 9 * 1024 * 1024;
+        pub const max_progress_bytes = 40 + max_cursor;
+        binding: @import("relational_index_owner_job.zig").Binding,
+        expected: []const u8,
+        next: ?[]const u8,
+        records_scanned: u16,
+
+        pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            try @import("relational_integrity_json.zig").write(self, stream);
+        }
+
+        pub fn validate(self: @This()) !void {
+            _ = try self.binding.encode();
+            if (self.binding.authority != .raft or self.binding.phase != .reserved or self.records_scanned > 256) return error.InvalidRelationalIndexGcProgress;
+            const before = try decodeProgress(self.binding.index, self.expected);
+            if (self.next) |bytes| {
+                const after = try decodeProgress(self.binding.index, bytes);
+                if (before.phase == after.phase) {
+                    if (self.records_scanned == 0 or std.mem.order(u8, after.after, before.after) != .gt) return error.InvalidRelationalIndexGcProgress;
+                } else if (before.phase != .forward or after.phase != .ownership or after.after.len != 0) return error.InvalidRelationalIndexGcProgress;
+            } else if (before.phase != .ownership) return error.InvalidRelationalIndexGcProgress;
+        }
+
+        pub fn applied(self: @This(), txn: anytype) !bool {
+            try self.validate();
+            const owner_jobs = @import("relational_index_owner_job.zig");
+            _ = try owner_jobs.requireCancellationCleanup(txn, self.binding);
+            const raw = txn.get(&key(self.binding.index)) catch |err| {
+                if (err != error.NotFound) return err;
+                try owner_jobs.requireCancellationArtifactsRetired(txn, self.binding);
+                return true;
+            };
+            if (std.mem.eql(u8, raw, self.expected)) return false;
+            const current = try decodeProgress(self.binding.index, raw);
+            const after = try decodeProgress(self.binding.index, self.next orelse return error.VersionConflict);
+            if (current.phase == .ownership and after.phase == .forward) return true;
+            if (current.phase == after.phase and std.mem.order(u8, current.after, after.after) != .lt) return true;
+            return error.VersionConflict;
+        }
+
+        pub fn requireApplied(self: @This(), txn: anytype) !void {
+            if (!try self.applied(txn)) return error.VersionConflict;
+        }
+    };
+
     arena: std.heap.ArenaAllocator,
-    pinned: catalog.WriteSnapshot,
+    pinned: ?catalog.WriteSnapshot,
     namespace: u64,
     owner: [32]u8,
     id: records.Id,
@@ -113,31 +165,71 @@ pub const Page = struct {
     consumed: bool = false,
 
     pub fn deinit(self: *Page) void {
-        self.pinned.deinit();
+        if (self.pinned) |*value| value.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
 
     pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype) !?Page {
+        return prepareSelected(alloc, io, core, null, null);
+    }
+
+    /// Cancellation must not wait behind the unrelated public retirement queue.
+    /// Selection is a point lookup; scanning retains the same bounded engine.
+    pub fn prepareGeneration(alloc: Allocator, io: ?std.Io, core: anytype, id: records.Id) !?Page {
+        return prepareSelected(alloc, io, core, id, null);
+    }
+
+    pub fn command(self: *const Page, binding: @import("relational_index_owner_job.zig").Binding) !Replay {
+        if (binding.index.mapKey() != self.id.mapKey()) return error.PrivateIndexOwnerJobChanged;
+        const result: Replay = .{ .binding = binding, .expected = self.expected, .next = self.next, .records_scanned = @intCast(self.records_scanned) };
+        try result.validate();
+        return result;
+    }
+
+    pub fn prepareReplay(alloc: Allocator, io: ?std.Io, core: anytype, replay: Replay) !?Page {
+        try replay.validate();
+        return prepareSelected(alloc, io, core, replay.binding.index, replay);
+    }
+
+    fn prepareSelected(alloc: Allocator, io: ?std.Io, core: anytype, selected: ?records.Id, replay: ?Replay) !?Page {
         if (io) |runtime| try runtime.checkCancel();
         const namespace = core.schemaNamespaceGeneration();
-        var pinned = core.relational_indexes.acquire() orelse return null;
+        // No published indexes is a valid pinned state, not an empty queue.
+        // Private cancellation and dropping the last public index both need
+        // retirement while this controller is absent. stage() CASes absence
+        // as well as the namespace generation and durable owner preimage.
+        var pinned = core.relational_indexes.acquire();
         var owned = true;
-        defer if (owned) pinned.deinit();
+        defer if (owned) {
+            if (pinned) |*value| value.deinit();
+        };
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer if (owned) arena.deinit();
         const page_alloc = arena.allocator();
         var read = try core.store.beginReadTxn();
         defer read.abort();
+        if (replay) |fixed| if (try fixed.applied(&read)) return null;
         const owner = try jobs.ownership(&read);
         var cursor = try read.openCursor();
         defer cursor.close();
-        const pending = (try cursor.seekAtOrAfter(prefix)) orelse return null;
-        if (!std.mem.startsWith(u8, pending.key, prefix)) return null;
-        const id = try records.Id.decode(pending.key[prefix.len..]);
-        for (pinned.plan.boundIndexes()) |index| if (index.id().mapKey() == id.mapKey())
+        const Selection = struct { id: records.Id, value: []const u8 };
+        const pending: Selection = if (selected) |id| blk: {
+            const value = read.get(&key(id)) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            break :blk .{ .id = id, .value = value };
+        } else blk: {
+            const entry = (try cursor.seekAtOrAfter(prefix)) orelse return null;
+            if (!std.mem.startsWith(u8, entry.key, prefix)) return null;
+            break :blk .{ .id = try records.Id.decode(entry.key[prefix.len..]), .value = entry.value };
+        };
+        const id = pending.id;
+        if (pinned) |value| for (value.plan.boundIndexes()) |index| if (index.id().mapKey() == id.mapKey())
             return error.ActiveRelationalIndexRetirement;
         const expected = try page_alloc.dupe(u8, pending.value);
+        if (replay) |fixed| if (!std.mem.eql(u8, fixed.expected, expected)) return error.VersionConflict;
         const progress = try decodeProgress(id, expected);
         const after = progress.after;
         const forward_prefix = try records.forwardPrefix(id);
@@ -147,12 +239,14 @@ pub const Page = struct {
         var scanned: usize = 0;
         var bytes: usize = 0;
         var exhausted = true;
-        const started = time.monotonicNs();
+        const started = if (replay == null) time.monotonicNs() else 0;
+        const expect_eof = if (replay) |fixed| if (fixed.next) |value| (try decodeProgress(id, value)).phase != progress.phase else true else false;
         const lower: []const u8 = if (progress.phase == .forward) &forward_prefix else &ownership_prefix;
         var entry = try cursor.seekAtOrAfter(if (after.len == 0) lower else after);
         while (entry) |kv| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, kv.key, lower)) break;
             if (after.len != 0 and std.mem.order(u8, kv.key, after) != .gt) continue;
+            if (replay) |fixed| if (scanned == fixed.records_scanned) return error.InvalidRelationalIndexGcProgress;
             if (io) |runtime| try runtime.checkCancel();
             if (kv.key.len > max_cursor) return error.ResourceBudgetExceeded;
             next = try page_alloc.dupe(u8, kv.key);
@@ -167,41 +261,58 @@ pub const Page = struct {
             }
             scanned += 1;
             bytes +|= next.len;
-            if (scanned >= 256 or bytes >= 1024 * 1024 or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) {
+            if (replay) |fixed| {
+                if (scanned == fixed.records_scanned and !expect_eof) {
+                    exhausted = false;
+                    break;
+                }
+                if (scanned >= 256 or bytes >= 1024 * 1024) return error.InvalidRelationalIndexGcProgress;
+            } else if (scanned >= 256 or bytes >= 1024 * 1024 or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) {
                 exhausted = false;
                 break;
             }
         }
         const continuation = if (!exhausted) try encode(page_alloc, id, progress.phase, next) else if (progress.phase == .forward) try encode(page_alloc, id, .ownership, "") else null;
+        if (replay) |fixed| {
+            if (scanned != fixed.records_scanned or (continuation == null) != (fixed.next == null)) return error.InvalidRelationalIndexGcProgress;
+            if (continuation) |value| if (!std.mem.eql(u8, value, fixed.next.?)) return error.InvalidRelationalIndexGcProgress;
+        }
         owned = false;
         return .{ .arena = arena, .pinned = pinned, .namespace = namespace, .owner = owner, .id = id, .expected = expected, .next = continuation, .deletes = deletes.items, .records_scanned = scanned };
     }
 
     /// Caller owns apply-exclusive and the snapshot/hot-standby mutation leases.
     pub fn commit(self: *Page, core: anytype) !void {
-        if (self.consumed) return error.RelationalIndexPageConsumed;
-        self.consumed = true;
-        if (core.schemaNamespaceGeneration() != self.namespace or !core.relational_indexes.isCurrent(self.pinned))
-            return error.PreparedGenerationChanged;
         var manager = try core.initTxnManager();
         defer manager.deinit();
         try manager.checkOrdinaryWriteConflict(&maintenance.controlKey(self.id));
         var txn = try core.store.beginWriteTxn();
         errdefer txn.abort();
-        if (!std.mem.eql(u8, &self.owner, &(try jobs.ownership(&txn)))) return error.PreparedGenerationChanged;
+        try self.stage(core, &txn);
+        try txn.commit();
+    }
+
+    /// Compose deletion with the caller's authority checks in one transaction.
+    /// Caller owns apply-exclusive, checks maintenance intent conflicts before
+    /// opening the writer, and aborts the transaction on every staging error.
+    pub fn stage(self: *Page, core: anytype, txn: anytype) !void {
+        if (self.consumed) return error.RelationalIndexPageConsumed;
+        self.consumed = true;
+        if (core.schemaNamespaceGeneration() != self.namespace or !core.relational_indexes.isCurrent(self.pinned))
+            return error.PreparedGenerationChanged;
+        if (!std.mem.eql(u8, &self.owner, &(try jobs.ownership(txn)))) return error.PreparedGenerationChanged;
         const record_key = key(self.id);
         const actual = txn.get(&record_key) catch |err| switch (err) {
             error.NotFound => return error.PreparedGenerationChanged,
             else => return err,
         };
         if (!std.mem.eql(u8, self.expected, actual)) return error.PreparedGenerationChanged;
-        for (self.deletes) |item| try remove(&txn, item);
+        for (self.deletes) |item| try remove(txn, item);
         if (self.next) |continuation| try txn.put(&record_key, continuation) else {
-            try remove(&txn, &jobs.progressKey(self.id));
-            try remove(&txn, &maintenance.controlKey(self.id));
+            try remove(txn, &jobs.progressKey(self.id));
+            try remove(txn, &maintenance.controlKey(self.id));
             try txn.delete(&record_key);
         }
-        try txn.commit();
     }
 };
 

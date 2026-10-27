@@ -112,7 +112,20 @@ pub const RequestDiagnostics = struct {
     }
 };
 
+pub const RowPolicyIntegrityRead = struct {
+    pub const Proof = struct { token: []const u8, database: []const u8 };
+    ptr: *anyopaque,
+    authorize: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?Proof,
+};
+
 pub const RequestContext = struct {
+    /// Borrowed preparation broker; never serialized or invoked by Raft apply.
+    column_sequences: ?@import("../system_catalog/column_sequences.zig").Provider = null,
+    /// Captured by the authenticated SQL transaction owner, never decoded
+    /// from public request JSON. Shared by normalization and FK cascades.
+    sql_transaction_micros: ?i64 = null,
+    /// Private coordinator capability; never serialized or accepted publicly.
+    row_policy_integrity_read: ?RowPolicyIntegrityRead = null,
     /// Native service admission only; never reconstructed from user input.
     native_service: ?@import("../common/service_ownership.zig").Owner = null,
     /// Granted only after administrator authentication by a trusted native
@@ -128,6 +141,12 @@ pub const RequestContext = struct {
     /// Internal body-bound authorization for fenced FK schema publication.
     /// Never accepted from public SQL or a client-provided catalog payload.
     fk_generation_publication_authority: bool = false,
+    /// Granted by authenticated, body-bound internal index-owner reads only.
+    /// Never reconstructed from a public SQL or serialized request payload.
+    index_publication_authority: bool = false,
+    /// Body-bound internal schema-validation owner reads. Never derived from
+    /// setting administrator/index-owner grants or serialized request fields.
+    schema_validation_authority: bool = false,
     /// Set only by the administrator-authorized relational recovery routes.
     relational_recovery: enum { none, repair, retry, retire } = .none,
     relational_retirement_target: ?[]const u8 = null,

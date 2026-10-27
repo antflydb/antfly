@@ -36,6 +36,8 @@ const Plan = struct {
     relation: ?[]const u8 = null,
     join_kind: ?[]const u8 = null,
     index: ?[]const u8 = null,
+    index_selection: ?[]const u8 = null,
+    declared_indexes: ?[]const []const u8 = null,
     source_format: ?[]const u8 = null,
     snapshot_mode: ?[]const u8 = null,
     table_id: ?u64 = null,
@@ -44,6 +46,13 @@ const Plan = struct {
     functions: ?[]const []const u8 = null,
     plans: []Plan = &.{},
 };
+
+fn declaredIndexes(alloc: Allocator, table: catalog.Table) !?[]const []const u8 {
+    if (table.external_base_source != null or table.index_definitions.len == 0) return null;
+    const names = try alloc.alloc([]const u8, table.index_definitions.len);
+    for (names, table.index_definitions) |*name, definition| name.* = definition.name;
+    return names;
+}
 
 fn wrap(alloc: Allocator, name: []const u8, child: Plan) !Plan {
     return .{ .node_type = name, .plans = try alloc.dupe(Plan, &.{child}) };
@@ -132,6 +141,7 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
         .prepared_rows => .{ .node_type = "Prepared Mutation Images" },
         .recursive_ref => .{ .node_type = "Recursive Reference" },
         .outer_ref => .{ .node_type = "Outer Reference" },
+        .unnest => |function| .{ .node_type = "Unnest", .plans = try alloc.dupe(Plan, &.{try relationPlan(alloc, bound, function.source, verbose, depth + 1, remaining)}) },
         .apply => |apply| blk: {
             const source: Plan = .{ .node_type = if (apply.demand != null) "Masked Apply" else "Lateral Apply", .join_kind = @tagName(apply.kind), .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, apply.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, apply.right, verbose, depth + 1, remaining) }) };
             var functions: std.ArrayList([]const u8) = .empty;
@@ -146,7 +156,9 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
             const source = bound.scans[scan.index];
             break :blk .{
                 .source_ordinal = scan.index,
-                .node_type = if (source.table.external_base_source != null) "Lake Scan" else if (source.request.index_equality != null) "Index Scan" else "Table Scan",
+                .node_type = if (source.table.external_base_source != null) "Lake Scan" else if (source.request.index_equality != null) "Index Scan" else if (source.table.index_definitions.len != 0) "Native Table Access" else "Table Scan",
+                .index_selection = if (source.table.external_base_source == null and source.request.index_equality == null and source.table.index_definitions.len != 0) "snapshot-local" else null,
+                .declared_indexes = if (source.request.index_equality == null) try declaredIndexes(alloc, source.table) else null,
                 .source_format = if (verbose) if (source.table.external_base_source) |lake| @tagName(lake.binding.format) else null else null,
                 .snapshot_mode = if (verbose) if (source.table.external_base_source) |lake| @tagName(lake.binding.snapshot_mode) else null else null,
                 .relation = try displayName(alloc, source.table),
@@ -197,6 +209,8 @@ fn statementPlan(alloc: Allocator, statement: ast.Statement, bound: describe.Bou
         try alloc.dupe(Plan, &.{.{
             .source_ordinal = 0,
             .node_type = if (table.external_base_source != null) "Lake Scan" else "Native Table Access",
+            .index_selection = if (table.external_base_source == null and table.index_definitions.len != 0) "snapshot-local" else null,
+            .declared_indexes = try declaredIndexes(alloc, table),
             .source_format = if (verbose) if (table.external_base_source) |lake| @tagName(lake.binding.format) else null else null,
             .snapshot_mode = if (verbose) if (table.external_base_source) |lake| @tagName(lake.binding.snapshot_mode) else null else null,
             .relation = try displayName(alloc, table),
@@ -251,6 +265,15 @@ fn appendText(alloc: Allocator, out: *std.ArrayList(u8), plan: Plan, depth: usiz
     if (plan.join_kind) |kind| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " ({s})", .{kind}));
     if (plan.relation) |name| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " on {s}", .{name}));
     if (plan.index) |name| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " using {s}", .{name}));
+    if (plan.index_selection) |selection| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [index selection: {s}]", .{selection}));
+    if (plan.declared_indexes) |names| {
+        try out.appendSlice(alloc, " [declared indexes:");
+        for (names) |name| {
+            try out.append(alloc, ' ');
+            try out.appendSlice(alloc, name);
+        }
+        try out.append(alloc, ']');
+    }
     if (plan.schema_version) |version| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [schema {d}]", .{version}));
     if (plan.source_format) |format| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [format {s}]", .{format}));
     if (plan.snapshot_mode) |mode| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [snapshot {s}]", .{mode}));
@@ -291,13 +314,76 @@ fn captureEstimates(a: Allocator, backend: catalog.Backend, bound: describe.Boun
         estimatePlan(plan, metadata, scans);
     } else estimatePlan(plan, &.{}, scans_input);
 }
-pub fn renderMeasured(alloc: Allocator, explanation: @FieldType(ast.Statement, "explain"), bound: describe.BoundStatement, profile: ?*const @import("execution_profile.zig").Profile, backend: catalog.Backend, parameters: []const std.json.Value) ![]const u8 {
+pub const RenderContext = struct {
+    planning_ns: ?u64 = null,
+    preparation_peak_bytes: ?usize = null,
+    memory_bytes: usize = 0,
+    scan_rows: usize = 0,
+    scan_pages: usize = 0,
+    batch_rows: usize = 0,
+};
+pub fn renderMeasured(alloc: Allocator, explanation: ast.Explain, bound: describe.BoundStatement, profile: ?*const @import("execution_profile.zig").Profile, backend: catalog.Backend, parameters: []const std.json.Value) ![]const u8 {
+    return renderMeasuredWithContext(alloc, explanation, bound, profile, backend, parameters, .{});
+}
+pub fn renderMeasuredWithContext(alloc: Allocator, explanation: ast.Explain, bound: describe.BoundStatement, profile: ?*const @import("execution_profile.zig").Profile, backend: catalog.Backend, parameters: []const std.json.Value, context: RenderContext) ![]const u8 {
+    const clock = if (explanation.summaryEnabled()) backend.execution_io else null;
+    const started = if (clock) |io| std.Io.Clock.awake.now(io) else null;
     var plan = try statementPlan(alloc, explanation.statement.*, bound, explanation.verbose);
-    if (explanation.costs) try captureEstimates(alloc, backend, bound, parameters, &plan);
-    if (explanation.format == .json) return std.json.Stringify.valueAlloc(alloc, .{ .plan_version = 1, .plan_kind = "logical", .planning_only = !explanation.analyze, .Plan = plan, .cost_model = if (explanation.costs) cost.model else null, .runtime = profile }, .{});
+    if (explanation.costs and explanation.statement.* == .select) try captureEstimates(alloc, backend, bound, parameters, &plan);
+    const planning_ns: ?u64 = if (started) |start| @as(u64, @intCast(@max(0, start.durationTo(std.Io.Clock.awake.now(clock.?)).toNanoseconds()))) +| (context.planning_ns orelse 0) else context.planning_ns;
+    // Never disclose policy values, credentials, definer/session identity or
+    // arbitrary application GUCs through a plan. Report the real execution
+    // limits and the authorized immutable settings epoch used for this query.
+    const settings = if (explanation.settings) .{
+        .scope = "effective execution limits; setting values and identities excluded",
+        .catalog_epoch = if (backend.settings_view) |view| @as(?u64, view.epoch) else null,
+        .memory_bytes = context.memory_bytes,
+        .scan_rows = context.scan_rows,
+        .scan_pages = context.scan_pages,
+        .execution_batch_rows = context.batch_rows,
+    } else null;
+    const options = .{ .analyze = explanation.analyze, .verbose = explanation.verbose, .costs = explanation.costs, .buffers = explanation.buffersEnabled(), .timing = explanation.timingEnabled(), .summary = explanation.summaryEnabled(), .settings = explanation.settings, .wal = explanation.wal };
+    if (explanation.format == .json) return std.json.Stringify.valueAlloc(alloc, .{ .plan_version = 2, .plan_kind = "logical", .planning_only = !explanation.analyze, .Plan = plan, .cost_model = if (explanation.costs) cost.model else null, .runtime = profile, .options = options, .settings = settings, .planning_time_ns = if (explanation.summaryEnabled()) planning_ns else null, .planning_buffers = if (explanation.buffersEnabled() and !explanation.analyze) .{ .scope = "binding and immutable preparation peak bytes", .retained_peak_bytes = context.preparation_peak_bytes, .storage_read_bytes = @as(?u64, null) } else null }, .{});
     var out: std.ArrayList(u8) = .empty;
     try appendText(alloc, &out, plan, 0);
     if (explanation.costs) try out.appendSlice(alloc, "Cost units are logical work, not predicted time. Unknown statistics remain null.\n");
-    if (profile) |measured| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Runtime: {d} result rows; elapsed_ns={?d}; retained_peak_bytes={?d}\n", .{ measured.result_rows, measured.elapsed_ns, measured.retained_peak_bytes }));
+    if (profile) |measured| {
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Execution: {d} result rows\n", .{measured.result_rows}));
+        for (measured.nodes.items) |node| {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "  {s}: rows={d} calls={d}", .{ node.node_type, node.rows, node.calls }));
+            if (explanation.timingEnabled()) try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " elapsed_ns={?d}", .{node.elapsed_ns}));
+            try out.appendSlice(alloc, "\n");
+        }
+        if (explanation.summaryEnabled()) try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Runtime: {d} result rows; elapsed_ns={?d}\n", .{ measured.result_rows, measured.elapsed_ns }));
+        if (explanation.buffersEnabled()) try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "SQL buffers: retained_peak_bytes={?d}; spill_written_bytes={?d}; provider storage I/O unavailable\n", .{ measured.retained_peak_bytes, measured.spill_written_bytes }));
+        if (explanation.wal) try out.appendSlice(alloc, "Journal: provider counters unavailable\n");
+    }
+    if (explanation.summaryEnabled()) try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Planning: elapsed_ns={?d}\n", .{planning_ns}));
+    if (settings) |value| {
+        try out.appendSlice(alloc, "Settings: ");
+        try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(alloc, value, .{}));
+        try out.appendSlice(alloc, "\n");
+    }
     return out.toOwnedSlice(alloc);
+}
+
+test "SQL EXPLAIN distinguishes declared indexes from snapshot-local physical choice" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const statement: ast.Statement = .{ .select = .{} };
+    const bound: describe.BoundStatement = .{
+        .table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{}, .index_definitions = &.{.{ .name = "email_key", .keys = &.{}, .include_columns = &.{}, .where = &.{} }} },
+        .action = .read,
+        .columns = &.{},
+        .parameter_types = &.{},
+        .json_literals = .empty,
+    };
+    const text = try renderMeasured(a, .{ .statement = &statement, .costs = false }, bound, null, undefined, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, text, "index selection: snapshot-local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "declared indexes: email_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Index Scan") == null);
+    const json = try renderMeasured(a, .{ .statement = &statement, .format = .json, .costs = false }, bound, null, undefined, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"index_selection\":\"snapshot-local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"declared_indexes\":[\"email_key\"]") != null);
 }

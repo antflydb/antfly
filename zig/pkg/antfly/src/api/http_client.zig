@@ -298,6 +298,221 @@ pub const EmptyResponse = struct {
     pub fn deinit(_: *EmptyResponse, _: std.mem.Allocator) void {}
 };
 
+test "private index claim client requires service credentials preserves binary values and never replays conflicts" {
+    const alloc = std.testing.allocator;
+    const execution = @import("relational_index_owner_execution.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        status: u16 = 200,
+        failure: []const u8 = "UniqueConstraintViolation",
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            const budget = try std.fmt.parseUnsigned(u32, request.header(execution.claim_remaining_ms_header).?, 10);
+            try std.testing.expect(budget > 0 and budget <= execution.max_claim_budget_ms);
+            try std.testing.expectEqual(budget, request.timeout_ms);
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/groups/7/tables/docs/relational-index-claims"));
+            var parsed = try std.json.parseFromSlice(execution.ClaimRequest, a, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("key\x00\xff", parsed.value.claims[0].tuple);
+            return .{ .status = self.status, .body = try a.dupe(u8, if (self.status == 200) "{\"acknowledged\":{}}" else self.failure) };
+        }
+    };
+    var fixture: Fixture = .{};
+    var client = ApiHttpClient.init(alloc, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
+    const request: execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "key\x00\xff", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };
+    try std.testing.expectError(error.Unauthorized, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    _ = client.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "test");
+    var result = try client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{});
+    defer result.deinit();
+    try std.testing.expect(result.value == .acknowledged);
+    fixture.status = 409;
+    try std.testing.expectError(error.UniqueConstraintViolation, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    fixture.status = 501;
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
+    fixture.status = 503;
+    fixture.failure = "InvalidPrivateIndexClaimReceipt";
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
+    fixture.status = 409;
+    fixture.failure = "PrivateIndexOwnerJobChanged";
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
+    try std.testing.expectError(error.GenerationPublicationChanged, client.fetchRelationalIndexClaims("http://owner", 8, "docs", request, .{}));
+    try std.testing.expectEqual(@as(usize, 5), fixture.calls);
+}
+
+test "private index control client authenticates scope bounds budgets and never retries owner effects" {
+    const alloc = std.testing.allocator;
+    const execution = @import("relational_index_owner_execution.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        status: u16 = 200,
+        body: []const u8 = "{\"acknowledged\":{}}",
+        operation: @FieldType(execution.Request, "operation") = .fence,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            const budget = try std.fmt.parseUnsigned(u32, request.header(execution.control_remaining_ms_header).?, 10);
+            try std.testing.expect(budget > 0 and budget <= execution.max_claim_budget_ms);
+            try std.testing.expectEqual(budget, request.timeout_ms);
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/groups/7/tables/docs/relational-index-control"));
+            var parsed = try std.json.parseFromSlice(execution.Request, a, request.body, .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            try std.testing.expectEqual(self.operation, parsed.value.operation);
+            try parsed.value.validate(7);
+            return .{ .status = self.status, .body = try a.dupe(u8, self.body) };
+        }
+    };
+    var fixture: Fixture = .{};
+    var client = ApiHttpClient.init(alloc, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
+    var request: execution.Request = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .operation = .fence };
+    try std.testing.expectError(error.Unauthorized, client.fetchRelationalIndexControl("http://owner", 7, "docs", request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    _ = client.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "test");
+    inline for (.{ .fence, .reserve }) |action| {
+        request.operation = action;
+        fixture.operation = action;
+        var result = try client.fetchRelationalIndexControl("http://owner", 7, "docs", request, .{});
+        defer result.deinit();
+        try std.testing.expect(result.value == .acknowledged);
+    }
+    fixture.status = 409;
+    fixture.body = "PrivateIndexOwnerJobChanged";
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, client.fetchRelationalIndexControl("http://owner", 7, "docs", request, .{}));
+    fixture.status = 503;
+    fixture.body = "InvalidPrivateIndexNativeReceipt";
+    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, client.fetchRelationalIndexControl("http://owner", 7, "docs", request, .{}));
+    fixture.status = 200;
+    fixture.body = "{\"acknowledged\":{},\"authority\":true}";
+    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, client.fetchRelationalIndexControl("http://owner", 7, "docs", request, .{}));
+    fixture.body = "";
+    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, client.fetchRelationalIndexControl("http://owner", 7, "docs", request, .{}));
+    fixture.status = 501;
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, client.fetchRelationalIndexControl("http://owner", 7, "docs", request, .{}));
+    try std.testing.expectError(error.GenerationPublicationChanged, client.fetchRelationalIndexControl("http://owner", 8, "docs", request, .{}));
+    try std.testing.expectError(error.DeadlineExceeded, client.fetchRelationalIndexControl("http://owner", 7, "docs", request, .{ .deadline_ns = 0 }));
+    try std.testing.expectEqual(@as(usize, 7), fixture.calls);
+}
+
+/// Borrowed immutable routing for one delivery attempt. Metadata/owner receivers
+/// recheck authority; a cached URI is never a permission or a physical binding.
+pub const RelationalIndexDeliveryTransport = struct {
+    api: *ApiHttpClient,
+    metadata: *@import("../metadata/http_client.zig").MetadataHttpClient,
+    metadata_uri: []const u8,
+    endpoints: []const Endpoint,
+    pub const Endpoint = struct { group_id: u64, uri: []const u8 };
+
+    pub fn init(api: *ApiHttpClient, metadata: *@import("../metadata/http_client.zig").MetadataHttpClient, metadata_uri: []const u8, endpoints: []const Endpoint, cohort: *const @import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.delivery.Cohort) !RelationalIndexDeliveryTransport {
+        const result: RelationalIndexDeliveryTransport = .{ .api = api, .metadata = metadata, .metadata_uri = metadata_uri, .endpoints = endpoints };
+        try result.validate(cohort);
+        return result;
+    }
+
+    pub fn validate(self: RelationalIndexDeliveryTransport, cohort: *const @import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.delivery.Cohort) !void {
+        if (self.metadata_uri.len == 0 or self.metadata_uri.len > 8192 or self.endpoints.len != cohort.targets.len) return error.InvalidGenerationPublication;
+        var previous: u64 = 0;
+        for (self.endpoints) |entry| {
+            if (entry.group_id <= previous or entry.uri.len == 0 or entry.uri.len > 8192) return error.InvalidGenerationPublication;
+            previous = entry.group_id;
+        }
+        for (cohort.targets) |target| _ = try self.endpoint(target.owner.group_id);
+    }
+    fn endpoint(self: *const RelationalIndexDeliveryTransport, group: u64) ![]const u8 {
+        var lower: usize = 0;
+        var upper = self.endpoints.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            const value = self.endpoints[middle];
+            if (value.group_id == group) return value.uri;
+            if (value.group_id < group) lower = middle + 1 else upper = middle;
+        }
+        return error.PrivateIndexOwnerJobChanged;
+    }
+    pub fn control(self: *RelationalIndexDeliveryTransport, _: std.mem.Allocator, table: []const u8, request: @import("relational_index_owner_execution.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ControlResponse) {
+        return self.api.fetchRelationalIndexControl(try self.endpoint(request.group_id), request.group_id, table, request, context);
+    }
+    pub fn claims(self: *RelationalIndexDeliveryTransport, _: std.mem.Allocator, table: []const u8, request: @import("relational_index_owner_execution.zig").ClaimRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ClaimResponse) {
+        return self.api.fetchRelationalIndexClaims(try self.endpoint(request.group_id), request.group_id, table, request, context);
+    }
+    pub fn systemCatalog(self: *RelationalIndexDeliveryTransport, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        if (!context.index_publication_authority) return error.Forbidden;
+        const control_budget: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse return error.InvalidGenerationPublication, .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        const status = switch (call) {
+            .relational_index_source_accept_status => |query| try self.metadata.relationalIndexSourceAcceptanceStatus(self.metadata_uri, query, try control_budget.remainingTimeoutMs(), &cancellation),
+            .relational_index_source_accept => |request| try self.metadata.acceptRelationalIndexSourceControlled(self.metadata_uri, request, try control_budget.remainingTimeoutMs(), &cancellation),
+            .relational_index_source_complete => |request| try self.metadata.completeRelationalIndexSourceControlled(self.metadata_uri, request, try control_budget.remainingTimeoutMs(), &cancellation),
+            else => return error.InvalidGenerationPublication,
+        };
+        return std.json.Stringify.valueAlloc(alloc, status, .{});
+    }
+};
+
+test "relational index publication delivery transport uses typed metadata status and bounded owner routing" {
+    const alloc = std.testing.allocator;
+    const journal = @import("../metadata/relational_index_delivery_journal.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            if (!std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog")) {
+                try std.testing.expect(std.mem.endsWith(u8, request.uri, "/groups/7/tables/items/relational-index-control"));
+                return .{ .status = 200, .body = try a.dupe(u8, "{\"acknowledged\":{}}") };
+            }
+            var call = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, a, request.body, .{});
+            defer call.deinit();
+            try std.testing.expect(call.value == .relational_index_source_accept_status and !call.value.isMutation());
+            try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
+            var response: http_common.HttpResponse = .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, journal.Status{ .query = call.value.relational_index_source_accept_status, .head = null }, .{}) };
+            errdefer response.deinit(a);
+            const headers = try a.alloc(http_common.Header, 2);
+            var initialized: usize = 0;
+            errdefer {
+                for (headers[0..initialized]) |*header| header.deinit(a);
+                a.free(headers);
+            }
+            const names = [_][]const u8{ "x-antfly-catalog-metadata-group", "x-antfly-catalog-metadata-incarnation" };
+            const values = [_][]const u8{ "13", "11111111111111111111111111111111" };
+            for (headers, names, values) |*header, name, value| {
+                const owned_name = try a.dupe(u8, name);
+                errdefer a.free(owned_name);
+                header.* = .{ .name = owned_name, .value = try a.dupe(u8, value) };
+                initialized += 1;
+            }
+            response.headers = headers;
+            return response;
+        }
+    };
+    var fixture: Fixture = .{};
+    const executor: http_common.RequestExecutor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } };
+    var api = ApiHttpClient.init(alloc, executor);
+    _ = api.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "delivery");
+    var metadata = @import("../metadata/http_client.zig").MetadataHttpClient.init(alloc, executor);
+    _ = metadata.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "delivery");
+    _ = metadata.withSettingAuthority("delivery-read-secret", "delivery");
+    const jobs = @import("antfly_local_sources").storage_db_relational_index_owner_job;
+    var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .ordinal = 0, .group_id = 7, .namespace = .{ .table_id = 101, .shard_id = 7, .range_id = 7 }, .authority = .native, .fence_digest = @splat(3) }, .start = "", .end = "" }});
+    defer cohort.deinit();
+    var transport = try RelationalIndexDeliveryTransport.init(&api, &metadata, "http://metadata", &.{.{ .group_id = 7, .uri = "http://owner" }}, &cohort);
+    try transport.validate(&cohort);
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, transport.endpoint(8));
+    var producer = try @import("relational_index_delivery_producer.zig").Producer.init(alloc, &cohort, "items", .{ .table_id = 101, .group_id = 7, .id = @splat(1), .operation = .source }, .{ .deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s });
+    defer producer.deinit();
+    _ = try producer.step(&transport, &transport);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    const idle = try producer.step(&transport, &transport);
+    try std.testing.expect(idle == .idle);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
 pub const ApiHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
@@ -505,30 +720,47 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !LookupResponse {
-        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", "", null, null, false);
+        return self.fetchGroupLookupWithOptions(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, .{});
     }
 
-    pub fn fetchGroupLookupWithMode(
-        self: *ApiHttpClient,
-        base_uri: []const u8,
-        group_id: u64,
-        table_name: []const u8,
-        key: []const u8,
-        fields: ?[]const u8,
-        read_consistency: []const u8,
-        timeout_ms: ?u32,
-        cancellation: ?*const http_common.RequestCancellation,
-        relational_integrity_catalog: bool,
-        relational_integrity_action: bool,
-        relational_integrity_jobs_json: []const u8,
-        relational_activation_json: []const u8,
-        relational_index_status_json: []const u8,
-        relational_topology_json: []const u8,
-        group_source_query_json: []const u8,
-        restore_staging_scope: ?[32]u8,
-        restore_staging_plan_id: ?[16]u8,
-        include_primary_digest: bool,
-    ) !LookupResponse {
+    pub const GroupLookupOptions = struct {
+        relational_integrity_catalog: bool = false,
+        relational_integrity_action: bool = false,
+        relational_integrity_jobs_json: []const u8 = "",
+        relational_activation_json: []const u8 = "",
+        relational_index_status_json: []const u8 = "",
+        relational_topology_json: []const u8 = "",
+        group_source_query_json: []const u8 = "",
+        restore_staging_scope: ?[32]u8 = null,
+        restore_staging_plan_id: ?[16]u8 = null,
+        include_primary_digest: bool = false,
+        row_policy_principal_proof: []const u8 = "",
+        row_policy_database: []const u8 = "",
+    };
+
+    pub fn fetchGroupLookupWithOptions(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, key: []const u8, fields: ?[]const u8, read_consistency: []const u8, timeout_ms: ?u32, cancellation: ?*const http_common.RequestCancellation, options: GroupLookupOptions) !LookupResponse {
+        const relational_integrity_catalog = options.relational_integrity_catalog;
+        const relational_integrity_action = options.relational_integrity_action;
+        const relational_integrity_jobs_json = options.relational_integrity_jobs_json;
+        const relational_activation_json = options.relational_activation_json;
+        const relational_index_status_json = options.relational_index_status_json;
+        const relational_topology_json = options.relational_topology_json;
+        const group_source_query_json = options.group_source_query_json;
+        const restore_staging_scope = options.restore_staging_scope;
+        const restore_staging_plan_id = options.restore_staging_plan_id;
+        const include_primary_digest = options.include_primary_digest;
+        const authority = @import("../usermgr/mod.zig").row_policy_authority;
+        if ((options.row_policy_principal_proof.len == 0) != (options.row_policy_database.len == 0) or
+            options.row_policy_principal_proof.len > authority.maximum_token_bytes or
+            options.row_policy_database.len > authority.maximum_name_bytes or
+            (options.row_policy_principal_proof.len != 0 and !db_mod.types.supportsIntegrityReadProof(include_primary_digest, relational_integrity_jobs_json))) return error.InvalidArgument;
+        for (options.row_policy_principal_proof) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != ':' and byte != '.' and byte != '-' and byte != '_') return error.InvalidArgument;
+        const policy_database = if (options.row_policy_principal_proof.len != 0) try percentEncodePathComponent(self.alloc, options.row_policy_database) else null;
+        defer if (policy_database) |value| self.alloc.free(value);
+        const policy_headers = [_]http_common.RequestHeader{
+            .{ .name = authority.principal_header, .value = options.row_policy_principal_proof },
+            .{ .name = authority.database_header, .value = policy_database orelse "" },
+        };
         // Group lookups are also used for routed derived-artifact hydration.
         // Those storage keys are binary and contain namespace bytes and NUL
         // component terminators, so every externally represented component
@@ -567,7 +799,11 @@ pub const ApiHttpClient = struct {
                 encoded_consistency,
             });
         defer self.alloc.free(suffix);
-        const jobs = if (relational_integrity_jobs_json.len != 0) try percentEncodePathComponent(self.alloc, relational_integrity_jobs_json) else "";
+        // Keep bounded control batches out of URI/header limits. The same
+        // routed read-index lookup accepts its control JSON as a POST body.
+        const body_control = relational_integrity_jobs_json.len > 1024;
+        if (relational_integrity_jobs_json.len > @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes) return error.InvalidArgument;
+        const jobs = if (relational_integrity_jobs_json.len != 0 and !body_control) try percentEncodePathComponent(self.alloc, relational_integrity_jobs_json) else "";
         defer if (jobs.len != 0) self.alloc.free(jobs);
         const activation = if (relational_activation_json.len != 0) try percentEncodePathComponent(self.alloc, relational_activation_json) else "";
         defer if (activation.len != 0) self.alloc.free(activation);
@@ -598,8 +834,11 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
-            .method = .GET,
+            .method = if (body_control) .POST else .GET,
             .uri = uri,
+            .body = if (body_control) relational_integrity_jobs_json else "",
+            .content_type = if (body_control) "application/json" else null,
+            .headers = if (options.row_policy_principal_proof.len != 0) &policy_headers else &.{},
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
         });
@@ -764,7 +1003,7 @@ pub const ApiHttpClient = struct {
         switch (response.status) {
             200 => {},
             400, 409 => return error.RestoreStagingScopeChanged,
-            422 => return error.BackupIntegrityFailure,
+            422 => return @import("restore_source_errors.zig").decodeOwnerFailure(self.alloc, response.body),
             413 => return error.InvalidBackupRequest,
             408, 504 => return error.Timeout,
             404, 503 => return error.RestoreValidationPending,
@@ -840,6 +1079,117 @@ pub const ApiHttpClient = struct {
 
     pub fn fetchFkGenerationSource(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").SourceReceipt, routes.Routes.fk_generation_source_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    /// Owned physical progress; no automatic retry or build-completion ACK.
+    pub fn fetchRelationalIndexClaims(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_index_owner_execution.zig").ClaimRequest, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ClaimResponse) {
+        return self.fetchRelationalIndexOwner(true, base_uri, group_id, table_name, request, input_context);
+    }
+
+    pub fn fetchRelationalIndexControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_index_owner_execution.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ControlResponse) {
+        return self.fetchRelationalIndexOwner(false, base_uri, group_id, table_name, request, input_context);
+    }
+
+    pub const SchemaPreparationResponse = struct {
+        alloc: std.mem.Allocator,
+        transport: http_common.HttpResponse,
+        value: @import("schema_validation_preparation.zig").Response,
+
+        pub fn deinit(self: *@This()) void {
+            self.transport.deinit(self.alloc);
+            self.* = undefined;
+        }
+    };
+
+    pub fn fetchSchemaValidationPreparation(self: *ApiHttpClient, base_uri: []const u8, group: u64, table: []const u8, request: @import("schema_validation_preparation.zig").Request, input: @import("antfly_local_sources").api_operation.RequestContext) !SchemaPreparationResponse {
+        const preparation = @import("schema_validation_preparation.zig");
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group);
+        if (self.internal_service == null) return error.Unauthorized;
+        const name = try percentEncodePathComponent(self.alloc, table);
+        defer self.alloc.free(name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group, routes.Routes.tables_prefix, name, routes.Routes.schema_validation_prepare_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > preparation.max_request_bytes) return error.TransactionTooLarge;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse platform_time.monotonicNs() +| preparation.max_budget_ms * std.time.ns_per_ms, .cancellation = context.cancellation };
+        const remaining = @min(preparation.max_budget_ms, try control.remainingTimeoutMs());
+        var buffer: [20]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&buffer, "{d}", .{remaining});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining, .cancellation = &cancellation, .max_response_bytes = preparation.max_response_bytes, .headers = &.{.{ .name = preparation.remaining_ms_header, .value = budget }} });
+        errdefer response.deinit(self.alloc);
+        if (response.body.len > preparation.max_response_bytes) return error.InvalidSchemaValidationJob;
+        switch (response.status) {
+            200 => {},
+            401, 403 => return error.Unauthorized,
+            400 => return error.InvalidSchemaValidationJob,
+            409 => return error.SchemaValidationJobChanged,
+            413 => return error.TransactionTooLarge,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.GenerationAdmissionPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const content_type = response.content_type orelse response.header("content-type") orelse return error.InvalidSchemaValidationJob;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t"), "application/octet-stream")) return error.InvalidSchemaValidationJob;
+        const value = try preparation.decode(response.body);
+        try value.requireFor(group, request);
+        return .{ .alloc = self.alloc, .transport = response, .value = value };
+    }
+
+    fn fetchRelationalIndexOwner(self: *ApiHttpClient, comptime claims: bool, base_uri: []const u8, group_id: u64, table_name: []const u8, request: if (claims) @import("relational_index_owner_execution.zig").ClaimRequest else @import("relational_index_owner_execution.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(if (claims) @import("relational_index_owner_execution.zig").ClaimResponse else @import("relational_index_owner_execution.zig").ControlResponse) {
+        const execution = @import("relational_index_owner_execution.zig");
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        const invalid_receipt = if (claims) error.InvalidPrivateIndexClaimReceipt else error.InvalidPrivateIndexNativeReceipt;
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        if (self.internal_service == null) return error.Unauthorized;
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, if (claims) routes.Routes.relational_index_claims_suffix else routes.Routes.relational_index_control_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > (if (claims) native.max_claim_wire_bytes else execution.max_control_request_bytes)) return error.TransactionTooLarge;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        const remaining_ms = @min(execution.max_claim_budget_ms, try control.remainingTimeoutMs());
+        var budget_buffer: [20]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&budget_buffer, "{d}", .{remaining_ms});
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        const max_response_bytes: usize = if (claims) (if (request.closure != null) @import("../metadata/relational_index_source_delivery.zig").max_wire_bytes else 32 * 1024) else if (request.operation == .source) native.SourceWire.max_wire_bytes + 4096 else 32 * 1024;
+        var response = self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining_ms, .cancellation = &cancellation, .max_response_bytes = max_response_bytes, .headers = &.{.{ .name = if (claims) execution.claim_remaining_ms_header else execution.control_remaining_ms_header, .value = budget }} }) catch |err| switch (err) {
+            error.ResponseTooLarge => return invalid_receipt,
+            else => return err,
+        };
+        defer response.deinit(self.alloc);
+        if (response.body.len > max_response_bytes) return invalid_receipt;
+        if (execution.claimHttpFailure(response.status, response.body)) |err| return err;
+        switch (response.status) {
+            200 => {},
+            401, 403 => return error.Unauthorized,
+            413 => return error.TransactionTooLarge,
+            501 => return error.UnsupportedNativeIndexOwner,
+            409 => return error.GenerationPublicationChanged,
+            400 => return error.InvalidGenerationPublication,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.GenerationAdmissionPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        if (response.body.len == 0) return invalid_receipt;
+        var parsed = std.json.parseFromSlice(if (claims) execution.ClaimResponse else execution.ControlResponse, self.alloc, response.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return switch (err) {
+            error.OutOfMemory => err,
+            else => invalid_receipt,
+        };
+        errdefer parsed.deinit();
+        try parsed.value.validate(request);
+        return parsed;
     }
 
     pub fn fetchFkInitialChild(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
@@ -4178,6 +4528,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (@import("relational_integrity_errors.zig").decode(body)) |reason| return reason;
     if (std.mem.eql(u8, body, "DocumentArtifactPublicationFailed")) return error.DocumentArtifactPublicationFailed;
     if (std.mem.eql(u8, body, "IndexGenerationMismatch")) return error.IndexGenerationMismatch;
     if (std.mem.eql(u8, body, "DecisionConflict") or std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
@@ -4480,10 +4831,11 @@ fn consumerTests() type {
         test "api http client distinguishes invalid restore sources from retryable owners" {
             const Executor = struct {
                 status: u16 = 422,
-                fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                body: []const u8 = "",
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.restore_owner_suffix));
-                    return .{ .status = self.status };
+                    return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
                 }
             };
             var executor: Executor = .{};
@@ -4493,6 +4845,13 @@ fn consumerTests() type {
                 .scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 11, .range_id = 11 }, .target_namespace = .{ .table_id = 2, .shard_id = 22, .range_id = 22 }, .target_schema_digest = @splat(4) },
             };
             try std.testing.expectError(error.BackupIntegrityFailure, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+            executor.body = "{\"protocol\":\"restore-owner-error-v1\",\"code\":\"constraint_validation_failed\"}";
+            try std.testing.expectError(error.ConstraintActivationFailed, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+            for ([_][]const u8{ "{\"code\":\"constraint_validation_failed\"}", "{\"protocol\":\"v2\",\"code\":\"constraint_validation_failed\"}", "{\"protocol\":\"restore-owner-error-v1\",\"code\":\"OutOfMemory\"}", "restore source integrity validation failed" }) |body| {
+                executor.body = body;
+                try std.testing.expectError(error.BackupIntegrityFailure, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+            }
+            executor.body = "";
             executor.status = 503;
             try std.testing.expectError(error.RestoreValidationPending, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
             executor.status = 408;
@@ -4839,6 +5198,30 @@ fn consumerTests() type {
                 "title,owner&admin",
             );
             defer response.deinit(std.testing.allocator);
+        }
+
+        test "api http client temporal probes use bounded bodies and preserve constraint rejection" {
+            const Executor = struct {
+                expected: []const u8,
+                fail: bool = false,
+                fn execute(raw: *anyopaque, a: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(req.uri.len < 512);
+                    try std.testing.expect(std.mem.indexOf(u8, req.uri, "_relational_integrity_jobs") == null);
+                    try std.testing.expectEqualStrings(self.expected, req.body);
+                    return .{ .status = if (self.fail) 409 else 200, .body = try a.dupe(u8, if (self.fail) "TemporalOverlapViolation" else "{\"validated\":true}") };
+                }
+            };
+            const input = try std.testing.allocator.alloc(u8, 8192);
+            defer std.testing.allocator.free(input);
+            @memset(input, ' ');
+            var fixture: Executor = .{ .expected = input };
+            var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fixture, .vtable = &.{ .execute = Executor.execute } });
+            var result = try client.fetchGroupLookupWithOptions("http://node", 7, "products", "group", null, "read_index", null, null, .{ .relational_integrity_jobs_json = input });
+            defer result.deinit(std.testing.allocator);
+            fixture.fail = true;
+            try std.testing.expectError(error.TemporalOverlapViolation, client.fetchGroupLookupWithOptions("http://node", 7, "products", "group", null, "read_index", null, null, .{ .relational_integrity_jobs_json = input }));
         }
 
         test "api http client preserves retryable group transaction unavailability" {

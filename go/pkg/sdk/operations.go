@@ -638,8 +638,9 @@ func (c *AntflyClient) LookupKeyWithFields(ctx context.Context, tableName, key, 
 
 // SQLExecutionError preserves SQLSTATE and an optional native reconciliation receipt.
 type SQLExecutionError struct {
-	StatusCode int
-	Diagnostic SQLDiagnostic
+	StatusCode     int
+	Diagnostic     SQLDiagnostic
+	CatalogReceipt *SQLCatalogOperationReceipt
 }
 
 func (e *SQLExecutionError) Error() string {
@@ -706,6 +707,54 @@ func (c *AntflyClient) ClosePreparedSQL(ctx context.Context, preparedID string, 
 	return err
 }
 
+// GetSQLCatalogOperation observes a retained operation; it never replays DDL.
+func (c *AntflyClient) GetSQLCatalogOperation(ctx context.Context, recoveryToken string) (*SQLCatalogOperationReceipt, error) {
+	if len(recoveryToken) == 0 || len(recoveryToken) > 8192 {
+		return nil, fmt.Errorf("SQL recovery token must contain 1..8192 bytes")
+	}
+	resp, err := c.client.GetSQLCatalogOperation(ctx, SQLCatalogRecoveryRequest{RecoveryToken: recoveryToken})
+	if err != nil {
+		return nil, err
+	}
+	body, err := readSQLResourceResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result SQLCatalogOperationReceipt
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decoding SQL catalog receipt: %w", err)
+	}
+	if !validSQLCatalogReceipt(result) || result.RecoveryToken != recoveryToken {
+		return nil, fmt.Errorf("invalid SQL catalog receipt")
+	}
+	return &result, nil
+}
+
+func validSQLCatalogReceipt(receipt SQLCatalogOperationReceipt) bool {
+	if receipt.Kind != "sequence" || receipt.Name == "" || receipt.Database == "" || receipt.Namespace == "" || len(receipt.RecoveryToken) == 0 || len(receipt.RecoveryToken) > 8192 {
+		return false
+	}
+	for _, value := range []string{receipt.ObjectId, receipt.Generation, receipt.CatalogRevision} {
+		if value != "" {
+			parsed, err := strconv.ParseUint(value, 10, 64)
+			if err != nil || strconv.FormatUint(parsed, 10) != value {
+				return false
+			}
+		}
+	}
+	switch receipt.Operation {
+	case "create", "alter", "rename", "drop":
+	default:
+		return false
+	}
+	switch receipt.State {
+	case "committed", "rejected", "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
 func readSQLResourceResponse(resp *http.Response) ([]byte, error) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
@@ -714,6 +763,16 @@ func readSQLResourceResponse(resp *http.Response) ([]byte, error) {
 			return nil, fmt.Errorf("reading SQL diagnostic: %w", err)
 		}
 		var diagnostic SQLDiagnostic
+		var result SQLResponse
+		if !truncated && json.Unmarshal(body, &result) == nil && validSQLCatalogReceipt(result.CatalogReceipt) {
+			receipt := result.CatalogReceipt
+			diagnostic = receipt.Diagnostic
+			if len(diagnostic.Code) != 5 || diagnostic.Message == "" {
+				diagnostic = SQLDiagnostic{Code: "40003", Message: "SQL catalog outcome is unknown; observe the recovery token without replaying DDL", Retryable: false}
+			}
+			diagnostic.Retryable = false
+			return nil, &SQLExecutionError{StatusCode: resp.StatusCode, Diagnostic: diagnostic, CatalogReceipt: &receipt}
+		}
 		if !truncated && json.Unmarshal(body, &diagnostic) == nil && len(diagnostic.Code) == 5 && diagnostic.Message != "" {
 			return nil, &SQLExecutionError{StatusCode: resp.StatusCode, Diagnostic: diagnostic}
 		}

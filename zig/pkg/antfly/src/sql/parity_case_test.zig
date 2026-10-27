@@ -74,7 +74,7 @@ test "SQL physical column qualification validates pinned namespace and alias bou
         defer compiled.deinit();
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        try std.testing.expectError(error.UndefinedColumn, sources.sql_describe.bind(arena.allocator(), backend, &compiled, &.{}));
+        try std.testing.expectError(error.UndefinedTable, sources.sql_describe.bind(arena.allocator(), backend, &compiled, &.{}));
     }
     for ([_][]const u8{ "SELECT a.b.c.d.e FROM items", "SELECT a.b.c.d.* FROM items" }) |sql|
         try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(std.testing.allocator, sql, .{}));
@@ -213,12 +213,39 @@ test "SQL exact corpus lookup owns parameters and rejects malformed identities" 
         try std.testing.expectError(error.UnknownParityCase, corpus.get(id));
 }
 
+test "SQL newly admitted historical UNNEST rejections remain unqualified" {
+    var corpus = try fixtures.Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0834", "sql-0835", "sql-0879", "sql-0880" }) |id| {
+        const case = try corpus.get(id);
+        // Preserve the immutable source expectation. Grammar admission does
+        // not prove document mappings, native indexes, or execution parity.
+        try std.testing.expectEqualStrings("rejection", case.source_expectation);
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(compiled.statement == .select);
+        try std.testing.expect(compiled.statement.select.source.?.* == .join);
+        try std.testing.expect(compiled.statement.select.source.?.join.right.* == .unnest);
+    }
+}
+
+test "SQL historical document patch rejections require runtime qualification" {
+    var corpus = try fixtures.Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0904", "sql-0905", "sql-0906" }) |id| {
+        const case = try corpus.get(id);
+        try std.testing.expectEqualStrings("rejection", case.source_expectation);
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(compiled.statement == .update);
+    }
+}
+
 test "SQL exact original rejection contracts fail before backend access" {
     var corpus = try fixtures.Corpus.init(std.testing.allocator);
     defer corpus.deinit();
     const cases = [_]struct { id: []const u8, expected: compiler.Error }{
-        .{ .id = "sql-0378", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0382", .expected = error.UnsupportedSqlShape },
+        .{ .id = "sql-0382", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0672", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0673", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0699", .expected = error.InvalidSqlSyntax },
@@ -228,50 +255,28 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-0703", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0776", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0777", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0780", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0781", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0782", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0783", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0784", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0785", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0786", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0781", .expected = error.SqlInvalidParameterValue },
+        .{ .id = "sql-0782", .expected = error.SqlInvalidParameterValue },
+        .{ .id = "sql-0785", .expected = error.SqlInvalidParameterValue },
+        .{ .id = "sql-0786", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0787", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0788", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0789", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0790", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0791", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0792", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0793", .expected = error.UnsupportedSqlShape },
+        .{ .id = "sql-0793", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0794", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0795", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0796", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0834", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0835", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0839", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0840", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0841", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0842", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0843", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0844", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0845", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0879", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0880", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0892", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0904", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0905", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0906", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1034", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1035", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1036", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1037", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1038", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1039", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1040", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1041", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1042", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1043", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1045", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1046", .expected = error.UnsupportedSqlShape },
+        .{ .id = "sql-0839", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0840", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0841", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0842", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0843", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0844", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0845", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0892", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-1183", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1184", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1193", .expected = error.InvalidSqlSyntax },
@@ -291,20 +296,37 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-1213", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1214", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1215", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1409", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-1585", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1586", .expected = error.UnsupportedSqlShape },
     };
+    var admitted: usize = 0;
     for (cases) |expected| {
         const case = try corpus.get(expected.id);
+        errdefer std.debug.print("original rejection contract {s}\n", .{case.id});
         try std.testing.expectEqualStrings("rejection", case.source_expectation);
         var diagnostic: compiler.Diagnostic = .{};
-        std.testing.expectError(expected.expected, compiler.compileDiagnostic(std.testing.allocator, case.sql, .{}, &diagnostic)) catch |err| {
-            std.debug.print("rejection contract {s}: {s}\n", .{ case.id, diagnostic.message });
-            return err;
-        };
+        if (compiler.compileDiagnostic(std.testing.allocator, case.sql, .{}, &diagnostic)) |value_| {
+            var value = value_;
+            defer value.deinit();
+            std.debug.print("rejection contract unexpectedly admitted {s}\n", .{case.id});
+            admitted += 1;
+            continue;
+        } else |err| try std.testing.expectEqual(expected.expected, err);
         try std.testing.expect(diagnostic.message.len > 0);
         try std.testing.expect(diagnostic.start <= diagnostic.end);
         try std.testing.expect(diagnostic.end <= case.sql.len);
     }
+    try std.testing.expectEqual(@as(usize, 0), admitted);
+}
+
+test "SQL original overriding system value retains PostgreSQL admission" {
+    // sql-1409 was an old unsupported-syntax contract. Its unchanged PostgreSQL
+    // statement is now supported; mounted EXPLAIN setup verifies the write and
+    // complete durable postimage rather than retaining an obsolete rejection.
+    var corpus = try @import("antfly_local_sources").sql_parity_fixtures.Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    const original = try corpus.get("sql-1409");
+    var compiled = try compiler.compile(std.testing.allocator, original.sql, .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement == .insert);
 }

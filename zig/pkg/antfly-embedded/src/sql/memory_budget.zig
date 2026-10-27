@@ -42,6 +42,58 @@ mutex: std.atomic.Mutex = .unlocked,
 admission: ?struct { ptr: *anyopaque, reserve: *const fn (*anyopaque, usize) bool, release: *const fn (*anyopaque, usize) void } = null,
 admission_exhausted: bool = false,
 
+/// Full replacement capacity, including coexistence with the old buffer.
+/// Use the collection's public growth rule instead of guessing per-row bytes.
+pub fn arrayListGrowthBytes(values: anytype, additional: usize) usize {
+    const required = values.items.len +| additional;
+    if (required <= values.capacity) return 0;
+    return @TypeOf(values).growCapacity(required) *| @sizeOf(@TypeOf(values.items[0]));
+}
+
+/// Conservative replacement bound for the standard 80%-load ordinal maps.
+/// KV size/alignment covers both arrays, metadata and alignment padding; old
+/// capacity is already charged to live memory and must not be subtracted.
+pub fn hashTableGrowthBytes(table: anytype, additional: usize) usize {
+    if (additional <= table.available) return 0;
+    const required = (table.count() +| additional) *| 100 / std.hash_map.default_max_load_percentage +| 1;
+    const capacity = std.math.ceilPowerOfTwo(usize, @max(8, required)) catch return std.math.maxInt(usize);
+    const Entry = @TypeOf(table).KV;
+    return capacity *| (@sizeOf(Entry) + @alignOf(Entry) + 1) +| 64;
+}
+
+/// Sequential row/program admission across independently retained regions.
+/// Unlike live-allocation callbacks, retirement never refunds parent-arena
+/// capacity. begin/finish bracket every operation that can grow the region.
+/// Both the memory owner and remaining counter must outlive this binding.
+pub const RegionAdmission = struct {
+    memory: *Budget,
+    remaining: *usize,
+    ceiling: usize,
+    admitted: usize,
+
+    pub fn init(memory: *Budget, remaining: *usize) !RegionAdmission {
+        const used = memory.footprint();
+        if (used > remaining.*) return error.SqlProgramLimitExceeded;
+        remaining.* -= used;
+        return .{ .memory = memory, .remaining = remaining, .ceiling = memory.limit, .admitted = used };
+    }
+
+    pub fn begin(self: *RegionAdmission) void {
+        self.finish();
+        self.memory.lock();
+        defer self.memory.mutex.unlock();
+        // Previously admitted peak/spent capacity remains available for reuse;
+        // only growth beyond it competes with other row/program regions.
+        self.memory.limit = @min(self.ceiling, self.admitted +| self.remaining.*);
+    }
+
+    pub fn finish(self: *RegionAdmission) void {
+        const used = self.memory.footprint();
+        self.remaining.* -|= used -| self.admitted;
+        self.admitted = @max(self.admitted, used);
+    }
+};
+
 pub fn finishAdmission(self: *Budget) void {
     self.lock();
     defer self.mutex.unlock();

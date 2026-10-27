@@ -29,6 +29,7 @@ const Numeric = @import("../common/sql_builtin_type.zig").Type;
 const casts = @import("../sql/builtin_cast.zig");
 const exact = @import("../sql/numeric_value.zig");
 const binary = @import("../sql/numeric_binary.zig");
+const text_kernel = @import("../sql/text_value.zig");
 pub const max_nodes = 128;
 pub const max_depth = 16;
 pub const max_output_bytes = 1024 * 1024;
@@ -36,10 +37,30 @@ pub const max_allocated_bytes = 4 * max_output_bytes;
 
 /// One invocation can span several immutable plans. Work/cancellation remain
 /// sticky across nodes and bindings, independently of retained-byte admission.
+pub const PreparationPhase = enum { complete, candidate, selected };
+
+pub const PreparationRuntime = struct {
+    io: std.Io,
+    uuid_clock: ?*@import("../common/uuid.zig").Version7Clock = null,
+    sequences: ?@import("../system_catalog/column_sequences.zig").Provider = null,
+    sequence_scope: ?@import("../system_catalog/column_sequences.zig").Scope = null,
+    transaction_start: ?@import("../sql/statement_clock.zig").Instant = null,
+
+    pub fn withClock(self: PreparationRuntime, required: bool) !PreparationRuntime {
+        var result = self;
+        if (required and result.transaction_start == null)
+            result.transaction_start = try (@import("../sql/statement_clock.zig").Source{ .io = self.io }).sample();
+        return result;
+    }
+};
+
 pub const Execution = struct {
     alloc: Allocator,
     bytes: *usize,
     numeric: exact.Context,
+    preparation_runtime: ?PreparationRuntime = null,
+    /// Immutable preparation input persisted by historical rewrite admission.
+    bound_transaction_start: ?@import("../sql/statement_clock.zig").Instant = null,
 
     pub fn init(alloc: Allocator, bytes: *usize) Execution {
         return .{ .alloc = alloc, .bytes = bytes, .numeric = .{ .alloc = alloc } };
@@ -53,6 +74,350 @@ pub const Execution = struct {
         return executionFailure(self.numeric.limit());
     }
 };
+
+/// One immutable row shared by multiple scalar plans. Initialize at its final
+/// address; plans, source payloads and Execution must outlive this owner.
+/// Cache only operands requiring preparation, never a schema-width vector.
+/// Results borrow this owner and must be consumed before deinit.
+pub const PreparedInput = struct {
+    execution: *Execution,
+    source: Plan.Source,
+    roots: @import("../sql/row_value.zig").JsonRow,
+    nulls: ?*@import("../sql/row_value.zig").JsonNulls,
+    entries: std.StringHashMapUnmanaged(Entry),
+    preparations: usize,
+    /// Immutable logical-predecessor ordinal -> physical historical ordinal.
+    /// NULL entries denote fields absent in that retained layout.
+    ordinals: ?[]const ?u32 = null,
+    const Entry = struct { kind: Kind, sql_type: ?Numeric, value: Value };
+
+    pub fn initJson(self: *PreparedInput, execution: *Execution, document: std.json.Value, nulls: ?*@import("../sql/row_value.zig").JsonNulls) !void {
+        if (document != .object) return error.InvalidRelationalExpressionInput;
+        if (nulls) |owner| {
+            if (owner.context != &execution.numeric or owner.admission == null or owner.admission.?.remaining != execution.bytes) return error.InvalidRelationalExpressionInput;
+        }
+        try self.init(execution, .{ .json = document }, nulls);
+    }
+
+    pub fn initRow(self: *PreparedInput, execution: *Execution, row: codec.OrdinalRowView) !void {
+        try self.init(execution, .{ .row = row }, null);
+    }
+
+    /// Caller has certified the exact compiler layout and column identity.
+    pub fn initBoundRow(self: *PreparedInput, execution: *Execution, row: codec.OrdinalRowView) !void {
+        try self.init(execution, .{ .bound_row = row }, null);
+    }
+
+    pub fn initMappedRow(self: *PreparedInput, execution: *Execution, row: codec.OrdinalRowView, ordinals: []const ?u32) !void {
+        try self.initBoundRow(execution, row);
+        self.ordinals = ordinals;
+    }
+
+    fn init(self: *PreparedInput, execution: *Execution, source: Plan.Source, nulls: ?*@import("../sql/row_value.zig").JsonNulls) !void {
+        self.* = .{ .execution = execution, .source = source, .roots = undefined, .nulls = nulls, .entries = .empty, .preparations = 0 };
+        self.roots.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        errdefer self.roots.deinit();
+        try self.roots.bindAdmission(execution.bytes);
+    }
+
+    pub fn deinit(self: *PreparedInput) void {
+        self.roots.deinit();
+        self.* = undefined;
+    }
+
+    /// Read an already resolved physical ordinal from this pinned source.
+    /// Rewrite mappings need no repeated name lookup or secondary cell decoder.
+    pub fn valueAt(self: *PreparedInput, execution: *Execution, ordinal: u32) !Value {
+        try self.requireExecution(execution);
+        if (self.source != .bound_row) return error.InvalidRelationalExpressionInput;
+        const columns = self.source.bound_row.table_schema.relational_columns;
+        if (ordinal >= columns.len) return error.InvalidRelationalExpressionInput;
+        try execution.charge(1);
+        const column = columns[ordinal];
+        return Plan.readColumn(execution, .{ .prepared = self }, .{
+            .op = .column,
+            .kind = column.column_type,
+            .sql_type = column.sql_element_type,
+            .column_name = column.name,
+            .ordinal = ordinal,
+        });
+    }
+
+    fn requireExecution(self: *const PreparedInput, execution: *Execution) !void {
+        if (execution != self.execution or self.roots.context != &execution.numeric or self.roots.admission.?.remaining != execution.bytes) return error.InvalidRelationalExpressionInput;
+        try execution.charge(0);
+    }
+
+    fn mappedNode(self: *const PreparedInput, logical: Node) !?Node {
+        var node = logical;
+        if (node.op == .column) if (self.ordinals) |mapping| {
+            if (node.ordinal >= mapping.len) return error.InvalidRelationalExpressionInput;
+            node.ordinal = mapping[node.ordinal] orelse return null;
+        };
+        return node;
+    }
+
+    fn read(self: *PreparedInput, execution: *Execution, logical: Node) !Value {
+        try self.requireExecution(execution);
+        const node = (try self.mappedNode(logical)) orelse return .null;
+        // Ordinary scalar cells already borrow the input. Preserve that path,
+        // and preserve streamed base64 comparisons in Plan.borrowedBlob.
+        switch (node.kind) {
+            // Cold numeric/array cells already carry their typed encoding;
+            // caching those borrowed views would add allocation without reuse.
+            .numeric, .sql_array, .numrange, .daterange, .tsrange, .tstzrange => if (self.source != .json) return Plan.readColumn(execution, self.source, node),
+            .blob, .json => {},
+            else => return Plan.readColumn(execution, self.source, node),
+        }
+        try execution.charge(node.column_name.len);
+        if (self.entries.get(node.column_name)) |entry| {
+            if (entry.kind != node.kind or entry.sql_type != node.sql_type) return error.RelationalIndexColumnTypeMismatch;
+            return entry.value;
+        }
+        if (self.roots.admission) |*admission| admission.begin();
+        defer if (self.roots.admission) |*admission| admission.finish();
+        const value: Value = if (node.kind != .json) try Plan.readColumn(execution, self.source, node) else switch (self.source) {
+            .json => |document| blk: {
+                const input = document.object.get(node.column_name) orelse break :blk .null;
+                if (input == .null and (self.nulls == null or !try self.nulls.?.contains(node.column_name))) break :blk .null;
+                break :blk .{ .json = try self.roots.pinValue(input) };
+            },
+            .row, .bound_row => |row| blk: {
+                const ordinal = if (self.source == .bound_row) node.ordinal else row.ordinalForName(node.column_name) orelse break :blk .null;
+                if (ordinal >= row.table_schema.relational_columns.len or row.table_schema.relational_columns[ordinal].column_type != .json or row.table_schema.relational_columns[ordinal].sql_element_type != node.sql_type) return error.RelationalIndexColumnTypeMismatch;
+                const cell = (try row.findCell(ordinal)) orelse break :blk .null;
+                if (cell.is_null) break :blk .null;
+                break :blk .{ .json = try self.roots.decodePinned(std.math.cast(u32, ordinal) orelse return error.InvalidRelationalExpressionInput, cell.value.bytes_val) };
+            },
+            else => return error.InvalidRelationalExpressionInput,
+        };
+        // Preparing a numeric/array value can consume the same invocation's
+        // byte counter. Refresh headroom before allocating the cache entry.
+        if (self.roots.admission) |*admission| admission.begin();
+        try execution.charge(node.column_name.len);
+        self.entries.put(self.roots.arena.allocator(), node.column_name, .{ .kind = node.kind, .sql_type = node.sql_type, .value = value }) catch |err| {
+            if (err == error.OutOfMemory and self.roots.memory.isExhausted()) return execution.limit();
+            return err;
+        };
+        self.preparations += 1;
+        return value;
+    }
+};
+
+test "relational index system shared prepared input reuses numeric operands and fences execution identity" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric }} };
+    var definition = try std.json.parseFromSlice(std.json.Value, a, "{\"op\":\"column\",\"column\":\"n\"}", .{});
+    defer definition.deinit();
+    var left = try Plan.init(a, table, definition.value, .numeric);
+    defer left.deinit();
+    var right = try Plan.init(a, table, definition.value, .numeric);
+    defer right.deinit();
+    const Run = struct {
+        fn run(backing: Allocator, first: *const Plan, second: *const Plan) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            const input_json = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"n\":1.200}", .{ .parse_numbers = false });
+            var bytes: usize = max_allocated_bytes;
+            var execution = Execution.init(region.allocator(), &bytes);
+            var input: PreparedInput = undefined;
+            try input.initJson(&execution, input_json, null);
+            defer input.deinit();
+            const one = try first.evaluatePreparedWithExecution(&execution, &input);
+            const two = try second.evaluatePreparedWithExecution(&execution, &input);
+            try std.testing.expectEqual(@as(usize, 1), input.preparations);
+            try std.testing.expectEqual(one.numeric.ptr, two.numeric.ptr);
+            try std.testing.expectEqualSlices(u8, one.numeric, two.numeric);
+            const before_work = execution.numeric.remaining;
+            const before_bytes = bytes;
+            for (0..64) |_| {
+                const reused = try second.evaluatePreparedWithExecution(&execution, &input);
+                try std.testing.expectEqual(one.numeric.ptr, reused.numeric.ptr);
+            }
+            // Cache hits charge the VM node and key hashing, but allocate no
+            // output and never rerun numeric parsing/binary preparation.
+            try std.testing.expectEqual(@as(u64, 64 * 2), before_work - execution.numeric.remaining);
+            try std.testing.expectEqual(before_bytes, bytes);
+            try std.testing.expectEqual(@as(usize, 1), input.preparations);
+            try std.testing.expectError(error.RelationalIndexColumnTypeMismatch, input.read(&execution, .{ .op = .column, .kind = .sql_array, .sql_type = .text, .column_name = "n" }));
+            var other_bytes: usize = max_allocated_bytes;
+            var other = Execution.init(region.allocator(), &other_bytes);
+            try std.testing.expectError(error.InvalidRelationalExpressionInput, first.evaluatePreparedWithExecution(&other, &input));
+            try std.testing.expect(execution.limit() == error.RelationalExpressionBudgetExceeded);
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, second.evaluatePreparedWithExecution(&execution, &input));
+        }
+    };
+    try Run.run(a, &left, &right);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ &left, &right });
+}
+
+test "relational index system shared prepared input pins JSON null authority without reparsing" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const document = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"j\":null,\"s\":null,\"payload\":{\"n\":1.20}}", .{ .parse_numbers = false });
+    var bytes: usize = max_allocated_bytes;
+    var execution = Execution.init(region.allocator(), &bytes);
+    var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+    nulls.initRegion(region.allocator(), bytes, &execution.numeric);
+    defer nulls.deinit();
+    try nulls.bindAdmission(&bytes);
+    // These names represent already authenticated typed provenance.
+    try nulls.import(&.{"j"});
+    var input: PreparedInput = undefined;
+    try input.initJson(&execution, document, &nulls);
+    defer input.deinit();
+    const json = try input.read(&execution, .{ .op = .column, .kind = .json, .column_name = "j" });
+    try std.testing.expectEqual(std.json.Value.null, json.json.value);
+    try std.testing.expectEqual(Value.null, try input.read(&execution, .{ .op = .column, .kind = .json, .column_name = "s" }));
+    const payload = try input.read(&execution, .{ .op = .column, .kind = .json, .column_name = "payload" });
+    const again = try input.read(&execution, .{ .op = .column, .kind = .json, .column_name = "payload" });
+    try std.testing.expectEqual(payload.json, again.json);
+    try std.testing.expectEqualStrings("1.20", payload.json.value.object.get("n").?.number_string);
+    try std.testing.expectEqual(@as(usize, 0), input.roots.decodes);
+    try std.testing.expectEqual(@as(usize, 3), input.preparations);
+}
+
+test "relational index system typed CHECK transport agrees with cold JSON null provenance" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+        .{ .name = "s", .path = "s", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var physical = try codec.PhysicalLayout.init(a, table);
+    defer physical.deinit();
+    const encoded = try codec.serializePreparedOrdinalDeferredHash(a, 1, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = "null" } },
+        .{ .ordinal = 1, .path = "s", .is_json = true, .is_null = true, .value_type = .bytes_val, .value = .{ .bytes_val = "" } },
+    }, &physical);
+    defer a.free(encoded);
+    try codec.finalizeOrdinalMetadata(encoded, @splat(0), 0);
+    const cold = try codec.ordinalRowView(encoded, table, &physical);
+    const Run = struct {
+        fn run(backing: Allocator, row: codec.OrdinalRowView) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            const owned = region.allocator();
+            const document = try std.json.parseFromSliceLeaky(std.json.Value, owned, "{\"j\":null,\"s\":null}", .{});
+            // Internal VM fixture only: public JSON compilation remains
+            // guarded until capability, literal identity and lowering activate.
+            var plans = [_]Plan{
+                .{ .arena = .init(backing), .nodes = &.{ .{ .op = .column, .kind = .json, .column_name = "j" }, .{ .op = .is_not_null, .kind = .boolean, .children = &.{0} } }, .dependencies = &.{0}, .fingerprint = @splat(0), .result_kind = .boolean, .literal_bytes = 0 },
+                .{ .arena = .init(backing), .nodes = &.{ .{ .op = .column, .kind = .json, .column_name = "s", .ordinal = 1 }, .{ .op = .is_null, .kind = .boolean, .children = &.{0} } }, .dependencies = &.{1}, .fingerprint = @splat(0), .result_kind = .boolean, .literal_bytes = 0 },
+            };
+            defer for (&plans) |*plan| plan.deinit();
+            // Borrow the pinned physical layout and plans; Set.deinit would
+            // incorrectly free these independently owned fixture resources.
+            const set: checks.Set = .{ .alloc = backing, .table = row.table_schema, .layout = row.layout.*, .definitions = &.{ .{ .name = "json_present" }, .{ .name = "text_absent" } }, .plans = &plans };
+            var bytes: usize = max_allocated_bytes;
+            var execution = Execution.init(owned, &bytes);
+            var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+            nulls.initRegion(owned, bytes, &execution.numeric);
+            defer nulls.deinit();
+            try nulls.bindAdmission(&bytes);
+            try nulls.import(&.{"j"});
+            try std.testing.expectEqual(@as(?usize, null), try set.firstViolationTypedJsonWithExecution(&execution, document, &nulls));
+            try std.testing.expectEqual(@as(?checks.Set.Failure, null), try set.firstFailureTypedJsonWithExecution(&execution, document, &nulls));
+            try std.testing.expectEqual(@as(?usize, null), try set.firstViolationRow(backing, row));
+            try std.testing.expectEqual(@as(?usize, 0), try set.firstViolationJsonWithExecution(&execution, document));
+            try nulls.import(&.{"s"});
+            try std.testing.expectEqual(@as(?usize, 1), try set.firstViolationTypedJsonWithExecution(&execution, document, &nulls));
+            const failure = (try set.firstFailureTypedJsonWithExecution(&execution, document, &nulls)).?;
+            try std.testing.expectEqual(@as(usize, 1), failure.index);
+            var other_bytes: usize = max_allocated_bytes;
+            var other = Execution.init(owned, &other_bytes);
+            try std.testing.expectError(error.InvalidRelationalExpressionInput, set.firstViolationTypedJsonWithExecution(&other, document, &nulls));
+            var foreign: @import("../sql/row_value.zig").JsonNulls = undefined;
+            foreign.initRegion(owned, bytes, &execution.numeric);
+            defer foreign.deinit();
+            try foreign.bindAdmission(&other_bytes);
+            try std.testing.expectError(error.InvalidRelationalExpressionInput, set.firstViolationTypedJsonWithExecution(&execution, document, &foreign));
+            var limited_bytes: usize = 0;
+            var limited = Execution.init(owned, &limited_bytes);
+            var limited_nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+            limited_nulls.initRegion(owned, 0, &limited.numeric);
+            defer limited_nulls.deinit();
+            try limited_nulls.bindAdmission(&limited_bytes);
+            // Activation cannot persist a shared budget failure as a bad row.
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, set.firstFailureTypedJsonWithExecution(&limited, document, &limited_nulls));
+            limited_bytes = max_allocated_bytes;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, set.firstViolationTypedJsonWithExecution(&limited, document, &limited_nulls));
+            const Cancel = struct {
+                fn poll(_: ?*anyopaque) anyerror!void {
+                    return error.Canceled;
+                }
+            };
+            execution.numeric.checkpoint = Cancel.poll;
+            execution.numeric.since_poll = 256;
+            try std.testing.expectError(error.Canceled, set.firstFailureTypedJsonWithExecution(&execution, document, &nulls));
+            execution.numeric.checkpoint = null;
+            try std.testing.expectError(error.Canceled, set.firstViolationTypedJsonWithExecution(&execution, document, &nulls));
+        }
+    };
+    try Run.run(a, cold);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{cold});
+}
+
+test "relational index system shared prepared input decodes cold JSON once and keeps cancellation sticky" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const bytes = try codec.serializePreparedOrdinalDeferredHash(a, 1, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = "{\"n\":1.20}" } },
+    }, &layout);
+    defer a.free(bytes);
+    try codec.finalizeOrdinalMetadata(bytes, @splat(0), 0);
+    const row = try codec.ordinalRowView(bytes, table, &layout);
+    const Run = struct {
+        fn run(backing: Allocator, source: codec.OrdinalRowView) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            var remaining: usize = max_allocated_bytes;
+            var execution = Execution.init(region.allocator(), &remaining);
+            var input: PreparedInput = undefined;
+            try input.initRow(&execution, source);
+            defer input.deinit();
+            const node: Node = .{ .op = .column, .kind = .json, .column_name = "j", .ordinal = 73 };
+            const one = try input.read(&execution, node);
+            const two = try input.read(&execution, node);
+            try std.testing.expectEqual(one.json, two.json);
+            try std.testing.expectEqualStrings("1.20", one.json.value.object.get("n").?.number_string);
+            try std.testing.expectEqual(@as(usize, 1), input.roots.decodes);
+            try std.testing.expectEqual(@as(usize, 1), input.preparations);
+            var bound: PreparedInput = undefined;
+            try bound.initBoundRow(&execution, source);
+            defer bound.deinit();
+            const resolved = try bound.valueAt(&execution, 0);
+            const before = execution.numeric.remaining;
+            const retained = remaining;
+            try std.testing.expectEqual(resolved.json, (try bound.valueAt(&execution, 0)).json);
+            try std.testing.expectEqual(@as(u64, 2), before - execution.numeric.remaining);
+            try std.testing.expectEqual(retained, remaining);
+            try std.testing.expectEqual(@as(usize, 1), bound.roots.decodes);
+            try std.testing.expectError(error.InvalidRelationalExpressionInput, bound.valueAt(&execution, 1));
+            const Cancel = struct {
+                fn poll(_: ?*anyopaque) anyerror!void {
+                    return error.Canceled;
+                }
+            };
+            execution.numeric.checkpoint = Cancel.poll;
+            // Arm the next bounded cancellation poll; installing a callback
+            // does not reset the invocation's existing sampling interval.
+            execution.numeric.since_poll = 256;
+            try std.testing.expectError(error.Canceled, input.read(&execution, node));
+            execution.numeric.checkpoint = null;
+            try std.testing.expectError(error.Canceled, input.read(&execution, node));
+        }
+    };
+    try Run.run(a, row);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{row});
+}
 
 /// Temporarily own bounded unpublished results while retaining the caller's
 /// work/cancellation identity. Reconcile capacity against existing VM charges
@@ -172,6 +537,37 @@ pub fn numericJson(execution: *Execution, input: std.json.Value) !Value {
     defer scratch.deinit();
     const parsed = @import("../sql/numeric_storage.zig").fromJson(&execution.numeric, input) catch |err| return scratch.failure(err);
     return scratch.encode(parsed.value) catch |err| return scratch.failure(err);
+}
+
+fn rangeJson(execution: *Execution, kind: @import("../sql/range_value.zig").Kind, input: std.json.Value) !Value {
+    try execution.charge(0);
+    if (input == .null) return .null;
+    if (input != .string) return error.InvalidRelationalExpressionInput;
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    const ranges = @import("../sql/range_value.zig");
+    const value = ranges.parseLeaky(&execution.numeric, kind, input.string) catch |err| return scratch.failure(err);
+    const size = ranges.encodedSize(&execution.numeric, value) catch |err| return scratch.failure(err);
+    if (size > execution.bytes.* -| scratch.memory.footprint()) return execution.limit();
+    const output = try allocateOutput(execution.alloc, size, execution.bytes);
+    errdefer execution.alloc.free(output);
+    var writer: std.Io.Writer = .fixed(output);
+    ranges.encode(&execution.numeric, value, &writer) catch |err| return scratch.failure(err);
+    return .{ .range = .{ .kind = kind, .bytes = output } };
+}
+
+fn rangeJsonOutput(execution: *Execution, range: @import("../sql/range_value.zig").Encoded) !std.json.Value {
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    const ranges = @import("../sql/range_value.zig");
+    const value = ranges.decodeCanonicalLeaky(&execution.numeric, range.kind, range.bytes) catch |err| return scratch.failure(err);
+    const text = ranges.formatLeaky(&execution.numeric, value) catch |err| return scratch.failure(err);
+    if (text.len > execution.bytes.* -| scratch.memory.footprint()) return execution.limit();
+    const output = try allocateOutput(execution.alloc, text.len, execution.bytes);
+    @memcpy(output, text);
+    return .{ .string = output };
 }
 
 /// Bind a parsed, explicitly typed array envelope without a JSON round trip.
@@ -416,18 +812,35 @@ fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     return scratch.json(parsed.value) catch |err| return scratch.failure(err);
 }
 
-pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array };
+pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7, transaction_timestamp };
+
+fn jsonFunction(op: Op) bool {
+    return switch (op) {
+        .jsonb_typeof, .jsonb_array_length, .jsonb_extract_path, .jsonb_extract_path_text => true,
+        else => false,
+    };
+}
+
+fn numericFunction(op: Op) ?@import("../sql/numeric_functions.zig").Function {
+    return switch (op) {
+        inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @field(@import("../sql/numeric_functions.zig").Function, @tagName(tag)),
+        else => null,
+    };
+}
 
 /// Shared structural grammar for public prechecks and typed compilation.
 /// These rules grant no column/type authority; the pinned compiler owns that.
 pub fn acceptsField(op: Op, name: []const u8) bool {
     if (std.mem.eql(u8, name, "op")) return true;
     return switch (op) {
-        .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type"),
+        .uuidv4 => false,
+        .transaction_timestamp => std.mem.eql(u8, name, "precision"),
+        .uuidv7 => std.mem.eql(u8, name, "shift"),
+        .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "json_null"),
         .column => std.mem.eql(u8, name, "column"),
         .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
         .array => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
-        .add, .subtract, .multiply, .divide, .modulo, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
+        .add, .subtract, .multiply, .divide, .modulo, .negate, .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
         else => std.mem.eql(u8, name, "args") or ((isComparison(op) or op == .in_list or op == .not_in_list) and std.mem.eql(u8, name, "collation")),
     };
 }
@@ -435,8 +848,13 @@ pub fn acceptsField(op: Op, name: []const u8) bool {
 pub fn acceptsArity(op: Op, count: usize) bool {
     return switch (op) {
         .literal, .column => false,
+        .uuidv4, .uuidv7, .transaction_timestamp => count == 0,
         .array => count <= 32,
-        .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast => count == 1,
+        .jsonb_typeof, .jsonb_array_length => count == 1,
+        .jsonb_extract_path, .jsonb_extract_path_text => count >= 2 and count <= 32,
+        .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast, .md5, .abs, .ceil, .floor, .sign, .sqrt => count == 1,
+        .round, .trunc => count == 1 or count == 2,
+        .replace => count == 3,
         .concat, .coalesce, .@"and", .@"or" => count >= 2 and count <= 32,
         .in_list, .not_in_list => count >= 2 and count <= max_nodes,
         .case_when => count >= 3 and count <= 31 and count % 2 == 1,
@@ -453,7 +871,111 @@ const Node = struct {
     literal: Value = .null,
     sql_type: ?Numeric = null,
     numeric_modifier: ?exact.TypeModifier = null,
+    replace_pattern: ?text_kernel.Pattern = null,
+    uuid_shift: ?@import("../sql/temporal_value.zig").Interval = null,
+    clock_precision: u8 = 6,
 };
+
+test "SQL UUID defaults require owned preparation preserve explicit values and never run during restore" {
+    const a = std.testing.allocator;
+    const sql = @import("../sql/compiler.zig");
+    var compiled = try sql.compile(a, "CREATE TABLE events (id UUID NOT NULL DEFAULT uuidv7(INTERVAL '1 month'))", .{});
+    defer compiled.deinit();
+    const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+    defer a.free(bytes);
+    var validator = try @import("mod.zig").CompiledTableValidator.init(a, bytes);
+    defer validator.deinit(a);
+    const table = validator.execution.expressions.?.table;
+    try std.testing.expect(table.requires_uuid_defaults);
+    try std.testing.expectEqual(@as(u32, 33), schema.requiredReaderVersion(table));
+    const encoded = try schema.serializeSchema(a, table);
+    defer a.free(encoded);
+    const restored = try schema.deserializeSchema(a, encoded);
+    defer schema.freeSchema(a, restored);
+    try std.testing.expect(restored.requires_uuid_defaults);
+    try std.testing.expect(!(@import("../common/schema_readers.zig").ReaderCapabilities{ .semantic_ceiling = 32, .encoding_ceiling = 32 }).supports(schema.readerRequirementsForSchema(table)));
+    const Input = struct {
+        calls: usize = 0,
+        fn random(raw: ?*anyopaque, output: []u8) std.Io.RandomSecureError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            @memset(output, 0x5a);
+        }
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = 1_706_704_496_123_456_789 };
+        }
+    };
+    var input: Input = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Input.random;
+    vtable.now = Input.now;
+    const io: std.Io = .{ .userdata = &input, .vtable = &vtable };
+    var clock: @import("../common/uuid.zig").Version7Clock = .{};
+    const preparation = validator.forPreparation(.{ .io = io, .uuid_clock = &clock });
+    var document = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer document.deinit();
+    try std.testing.expectError(error.SqlEntropyUnavailable, validator.prepareValue(document.arena.allocator(), a, &document.value));
+    try std.testing.expectEqual(@as(usize, 0), input.calls);
+    try preparation.prepareValue(document.arena.allocator(), a, &document.value);
+    try std.testing.expectEqual(@as(usize, 1), input.calls);
+    const uuid = @import("../common/uuid.zig");
+    try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(document.value.object.get("id").?.string)));
+    const saved = try a.dupe(u8, document.value.object.get("id").?.string);
+    defer a.free(saved);
+    try preparation.prepareValue(document.arena.allocator(), a, &document.value);
+    try validator.validateValue(a, &document.value);
+    try std.testing.expectEqual(@as(usize, 1), input.calls);
+    try std.testing.expectEqualStrings(saved, document.value.object.get("id").?.string);
+    // Rebuilding the immutable registry compiles default operations but must
+    // not require or invent an entropy source for historical validation.
+    var reopened = try @import("mod.zig").CompiledTableValidator.init(a, bytes);
+    defer reopened.deinit(a);
+    try reopened.validateValue(a, &document.value);
+    try std.testing.expectEqual(@as(usize, 1), input.calls);
+    var node = try std.json.parseFromSlice(std.json.Value, a, "{\"op\":\"uuidv7\"}", .{});
+    defer node.deinit();
+    try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, table, node.value, .string));
+    for ([_]struct { expression: []const u8, version: ?u4 }{
+        .{ .expression = "uuidv4()", .version = 4 },
+        .{ .expression = "gen_random_uuid()", .version = 4 },
+        .{ .expression = "COALESCE(NULL::uuid, uuidv7())", .version = 7 },
+        .{ .expression = "uuidv7(NULL::interval)", .version = null },
+        .{ .expression = "CASE WHEN false THEN uuidv7() ELSE NULL::uuid END", .version = null },
+    }) |case| {
+        const statement = try std.fmt.allocPrint(a, "CREATE TABLE variants (id UUID DEFAULT {s})", .{case.expression});
+        defer a.free(statement);
+        var declaration = try sql.compile(a, statement, .{});
+        defer declaration.deinit();
+        const definition = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, declaration.statement.create_table);
+        defer a.free(definition);
+        var owner = try @import("mod.zig").CompiledTableValidator.init(a, definition);
+        defer owner.deinit(a);
+        var value = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+        defer value.deinit();
+        const calls = input.calls;
+        try owner.forPreparation(.{ .io = io, .uuid_clock = &clock }).prepareValue(value.arena.allocator(), a, &value.value);
+        const actual = value.value.object.get("id").?;
+        if (case.version) |expected| {
+            try std.testing.expectEqual(@as(?u4, expected), uuid.version(try uuid.parse(actual.string)));
+            try std.testing.expectEqual(calls + 1, input.calls);
+        } else {
+            try std.testing.expect(actual == .null);
+            try std.testing.expectEqual(calls, input.calls);
+        }
+        try owner.validateValue(a, &value.value);
+    }
+    var infinite = try sql.compile(a, "CREATE TABLE invalid_shift (id UUID DEFAULT uuidv7(INTERVAL 'infinity'))", .{});
+    defer infinite.deinit();
+    const infinite_schema = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, infinite.statement.create_table);
+    defer a.free(infinite_schema);
+    var infinite_owner = try @import("mod.zig").CompiledTableValidator.init(a, infinite_schema);
+    defer infinite_owner.deinit(a);
+    var infinite_row = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer infinite_row.deinit();
+    const calls = input.calls;
+    try std.testing.expectError(error.TemporalOutOfRange, infinite_owner.prepareValue(infinite_row.arena.allocator(), a, &infinite_row.value));
+    try std.testing.expectEqual(calls, input.calls);
+}
 
 pub const Plan = struct {
     arena: std.heap.ArenaAllocator,
@@ -463,19 +985,30 @@ pub const Plan = struct {
     result_kind: Kind,
     result_sql_type: ?Numeric = null,
     literal_bytes: usize,
+    /// Compile-time source shape: bit 0 prepares ingress operands, bit 1 cold
+    /// operands. Hand-built VM fixtures derive this once at their boundary.
+    prepared_sources: u8 = 0xff,
 
     pub fn init(alloc: Allocator, table: schema.TableSchema, expression: std.json.Value, expected: Kind) !Plan {
+        return initPolicy(alloc, table, expression, expected, false);
+    }
+
+    pub fn initDefault(alloc: Allocator, table: schema.TableSchema, expression: std.json.Value, expected: Kind) !Plan {
+        return initPolicy(alloc, table, expression, expected, true);
+    }
+
+    fn initPolicy(alloc: Allocator, table: schema.TableSchema, expression: std.json.Value, expected: Kind, defaults: bool) !Plan {
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         var bytes: usize = max_allocated_bytes;
         var execution = Execution.init(arena.allocator(), &bytes);
-        var compiler: Compiler = .{ .alloc = arena.allocator(), .table = table, .execution = &execution };
+        var compiler: Compiler = .{ .alloc = arena.allocator(), .table = table, .execution = &execution, .allow_preparation_defaults = defaults };
         compiler.hash.update("antfly immutable scalar expression v1");
         const root = try compiler.compile(expression, 0);
         if (compiler.nodes.items[root].kind != expected) return error.InvalidRelationalExpressionType;
         var fingerprint: [32]u8 = undefined;
         compiler.hash.final(&fingerprint);
-        return .{ .arena = arena, .nodes = compiler.nodes.items, .dependencies = compiler.dependencies.items, .fingerprint = fingerprint, .result_kind = expected, .result_sql_type = compiler.nodes.items[root].sql_type, .literal_bytes = compiler.literal_bytes };
+        return .{ .arena = arena, .nodes = compiler.nodes.items, .dependencies = compiler.dependencies.items, .fingerprint = fingerprint, .result_kind = expected, .result_sql_type = compiler.nodes.items[root].sql_type, .literal_bytes = compiler.literal_bytes, .prepared_sources = preparedSourceMask(compiler.nodes.items) };
     }
 
     pub fn deinit(self: *Plan) void {
@@ -511,7 +1044,7 @@ pub const Plan = struct {
 
     pub fn evaluateJsonWithExecution(self: *const Plan, execution: *Execution, document: std.json.Value) !Value {
         if (document != .object) return error.InvalidRelationalExpressionInput;
-        return self.evaluateNode(execution, .{ .json = document }, @intCast(self.nodes.len - 1)) catch |err| return executionFailure(err);
+        return self.evaluateRetainedSource(execution, .{ .json = document });
     }
 
     pub fn evaluateRow(self: *const Plan, alloc: Allocator, row: codec.OrdinalRowView) !Value {
@@ -525,7 +1058,7 @@ pub const Plan = struct {
     }
 
     pub fn evaluateRowWithExecution(self: *const Plan, execution: *Execution, row: codec.OrdinalRowView) !Value {
-        return self.evaluateNode(execution, .{ .row = row }, @intCast(self.nodes.len - 1)) catch |err| return executionFailure(err);
+        return self.evaluateRetainedSource(execution, .{ .row = row });
     }
 
     /// Caller must fence the exact immutable source layout used to compile this
@@ -536,16 +1069,60 @@ pub const Plan = struct {
     }
 
     pub fn evaluateBoundRowWithExecution(self: *const Plan, execution: *Execution, row: codec.OrdinalRowView) !Value {
-        return self.evaluateNode(execution, .{ .bound_row = row }, @intCast(self.nodes.len - 1)) catch |err| return executionFailure(err);
+        return self.evaluateRetainedSource(execution, .{ .bound_row = row });
     }
 
-    const Source = union(enum) { values: []const Value, json: std.json.Value, row: codec.OrdinalRowView, bound_row: codec.OrdinalRowView };
+    /// Legacy entry points own their temporary prepared input. Retain any
+    /// potentially decoded result in the caller's row region before retiring
+    /// that input; explicit shared-owner callers can keep the borrowing API.
+    fn evaluateRetainedSource(self: *const Plan, execution: *Execution, source: Source) !Value {
+        const mask = if (self.prepared_sources == 0xff) preparedSourceMask(self.nodes) else self.prepared_sources;
+        const selected: u8 = switch (source) {
+            .json => 1,
+            .row, .bound_row => 2,
+            else => unreachable,
+        };
+        // Ordinary scalars and already encoded cold NUMERIC/arrays need no
+        // temporary owner, cache, allocator accounting or per-row node scan.
+        if (mask & selected == 0) {
+            const value = self.evaluateNode(execution, source, @intCast(self.nodes.len - 1)) catch |err| {
+                if (err == error.RelationalExpressionBudgetExceeded) return execution.limit();
+                return executionFailure(err);
+            };
+            return retainPreparedResult(execution, value, false) catch |err| {
+                if (err == error.RelationalExpressionBudgetExceeded) return execution.limit();
+                return executionFailure(err);
+            };
+        }
+        var input: PreparedInput = undefined;
+        input.init(execution, source, null) catch |err| return executionFailure(err);
+        defer input.deinit();
+        const value = self.evaluatePreparedWithExecution(execution, &input) catch |err| {
+            if (err == error.RelationalExpressionBudgetExceeded) return execution.limit();
+            return executionFailure(err);
+        };
+        return retainPreparedResult(execution, value, input.roots.decodes != 0) catch |err| {
+            if (err == error.RelationalExpressionBudgetExceeded) return execution.limit();
+            return executionFailure(err);
+        };
+    }
 
-    fn borrowedBlob(self: *const Plan, source: Source, index: u16) !BlobOperand {
-        const node = self.nodes[index];
+    pub fn evaluatePreparedWithExecution(self: *const Plan, execution: *Execution, input: *PreparedInput) !Value {
+        try input.requireExecution(execution);
+        return self.evaluateNode(execution, .{ .prepared = input }, @intCast(self.nodes.len - 1)) catch |err| return executionFailure(err);
+    }
+
+    const Source = union(enum) { values: []const Value, json: std.json.Value, row: codec.OrdinalRowView, bound_row: codec.OrdinalRowView, prepared: *PreparedInput };
+
+    fn borrowedBlob(self: *const Plan, source: Source, index: u16) anyerror!BlobOperand {
+        return borrowedBlobNode(source, self.nodes[index]);
+    }
+
+    fn borrowedBlobNode(source: Source, node: Node) anyerror!BlobOperand {
         if (node.op == .literal) return BlobOperand.fromValue(node.literal);
         std.debug.assert(node.op == .column and node.kind == .blob);
         return switch (source) {
+            .prepared => |input| if (try input.mappedNode(node)) |physical| borrowedBlobNode(input.source, physical) else .{},
             .values => |values| if (node.ordinal < values.len) BlobOperand.fromValue(values[node.ordinal]) else error.InvalidRelationalExpressionInput,
             .json => |json| BlobOperand.fromJson(json.object.get(node.column_name) orelse .null),
             .row, .bound_row => |row| blk: {
@@ -618,45 +1195,72 @@ pub const Plan = struct {
 
     fn evaluateNode(self: *const Plan, execution: *Execution, source: Source, index: u16) anyerror!Value {
         try execution.numeric.charge(1);
+        const node = self.nodes[index];
+        if (node.op == .transaction_timestamp) {
+            const instant = execution.bound_transaction_start orelse (if (execution.preparation_runtime) |runtime| runtime.transaction_start else null) orelse return error.SqlClockUnavailable;
+            const rounded = try instant.withPrecision(node.clock_precision);
+            return .{ .datetime = rounded.unixNanoseconds() orelse return error.TemporalOutOfRange };
+        }
+        if (node.op == .uuidv4 or node.op == .uuidv7) {
+            if (node.uuid_shift) |shift| if (shift.infinity() != 0) return error.TemporalOutOfRange;
+            const runtime = execution.preparation_runtime orelse return error.SqlEntropyUnavailable;
+            const functions = @import("../sql/uuid_functions.zig");
+            const bytes = if (node.op == .uuidv4) try functions.generate4(runtime.io) else try functions.generate(runtime.io, runtime.uuid_clock orelse &functions.process_clock, node.uuid_shift);
+            const formatted = @import("../common/uuid.zig").format(bytes);
+            try execution.charge(formatted.len);
+            const result = try allocateOutput(execution.alloc, formatted.len, execution.bytes);
+            @memcpy(result, &formatted);
+            return .{ .string = result };
+        }
+        if (node.op == .literal) return node.literal;
+        if (node.op == .array) return self.evaluateArray(execution, source, node);
+        if (node.op == .column) return readColumn(execution, source, node);
+        return self.evaluateOperation(execution, source, index);
+    }
+
+    fn readColumn(execution: *Execution, source: Source, node: Node) anyerror!Value {
+        const alloc = execution.alloc;
+        const value: Value = switch (source) {
+            .prepared => |input| try input.read(execution, node),
+            .values => |values| if (node.ordinal < values.len) values[node.ordinal] else return error.InvalidRelationalExpressionInput,
+            .json => |json| blk: {
+                const input = json.object.get(node.column_name) orelse .null;
+                if (node.kind == .blob) break :blk try decodeBlob(execution, try BlobOperand.fromJson(input));
+                if (node.kind == .sql_array) break :blk try arrayJson(execution, node.sql_type.?, input, null);
+                if (@import("../sql/range_value.zig").kindFromType(node.kind)) |kind| break :blk try rangeJson(execution, kind, input);
+                break :blk if (node.kind == .numeric) try numericJson(execution, input) else try scalarJson(alloc, node.kind, input, false);
+            },
+            .row, .bound_row => |row| blk: {
+                const ordinal = if (source == .bound_row) node.ordinal else row.ordinalForName(node.column_name) orelse break :blk .null;
+                if (ordinal >= row.table_schema.relational_columns.len) return error.RelationalIndexColumnTypeMismatch;
+                if (row.table_schema.relational_columns[ordinal].column_type != node.kind) return error.RelationalIndexColumnTypeMismatch;
+                if (node.kind == .sql_array and row.table_schema.relational_columns[ordinal].sql_element_type != node.sql_type) return error.RelationalIndexColumnTypeMismatch;
+                const cell = (try row.findCell(ordinal)) orelse break :blk .null;
+                if (cell.is_null) break :blk .null;
+                break :blk switch (node.kind) {
+                    .string => .{ .string = cell.value.bytes_val },
+                    .blob => try decodeBlob(execution, try BlobOperand.fromJson(.{ .string = cell.value.bytes_val })),
+                    .integer => .{ .integer = cell.value.i64_val },
+                    .number => .{ .number = cell.value.f64_val },
+                    .numeric => .{ .numeric = cell.value.bytes_val },
+                    .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../sql/range_value.zig").kindFromType(node.kind).?, .bytes = cell.value.bytes_val } },
+                    .sql_array => .{ .sql_array = .{ .element_type = node.sql_type.?, .bytes = cell.value.bytes_val } },
+                    .boolean => .{ .boolean = cell.value.bool_val },
+                    .datetime => .{ .datetime = cell.value.u64_val },
+                    else => return error.InvalidRelationalExpressionType,
+                };
+            },
+        };
+        if (value != .null and !valueHasKind(value, node.kind)) return error.InvalidRelationalExpressionInput;
+        if (value == .sql_array and value.sql_array.element_type != node.sql_type) return error.InvalidRelationalExpressionInput;
+        if (value == .number and !std.math.isFinite(value.number)) return error.InvalidRelationalExpressionInput;
+        return value;
+    }
+
+    fn evaluateOperation(self: *const Plan, execution: *Execution, source: Source, index: u16) anyerror!Value {
         const alloc = execution.alloc;
         const budget = execution.bytes;
         const node = self.nodes[index];
-        if (node.op == .literal) return node.literal;
-        if (node.op == .array) return self.evaluateArray(execution, source, node);
-        if (node.op == .column) {
-            const value: Value = switch (source) {
-                .values => |values| if (node.ordinal < values.len) values[node.ordinal] else return error.InvalidRelationalExpressionInput,
-                .json => |json| blk: {
-                    const input = json.object.get(node.column_name) orelse .null;
-                    if (node.kind == .blob) break :blk try decodeBlob(execution, try BlobOperand.fromJson(input));
-                    if (node.kind == .sql_array) break :blk try arrayJson(execution, node.sql_type.?, input, null);
-                    break :blk if (node.kind == .numeric) try numericJson(execution, input) else try scalarJson(alloc, node.kind, input, false);
-                },
-                .row, .bound_row => |row| blk: {
-                    const ordinal = if (source == .bound_row) node.ordinal else row.ordinalForName(node.column_name) orelse break :blk .null;
-                    if (ordinal >= row.table_schema.relational_columns.len) return error.RelationalIndexColumnTypeMismatch;
-                    if (row.table_schema.relational_columns[ordinal].column_type != node.kind) return error.RelationalIndexColumnTypeMismatch;
-                    if (node.kind == .sql_array and row.table_schema.relational_columns[ordinal].sql_element_type != node.sql_type) return error.RelationalIndexColumnTypeMismatch;
-                    const cell = (try row.findCell(ordinal)) orelse break :blk .null;
-                    if (cell.is_null) break :blk .null;
-                    break :blk switch (node.kind) {
-                        .string => .{ .string = cell.value.bytes_val },
-                        .blob => try decodeBlob(execution, try BlobOperand.fromJson(.{ .string = cell.value.bytes_val })),
-                        .integer => .{ .integer = cell.value.i64_val },
-                        .number => .{ .number = cell.value.f64_val },
-                        .numeric => .{ .numeric = cell.value.bytes_val },
-                        .sql_array => .{ .sql_array = .{ .element_type = node.sql_type.?, .bytes = cell.value.bytes_val } },
-                        .boolean => .{ .boolean = cell.value.bool_val },
-                        .datetime => .{ .datetime = cell.value.u64_val },
-                        else => return error.InvalidRelationalExpressionType,
-                    };
-                },
-            };
-            if (value != .null and !valueHasKind(value, node.kind)) return error.InvalidRelationalExpressionInput;
-            if (value == .sql_array and value.sql_array.element_type != node.sql_type) return error.InvalidRelationalExpressionInput;
-            if (value == .number and !std.math.isFinite(value.number)) return error.InvalidRelationalExpressionInput;
-            return value;
-        }
         if (node.op == .case_when) {
             var i: usize = 0;
             while (i + 1 < node.children.len) : (i += 2) {
@@ -746,6 +1350,67 @@ pub const Plan = struct {
             if (node.numeric_modifier) |modifier| return normalizeNumericArrayBinding(execution, input, modifier, false);
             return input;
         }
+        if (jsonFunction(node.op)) return self.evaluateJsonFunction(execution, source, node);
+        if (node.op == .replace or node.op == .md5) {
+            // Strict calls still evaluate every argument before propagating
+            // NULL; a later selected argument may raise an arithmetic error.
+            var args: [3]Value = undefined;
+            var has_null = false;
+            for (node.children, 0..) |child, i| {
+                args[i] = try self.evaluateNode(execution, source, child);
+                has_null = has_null or args[i] == .null;
+            }
+            if (has_null) return .null;
+            if (node.op == .md5) {
+                if (budget.* < 32) return execution.limit();
+                const digest = try text_kernel.md5(args[0].string, &execution.numeric);
+                const output = try allocateOutput(alloc, digest.len, budget);
+                @memcpy(output, &digest);
+                return .{ .string = output };
+            }
+            const limit = @min(max_output_bytes, budget.*);
+            const result = if (node.replace_pattern) |pattern|
+                try pattern.replace(alloc, args[0].string, args[2].string, limit, &execution.numeric)
+            else
+                try text_kernel.replace(alloc, args[0].string, args[1].string, args[2].string, limit, &execution.numeric);
+            budget.* -= result.allocated_bytes;
+            return .{ .string = result.bytes };
+        }
+        if (numericFunction(node.op)) |function| {
+            // Selected arguments are evaluated before strict NULL propagation.
+            var args: [2]Value = undefined;
+            var has_null = false;
+            for (node.children, 0..) |child, i| {
+                args[i] = try self.evaluateNode(execution, source, child);
+                has_null = has_null or args[i] == .null;
+            }
+            if (has_null) return .null;
+            if (args[0] == .integer) {
+                const input = args[0].integer;
+                return numericCast(.{ .integer = if (input < 0) std.math.negate(input) catch return error.RelationalExpressionOverflow else input }, node.sql_type orelse .int64);
+            }
+            if (args[0] == .number) {
+                const result = @import("../sql/numeric_functions.zig").floating(&execution.numeric, function, args[0].number) catch |err| return executionFailure(err);
+                return numericCast(.{ .number = result }, node.sql_type orelse .float64);
+            }
+            if (function == .abs) return numericOperation(execution, node, args[0..1], self.nodes[node.children[0]]);
+            if (function == .sign) {
+                const view = try binary.layout.View.openWithBudget(args[0].numeric, .{}, &execution.numeric);
+                const sign: exact.Value = if (view.kind == .nan) .{ .kind = .nan } else if (view.kind == .finite and view.count == 0) .{} else .{ .digits = &.{1}, .negative = view.negative or view.kind == .negative_infinity };
+                var scratch: NumericScratch = undefined;
+                scratch.init(execution);
+                defer scratch.deinit();
+                return scratch.encode(sign) catch |err| return scratch.failure(err);
+            }
+            var scratch: NumericScratch = undefined;
+            scratch.init(execution);
+            defer scratch.deinit();
+            const input = numericOperand(&execution.numeric, args[0], false) catch |err| return scratch.failure(err);
+            const scale: i32 = if (node.children.len == 2) std.math.cast(i32, args[1].integer) orelse return error.RelationalExpressionOverflow else 0;
+            const result = @import("../sql/numeric_functions.zig").numeric(&execution.numeric, function, input, scale) catch |err| return scratch.failure(err);
+            // The scratch owner pins borrowed limbs through canonical encoding.
+            return scratch.encode(result.value) catch |err| return scratch.failure(err);
+        }
         var operands: [32]Value = undefined;
         for (node.children, 0..) |child, i| {
             operands[i] = try self.evaluateNode(execution, source, child);
@@ -818,7 +1483,266 @@ pub const Plan = struct {
             else => unreachable,
         }
     }
+
+    fn selectJsonPath(self: *const Plan, execution: *Execution, source: Source, node: Node) anyerror!?std.json.Value {
+        const operand = self.nodes[node.children[0]];
+        var value: ?std.json.Value = if (operand.op == .jsonb_extract_path) nested: {
+            // A structural consumer needs the subtree, not a transient JSON
+            // result header. Fuse direct path chains without cloning or
+            // allocating an intermediate wrapper; keep node work identical.
+            try execution.numeric.charge(1);
+            break :nested try self.selectJsonPath(execution, source, operand);
+        } else root: {
+            const result = try self.evaluateNode(execution, source, node.children[0]);
+            break :root if (result == .null) null else result.json.value;
+        };
+        var work: @import("../sql/json_order.zig").Budget = .{ .shared = &execution.numeric };
+        // Strict selected arguments still run after SQL NULL, a NULL path
+        // component or a missing child. Lazy ancestors decide selection.
+        for (node.children[1..]) |child| {
+            const key = try self.evaluateNode(execution, source, child);
+            if (key == .null) {
+                value = null;
+            } else if (value) |current| {
+                value = @import("../sql/json_path.zig").extract(current, key.string, &work) catch |err| return executionFailure(err);
+            }
+        }
+        return value;
+    }
+
+    fn evaluateJsonFunction(self: *const Plan, execution: *Execution, source: Source, node: Node) !Value {
+        const selected = (try self.selectJsonPath(execution, source, node)) orelse return .null;
+        var work: @import("../sql/json_order.zig").Budget = .{ .shared = &execution.numeric };
+        switch (node.op) {
+            .jsonb_typeof => return .{ .string = switch (selected) {
+                .null => "null",
+                .bool => "boolean",
+                .integer, .float, .number_string => "number",
+                .string => "string",
+                .array => "array",
+                .object => "object",
+            } },
+            .jsonb_array_length => {
+                if (selected != .array) return error.InvalidRelationalExpressionInput;
+                return .{ .integer = std.math.cast(i32, selected.array.items.len) orelse return error.RelationalExpressionOverflow };
+            },
+            .jsonb_extract_path => {
+                const Json = @import("../sql/row_value.zig").Json;
+                try execution.charge(1);
+                if (@sizeOf(Json) > execution.bytes.*) return execution.limit();
+                execution.bytes.* -= @sizeOf(Json);
+                const view = try execution.alloc.create(Json);
+                view.* = .{ .value = selected };
+                return .{ .json = view };
+            },
+            .jsonb_extract_path_text => {
+                if (selected == .null) return .null;
+                if (selected == .string) return .{ .string = selected.string };
+                var memory: @import("../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true };
+                defer execution.bytes.* -|= memory.footprint();
+                const text = @import("../sql/jsonb_text.zig").format(memory.allocator(), selected, @min(max_output_bytes, execution.bytes.*), &work) catch |err|
+                    return if (err == error.OutOfMemory and memory.isExhausted()) execution.limit() else executionFailure(err);
+                return .{ .string = text };
+            },
+            else => unreachable,
+        }
+    }
 };
+
+test "relational index system SQL durable numeric ABS borrows positive payloads without allocation" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "9007199254740993.2500", "NaN", "Infinity", "0.00" }) |input| {
+        const text = try std.fmt.allocPrint(a, "{{\"op\":\"abs\",\"args\":[{{\"op\":\"literal\",\"type\":\"numeric\",\"value\":\"{s}\"}}]}}", .{input});
+        defer a.free(text);
+        var definition = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer definition.deinit();
+        var plan = try Plan.init(a, .{}, definition.value, .numeric);
+        defer plan.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const result = try plan.evaluate(none.allocator(), &.{});
+        try std.testing.expectEqual(@intFromPtr(plan.nodes[0].literal.numeric.ptr), @intFromPtr(result.numeric.ptr));
+        try std.testing.expectEqual(@as(usize, 0), none.end_index);
+    }
+}
+
+test "relational index system SQL durable numeric functions validate mixed types and selected errors" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"op":"ceil","sql_type":"float32","args":[{"op":"literal","type":"number","sql_type":"float64","value":1}]}
+        ,
+        \\{"op":"abs","sql_type":"int16","args":[{"op":"literal","type":"integer","sql_type":"int32","value":1}]}
+        ,
+        "{\"op\":\"ceil\",\"args\":[{\"op\":\"literal\",\"type\":\"integer\",\"value\":1}]}",
+        "{\"op\":\"sqrt\",\"args\":[{\"op\":\"literal\",\"type\":\"number\",\"sql_type\":\"float32\",\"value\":1}]}",
+        "{\"op\":\"round\",\"args\":[{\"op\":\"literal\",\"type\":\"number\",\"value\":1},{\"op\":\"literal\",\"type\":\"integer\",\"sql_type\":\"int32\",\"value\":2}]}",
+        "{\"op\":\"trunc\",\"args\":[{\"op\":\"literal\",\"type\":\"numeric\",\"value\":\"1\"},{\"op\":\"literal\",\"type\":\"integer\",\"sql_type\":\"int64\",\"value\":2}]}",
+    }) |text| {
+        var definition = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer definition.deinit();
+        try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, .{}, definition.value, .numeric));
+    }
+    var definition = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"round","args":[{"op":"literal","type":"numeric"},{"op":"divide","sql_type":"int32","args":[{"op":"literal","type":"integer","sql_type":"int32","value":1},{"op":"literal","type":"integer","sql_type":"int32","value":0}]}]}
+    , .{});
+    defer definition.deinit();
+    var plan = try Plan.init(a, .{}, definition.value, .numeric);
+    defer plan.deinit();
+    try std.testing.expectError(error.RelationalExpressionDivisionByZero, plan.evaluate(a, &.{}));
+}
+
+test "relational index system SQL durable numeric functions unwind faults and retain shared cancellation" {
+    const a = std.testing.allocator;
+    const Harness = struct {
+        fn definition(alloc: Allocator, function: []const u8) !std.json.Parsed(std.json.Value) {
+            const scale: []const u8 = if (std.mem.eql(u8, function, "round") or std.mem.eql(u8, function, "trunc")) ",{\"op\":\"literal\",\"type\":\"integer\",\"sql_type\":\"int32\",\"value\":2}" else "";
+            const text = try std.fmt.allocPrint(alloc, "{{\"op\":\"{s}\",\"sql_type\":\"numeric\",\"args\":[{{\"op\":\"literal\",\"type\":\"numeric\",\"value\":\"123456789.125\"}}{s}]}}", .{ function, scale });
+            defer alloc.free(text);
+            return std.json.parseFromSlice(std.json.Value, alloc, text, .{ .allocate = .alloc_always });
+        }
+        fn prepare(alloc: Allocator, expression: std.json.Value) !void {
+            var plan = try Plan.init(alloc, .{}, expression, .numeric);
+            defer plan.deinit();
+        }
+        fn evaluate(alloc: Allocator, plan: *const Plan) !void {
+            const result = try plan.evaluate(alloc, &.{});
+            if (result.numeric.ptr != plan.nodes[0].literal.numeric.ptr) alloc.free(result.numeric);
+        }
+    };
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    inline for (comptime std.meta.fieldNames(@import("../sql/numeric_functions.zig").Function)) |function| {
+        var parsed = try Harness.definition(a, function);
+        defer parsed.deinit();
+        // Force arena growth through allocations: backing allocator resize
+        // success may depend on its address/bin history, changing the number
+        // of fault cuts. This also exercises every replacement-allocation cut.
+        var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(no_resize.allocator(), Harness.prepare, .{parsed.value});
+        var plan = try Plan.init(a, .{}, parsed.value, .numeric);
+        defer plan.deinit();
+        try std.testing.checkAllAllocationFailures(no_resize.allocator(), Harness.evaluate, .{&plan});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = max_allocated_bytes;
+        var execution = Execution.init(arena.allocator(), &bytes);
+        var observed: Control = .{};
+        execution.numeric.checkpoint = Control.check;
+        execution.numeric.ptr = &observed;
+        _ = try plan.evaluateWithExecution(&execution, &.{});
+        for (1..observed.polls + 1) |cut| {
+            bytes = max_allocated_bytes;
+            execution = Execution.init(arena.allocator(), &bytes);
+            var control: Control = .{ .fail_at = cut };
+            execution.numeric.checkpoint = Control.check;
+            execution.numeric.ptr = &control;
+            try std.testing.expectError(error.QueryCanceled, plan.evaluateWithExecution(&execution, &.{}));
+            try std.testing.expectError(error.QueryCanceled, execution.charge(0));
+        }
+        bytes = max_allocated_bytes;
+        execution = Execution.init(arena.allocator(), &bytes);
+        execution.numeric.remaining = 0;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithExecution(&execution, &.{}));
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, execution.charge(0));
+    }
+}
+
+test "relational index system SQL durable text literal patterns compile once and retain invocation limits" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{.{ .name = "s", .path = "s", .column_type = .string }} };
+    const definition = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"replace","args":[{"op":"column","column":"s"},{"op":"literal","type":"string","value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"},{"op":"literal","type":"string","value":"X"}]}
+    , .{});
+    defer definition.deinit();
+    var plan = try Plan.init(a, table, definition.value, .string);
+    defer plan.deinit();
+    try std.testing.expect(plan.nodes[plan.nodes.len - 1].replace_pattern != null);
+    try std.testing.expect(plan.literal_bytes >= 80 * (1 + @sizeOf(usize)));
+    const input: [1024]u8 = @splat('a');
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var bytes: usize = 0;
+    var execution = Execution.init(none.allocator(), &bytes);
+    execution.numeric.remaining = 100_000_000;
+    for (0..1024) |_| {
+        const result = try plan.evaluateWithExecution(&execution, &.{.{ .string = &input }});
+        try std.testing.expectEqual(@intFromPtr(&input), @intFromPtr(result.string.ptr));
+    }
+    try std.testing.expectEqual(@as(usize, 0), none.end_index);
+    execution.numeric.remaining = 10;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithExecution(&execution, &.{.{ .string = &input }}));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, execution.charge(0));
+}
+
+test "relational index system SQL durable text evaluation preserves lazy branches strict calls and allocation faults" {
+    const a = std.testing.allocator;
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const definition = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"op":"md5","args":[{"op":"replace","args":[{"op":"literal","type":"string","value":"aaaaa"},{"op":"literal","type":"string","value":"aa"},{"op":"literal","type":"string","value":"X"}]}]}
+            , .{});
+            defer definition.deinit();
+            var plan = try Plan.init(alloc, .{}, definition.value, .string);
+            defer plan.deinit();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const result = try plan.evaluate(arena.allocator(), &.{});
+            var work: exact.Context = .{ .alloc = alloc };
+            try std.testing.expectEqualStrings(&(try text_kernel.md5("XXa", &work)), result.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+    const definition = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"replace","args":[{"op":"literal","type":"string"},{"op":"case_when","args":[{"op":"eq","args":[{"op":"divide","args":[{"op":"literal","type":"integer","value":1},{"op":"literal","type":"integer","value":0}]},{"op":"literal","type":"integer","value":0}]},{"op":"literal","type":"string","value":"x"},{"op":"literal","type":"string","value":""}]},{"op":"literal","type":"string","value":""}]}
+    , .{});
+    defer definition.deinit();
+    var plan = try Plan.init(a, .{}, definition.value, .string);
+    defer plan.deinit();
+    try std.testing.expectError(error.RelationalExpressionDivisionByZero, plan.evaluate(a, &.{}));
+}
+
+test "relational index system SQL durable text dynamic search and cancellation share one owner" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "s", .path = "s", .column_type = .string },
+        .{ .name = "search", .path = "search", .column_type = .string },
+    } };
+    const definition = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"replace","args":[{"op":"column","column":"s"},{"op":"column","column":"search"},{"op":"literal","type":"string","value":"X"}]}
+    , .{});
+    defer definition.deinit();
+    var plan = try Plan.init(a, table, definition.value, .string);
+    defer plan.deinit();
+    try std.testing.expect(plan.nodes[plan.nodes.len - 1].replace_pattern == null);
+    var exact_bytes: [3]u8 = undefined;
+    var memory = std.heap.FixedBufferAllocator.init(&exact_bytes);
+    var bytes: usize = exact_bytes.len;
+    var execution = Execution.init(memory.allocator(), &bytes);
+    const result = try plan.evaluateWithExecution(&execution, &.{ .{ .string = "aaaaa" }, .{ .string = "aa" } });
+    try std.testing.expectEqualStrings("XXa", result.string);
+    try std.testing.expectEqual(@as(usize, 0), bytes);
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.QueryCanceled;
+        }
+    };
+    var control: Control = .{};
+    bytes = 4096;
+    execution = Execution.init(a, &bytes);
+    execution.numeric.checkpoint = Control.check;
+    execution.numeric.ptr = &control;
+    const wide: [4096]u8 = @splat('a');
+    try std.testing.expectError(error.QueryCanceled, plan.evaluateWithExecution(&execution, &.{ .{ .string = &wide }, .{ .string = "aaaab" } }));
+    try std.testing.expectError(error.QueryCanceled, execution.charge(0));
+}
 
 fn numericOperand(ctx: *exact.Context, value: Value, real: bool) !exact.Value {
     return switch (value) {
@@ -833,10 +1757,11 @@ fn numericOperation(execution: *Execution, node: Node, operands: []const Value, 
     const input = operands[0];
     if (node.op == .cast and input == .numeric) if (node.numeric_modifier) |modifier|
         return normalizeNumericBinding(execution, input.numeric, modifier, false);
-    if (input == .numeric and (node.op == .negate or (node.op == .cast and node.sql_type == .numeric))) {
+    if (input == .numeric and (node.op == .negate or node.op == .abs or (node.op == .cast and node.sql_type == .numeric))) {
         const View = @import("../common/sql_numeric_layout.zig").View;
         const view = try View.openWithBudget(input.numeric, .{}, &execution.numeric);
         if (node.op == .cast or view.kind == .nan or (view.kind == .finite and view.count == 0)) return input;
+        if (node.op == .abs and !view.negative and view.kind != .negative_infinity) return input;
         try execution.numeric.charge(input.numeric.len);
         const bytes = try allocateOutput(execution.alloc, input.numeric.len, execution.bytes);
         @memcpy(bytes, input.numeric);
@@ -1582,6 +2507,11 @@ fn valueOrderWithContext(a: Value, b: Value, fold_ascii: bool, context: *exact.C
         .number => |value| std.math.order(value, b.number),
         .datetime => |value| std.math.order(value, b.datetime),
         .sql_array => |array| @import("../sql/array_comparison.zig").order(try array.view(), try b.sql_array.view(), context, max_allocated_bytes),
+        .range => |range| (try range.view(context)).order(context, try b.range.view(context)),
+        .json => |json| blk: {
+            var work: @import("../sql/json_order.zig").Budget = .{ .shared = context };
+            break :blk try @import("../sql/json_order.zig").compare(json.value, b.json.value, &work, 0);
+        },
     };
 }
 
@@ -1649,12 +2579,15 @@ test "relational declarations blob views decode boundaries and validate complete
 
 fn finite(value: f64) !Value {
     if (!std.math.isFinite(value)) return error.RelationalExpressionOverflow;
-    return .{ .number = if (value == 0) 0 else value };
+    // SQL scalar results retain signed zero. Ordered keys may normalize its
+    // equality identity, but that must not erase expression result semantics.
+    return .{ .number = value };
 }
 
 fn valueHasKind(value: Value, kind: Kind) bool {
     return switch (value) {
         .null => true,
+        .range => |range| @import("../sql/range_value.zig").kindFromType(kind) == range.kind,
         inline else => |_, tag| std.mem.eql(u8, @tagName(tag), @tagName(kind)),
     };
 }
@@ -1676,6 +2609,56 @@ pub fn foldAsciiCollation(kind: Kind, collation: []const u8) !bool {
     return error.UnsupportedRelationalIndexCollation;
 }
 
+fn preparedSourceMask(nodes: []const Node) u8 {
+    var mask: u8 = 0;
+    for (nodes) |node| {
+        if (node.op != .column) continue;
+        mask |= switch (node.kind) {
+            .numeric, .sql_array, .numrange, .daterange, .tsrange, .tstzrange => @as(u8, 1),
+            .blob, .json => @as(u8, 3),
+            else => @as(u8, 0),
+        };
+    }
+    return mask;
+}
+
+const JsonLiteral = struct { value: Value, encoded_bytes: usize, fingerprint: [32]u8 };
+
+fn prepareJsonLiteral(execution: *Execution, value: std.json.Value) !JsonLiteral {
+    const order = @import("../sql/json_order.zig");
+    var work: order.Budget = .{ .shared = &execution.numeric };
+    order.validateJsonbDomain(value, &work, 0) catch |err| return switch (err) {
+        error.SqlTypeMismatch, error.SqlInvalidTextRepresentation, error.SqlNumericOutOfRange, error.SqlJsonUnicodeEscape, error.SqlInvalidTextEncoding => error.InvalidRelationalExpressionType,
+        else => executionFailure(err),
+    };
+    const identity = blk: {
+        var scratch: ExecutionScratch = undefined;
+        scratch.init(execution);
+        defer scratch.deinit();
+        const encoded = @import("../storage/db/document_content_hash.zig").canonicalJsonbValueAlloc(execution.alloc, value, &work, max_output_bytes) catch |err| {
+            if (err == error.RelationalRowResultTooLarge) return execution.limit();
+            if (err == error.InvalidBatchRequest or err == error.SqlNumericOutOfRange) return error.InvalidRelationalExpressionType;
+            return scratch.failure(err);
+        };
+        if (encoded.len > max_output_bytes) return execution.limit();
+        try execution.charge(encoded.len);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly durable JSON literal display v1\x00");
+        hash.update(encoded);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        break :blk .{ .fingerprint = digest, .encoded_bytes = encoded.len };
+    };
+    const source: @import("../sql/row_value.zig").Json = .{ .value = value };
+    const retained = try retainPreparedResult(execution, .{ .json = &source }, false);
+    // Plan is movable until installed in its schema epoch. Its immutable tree
+    // must never embed an allocator pointing at the compiler's stack arena.
+    // Plan.deinit frees the complete arena; per-container mutation/free is not
+    // part of the immutable literal interface.
+    order.rehomeArrayAllocators(&@constCast(retained.json).value, .failing, &work, 0) catch |err| return executionFailure(err);
+    return .{ .value = retained, .encoded_bytes = identity.encoded_bytes, .fingerprint = identity.fingerprint };
+}
+
 const Compiler = struct {
     alloc: Allocator,
     execution: *Execution,
@@ -1684,6 +2667,7 @@ const Compiler = struct {
     dependencies: std.ArrayList(u32) = .empty,
     hash: std.crypto.hash.Blake3 = std.crypto.hash.Blake3.init(.{}),
     visited: usize = 0,
+    allow_preparation_defaults: bool = false,
     literal_bytes: usize = 0,
 
     fn frame(self: *Compiler, bytes: []const u8) void {
@@ -1708,14 +2692,46 @@ const Compiler = struct {
         self.frame(op_value.string);
         var node: Node = .{ .op = op, .kind = undefined };
         switch (op) {
+            .transaction_timestamp => {
+                if (!self.allow_preparation_defaults or !self.table.requires_clock_defaults) return error.InvalidRelationalExpressionType;
+                node.kind = .datetime;
+                if (input.object.get("precision")) |precision| {
+                    node.clock_precision = switch (precision) {
+                        .integer => |value| std.math.cast(u8, value) orelse return error.InvalidRelationalExpression,
+                        .number_string => |value| std.fmt.parseInt(u8, value, 10) catch return error.InvalidRelationalExpression,
+                        else => return error.InvalidRelationalExpression,
+                    };
+                    if (node.clock_precision > 6) return error.InvalidRelationalExpression;
+                }
+                self.hash.update(&.{node.clock_precision});
+            },
+            .uuidv4, .uuidv7 => {
+                if (!self.allow_preparation_defaults or !self.table.requires_uuid_defaults) return error.InvalidRelationalExpressionType;
+                node.kind = .string;
+                node.sql_type = .uuid;
+                if (input.object.get("shift")) |shift| {
+                    if (op != .uuidv7 or shift != .string or shift.string.len == 0 or shift.string.len > 128) return error.InvalidRelationalExpression;
+                    const value = try @import("../sql/temporal_text.zig").parseCanonical(.interval, shift.string);
+                    node.uuid_shift = value.interval;
+                    var encoded: [16]u8 = undefined;
+                    self.frame(try @import("../sql/temporal_value.zig").encode(value, &encoded));
+                }
+            },
             .literal => {
                 const kind = input.object.get("type") orelse return error.InvalidRelationalExpression;
                 if (kind != .string) return error.InvalidRelationalExpression;
                 node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpression;
                 const value = input.object.get("value") orelse .null;
+                const marker = input.object.get("json_null");
+                if (marker) |present| {
+                    if (node.kind != .json or present != .bool or !self.table.requires_json_expressions) return error.InvalidRelationalExpressionType;
+                    if (present.bool and value != .null) return error.InvalidRelationalExpression;
+                }
+                const json_null = if (marker) |present| present.bool else false;
                 switch (node.kind) {
                     .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array => {},
-                    .json => if (value != .null) return error.InvalidRelationalExpressionType,
+                    .numrange, .daterange, .tsrange, .tstzrange => if (!self.table.requires_range_expressions) return error.InvalidRelationalExpressionType,
+                    .json => if ((value != .null or json_null) and !self.table.requires_json_expressions) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
                 }
                 if (node.kind == .blob and value == .string and value.string.len > std.base64.standard.Encoder.calcSize(max_output_bytes)) return error.RelationalExpressionBudgetExceeded;
@@ -1724,7 +2740,9 @@ const Compiler = struct {
                     if (identity != .string) return error.InvalidRelationalExpressionType;
                     node.sql_type = std.meta.stringToEnum(Numeric, identity.string) orelse return error.InvalidRelationalExpressionType;
                 }
-                node.literal = (if (node.kind == .sql_array) arrayJson(self.execution, node.sql_type.?, value, null) else if (node.kind == .numeric) numericJson(self.execution, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
+                var json_literal: ?JsonLiteral = null;
+                if (node.kind == .json and (value != .null or json_null)) json_literal = try prepareJsonLiteral(self.execution, value);
+                node.literal = (if (json_literal) |literal| literal.value else if (node.kind == .sql_array) arrayJson(self.execution, node.sql_type.?, value, null) else if (node.kind == .numeric) numericJson(self.execution, value) else if (@import("../sql/range_value.zig").kindFromType(node.kind)) |range_kind| rangeJson(self.execution, range_kind, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.SqlProgramLimitExceeded, error.RelationalExpressionBudgetExceeded => return err,
                     else => return error.InvalidRelationalExpressionType,
@@ -1742,6 +2760,8 @@ const Compiler = struct {
                 self.literal_bytes += switch (node.literal) {
                     .string, .blob, .numeric => |bytes| bytes.len,
                     .sql_array => |array| array.bytes.len,
+                    .range => |range| range.bytes.len,
+                    .json => json_literal.?.encoded_bytes,
                     .datetime => 16,
                     else => 8,
                 };
@@ -1766,6 +2786,13 @@ const Compiler = struct {
                         self.hash.update(&bytes);
                     },
                     .sql_array => |array| self.frame(array.bytes),
+                    .range => |range| {
+                        self.frame(@tagName(range.kind));
+                        self.frame(range.bytes);
+                    },
+                    // Program identity includes observable JSONB display
+                    // scale, unlike the row's semantic content hash.
+                    .json => self.frame(&json_literal.?.fingerprint),
                 }
             },
             .column => {
@@ -1781,6 +2808,8 @@ const Compiler = struct {
                 if (node.kind == .sql_array and node.sql_type == null) return error.InvalidRelationalExpressionType;
                 switch (node.kind) {
                     .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array => {},
+                    .numrange, .daterange, .tsrange, .tstzrange => {},
+                    .json => if (!self.table.requires_json_expressions) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
                 }
                 if (std.mem.indexOfScalar(u32, self.dependencies.items, node.ordinal) == null) try self.dependencies.append(self.alloc, node.ordinal);
@@ -1838,6 +2867,21 @@ const Compiler = struct {
                             if (candidate.kind != .boolean) return error.InvalidRelationalExpressionType;
                         } else if (!sameOperandType(candidate, operand)) return error.InvalidRelationalExpressionType;
                     }
+                } else if (jsonFunction(op)) {
+                    if (!self.table.requires_json_expressions or operand.kind != .json) return error.InvalidRelationalExpressionType;
+                    for (children[1..]) |child| if (self.nodes.items[child].kind != .string) return error.InvalidRelationalExpressionType;
+                    node.kind = switch (op) {
+                        .jsonb_extract_path => .json,
+                        .jsonb_array_length => .integer,
+                        else => .string,
+                    };
+                    if (op == .jsonb_array_length) node.sql_type = .int32;
+                } else if (numericFunction(op) != null) {
+                    if (operand.kind != .integer and operand.kind != .number and operand.kind != .numeric) return error.InvalidRelationalExpressionType;
+                    if (operand.kind == .integer and op != .abs) return error.InvalidRelationalExpressionType;
+                    if (operand.kind == .number and op != .abs and numericIdentity(operand) != .float64) return error.InvalidRelationalExpressionType;
+                    if (children.len == 2 and (operand.kind != .numeric or self.nodes.items[children[1]].kind != .integer or numericIdentity(self.nodes.items[children[1]]) != .int32)) return error.InvalidRelationalExpressionType;
+                    node.sql_type = numericIdentity(operand);
                 } else for (children[1..]) |child| if (!sameOperandType(self.nodes.items[child], operand)) return error.InvalidRelationalExpressionType;
                 if (isComparison(op) or op == .in_list or op == .not_in_list) {
                     if (input.object.get("collation")) |collation| {
@@ -1856,10 +2900,10 @@ const Compiler = struct {
                         if ((operand.kind == .sql_array) != (node.kind == .sql_array)) return error.InvalidRelationalExpressionType;
                         if (input.object.get("sql_type") == null) return error.InvalidRelationalExpression;
                     },
-                    .add, .subtract, .multiply, .divide, .negate => if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType,
+                    .add, .subtract, .multiply, .divide, .negate, .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType,
                     // PostgreSQL has no float4/float8 remainder operator.
                     .modulo => if (node.kind != .integer and node.kind != .numeric) return error.InvalidRelationalExpressionType,
-                    .concat, .lower_ascii, .upper_ascii => if (node.kind != .string) return error.InvalidRelationalExpressionType,
+                    .concat, .lower_ascii, .upper_ascii, .replace, .md5 => if (node.kind != .string) return error.InvalidRelationalExpressionType,
                     .coalesce, .case_when => {
                         if (node.kind == .sql_array) node.sql_type = operand.sql_type;
                         if (node.kind == .integer or node.kind == .number or node.kind == .numeric) {
@@ -1875,6 +2919,7 @@ const Compiler = struct {
                     .is_null, .is_not_null => node.kind = .boolean,
                     .in_list, .not_in_list => node.kind = .boolean,
                     .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct => {},
+                    .jsonb_typeof, .jsonb_array_length, .jsonb_extract_path, .jsonb_extract_path_text => {},
                     else => unreachable,
                 }
             },
@@ -1882,6 +2927,10 @@ const Compiler = struct {
         if (input.object.get("sql_type")) |identity| {
             if (identity != .string) return error.InvalidRelationalExpressionType;
             const typed = std.meta.stringToEnum(Numeric, identity.string) orelse return error.InvalidRelationalExpressionType;
+            // Function identity follows its resolved operand. Assignment or
+            // width conversion is an explicit surrounding cast, not an
+            // undeclared float4 overload or narrowed integer ABS operation.
+            if (numericFunction(op) != null and typed != numericIdentity(self.nodes.items[node.children[0]])) return error.InvalidRelationalExpressionType;
             if (node.kind != .sql_array and (node.kind != .integer or !casts.integral(typed)) and (node.kind != .number or !casts.floating(typed)) and (node.kind != .numeric or typed != .numeric)) return error.InvalidRelationalExpressionType;
             if (node.kind == .sql_array and op == .cast and self.nodes.items[node.children[0]].sql_type != typed) return error.InvalidRelationalExpressionType;
             node.sql_type = typed;
@@ -1903,6 +2952,16 @@ const Compiler = struct {
             std.mem.writeInt(u16, identity[0..2], modifier.precision, .little);
             std.mem.writeInt(i16, identity[2..4], modifier.scale, .little);
             self.frame(&identity);
+        }
+        if (op == .replace) {
+            const search = self.nodes.items[node.children[1]];
+            if (search.op == .literal and search.literal == .string) {
+                const bytes = std.math.mul(usize, search.literal.string.len, @sizeOf(usize)) catch return error.RelationalExpressionBudgetExceeded;
+                if (bytes > max_allocated_bytes -| self.literal_bytes) return error.RelationalExpressionBudgetExceeded;
+                self.literal_bytes += bytes;
+                const links = try self.alloc.alloc(usize, search.literal.string.len);
+                node.replace_pattern = try text_kernel.Pattern.init(search.literal.string, links, &self.execution.numeric);
+            }
         }
         const index: u16 = @intCast(self.nodes.items.len);
         try self.nodes.append(self.alloc, node);
@@ -2446,10 +3505,10 @@ test "relational declarations NUMERIC defaults generated topology and strict res
             try std.testing.expectEqualStrings("9007199254740993.0003", document.value.object.get("sum").?.number_string);
             try std.testing.expectEqualStrings("-9007199254740993.0003", document.value.object.get("negative").?.number_string);
             try set.verifyJson(alloc, document.value);
-            // Restore accepts logically equivalent display scales but never
-            // repairs missing or forged generated values.
+            // Logical comparison ignores display scale, but authenticated
+            // restoration must preserve the canonical generated display.
             try document.value.object.put(document.arena.allocator(), "sum", .{ .number_string = "9007199254740993.000300" });
-            try set.verifyJson(alloc, document.value);
+            try invalidGenerated(alloc, set, document.value);
             try document.value.object.put(document.arena.allocator(), "sum", .{ .number_string = "9007199254740993.0004" });
             try invalidGenerated(alloc, set, document.value);
             _ = document.value.object.swapRemove("sum");
@@ -3099,7 +4158,48 @@ pub const Set = struct {
     read_columns: []bool,
     generated_columns: []bool,
     modifier_ordinals: []const u32,
-    pub const Binding = struct { ordinal: u32, generated: bool, plan: Plan };
+    pub const Binding = struct {
+        ordinal: u32,
+        generated: bool,
+        source: union(enum) {
+            expression: Plan,
+            sequence: @import("../system_catalog/column_sequences.zig").Owned,
+        },
+
+        fn dependencies(self: *const Binding) []const u32 {
+            return switch (self.source) {
+                .expression => |*plan| plan.dependencies,
+                .sequence => &.{},
+            };
+        }
+        fn deinit(self: *Binding) void {
+            switch (self.source) {
+                .expression => |*plan| plan.deinit(),
+                .sequence => |*owned| owned.deinit(),
+            }
+        }
+        fn evaluate(self: *const Binding, execution: *Execution, values: []const Value, column_name: []const u8) !Value {
+            return switch (self.source) {
+                .expression => |*plan| plan.evaluateWithExecution(execution, values),
+                .sequence => |*owned| blk: {
+                    try execution.charge(1);
+                    const provider = if (execution.preparation_runtime) |runtime| runtime.sequences else null;
+                    const source = provider orelse return error.SequenceProviderUnavailable;
+                    const scope = execution.preparation_runtime.?.sequence_scope orelse return error.SequenceProviderUnavailable;
+                    if (scope.table_id != owned.value.owner.table_id) return error.CatalogGenerationChanged;
+                    // This containing row-preparation boundary owns effects;
+                    // immutable scalar bytecode never performs allocator I/O.
+                    break :blk .{ .integer = try source.allocate(source.ptr, execution.alloc, scope, column_name, owned.value) };
+                },
+            };
+        }
+        fn fingerprint(self: *const Binding) [32]u8 {
+            return switch (self.source) {
+                .expression => |*plan| plan.fingerprint,
+                .sequence => |*owned| owned.value.fingerprint(),
+            };
+        }
+    };
 
     pub fn createOwned(alloc: Allocator, table: schema.TableSchema, defaults: std.json.Value, generated: std.json.Value) !*Set {
         const default_entries = try entries(defaults);
@@ -3110,7 +4210,7 @@ pub const Set = struct {
         var initialized: usize = 0;
         var total_nodes: usize = 0;
         var total_literal_bytes: usize = 0;
-        errdefer for (bindings[0..initialized]) |*binding| binding.plan.deinit();
+        errdefer for (bindings[0..initialized]) |*binding| binding.deinit();
         for ([_][]const std.json.Value{ default_entries, generated_entries }, 0..) |declarations, mode| {
             for (declarations) |entry| {
                 if (entry != .object or entry.object.count() != 2) return error.InvalidRelationalExpression;
@@ -3120,14 +4220,26 @@ pub const Set = struct {
                     if (std.mem.eql(u8, column.name, name.string)) break @intCast(i);
                 } else return error.RelationalIndexColumnNotFound;
                 for (bindings[0..initialized]) |binding| if (binding.ordinal == ordinal) return error.InvalidRelationalExpression;
-                var plan = try Plan.init(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type);
+                if (entry.object.get("sequence")) |reference| {
+                    if (mode != 0 or !table.requires_sequence_defaults or table.relational_columns[ordinal].column_type != .integer)
+                        return error.InvalidRelationalExpressionType;
+                    var owned = try @import("../system_catalog/column_sequences.zig").Binding.parse(alloc, reference);
+                    errdefer owned.deinit();
+                    total_nodes += 1;
+                    total_literal_bytes += owned.value.target.database.len + owned.value.target.namespace.len + owned.value.target.table.len + @sizeOf(@TypeOf(owned.value));
+                    if (total_nodes > 4096 or total_literal_bytes > max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
+                    bindings[initialized] = .{ .ordinal = ordinal, .generated = false, .source = .{ .sequence = owned } };
+                    initialized += 1;
+                    continue;
+                }
+                var plan = if (mode == 0) try Plan.initDefault(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type) else try Plan.init(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type);
                 errdefer plan.deinit();
                 if (plan.result_kind == .sql_array and plan.result_sql_type != table.relational_columns[ordinal].sql_element_type) return error.InvalidRelationalExpressionType;
                 total_nodes += plan.nodes.len;
                 total_literal_bytes += plan.literal_bytes;
                 if (total_nodes > 4096 or total_literal_bytes > max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
                 if (mode == 0 and plan.dependencies.len != 0) return error.InvalidRelationalExpression;
-                bindings[initialized] = .{ .ordinal = ordinal, .generated = mode != 0, .plan = plan };
+                bindings[initialized] = .{ .ordinal = ordinal, .generated = mode != 0, .source = .{ .expression = plan } };
                 initialized += 1;
             }
         }
@@ -3140,7 +4252,7 @@ pub const Set = struct {
         errdefer alloc.free(generated_columns);
         @memset(generated_columns, false);
         for (bindings) |binding| {
-            for (binding.plan.dependencies) |ordinal| read_columns[ordinal] = true;
+            for (binding.dependencies()) |ordinal| read_columns[ordinal] = true;
             if (binding.generated) {
                 read_columns[binding.ordinal] = true;
                 generated_columns[binding.ordinal] = true;
@@ -3165,7 +4277,7 @@ pub const Set = struct {
         if (states[index] == 2) return;
         if (states[index] == 1) return error.RelationalGeneratedColumnCycle;
         states[index] = 1;
-        for (bindings[index].plan.dependencies) |dependency| for (bindings, 0..) |binding, i| {
+        for (bindings[index].dependencies()) |dependency| for (bindings, 0..) |binding, i| {
             if (binding.ordinal == dependency) try visit(bindings, order, states, written, i);
         };
         states[index] = 2;
@@ -3175,7 +4287,7 @@ pub const Set = struct {
 
     pub fn deinit(self: *Set) void {
         self.alloc.free(self.modifier_ordinals);
-        for (self.bindings) |*binding| binding.plan.deinit();
+        for (self.bindings) |*binding| binding.deinit();
         self.alloc.free(self.bindings);
         self.alloc.free(self.order);
         self.alloc.free(self.read_columns);
@@ -3203,6 +4315,10 @@ pub const Set = struct {
     }
 
     pub fn applyValuesWithExecution(self: *const Set, execution: *Execution, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool) !void {
+        return self.applyValuesPhase(execution, values, present, defaults, default_mask, .complete);
+    }
+
+    fn applyValuesPhase(self: *const Set, execution: *Execution, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool, phase: PreparationPhase) !void {
         if (values.len != self.table.relational_columns.len or present.len != values.len or (default_mask != null and default_mask.?.len != values.len)) return error.InvalidRelationalExpressionInput;
         // Base assignments must cross the target domain before any generated
         // expression reads them. Ignore submitted generated fields and keep
@@ -3213,8 +4329,9 @@ pub const Set = struct {
         }
         for (self.order) |index| {
             const binding = &self.bindings[index];
+            if (phase == .candidate and binding.generated) continue;
             if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence or (default_mask != null and !default_mask.?[binding.ordinal]))) continue;
-            values[binding.ordinal] = try self.normalizeBinding(execution, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
+            values[binding.ordinal] = try self.normalizeBinding(execution, binding.ordinal, try binding.evaluate(execution, values, self.table.relational_columns[binding.ordinal].name));
             present[binding.ordinal] = true;
         }
     }
@@ -3228,7 +4345,30 @@ pub const Set = struct {
     }
 
     pub fn applyJsonWithExecution(self: *const Set, execution: *Execution, document: *std.json.Value) !void {
+        var roots: @import("../sql/row_value.zig").JsonRow = undefined;
+        roots.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer roots.deinit();
+        try roots.bindAdmission(execution.bytes);
+        var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+        nulls.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer nulls.deinit();
+        try nulls.bindAdmission(execution.bytes);
+        try self.applyTypedJsonWithExecution(execution, document, &roots, &nulls);
+        // A representation-only caller cannot discard new typed provenance.
+        // Typed preparation must retain the supplied owner through encoding.
+        if (nulls.fields.count() != 0 and !self.table.requires_document_expressions) return error.InvalidRelationalExpressionInput;
+    }
+
+    pub fn applyTypedJsonWithExecution(self: *const Set, execution: *Execution, document: *std.json.Value, roots: *@import("../sql/row_value.zig").JsonRow, nulls: *@import("../sql/row_value.zig").JsonNulls) !void {
+        return self.applyTypedJsonPhase(execution, document, roots, nulls, .complete);
+    }
+
+    pub fn applyTypedJsonPhase(self: *const Set, execution: *Execution, document: *std.json.Value, roots: *@import("../sql/row_value.zig").JsonRow, nulls: *@import("../sql/row_value.zig").JsonNulls, phase: PreparationPhase) !void {
         execution.numeric.charge(0) catch |err| return executionFailure(err);
+        if (roots.context != &execution.numeric or nulls.context != &execution.numeric or
+            roots.admission == null or nulls.admission == null or
+            roots.admission.?.remaining != execution.bytes or nulls.admission.?.remaining != execution.bytes)
+            return error.InvalidRelationalExpressionInput;
         if (document.* != .object) return error.InvalidBatchRequest;
         const alloc = execution.alloc;
         const count = self.table.relational_columns.len;
@@ -3240,8 +4380,8 @@ pub const Set = struct {
         const present = try alloc.alloc(bool, values.len);
         defer alloc.free(present);
         execution.bytes.* -= staging_bytes;
-        try self.readValues(execution, document.*, values, present, true);
-        try self.applyValuesWithExecution(execution, values, present, .apply_to_absent, null);
+        try self.readValues(execution, document.*, values, present, true, roots, nulls);
+        try self.applyValuesPhase(execution, values, present, if (phase == .selected) .preserve_absence else .apply_to_absent, null, phase);
         for (self.modifier_ordinals) |ordinal| {
             if (self.generated_columns[ordinal]) continue;
             const column = self.table.relational_columns[ordinal];
@@ -3253,12 +4393,21 @@ pub const Set = struct {
             };
         }
         for (self.bindings) |binding| {
+            if ((phase == .candidate and binding.generated) or (phase == .selected and !binding.generated)) continue;
             const name = self.table.relational_columns[binding.ordinal].name;
             if (!binding.generated and document.object.contains(name)) continue;
             const value = values[binding.ordinal];
+            if (self.table.requires_document_expressions and value == .null) {
+                if (self.table.relational_columns[binding.ordinal].column_type == .json)
+                    nulls.assign(name, value) catch |err| return executionFailure(err);
+                _ = document.object.orderedRemove(name);
+                continue;
+            }
             const key = try allocateOutput(alloc, name.len, execution.bytes);
             @memcpy(key, name);
             try document.object.put(alloc, key, try boundedValueToJson(execution, value));
+            if (self.table.relational_columns[binding.ordinal].column_type == .json)
+                nulls.assign(name, value) catch |err| return executionFailure(err);
         }
     }
 
@@ -3271,14 +4420,18 @@ pub const Set = struct {
     }
 
     pub fn verifyJsonWithExecution(self: *const Set, execution: *Execution, document: std.json.Value) !void {
+        return self.verifyTypedJsonWithExecution(execution, document, &.{});
+    }
+
+    pub fn verifyTypedJsonWithExecution(self: *const Set, execution: *Execution, document: std.json.Value, json_null_fields: []const []const u8) !void {
         try execution.charge(0);
         var scratch: ExecutionScratch = undefined;
         scratch.init(execution);
         defer scratch.deinit();
-        self.verifyJsonInner(execution, document) catch |err| return scratch.failure(err);
+        self.verifyJsonInner(execution, document, json_null_fields) catch |err| return scratch.failure(err);
     }
 
-    fn verifyJsonInner(self: *const Set, execution: *Execution, document: std.json.Value) !void {
+    fn verifyJsonInner(self: *const Set, execution: *Execution, document: std.json.Value, json_null_fields: []const []const u8) !void {
         const has_generated = for (self.bindings) |binding| {
             if (binding.generated) break true;
         } else false;
@@ -3287,7 +4440,32 @@ pub const Set = struct {
         try execution.charge(self.table.relational_columns.len);
         const values = try execution.alloc.alloc(Value, self.table.relational_columns.len);
         const present = try execution.alloc.alloc(bool, values.len);
-        try self.readValues(execution, document, values, present, false);
+        var roots: @import("../sql/row_value.zig").JsonRow = undefined;
+        roots.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer roots.deinit();
+        try roots.bindAdmission(execution.bytes);
+        var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+        nulls.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer nulls.deinit();
+        try nulls.bindAdmission(execution.bytes);
+        try nulls.import(json_null_fields);
+        try self.readValues(execution, document, values, present, false, &roots, &nulls);
+        // Logical transport may spell NUMERIC(p,s) with an equivalent scale.
+        // First reject any coefficient changed by assignment, then normalize
+        // only this unpublished typed shadow to the declared domain. The
+        // document is unchanged; generated expressions are never repaired.
+        // Physical verifyRow has no such allowance: its caller admitted the
+        // exact canonical bytes already, including typmod display metadata.
+        for (self.modifier_ordinals) |ordinal| {
+            if (!present[ordinal] or values[ordinal] == .null) continue;
+            const modifier = self.table.relational_columns[ordinal].numeric_modifier.?;
+            if (values[ordinal] == .sql_array) {
+                _ = try normalizeNumericArrayBinding(execution, values[ordinal], modifier, true);
+            } else if (values[ordinal] == .numeric) {
+                _ = try normalizeNumericBinding(execution, values[ordinal].numeric, modifier, true);
+            } else return error.InvalidRelationalGeneratedValue;
+            values[ordinal] = try self.normalizeBinding(execution, ordinal, values[ordinal]);
+        }
         try self.verifyValues(execution, values, present);
     }
 
@@ -3313,6 +4491,13 @@ pub const Set = struct {
             if (binding.generated) break true;
         } else false;
         if (!has_generated) return;
+        // One stable decoded owner spans every generated binding. Its sparse
+        // cache is keyed by physical source ordinal, not by a logical ordinal
+        // that may change across immutable historical schema layouts.
+        var json_owner: @import("../sql/row_value.zig").JsonRow = undefined;
+        json_owner.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer json_owner.deinit();
+        try json_owner.bindAdmission(execution.bytes);
         try execution.charge(self.table.relational_columns.len);
         const values = try execution.alloc.alloc(Value, self.table.relational_columns.len);
         const present = try execution.alloc.alloc(bool, values.len);
@@ -3333,9 +4518,11 @@ pub const Set = struct {
                 .integer => .{ .integer = cell.value.i64_val },
                 .number => .{ .number = cell.value.f64_val },
                 .numeric => .{ .numeric = cell.value.bytes_val },
+                .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../sql/range_value.zig").kindFromType(column.column_type).?, .bytes = cell.value.bytes_val } },
                 .sql_array => .{ .sql_array = .{ .element_type = column.sql_element_type orelse return error.InvalidRelationalGeneratedValue, .bytes = cell.value.bytes_val } },
                 .boolean => .{ .boolean = cell.value.bool_val },
                 .datetime => .{ .datetime = cell.value.u64_val },
+                .json => .{ .json = try json_owner.decodePinned(std.math.cast(u32, physical) orelse return error.InvalidRelationalGeneratedValue, cell.value.bytes_val) },
                 else => return error.InvalidRelationalGeneratedValue,
             };
         }
@@ -3357,15 +4544,14 @@ pub const Set = struct {
         for (self.order) |index| {
             const binding = &self.bindings[index];
             if (!binding.generated) continue;
-            if (!present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
-            const expected = try self.normalizeBinding(execution, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
+            if (!present[binding.ordinal] and !self.table.requires_document_expressions) return error.InvalidRelationalGeneratedValue;
+            const expected = try self.normalizeBinding(execution, binding.ordinal, try binding.evaluate(execution, values, self.table.relational_columns[binding.ordinal].name));
+            if (!present[binding.ordinal] and !(self.table.requires_document_expressions and expected == .null)) return error.InvalidRelationalGeneratedValue;
+            // SQL NULL is absence in document storage. JSON null remains a
+            // present JSON datum; a forged present null is not canonical.
+            if (self.table.requires_document_expressions and expected == .null and present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
             const actual = values[binding.ordinal];
-            const equal = if (std.meta.activeTag(expected) != std.meta.activeTag(actual))
-                false
-            else if (expected == .null)
-                true
-            else
-                (compareValues(execution, expected, actual, false) catch |err| return executionFailure(err)) == .eq;
+            const equal = generatedDisplayEqual(execution, expected, actual) catch |err| return executionFailure(err);
             if (!equal) return error.InvalidRelationalGeneratedValue;
         }
     }
@@ -3399,7 +4585,7 @@ pub const Set = struct {
         };
     }
 
-    fn readValues(self: *const Set, execution: *Execution, document: std.json.Value, values: []Value, present: []bool, ignore_generated: bool) !void {
+    fn readValues(self: *const Set, execution: *Execution, document: std.json.Value, values: []Value, present: []bool, ignore_generated: bool, roots: *@import("../sql/row_value.zig").JsonRow, nulls: ?*@import("../sql/row_value.zig").JsonNulls) !void {
         for (self.table.relational_columns, values, present, 0..) |column, *value, *exists, ordinal| {
             const input = document.object.get(column.name);
             exists.* = input != null;
@@ -3409,8 +4595,17 @@ pub const Set = struct {
             if (!self.read_columns[ordinal] or (ignore_generated and self.generated_columns[ordinal])) continue;
             if (input) |scalar| switch (column.column_type) {
                 .numeric => value.* = try numericJson(execution, scalar),
+                .numrange, .daterange, .tsrange, .tstzrange => value.* = try rangeJson(execution, @import("../sql/range_value.zig").kindFromType(column.column_type).?, scalar),
                 .sql_array => value.* = try arrayJson(execution, column.sql_element_type orelse return error.InvalidRelationalExpressionInput, scalar, null),
                 .blob => value.* = try decodeBlob(execution, try BlobOperand.fromJson(scalar)),
+                .json => {
+                    const present_json_null = scalar == .null and (self.table.requires_document_expressions or if (nulls) |owner|
+                        owner.contains(column.name) catch |err| return executionFailure(err)
+                    else
+                        false);
+                    if (scalar != .null or present_json_null)
+                        value.* = .{ .json = roots.pinValue(scalar) catch |err| return executionFailure(err) };
+                },
                 .string, .boolean, .datetime, .integer, .number => value.* = try scalarJson(execution.alloc, column.column_type, scalar, false),
                 else => {},
             };
@@ -3418,13 +4613,229 @@ pub const Set = struct {
     }
 };
 
+/// Generated restore results retain observable display, not only SQL equality.
+/// Encoded NUMERIC/arrays are authenticated canonical values in one active
+/// codec; comparing their display metadata never changes semantic row hashes.
+fn generatedDisplayEqual(execution: *Execution, expected: Value, actual: Value) !bool {
+    if (std.meta.activeTag(expected) != std.meta.activeTag(actual)) return false;
+    if (expected == .null) return true;
+    if (expected == .json) {
+        var work: @import("../sql/json_order.zig").Budget = .{ .shared = &execution.numeric };
+        return @import("../sql/json_order.zig").sameDisplay(expected.json.value, actual.json.value, &work, 0);
+    }
+    if (expected == .numeric) {
+        // Validate once, retaining the same borrowed views for value and scale.
+        const left = try binary.layout.View.openWithBudget(expected.numeric, .{}, &execution.numeric);
+        const right = try binary.layout.View.openWithBudget(actual.numeric, .{}, &execution.numeric);
+        return left.scale == right.scale and try left.order(right, &execution.numeric) == .eq;
+    }
+    if (expected == .sql_array) {
+        if (expected.sql_array.element_type != actual.sql_array.element_type) return false;
+        // Value.Array is a pinned canonical-codec capability, not producer
+        // input. verifyRow's caller already checked canonicality/checksums;
+        // parsed envelopes enter through the canonical owning encoder.
+        // Exact bytes retain every observable scale/zero bit without decoding
+        // JSONB cells again. This is not a storage-format migration identity.
+        _ = try expected.sql_array.view();
+        _ = try actual.sql_array.view();
+        return try orderBytes(expected.sql_array.bytes, actual.sql_array.bytes, false, &execution.numeric) == .eq;
+    }
+    if (expected == .range) {
+        if (expected.range.kind != actual.range.kind) return false;
+        _ = try expected.range.view(&execution.numeric);
+        _ = try actual.range.view(&execution.numeric);
+        return try orderBytes(expected.range.bytes, actual.range.bytes, false, &execution.numeric) == .eq;
+    }
+    if (try compareValues(execution, expected, actual, false) != .eq) return false;
+    return switch (expected) {
+        .number => |number| if (number == 0) std.math.signbit(number) == std.math.signbit(actual.number) else true,
+        else => true,
+    };
+}
+
+test "relational index system generated restore rejects display forgeries with unchanged SQL equality" {
+    const a = std.testing.allocator;
+    const Helper = struct {
+        fn cell(alloc: Allocator, ordinal: u32, column: schema.RelationalColumn, value: Value) !codec.Cell {
+            var result: codec.Cell = .{ .ordinal = ordinal, .path = column.path, .value_type = .bytes_val, .value = .{ .bytes_val = &.{} } };
+            switch (value) {
+                .json => |json| {
+                    var work: @import("../sql/json_order.zig").Budget = .{};
+                    result.is_json = true;
+                    result.value.bytes_val = try @import("../sql/jsonb_text.zig").format(alloc, json.value, max_output_bytes, &work);
+                },
+                .numeric => |bytes| {
+                    result.is_numeric = true;
+                    result.value.bytes_val = bytes;
+                },
+                .sql_array => |array| {
+                    result.sql_array_element_type = array.element_type;
+                    result.value.bytes_val = array.bytes;
+                },
+                .number => |number| {
+                    result.value_type = .f64_val;
+                    result.value = .{ .f64_val = number };
+                },
+                else => return error.UnexpectedDisplayFixture,
+            }
+            return result;
+        }
+        fn check(alloc: Allocator, expected: Value, forged: Value) !void {
+            const kind = std.meta.stringToEnum(Kind, @tagName(std.meta.activeTag(expected))) orelse return error.UnexpectedDisplayFixture;
+            const element: ?Numeric = switch (expected) {
+                .numeric => .numeric,
+                .number => .float64,
+                .sql_array => |array| array.element_type,
+                else => null,
+            };
+            const columns = [_]schema.RelationalColumn{
+                .{ .name = "source", .path = "source", .column_type = kind, .is_json = kind == .json, .json_kind = if (kind == .json) .any else .none, .sql_element_type = element },
+                .{ .name = "target", .path = "target", .column_type = kind, .is_json = kind == .json, .json_kind = if (kind == .json) .any else .none, .sql_element_type = element },
+            };
+            const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = kind == .json, .requires_jsonb_display = kind == .json, .requires_exact_numeric_expressions = kind == .numeric, .requires_exact_numeric_validation = kind == .numeric, .requires_array_expressions = kind == .sql_array, .requires_jsonb_array_display = kind == .sql_array and element == .jsonb, .relational_columns = &columns };
+            const bytes = try schema.serializeSchema(alloc, table);
+            defer alloc.free(bytes);
+            const owned = try schema.deserializeSchema(alloc, bytes);
+            const definition = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"column\":\"target\",\"expression\":{\"op\":\"column\",\"column\":\"source\"}}]", .{});
+            defer definition.deinit();
+            const set = Set.createOwned(alloc, owned, .null, definition.value) catch |err| {
+                schema.freeSchema(alloc, owned);
+                return err;
+            };
+            defer set.deinit();
+            var region: std.heap.ArenaAllocator = .init(alloc);
+            defer region.deinit();
+            var remaining: usize = max_allocated_bytes;
+            var execution = Execution.init(region.allocator(), &remaining);
+            try std.testing.expectEqual(std.math.Order.eq, try compareValues(&execution, expected, forged, false));
+            try std.testing.expect(!try generatedDisplayEqual(&execution, expected, forged));
+            const present = [_]bool{ true, true };
+            try set.verifyValues(&execution, &.{ expected, expected }, &present);
+            try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyValues(&execution, &.{ expected, forged }, &present));
+            var layout = try codec.PhysicalLayout.init(alloc, set.table);
+            defer layout.deinit();
+            for ([_]bool{ false, true }) |tampered| {
+                const cells = [_]codec.Cell{
+                    try cell(region.allocator(), 0, set.table.relational_columns[0], expected),
+                    try cell(region.allocator(), 1, set.table.relational_columns[1], if (tampered) forged else expected),
+                };
+                const row_bytes = try codec.serializePreparedOrdinalDeferredHash(region.allocator(), 1, set.table.relational_columns, &cells, &layout);
+                try codec.finalizeOrdinalMetadata(row_bytes, @splat(0), 0);
+                const row = try codec.ordinalRowView(row_bytes, set.table, &layout);
+                if (tampered) try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyRow(region.allocator(), row)) else try set.verifyRow(region.allocator(), row);
+            }
+        }
+    };
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const alloc = region.allocator();
+    var parsing: @import("../sql/json_order.zig").Budget = .{};
+    const left_json: @import("../sql/row_value.zig").Json = .{ .value = try @import("../sql/json_order.zig").parseTextLeaky(alloc, "{\"n\":1.20}", &parsing) };
+    const right_json: @import("../sql/row_value.zig").Json = .{ .value = try @import("../sql/json_order.zig").parseTextLeaky(alloc, "{\"n\":1.2}", &parsing) };
+    try Helper.check(a, .{ .json = &left_json }, .{ .json = &right_json });
+    var numeric_context: exact.Context = .{ .alloc = alloc };
+    var left_number = try exact.parse(&numeric_context, "1.20");
+    defer left_number.deinit();
+    var right_number = try exact.parse(&numeric_context, "1.2");
+    defer right_number.deinit();
+    const left_bytes = try binary.encodeAlloc(&numeric_context, left_number.value);
+    const right_bytes = try binary.encodeAlloc(&numeric_context, right_number.value);
+    try Helper.check(a, .{ .numeric = left_bytes }, .{ .numeric = right_bytes });
+    try Helper.check(a, .{ .number = -0.0 }, .{ .number = 0.0 });
+    const arrays = @import("../sql/array_value.zig");
+    for ([_]Numeric{ .jsonb, .numeric, .float64 }) |element| {
+        const left_cell: arrays.Element = switch (element) {
+            .jsonb => arrays.Element.json(.{ .number_string = "1.20" }),
+            .numeric => arrays.Element.typedNumeric(&left_number.value),
+            else => arrays.Element.json(.{ .float = -0.0 }),
+        };
+        const right_cell: arrays.Element = switch (element) {
+            .jsonb => arrays.Element.json(.{ .number_string = "1.2" }),
+            .numeric => arrays.Element.typedNumeric(&right_number.value),
+            else => arrays.Element.json(.{ .float = 0.0 }),
+        };
+        const left_array = try @import("../sql/array_storage.zig").encodeAlloc(alloc, try arrays.Value.init(element, &.{.{ .length = 2, .lower = -3 }}, &.{ left_cell, .{} }, .{}), .{});
+        const right_array = try @import("../sql/array_storage.zig").encodeAlloc(alloc, try arrays.Value.init(element, &.{.{ .length = 2, .lower = -3 }}, &.{ right_cell, .{} }, .{}), .{});
+        try Helper.check(a, .{ .sql_array = .{ .element_type = element, .bytes = left_array } }, .{ .sql_array = .{ .element_type = element, .bytes = right_array } });
+    }
+}
+
+test "relational index system generated logical restore normalizes typmod display aliases without repairing values" {
+    const a = std.testing.allocator;
+    for ([_]Kind{ .numeric, .sql_array }) |kind| {
+        const columns = [_]schema.RelationalColumn{
+            .{ .name = "source", .path = "source", .column_type = kind, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+            .{ .name = "target", .path = "target", .column_type = kind, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+        };
+        const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_exact_numeric_expressions = kind == .numeric, .requires_exact_numeric_validation = kind == .numeric, .requires_array_expressions = kind == .sql_array, .requires_numeric_modifiers = true, .relational_columns = &columns };
+        const bytes = try schema.serializeSchema(a, table);
+        defer a.free(bytes);
+        const owned = try schema.deserializeSchema(a, bytes);
+        const definition = try std.json.parseFromSlice(std.json.Value, a, "[{\"column\":\"target\",\"expression\":{\"op\":\"column\",\"column\":\"source\"}}]", .{});
+        defer definition.deinit();
+        const set = Set.createOwned(a, owned, .null, definition.value) catch |err| {
+            schema.freeSchema(a, owned);
+            return err;
+        };
+        defer set.deinit();
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        const input = if (kind == .numeric) "{\"source\":1.2,\"target\":1.2}" else "{\"source\":{\"dimensions\":[{\"length\":1,\"lower_bound\":-2}],\"values\":[\"1.2\"],\"sql_nulls\":[false]},\"target\":{\"dimensions\":[{\"length\":1,\"lower_bound\":-2}],\"values\":[\"1.2\"],\"sql_nulls\":[false]}}";
+        const document = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), input, .{ .parse_numbers = false });
+        const source = if (kind == .numeric) document.object.getPtr("source").? else &document.object.getPtr("source").?.object.getPtr("values").?.array.items[0];
+        const target = if (kind == .numeric) document.object.getPtr("target").? else &document.object.getPtr("target").?.object.getPtr("values").?.array.items[0];
+        try set.verifyJson(region.allocator(), document);
+        try std.testing.expectEqualStrings("1.2", if (kind == .numeric) source.number_string else source.string);
+        try std.testing.expectEqualStrings("1.2", if (kind == .numeric) target.number_string else target.string);
+        target.* = if (kind == .numeric) .{ .number_string = "1.3" } else .{ .string = "1.3" };
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyJson(region.allocator(), document));
+        source.* = if (kind == .numeric) .{ .number_string = "1.234" } else .{ .string = "1.234" };
+        target.* = source.*;
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyJson(region.allocator(), document));
+    }
+}
+
+test "relational index system generated array display verification streams authenticated bytes without allocations" {
+    const a = std.testing.allocator;
+    const arrays = @import("../sql/array_value.zig");
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"n\":1.20,\"a\":[null,true]}", .{ .parse_numbers = false });
+    const cells = try region.allocator().alloc(arrays.Element, 1000);
+    @memset(cells, arrays.Element.json(json));
+    const encoded = try @import("../sql/array_storage.zig").encodeAlloc(region.allocator(), try arrays.Value.init(.jsonb, &.{.{ .length = 1000 }}, cells, .{}), .{});
+    const value: Value = .{ .sql_array = .{ .element_type = .jsonb, .bytes = encoded } };
+    const independent = try region.allocator().dupe(u8, encoded);
+    const other: Value = .{ .sql_array = .{ .element_type = .jsonb, .bytes = independent } };
+    try std.testing.expect(encoded.ptr != independent.ptr);
+    var old_bytes: usize = max_allocated_bytes;
+    var old = Execution.init(a, &old_bytes);
+    const old_start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..8) |_| try std.testing.expectEqual(std.math.Order.eq, try compareValues(&old, value, other, false));
+    const old_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - old_start;
+    var new_bytes: usize = max_allocated_bytes;
+    var current = Execution.init(.failing, &new_bytes);
+    const new_start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..8) |_| try std.testing.expect(try generatedDisplayEqual(&current, value, other));
+    const new_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - new_start;
+    try std.testing.expectEqual(max_allocated_bytes, new_bytes);
+    std.debug.print("generated JSONB array verification: cells=1000 iterations=8 bytes={d} old_logical_ns={d} display_ns={d} display_allocations=0\n", .{ encoded.len, old_ns, new_ns });
+    const cost = 8 * 1024 * 1024 - current.numeric.remaining;
+    current.numeric.remaining = cost / 8;
+    try std.testing.expect(try generatedDisplayEqual(&current, value, other));
+    try std.testing.expectEqual(@as(u64, 0), current.numeric.remaining);
+    current.numeric.remaining = cost / 8 - 1;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, generatedDisplayEqual(&current, value, other));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, generatedDisplayEqual(&current, value, other));
+}
+
 fn valuesEqual(a: Value, b: Value) !bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .null => true,
         .string => |bytes| std.mem.eql(u8, bytes, b.string),
         .blob => |bytes| std.mem.eql(u8, bytes, b.blob),
-        .numeric, .sql_array => try valueOrder(a, b, false) == .eq,
+        .numeric, .sql_array, .json, .range => try valueOrder(a, b, false) == .eq,
         .integer => |value| value == b.integer,
         .number => |value| value == b.number,
         .boolean => |value| value == b.boolean,
@@ -3545,8 +4956,10 @@ test "relational declarations constant folding owns output and shares sticky adm
 
 fn boundedValueToJson(execution: *Execution, value: Value) !std.json.Value {
     return switch (value) {
+        .json => |json| cloneJsonOutput(execution, json.*),
         .numeric => |bytes| numericJsonOutput(execution, bytes),
         .sql_array => |array| arrayJsonOutputLeaky(execution, array),
+        .range => |range| rangeJsonOutput(execution, range),
         .string => |bytes| blk: {
             const output = try allocateOutput(execution.alloc, bytes.len, execution.bytes);
             @memcpy(output, bytes);
@@ -3567,6 +4980,54 @@ fn boundedValueToJson(execution: *Execution, value: Value) !std.json.Value {
     };
 }
 
+fn retainPreparedResult(execution: *Execution, value: Value, decoded: bool) !Value {
+    // JSON headers themselves can belong to the temporary owner even when
+    // their ingress DOM is borrowed. Always own the whole returned tree.
+    if (value == .json) {
+        const Json = @import("../sql/row_value.zig").Json;
+        try execution.charge(1);
+        if (@sizeOf(Json) > execution.bytes.*) return execution.limit();
+        execution.bytes.* -= @sizeOf(Json);
+        const output = try execution.alloc.create(Json);
+        errdefer execution.alloc.destroy(output);
+        output.* = .{ .value = try cloneJsonOutput(execution, value.json.*) };
+        return .{ .json = output };
+    }
+    // Ordinary scalar programs still borrow cold/ingress scalar payloads and
+    // allocate nothing here. Once JSON was decoded, a derived scalar may point
+    // into its tree. Copy at this lifetime boundary rather than escaping it.
+    if (!decoded) return value;
+    return switch (value) {
+        inline .string, .blob, .numeric => |bytes, tag| @unionInit(Value, @tagName(tag), try retainPreparedBytes(execution, bytes)),
+        .sql_array => |array| .{ .sql_array = .{ .element_type = array.element_type, .bytes = try retainPreparedBytes(execution, array.bytes) } },
+        .range => |range| .{ .range = .{ .kind = range.kind, .bytes = try retainPreparedBytes(execution, range.bytes) } },
+        else => value,
+    };
+}
+
+fn retainPreparedBytes(execution: *Execution, bytes: []const u8) ![]const u8 {
+    try execution.charge(bytes.len);
+    const output = try allocateOutput(execution.alloc, bytes.len, execution.bytes);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = offset + @min(bytes.len - offset, 256);
+        try execution.numeric.pollCheckpoint(end - offset);
+        @memcpy(output[offset..end], bytes[offset..end]);
+        offset = end;
+    }
+    return output;
+}
+
+fn cloneJsonOutput(execution: *Execution, json: @import("../sql/row_value.zig").Json) !std.json.Value {
+    var memory: @import("../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true };
+    defer execution.bytes.* -|= memory.footprint();
+    var work: @import("../sql/json_order.zig").Budget = .{ .shared = &execution.numeric };
+    var output = (json.cloneLeaky(memory.allocator(), &work) catch |err| return if (err == error.OutOfMemory and memory.isExhausted()) execution.limit() else executionFailure(err)).value;
+    // Never retain the temporary admission allocator in managed JSON arrays.
+    @import("../sql/json_order.zig").rehomeArrayAllocators(&output, execution.alloc, &work, 0) catch |err| return executionFailure(err);
+    return output;
+}
+
 fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
     return switch (value) {
         .null => .null,
@@ -3578,6 +5039,7 @@ fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
         .integer => |integer| .{ .integer = integer },
         .number => |number| .{ .float = number },
         .numeric => |bytes| @import("../sql/numeric_storage.zig").jsonValueAlloc(alloc, bytes),
+        .range => |range| @import("../sql/range_storage.zig").jsonValueAlloc(alloc, range.kind, range.bytes),
         .boolean => |boolean| .{ .bool = boolean },
         .datetime => |datetime| .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{datetime}) },
         .sql_array => |array| blk: {
@@ -3585,7 +5047,607 @@ fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
             var execution = Execution.init(alloc, &allowance);
             break :blk arrayJsonOutputLeaky(&execution, array);
         },
+        .json => |json| blk: {
+            var allowance: usize = max_allocated_bytes;
+            var execution = Execution.init(alloc, &allowance);
+            break :blk cloneJsonOutput(&execution, json.*);
+        },
     };
+}
+
+test "relational index system legacy preparation is bound once to operand source shape" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "s", .path = "s", .column_type = .string },
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric },
+        .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 },
+        .{ .name = "b", .path = "b", .column_type = .blob },
+    } };
+    for ([_]struct { name: []const u8, kind: Kind, mask: u8 }{
+        .{ .name = "s", .kind = .string, .mask = 0 },
+        .{ .name = "n", .kind = .numeric, .mask = 1 },
+        .{ .name = "a", .kind = .sql_array, .mask = 1 },
+        .{ .name = "b", .kind = .blob, .mask = 3 },
+    }) |case| {
+        const source = try std.fmt.allocPrint(a, "{{\"op\":\"column\",\"column\":\"{s}\"}}", .{case.name});
+        defer a.free(source);
+        var definition = try std.json.parseFromSlice(std.json.Value, a, source, .{});
+        defer definition.deinit();
+        var plan = try Plan.init(a, table, definition.value, case.kind);
+        defer plan.deinit();
+        try std.testing.expectEqual(case.mask, plan.prepared_sources);
+        if (case.kind == .string) {
+            var document = try std.json.parseFromSlice(std.json.Value, a, "{\"s\":\"borrowed\"}", .{});
+            defer document.deinit();
+            var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            var bytes: usize = max_allocated_bytes;
+            var execution = Execution.init(denied.allocator(), &bytes);
+            const result = try plan.evaluateJsonWithExecution(&execution, document.value);
+            try std.testing.expectEqual(document.value.object.get("s").?.string.ptr, result.string.ptr);
+            try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+            try std.testing.expectEqual(max_allocated_bytes, bytes);
+        }
+    }
+}
+
+test "relational index system durable JSON functions match PostgreSQL path contracts behind capability" {
+    const a = std.testing.allocator;
+    const Fixture = struct { entries: []const struct { sql: []const u8, value: std.json.Value = .null, sql_null: ?bool = null, oid: ?u32 = null, @"error": ?[]const u8 = null } };
+    const fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../sql/fixtures/sql_json_path_reference.json"), .{ .ignore_unknown_fields = true, .parse_numbers = false });
+    defer fixture.deinit();
+    // A test-only structural bridge feeds already typed native programs from
+    // the independent SQL oracle. It does not activate public SQL lowering.
+    const Native = struct {
+        fn expression(alloc: Allocator, input: *const @import("../sql/ast.zig").Scalar, expected: Kind) anyerror!std.json.Value {
+            var result: std.json.ObjectMap = .empty;
+            switch (input.*) {
+                .literal => |raw| {
+                    var value: std.json.Value = switch (raw) {
+                        .null => .null,
+                        .string => |text| .{ .string = text },
+                        else => return error.UnexpectedJsonFixture,
+                    };
+                    if (expected == .json and raw != .null) {
+                        if (raw != .string) return error.UnexpectedJsonFixture;
+                        var work: @import("../sql/json_order.zig").Budget = .{};
+                        value = try @import("../sql/json_order.zig").parseTextLeaky(alloc, raw.string, &work);
+                        if (value == .null) try result.put(alloc, "json_null", .{ .bool = true });
+                    }
+                    try result.put(alloc, "op", .{ .string = "literal" });
+                    try result.put(alloc, "type", .{ .string = @tagName(expected) });
+                    try result.put(alloc, "value", value);
+                },
+                .call => |call| {
+                    const op = std.meta.stringToEnum(Op, call.name) orelse return error.UnexpectedJsonFixture;
+                    if (!jsonFunction(op)) return error.UnexpectedJsonFixture;
+                    var args = std.json.Array.init(alloc);
+                    for (call.args, 0..) |arg, i| try args.append(try expression(alloc, arg, if (i == 0) .json else .string));
+                    try result.put(alloc, "op", .{ .string = @tagName(op) });
+                    try result.put(alloc, "args", .{ .array = args });
+                },
+                else => return error.UnexpectedJsonFixture,
+            }
+            return .{ .object = result };
+        }
+    };
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true };
+    var checked: usize = 0;
+    for (fixture.value.entries) |entry| {
+        if (entry.@"error" != null) continue; // SQL signature/input errors remain the binder's contract.
+        errdefer std.debug.print("native JSON oracle: {s}\n", .{entry.sql});
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        var parsed = try @import("../sql/compiler.zig").compileScalar(a, entry.sql, .{});
+        defer parsed.deinit();
+        const kind: Kind = switch (entry.oid.?) {
+            3802 => .json,
+            25 => .string,
+            23 => .integer,
+            else => return error.UnexpectedJsonFixture,
+        };
+        const definition = try Native.expression(region.allocator(), parsed.expression, kind);
+        var plan = try Plan.init(a, table, definition, kind);
+        defer plan.deinit();
+        const actual = try plan.evaluate(region.allocator(), &.{});
+        try std.testing.expectEqual(entry.sql_null orelse (entry.value == .null), actual == .null);
+        const rendered = try valueToJson(region.allocator(), actual);
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(region.allocator(), entry.value, .{}), try std.json.Stringify.valueAlloc(region.allocator(), rendered, .{}));
+        if (kind == .integer) try std.testing.expectEqual(@as(?Numeric, .int32), plan.result_sql_type);
+        var guarded = table;
+        guarded.requires_json_expressions = false;
+        try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, guarded, definition, kind));
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 25), checked);
+}
+
+test "relational index system durable JSON columns reuse pinned roots and fuse structural consumers" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const bytes = try codec.serializePreparedOrdinalDeferredHash(a, 1, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = "{\"k\":\"owned\",\"n\":1.20,\"a\":[null,{\"s\":\"owned\"}]}" } },
+    }, &layout);
+    defer a.free(bytes);
+    try codec.finalizeOrdinalMetadata(bytes, @splat(0), 0);
+    const cold = try codec.ordinalRowView(bytes, table, &layout);
+    const Compile = struct {
+        fn run(backing: Allocator, binding: schema.TableSchema, source: []const u8, kind: Kind) !Plan {
+            const parsed = try std.json.parseFromSlice(std.json.Value, backing, source, .{});
+            defer parsed.deinit();
+            return Plan.init(backing, binding, parsed.value, kind);
+        }
+    };
+    var text = try Compile.run(a, table, "{\"op\":\"jsonb_extract_path_text\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"k\"}]}", .string);
+    defer text.deinit();
+    var length = try Compile.run(a, table, "{\"op\":\"jsonb_array_length\",\"args\":[{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"}]}]}", .integer);
+    defer length.deinit();
+    var json = try Compile.run(a, table, "{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"-1\"}]}", .json);
+    defer json.deinit();
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    var allowance: usize = max_allocated_bytes;
+    var execution = Execution.init(region.allocator(), &allowance);
+    var input: PreparedInput = undefined;
+    try input.initRow(&execution, cold);
+    defer input.deinit();
+    const first = try text.evaluatePreparedWithExecution(&execution, &input);
+    try std.testing.expectEqualStrings("owned", first.string);
+    try std.testing.expectEqual(@as(i64, 2), (try length.evaluatePreparedWithExecution(&execution, &input)).integer);
+    try std.testing.expectEqual(@as(usize, 1), input.preparations);
+    try std.testing.expectEqual(@as(usize, 1), input.roots.decodes);
+    const before = allowance;
+    execution.alloc = .failing;
+    execution.numeric.alloc = .failing;
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const reused = try text.evaluatePreparedWithExecution(&execution, &input);
+        try std.testing.expectEqual(first.string.ptr, reused.string.ptr);
+        try std.testing.expectEqual(@as(i64, 2), (try length.evaluatePreparedWithExecution(&execution, &input)).integer);
+    }
+    std.debug.print("durable JSON pinned path: evaluations=20000 decodes={d} output_allocations=0 elapsed_ns={d}\n", .{ input.roots.decodes, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
+    try std.testing.expectEqual(before, allowance);
+    execution.alloc = region.allocator();
+    execution.numeric.alloc = region.allocator();
+    const selected = try json.evaluatePreparedWithExecution(&execution, &input);
+    try std.testing.expectEqualStrings("owned", selected.json.value.object.get("s").?.string);
+    // Legacy retained results must outlive the temporary decoded-root owner
+    // and the physical source. Mutating the retired source proves no alias.
+    const retired = try a.dupe(u8, bytes);
+    defer a.free(retired);
+    const source = try codec.ordinalRowView(retired, table, &layout);
+    const owned_text = try text.evaluateRowWithExecution(&execution, source);
+    const owned_json = try json.evaluateBoundRowWithExecution(&execution, source);
+    @memset(retired, 0);
+    try std.testing.expectEqualStrings("owned", owned_text.string);
+    try std.testing.expectEqualStrings("owned", owned_json.json.value.object.get("s").?.string);
+    var reordered = table;
+    reordered.version = 99;
+    reordered.relational_columns = &.{
+        .{ .name = "other", .path = "other", .column_type = .string },
+        table.relational_columns[0],
+    };
+    var same = try Compile.run(a, reordered, "{\"op\":\"jsonb_extract_path_text\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"k\"}]}", .string);
+    defer same.deinit();
+    try std.testing.expectEqualSlices(u8, &text.fingerprint, &same.fingerprint);
+    try std.testing.expectEqual(@as(u32, 1), same.dependencies[0]);
+    try std.testing.expectEqualStrings("owned", (try same.evaluateRowWithExecution(&execution, cold)).string);
+    const hot = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"j\":{\"k\":\"owned\",\"a\":[null,{\"s\":\"owned\"}]}}", .{});
+    var hot_input: PreparedInput = undefined;
+    try hot_input.initJson(&execution, hot, null);
+    defer hot_input.deinit();
+    const hot_text = try text.evaluatePreparedWithExecution(&execution, &hot_input);
+    try std.testing.expectEqual(hot.object.get("j").?.object.get("k").?.string.ptr, hot_text.string.ptr);
+    try std.testing.expectEqual(@as(i64, 2), (try length.evaluatePreparedWithExecution(&execution, &hot_input)).integer);
+    try std.testing.expectEqual(@as(usize, 1), hot_input.preparations);
+    try std.testing.expectEqual(@as(usize, 0), hot_input.roots.decodes);
+}
+
+test "relational index system durable JSON functions keep strict selection type and null provenance" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    const Compile = struct {
+        fn run(backing: Allocator, binding: schema.TableSchema, source: []const u8, kind: Kind) !Plan {
+            const parsed = try std.json.parseFromSlice(std.json.Value, backing, source, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            return Plan.init(backing, binding, parsed.value, kind);
+        }
+    };
+    for ([_]struct { value: []const u8, expected: []const u8 }{
+        .{ .value = "null", .expected = "null" },
+        .{ .value = "true", .expected = "boolean" },
+        .{ .value = "1.20", .expected = "number" },
+        .{ .value = "\"x\"", .expected = "string" },
+        .{ .value = "[]", .expected = "array" },
+        .{ .value = "{}", .expected = "object" },
+    }) |case| {
+        const definition = try std.fmt.allocPrint(a, "{{\"op\":\"jsonb_typeof\",\"args\":[{{\"op\":\"literal\",\"type\":\"json\",\"value\":{s}{s}}}]}}", .{ case.value, if (std.mem.eql(u8, case.value, "null")) ",\"json_null\":true" else "" });
+        defer a.free(definition);
+        var plan = try Compile.run(a, table, definition, .string);
+        defer plan.deinit();
+        try std.testing.expectEqualStrings(case.expected, (try plan.evaluate(.failing, &.{})).string);
+    }
+    for ([_][]const u8{ "null", "true", "1", "\"text\"", "{}" }) |scalar| {
+        const definition = try std.fmt.allocPrint(a, "{{\"op\":\"jsonb_array_length\",\"args\":[{{\"op\":\"literal\",\"type\":\"json\",\"value\":{s}{s}}}]}}", .{ scalar, if (std.mem.eql(u8, scalar, "null")) ",\"json_null\":true" else "" });
+        defer a.free(definition);
+        var plan = try Compile.run(a, table, definition, .integer);
+        defer plan.deinit();
+        try std.testing.expectError(error.InvalidRelationalExpressionInput, plan.evaluate(.failing, &.{}));
+    }
+    for ([_][]const u8{
+        "{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"}]}",
+        "{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"integer\",\"value\":1}]}",
+        "{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"literal\",\"type\":\"string\",\"value\":\"{}\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"}]}",
+    }, 0..) |invalid, i| {
+        try std.testing.expectError(if (i == 0) error.InvalidRelationalExpression else error.InvalidRelationalExpressionType, Compile.run(a, table, invalid, .json));
+    }
+    // Missing/NULL path components must not suppress a later selected error.
+    const failing_key = "{\"op\":\"case_when\",\"args\":[{\"op\":\"eq\",\"args\":[{\"op\":\"divide\",\"args\":[{\"op\":\"literal\",\"type\":\"integer\",\"value\":1},{\"op\":\"literal\",\"type\":\"integer\",\"value\":0}]},{\"op\":\"literal\",\"type\":\"integer\",\"value\":0}]},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"b\"}]}";
+    for ([_][]const u8{ "null", "{}" }) |source| for ([_][]const u8{ "null", "\"missing\"" }) |key| {
+        const definition = try std.fmt.allocPrint(a, "{{\"op\":\"jsonb_extract_path_text\",\"args\":[{{\"op\":\"literal\",\"type\":\"json\",\"value\":{s}}},{{\"op\":\"literal\",\"type\":\"string\",\"value\":{s}}},{s}]}}", .{ source, key, failing_key });
+        defer a.free(definition);
+        var plan = try Compile.run(a, table, definition, .string);
+        defer plan.deinit();
+        try std.testing.expectError(error.RelationalExpressionDivisionByZero, plan.evaluate(.failing, &.{}));
+    };
+    const guarded_failure = try std.fmt.allocPrint(a, "{{\"op\":\"jsonb_extract_path_text\",\"args\":[{{\"op\":\"literal\",\"type\":\"json\",\"value\":null}},{{\"op\":\"literal\",\"type\":\"string\",\"value\":null}},{s}]}}", .{failing_key});
+    defer a.free(guarded_failure);
+    const lazy = try std.fmt.allocPrint(a, "{{\"op\":\"coalesce\",\"args\":[{{\"op\":\"literal\",\"type\":\"string\",\"value\":\"ok\"}},{s}]}}", .{guarded_failure});
+    defer a.free(lazy);
+    var selected = try Compile.run(a, table, lazy, .string);
+    defer selected.deinit();
+    try std.testing.expectEqualStrings("ok", (try selected.evaluate(.failing, &.{})).string);
+    var typeof = try Compile.run(a, table, "{\"op\":\"jsonb_typeof\",\"args\":[{\"op\":\"column\",\"column\":\"j\"}]}", .string);
+    defer typeof.deinit();
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    var allowance: usize = max_allocated_bytes;
+    var execution = Execution.init(region.allocator(), &allowance);
+    const document = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"j\":null}", .{});
+    var markers: @import("../sql/row_value.zig").JsonNulls = undefined;
+    markers.initRegion(region.allocator(), allowance, &execution.numeric);
+    defer markers.deinit();
+    try markers.bindAdmission(&allowance);
+    try markers.import(&.{"j"});
+    var present: PreparedInput = undefined;
+    try present.initJson(&execution, document, &markers);
+    defer present.deinit();
+    try std.testing.expectEqualStrings("null", (try typeof.evaluatePreparedWithExecution(&execution, &present)).string);
+    var sql_null: PreparedInput = undefined;
+    try sql_null.initJson(&execution, document, null);
+    defer sql_null.deinit();
+    try std.testing.expect((try typeof.evaluatePreparedWithExecution(&execution, &sql_null)) == .null);
+}
+
+test "relational index system durable JSON formatting and retention unwind every allocation and cancellation cut" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const wide: [1024]u8 = @splat('x');
+    const raw = try std.fmt.allocPrint(a, "{{\"a\":{{\"k\":\"{s}\",\"n\":1.20}}}}", .{&wide});
+    defer a.free(raw);
+    const bytes = try codec.serializePreparedOrdinalDeferredHash(a, 1, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = raw } },
+    }, &layout);
+    defer a.free(bytes);
+    try codec.finalizeOrdinalMetadata(bytes, @splat(0), 0);
+    const cold = try codec.ordinalRowView(bytes, table, &layout);
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = 0,
+        fn check(ptr: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    const Run = struct {
+        fn run(backing: Allocator, binding: schema.TableSchema, source: codec.OrdinalRowView, kind: Kind, control: *Control) !void {
+            const definition = try std.fmt.allocPrint(backing, "{{\"op\":\"{s}\",\"args\":[{{\"op\":\"column\",\"column\":\"j\"}},{{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"}}]}}", .{if (kind == .json) "jsonb_extract_path" else "jsonb_extract_path_text"});
+            defer backing.free(definition);
+            const parsed = try std.json.parseFromSlice(std.json.Value, backing, definition, .{});
+            defer parsed.deinit();
+            var plan = try Plan.init(backing, binding, parsed.value, kind);
+            defer plan.deinit();
+            var region: std.heap.ArenaAllocator = .init(backing);
+            defer region.deinit();
+            var remaining: usize = max_allocated_bytes;
+            var execution = Execution.init(region.allocator(), &remaining);
+            execution.numeric.checkpoint = Control.check;
+            execution.numeric.ptr = control;
+            const value = plan.evaluateRowWithExecution(&execution, source) catch |err| {
+                if (err == error.QueryCanceled) {
+                    try std.testing.expectError(error.QueryCanceled, execution.charge(0));
+                    try std.testing.expectError(error.QueryCanceled, plan.evaluateRowWithExecution(&execution, source));
+                }
+                return err;
+            };
+            if (kind == .json) {
+                try std.testing.expectEqualStrings("1.20", value.json.value.object.get("n").?.number_string);
+            } else {
+                try std.testing.expect(std.mem.endsWith(u8, value.string, "\", \"n\": 1.20}"));
+            }
+        }
+    };
+    for ([_]Kind{ .json, .string }) |kind| {
+        var observed: Control = .{};
+        try Run.run(a, table, cold, kind, &observed);
+        for (1..observed.polls + 1) |cut| {
+            var canceled: Control = .{ .fail_at = cut };
+            try std.testing.expectError(error.QueryCanceled, Run.run(a, table, cold, kind, &canceled));
+        }
+        var healthy: Control = .{};
+        var stable: std.testing.FailingAllocator = .init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ table, cold, kind, &healthy });
+    }
+}
+
+test "relational index system durable JSON generated text shares typed preparation identity and restore verification" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "metadata", .path = "metadata", .column_type = .json, .is_json = true, .json_kind = .any },
+        .{ .name = "source_key", .path = "source_key", .column_type = .string },
+    } };
+    const Compile = struct {
+        fn run(alloc: Allocator, binding: schema.TableSchema, key: []const u8) !*Set {
+            const bytes = try schema.serializeSchema(alloc, binding);
+            defer alloc.free(bytes);
+            const owned = try schema.deserializeSchema(alloc, bytes);
+            errdefer schema.freeSchema(alloc, owned);
+            const definition = try std.fmt.allocPrint(alloc, "[{{\"column\":\"source_key\",\"expression\":{{\"op\":\"jsonb_extract_path_text\",\"args\":[{{\"op\":\"column\",\"column\":\"metadata\"}},{{\"op\":\"literal\",\"type\":\"string\",\"value\":\"{s}\"}}]}}}}]", .{key});
+            defer alloc.free(definition);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, definition, .{});
+            defer parsed.deinit();
+            return Set.createOwned(alloc, owned, .null, parsed.value);
+        }
+    };
+    const set = try Compile.run(a, table, "source");
+    defer set.deinit();
+    const changed = try Compile.run(a, table, "other");
+    defer changed.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &generatedFingerprint(set), &generatedFingerprint(changed)));
+    var moved_table = table;
+    moved_table.version = 999;
+    moved_table.relational_columns = &.{ table.relational_columns[1], table.relational_columns[0] };
+    const moved = try Compile.run(a, moved_table, "source");
+    defer moved.deinit();
+    try std.testing.expectEqualSlices(u8, &generatedFingerprint(set), &generatedFingerprint(moved));
+    for ([_]struct { json: []const u8, expected: ?[]const u8 }{
+        .{ .json = "{\"metadata\":{\"source\":1.2300e2},\"source_key\":\"forged\"}", .expected = "123.00" },
+        .{ .json = "{\"metadata\":{\"source\":true}}", .expected = "true" },
+        .{ .json = "{\"metadata\":{\"source\":null}}", .expected = null },
+        .{ .json = "{\"metadata\":{}}", .expected = null },
+    }) |case| {
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        var document = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), case.json, .{ .parse_numbers = false });
+        var remaining: usize = max_allocated_bytes;
+        var execution = Execution.init(region.allocator(), &remaining);
+        var roots: @import("../sql/row_value.zig").JsonRow = undefined;
+        roots.initRegion(region.allocator(), remaining, &execution.numeric);
+        defer roots.deinit();
+        try roots.bindAdmission(&remaining);
+        var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+        nulls.initRegion(region.allocator(), remaining, &execution.numeric);
+        defer nulls.deinit();
+        try nulls.bindAdmission(&remaining);
+        try set.applyTypedJsonWithExecution(&execution, &document, &roots, &nulls);
+        if (case.expected) |text| try std.testing.expectEqualStrings(text, document.object.get("source_key").?.string) else try std.testing.expect(document.object.get("source_key").? == .null);
+        const markers = try nulls.snapshot();
+        try set.verifyTypedJsonWithExecution(&execution, document, markers);
+        try document.object.put(region.allocator(), "source_key", .{ .string = "forged" });
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyTypedJsonWithExecution(&execution, document, markers));
+        try std.testing.expectEqual(@as(usize, 0), roots.decodes);
+    }
+}
+
+test "relational index system JSON literal ownership and display identity require explicit capability" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true };
+    const input = "{\"op\":\"literal\",\"type\":\"json\",\"value\":{\"b\":[null,[\"owned\"]],\"a\":1.20}}";
+    const Compile = struct {
+        fn run(backing: Allocator, binding: schema.TableSchema, source: []const u8) !Plan {
+            var parsed = try std.json.parseFromSlice(std.json.Value, backing, source, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            return Plan.init(backing, binding, parsed.value, .json);
+        }
+    };
+    const Run = struct {
+        fn run(backing: Allocator, binding: schema.TableSchema, source: []const u8) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            const owned = region.allocator();
+            var bytes: usize = max_allocated_bytes;
+            var execution = Execution.init(owned, &bytes);
+            const output = blk: {
+                var plan = try Compile.run(backing, binding, source);
+                defer plan.deinit();
+                try std.testing.expectEqual(@as(u8, 0), plan.prepared_sources);
+                // An explicit pinned-plan caller borrows the immutable tree
+                // without allocating. Moving the Plan leaves no stack arena
+                // allocator embedded in its JSON array metadata.
+                const literal = try plan.evaluate(.failing, &.{});
+                try std.testing.expectEqualStrings("1.20", literal.json.value.object.get("a").?.number_string);
+                try std.testing.expectEqual(Allocator.failing.vtable, literal.json.value.object.get("b").?.array.allocator.vtable);
+                try std.testing.expectEqual(Allocator.failing.vtable, literal.json.value.object.get("b").?.array.items[1].array.allocator.vtable);
+                try std.testing.expectEqual(literal.json, (try plan.evaluate(.failing, &.{})).json);
+                break :blk try plan.evaluateJsonWithExecution(&execution, .{ .object = .empty });
+            };
+            try std.testing.expectEqualStrings("owned", output.json.value.object.get("b").?.array.items[1].array.items[0].string);
+            try std.testing.expectEqualStrings("1.20", output.json.value.object.get("a").?.number_string);
+            try std.testing.expectEqual(owned.ptr, output.json.value.object.get("b").?.array.allocator.ptr);
+            const nested = &@constCast(output.json).value.object.getPtr("b").?.array.items[1].array;
+            try std.testing.expectEqual(owned.ptr, nested.allocator.ptr);
+            try nested.ensureTotalCapacity(nested.capacity + 16);
+        }
+    };
+    try Run.run(a, table, input);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ table, input });
+    var first = try Compile.run(a, table, input);
+    defer first.deinit();
+    var equivalent = try Compile.run(a, table, "{\"op\":\"literal\",\"type\":\"json\",\"value\":{\"a\":120e-2,\"b\":[null,[\"owned\"]]}}");
+    defer equivalent.deinit();
+    try std.testing.expectEqualSlices(u8, &first.fingerprint, &equivalent.fingerprint);
+    var different_display = try Compile.run(a, table, "{\"op\":\"literal\",\"type\":\"json\",\"value\":{\"a\":1.2,\"b\":[null,[\"owned\"]]}}");
+    defer different_display.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &first.fingerprint, &different_display.fingerprint));
+    try std.testing.expect(try valuesEqual(try first.evaluate(.failing, &.{}), try different_display.evaluate(.failing, &.{})));
+    var sql_null = try Compile.run(a, table, "{\"op\":\"literal\",\"type\":\"json\",\"value\":null}");
+    defer sql_null.deinit();
+    var json_null = try Compile.run(a, table, "{\"op\":\"literal\",\"type\":\"json\",\"value\":null,\"json_null\":true}");
+    defer json_null.deinit();
+    var omitted = try Compile.run(a, table, "{\"op\":\"literal\",\"type\":\"json\",\"json_null\":true}");
+    defer omitted.deinit();
+    try std.testing.expectEqualSlices(u8, &json_null.fingerprint, &omitted.fingerprint);
+    const omitted_value = try omitted.evaluate(.failing, &.{});
+    try std.testing.expect(omitted_value == .json and omitted_value.json.value == .null);
+    try std.testing.expectEqual(Value.null, try sql_null.evaluate(.failing, &.{}));
+    const present = try json_null.evaluate(.failing, &.{});
+    try std.testing.expect(present == .json and present.json.value == .null);
+    try std.testing.expect(!std.mem.eql(u8, &sql_null.fingerprint, &json_null.fingerprint));
+    var old = table;
+    old.requires_json_expressions = false;
+    try std.testing.expectError(error.InvalidRelationalExpressionType, Compile.run(a, old, input));
+    try std.testing.expectError(error.InvalidRelationalExpressionType, Compile.run(a, old, "{\"op\":\"literal\",\"type\":\"json\",\"value\":null,\"json_null\":true}"));
+    for ([_][]const u8{
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":{},\"json_null\":true}",
+    }) |invalid| try std.testing.expectError(error.InvalidRelationalExpression, Compile.run(a, table, invalid));
+    for ([_][]const u8{
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":null,\"json_null\":1}",
+        "{\"op\":\"literal\",\"type\":\"integer\",\"value\":1,\"json_null\":false}",
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":1e131072}",
+    }) |invalid| try std.testing.expectError(error.InvalidRelationalExpressionType, Compile.run(a, table, invalid));
+    for ([_][]const u8{
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":\"\\u0000\"}",
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":{\"\\u0000\":1}}",
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":[{\"k\":\"\\u0000\"}]}",
+    }) |invalid| try std.testing.expectError(error.SqlUntranslatableCharacter, Compile.run(a, table, invalid));
+}
+
+test "relational index system legacy expression results survive prepared input and ingress retirement" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const encoded = try codec.serializePreparedOrdinalDeferredHash(a, 1, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = "{\"a\":[\"owned\"],\"n\":1.20}" } },
+    }, &layout);
+    defer a.free(encoded);
+    try codec.finalizeOrdinalMetadata(encoded, @splat(0), 0);
+    const row = try codec.ordinalRowView(encoded, table, &layout);
+    const Run = struct {
+        fn run(backing: Allocator, cold: codec.OrdinalRowView) !void {
+            var result_region = std.heap.ArenaAllocator.init(backing);
+            defer result_region.deinit();
+            const owned = result_region.allocator();
+            var bytes: usize = max_allocated_bytes;
+            var execution = Execution.init(owned, &bytes);
+            // Exercise the internal ownership boundary without admitting the
+            // still-guarded public JSON column compiler grammar.
+            var plan: Plan = .{ .arena = .init(backing), .nodes = &.{.{ .op = .column, .kind = .json, .column_name = "j" }}, .dependencies = &.{0}, .fingerprint = @splat(0), .result_kind = .json, .literal_bytes = 0 };
+            defer plan.deinit();
+            const named = try plan.evaluateRowWithExecution(&execution, cold);
+            const bound = try plan.evaluateBoundRowWithExecution(&execution, cold);
+            const ingress = blk: {
+                var source = std.heap.ArenaAllocator.init(backing);
+                defer source.deinit();
+                const document = try std.json.parseFromSliceLeaky(std.json.Value, source.allocator(), "{\"j\":{\"a\":[\"owned\"],\"n\":1.20}}", .{ .parse_numbers = false });
+                const result = try plan.evaluateJsonWithExecution(&execution, document);
+                try std.testing.expect(result.json.value.object.get("a").?.array.items[0].string.ptr != document.object.get("j").?.object.get("a").?.array.items[0].string.ptr);
+                break :blk result;
+            };
+            for ([_]Value{ named, bound, ingress }) |result| {
+                try std.testing.expectEqualStrings("1.20", result.json.value.object.get("n").?.number_string);
+                var array = &@constCast(result.json).value.object.getPtr("a").?.array;
+                try std.testing.expectEqualStrings("owned", array.items[0].string);
+                try std.testing.expectEqual(owned.ptr, array.allocator.ptr);
+                try std.testing.expectEqual(owned.vtable, array.allocator.vtable);
+                // Force allocation after the temporary owner and ingress DOM
+                // retire; no embedded allocator may point at a dead owner.
+                try array.ensureTotalCapacity(array.capacity + 16);
+            }
+            const retained_scalar = blk: {
+                var source: @import("../sql/row_value.zig").JsonRow = undefined;
+                source.init(backing, max_allocated_bytes, &execution.numeric);
+                defer source.deinit();
+                const root = try source.decodePinned(0, "\"decoded scalar\"");
+                const borrowed: Value = .{ .string = root.value.string };
+                const result = try retainPreparedResult(&execution, borrowed, true);
+                try std.testing.expect(result.string.ptr != borrowed.string.ptr);
+                break :blk result;
+            };
+            try std.testing.expectEqualStrings("decoded scalar", retained_scalar.string);
+            const json_null: @import("../sql/row_value.zig").Json = .{ .value = .null };
+            const retained_null = try retainPreparedResult(&execution, .{ .json = &json_null }, false);
+            try std.testing.expect(retained_null == .json and retained_null.json.value == .null);
+            try std.testing.expectEqual(Value.null, try retainPreparedResult(&execution, .null, false));
+            var denied = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
+            var allowance: usize = max_allocated_bytes;
+            var scalar_execution = Execution.init(denied.allocator(), &allowance);
+            const scalar = try retainPreparedResult(&scalar_execution, .{ .string = "borrowed scalar" }, false);
+            try std.testing.expectEqualStrings("borrowed scalar", scalar.string);
+            try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+            var tiny: usize = 0;
+            var limited = Execution.init(owned, &tiny);
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, retainPreparedResult(&limited, .{ .json = &json_null }, false));
+            tiny = max_allocated_bytes;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateRowWithExecution(&limited, cold));
+        }
+    };
+    try Run.run(a, row);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{row});
+}
+
+test "relational index system typed JSON values compare exactly and materialize owned bounded output" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const alloc = region.allocator();
+    var bytes: usize = max_allocated_bytes;
+    var execution = Execution.init(alloc, &bytes);
+    const output = blk: {
+        var source: @import("../sql/row_value.zig").JsonRow = undefined;
+        source.init(a, max_allocated_bytes, &execution.numeric);
+        defer source.deinit();
+        const left: Value = .{ .json = try source.decodePinned(0, "{\"n\":9007199254740993.2500,\"a\":[null,\"escaped\\ntext\"]}") };
+        const right: Value = .{ .json = try source.decodePinned(1, "{\"a\":[null,\"escaped\\ntext\"],\"n\":9007199254740993.25}") };
+        try std.testing.expectEqual(std.math.Order.eq, try valueOrderWithContext(left, right, false, &execution.numeric));
+        try std.testing.expect(try valuesEqual(left, right));
+        try std.testing.expect(!try valuesEqual(.null, .{ .json = &.{ .value = .null } }));
+        break :blk try boundedValueToJson(&execution, left);
+    };
+    try std.testing.expectEqualStrings("9007199254740993.2500", output.object.get("n").?.number_string);
+    const array = output.object.get("a").?.array;
+    try std.testing.expectEqual(alloc.ptr, array.allocator.ptr);
+    try std.testing.expectEqual(alloc.vtable, array.allocator.vtable);
+    try std.testing.expectEqualStrings("escaped\ntext", array.items[1].string);
+    try std.testing.expect(bytes < max_allocated_bytes);
+    var limited_bytes: usize = 0;
+    var limited = Execution.init(alloc, &limited_bytes);
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, boundedValueToJson(&limited, .{ .json = &.{ .value = output } }));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, limited.charge(0));
+    var cpu_bytes: usize = max_allocated_bytes;
+    var cpu = Execution.init(alloc, &cpu_bytes);
+    cpu.numeric.remaining = 1; // Clone succeeds; allocator rehoming exhausts work.
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, boundedValueToJson(&cpu, .{ .json = &.{ .value = .null } }));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, cpu.charge(0));
+    // A tagged VM operand must not accidentally activate public JSON programs
+    // before schema capability and physical SQL NULL provenance are wired.
+    const definition = try std.json.parseFromSlice(std.json.Value, a, "{\"op\":\"column\",\"column\":\"doc\"}", .{});
+    defer definition.deinit();
+    try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, .{ .storage_mode = .relational, .relational_columns = &.{.{ .name = "doc", .path = "doc", .column_type = .json }} }, definition.value, .json));
 }
 
 fn entries(value: std.json.Value) ![]const std.json.Value {
@@ -3603,7 +5665,7 @@ pub fn generatedFingerprint(set: ?*const Set) [32]u8 {
     if (set) |expressions| for (expressions.bindings) |binding| {
         if (!binding.generated) continue;
         const column = expressions.table.relational_columns[binding.ordinal];
-        entries_buffer[count] = .{ .name = column.name, .fingerprint = binding.plan.fingerprint, .modifier = column.numeric_modifier };
+        entries_buffer[count] = .{ .name = column.name, .fingerprint = binding.fingerprint(), .modifier = column.numeric_modifier };
         count += 1;
     };
     const selected = entries_buffer[0..count];
@@ -4250,7 +6312,7 @@ test "relational declarations public NUMERIC modifiers preserve PostgreSQL assig
                 if (entry.@"error" != null) {
                     if (result) |_| return error.TestExpectedError else |err| {
                         if (err == error.OutOfMemory) return err;
-                        try std.testing.expect(err == error.InvalidBatchRequest or err == error.RelationalExpressionOverflow);
+                        try std.testing.expectEqualStrings(entry.@"error".?, @import("../sql/errors.zig").describe(err).code);
                     }
                     continue;
                 }
@@ -4450,4 +6512,70 @@ test "relational declarations cold generated verification reads dependency cells
     try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.execution.expressions.?.verifyRow(alloc, &row));
     row.missing = true;
     try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.execution.expressions.?.verifyRow(alloc, &row));
+}
+
+test "SQL owned sequence defaults allocate outside scalar bytecode preserve NULL and restore without effects" {
+    const a = std.testing.allocator;
+    const columns = @import("../system_catalog/column_sequences.zig");
+    const input =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"id","sequence":{"generation":"serial","incarnation":"01010101010101010101010101010101","sequence_id":"18446744073709551615","namespace_id":"1","table_id":"88","column_id":"2","database":"default","namespace":"public","name":"items_id_seq"}}],"generated_columns":[{"column":"next_id","expression":{"op":"add","args":[{"op":"column","column":"id"},{"op":"literal","type":"integer","value":1}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","x-antfly-sql-type":"int64"},"next_id":{"type":"integer","x-antfly-sql-type":"int64"}},"required":["id","next_id"],"additionalProperties":false}}}}
+    ;
+    var validator = try @import("mod.zig").CompiledTableValidator.init(a, input);
+    defer validator.deinit(a);
+    const table = try @import("mod.zig").deriveRuntimeTableSchema(a, validator.schema);
+    defer schema.freeSchema(a, table);
+    try std.testing.expect(table.requires_sequence_defaults);
+    try std.testing.expectEqual(@as(u32, 37), schema.requiredReaderVersion(table));
+    const encoded = try schema.serializeSchema(a, table);
+    defer a.free(encoded);
+    const decoded = try schema.deserializeSchema(a, encoded);
+    defer schema.freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_sequence_defaults);
+    try std.testing.expect(!(schema.ReaderCapabilities{ .semantic_ceiling = 36, .encoding_ceiling = 37 }).supports(schema.readerRequirementsForSchema(table)));
+
+    const Source = struct {
+        calls: usize = 0,
+        next: i64 = 100,
+        fn allocate(raw: *anyopaque, _: Allocator, scope: columns.Scope, name: []const u8, bound: columns.Binding) !i64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 88), scope.table_id);
+            try std.testing.expectEqualStrings("id", name);
+            try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), bound.sequence_id);
+            try std.testing.expectEqual(@as(u64, 88), bound.owner.table_id);
+            try std.testing.expectEqual(@as(u64, 2), bound.owner.column_id);
+            self.calls += 1;
+            const value = self.next;
+            self.next += 1;
+            return value;
+        }
+    };
+    var source: Source = .{};
+    const preparation = validator.forPreparation(.{ .io = std.testing.io, .sequences = .{ .ptr = &source, .allocate = Source.allocate }, .sequence_scope = .{ .table_id = 88, .schema_version = 1, .storage_name = "items" } });
+    var absent = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer absent.deinit();
+    try std.testing.expectError(error.SequenceProviderUnavailable, validator.prepareValue(absent.arena.allocator(), a, &absent.value));
+    try std.testing.expectEqual(@as(usize, 0), absent.value.object.count());
+    try preparation.prepareValue(absent.arena.allocator(), a, &absent.value);
+    try std.testing.expectEqual(@as(i64, 100), absent.value.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 101), absent.value.object.get("next_id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    // A second preparation sees the owned logical value, never a new lease.
+    try preparation.prepareValue(absent.arena.allocator(), a, &absent.value);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try validator.prepareTypedValue(absent.arena.allocator(), a, &absent.value, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+
+    var explicit = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":7}", .{});
+    defer explicit.deinit();
+    try preparation.prepareValue(explicit.arena.allocator(), a, &explicit.value);
+    try std.testing.expectEqual(@as(i64, 7), explicit.value.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), explicit.value.object.get("next_id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+
+    var null_document = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":null}", .{});
+    defer null_document.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, preparation.prepareValue(null_document.arena.allocator(), a, &null_document.value));
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    explicit.value.object.getPtr("next_id").?.* = .{ .integer = 9 };
+    try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.prepareTypedValue(explicit.arena.allocator(), a, &explicit.value, &.{}, true));
 }

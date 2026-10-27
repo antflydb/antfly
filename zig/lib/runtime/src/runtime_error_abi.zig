@@ -886,6 +886,59 @@ pub const Detail = enum(c_int) {
     graph_start_identity_required,
     metadata_snapshot_head_mismatch,
     inference_endpoint_access_denied,
+    sql_index_already_exists,
+    sql_constraint_already_exists,
+    program_limit_exceeded,
+    catalog_occupancy_not_ready,
+    unsupported_native_index_owner,
+    invalid_private_index_claim_inventory,
+    invalid_private_index_claim_receipt,
+    private_index_owner_job_changed,
+    private_index_publication_canceled,
+    private_index_job_required,
+    private_index_publication_required,
+    invalid_private_index_owner_job,
+    invalid_private_index_inputs,
+    relational_index_catalog_schema_mismatch,
+    invalid_index_publication_candidate,
+    immutable_relational_index_definition_conflict,
+    private_index_cancellation_pending,
+    private_index_cancellation_required,
+    invalid_private_index_cancellation,
+    invalid_private_index_native_receipt,
+    invalid_relational_index_progress,
+    missing_relational_index_definitions,
+    index_owner_receipt_changed,
+    invalid_index_owner_receipt,
+    sql_invalid_power_argument,
+    invalid_schema_reader_requirements,
+    private_index_root_recovery_required,
+    invalid_relational_index_budget,
+    private_index_claim_backlog_full,
+    partial_index_predicate_not_implied,
+    // Append only: existing detail integers are a released runtime contract.
+    relational_check_violation,
+    row_policy_denied,
+    row_policy_authentication_required,
+    check_constraint_validation_required,
+    foreign_key_match_full_violation,
+    invalid_schema_validation_job,
+    invalid_schema_validation_page_command,
+    invalid_schema_validation_token,
+    schema_validation_canceled,
+    schema_validation_cancellation_required,
+    schema_validation_command_rejected,
+    schema_validation_inputs_required,
+    schema_validation_job_changed,
+    schema_validation_job_required,
+    schema_validation_not_ready,
+    schema_validation_preparation_changed,
+    schema_validation_publication_required,
+    schema_validation_runtime_recovery_required,
+    store_registration_required,
+    catalog_publication_fence_unavailable,
+    undefined_column,
+    foreign_key_validation_required,
     document_storage_not_configured,
     document_run_busy,
     document_run_exists,
@@ -932,6 +985,51 @@ pub const Detail = enum(c_int) {
     invalid_cloudflare_response,
     document_token_limit_exceeded,
 };
+
+test "partial index proof rejection preserves exact callback error identity" {
+    const wire = statusFromError(error.PartialIndexPredicateNotImplied);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
+    try std.testing.expectEqual(error.PartialIndexPredicateNotImplied, errorFromStatus(wire));
+}
+
+test "schema reader requirement validation preserves exact callback error identity" {
+    const wire = statusFromError(error.InvalidSchemaReaderRequirements);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
+    try std.testing.expectEqual(error.InvalidSchemaReaderRequirements, errorFromStatus(wire));
+}
+
+test "native index claim failures preserve typed callback boundary identities" {
+    const cases = .{
+        .{ error.UnsupportedNativeIndexOwner, Code.unsupported },
+        .{ error.InvalidPrivateIndexClaimInventory, Code.invalid_argument },
+        .{ error.InvalidPrivateIndexClaimReceipt, Code.corrupt },
+        .{ error.PrivateIndexOwnerJobChanged, Code.conflict },
+        .{ error.PrivateIndexPublicationCanceled, Code.conflict },
+        .{ error.PrivateIndexJobRequired, Code.retryable },
+        .{ error.PrivateIndexRootRecoveryRequired, Code.retryable },
+        .{ error.InvalidRelationalIndexBudget, Code.invalid_argument },
+        .{ error.PrivateIndexClaimBacklogFull, Code.retryable },
+        .{ error.PrivateIndexPublicationRequired, Code.retryable },
+        .{ error.InvalidPrivateIndexOwnerJob, Code.corrupt },
+        .{ error.InvalidPrivateIndexInputs, Code.corrupt },
+        .{ error.RelationalIndexCatalogSchemaMismatch, Code.conflict },
+        .{ error.InvalidIndexPublicationCandidate, Code.invalid_argument },
+        .{ error.ImmutableRelationalIndexDefinitionConflict, Code.conflict },
+        .{ error.PrivateIndexCancellationPending, Code.retryable },
+        .{ error.PrivateIndexCancellationRequired, Code.retryable },
+        .{ error.InvalidPrivateIndexCancellation, Code.corrupt },
+        .{ error.InvalidPrivateIndexNativeReceipt, Code.corrupt },
+        .{ error.InvalidRelationalIndexProgress, Code.corrupt },
+        .{ error.MissingRelationalIndexDefinitions, Code.corrupt },
+        .{ error.IndexOwnerReceiptChanged, Code.conflict },
+        .{ error.InvalidIndexOwnerReceipt, Code.invalid_argument },
+    };
+    inline for (cases) |entry| {
+        const result = statusFromError(entry[0]);
+        try std.testing.expectEqual(@backingInt(entry[1]), result.code);
+        try std.testing.expectEqual(entry[0], errorFromStatus(result));
+    }
+}
 
 pub const Status = extern struct {
     // Keep the wire fields as integers so a newer peer's enum value can be
@@ -1150,6 +1248,21 @@ pub fn statusFromError(err: anyerror) Status {
         error.ArtifactCatalogScopeChanged => status(.conflict, .artifact_catalog_scope_changed),
         error.OnlineMergeArtifactCatalogChanged => status(.conflict, .online_merge_artifact_catalog_changed),
         error.StoreRootEnrollmentChanged => status(.forbidden, .store_root_enrollment_changed),
+        error.InvalidSchemaValidationJob => status(.invalid_argument, .invalid_schema_validation_job),
+        error.InvalidSchemaValidationPageCommand => status(.invalid_argument, .invalid_schema_validation_page_command),
+        error.InvalidSchemaValidationToken => status(.invalid_argument, .invalid_schema_validation_token),
+        error.SchemaValidationCanceled => status(.conflict, .schema_validation_canceled),
+        error.SchemaValidationCancellationRequired => status(.conflict, .schema_validation_cancellation_required),
+        error.SchemaValidationCommandRejected => status(.invalid_argument, .schema_validation_command_rejected),
+        error.SchemaValidationInputsRequired => status(.invalid_argument, .schema_validation_inputs_required),
+        error.SchemaValidationJobChanged => status(.conflict, .schema_validation_job_changed),
+        error.SchemaValidationJobRequired => status(.conflict, .schema_validation_job_required),
+        error.SchemaValidationNotReady => status(.retryable, .schema_validation_not_ready),
+        error.SchemaValidationPreparationChanged => status(.conflict, .schema_validation_preparation_changed),
+        error.SchemaValidationPublicationRequired => status(.unsupported, .schema_validation_publication_required),
+        error.SchemaValidationRuntimeRecoveryRequired => status(.retryable, .schema_validation_runtime_recovery_required),
+        error.StoreRegistrationRequired => status(.unavailable, .store_registration_required),
+        error.CatalogPublicationFenceUnavailable => status(.unavailable, .catalog_publication_fence_unavailable),
         error.InvalidStoreRootEnrollment => status(.invalid_argument, .invalid_store_root_enrollment),
         error.InitialChildRootReceiptChanged => status(.conflict, .initial_child_root_receipt_changed),
         error.InvalidInitialFkRetirementSignature => status(.forbidden, .invalid_initial_fk_retirement_signature),
@@ -1202,13 +1315,22 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalRewriteBudgetExceeded => status(.invalid_argument, .relational_rewrite_budget_exceeded),
         error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
+        error.SqlInvalidPowerArgument => status(.invalid_argument, .sql_invalid_power_argument),
+        error.InvalidSchemaReaderRequirements => status(.invalid_argument, .invalid_schema_reader_requirements),
         error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
         error.CatalogPublicationProofPending => status(.retryable, .catalog_publication_proof_pending),
+        error.SqlIndexAlreadyExists => status(.already_exists, .sql_index_already_exists),
+        error.SqlConstraintAlreadyExists => status(.already_exists, .sql_constraint_already_exists),
+        error.UndefinedColumn => status(.invalid_argument, .undefined_column),
+        error.ForeignKeyValidationRequired => status(.unsupported, .foreign_key_validation_required),
+        error.ProgramLimitExceeded => status(.invalid_argument, .program_limit_exceeded),
+        error.CatalogOccupancyNotReady => status(.retryable, .catalog_occupancy_not_ready),
         error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
         error.RelationalIndexKeyTooLarge => status(.invalid_argument, .relational_index_key_too_large),
         error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
         error.InvalidRelationalGeneratedValue => status(.invalid_argument, .invalid_relational_generated_value),
         error.GeneratedColumnRewriteRequired => status(.conflict, .generated_column_rewrite_required),
+        error.CheckConstraintValidationRequired => status(.conflict, .check_constraint_validation_required),
         error.RestoreJobCommitNotApplied => status(.retryable, .restore_job_commit_not_applied),
         error.CoordinatedStandaloneHAMetadataRequired => status(.unsupported, .coordinated_standalone_ha_metadata_required),
         error.StorageBusy => status(.retryable, .storage_busy),
@@ -1333,7 +1455,35 @@ pub fn statusFromError(err: anyerror) Status {
         error.ConstraintRetirementChanged => status(.conflict, .constraint_retirement_changed),
         error.ForeignKeyParentMissing => status(.conflict, .foreign_key_parent_missing),
         error.ForeignKeyReferenced => status(.conflict, .foreign_key_referenced),
+        error.ForeignKeyMatchFullViolation => status(.conflict, .foreign_key_match_full_violation),
         error.UniqueConstraintViolation => status(.conflict, .unique_constraint_violation),
+        error.RelationalCheckViolation => status(.invalid_argument, .relational_check_violation),
+        error.RowPolicyDenied => status(.forbidden, .row_policy_denied),
+        error.RowPolicyAuthenticationRequired => status(.forbidden, .row_policy_authentication_required),
+        error.UnsupportedNativeIndexOwner => status(.unsupported, .unsupported_native_index_owner),
+        error.InvalidPrivateIndexClaimInventory => status(.invalid_argument, .invalid_private_index_claim_inventory),
+        error.InvalidPrivateIndexClaimReceipt => status(.corrupt, .invalid_private_index_claim_receipt),
+        error.PrivateIndexOwnerJobChanged => status(.conflict, .private_index_owner_job_changed),
+        error.PrivateIndexPublicationCanceled => status(.conflict, .private_index_publication_canceled),
+        error.PrivateIndexJobRequired => status(.retryable, .private_index_job_required),
+        error.PrivateIndexRootRecoveryRequired => status(.retryable, .private_index_root_recovery_required),
+        error.InvalidRelationalIndexBudget => status(.invalid_argument, .invalid_relational_index_budget),
+        error.PrivateIndexClaimBacklogFull => status(.retryable, .private_index_claim_backlog_full),
+        error.PrivateIndexPublicationRequired => status(.retryable, .private_index_publication_required),
+        error.InvalidPrivateIndexOwnerJob => status(.corrupt, .invalid_private_index_owner_job),
+        error.InvalidPrivateIndexInputs => status(.corrupt, .invalid_private_index_inputs),
+        error.RelationalIndexCatalogSchemaMismatch => status(.conflict, .relational_index_catalog_schema_mismatch),
+        error.InvalidIndexPublicationCandidate => status(.invalid_argument, .invalid_index_publication_candidate),
+        error.ImmutableRelationalIndexDefinitionConflict => status(.conflict, .immutable_relational_index_definition_conflict),
+        error.PrivateIndexCancellationPending => status(.retryable, .private_index_cancellation_pending),
+        error.PrivateIndexCancellationRequired => status(.retryable, .private_index_cancellation_required),
+        error.InvalidPrivateIndexCancellation => status(.corrupt, .invalid_private_index_cancellation),
+        error.InvalidPrivateIndexNativeReceipt => status(.corrupt, .invalid_private_index_native_receipt),
+        error.InvalidRelationalIndexProgress => status(.corrupt, .invalid_relational_index_progress),
+        error.MissingRelationalIndexDefinitions => status(.corrupt, .missing_relational_index_definitions),
+        error.IndexOwnerReceiptChanged => status(.conflict, .index_owner_receipt_changed),
+        error.PartialIndexPredicateNotImplied => status(.invalid_argument, .partial_index_predicate_not_implied),
+        error.InvalidIndexOwnerReceipt => status(.invalid_argument, .invalid_index_owner_receipt),
         error.PreparedGenerationChanged => status(.conflict, .prepared_generation_changed),
         error.PreparedReadSetChanged => status(.conflict, .prepared_read_set_changed),
         error.ForeignKeyActionMismatch => status(.conflict, .foreign_key_action_mismatch),
@@ -1833,6 +1983,9 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .relational_check_violation => "RelationalCheckViolation",
+        .row_policy_denied => "RowPolicyDenied",
+        .row_policy_authentication_required => "RowPolicyAuthenticationRequired",
         .invalid_document_source => "InvalidDocumentSource",
         .unsupported_document_format => "UnsupportedDocumentFormat",
         .document_source_limit_exceeded => "DocumentSourceLimitExceeded",
@@ -2064,6 +2217,21 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .artifact_catalog_scope_changed => "ArtifactCatalogScopeChanged",
         .online_merge_artifact_catalog_changed => "OnlineMergeArtifactCatalogChanged",
         .store_root_enrollment_changed => "StoreRootEnrollmentChanged",
+        .invalid_schema_validation_job => "InvalidSchemaValidationJob",
+        .invalid_schema_validation_page_command => "InvalidSchemaValidationPageCommand",
+        .invalid_schema_validation_token => "InvalidSchemaValidationToken",
+        .schema_validation_canceled => "SchemaValidationCanceled",
+        .schema_validation_cancellation_required => "SchemaValidationCancellationRequired",
+        .schema_validation_command_rejected => "SchemaValidationCommandRejected",
+        .schema_validation_inputs_required => "SchemaValidationInputsRequired",
+        .schema_validation_job_changed => "SchemaValidationJobChanged",
+        .schema_validation_job_required => "SchemaValidationJobRequired",
+        .schema_validation_not_ready => "SchemaValidationNotReady",
+        .schema_validation_preparation_changed => "SchemaValidationPreparationChanged",
+        .schema_validation_publication_required => "SchemaValidationPublicationRequired",
+        .schema_validation_runtime_recovery_required => "SchemaValidationRuntimeRecoveryRequired",
+        .store_registration_required => "StoreRegistrationRequired",
+        .catalog_publication_fence_unavailable => "CatalogPublicationFenceUnavailable",
         .invalid_store_root_enrollment => "InvalidStoreRootEnrollment",
         .initial_child_root_receipt_changed => "InitialChildRootReceiptChanged",
         .invalid_initial_fk_retirement_signature => "InvalidInitialFkRetirementSignature",
@@ -2116,13 +2284,22 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_rewrite_budget_exceeded => "RelationalRewriteBudgetExceeded",
         .relational_expression_overflow => "RelationalExpressionOverflow",
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
+        .sql_invalid_power_argument => "SqlInvalidPowerArgument",
+        .invalid_schema_reader_requirements => "InvalidSchemaReaderRequirements",
         .sql_feature_not_supported => "SqlFeatureNotSupported",
         .catalog_publication_proof_pending => "CatalogPublicationProofPending",
+        .sql_index_already_exists => "SqlIndexAlreadyExists",
+        .sql_constraint_already_exists => "SqlConstraintAlreadyExists",
+        .undefined_column => "UndefinedColumn",
+        .foreign_key_validation_required => "ForeignKeyValidationRequired",
+        .program_limit_exceeded => "ProgramLimitExceeded",
+        .catalog_occupancy_not_ready => "CatalogOccupancyNotReady",
         .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
         .relational_index_key_too_large => "RelationalIndexKeyTooLarge",
         .invalid_relational_expression_input => "InvalidRelationalExpressionInput",
         .invalid_relational_generated_value => "InvalidRelationalGeneratedValue",
         .generated_column_rewrite_required => "GeneratedColumnRewriteRequired",
+        .check_constraint_validation_required => "CheckConstraintValidationRequired",
         .invalid_retained_effects_admission => "InvalidRetainedEffectsAdmission",
         .retained_effects_fence_mismatch => "RetainedEffectsFenceMismatch",
         .retained_effects_mixed_control => "RetainedEffectsMixedControl",
@@ -2245,7 +2422,32 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .constraint_retirement_changed => "ConstraintRetirementChanged",
         .foreign_key_parent_missing => "ForeignKeyParentMissing",
         .foreign_key_referenced => "ForeignKeyReferenced",
+        .foreign_key_match_full_violation => "ForeignKeyMatchFullViolation",
         .unique_constraint_violation => "UniqueConstraintViolation",
+        .unsupported_native_index_owner => "UnsupportedNativeIndexOwner",
+        .invalid_private_index_claim_inventory => "InvalidPrivateIndexClaimInventory",
+        .invalid_private_index_claim_receipt => "InvalidPrivateIndexClaimReceipt",
+        .private_index_owner_job_changed => "PrivateIndexOwnerJobChanged",
+        .private_index_publication_canceled => "PrivateIndexPublicationCanceled",
+        .private_index_job_required => "PrivateIndexJobRequired",
+        .private_index_root_recovery_required => "PrivateIndexRootRecoveryRequired",
+        .invalid_relational_index_budget => "InvalidRelationalIndexBudget",
+        .private_index_claim_backlog_full => "PrivateIndexClaimBacklogFull",
+        .private_index_publication_required => "PrivateIndexPublicationRequired",
+        .invalid_private_index_owner_job => "InvalidPrivateIndexOwnerJob",
+        .invalid_private_index_inputs => "InvalidPrivateIndexInputs",
+        .relational_index_catalog_schema_mismatch => "RelationalIndexCatalogSchemaMismatch",
+        .invalid_index_publication_candidate => "InvalidIndexPublicationCandidate",
+        .immutable_relational_index_definition_conflict => "ImmutableRelationalIndexDefinitionConflict",
+        .private_index_cancellation_pending => "PrivateIndexCancellationPending",
+        .private_index_cancellation_required => "PrivateIndexCancellationRequired",
+        .invalid_private_index_cancellation => "InvalidPrivateIndexCancellation",
+        .invalid_private_index_native_receipt => "InvalidPrivateIndexNativeReceipt",
+        .invalid_relational_index_progress => "InvalidRelationalIndexProgress",
+        .missing_relational_index_definitions => "MissingRelationalIndexDefinitions",
+        .index_owner_receipt_changed => "IndexOwnerReceiptChanged",
+        .partial_index_predicate_not_implied => "PartialIndexPredicateNotImplied",
+        .invalid_index_owner_receipt => "InvalidIndexOwnerReceipt",
         .prepared_generation_changed => "PreparedGenerationChanged",
         .prepared_read_set_changed => "PreparedReadSetChanged",
         .foreign_key_action_mismatch => "ForeignKeyActionMismatch",
@@ -2883,15 +3085,23 @@ test "catalog publication preparation preserves explicit retry identity across a
     var forged = pending;
     forged.code = @backingInt(Code.corrupt);
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(forged));
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired }) |err| {
+        const encoded = statusFromError(err);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(encoded));
+        var mismatched = encoded;
+        mismatched.code = @backingInt(Code.corrupt);
+        try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(mismatched));
+    }
 }
 
 test "released main Detail identifiers retain their exact names and numeric values" {
-    @setEvalBranchQuota(2000);
+    @setEvalBranchQuota(20_000);
     const std_test = @import("std");
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |reflected_name, field_value| {
-        if (field_value <= 370) {
+        if (field_value <= 781) {
             for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
             std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
@@ -2899,8 +3109,8 @@ test "released main Detail identifiers retain their exact names and numeric valu
             count += 1;
         }
     }
-    try std_test.testing.expectEqual(@as(usize, 371), count);
-    try std_test.testing.expectEqual(@as(u64, 0xa07c5018c0739e78), fingerprint);
+    try std_test.testing.expectEqual(@as(usize, 782), count);
+    try std_test.testing.expectEqual(@as(u64, 0xf7de08bbd998f30a), fingerprint);
 }
 
 test "metadata proposal recovery errors preserve identity across runtime archives" {
@@ -3005,6 +3215,35 @@ test "inference worker setup and transport failures retain distinct boundary sem
     for ([_]anyerror{ error.InferenceWorkerExecutableNotConfigured, error.InferenceWorkerUnavailable }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.InferenceProviderFailure)));
     }
+}
+
+/// Exact lookup for authenticated textual compatibility transports. Never
+/// construct compilation-local errors from untrusted or arbitrary names.
+pub fn errorFromStableName(name: []const u8) ?anyerror {
+    const lookup = comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        const details = std.meta.tags(Detail);
+        var entries: [details.len]struct { []const u8, anyerror } = undefined;
+        for (details, 0..) |detail, index| {
+            const spelling = detailErrorName(detail);
+            entries[index] = .{ spelling, @field(anyerror, spelling) };
+        }
+        break :blk std.StaticStringMap(anyerror).initComptime(entries);
+    };
+    const err = lookup.get(name) orelse return null;
+    return if (errorHasStableDetail(err)) err else null;
+}
+
+test "native normalization failures retain exact stable identities without accepting arbitrary names" {
+    for ([_]anyerror{ error.RelationalCheckViolation, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired, error.InvalidBatchRequest, error.UniqueConstraintViolation, error.OutOfMemory, error.DeadlineExceeded }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+        try std.testing.expectEqual(err, errorFromStableName(@errorName(err)).?);
+    }
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.RelationalCheckViolation).code);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.RowPolicyDenied).code);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.RowPolicyAuthenticationRequired).code);
+    try std.testing.expectEqual(@backingInt(Detail.partial_index_predicate_not_implied) + 1, @backingInt(Detail.relational_check_violation));
+    for ([_][]const u8{ "RelationalCheckViolation\n", "relationalcheckviolation", "PrivateProviderSecret", "RuntimeBoundaryFailure" }) |name| try std.testing.expect(errorFromStableName(name) == null);
 }
 
 test "grouped and constrained producer failures preserve callback identity and behavior" {

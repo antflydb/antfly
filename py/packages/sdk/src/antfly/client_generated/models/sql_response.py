@@ -10,6 +10,7 @@ from ..models.sql_transaction_status import SQLTransactionStatus
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.sql_catalog_operation_receipt import SQLCatalogOperationReceipt
     from ..models.sql_column import SQLColumn
     from ..models.sqlddl_receipt import SQLDDLReceipt
 
@@ -38,12 +39,26 @@ class SQLResponse:
                 not
                 cause the statement to be replayed. Pending or repair outcomes require
                 visibility convergence or operator action rather than another write.
-            ddl_receipt (SQLDDLReceipt | Unset): Durable DDL declaration receipt. admission_unknown means admission has
-                not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
-                Pending or invalid means the declaration
-                committed but validation has not established an active constraint. Do not
-                replay it. Inspect table constraint status using this immutable table
-                identity and schema generation; a later generation supersedes this receipt.
+            ddl_receipt (SQLDDLReceipt | Unset): Durable DDL operation receipt. admission_unknown means admission has
+                not been confirmed; retain the matching restore job, FK publication ID,
+                index publication token, or schema validation token and reconcile its
+                status without replaying DDL.
+                Pending means a durable operation was admitted, not necessarily that its
+                successor schema is published. Invalid means declaration validation failed.
+                Do not replay either. For an index build, observe the exact publication
+                token. For validation-only schema changes, observe the exact schema
+                validation token; otherwise inspect its restore job or table constraint status using
+                this immutable table identity and schema generation. A later generation
+                may supersede the completed operation.
+            catalog_receipt (SQLCatalogOperationReceipt | Unset): Recovery receipt for an atomic native catalog mutation,
+                separate from
+                physical table/schema publication receipts. Retain recovery_token and
+                observe it with getSQLCatalogOperation; never resubmit uncertain DDL.
+                Retention is bounded by catalog activity, not a promised wall-clock
+                interval. Missing, expired, inaccessible or superseded-authority outcomes
+                cannot be inferred from a current object name and remain unknown.
+                This receipt does not make a new request idempotent or recover a token
+                lost with an entire response. All identity integers are exact decimal strings.
             transaction_id (str | Unset): Native transaction receipt for visibility or repair reconciliation; never replay a
                 committed statement.
             session_id (str | Unset): Opaque SQL session identifier for subsequent requests.
@@ -59,6 +74,7 @@ class SQLResponse:
     sql_nulls: list[list[bool]] | Unset = UNSET
     mutation_outcome: SQLMutationOutcome | Unset = UNSET
     ddl_receipt: SQLDDLReceipt | Unset = UNSET
+    catalog_receipt: SQLCatalogOperationReceipt | Unset = UNSET
     transaction_id: str | Unset = UNSET
     session_id: str | Unset = UNSET
     transaction_status: SQLTransactionStatus | Unset = UNSET
@@ -95,6 +111,10 @@ class SQLResponse:
         if not isinstance(self.ddl_receipt, Unset):
             ddl_receipt = self.ddl_receipt.to_dict()
 
+        catalog_receipt: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.catalog_receipt, Unset):
+            catalog_receipt = self.catalog_receipt.to_dict()
+
         transaction_id = self.transaction_id
 
         session_id = self.session_id
@@ -119,6 +139,8 @@ class SQLResponse:
             field_dict["mutation_outcome"] = mutation_outcome
         if ddl_receipt is not UNSET:
             field_dict["ddl_receipt"] = ddl_receipt
+        if catalog_receipt is not UNSET:
+            field_dict["catalog_receipt"] = catalog_receipt
         if transaction_id is not UNSET:
             field_dict["transaction_id"] = transaction_id
         if session_id is not UNSET:
@@ -130,6 +152,7 @@ class SQLResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.sql_catalog_operation_receipt import SQLCatalogOperationReceipt
         from ..models.sql_column import SQLColumn
         from ..models.sqlddl_receipt import SQLDDLReceipt
 
@@ -175,6 +198,13 @@ class SQLResponse:
         else:
             ddl_receipt = SQLDDLReceipt.from_dict(_ddl_receipt)
 
+        _catalog_receipt = d.pop("catalog_receipt", UNSET)
+        catalog_receipt: SQLCatalogOperationReceipt | Unset
+        if isinstance(_catalog_receipt, Unset):
+            catalog_receipt = UNSET
+        else:
+            catalog_receipt = SQLCatalogOperationReceipt.from_dict(_catalog_receipt)
+
         transaction_id = d.pop("transaction_id", UNSET)
 
         session_id = d.pop("session_id", UNSET)
@@ -194,6 +224,7 @@ class SQLResponse:
             sql_nulls=sql_nulls,
             mutation_outcome=mutation_outcome,
             ddl_receipt=ddl_receipt,
+            catalog_receipt=catalog_receipt,
             transaction_id=transaction_id,
             session_id=session_id,
             transaction_status=transaction_status,

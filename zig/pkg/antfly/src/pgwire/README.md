@@ -20,7 +20,8 @@ are bounded scalar expressions; column references, parameters, and subqueries
 are not an argument-evaluation escape hatch into table reads. These commands
 do not create durable HTTP prepared-statement resources.
 
-SQL `DECLARE [NO SCROLL|SCROLL] CURSOR [WITH|WITHOUT HOLD]`, `FETCH`, `MOVE`,
+SQL `DECLARE [BINARY] [ASENSITIVE|INSENSITIVE] [NO SCROLL|SCROLL] CURSOR
+[WITH|WITHOUT HOLD]`, `FETCH`, `MOVE`,
 and `CLOSE` retain one eligible native pull snapshot. SCROLL supports forward,
 backward, absolute, relative, first/last and current-row positioning. Scroll and
 hold rows are copied as typed cells into a connection-owned spool: at most
@@ -35,8 +36,21 @@ buffered rows retain a small authorization capsule. Every fetch rechecks current
 credentials, scoped table identities, read grants and row filters. Held rows
 survive later transaction boundaries, not disconnect or node restart. Rollback
 to a savepoint closes cursors created after that savepoint without rewinding
-earlier cursor positions. Blocking plans without a native pull stream remain
-unsupported for SQL DECLARE.
+earlier cursor positions. Blocking read plans materialize once under the
+ordinary statement result cap before entering the shared cursor spool. DECLARE
+requires the native binder to identify a read query before opening or executing
+it; mutation RETURNING columns cannot grant cursor eligibility.
+
+Simple-query FETCH uses the declaration's text or binary format. Extended-query
+DECLARE, FETCH, MOVE and CLOSE use Parse/Bind/Execute, and Bind's result formats
+always override BINARY, including an empty format vector meaning text. An
+extended FETCH evaluates the whole requested range once before its first output
+page, matching PostgreSQL cursor-position semantics. Execute can then suspend and
+resume those results independently of later cursor movement or CLOSE. Existing
+scroll pages are retained by reference in constant space; streaming cursors copy
+only the fetched result into the same bounded typed-store budget. Portal closure
+and disconnect release those references. Binary encoding uses precise temporal,
+array, NUMERIC and range identities; SQL NULL remains distinct from JSON null.
 
 `SET [SESSION|LOCAL] statement_timeout`, `SHOW statement_timeout`, and
 `RESET statement_timeout` work with both simple and extended queries. Values
@@ -111,6 +125,67 @@ encodings, and binary representation guesses are rejected. Passwords may only
 be accepted on loopback by default; remote binding requires explicit deployment
 acknowledgement of an externally protected transport. This override supplies no
 TLS itself.
+
+## COPY input
+
+`COPY table [(columns)] FROM STDIN` accepts PostgreSQL text, CSV and binary
+payloads in simple and extended queries. Input frames may split any field,
+UTF-8 character, quoted newline or binary length word. CSV supports HEADER,
+DELIMITER, NULL, QUOTE and ESCAPE. Text/CSV support HEADER MATCH, DEFAULT,
+ON_ERROR IGNORE, REJECT_LIMIT and LOG_VERBOSITY; CSV also supports FORCE_NULL
+and FORCE_NOT_NULL by column or for all columns. Only UTF-8 encoding is accepted. Implicit
+column lists omit generated columns. Supplied identity values use PostgreSQL's
+COPY override semantics; omitted identity/default columns retain normal defaults.
+
+One COPY owns one transaction. An idle connection uses an implicit BEGIN/COMMIT;
+an explicit transaction retains its normal commit, rollback and savepoint
+rules. Decoding and native constraints must succeed before COPY completion.
+Malformed input or a disconnected upload rolls back an implicit COPY, including
+already staged batches. A failed explicit COPY marks the transaction failed.
+An uncertain COMMIT retains the ordinary reconciliation diagnostic and must not
+be automatically replayed.
+
+The decoder retains one bounded row; typed batches contain at most 128 rows
+and respect parameter, connection-memory and transaction limits. Full COPY input
+is never accumulated in the transport. Cached parameterized INSERT plans reuse
+native row preparation, constraints, schema fences and distributed decisions.
+One statement clock spans all batches. Retained normalization checks live write
+authority during preparation and finalization, and closes before writer admission.
+
+COPY requires write permission. Tables with active row-level security reject
+COPY input with `0A000`, following PostgreSQL; use INSERT for policy-protected
+writes. Normal row filters, owner proofs and transaction checks remain active.
+ON_ERROR IGNORE skips conversion failures, including numeric-modifier overflow;
+it never skips malformed framing, missing defaults, encoding, constraint,
+authority or commit errors. Exceeding REJECT_LIMIT rolls back the whole COPY.
+WHERE evaluates typed candidates after defaults and before generated values and
+constraints. Prepared predicate arguments stay separate from imported row cells.
+Generated-column references, aggregates, windows and subqueries are rejected.
+FREEZE remains unavailable. COPY requires the wire streaming
+protocol; the ordinary JSON SQL endpoint cannot carry an input stream.
+
+## COPY output
+
+`COPY table [(columns)] TO STDOUT` and `COPY (SELECT ...) TO STDOUT`
+use retained native read cursors in both simple and extended wire protocols.
+Text, CSV and PostgreSQL binary output share typed pgwire encoders. CSV supports
+HEADER, DELIMITER, NULL, QUOTE, ESCAPE and FORCE_QUOTE; text supports HEADER,
+DELIMITER and NULL. Only UTF-8 encoding is currently accepted. Implicit table
+columns exclude generated columns; explicit projections retain their columns.
+
+The server sends CopyOutResponse, bounded CopyData frames, CopyDone and
+`COPY count`. Frames can split fields and rows. COPY does not suspend at the
+Execute row count or silently truncate at the ordinary result limit. Scan,
+memory, spill and deadline limits still apply. A page is flushed before pulling
+another; cancellation, authorization revocation and errors abort without a
+successful COPY completion. One reusable field buffer is connection-budgeted;
+neither a complete row nor the complete result is buffered by the transport.
+
+Server files, PROGRAM, write-returning COPY queries and zero-column
+implicit projections remain unsupported. COPY is a wire streaming operation,
+not an alias for a JSON SQL response; ordinary nonstreaming execution rejects it.
+As in PostgreSQL, `TO STDIN` is accepted as an alternative spelling for client
+output; the TO/FROM direction determines the operation, not the stream token.
 
 ## DDL admission and readiness
 

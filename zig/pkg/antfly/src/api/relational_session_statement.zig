@@ -21,6 +21,20 @@ const integrity = @import("antfly_local_sources").api_relational_integrity_commi
 const contract = @import("antfly_local_sources").api_distributed_txn_contract;
 const types = @import("antfly_local_sources").storage_db_types;
 
+/// Retroactive timing validation observes existing staged rows; it does not
+/// normalize or replace them. Its result can borrow candidate row storage.
+/// Retain only physical observations so validation neither recopies the batch
+/// nor frees row bytes still referenced by the validation result.
+pub fn retainObservations(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionCommitRequest, updates: []const contract.TableCommitRequest) !void {
+    const observations = try alloc.dupe(contract.TableCommitRequest, updates);
+    defer alloc.free(observations);
+    for (observations) |*table| {
+        table.writes = &.{};
+        table.deletes = &.{};
+    }
+    try apply(alloc, candidate, observations);
+}
+
 pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionCommitRequest, updates: []const contract.TableCommitRequest) !void {
     for (updates) |update| {
         if (update.writes.len == 0 and update.deletes.len == 0 and update.predicates.len == 0) continue;
@@ -45,6 +59,8 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
             for (table.batch.writes) |write| if (changes(update, write.key)) {
                 alloc.free(write.key);
                 alloc.free(write.value);
+                for (write.json_null_fields) |field| alloc.free(field);
+                if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
             };
             for (table.batch.deletes) |key| if (changes(update, key)) alloc.free(key);
             if (table.batch.writes.len != 0) alloc.free(table.batch.writes);
@@ -55,7 +71,7 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
         };
         const writes = try alloc.alloc(types.BatchWrite, update.writes.len);
         defer alloc.free(writes);
-        for (writes, update.writes) |*out, input| out.* = .{ .key = input.key, .value = input.value };
+        for (writes, update.writes) |*out, input| out.* = .{ .key = input.key, .value = input.value, .json_null_fields = input.json_null_fields };
         const label = candidate.logicalName(update.table_name);
         // New cascade participants also receive a server-authored binding;
         // never reinterpret their physical identity as a public table name.
@@ -89,22 +105,48 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
     defer incoming_view.deinit();
     const incoming = incoming_view.tables;
     try server.validateCommitTablesAgainstSchema(context, incoming);
-    var snapshot = (try server.source.adminSnapshot()) orelse {
-        _ = try integrity.metadataRequiresCoordination(alloc, null, incoming);
-        return;
-    };
+    const selected = (try server.selectIntegritySnapshot(alloc, incoming, context)) orelse return;
+    var snapshot = selected.snapshot;
     defer server.source.freeAdminSnapshot(&snapshot);
-    if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, incoming)) return;
+    if (!selected.coordinated) return;
     var before = if (previous) |value| try value.clone(alloc) else sessions.OwnedTransactionCommitRequest{};
     defer before.deinit(alloc);
     const staged_view = try before.distributedTables(alloc);
     defer staged_view.deinit();
     const staged = staged_view.tables;
-    var prepared = try integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items);
+    var prepared = integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items) catch |err| refreshed: {
+        // This is read-only preparation of an unpublished session candidate,
+        // not a retry of staging or commit. Share REST's bounded authoritative
+        // refresh when a data-node metadata cache trails a completed DDL.
+        if (err != error.PreparedGenerationChanged) return err;
+        const authoritative = try server.authoritativeIntegritySnapshot(context);
+        server.source.freeAdminSnapshot(&snapshot);
+        snapshot = authoritative;
+        if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, incoming)) return;
+        break :refreshed try integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items);
+    };
     defer prepared.deinit();
     try server.authorizeAndBindIntegrityMutations(alloc, context, prepared.tables, candidate);
     try server.validateCommitTablesAgainstSchema(context, prepared.tables);
     try apply(alloc, candidate, prepared.tables);
+}
+
+test "distributed txn session timing observations preserve borrowed staged row ownership" {
+    const alloc = std.testing.allocator;
+    var candidate = try sessions.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"p\":{\"inserts\":{\"x\":{\"id\":1}}}}}");
+    defer candidate.deinit(alloc);
+    const borrowed_view = try candidate.distributedTables(alloc);
+    defer borrowed_view.deinit();
+    const borrowed = borrowed_view.tables;
+    const original_value = candidate.tables[0].batch.writes[0].value;
+    const predicates = [_]types.TransactionVersionPredicate{.{ .key = "x", .expected_version = 7 }};
+    borrowed[0].predicates = &predicates;
+    try retainObservations(alloc, &candidate, borrowed);
+    try std.testing.expectEqual(@as(usize, 1), candidate.tables[0].batch.writes.len);
+    try std.testing.expectEqual(original_value.ptr, candidate.tables[0].batch.writes[0].value.ptr);
+    try std.testing.expectEqualStrings("{\"id\":1}", candidate.tables[0].batch.writes[0].value);
+    try std.testing.expectEqual(@as(usize, 1), candidate.tables[0].predicates.items.len);
+    try std.testing.expectEqual(@as(u64, 7), candidate.tables[0].predicates.items[0].expected_version);
 }
 
 test "distributed txn session statement normalization replaces old deletes and cascaded values" {

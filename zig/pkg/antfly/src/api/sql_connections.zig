@@ -187,7 +187,10 @@ pub const Action = union(enum) {
     bind: struct { id: [32]u8, txn_id: [16]u8 },
     uncertain: struct { id: [32]u8, txn_id: [16]u8 },
     terminal: struct { id: [32]u8, txn_id: [16]u8 },
-    overlay: struct { id: [32]u8, expected_revision: u64, entries: []const settings.OverlayEntry },
+    search_path: struct { id: [32]u8, expected_revision: u64, value: ?@import("../pgwire/search_path.zig").Path },
+    overlay: struct { id: [32]u8, expected_revision: u64, entries: []const settings.OverlayEntry, reset_search_path: bool = false },
+    discard_sequences: [32]u8,
+    sequence_state: struct { id: [32]u8, generation: u64, sequence_epoch: u64, active_txn: ?[16]u8, value: @import("antfly_local_sources").sql_sequence_session.Snapshot },
 };
 
 pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !usize {
@@ -214,7 +217,8 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
     if (action == .create) {
         const value = action.create;
         try value.validate();
-        if (value.state != .idle or value.generation != 1 or value.revision != 1 or value.active_txn != null or value.overlay.len != 0 or
+        if (value.state != .idle or value.generation != 1 or value.revision != 1 or value.active_txn != null or value.overlay.len != 0 or value.lookup_path != null or
+            value.sequence_epoch != 1 or value.sequence_state.values.len != 0 or value.sequence_state.last != null or
             value.owner_node_id != owner_node_id or !std.mem.eql(u8, value.principal, principal) or
             value.expires_at_ms <= now_ms or value.expires_at_ms - now_ms > record.ttl_ms)
             return error.InvalidSqlConnection;
@@ -279,12 +283,33 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         .uncertain => |value| value.id,
         .terminal => |value| value.id,
         .overlay => |value| value.id,
+        .search_path => |value| value.id,
+        .discard_sequences => |value| value,
+        .sequence_state => |value| value.id,
     };
     var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, now_ms);
     defer owned.deinit();
     var next = owned.value;
     return switch (action) {
         .create => unreachable,
+        .discard_sequences => blk: {
+            if (next.state == .beginning or next.state == .uncertain) return error.SqlConnectionBusy;
+            if (next.sequence_epoch == std.math.maxInt(u64) or next.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
+            next.sequence_epoch += 1;
+            next.revision += 1;
+            next.sequence_state = .{};
+            try record.putTxn(txn, alloc, next);
+            break :blk 0;
+        },
+        .sequence_state => |update| blk: {
+            if (next.sequence_epoch != update.sequence_epoch) return error.SqlConnectionChanged;
+            if (next.generation != update.generation or !std.meta.eql(next.active_txn, update.active_txn) or next.state == .beginning) return error.SqlConnectionBusy;
+            try update.value.validate();
+            next.sequence_state = update.value;
+            next.revision = std.math.add(u64, next.revision, 1) catch return error.SqlProgramLimitExceeded;
+            try record.putTxn(txn, alloc, next);
+            break :blk 0;
+        },
         .discard, .close => blk: {
             if (next.state != .idle) return error.SqlConnectionBusy;
             const removed = try prepared.discardConnectionTxn(txn, alloc, id);
@@ -294,6 +319,10 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
                 next.generation += 1;
                 next.revision += 1;
                 next.overlay = &.{};
+                next.lookup_path = null;
+                if (next.sequence_epoch == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
+                next.sequence_epoch += 1;
+                next.sequence_state = .{};
                 try record.putTxn(txn, alloc, next);
             } else {
                 const connection_key = try record.key(&id);
@@ -364,7 +393,18 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             next.active_txn = null;
             if (next.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
             next.revision += 1;
-            if (session.terminal_commit != null) next.overlay = session.setting_committed.items;
+            if (session.terminal_commit != null) {
+                next.overlay = session.setting_committed.items;
+                next.lookup_path = (session.sql orelse return error.InvalidTransactionSessionRecord).search_path_committed;
+            }
+            try record.putTxn(txn, alloc, next);
+            break :blk 0;
+        },
+        .search_path => |change| blk: {
+            if (next.state != .idle or next.revision != change.expected_revision) return error.SqlConnectionChanged;
+            if (change.value) |path| try path.validate();
+            next.lookup_path = change.value;
+            next.revision = std.math.add(u64, next.revision, 1) catch return error.SqlProgramLimitExceeded;
             try record.putTxn(txn, alloc, next);
             break :blk 0;
         },
@@ -373,6 +413,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
                 return error.SqlConnectionChanged;
             if (next.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
             next.overlay = change.entries;
+            if (change.reset_search_path) next.lookup_path = null;
             next.revision += 1;
             try record.putTxn(txn, alloc, next);
             break :blk 0;
@@ -604,4 +645,35 @@ test "HTTP connection publishes only committed nonlocal settings on terminal pro
     try std.testing.expectEqual(record.State.idle, committed.value.state);
     try std.testing.expectEqual(@as(usize, 1), committed.value.overlay.len);
     try std.testing.expectEqual(@as(i64, 5), committed.value.overlay[0].value.integer);
+}
+
+test "HTTP sequence sessions persist issued values and fence discarded cache epochs without invalidating plans" {
+    const alloc = std.testing.allocator;
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var native = try backend.runtimeStore(alloc, .{ .name = "sql-sequence-session" });
+    defer native.deinit();
+    var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
+    const id: [32]u8 = @splat('a');
+    _ = try mutate(&store, .{ .create = .{ .id = id, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 1);
+    const Identity = @import("antfly_local_sources").sql_sequence_session.Identity;
+    const sequence_id: Identity = .{ .incarnation = @splat(2), .id = 9 };
+    const values: @import("antfly_local_sources").sql_sequence_session.Snapshot = .{ .values = &.{.{ .identity = sequence_id, .value = 42 }}, .last = sequence_id };
+    const update: Action = .{ .sequence_state = .{ .id = id, .generation = 1, .sequence_epoch = 1, .active_txn = null, .value = values } };
+    _ = try mutate(&store, update, "alice", 7, 2);
+    var prior = try load(&store, alloc, id, "alice", 7, 2);
+    try std.testing.expectEqualDeep(values, prior.value.sequence_state);
+    prior.deinit();
+    store.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, mutate(&store, .{ .discard_sequences = id }, "alice", 7, 2));
+    store.fail_writes_for_test = false;
+    _ = try mutate(&store, .{ .discard_sequences = id }, "alice", 7, 2);
+    try std.testing.expectError(error.SqlConnectionChanged, mutate(&store, update, "alice", 7, 2));
+    var current = try load(&store, alloc, id, "alice", 7, 2);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u64, 1), current.value.generation);
+    try std.testing.expectEqual(@as(u64, 2), current.value.sequence_epoch);
+    try std.testing.expectEqual(@as(usize, 0), current.value.sequence_state.values.len);
+    try std.testing.expect(current.value.sequence_state.last == null);
+    try std.testing.expectError(error.SqlConnectionNotFound, mutate(&store, .{ .discard_sequences = id }, "bob", 7, 2));
 }

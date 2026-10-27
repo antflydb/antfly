@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import io
 import tempfile
@@ -26,9 +27,43 @@ from pathlib import Path
 from unittest.mock import patch
 
 import license_headers as policy
+from generated_source_licenses import unicode_source_header
 
 
 class LicenseHeaderTests(unittest.TestCase):
+    def test_unicode_generator_emits_canonical_header(self):
+        # Inspect the shared emission contract without downloading Unicode data
+        # or regenerating the large table. The old resolver generator no longer
+        # exists; regex now owns this generated Unicode property inventory.
+        generator = policy.ROOT / "zig/lib/regex/tools/generate_unicode.py"
+        tree = ast.parse(generator.read_text())
+        output = next(
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "chunks"
+                for target in node.targets
+            )
+        )
+        emission = output.elts[0]
+        self.assertIsInstance(emission, ast.Call)
+        self.assertEqual(emission.func.id, "unicode_source_header")
+        self.assertEqual(len(emission.args), 1)
+        self.assertEqual(emission.args[0].id, "__file__")
+        self.assertEqual(emission.keywords, [])
+        header = unicode_source_header(str(generator))
+        self.assertTrue(
+            header.startswith(
+                policy.render_header(
+                    Path("unicode_data.zig"), policy.read_header("apache")
+                )
+            )
+        )
+        checked_in = (policy.ROOT / "zig/lib/regex/src/unicode_data.zig").read_text()
+        self.assertTrue(checked_in.startswith(header))
+        self.assertIn("// UNICODE LICENSE V3\n", header)
+
     def test_product_groups(self):
         self.assertEqual(
             policy.group_for("zig/pkg/antfly-embedded/src/public_capi_root.zig", "all"),

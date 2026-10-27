@@ -70,6 +70,17 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_ha_compat_tests = options.run_lib_ha_compat_tests;
     const compiled_recall_tests = options.compiled_recall_tests;
+    const role_default_bench = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("bench/sql_role_defaults.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    role_default_bench.root_module.addImport("sql_settings", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/settings.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    b.step("sql-role-default-bench", "Benchmark maximum-sized role settings validation and no-op comparison").dependOn(&b.addRunArtifact(role_default_bench).step);
     const system_catalog_bench = b.addExecutable(.{
         .name = "antfly-system-catalog-bench",
         .root_module = b.createModule(.{

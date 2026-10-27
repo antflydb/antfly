@@ -116,6 +116,9 @@ pub fn applyReplicatedTransactionMutationInternal(
         },
         .prepare => |prepare| {
             const intents: db_mod.types.TransactionIntentRequest = .{
+                .row_policy_principal_proof = req.row_policy_principal_proof,
+                .row_policy_database = req.row_policy_database,
+                .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
                 .writes = batchWritesAsTransactionWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,

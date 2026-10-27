@@ -22,6 +22,16 @@ const metadata = @import("../metadata/api.zig");
 const http = @import("antfly_local_sources").common_http_http_common;
 const time = @import("antfly_platform").time;
 
+fn unpublishedAdmissionBusy(operation: @FieldType(rpc.Request, "operation"), status: u16, acknowledged: bool, body: []const u8) bool {
+    if (status != 503 or !acknowledged or !std.mem.eql(u8, body, "ReadUnavailable")) return false;
+    return switch (operation) {
+        .admit, .capture, .validate, .snapshot, .open => true,
+        // These operations can run after query evaluation/row delivery. A
+        // negative reply never authorizes replay of an advanced cursor.
+        .open_snapshot, .next, .normalize, .range_proofs, .close, .cancel, .renew_snapshot => false,
+    };
+}
+
 /// Owns endpoint and catalog capability bytes. Executor must be a stable
 /// server-owned authenticated transport, never a stack-built hosted adapter.
 pub const Client = struct {
@@ -52,7 +62,7 @@ pub const Client = struct {
         try receiver.io().randomSecure(&nonce);
         const connection = std.mem.readInt(u128, &nonce, .little);
         if (connection == 0) return error.ReadUnavailable;
-        self.* = .{ .alloc = alloc, .executor = executor, .uri = uri, .route = encoded_route, .schema_version = schema_version, .deadline_ns = deadline_ns orelse time.monotonicNs() +| 30 * std.time.ns_per_s, .token = undefined, .connection = connection };
+        self.* = .{ .alloc = alloc, .executor = executor, .uri = uri, .route = encoded_route, .schema_version = schema_version, .deadline_ns = deadline_ns orelse executor.monotonicNs() +| 30 * std.time.ns_per_s, .token = undefined, .connection = connection };
         return self;
     }
 
@@ -89,7 +99,7 @@ pub const Client = struct {
     fn call(self: *Client, request: rpc.Request) !http.HttpResponse {
         const cleanup = request.operation == .close or request.operation == .cancel;
         if (self.poisoned and !cleanup) return error.RetainedReadRestartRequired;
-        const now = time.monotonicNs();
+        const now = self.executor.monotonicNs();
         if (now >= self.deadline_ns and !cleanup) return error.DeadlineExceeded;
         const timeout: u32 = if (cleanup) 100 else @intCast(@max(1, @min(5000, (self.deadline_ns -| now) / std.time.ns_per_ms)));
         const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
@@ -115,8 +125,24 @@ pub const Client = struct {
             self.poisoned = true;
             return error.SqlRangeTrackingRequired;
         }
+        // Normalization is pure preparation, not a stateful page advance or
+        // commit. An authenticated, protocol-acknowledged, canonical negative
+        // result must preserve validation/cancellation/resource identity.
+        // Unknown names, mismatched status, missing ACK and other operations
+        // retain the fail-closed restart path; never replay this RPC.
+        if (request.operation == .normalize and response.status >= 400 and response.status < 600 and
+            std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value))
+        {
+            if (@import("antfly_runtime_abi").error_abi.errorFromStableName(response.body)) |err| {
+                if (rpc.normalizationFailureHttpStatus(err) == response.status) {
+                    self.poisoned = true;
+                    return err;
+                }
+            }
+        }
         if (response.status != 200 or !std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value)) {
             self.poisoned = true;
+            if (unpublishedAdmissionBusy(request.operation, response.status, std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value), response.body)) return error.ReadUnavailable;
             return error.RetainedReadRestartRequired;
         }
         return response;
@@ -126,6 +152,17 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var response = try self.call(.{ .operation = .validate, .schema_version = self.schema_version, .token = self.token });
         defer response.deinit(self.alloc);
+    }
+
+    /// Explicit heartbeat for a transaction-owned snapshot. This never opens
+    /// a replacement cut. As with other retained operations, ambiguous delivery
+    /// poisons the client; recovery must not silently recapture newer data.
+    pub fn renewSnapshot(self: *Client, lease_ms: u32) !void {
+        if (lease_ms == 0 or lease_ms > rpc.max_lease_ms) return error.InvalidRetainedReadLease;
+        var response = try self.call(.{ .operation = .renew_snapshot, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = lease_ms });
+        defer response.deinit(self.alloc);
+        // Resource retention is not execution admission. Heartbeats must never
+        // extend the caller's statement deadline or bypass its cancellation.
     }
 
     fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
@@ -146,7 +183,7 @@ pub const Client = struct {
         const route = try alloc.dupe(u8, self.route);
         errdefer alloc.free(route);
         snapshot.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = token, .connection = self.connection };
-        return .{ .ptr = snapshot, .vtable = &.{ .open = openSnapshot, .release = close } };
+        return .{ .ptr = snapshot, .vtable = &.{ .renew = renewRetainedSnapshot, .open = openSnapshot, .release = close } };
     }
 
     fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
@@ -154,8 +191,17 @@ pub const Client = struct {
         return self.openKind(alloc, from, to, opts, false);
     }
 
+    fn renewRetainedSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !void {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        self.deadline_ns = deadline_ns orelse self.executor.monotonicNs() +| 5 * std.time.ns_per_s;
+        try self.renewSnapshot(rpc.max_lease_ms);
+    }
+
     fn openSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
         const self: *Client = @ptrCast(@alignCast(ptr));
+        if (opts.cancellation) |token| try token.check();
+        // Forks use the current statement budget, never a stale capture budget.
+        self.deadline_ns = opts.execution_deadline_ns orelse self.executor.monotonicNs() +| 30 * std.time.ns_per_s;
         return self.openKind(alloc, from, to, opts, true);
     }
 
@@ -178,8 +224,13 @@ pub const Client = struct {
         defer response.deinit(self.alloc);
         var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
         defer parsed.deinit();
+        if (query.text_filter) |text| {
+            var expected: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(text.query, &expected, .{});
+            if (parsed.value.text_filter_digest == null or !std.mem.eql(u8, &expected, &parsed.value.text_filter_digest.?)) return error.UnsupportedSqlExecution;
+        } else if (parsed.value.text_filter_digest != null) return error.InvalidRetainedReadResponse;
         cursor.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = parsed.value.token orelse return error.InvalidRetainedReadResponse, .connection = self.connection };
-        return .{ .ptr = cursor, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
+        return .{ .text_filter_digest = parsed.value.text_filter_digest, .ptr = cursor, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
     }
 
     fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !reads.RelationalReadView.Page {
@@ -264,6 +315,98 @@ fn consumerTests() type {
     const root = @import("antfly_source_root");
     if (@hasDecl(root, "implementation_tests_only") and root.implementation_tests_only) return struct {};
     return struct {
+        test "retained read client admission retries require an exact unpublished owner rejection" {
+            const Operation = @FieldType(rpc.Request, "operation");
+            for (std.meta.tags(Operation)) |operation| {
+                const expected = switch (operation) {
+                    .admit, .capture, .validate, .snapshot, .open => true,
+                    else => false,
+                };
+                try std.testing.expectEqual(expected, unpublishedAdmissionBusy(operation, 503, true, "ReadUnavailable"));
+                try std.testing.expect(!unpublishedAdmissionBusy(operation, 503, false, "ReadUnavailable"));
+                try std.testing.expect(!unpublishedAdmissionBusy(operation, 409, true, "ReadUnavailable"));
+                try std.testing.expect(!unpublishedAdmissionBusy(operation, 503, true, "RetainedReadExpired"));
+                try std.testing.expect(!unpublishedAdmissionBusy(operation, 503, true, "ReadUnavailable\n"));
+            }
+        }
+
+        test "retained read client renews the exact snapshot and fails closed on lost acknowledgement" {
+            const Fixture = struct {
+                registry_owner: *registry.Registry,
+                calls: usize = 0,
+                closed: usize = 0,
+                lose_renewal: bool = false,
+                const scope = registry.Scope{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+                const route = metadata.CatalogRouteFence{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } };
+                fn release(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.closed += 1;
+                }
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    var input = try std.json.parseFromSlice(rpc.Request, alloc, request.body, .{});
+                    defer input.deinit();
+                    const body = try rpc.execute(alloc, .{ .registry = self.registry_owner, .source = .{ .ptr = self, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } } }, scope, "rows", input.value);
+                    errdefer alloc.free(body);
+                    if (self.lose_renewal and input.value.operation == .renew_snapshot) return error.ConnectionResetByPeer;
+                    const headers = try alloc.alloc(http.Header, 1);
+                    errdefer alloc.free(headers);
+                    const name = try alloc.dupe(u8, metadata.catalog_route_fence_ack_header);
+                    errdefer alloc.free(name);
+                    headers[0] = .{ .name = name, .value = try alloc.dupe(u8, metadata.catalog_route_fence_ack_value) };
+                    return .{ .status = 200, .body = body, .headers = headers };
+                }
+            };
+            const a = std.testing.allocator;
+            var lifetime = try registry.Registry.init(a, std.testing.io, 1, 8, 8, 30 * std.time.ns_per_s);
+            defer lifetime.deinit();
+            var fixture: Fixture = .{ .registry_owner = &lifetime };
+            const executor = http.RequestExecutor{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } };
+            const client = try Client.create(a, executor, "http://peer", "rows", Fixture.route, 5, null);
+            var client_closed = false;
+            defer if (!client_closed) Client.close(client);
+            const now = executor.monotonicNs();
+            client.deadline_ns = now + 10 * std.time.ns_per_s;
+            const request_deadline = client.deadline_ns;
+            client.token = try lifetime.insert(Fixture.scope, client.connection, now, now + std.time.ns_per_s, .{ .ptr = &fixture, .close = Fixture.release, .kind = .snapshot });
+            const original = client.token;
+            const owner: @import("retained_read_owner.zig").Owner = .{ .registry = &lifetime, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } } };
+            try std.testing.expectError(error.InvalidRetainedReadToken, rpc.execute(a, owner, Fixture.scope, "rows", .{ .operation = .renew_snapshot, .schema_version = 5 }));
+            try std.testing.expectError(error.RetainedReadScopeChanged, rpc.execute(a, owner, Fixture.scope, "rows", .{ .operation = .renew_snapshot, .schema_version = 5, .token = original, .connection = 0 }));
+            // Failure to allocate the acknowledgement cannot mutate retention.
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            try std.testing.expectError(error.OutOfMemory, rpc.execute(failing.allocator(), owner, Fixture.scope, "rows", .{ .operation = .renew_snapshot, .schema_version = 5, .token = original, .connection = client.connection, .lease_ms = rpc.max_lease_ms }));
+            try std.testing.expectError(error.RetainedReadExpired, lifetime.borrow(original, Fixture.scope, .snapshot, now + std.time.ns_per_s));
+            try std.testing.expectError(error.InvalidRetainedReadLease, client.renewSnapshot(0));
+            try std.testing.expectError(error.InvalidRetainedReadLease, client.renewSnapshot(rpc.max_lease_ms + 1));
+            try std.testing.expectEqual(0, fixture.calls);
+            try client.renewSnapshot(rpc.max_lease_ms);
+            try std.testing.expectEqual(request_deadline, client.deadline_ns);
+            try std.testing.expectEqual(original, client.token);
+            try client.renewSnapshot(1000);
+            try std.testing.expectEqual(request_deadline, client.deadline_ns);
+            var pinned = try lifetime.borrow(original, Fixture.scope, .snapshot, now + 2 * std.time.ns_per_s);
+            pinned.deinit();
+            const calls_before_expiry = fixture.calls;
+            client.deadline_ns = 0;
+            try std.testing.expectError(error.DeadlineExceeded, client.renewSnapshot(rpc.max_lease_ms));
+            try std.testing.expectEqual(calls_before_expiry, fixture.calls);
+            client.deadline_ns = request_deadline;
+            fixture.lose_renewal = true;
+            try std.testing.expectError(error.ConnectionResetByPeer, client.renewSnapshot(rpc.max_lease_ms));
+            try std.testing.expect(client.poisoned);
+            const calls = fixture.calls;
+            try std.testing.expectError(error.RetainedReadRestartRequired, client.renewSnapshot(rpc.max_lease_ms));
+            try std.testing.expectEqual(calls, fixture.calls);
+            try std.testing.expectEqual(0, fixture.closed);
+            // Cleanup remains available on the poisoned client and never
+            // creates a replacement cut after ambiguous renewal delivery.
+            Client.close(client);
+            client_closed = true;
+            try std.testing.expectEqual(1, fixture.closed);
+        }
+
         test "retained read client never replays an ambiguous page request" {
             const Fixture = struct {
                 calls: usize = 0,
@@ -282,6 +425,106 @@ fn consumerTests() type {
             try std.testing.expectError(error.ConnectionResetByPeer, Client.next(client, alloc, 1));
             try std.testing.expectError(error.RetainedReadRestartRequired, Client.next(client, alloc, 1));
             try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        }
+
+        test "retained read client preserves only canonical acknowledged normalization failures without replay" {
+            const Fixture = struct {
+                status: u16,
+                body: []const u8,
+                ack: bool,
+                calls: usize = 0,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    const headers = try alloc.alloc(http.Header, @intFromBool(self.ack));
+                    if (self.ack) headers[0] = .{
+                        .name = try alloc.dupe(u8, metadata.catalog_route_fence_ack_header),
+                        .value = try alloc.dupe(u8, metadata.catalog_route_fence_ack_value),
+                    };
+                    return .{ .status = self.status, .body = try alloc.dupe(u8, self.body), .headers = headers };
+                }
+            };
+            const Case = struct { operation: @FieldType(rpc.Request, "operation") = .normalize, status: u16 = 400, body: []const u8 = "RelationalCheckViolation", ack: bool = true, expected: anyerror = error.RetainedReadRestartRequired };
+            for ([_]Case{
+                .{ .expected = error.RelationalCheckViolation },
+                .{ .body = "UniqueConstraintViolation", .expected = error.UniqueConstraintViolation },
+                .{ .body = "InvalidBatchRequest", .expected = error.InvalidBatchRequest },
+                .{ .status = 403, .body = "RowPolicyDenied", .expected = error.RowPolicyDenied },
+                .{ .status = 403, .body = "RowPolicyAuthenticationRequired", .expected = error.RowPolicyAuthenticationRequired },
+                .{ .body = "RowPolicyDenied" },
+                .{ .status = 500, .body = "OutOfMemory", .expected = error.OutOfMemory },
+                .{ .status = 503, .body = "ReadUnavailable", .expected = error.ReadUnavailable },
+                .{ .ack = false },
+                .{ .status = 409 },
+                .{ .body = "RelationalCheckViolation\n" },
+                .{ .body = "PrivateProviderSecret" },
+                .{ .operation = .next },
+                .{ .operation = .open },
+            }) |case| {
+                var fixture: Fixture = .{ .status = case.status, .body = case.body, .ack = case.ack };
+                const alloc = std.testing.allocator;
+                const client = try Client.create(alloc, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "rows", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+                defer client.destroy();
+                client.token = .{ .incarnation = 1, .sequence = 1, .slot = 0 };
+                const request: rpc.Request = .{ .operation = case.operation, .schema_version = 5, .token = client.token };
+                try std.testing.expectError(case.expected, client.call(request));
+                try std.testing.expect(client.poisoned);
+                try std.testing.expectError(error.RetainedReadRestartRequired, client.call(request));
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            }
+        }
+
+        test "retained read client requires exact text acknowledgement before rows and cancels ignored predicates" {
+            const Fixture = struct {
+                mode: u8,
+                opens: usize = 0,
+                pages: usize = 0,
+                cancels: usize = 0,
+                fn execute(raw: *anyopaque, a: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    var parsed = try std.json.parseFromSlice(rpc.Request, a, request.body, .{});
+                    defer parsed.deinit();
+                    var reply: rpc.Response = .{ .token = .{ .incarnation = 1, .sequence = 2, .slot = 0 } };
+                    switch (parsed.value.operation) {
+                        .open => {
+                            self.opens += 1;
+                            if (self.mode != 0) {
+                                var digest: [32]u8 = @splat(0);
+                                if (self.mode == 2) std.crypto.hash.sha2.Sha256.hash(parsed.value.query.?.text_filter.?.query, &digest, .{});
+                                reply.text_filter_digest = digest;
+                            }
+                        },
+                        .next => self.pages += 1,
+                        .cancel => self.cancels += 1,
+                        .close => {},
+                        else => return error.TestUnexpectedResult,
+                    }
+                    const body = try std.json.Stringify.valueAlloc(a, reply, .{});
+                    errdefer a.free(body);
+                    const headers = try a.alloc(http.Header, 1);
+                    errdefer a.free(headers);
+                    const name = try a.dupe(u8, metadata.catalog_route_fence_ack_header);
+                    errdefer a.free(name);
+                    headers[0] = .{ .name = name, .value = try a.dupe(u8, metadata.catalog_route_fence_ack_value) };
+                    return .{ .status = 200, .body = body, .headers = headers };
+                }
+            };
+            const a = std.testing.allocator;
+            for (0..3) |mode| {
+                var source: Fixture = .{ .mode = @intCast(mode) };
+                const client = try Client.create(a, .{ .ptr = &source, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "rows", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+                defer client.destroy();
+                client.token = .{ .incarnation = 1, .sequence = 1, .slot = 0 };
+                const opts: types.ScanOptions = .{ .relational_query = .{ .fields = &.{}, .auto_index = true, .text_filter = .{ .query = "body:alpha" } } };
+                if (mode == 2) {
+                    const view = try client.openKind(a, "", "", opts, false);
+                    defer view.deinit();
+                    try std.testing.expect(view.text_filter_digest != null);
+                } else try std.testing.expectError(error.UnsupportedSqlExecution, client.openKind(a, "", "", opts, false));
+                try std.testing.expectEqual(@as(usize, 1), source.opens);
+                try std.testing.expectEqual(@as(usize, 0), source.pages);
+                try std.testing.expectEqual(@as(usize, if (mode == 2) 0 else 1), source.cancels);
+            }
         }
 
         test "retained read client round trips owned snapshots and exact typed pages" {

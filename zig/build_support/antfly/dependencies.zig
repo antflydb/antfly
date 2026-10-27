@@ -315,7 +315,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // transitive tests require different owner roots. Select the SQL and
     // row-policy contract namespaces at compile time, while allowing explicit
     // caller filters.
-    const sql_tests = b.addTest(.{ .name = "sql-tests", .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
+    // SQL declaration lowering must agree with the distributed integrity
+    // planner, which lives outside sql/. Keep that cross-layer regression in
+    // this gate rather than leaving it silently outside the selected corpus.
+    const sql_tests = b.addTest(.{ .name = "sql-tests", .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "document generated", "SQL range", "column nullability transition", "projected column nullability", "relational nullness", "relational predicate", "relational residual comparisons", "relational index system partial implication", "relational index system SQL immutable index constant", "relational index system schema reader", "relational declarations public NUMERIC modifiers", "common.sql_array_layout", "system_catalog.policies", "system catalog definite naming diagnostics", "system catalog relation guard", "SQL UNIQUE null clauses share distributed claims and conflict arbiters", "SQL covering constraint", "schema deserialization cleans initialized mappings on allocation failure", "prepared schema definitions", "installed view policy selects owner roles" }) });
     // Use the same exact-filter runner as extracted SQL owners. Besides
     // consistent failure/leak attribution, this keeps compile-only anonymous
     // reachability anchors out of runtime selection.
@@ -330,6 +333,21 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // is independent of the executor's per-statement memory admission tests.
     run_sql_tests.step.max_rss = 384 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const mutation_domain_tests = b.addTest(.{
+        .name = "sql-mutation-domain-tests",
+        .root_module = sql_test_mod,
+        .filters = &.{
+            "SQL mutation assignment domains match PostgreSQL before physical encoding",
+            "SQL mutation temporal frames preserve every precise parameter identity",
+            "SQL mutation temporal batches preserve exact borrowed domains through selection and projection",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    mutation_domain_tests.step.max_rss = sql_tests.step.max_rss;
+    const run_mutation_domain_tests = addFilteredTestRunArtifact(b, mutation_domain_tests);
+    run_mutation_domain_tests.step.max_rss = run_sql_tests.step.max_rss;
+    run_mutation_domain_tests.addArg("--require-no-skips");
+    b.step("sql-mutation-domain-test", "Verify PostgreSQL assignment admission and precise borrowed temporal domains").dependOn(&run_mutation_domain_tests.step);
     const relation_name_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_names.zig"),
         .target = target,
@@ -340,6 +358,34 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     b.step("system-catalog-relation-test", "Test namespace ownership and atomic catalog publication plans")
         .dependOn(&run_relation_name_tests.step);
     run_sql_tests.step.dependOn(&run_relation_name_tests.step);
+    const constraint_name_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/constraint_names.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_constraint_name_tests = b.addRunArtifact(constraint_name_tests);
+    constraint_name_tests.root_module.addImport("antfly_platform", platform_mod);
+    b.step("system-catalog-constraint-name-test", "Test bounded PostgreSQL-compatible generated constraint names")
+        .dependOn(&run_constraint_name_tests.step);
+    run_sql_tests.step.dependOn(&run_constraint_name_tests.step);
+    const sequence_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/sequence_reference_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_sequence_tests = b.addRunArtifact(sequence_tests);
+    b.step("system-catalog-sequence-test", "Test sequence arithmetic and bounded retry contracts against PostgreSQL witnesses")
+        .dependOn(&run_sequence_tests.step);
+    run_sql_tests.step.dependOn(&run_sequence_tests.step);
+    const naming_wire_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/constraint_name_wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_naming_wire_tests = b.addRunArtifact(naming_wire_tests);
+    b.step("system-catalog-naming-wire-test", "Test fixed-memory naming capability projection")
+        .dependOn(&run_naming_wire_tests.step);
+    run_sql_tests.step.dependOn(&run_naming_wire_tests.step);
     const relation_reconciliation_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_reconciliation.zig"),
         .target = target,
@@ -1350,14 +1396,21 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // need the inference/API module graph of a full storage owner.
     antfly_imports.configureRuntimeContracts(usermgr_mod);
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
+    antfly_imports.configureLocalDatabaseContracts(sql_test_mod);
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
     sql_test_mod.addImport("antfly-json", json_mod);
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    pgwire_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);
     sql_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
+    // Native wire parameter frames share the SQL scalar/type owner.
+    pgwire_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
+    pgwire_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
+    sql_test_mod.addImport("antfly_resolver", resolver_mod);
+    sql_test_mod.addImport("antfly_vector", vector_mod);
     sql_test_mod.link_libc = link_libc;
     const refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/sql_refinement_bench_root.zig"),

@@ -42,6 +42,11 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
+
+fn preparationValidator(input: anytype, historical: bool) @TypeOf(input) {
+    if (input) |validator| if (historical) return validator.forHistoricalImport();
+    return input;
+}
 const merge_state_mod = @import("merge_state.zig");
 const platform = @import("antfly_platform");
 const platform_clock = @import("antfly_platform").clock;
@@ -259,6 +264,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) {
                 const trusted = opts.transaction_resolution != null or opts.replication_applied_lsn_marker != null;
+                const validation = @import("relational_integrity_activation_contract.zig");
+                if (trusted and std.mem.eql(u8, write.key, validation.validation_key)) {
+                    _ = try validation.ForeignKeyValidationRecord.decode(write.value);
+                    continue;
+                }
+                if (trusted and std.mem.eql(u8, write.key, validation.validation_inputs_key)) {
+                    _ = try @import("relational_schema_owner_contract.zig").inputParts(write.value);
+                    continue;
+                }
                 if (!trusted or !maintenance_contract.isControlKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
                 _ = try maintenance_contract.Control.decode(write.value);
                 maintenance_attempted = true;
@@ -272,9 +286,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) return error.ReadOnly;
             if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
+            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
             var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
-            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
             if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
             const total_start_ns = monotonicTimeNs();
@@ -410,8 +424,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // schema or its durable catalog.
             const request_schema_binding: ?transactions_mod.SchemaBinding = if (opts.transaction_resolution) |resolution|
                 resolution.schema_binding
-            else if (opts.ordered_apply_receipt != null and req.relational_schema_version != null)
-                .{ .version = req.relational_schema_version }
+            else if (opts.ordered_apply_receipt != null and (req.relational_schema_version != null or req.schema_version != null))
+                .{ .version = req.relational_schema_version orelse req.schema_version }
             else
                 null;
             var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, request_schema_binding);
@@ -436,6 +450,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (view.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
                 if (view.version() != version) return error.PreparedGenerationChanged;
             }
+            var prepared_document: ?mapper.PreparedDocumentBatch = null;
+            defer if (prepared_document) |*prepared| prepared.deinit();
+            if (request_schema_view) |view| if (view.storageMode() == .document and (if (view.validator()) |validator| validator.requiresDocumentPreparation() else false) and effective_req.writes.len != 0) {
+                const validator = preparationValidator(view.validator(), opts.restore_staging != null) orelse return error.InvalidSchemaUpdateRequest;
+                prepared_document = try mapper.PreparedDocumentBatch.init(preparation_alloc, effective_req.writes, validator, opts.restore_staging != null or opts.preserve_logical_values or opts.replication_applied_lsn_marker != null or req.split_replication != null or req.merge_replication != null);
+                effective_req.writes = prepared_document.?.writes;
+            };
             // Integrity effects may only enter through durable transaction prepare.
             if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
             var relational_index_snapshot = S.ownerField(self, "core").*.relational_indexes.acquire();
@@ -491,6 +512,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var preprepared_document_generated: ?PrecomputedGeneratedBatch = null;
             defer if (preprepared_document_generated) |*generated| generated.deinit(preparation_alloc);
             var document_generated_write_plan_generation: ?u64 = null;
+            if (prepared_document != null) {
+                write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                document_generated_write_plan_generation = write_plan_snapshot.?.generation();
+            }
             var generated_precompute_snapshot: GeneratedWriteReadSnapshot = .{};
             defer generated_precompute_snapshot.deinit(preparation_alloc);
             if (request_schema_view) |view| if (view.storageMode() == .relational) {
@@ -532,7 +557,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         S.ownerField(self, "backend_runtime").*.io(),
                         self,
                         effective_req.writes,
-                        view.validator(),
+                        preparationValidator(view.validator(), opts.restore_staging != null),
                         view.tableSchema().*,
                         view.physicalLayout(),
                         write_plan_snapshot.?.plan().*,
@@ -697,7 +722,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // any catalog publication racing with this precompute is
                     // also caught as a generation change under the lock, never
                     // silently used.
-                    write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                    if (write_plan_snapshot == null) write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     document_generated_write_plan_generation = write_plan_snapshot.?.generation();
                     const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
                     var extracted_rows_initialized: usize = 0;
@@ -719,13 +744,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             extracted_rows_initialized += 1;
                             continue;
                         }
-                        extracted_rows[i] = try mapper.extractWrite(preparation_alloc, write.key, write.value);
+                        const root = if (prepared_document) |prepared| prepared.roots[i] else null;
+                        extracted_rows[i] = if (root) |value| try mapper.extractWriteFromParsed(preparation_alloc, write.key, write.value, value) else try mapper.extractWrite(preparation_alloc, write.key, write.value);
                         extracted_rows_initialized += 1;
                         if (doc_plan_needs_parse) {
-                            var parsed = try std.json.parseFromSlice(std.json.Value, preparation_alloc, write.value, .{});
-                            defer parsed.deinit();
-                            try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(doc_plan, preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
-                            try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
+                            var parsed = if (root == null) try std.json.parseFromSlice(std.json.Value, preparation_alloc, write.value, .{}) else null;
+                            defer if (parsed) |*value| value.deinit();
+                            const value = root orelse parsed.?.value;
+                            try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(doc_plan, preparation_alloc, write.key, value, &extracted_rows[i]);
+                            try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, value, &extracted_rows[i]);
                         }
                     }
                     preprepared_document_generated = try prepareGeneratedEnrichments(
@@ -857,7 +884,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         effective_req.relational_topology.?.action != .release_initial_child and
                         effective_req.relational_topology.?.action != .cancel_initial_child)))
                 return error.InitialChildNotPublished;
-            if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            // Durable intents already retain a historical schema identity.
+            // Ordinary requests must still prove their speculative epoch current.
+            if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            if (prepared_document != null and S.ownerField(self, "core").*.index_manager.writePlanGeneration() != document_generated_write_plan_generation.?) return error.PreparedGenerationChanged;
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (live_replication_apply) {
                 var integrity_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
@@ -1113,7 +1143,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             {
                 var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer topology_read.abort();
-                try @import("relational_integrity_topology.zig").requireUnfenced(&topology_read);
+                try @import("relational_integrity_topology.zig").requireWriteUnfenced(&topology_read);
             }
 
             // A pending coalescer flush may itself run a complete nested batch and
@@ -1132,8 +1162,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // preflight remains useful for early UX feedback, but every embedded,
             // replicated, recovery, and direct DB caller gets the same contract.
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-            // Coalescer draining above can release/reacquire apply. An index-only
-            // publication need not change the schema or managed-index generation.
+            // Coalescer draining above can release/reacquire apply. Even a
+            // schemaless or unconstrained document write must not bypass a newly
+            // published schema. Durable decisions retain their admitted epoch.
+            if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            // An index-only publication need not change the schema generation.
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (write_plan_snapshot) |pinned| if (pinned.plan().group_sources) |group_plan| {
                 if (group_plan.entries.len > 0 and pinned.generation() != S.ownerField(self, "core").*.index_manager.writePlanGeneration()) return error.PreparedGenerationChanged;
@@ -1513,9 +1546,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk prepared;
                 } else if (apply_schema_view) |view|
                     if (write.json_null_fields.len != 0)
-                        try mapper.PreparedRelationalWrite.initTyped(S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
+                        try mapper.PreparedRelationalWrite.initTyped(S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, false, write.key, write.value, preparationValidator(view.validator(), opts.restore_staging != null), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
                     else if (opts.restore_staging != null or opts.preserve_logical_values)
-                        try mapper.PreparedRelationalWrite.initPreserved(S.ownerField(self, "alloc").*, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout())
+                        try mapper.PreparedRelationalWrite.initPreserved(S.ownerField(self, "alloc").*, write.key, write.value, preparationValidator(view.validator(), opts.restore_staging != null), view.tableSchema().*, view.physicalLayout())
                     else
                         try mapper.PreparedRelationalWrite.initFromIntent(
                             S.ownerField(self, "alloc").*,
@@ -1547,16 +1580,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const semantic_hash = if (prepared_relational) |*prepared| prepared.semantic_hash else null;
                 extracted[i] = if (prepared_relational) |*prepared|
                     prepared.takeExtracted()
+                else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                    try mapper.extractWriteFromParsed(S.ownerField(self, "alloc").*, write.key, write.value, root)
                 else
                     try mapper.extractWrite(S.ownerField(self, "alloc").*, write.key, write.value);
                 // Ownership has transferred even if a later graph/vector consumer
                 // rejects this row. Include it in error cleanup immediately.
                 extracted_initialized += 1;
+                if (if (prepared_document) |prepared| prepared.roots[i] else null) |root| {
+                    extracted[i].prepared_text_root = root;
+                    extracted[i].prepared_text_source_bytes = mapper.estimateJsonValueRetainedBytes(root);
+                    extracted[i].prepared_schema_version = request_schema_view.?.version();
+                    extracted[i].prepared_write_plan_generation = document_generated_write_plan_generation.?;
+                }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_mapper_ns, mapper_extract_start_ns);
                 const graph_field_extract_start_ns = monotonicTimeNs();
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
                         try augmentExtractedWriteWithGraphFieldEdgesParsed(self, S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), &extracted[i])
+                    else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                        try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(write_plan_snapshot.?.plan().*, S.ownerField(self, "alloc").*, write.key, root, &extracted[i])
                     else
                         try augmentExtractedWriteWithGraphFieldEdges(self, S.ownerField(self, "alloc").*, write.key, write.value, &extracted[i]);
                 }
@@ -1565,6 +1608,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
                         try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), try prepared.typedView(apply_schema_view.?.tableSchema().*, apply_schema_view.?.physicalLayout()), &extracted[i])
+                    else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                        try write_plan_snapshot.?.plan().*.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(S.ownerField(self, "alloc").*, write.key, root, &extracted[i])
                     else
                         try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(S.ownerField(self, "alloc").*, write.key, write.value, &extracted[i]);
                 }
@@ -1633,7 +1678,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // persistence and timestamps use the prepared typed authority.
                     const cleaned = if (prepared_relational == null) extracted[i].cleaned_value.? else "";
                     if (prepared_relational == null) if (group_plan) |plan| {
-                        const logical = try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
+                        const logical = (if (prepared_document) |prepared| prepared.roots[i] else null) orelse try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
                         group_changes[i] = try plan.prepareRow(group_alloc, write.key, logical);
                     };
                     const resolved_write_timestamp_ns: ?u64 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
@@ -1666,6 +1711,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (!use_preprepared_rows) {
                         if (prepared_relational) |*prepared|
                             try validateDocumentExtractionInlineSourcesSnapshotParsed(S.ownerField(self, "alloc").*, self, fallback_consumer_plan.?.plan().*, prepared.parsedValue(), extracted[i])
+                        else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                            try validateDocumentExtractionInlineSourcesSnapshotParsed(S.ownerField(self, "alloc").*, self, write_plan_snapshot.?.plan().*, root, extracted[i])
                         else
                             try validateDocumentExtractionInlineSources(self, cleaned);
                     }
@@ -3334,6 +3381,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.RowPolicyMutationUnsupported;
             const bundle = if (S.ownerField(self, "local_execution").*.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
             const schema = schema_view.tableSchema().*;
+            var requirements = try @import("row_policy_bundle.zig").MutationRequirements.init(S.ownerField(self, "alloc").*, req.predicates, principal);
+            defer requirements.deinit(S.ownerField(self, "alloc").*);
+            const select_check = if (requirements.needsSelect()) try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .select) else null;
+            defer if (select_check) |evaluation| evaluation.deinit();
             var insert_check = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .insert);
             defer insert_check.deinit();
             var update_old = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .update_old);
@@ -3346,6 +3397,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer probe.abort();
             for (req.writes, 0..) |write, i| {
                 if (isMetadataKey(write.key)) return error.RowPolicyMutationUnsupported;
+                const requirement = try requirements.forKey(write.key);
+                if (requirement.isDelete()) return error.RowPolicyAuthenticationRequired;
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
                 defer S.ownerField(self, "alloc").*.free(store_key);
                 const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
@@ -3353,20 +3406,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else => return err,
                 };
                 if (old_bytes) |bytes| {
+                    if (requirement.isInsert()) return error.RowPolicyDenied;
                     if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
                     const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
                         try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
                     else
                         try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
                     if (!try update_old.permits(old)) return error.RowPolicyDenied;
+                    if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
                 }
+                if (old_bytes == null and requirement.isUpdate()) return error.RowPolicyDenied;
                 const prepared = prepared_rows.?[i] orelse return error.RowPolicyMutationUnsupported;
                 const new = try relational_row_codec.ordinalRowViewTrusted(prepared.packed_row, schema, schema_view.physicalLayout());
                 if (!try (if (old_bytes != null) update_new else insert_check).permits(new))
                     return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(new)) return error.RowPolicyDenied;
             }
             for (req.deletes) |key| {
                 if (isMetadataKey(key)) return error.RowPolicyMutationUnsupported;
+                const requirement = try requirements.forKey(key);
+                if (requirement.isInsert() or requirement.isUpdate()) return error.RowPolicyAuthenticationRequired;
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, key);
                 defer S.ownerField(self, "alloc").*.free(store_key);
                 const bytes = probe.getLeased(store_key) catch |err| switch (err) {
@@ -3379,13 +3438,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else
                     try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
                 if (!try delete_old.permits(old)) return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
             }
         }
 
         pub fn ensureDurableReplicationStartupBarrier(self: anytype) !void {
             // A failed primary append must complete before a later mutation can
             // overtake its afterimage in the hot-standby tail.
-            while (S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
+            while (S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) {
+                // The admission flag closes an ordering gap, not a hint-only
+                // spin loop. Force a bounded truth scan even if another hint
+                // is stale or staging aborted before its transaction commit.
+                S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
+                try self.flushDurableReplicationOutboxes();
+            }
             if (!S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.load(.acquire) and
                 !S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.load(.acquire)) return;
             const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
@@ -3559,9 +3625,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mirror = switch (kind) {
                     .batch, .restore_batch => S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
                     .replay, .primary_effect => S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
-                    .schema, .row_policy => S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
+                    .schema, .row_policy, .metadata_control => S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
                 } orelse return error.ReplicationPublisherUnavailable;
-                if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
+                if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and kind != .metadata_control and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
                 var ctx = self.batchContext();
                 try recoverDurableReplicationOutboxContext(&ctx, mirror, outbox, kind);
                 // The key names this exact mutation, so concurrent publishers cannot
@@ -3625,6 +3691,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (@import("retirement_set_summary.zig").isKey(key)) return true;
             if (@import("native_topology_receipt.zig").isKey(key)) return true;
             const generation_admission = @import("relational_integrity_generation_admission.zig");
+            const validation = @import("relational_integrity_activation_contract.zig");
+            if (std.mem.eql(u8, key, validation.validation_key) or std.mem.eql(u8, key, validation.validation_inputs_key)) return true;
             return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational_integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key) or
                 std.mem.eql(u8, key, @import("relational_integrity_activation.zig").key) or
                 std.mem.eql(u8, key, @import("relational_integrity_topology.zig").fence_key) or
@@ -3640,7 +3708,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, generation_admission.prefix) or
                 std.mem.eql(u8, key, generation_admission.staged_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.activation_receipt_key) or
-                std.mem.eql(u8, key, generation_admission.acknowledged_receipt_key) or
+                std.mem.eql(u8, key, generation_admission.pending_reference_coverage_key) or std.mem.eql(u8, key, generation_admission.acknowledged_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.dual_acknowledged_fence_key) or
                 std.mem.eql(u8, key, generation_admission.dual_canceled_fence_key) or
                 std.mem.eql(u8, key, generation_admission.cancel_receipt_key) or
@@ -4109,7 +4177,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else => return err,
                 });
                 const catalog = loaded.?;
-                if (std.mem.eql(u8, write.key, activation.key)) {
+                if (std.mem.eql(u8, write.key, activation.validation_key)) {
+                    const next = try activation.ValidationRecord.decode(write.value);
+                    const namespace = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
+                    if (!next.binding.fence.namespace.eql(namespace) or !next.progress.matches(catalog, try activation.ownership(txn)) or
+                        !std.mem.eql(u8, &next.binding.before_schema, &catalog.schema_digest) or next.binding.before_version != catalog.schema_version)
+                        return error.SchemaValidationJobChanged;
+                } else if (std.mem.eql(u8, write.key, activation.validation_inputs_key)) {
+                    var expected: ?[32]u8 = null;
+                    for (req.writes) |sibling| if (std.mem.eql(u8, sibling.key, activation.validation_key)) {
+                        expected = (try activation.ValidationRecord.decode(sibling.value)).binding.inputs;
+                        break;
+                    };
+                    if (expected == null) expected = (try activation.ValidationRecord.decode(try txn.get(activation.validation_key))).binding.inputs;
+                    if (!std.mem.eql(u8, &@import("relational_schema_owner_contract.zig").hash(write.value), &expected.?)) return error.SchemaValidationJobChanged;
+                    _ = try @import("relational_schema_owner_contract.zig").inputParts(write.value);
+                } else if (std.mem.eql(u8, write.key, activation.key)) {
                     const next = try activation.Progress.decode(write.value);
                     if (!next.matches(catalog, try activation.ownership(txn)) or next.schema_version != catalog.schema_version)
                         return error.IntegrityCatalogChanged;

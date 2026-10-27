@@ -50,15 +50,37 @@ immutable bound relations, retained statement capture, owner-fenced commits and
 current catalog/constraint generations. No legacy adapter fallback may be
 introduced to claim parity.
 
+## Concurrent index DDL
+
+Nonunique `CREATE INDEX CONCURRENTLY` installs the ordinary live native index
+generation. Mutations maintain that generation atomically with their rows while
+bounded, durable backfill pages reconcile historical candidates. SQL completion
+uses the shared `/indexes` collector to require the exact table/schema identity,
+comparison fingerprint and complete current owner coverage, including a second
+metadata cut. A first ready shard or constraint-enforcement status is insufficient.
+HTTP may return a pending or admission-unknown table/schema receipt within its
+observation budget; callers inspect `/indexes` rather than replaying the DDL.
+
+Single-index `DROP INDEX CONCURRENTLY` uses the same guarded schema and
+index-owned constraint retirement as ordinary DROP. Preparation waits for a
+cached full dependency/range cut to reflect completed read-layout retirement;
+this is read-only observation before admission. Old physical snapshots retain
+their original generation through drop and name reuse. Concurrent index DDL
+rejects transaction blocks with `25001`. Concurrent UNIQUE creation remains
+unsupported because its current private publication protocol fences writers.
+External lake indexes retain their separate publication path and do not claim
+this native concurrent-build contract.
+
 ## Capability surface
 
 | Surface | Available shape | Remaining boundary |
 | --- | --- | --- |
 | Reads and operators | Joins, sets, CTEs, aggregates/windows, typed batch kernels, spill-backed blocking operators and pgwire continuation pages | Exact original-case adjudication; broader correlated/lateral shapes; remote workloads rather than only local kernel benchmarks |
 | Mutations | Native/document DML, joined UPDATE/DELETE, read-only CTE sources, MERGE, normalized RETURNING and guarded UNIQUE conflict ownership | Data-modifying CTE dataflow; broader demand-masked/correlated conflict subqueries and index membership proofs; MERGE partial/expression-key probe planning |
+| COPY input | [Transactional pgwire text, CSV and binary STDIN](copy-input.md), bounded decoding/batches, typed WHERE predicates/defaults, matching headers, native DEFAULT cells, soft conversion rejection and atomic rollback | COPY FREEZE, non-UTF8 and server-file/PROGRAM execution; active RLS uses INSERT |
 | Recursion | Bounded linear delta worklists, typed deduplication and captured physical sources | Mutual/nonlinear recursion, recursive aggregates/windows and nullable-side recursive self joins reject explicitly |
 | Sessions and protocols | READ COMMITTED sessions/savepoints, durable HTTP prepared/connection resources, pgwire scroll/hold cursors, typed settings and ordered multi-namespace lookup | Stronger-isolation provider activation/fault coverage, TTL visibility contract, guarded Lite sessions, restart/failover ownership and complete setting/policy parity; HTTP has no connection-owned cursor resource |
-| Catalog and retirement | Native schema/index/constraint DDL; hosted and native standalone external-FK/graph TRUNCATE with durable publication/recovery receipts | Owned sequences/serial declarations, broader schema rewrite/restore and standby-promotion gates; pending receipts are not synchronous publication |
+| Catalog and retirement | Native schema/index/constraint, serial/identity defaults and owned-sequence DDL; hosted and native standalone external-FK/graph TRUNCATE with durable publication/recovery receipts | Sequence-aware initial FK creation and counter-aware table-archive imports, broader schema rewrite/restore and standby-promotion gates; pending receipts are not synchronous publication |
 | Row policies | Versioned settings/policy catalog, owner proofs and guarded publication, including native/standby component coverage | Every public protected route, revocation/restore and promoted-primary fault/security validation; unsupported providers remain closed |
 | Typed values | Typed rows, lossless SQL arrays (public envelopes, pgwire OIDs, stored `sql_array` columns), precise builtin widths, exact NUMERIC with precision/scale modifiers | Array DDL beyond declarations, element-changing durable casts, non-NULL SQL array defaults, array-valued ordered keys, temporal domains, non-C collations |
 | Lake SQL | Read-only Parquet/Iceberg attachments, snapshot/version pinning, pruning, bounded typed cursors, shared caches and spill | Remote end-to-end performance/recovery evidence; writes, nested/binary inference and native SQL decimal semantics are not claimed |
@@ -89,7 +111,7 @@ case receives release credit because an overlapping component test passed.
 ## Schema format and reader capabilities
 
 Every durable SQL-visible type or expression feature advances the native runtime
-schema format (`storage_format_version`, currently 25, in
+schema format (`storage_format_version` in
 `zig/pkg/antfly-embedded/src/storage/schema.zig`). Serialization refuses to
 downgrade a schema that requires a newer format, and the transactional catalog
 refuses to bind a schema whose requirement exceeds the catalog's advertised
@@ -117,7 +139,31 @@ metadata decoder capability 22 and reader protocols 23–26 (see
 [remote table serving](../../../zig/REMOTE_TABLE_SERVING.md)); the expanded
 ordered-artifact protocols 15 and 17 are not advertised.
 
+Runtime-status wire profiles are separate from these topology capabilities:
+v19 carries media output counters, and v20 adds source authority and native
+commit cuts. Rolling negotiation retains v19 media fields while withholding
+source-authority observations until the named v20 profile is ready.
+
 ## Statement execution
+
+### Cursor protocol and retained output
+
+SQL cursors use the same authenticated typed reads as ordinary queries. DECLARE
+requires an explicit native read-query descriptor; result columns alone cannot
+authorize execution, because mutations may have RETURNING columns. BINARY,
+SCROLL, sensitivity spelling and WITH HOLD compose without changing stored row
+representations. Simple FETCH follows BINARY; extended Bind controls its own
+format vector.
+
+Extended FETCH evaluates its requested range as one statement before sending
+continuation pages, preserving PostgreSQL's cursor-position and completion-count
+semantics. A portal retains an immutable range over connection-budgeted typed
+pages. Existing scroll rows are shared rather than copied; forward-only streams
+materialize only the FETCH result under the same row/byte quotas. Results remain
+valid after cursor CLOSE and name reuse. Shared references do not retain native
+read snapshots after exhaustion. Cold-owner tests compare exact original SQL,
+column OIDs, formats, row bytes and completion tags against PostgreSQL; allocation
+fault tests verify ownership and budget reclamation.
 
 ### Reads and operators
 
@@ -169,10 +215,67 @@ ordered-artifact protocols 15 and 17 are not advertised.
   database/namespace/table scope; aliases hide the original name.
 - Table references accept ONLY across SELECT, INSERT, UPDATE, DELETE, MERGE and
   TRUNCATE; without inheritance it names the same exact table.
-- Dry-run EXPLAIN binds the inner query or mutation under its real authority and
-  renders bounded text or versioned JSON from the immutable bound plan. It opens
-  no row cursor and executes no mutation. ANALYZE and fabricated cost estimates
-  fail explicitly.
+- EXPLAIN binds under the inner statement's authority and renders bounded text
+  or versioned native logical-plan JSON. Planning alone opens no row cursor and
+  executes no mutation. SELECT ANALYZE executes once through the normal typed
+  operators, preserves authorized volatile effects, drains every projected cell
+  and discards result payloads with
+  resettable scratch. Result-response row limits do not truncate the measured
+  query; scan, memory, spill, cancellation and authorization limits still apply.
+  Mutation ANALYZE remains explicitly unsupported.
+- EXPLAIN options use PostgreSQL defaults and Boolean grammar. TIMING OFF removes
+  per-operator clock reads independently of SUMMARY. COSTS uses the declared
+  native estimate model when metadata supports it; absent estimates stay unknown.
+  BUFFERS reports coordinator memory and temporary spill bytes, with explicit
+  units. Provider storage/cache I/O and journal/WAL counts remain unavailable,
+  never synthetic zero. SETTINGS exposes the authorized settings epoch and
+  execution limits, without arbitrary setting values or policy secrets. Native
+  JSON describes Antfly's logical plan and inclusive pull-boundary measurements;
+  it does not impersonate PostgreSQL physical nodes, buffer blocks or WAL units.
+- Binding precedes a bounded, request-owned immutable expression pass shared by
+  execution, streamed reads and EXPLAIN. Custom plans use the owned typed
+  parameter frame. Constant-false subplan demand and unused pure derived outputs
+  suppress unreachable evaluation; group keys, HAVING, ordering and side effects
+  stay live. Stable/volatile functions are never executed during preparation.
+
+### Exact indexed document predicates
+
+Native `full_text_search(...)` document/view queries use an exact postings
+producer. A ranked top-K search followed by residual SQL filtering can
+omit valid rows, and primary scans cannot establish mandatory index readiness.
+The retained source must pair one primary transaction with a frozen full-text
+inventory and deletion cut after its selected derived watermark reaches that
+primary cut. Later updates, deletes, compaction and index retirement must not
+change cursor membership. The text writer's ordinary snapshot intentionally
+shares live deletion masks; retaining it alone does not supply this contract.
+Catalog and analysis leases protect index-entry relocation during preparation
+and capture; neither lease remains held while paging.
+
+The selector pulls one segment bitmap at a time with bounded memory, explicit
+work per pull, deadline/cancellation checks, and empty nonterminal pages. It
+retains physical readers through compaction and resolves only selected document
+identities. Existing document pages remain responsible for primary visibility,
+TTL, mandatory authorization, typed projection and residual SQL evaluation.
+Normal and bound view queries must use this producer through the existing
+retained routed-read machinery. Unsupported placement or provider capability
+must reject before output; it cannot fall back to a capped search or skip a
+required index. Catalog generation, attribute/schema and index readiness guards
+remain mandatory across prepared execution and cold reopen.
+
+The mounted production campaign closes 15 original indexed-read contracts,
+including lateral array expansion and unbounded COUNT, with full result/OID/NULL
+comparisons before and after catalog/owner restart and mandatory caller filters.
+Its PostgreSQL witness explicitly lowers the Antfly-only implicit-document text
+predicate to field-scoped PostgreSQL text matching; it never claims PostgreSQL
+implements that extension or executes the lowering on Antfly. Owner admission
+requires an exact query digest, including across routed retained-read transport;
+older or mixed owners cannot silently supply unfiltered rows.
+
+Only positive WHERE conjuncts over one unambiguous document source are selected.
+Row bounds, aggregation, shared physical materialization, outer joins and security
+barriers remain guarded. Ranked search, stronger delayed snapshots and staged
+mutation overlays are separate capabilities. Ordinary WHERE clauses retain the
+allocation-free path through predicate extraction.
 
 ### Mutations
 
@@ -186,6 +289,24 @@ ordered-artifact protocols 15 and 17 are not advertised.
   Document UPDATE preserves undeclared fields from the full raw preimage;
   exact-byte row digests prevent stale writes even when custom TTL timestamps
   are unchanged.
+- Mutation targets use assignment-domain binding, separate from read-column
+  qualification. Unquoted `metadata.profile` denotes a composite-field target;
+  JSONB, arrays and scalar columns are not composites (`42804`), and an absent
+  root receives `42703`. A quoted `"metadata.profile"` remains one column name.
+  INSERT source binding, UPDATE, ON CONFLICT and MERGE share this boundary before
+  source execution. It allocates no memory; ordinary INSERT columns retain their
+  existing single schema lookup.
+- A constant-time check on the immutable validator selects document preparation.
+  Unconstrained native JSON tables retain their streaming validation fast path
+  and scalar/array values; malformed transaction rows fail before intent
+  admission. Declared document schemas use owned typed preparation.
+- Whole-document patches still pass through the native pinned-schema preparation
+  boundary. An invalid late candidate rejects the entire SQL mutation or REST
+  batch without changing primary bytes, versions or content digests. The
+  document-integrity campaign exercises those outcomes before and after both
+  metadata and data-owner recovery. Its PostgreSQL oracle declares Antfly's
+  patch/schema-validation extensions explicitly; ordinary assignment-indirection
+  diagnostics come directly from PostgreSQL.
 - Multi-row `INSERT ... VALUES` uses a flat VALUES source with ordered arms;
   adjacent literal-only arms share a typed row block, and only one nonliteral arm
   iterator is active. Scalar subqueries in VALUES use the bounded INSERT-source
@@ -196,6 +317,17 @@ ordered-artifact protocols 15 and 17 are not advertised.
   recomputes generated columns. Generated columns accept only DEFAULT. The
   omission mask keeps DEFAULT distinct from explicit SQL NULL through binding
   and RETURNING.
+- Scalar mutation binding checks known source families against assignment
+  targets before physical preparation. An expected result hint cannot reinterpret
+  an incompatible type; INSERT source boundaries report the same assignment
+  diagnostic. Contexts retain builtin widths, NUMERIC modifiers and precise
+  temporal kinds across ordinary, joined, conflict and MERGE mutations.
+  RETURNING retains those kinds in its public column metadata.
+- Mapped execution batches and borrowed column pages use complete typed
+  descriptors. Already typed temporal cells and SQL NULLs remain borrowed through
+  selection/projection; no JSON conversion or allocation is needed to preserve
+  their identity. Parameter-frame binding checks the precise temporal kind before
+  execution, while implicit and explicit timestamptz descriptors remain equivalent.
 - Explicit ROW and parenthesized tuple assignments lower to one simultaneous
   assignment plan; duplicate targets and arity mismatch fail during compilation.
   A row-valued subquery assignment binds positional outputs through one guarded
@@ -524,9 +656,12 @@ public contract returns 202 with a pending receipt.
   with a fresh read-index barrier. An unsupported pre-cutover attempt follows
   durable cancellation; a capability mismatch after irreversible cutover is a
   recovery error that must retain fences.
-- RESTART IDENTITY uses the fresh owner generation. There is no owned sequence or
-  serial declaration and generated row IDs are opaque, so no counter exists to
-  reset; future owned sequences must join the same staging plan and publication.
+- Document RESTART IDENTITY uses a fresh owner generation; opaque document
+  IDs do not use SQL sequence counters. Its original SQL is qualified through
+  completed publication, key reuse and cold-owner recovery. Owned SQL sequences
+  exist separately: serial/identity defaults and transactional counter
+  ownership/generation/reset handoff must join the same staging publication;
+  this document does not claim that unfinished boundary.
 - Graph-index cutover: the old owner closes graph reader, mutation, maintenance
   and worker-snapshot admission under its catalog/apply locks, drains schedule
   pins and persists a Raft-bound seal whose digest binds the active source
@@ -915,6 +1050,34 @@ target reported a 14.46 GB compiler peak against its 13.96 GB reservation. The
 isolated `sql-numeric-test` target does not fix either
 ([history](history/typed-values-log-2026-10.md)).
 
+## Sequence execution
+
+`nextval`, `currval`, `lastval` and `setval` use the existing native catalog
+allocator and exact nonce-bound acknowledgement journal. Scalar evaluation
+suspends on a lazy demand; the execution owner performs I/O and resumes with
+one shared resource budget. Successful volatile siblings are not re-executed.
+Statements without sequence calls retain their ordinary binding path.
+
+Literal names capture catalog incarnation and immutable object identity.
+Connection state separates issued values from compact, process-local cached
+leases. HTTP connections persist issued `currval`/`lastval` before result
+publication; pgwire owns those values and allocations for its connection
+lifetime. `setval(..., false)` clears the caller's cache without changing its
+`currval`; `setval(..., true)` updates that sequence's current value without
+selecting a new `lastval` owner. Rollback/savepoints preserve issued values,
+DISCARD SEQUENCES has a
+separate cache epoch, and cold owners burn unconsumed leases. MERGE's
+stateful predicate and selected assignment execute together per row; deferred
+ordered outputs also use row evaluation. Other decision expressions keep their
+batch path.
+
+`antfly-api-sql-sequence-effects-test` qualifies real HTTP connections, pgwire
+prepared resources, implicit MERGE transactions, lost/forged acknowledgement
+handling, document TRUNCATE publication and independently reopened owners.
+The PostgreSQL reference also records serial/identity lifecycles, but those
+three original declarations remain unresolved until their native atomic
+publication and shared mutation/default contracts are implemented.
+
 ## Open work
 
 - Original-corpus adjudication until `make sql-parity-release-check` passes.
@@ -923,7 +1086,8 @@ isolated `sql-numeric-test` target does not fix either
 - MERGE cross-owner/failover fault matrix and partial/expression-key probes.
 - Stronger-isolation deployment and fault validation; TTL visibility contract;
   guarded Lite sessions.
-- Owned sequences/serial declarations; TRUNCATE and FK promoted-standby and
+- Serial/identity declarations, atomic table/owned-sequence defaults and
+  transactional counter ownership/reset handoff; TRUNCATE and FK promoted-standby and
   repeated-soak gates (see TRUNCATE known gaps).
 - Complete route-wide policy/session validation, revocation/restore and
   promoted-primary security workloads.
@@ -945,3 +1109,49 @@ isolated `sql-numeric-test` target does not fix either
 - [Typed rows, arrays, precise types and exact NUMERIC log](history/typed-values-log-2026-10.md)
 - [Regex backend and scalar activation log](history/regex-implementation-log.md)
 - [Ordered artifact activation gate log](../ordered-artifacts/history/activation-gate-log.md)
+
+
+### Ordered table-name admission and implicit INSERT targets
+
+Unqualified DROP TABLE, table RENAME, and SET TABLESPACE resolve the bounded
+search path in one names-only catalog cut. Namespace visibility and live table
+administration use the same authorization helpers as other catalog operations.
+The first visible relation determines the target; a wrong object kind does not
+fall through to another namespace. Ingress forwards its exact owner and metadata
+incarnation proof to a private native admission operation. That operation checks
+the proof and reads the catalog revision in the same storage transaction, before
+topology preparation or proposal. Unrelated catalog writes do not invalidate an
+unchanged owner. The existing catalog revision and topology preconditions fence
+the ensuing durable command. An ambiguous proposal is never automatically replayed.
+
+An INSERT without a target list binds its target prefix from the pinned
+relational schema's declaration order. This includes generated and identity
+positions, whose existing DEFAULT and OVERRIDING rules still apply. Missing
+trailing positions use native row preparation. Document tables require explicit
+targets because dynamic fields and aliases do not define a relational ordinal
+layout. Binding owns the inferred names; cached compiler syntax stays immutable.
+VALUES, SELECT, wildcard sources, scalar subqueries, parameters, and ON CONFLICT
+then share the existing typed mutation pipeline. Source-width discovery remains
+symbolic and cannot publish provisional parameter types. Direct VALUES parameters
+inherit assignment domains before set-type resolution, while subqueries keep
+PostgreSQL's own inference boundaries. A masked DEFAULT source slot has a typed
+NULL placeholder and is evaluated only by native preparation. DEFAULT cells also
+consume the compiler's node budget.
+
+HTTP connections persist a compact, owned search path through the existing
+connection and transaction records. Active and post-commit values are distinct:
+SET LOCAL lasts only for the transaction, ordinary SET survives a proven commit,
+and savepoint rollback restores both values. RESET ALL and DISCARD ALL restore
+the connection namespace baseline. Savepoints and path settings survive cold
+owner recovery without reacquiring a lost data snapshot. HTTP and pgwire share
+ordered relation lookup; prepared resources retain their captured path and
+exact relation bindings. Authorization failures remain terminal lookup results.
+The PostgreSQL campaign covers these controls and resumes a durable control-only
+transaction and savepoint after restarting the native owners.
+
+The placement fixture uses a table without key constraints: automatic whole-table
+constraint retirement remains separate work. The same mounted campaign verifies
+that dropping a UNIQUE-constrained table is definitely rejected before proposal,
+preserves its data/schema through restart, and returns the existing `0A000`
+retirement diagnostic. Private forwarding preserves that exact non-admission
+instead of reporting an unknown commit outcome.

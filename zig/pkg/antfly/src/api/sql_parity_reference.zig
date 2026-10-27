@@ -20,6 +20,29 @@ const compiler = @import("antfly_local_sources").sql_compiler;
 const wire = @import("antfly_metadata_openapi").types;
 const httpx = @import("httpx");
 const Json = std.json.Value;
+/// Real HTTP execution must preserve exact widths and temporal identities,
+/// including when generic JSON adaptation is used instead of native pgwire.
+pub fn runUuidExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SELECT uuidv7() AS id, uuid_extract_version(uuidv7()) AS version, uuid_extract_timestamp(uuidv7(INTERVAL '1 day')) AS created, INTERVAL '1 month 2 days 3 hours' AS delta" }, .{});
+    defer alloc.free(request.body.?);
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    var response = try handler.executeSQL(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(wire.SQLResponse, alloc, response.body.?, .{});
+    defer parsed.deinit();
+    const result = parsed.value;
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    const uuid = @import("antfly_local_sources").common_uuid;
+    try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(result.rows[0][0].string)));
+    try std.testing.expectEqual(@as(?wire.SQLArrayElementType, .int16), result.columns[1].element_type);
+    try std.testing.expectEqual(@as(?wire.SQLTemporalKind, .interval), result.columns[3].temporal_kind);
+    try std.testing.expectEqualStrings("7", result.rows[0][1].string);
+    try std.testing.expectEqualStrings("1 mon 2 days 03:00:00", result.rows[0][3].string);
+}
+
 const OrderedGroup = struct { rows: []const []const Json, sql_nulls: []const []const bool };
 
 test "SQL PostgreSQL reference distinguishes JSON null and validates ordered peer prefixes" {
@@ -44,6 +67,7 @@ test "SQL PostgreSQL reference distinguishes JSON null and validates ordered pee
 }
 
 const Reference = struct {
+    exact_builtin_types: bool = false,
     reference: []const u8 = "",
     entries: []const struct { id: []const u8, columns: []const []const u8, rows: []const []const Json, sql_nulls: ?[]const []const bool = null, column_oids: ?[]const u32 = null, ordered_groups: ?[]const OrderedGroup = null },
 };
@@ -85,13 +109,38 @@ fn postgresTypeMatches(kind: wire.SQLColumnType, oid: u32) bool {
     };
 }
 
-fn postgresColumnMatches(column: wire.SQLColumn, oid: u32) bool {
+pub fn postgresColumnMatches(column: wire.SQLColumn, oid: u32) bool {
+    switch (oid) {
+        3906 => return column.type == .numrange,
+        3912 => return column.type == .daterange,
+        3908 => return column.type == .tsrange,
+        3910 => return column.type == .tstzrange,
+        1082 => return column.type == .datetime and column.temporal_kind == .date,
+        1083 => return column.type == .datetime and column.temporal_kind == .time,
+        1266 => return column.type == .datetime and column.temporal_kind == .time_tz,
+        1114 => return column.type == .datetime and column.temporal_kind == .timestamp,
+        1186 => return column.type == .datetime and column.temporal_kind == .interval,
+        else => {},
+    }
+    if (oid == 1700) return column.type == .number and column.element_type == .numeric;
     if (column.type != .array) return postgresTypeMatches(column.type, oid);
     const element = column.element_type orelse return false;
     const native: @import("antfly_local_sources").sql_array_value.ElementType = switch (element) {
         inline else => |tag| @field(@import("antfly_local_sources").sql_array_value.ElementType, @tagName(tag)),
     };
     return native.arrayOid() == oid;
+}
+
+fn postgresBuiltinMatches(column: wire.SQLColumn, oid: u32) bool {
+    if (!postgresColumnMatches(column, oid)) return false;
+    return switch (oid) {
+        20 => column.element_type == null or column.element_type == .int64,
+        21 => column.element_type == .int16,
+        23 => column.element_type == .int32,
+        700 => column.element_type == .float32,
+        701 => column.element_type == null or column.element_type == .float64,
+        else => true,
+    };
 }
 
 fn equivalent(a: Json, b: Json) bool {
@@ -118,11 +167,25 @@ fn equivalent(a: Json, b: Json) bool {
     };
 }
 
+test "SQL parity exact NUMERIC references reject lost bits scale and builtin identity" {
+    const a = std.testing.allocator;
+    const columns = [_]wire.SQLColumn{.{ .name = "n", .type = .number, .element_type = .numeric }};
+    try std.testing.expect(postgresColumnMatches(columns[0], 1700));
+    try std.testing.expect(!postgresColumnMatches(.{ .name = "n", .type = .number, .element_type = .float64 }, 1700));
+    try std.testing.expect(postgresBuiltinMatches(.{ .name = "tile", .type = .integer, .element_type = .int32 }, 23));
+    try std.testing.expect(!postgresBuiltinMatches(.{ .name = "tile", .type = .integer, .element_type = .int64 }, 23));
+    const expected = [_]Json{.{ .string = "9007199254740993.5000" }};
+    try std.testing.expect(try rowMatches(a, &columns, &expected, &.{false}, &expected));
+    for ([_]Json{ .{ .string = "9007199254740993.0000" }, .{ .string = "9007199254740993.5" }, .{ .float = 9007199254740994.0 } }) |wrong| {
+        try std.testing.expect(!try rowMatches(a, &columns, &.{wrong}, &.{false}, &expected));
+    }
+}
+
 fn rowMatches(alloc: std.mem.Allocator, columns: []const wire.SQLColumn, actual: []const Json, nulls: ?[]const bool, expected: []const Json) !bool {
     return rowMatchesWithNulls(alloc, columns, actual, nulls, expected, null);
 }
 
-fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn, actual: []const Json, nulls: ?[]const bool, expected: []const Json, expected_nulls: ?[]const bool) !bool {
+pub fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn, actual: []const Json, nulls: ?[]const bool, expected: []const Json, expected_nulls: ?[]const bool) !bool {
     if (actual.len != expected.len or actual.len != columns.len) return false;
     if (nulls) |flags| if (flags.len != actual.len) return false;
     if (expected_nulls) |flags| if (flags.len != actual.len) return false;
@@ -151,7 +214,37 @@ fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn
             .integer => if (cell == .string) {
                 value = .{ .integer = try std.fmt.parseInt(i64, cell.string, 10) };
             },
+            .numrange, .daterange, .tsrange, .tstzrange => {
+                if (cell != .string or want != .string or !std.mem.eql(u8, cell.string, want.string)) return false;
+                continue;
+            },
+            .datetime => {
+                if (cell != .string or want != .string) return false;
+                if (column.temporal_kind) |kind| if (kind != .timestamp_tz) {
+                    const sources = @import("antfly_local_sources");
+                    const native_kind = std.meta.stringToEnum(sources.sql_temporal_value.Kind, @tagName(kind)) orelse return false;
+                    const left = sources.sql_temporal_text.parseCanonical(native_kind, cell.string) catch return false;
+                    const right = sources.sql_temporal_text.parseCanonical(native_kind, want.string) catch return false;
+                    if (!std.meta.eql(left, right)) return false;
+                    continue;
+                };
+                const left = timestampInstant(cell.string) orelse return false;
+                const right = timestampInstant(want.string) orelse return false;
+                if (!std.meta.eql(left, right)) return false;
+                continue;
+            },
             .number => {
+                if (column.element_type == .numeric and want == .string) {
+                    if (cell != .string) return false;
+                    const numeric = @import("antfly_local_sources").sql_numeric_value;
+                    var context: numeric.Context = .{ .alloc = alloc };
+                    var left = try numeric.parse(&context, cell.string);
+                    defer left.deinit();
+                    var right = try numeric.parse(&context, want.string);
+                    defer right.deinit();
+                    if (left.value.scale != right.value.scale or try numeric.order(&context, left.value, right.value) != .eq) return false;
+                    continue;
+                }
                 if (cell == .string) value = .{ .float = try std.fmt.parseFloat(f64, cell.string) };
                 // JSON has one numeric domain: a number column's integral
                 // float can serialize without a decimal point. Normalize
@@ -183,6 +276,32 @@ fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn
         } else if (!equivalent(value, want)) return false;
     }
     return true;
+}
+
+// JSON timestamp ingress uses RFC text while typed SQL results use canonical
+// PostgreSQL UTC text. Compare exact instants without rounding RFC nanoseconds
+// down to the typed microsecond domain or conflating infinity with SQL NULL.
+const TimestampInstant = union(enum) { finite: i128, infinity: i8 };
+fn timestampInstant(text: []const u8) ?TimestampInstant {
+    const sources = @import("antfly_local_sources");
+    if (sources.datetime.parseDateTimeToSignedNs(text)) |ns| return .{ .finite = ns };
+    const value = sources.sql_temporal_text.parseCanonical(.timestamp_tz, text) catch return null;
+    if (value.timestamp_tz.unixNanoseconds()) |ns| return .{ .finite = ns };
+    return .{ .infinity = value.timestamp_tz.infinity() };
+}
+
+test "SQL parity timestamp comparison preserves nanoseconds and timezone offsets rather than textual spelling" {
+    const columns = [_]wire.SQLColumn{.{ .name = "t", .type = .datetime }};
+    const actual = [_]Json{.{ .string = "2025-06-01T12:30:00.000000001Z" }};
+    try std.testing.expect(try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "2025-06-01T13:30:00.000000001+01:00" }}, &.{false}));
+    try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "2025-06-01T12:30:00+00:00" }}, &.{false}));
+    try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "not a timestamp" }}, &.{false}));
+    try std.testing.expect(try rowMatchesWithNulls(std.testing.allocator, &columns, &.{.{ .string = "2024-02-29 23:59:59.123456+00" }}, &.{false}, &.{.{ .string = "2024-03-01T01:29:59.123456+01:30" }}, &.{false}));
+    try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "2025-06-01 12:30:00+00" }}, &.{false}));
+    for ([_][]const u8{ "infinity", "-infinity", "294276-12-31 23:59:59.999999+00" }) |text| {
+        try std.testing.expect(try rowMatchesWithNulls(std.testing.allocator, &columns, &.{.{ .string = text }}, &.{false}, &.{.{ .string = text }}, &.{false}));
+    }
+    try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &.{.{ .string = "infinity" }}, &.{false}, &.{.{ .string = "-infinity" }}, &.{false}));
 }
 
 pub fn runArrayWireContracts(alloc: std.mem.Allocator) !void {
@@ -235,10 +354,78 @@ fn expectMutationRejected(alloc: std.mem.Allocator, handler: anytype, statement:
     try std.testing.expectEqualStrings(sqlstate, diagnostic.value.code);
 }
 
-fn execute(alloc: std.mem.Allocator, handler: anytype, case: *const fixtures.Corpus.Case) !std.json.Parsed(wire.SQLResponse) {
+pub fn execute(alloc: std.mem.Allocator, handler: anytype, case: *const fixtures.Corpus.Case) !std.json.Parsed(wire.SQLResponse) {
+    return executeWithTransport(alloc, handler, case, false);
+}
+
+fn describedParameters(a: std.mem.Allocator, values: []const Json, descriptors: []const @import("antfly_local_sources").sql_scalar.Type) ![]const Json {
+    const local = @import("antfly_local_sources");
+    if (values.len != descriptors.len) return error.InvalidParityParameters;
+    const output = try a.dupe(Json, values);
+    for (output, descriptors) |*value, descriptor| {
+        if (value.* != .array or descriptor.kind != .array) continue;
+        // Mirror the PostgreSQL oracle's explicit text[] transport adapter.
+        // Never infer an SQL array from JSON shape or convert JSONB columns.
+        if (descriptor.element_type != .text) return error.InvalidParityParameters;
+        const cells = try a.alloc(local.sql_scalar.Datum, value.array.items.len);
+        for (value.array.items, cells) |cell, *out| {
+            if (cell != .string and cell != .null) return error.InvalidParityParameters;
+            out.* = local.sql_scalar.Datum.fromJson(cell);
+        }
+        const length = std.math.cast(u32, cells.len) orelse return error.InvalidParityParameters;
+        const dimensions: []const local.sql_array_value.Dimension = if (cells.len == 0) &.{} else &.{.{ .length = length, .lower = 1 }};
+        const array = try local.sql_array_value.Value.init(.text, dimensions, cells, .{});
+        value.* = try local.sql_array_wire.toJsonLeaky(a, array, .{});
+    }
+    return output;
+}
+
+test "SQL parity described parameter transport preserves JSON identity and NULLs" {
+    const local = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const input = (try std.json.parseFromSliceLeaky(Json, scratch, "[[\"a\",null],[\"b\",null]]", .{})).array.items;
+    const descriptors: []const local.sql_scalar.Type = &.{ .{ .kind = .json }, .{ .kind = .array, .element_type = .text } };
+    const output = try describedParameters(scratch, input, descriptors);
+    try std.testing.expect(output[0] == .array);
+    try std.testing.expect(output[1] == .object);
+    try std.testing.expect(input[1] == .array);
+    var frame = try local.sql_parameter_frame.Frame.prepareJson(a, descriptors, output, .{});
+    defer frame.deinit();
+    try std.testing.expect(frame.values[0].array == null and frame.values[0].value == .array);
+    try std.testing.expectEqualStrings("b", frame.values[1].array.?.elements[0].value.string);
+    try std.testing.expect(frame.values[1].array.?.elements[1].sql_null);
+    try std.testing.expectEqual(@as(i32, 1), frame.values[1].array.?.dimensions[0].lower);
+    try std.testing.expectError(error.InvalidParityParameters, describedParameters(scratch, input[0..1], &.{.{ .kind = .array, .element_type = .int64 }}));
+    const bad = (try std.json.parseFromSliceLeaky(Json, scratch, "[[1]]", .{})).array.items;
+    try std.testing.expectError(error.InvalidParityParameters, describedParameters(scratch, bad, descriptors[1..]));
+    // This is transport adaptation in the evidence fixture, not a new API
+    // coercion: unchanged plain JSON arrays still fail declared SQL frames.
+    try std.testing.expectError(error.SqlTypeMismatch, local.sql_parameter_frame.Frame.prepareJson(a, descriptors, input, .{}));
+}
+
+fn executeWithTransport(alloc: std.mem.Allocator, handler: anytype, case: *const fixtures.Corpus.Case, comptime described_transport: bool) !std.json.Parsed(wire.SQLResponse) {
     var parameter_arena = std.heap.ArenaAllocator.init(alloc);
     defer parameter_arena.deinit();
-    const parameters = try fixtures.Corpus.logicalParameters(parameter_arena.allocator(), case);
+    var parameters = try fixtures.Corpus.logicalParameters(parameter_arena.allocator(), case);
+    if (described_transport) {
+        var has_array = false;
+        for (parameters) |value| if (value == .array) {
+            has_array = true;
+            break;
+        };
+        if (has_array) {
+            var compiled = try compiler.compile(alloc, case.sql, .{});
+            defer compiled.deinit();
+            var identity: ?@import("http_server.zig").AuthenticatedIdentity = null;
+            var adapter: @import("sql_execution.zig").Adapter = .{ .server = handler.api_server, .identity = &identity, .context = .{} };
+            var description = try @import("antfly_local_sources").sql_describe.describe(alloc, adapter.backend(), &compiled, &.{});
+            defer description.deinit();
+            parameters = try describedParameters(parameter_arena.allocator(), parameters, description.binding.parameter_descriptors);
+        }
+    }
     const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql, .parameters = parameters }, .{});
     defer alloc.free(body);
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
@@ -410,28 +597,34 @@ pub const PostgresMutationReference = struct {
         sql_nulls: []const []const bool,
     };
     profile: struct { schema: Json, primary_key: []const []const u8 = &.{}, unique: []const []const []const u8 = &.{}, index_owner_ddl: ?[]const u8 = null, admission_probes: []const AdmissionProbe = &.{}, rows: []const Seed, additional_tables: []const Table },
+    rejection_final_tables: ?std.json.ArrayHashMap(Rows) = null,
     entries: []const struct {
         id: []const u8,
         command_tag: []const u8,
+        sqlstate: ?[]const u8 = null,
         affected: i64,
         columns: []const []const u8,
         column_oids: []const u32,
         rows: []const []const Json,
         sql_nulls: []const []const bool,
-        final_tables: std.json.ArrayHashMap(Rows),
+        final_tables: ?std.json.ArrayHashMap(Rows) = null,
+        noop_contract: ?struct { kind: []const u8, eligible_rows: usize } = null,
     },
 };
 
 /// Fixture writes use the production integrity planner and native transaction
 /// boundary. Resetting primary rows alone would strand logical unique claims.
-fn commitMutationFixture(a: std.mem.Allocator, source: @import("antfly_local_sources").api_table_read_source.TableReadSource, records: []const @import("antfly_local_sources").common_topology_records.TableRecord, table: anytype, writes: []const @import("antfly_local_sources").storage_db_types.TransactionWrite, deletes: []const []const u8, sequence: u64) !void {
+pub fn commitMutationFixture(a: std.mem.Allocator, source: @import("antfly_local_sources").api_table_read_source.TableReadSource, records: []const @import("antfly_local_sources").common_topology_records.TableRecord, table: anytype, writes: []const @import("antfly_local_sources").storage_db_types.TransactionWrite, deletes: []const []const u8, sequence: u64) !void {
     const local = @import("antfly_local_sources");
     var prepared = try local.api_relational_integrity_commit.prepare(a, source, records, &.{.{ .table_name = table.name, .relational_schema_version = 1, .writes = writes, .deletes = deletes }});
     defer prepared.deinit();
     try std.testing.expectEqual(@as(usize, 1), prepared.tables.len);
     const request = prepared.tables[0];
     try std.testing.expectEqualStrings(table.name, request.table_name);
-    try std.testing.expect(request.relational_integrity_generation_set != null);
+    // Unconstrained typed tables legitimately have no integrity publication;
+    // owner fixtures retain the strict proof assertion by default.
+    const owns_integrity = if (@hasField(@TypeOf(table), "requires_integrity")) table.requires_integrity else true;
+    if (owns_integrity) try std.testing.expect(request.relational_integrity_generation_set != null);
     var id: [16]u8 = @splat(0);
     std.mem.writeInt(u64, id[0..8], sequence, .little);
     _ = try table.db.beginTransactionWithId(id, sequence);
@@ -455,16 +648,18 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
     var corpus = try fixtures.Corpus.init(alloc);
     defer corpus.deinit();
     const TransactionWrite = @import("antfly_local_sources").storage_db_types.TransactionWrite;
+    const NoopPrimary = struct { table: usize, key: []const u8, before: @import("antfly_local_sources").storage_db_types.LookupResult };
     try std.testing.expectEqual(reference.profile.additional_tables.len + 1, tables.len);
     for (ids, 0..) |id, ordinal| {
         errdefer std.debug.print("POSTGRES MUTATION CASE {s}\n", .{id});
         const expected = for (reference.entries) |entry| {
             if (std.mem.eql(u8, id, entry.id)) break entry;
         } else return error.MissingPostgresMutationReference;
+        const final_tables = expected.final_tables orelse if (expected.sqlstate != null) reference.rejection_final_tables orelse return error.MissingPostgresMutationTable else return error.MissingPostgresMutationTable;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        try std.testing.expectEqual(tables.len, expected.final_tables.map.count());
+        try std.testing.expectEqual(tables.len, final_tables.map.count());
         for (tables, 0..) |table, table_index| {
             for (tables[0..table_index]) |prior| try std.testing.expect(!std.mem.eql(u8, table.name, prior.name));
             const seeds = if (std.mem.eql(u8, table.name, "usage_records")) reference.profile.rows else for (reference.profile.additional_tables) |profile| {
@@ -480,7 +675,7 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
             for (seeds, writes) |seed, *write| write.* = .{ .key = seed.key, .value = try std.json.Stringify.valueAlloc(a, seed.value, .{}) };
             try commitMutationFixture(a, handler.api_server.table_reads.?, records, table, writes, &.{}, @intCast((ordinal * tables.len + table_index) * 2 + 1001));
         }
-        if (ordinal == 0) {
+        if (ordinal == 0 and reference.profile.primary_key.len == 1 and std.mem.eql(u8, reference.profile.primary_key[0], "id")) {
             var before = try tables[0].db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
             defer before.deinit(a);
             // These logical identities differ from physical document keys.
@@ -500,11 +695,60 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
                 try std.testing.expectEqualStrings(prior.json, current.json);
             }
         }
-        const response = try execute(a, handler, try corpus.get(id));
-        defer response.deinit();
-        const result = response.value;
+        var noop_primaries: std.ArrayList(NoopPrimary) = .empty;
+        defer for (noop_primaries.items) |*primary| primary.before.deinit(a);
+        if (expected.sqlstate != null) {
+            for (tables, 0..) |table, index| {
+                const seeds = if (index == 0) reference.profile.rows else reference.profile.additional_tables[index - 1].rows;
+                for (seeds) |seed| {
+                    if (noop_primaries.items.len == 4096) return error.InvalidNoopMutationFixture;
+                    var before = (try table.db.lookup(a, seed.key, .{ .include_primary_digest = true })) orelse return error.MissingNoopPrimary;
+                    errdefer before.deinit(a);
+                    try std.testing.expect(before.version != null and before.expected_content_digest != null);
+                    try noop_primaries.append(a, .{ .table = index, .key = seed.key, .before = before });
+                }
+            }
+        }
+        if (expected.noop_contract) |contract| {
+            try std.testing.expectEqualStrings("primary_conflict_do_nothing", contract.kind);
+            try std.testing.expectEqual(@as(i64, 0), expected.affected);
+            try std.testing.expectEqual(@as(usize, 1), reference.profile.primary_key.len);
+            try std.testing.expectEqualStrings("id", reference.profile.primary_key[0]);
+            const source_insert = std.mem.eql(u8, id, "sql-1432");
+            if (!source_insert and !std.mem.eql(u8, id, "sql-1462")) return error.InvalidNoopMutationFixture;
+            var eligible: usize = 0;
+            for (reference.profile.rows) |seed| {
+                const value = seed.value.object.get(if (source_insert) "status" else "id") orelse continue;
+                if (value == .string and std.mem.eql(u8, value.string, if (source_insert) "ready" else "u1")) eligible += 1;
+            }
+            try std.testing.expect(eligible > 0 and eligible <= 4096);
+            try std.testing.expectEqual(eligible, contract.eligible_rows);
+            for (tables, 0..) |table, index| {
+                const seeds = if (index == 0) reference.profile.rows else reference.profile.additional_tables[index - 1].rows;
+                for (seeds) |seed| {
+                    if (noop_primaries.items.len == 4096) return error.InvalidNoopMutationFixture;
+                    var before = (try table.db.lookup(a, seed.key, .{ .include_primary_digest = true })) orelse return error.MissingNoopPrimary;
+                    errdefer before.deinit(a);
+                    try std.testing.expect(before.version != null and before.expected_content_digest != null);
+                    try noop_primaries.append(a, .{ .table = index, .key = seed.key, .before = before });
+                }
+            }
+        }
+        var response: ?std.json.Parsed(wire.SQLResponse) = null;
+        defer if (response) |*value| value.deinit();
+        if (expected.sqlstate) |code| {
+            try expectRejection(a, handler, id, code);
+        } else response = try execute(a, handler, try corpus.get(id));
+        const result: wire.SQLResponse = if (response) |value| value.value else .{ .command_tag = "", .rows_affected = 0, .columns = &.{}, .rows = &.{} };
         try std.testing.expectEqualStrings(expected.command_tag, result.command_tag);
         try std.testing.expectEqual(expected.affected, result.rows_affected);
+        for (noop_primaries.items) |primary| {
+            var after = (try tables[primary.table].db.lookup(a, primary.key, .{ .include_primary_digest = true })) orelse return error.MissingNoopPrimary;
+            defer after.deinit(a);
+            try std.testing.expectEqual(primary.before.version, after.version);
+            try std.testing.expectEqual(primary.before.expected_content_digest, after.expected_content_digest);
+            try std.testing.expectEqualStrings(primary.before.json, after.json);
+        }
         try std.testing.expectEqual(expected.columns.len, result.columns.len);
         try std.testing.expectEqual(expected.columns.len, expected.column_oids.len);
         for (result.columns, expected.columns, expected.column_oids) |column, name, oid| {
@@ -528,52 +772,59 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
             try std.testing.expect(matched);
         }
         for (tables) |table| {
-            const final = expected.final_tables.map.get(table.name) orelse return error.MissingPostgresMutationTable;
-            try std.testing.expectEqual(final.columns.len, final.column_oids.len);
-            try std.testing.expectEqual(final.rows.len, final.sql_nulls.len);
-            var stored = try table.db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
-            defer stored.deinit(a);
-            try std.testing.expectEqual(final.rows.len, stored.documents.len);
-            try std.testing.expectEqual(stored.documents.len, stored.hashes.len);
-            const storage_used = try a.alloc(bool, final.rows.len);
-            @memset(storage_used, false);
-            for (stored.documents, stored.hashes) |document, hash| {
-                try std.testing.expectEqualStrings(document.id, hash.id);
-                const parsed = try std.json.parseFromSlice(Json, a, document.json, .{});
-                defer parsed.deinit();
-                try std.testing.expect(parsed.value == .object);
-                for (parsed.value.object.keys()) |key| {
-                    var known = false;
-                    for (final.columns) |column| if (std.mem.eql(u8, key, column)) {
-                        known = true;
-                        break;
-                    };
-                    try std.testing.expect(known);
-                }
-                var matched = false;
-                for (final.rows, final.sql_nulls, 0..) |want, nulls, target| {
-                    if (storage_used[target]) continue;
-                    try std.testing.expectEqual(final.columns.len, want.len);
-                    try std.testing.expectEqual(want.len, nulls.len);
-                    var equal = true;
-                    for (final.columns, want, nulls) |column, cell, sql_null| {
-                        const value = parsed.value.object.get(column) orelse .null;
-                        var json_null = false;
-                        for (hash.json_null_fields) |name| if (std.mem.eql(u8, name, column)) {
-                            json_null = true;
-                            break;
-                        };
-                        equal = equal and equivalent(value, cell) and sql_null == (value == .null and !json_null);
-                    }
-                    if (!equal) continue;
-                    storage_used[target] = true;
-                    matched = true;
-                    break;
-                }
-                if (!matched) std.debug.print("POSTGRES MUTATION STORAGE {s}/{s}: {s}\n", .{ id, table.name, document.json });
-                try std.testing.expect(matched);
-            }
+            const final = final_tables.map.get(table.name) orelse return error.MissingPostgresMutationTable;
+            try expectPostgresMutationStorage(a, table.db, final);
         }
+    }
+}
+
+/// Independent primary-row validation is shared by live and cold-reopened
+/// mutation campaigns. SQL binding cannot hide missing fields or array bounds.
+pub fn expectPostgresMutationStorage(a: std.mem.Allocator, db: anytype, final: PostgresMutationReference.Rows) !void {
+    try std.testing.expectEqual(final.columns.len, final.column_oids.len);
+    try std.testing.expectEqual(final.rows.len, final.sql_nulls.len);
+    var stored = try db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
+    defer stored.deinit(a);
+    try std.testing.expectEqual(final.rows.len, stored.documents.len);
+    try std.testing.expectEqual(stored.documents.len, stored.hashes.len);
+    const storage_used = try a.alloc(bool, final.rows.len);
+    defer a.free(storage_used);
+    @memset(storage_used, false);
+    for (stored.documents, stored.hashes) |document, hash| {
+        try std.testing.expectEqualStrings(document.id, hash.id);
+        const parsed = try std.json.parseFromSlice(Json, a, document.json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        for (parsed.value.object.keys()) |key| {
+            var known = false;
+            for (final.columns) |column| if (std.mem.eql(u8, key, column)) {
+                known = true;
+                break;
+            };
+            try std.testing.expect(known);
+        }
+        var matched = false;
+        for (final.rows, final.sql_nulls, 0..) |want, nulls, target| {
+            if (storage_used[target]) continue;
+            try std.testing.expectEqual(final.columns.len, want.len);
+            try std.testing.expectEqual(want.len, nulls.len);
+            var equal = true;
+            for (final.columns, want, nulls) |column, cell, sql_null| {
+                const value = parsed.value.object.get(column) orelse .null;
+                var json_null = false;
+                for (hash.json_null_fields) |name| if (std.mem.eql(u8, name, column)) {
+                    json_null = true;
+                    break;
+                };
+                equal = equal and equivalent(value, cell) and sql_null == (value == .null and !json_null);
+            }
+            if (!equal) continue;
+            storage_used[target] = true;
+            matched = true;
+            break;
+        }
+        if (!matched) std.debug.print("POSTGRES MUTATION STORAGE {s}: {s}\n", .{ document.id, document.json });
+        try std.testing.expect(matched);
     }
 }
 
@@ -664,17 +915,20 @@ pub fn runMutationReference(alloc: std.mem.Allocator, handler: anytype, db: anyt
 }
 
 pub const DocumentReference = struct {
+    pub const Seed = struct { key: []const u8, value: Json };
     reference: []const u8,
-    seeds: []const struct { key: []const u8, value: Json },
+    seeds: []const Seed,
     entries: []const struct {
         id: []const u8,
+        seeds: ?[]const Seed = null,
         schema: Json,
         native_schema: ?Json = null,
-        columns: []const []const u8,
-        column_oids: []const u32,
-        rows: []const []const Json,
+        columns: []const []const u8 = &.{},
+        column_oids: []const u32 = &.{},
+        rows: []const []const Json = &.{},
         sql_nulls: ?[]const []const bool = null,
-        affected: i64,
+        affected: i64 = 0,
+        sqlstate: ?[]const u8 = null,
         final: []const struct { key: []const u8, value: Json },
     },
 };
@@ -683,7 +937,6 @@ pub fn runDocuments(alloc: std.mem.Allocator, handler: anytype, db: anytype, sou
     try std.testing.expectEqualStrings("PostgreSQL exact SQL", reference.reference);
     var corpus = try fixtures.Corpus.init(alloc);
     defer corpus.deinit();
-    const discovery = try std.testing.environ.containsUnempty(alloc, "ANTFLY_SQL_DOCUMENT_DISCOVERY");
     var passed: usize = 0;
     const original_schema = source.schema;
     const original_record_schema = source.records[0].schema_json;
@@ -692,6 +945,8 @@ pub fn runDocuments(alloc: std.mem.Allocator, handler: anytype, db: anytype, sou
         source.records[0].schema_json = original_record_schema;
     }
     for (reference.entries, 0..) |expected, ordinal| {
+        errdefer std.debug.print("DOCUMENT original {s}\n", .{expected.id});
+        const seeds = expected.seeds orelse reference.seeds;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -708,16 +963,18 @@ pub fn runDocuments(alloc: std.mem.Allocator, handler: anytype, db: anytype, sou
         try schema.object.put(a, "version", .{ .integer = @intCast(ordinal + 1) });
         source.schema = try std.json.Stringify.valueAlloc(a, schema, .{});
         source.records[0].schema_json = source.schema;
-        db.setSchemaJson(a, source.schema) catch |err| {
-            if (discovery and err == error.InvalidSchemaUpdateRequest) {
-                std.debug.print("DOCUMENT PROFILE {s}: source schema requires a current native owner profile\n", .{expected.id});
-                continue;
-            }
-            return err;
-        };
-        const writes = try a.alloc(@import("antfly_local_sources").storage_db_types.BatchWrite, reference.seeds.len);
-        for (reference.seeds, writes) |seed, *write| write.* = .{ .key = seed.key, .value = try std.json.Stringify.valueAlloc(a, seed.value, .{}) };
+        try db.setSchemaJson(a, source.schema);
+        const writes = try a.alloc(@import("antfly_local_sources").storage_db_types.BatchWrite, seeds.len);
+        for (seeds, writes) |seed, *write| write.* = .{ .key = seed.key, .value = try std.json.Stringify.valueAlloc(a, seed.value, .{}) };
         try db.batch(.{ .writes = writes, .timestamp_ns = @as(u64, @intCast(ordinal * 2 + 1001)) });
+        const before_versions = try a.alloc(u64, seeds.len);
+        const before_digests = try a.alloc([32]u8, seeds.len);
+        for (seeds, before_versions, before_digests) |seed, *version, *digest| {
+            var primary = (try db.lookup(a, seed.key, .{ .include_primary_digest = true })) orelse return error.MissingDocumentSeed;
+            defer primary.deinit(a);
+            version.* = primary.version orelse return error.MissingDocumentVersion;
+            digest.* = primary.expected_content_digest orelse return error.MissingDocumentDigest;
+        }
         const case = try corpus.get(expected.id);
         const body = try std.json.Stringify.valueAlloc(a, .{ .statement = case.sql, .parameters = try fixtures.Corpus.logicalParameters(a, case) }, .{});
         var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/db/v1/sql");
@@ -727,38 +984,51 @@ pub fn runDocuments(alloc: std.mem.Allocator, handler: anytype, db: anytype, sou
         defer context.deinit();
         var response = try handler.executeSQL(&context);
         defer response.deinit();
-        if (response.status.code != 200 and discovery) {
-            std.debug.print("DOCUMENT DISCOVERY {s}: {s}\n", .{ case.id, response.body orelse "" });
-            continue;
-        }
-        if (response.status.code != 200) std.debug.print("DOCUMENT {s}: {s}\n", .{ case.id, response.body orelse "" });
-        try std.testing.expectEqual(@as(u16, 200), response.status.code);
-        const parsed = try std.json.parseFromSlice(wire.SQLResponse, a, response.body.?, .{});
-        defer parsed.deinit();
-        const result = parsed.value;
-        try std.testing.expectEqualStrings(if (std.mem.startsWith(u8, case.sql, "INSERT")) "INSERT" else if (std.mem.startsWith(u8, case.sql, "UPDATE")) "UPDATE" else "DELETE", result.command_tag);
-        try std.testing.expectEqual(expected.affected, result.rows_affected);
-        try std.testing.expectEqual(expected.columns.len, result.columns.len);
-        try std.testing.expectEqual(expected.column_oids.len, result.columns.len);
-        for (result.columns, expected.column_oids) |column, oid| try std.testing.expect(postgresColumnMatches(column, oid));
-        for (result.columns, expected.columns) |column, name| try std.testing.expectEqualStrings(name, column.name);
-        try std.testing.expectEqual(expected.rows.len, result.rows.len);
-        if (result.rows.len != 0) {
-            try std.testing.expect(result.sql_nulls != null);
-            try std.testing.expectEqual(result.rows.len, result.sql_nulls.?.len);
-        }
-        if (expected.sql_nulls) |nulls| try std.testing.expectEqual(expected.rows.len, nulls.len);
-        const used = try a.alloc(bool, expected.rows.len);
-        @memset(used, false);
-        for (result.rows, 0..) |row, index| {
-            var matched = false;
-            for (expected.rows, 0..) |want, target| {
-                if (used[target] or !try rowMatchesWithNulls(a, result.columns, row, result.sql_nulls.?[index], want, if (expected.sql_nulls) |nulls| nulls[target] else null)) continue;
-                used[target] = true;
-                matched = true;
-                break;
+        if (expected.sqlstate) |code| {
+            if (response.status.code != 400) std.debug.print("DOCUMENT rejection {s}: {s}\n", .{ case.id, response.body orelse "" });
+            try std.testing.expectEqual(@as(u16, 400), response.status.code);
+            const diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, a, response.body.?, .{});
+            defer diagnostic.deinit();
+            if (!std.mem.eql(u8, code, diagnostic.value.code)) std.debug.print("DOCUMENT diagnostic {s}: expected={s} body={s}\n", .{ case.id, code, response.body.? });
+            try std.testing.expectEqualStrings(code, diagnostic.value.code);
+        } else {
+            if (response.status.code != 200) std.debug.print("DOCUMENT {s}: {s}\n", .{ case.id, response.body orelse "" });
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const parsed = try std.json.parseFromSlice(wire.SQLResponse, a, response.body.?, .{});
+            defer parsed.deinit();
+            const result = parsed.value;
+            try std.testing.expectEqualStrings(if (std.mem.startsWith(u8, case.sql, "INSERT")) "INSERT" else if (std.mem.startsWith(u8, case.sql, "UPDATE")) "UPDATE" else "DELETE", result.command_tag);
+            try std.testing.expectEqual(expected.affected, result.rows_affected);
+            try std.testing.expectEqual(expected.columns.len, result.columns.len);
+            try std.testing.expectEqual(expected.column_oids.len, result.columns.len);
+            for (result.columns, expected.column_oids) |column, oid| try std.testing.expect(postgresColumnMatches(column, oid));
+            for (result.columns, expected.columns) |column, name| try std.testing.expectEqualStrings(name, column.name);
+            try std.testing.expectEqual(expected.rows.len, result.rows.len);
+            if (result.rows.len != 0) {
+                try std.testing.expect(result.sql_nulls != null);
+                try std.testing.expectEqual(result.rows.len, result.sql_nulls.?.len);
             }
-            try std.testing.expect(matched);
+            if (expected.sql_nulls) |nulls| try std.testing.expectEqual(expected.rows.len, nulls.len);
+            const used = try a.alloc(bool, expected.rows.len);
+            @memset(used, false);
+            for (result.rows, 0..) |row, index| {
+                var matched = false;
+                for (expected.rows, 0..) |want, target| {
+                    if (used[target] or !try rowMatchesWithNulls(a, result.columns, row, result.sql_nulls.?[index], want, if (expected.sql_nulls) |nulls| nulls[target] else null)) continue;
+                    used[target] = true;
+                    matched = true;
+                    break;
+                }
+                try std.testing.expect(matched);
+            }
+        }
+        if (expected.sqlstate != null or expected.affected == 0) {
+            for (seeds, before_versions, before_digests) |seed, version, digest| {
+                var primary = (try db.lookup(a, seed.key, .{ .include_primary_digest = true })) orelse return error.MissingUnchangedDocument;
+                defer primary.deinit(a);
+                try std.testing.expectEqual(version, primary.version orelse return error.MissingDocumentVersion);
+                try std.testing.expectEqual(digest, primary.expected_content_digest orelse return error.MissingDocumentDigest);
+            }
         }
         var stored = try db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
         defer stored.deinit(a);
@@ -773,10 +1043,9 @@ pub fn runDocuments(alloc: std.mem.Allocator, handler: anytype, db: anytype, sou
             try std.testing.expect(equivalent(value.value, want.value));
         }
         passed += 1;
-        if (discovery) std.debug.print("DOCUMENT PASS {s}\n", .{case.id});
     }
-    if (!discovery) try std.testing.expectEqual(reference.entries.len, passed);
-    std.debug.print("SQL document campaign native outcomes {d}/{d}; discovery alone grants no disposition credit\n", .{ passed, reference.entries.len });
+    try std.testing.expectEqual(reference.entries.len, passed);
+    std.debug.print("SQL document campaign native outcomes {d}/{d}\n", .{ passed, reference.entries.len });
 }
 
 /// Exact-source negative contracts are strict regardless of discovery settings.
@@ -795,6 +1064,7 @@ pub fn expectRejection(alloc: std.mem.Allocator, handler: anytype, case_id: []co
     defer context.deinit();
     var response = try handler.executeSQL(&context);
     defer response.deinit();
+    errdefer std.debug.print("original SQL rejection {s}: expected={s} status={d} body={s}\n", .{ case_id, sqlstate, response.status.code, response.body orelse "" });
     try std.testing.expectEqual(@as(u16, 400), response.status.code);
     const diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, alloc, response.body.?, .{});
     defer diagnostic.deinit();
@@ -803,6 +1073,79 @@ pub fn expectRejection(alloc: std.mem.Allocator, handler: anytype, case_id: []co
 
 pub fn run(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8) !void {
     return runReference(alloc, handler, case_ids, fixtures.read_reference);
+}
+
+/// Supplemental PostgreSQL contracts, not original-corpus disposition credit.
+pub fn runScalarKernels(alloc: std.mem.Allocator, handler: anytype) !void {
+    const reference = try std.json.parseFromSlice(struct {
+        entries: []const struct { sql: []const u8, value: Json = .null, oid: ?u32 = null, @"error": ?[]const u8 = null },
+    }, alloc, fixtures.scalar_kernel_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    for (reference.value.entries) |entry| {
+        errdefer std.debug.print("public scalar kernel: {s}\n", .{entry.sql});
+        const sql = try std.fmt.allocPrint(alloc, "SELECT {s} AS value", .{entry.sql});
+        defer alloc.free(sql);
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = sql }, .{});
+        defer alloc.free(request.body.?);
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (entry.@"error") |code| {
+            try std.testing.expectEqual(@as(u16, 400), response.status.code);
+            const diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, alloc, response.body.?, .{});
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings(code, diagnostic.value.code);
+            continue;
+        }
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const parsed = try std.json.parseFromSlice(wire.SQLResponse, alloc, response.body.?, .{});
+        defer parsed.deinit();
+        const result = parsed.value;
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+        try std.testing.expectEqualStrings("value", result.columns[0].name);
+        try std.testing.expect(postgresColumnMatches(result.columns[0], entry.oid.?));
+        try std.testing.expectEqualStrings("SELECT", result.command_tag);
+        try std.testing.expectEqual(@as(i64, 0), result.rows_affected);
+        try std.testing.expect(try rowMatchesWithNulls(alloc, result.columns, result.rows[0], result.sql_nulls.?[0], &.{entry.value}, &.{entry.value == .null}));
+    }
+}
+
+/// Supplemental PostgreSQL contracts, not original-corpus disposition credit.
+pub fn runArrayExpansion(alloc: std.mem.Allocator, handler: anytype) !void {
+    var reference = try std.json.parseFromSlice(struct {
+        format: u8,
+        reference: []const u8,
+        entries: []const struct { id: []const u8, sql: []const u8, columns: []const []const u8, column_oids: []const u32, rows: []const []const Json, sql_nulls: []const []const bool },
+    }, alloc, fixtures.array_expansion_reference, .{});
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(u8, 1), reference.value.format);
+    try std.testing.expectEqualStrings("PostgreSQL exact SQL", reference.value.reference);
+    try std.testing.expectEqual(@as(usize, 17), reference.value.entries.len);
+    for (reference.value.entries) |entry| {
+        const case: fixtures.Corpus.Case = .{ .id = entry.id, .name = entry.sql, .family = "array", .sql = entry.sql, .params = &.{}, .source_expectation = "success" };
+        var response = try execute(alloc, handler, &case);
+        defer response.deinit();
+        const result = response.value;
+        try std.testing.expectEqualStrings("SELECT", result.command_tag);
+        try std.testing.expectEqual(@as(i64, 0), result.rows_affected);
+        try std.testing.expectEqual(entry.rows.len, result.rows.len);
+        try std.testing.expectEqual(entry.columns.len, result.columns.len);
+        for (result.columns, entry.columns, entry.column_oids) |column, name, oid| {
+            try std.testing.expectEqualStrings(name, column.name);
+            try std.testing.expect(postgresColumnMatches(column, oid));
+        }
+        for (result.rows, entry.rows, entry.sql_nulls, 0..) |row, want, flags, index| {
+            // This oracle already uses exact public wire encodings for
+            // bigint/NUMERIC. Do not round through the legacy float matcher.
+            try std.testing.expectEqual(want.len, row.len);
+            for (row, want) |actual, expected| try std.testing.expect(equivalent(actual, expected));
+            try std.testing.expectEqualSlices(bool, flags, result.sql_nulls.?[index]);
+        }
+    }
 }
 
 /// Supplemental PostgreSQL contracts, not original-corpus disposition credit.
@@ -969,15 +1312,21 @@ fn runArrayResults(alloc: std.mem.Allocator, handler: anytype) !void {
 
 pub fn runReference(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
     const discovery = try std.testing.environ.containsUnempty(alloc, "ANTFLY_SQL_READ_DISCOVERY");
-    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, discovery);
+    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, discovery, false);
 }
 
 /// Evidence gates must fail closed even in a discovery-configured shell.
 pub fn runReferenceStrict(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
-    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, false);
+    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, false, false);
 }
 
-fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8, discovery: bool) !void {
+/// Only legacy fixture transport changes: native binding must first declare
+/// text[]; production ingress continues rejecting untyped plain JSON arrays.
+pub fn runReferenceDescribedTransportStrict(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
+    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, false, true);
+}
+
+fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8, discovery: bool, comptime described_transport: bool) !void {
     var corpus = try fixtures.Corpus.init(alloc);
     defer corpus.deinit();
     const reference = try std.json.parseFromSlice(Reference, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
@@ -988,8 +1337,7 @@ fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_id
     for (reference.value.entries, case_ids) |expected, case_id| {
         try std.testing.expectEqualStrings(case_id, expected.id);
         const case = try corpus.get(expected.id);
-        try std.testing.expect(!std.mem.eql(u8, case.source_expectation, "rejection"));
-        const parsed = execute(alloc, handler, case) catch |err| {
+        const parsed = executeWithTransport(alloc, handler, case, described_transport) catch |err| {
             if (err == error.NativeParityAdmissionFailed) {
                 if (!discovery) failures += 1;
                 continue;
@@ -1024,7 +1372,7 @@ fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_id
         };
         if (matches) if (expected.column_oids) |oids| {
             try std.testing.expectEqual(result.columns.len, oids.len);
-            for (result.columns, oids) |column, oid| if (!postgresColumnMatches(column, oid)) {
+            for (result.columns, oids) |column, oid| if (!(if (reference.value.exact_builtin_types) postgresBuiltinMatches(column, oid) else postgresColumnMatches(column, oid))) {
                 matches = false;
                 break;
             };

@@ -26,6 +26,7 @@ pub const Identity = struct {
     catalog_digest: [32]u8,
     next_epoch: u64,
     backup_seal_supported: bool = false,
+    catalog_checks_identity_supported: bool = false,
     // Explicit durable authority domain; native receipts never contain a
     // fabricated Raft position. Missing capability fails closed at admission.
     generation_handoff_receipt_authority: GenerationHandoffReceiptAuthority = .unsupported,
@@ -43,7 +44,7 @@ pub const receipt_key = "\x00\x00__metadata__:relational_integrity_topology_rece
 
 pub const abort_prefix = "\x00\x00__metadata__:relational_integrity_topology_aborted:";
 
-pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7, child_generation_parent = 8, child_generation_source = 9, child_generation_dual = 10, rewrite_destination = 11 };
+pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7, child_generation_parent = 8, child_generation_source = 9, child_generation_dual = 10, rewrite_destination = 11, index_build = 12, schema_validation = 13 };
 
 pub const ParentRetirementEntry = struct {
     child_table_id: u64,
@@ -242,7 +243,56 @@ pub const Command = struct {
     generation_handoff: ?GenerationHandoffIntent = null,
     generation_handoff_seal: ?GenerationHandoffSeal = null,
     generation_handoff_install: ?GenerationHandoffInstall = null,
+    child_generation_reference_coverage_required: bool = false,
+    child_reference_coverage_ready: bool = false,
+    /// Set only by the metadata-authenticated whole-table deletion adapter.
+    /// This permits fencing and retire-only control under a stable row policy;
+    /// it never grants row, successor-schema or transfer authority.
+    sql_drop_control: bool = false,
+
+    pub fn isSqlDropControl(self: Command) bool {
+        if (!self.sql_drop_control or (self.fence.role != .child_generation_source and self.fence.role != .child_generation_parent and self.fence.role != .child_generation_dual)) return false;
+        if (self.transfer != null or self.parent_retirement != null or self.parent_activation != null or
+            self.child_schema_install != null or self.initial_child_provision != null or self.initial_child_control != null or
+            self.graph_retirement != null or self.generation_handoff != null or self.generation_handoff_seal != null or self.generation_handoff_install != null) return false;
+        switch (self.action) {
+            .begin => return self.child_generations == null,
+            .cancel_child_generation_source => return self.fence.role != .child_generation_parent and self.child_generations == null,
+            .stage_child_generation, .activate_child_generation, .acknowledge_child_generation, .cancel => {
+                if (self.fence.role == .child_generation_source) return false;
+                const transitions = self.child_generations orelse return false;
+                if (transitions.len == 0) return false;
+                for (transitions) |transition| if (transition.expected_generation == null or transition.next_generation != null) return false;
+                return true;
+            },
+            else => return false,
+        }
+    }
+    pub fn nativeJsonSkipField(self: Command, comptime name: []const u8) bool {
+        if (comptime std.mem.eql(u8, name, "sql_drop_control")) return !self.sql_drop_control;
+        if (comptime std.mem.eql(u8, name, "child_generation_reference_coverage_required")) return !self.child_generation_reference_coverage_required;
+        if (comptime std.mem.eql(u8, name, "child_reference_coverage_ready")) return !self.child_reference_coverage_ready;
+        return false;
+    }
     pub fn jsonStringify(self: Command, jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
     }
 };
+
+/// Reject every other batch effect, including fields added in the future.
+/// Empty slices are compared semantically because decoders own their storage.
+pub fn validateSqlDropBatch(request: anytype) !void {
+    const command = request.relational_topology orelse return error.InvalidBatchRequest;
+    if (!command.isSqlDropControl()) return error.InvalidBatchRequest;
+    const defaults: @TypeOf(request) = .{};
+    inline for (@typeInfo(@TypeOf(request)).@"struct".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "relational_topology") or std.mem.eql(u8, name, "sync_level") or std.mem.eql(u8, name, "timestamp_ns")) continue;
+        const value = @field(request, name);
+        const expected = @field(defaults, name);
+        const same = if (comptime @typeInfo(@TypeOf(value)) == .pointer and @typeInfo(@TypeOf(value)).pointer.size == .slice)
+            value.len == 0 and expected.len == 0
+        else
+            std.meta.eql(value, expected);
+        if (!same) return error.InvalidBatchRequest;
+    }
+}

@@ -17,10 +17,18 @@ const std = @import("std");
 pub const antfly_sources = @import("source_owner_physical.zig");
 const native_snapshot = @import("raft/storage/native_snapshot.zig");
 const file_snapshot_store = @import("raft/storage/file_snapshot_store.zig");
+const snapshot_payload_store = @import("raft/storage/snapshot_payload_store.zig");
+const snapshot_metadata = @import("raft/storage/snapshot_metadata.zig");
+const replica_state = @import("raft/storage/replica_state.zig");
+const wal_replica_state = @import("raft/storage/wal_replica_state.zig");
 
 test "raft snapshot storage tests are reachable" {
     std.testing.refAllDecls(file_snapshot_store);
     std.testing.refAllDecls(native_snapshot);
+    std.testing.refAllDecls(snapshot_payload_store);
+    std.testing.refAllDecls(snapshot_metadata);
+    std.testing.refAllDecls(replica_state);
+    std.testing.refAllDecls(wal_replica_state);
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

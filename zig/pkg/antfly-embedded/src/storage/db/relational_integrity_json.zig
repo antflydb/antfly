@@ -26,6 +26,7 @@ pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     if (comptime T == std.json.Value) return stream.write(value);
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
+            if (@hasDecl(T, "nativeJsonStringify")) return value.nativeJsonStringify(stream);
             if (@hasDecl(T, "nativeJsonProjection")) return write(value.nativeJsonProjection(), stream);
             try stream.beginObject();
             inline for (info.field_names) |reflected_name| {

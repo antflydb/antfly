@@ -1,0 +1,2045 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL",
+  "cases": [
+    {
+      "id": "sql-1509",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount BIGINT,deleted_at BIGINT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','t1','active',5,NULL),('00000000-0000-0000-0000-000000000002','b@example.test','t2','inactive',7,9)"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_email_idx ON usage_records(email)"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount,deleted_at FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000003','a@example.test','t1','active',99,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1509",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "t1",
+                "processing",
+                "5",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000004','a@example.test','t1','active',100,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1509",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "t1",
+                "processing",
+                "5",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "outcome": {
+        "command_tag": "UPDATE",
+        "result": {
+          "id": "sql-1509",
+          "columns": [
+            "id",
+            "status"
+          ],
+          "rows": [
+            [
+              "00000000-0000-0000-0000-000000000001",
+              "processing"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ],
+          "column_oids": [
+            2950,
+            25
+          ],
+          "affected": 1
+        }
+      },
+      "after_ddl": {
+        "id": "sql-1509",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount",
+          "deleted_at"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "b@example.test",
+            "t2",
+            "inactive",
+            "7",
+            9
+          ],
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "t1",
+            "processing",
+            "5",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          20
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-1510",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount BIGINT,deleted_at BIGINT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','t1','active',5,NULL),('00000000-0000-0000-0000-000000000002','b@example.test','t2','inactive',7,9)"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000005','a@example.test','t1','inactive',12,NULL)"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_email_idx ON usage_records(email) WHERE status='active'"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount,deleted_at FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000003','a@example.test','t1','active',99,NULL)",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1510",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t1",
+                "inactive",
+                "12",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "t1",
+                "disabled",
+                "5",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000004','a@example.test','t1','active',100,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1510",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t1",
+                "inactive",
+                "12",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "t1",
+                "disabled",
+                "5",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "outcome": {
+        "command_tag": "UPDATE",
+        "result": {
+          "id": "sql-1510",
+          "columns": [
+            "id",
+            "status"
+          ],
+          "rows": [
+            [
+              "00000000-0000-0000-0000-000000000001",
+              "disabled"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ],
+          "column_oids": [
+            2950,
+            25
+          ],
+          "affected": 1
+        }
+      },
+      "after_ddl": {
+        "id": "sql-1510",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount",
+          "deleted_at"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "b@example.test",
+            "t2",
+            "inactive",
+            "7",
+            9
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "a@example.test",
+            "t1",
+            "inactive",
+            "12",
+            null
+          ],
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "t1",
+            "disabled",
+            "5",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            true
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          20
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-1511",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount BIGINT,deleted_at BIGINT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','t1','active',5,NULL),('00000000-0000-0000-0000-000000000002','b@example.test','t2','inactive',7,9)"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000005','a@example.test','t1','active',12,99)"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_email_idx ON usage_records(email) WHERE deleted_at IS NULL"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount,deleted_at FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000003','a@example.test','t1','active',99,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1511",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t1",
+                "active",
+                "12",
+                99
+              ],
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "t1",
+                "disabled",
+                "5",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000004','a@example.test','t1','active',100,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1511",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t1",
+                "active",
+                "12",
+                99
+              ],
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "t1",
+                "disabled",
+                "5",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "outcome": {
+        "command_tag": "UPDATE",
+        "result": {
+          "id": "sql-1511",
+          "columns": [
+            "id",
+            "status"
+          ],
+          "rows": [
+            [
+              "00000000-0000-0000-0000-000000000001",
+              "disabled"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ],
+          "column_oids": [
+            2950,
+            25
+          ],
+          "affected": 1
+        }
+      },
+      "after_ddl": {
+        "id": "sql-1511",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount",
+          "deleted_at"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "b@example.test",
+            "t2",
+            "inactive",
+            "7",
+            9
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "a@example.test",
+            "t1",
+            "active",
+            "12",
+            99
+          ],
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "t1",
+            "disabled",
+            "5",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          20
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-1512",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount BIGINT,deleted_at BIGINT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','t1','active',5,NULL),('00000000-0000-0000-0000-000000000002','b@example.test','t2','inactive',7,9)"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000005','a@example.test','t2','active',12,NULL)"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_email_idx ON usage_records(email) WHERE tenant_id='t1' AND status='active'"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount,deleted_at FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000003','a@example.test','t1','active',99,NULL)",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1512",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t2",
+                "active",
+                "12",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "t1",
+                "disabled",
+                "5",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000004','a@example.test','t1','active',100,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1512",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t2",
+                "active",
+                "12",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "t1",
+                "disabled",
+                "5",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "outcome": {
+        "command_tag": "UPDATE",
+        "result": {
+          "id": "sql-1512",
+          "columns": [
+            "id",
+            "status"
+          ],
+          "rows": [
+            [
+              "00000000-0000-0000-0000-000000000001",
+              "disabled"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ],
+          "column_oids": [
+            2950,
+            25
+          ],
+          "affected": 1
+        }
+      },
+      "after_ddl": {
+        "id": "sql-1512",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount",
+          "deleted_at"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "b@example.test",
+            "t2",
+            "inactive",
+            "7",
+            9
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "a@example.test",
+            "t2",
+            "active",
+            "12",
+            null
+          ],
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "t1",
+            "disabled",
+            "5",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            true
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          20
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-1514",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount BIGINT,deleted_at BIGINT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','t1','active',5,NULL),('00000000-0000-0000-0000-000000000002','b@example.test','t2','inactive',7,9)"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_email_idx ON usage_records(email)"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount,deleted_at FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000003','a@example.test','t1','active',99,NULL)",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1514",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000004','a@example.test','t1','active',100,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1514",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "outcome": {
+        "command_tag": "DELETE",
+        "result": {
+          "id": "sql-1514",
+          "columns": [
+            "id",
+            "deleted_status"
+          ],
+          "rows": [
+            [
+              "00000000-0000-0000-0000-000000000001",
+              "active"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ],
+          "column_oids": [
+            2950,
+            25
+          ],
+          "affected": 1
+        }
+      },
+      "after_ddl": {
+        "id": "sql-1514",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount",
+          "deleted_at"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "b@example.test",
+            "t2",
+            "inactive",
+            "7",
+            9
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          20
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-1515",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount BIGINT,deleted_at BIGINT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','t1','active',5,NULL),('00000000-0000-0000-0000-000000000002','b@example.test','t2','inactive',7,9)"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000005','a@example.test','t1','inactive',12,NULL)"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_email_idx ON usage_records(email) WHERE status='active'"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount,deleted_at FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000003','a@example.test','t1','active',99,NULL)",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1515",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t1",
+                "inactive",
+                "12",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000004','a@example.test','t1','active',100,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1515",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t1",
+                "inactive",
+                "12",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "outcome": {
+        "command_tag": "DELETE",
+        "result": {
+          "id": "sql-1515",
+          "columns": [
+            "id",
+            "status"
+          ],
+          "rows": [
+            [
+              "00000000-0000-0000-0000-000000000001",
+              "active"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ],
+          "column_oids": [
+            2950,
+            25
+          ],
+          "affected": 1
+        }
+      },
+      "after_ddl": {
+        "id": "sql-1515",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount",
+          "deleted_at"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "b@example.test",
+            "t2",
+            "inactive",
+            "7",
+            9
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "a@example.test",
+            "t1",
+            "inactive",
+            "12",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          20
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-1516",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount BIGINT,deleted_at BIGINT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','t1','active',5,NULL),('00000000-0000-0000-0000-000000000002','b@example.test','t2','inactive',7,9)"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000005','a@example.test','t1','active',12,99)"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_email_idx ON usage_records(email) WHERE deleted_at IS NULL"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount,deleted_at FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000003','a@example.test','t1','active',99,NULL)",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1516",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t1",
+                "active",
+                "12",
+                99
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000004','a@example.test','t1','active',100,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1516",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "a@example.test",
+                "t1",
+                "active",
+                "12",
+                99
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "outcome": {
+        "command_tag": "DELETE",
+        "result": {
+          "id": "sql-1516",
+          "columns": [
+            "id",
+            "status"
+          ],
+          "rows": [
+            [
+              "00000000-0000-0000-0000-000000000001",
+              "active"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ],
+          "column_oids": [
+            2950,
+            25
+          ],
+          "affected": 1
+        }
+      },
+      "after_ddl": {
+        "id": "sql-1516",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount",
+          "deleted_at"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "b@example.test",
+            "t2",
+            "inactive",
+            "7",
+            9
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "a@example.test",
+            "t1",
+            "active",
+            "12",
+            99
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          20
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-1517",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount BIGINT,deleted_at BIGINT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','t1','active',5,NULL),('00000000-0000-0000-0000-000000000002','b@example.test','t2','inactive',7,9)"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_email_idx ON usage_records(email)"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount,deleted_at FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000003','a@example.test','t1','active',99,NULL)",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1517",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,deleted_at) VALUES ('00000000-0000-0000-0000-000000000004','a@example.test','t1','active',100,NULL)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-1517",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount",
+              "deleted_at"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "b@example.test",
+                "t2",
+                "inactive",
+                "7",
+                9
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                "t1",
+                "active",
+                "99",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              20
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "outcome": {
+        "command_tag": "DELETE",
+        "result": {
+          "id": "sql-1517",
+          "columns": [
+            "id",
+            "status"
+          ],
+          "rows": [
+            [
+              "00000000-0000-0000-0000-000000000001",
+              "active"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ],
+          "column_oids": [
+            2950,
+            25
+          ],
+          "affected": 1
+        }
+      },
+      "after_ddl": {
+        "id": "sql-1517",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount",
+          "deleted_at"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "b@example.test",
+            "t2",
+            "inactive",
+            "7",
+            9
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          20
+        ],
+        "affected": 0
+      }
+    }
+  ]
+}

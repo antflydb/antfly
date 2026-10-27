@@ -121,13 +121,18 @@ def sync_detailed(
 ) -> Response[Any | SQLDiagnostic | SQLDiagnostic | SQLResponse | SQLResponse]:
     """Execute a SQL statement
 
-     Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
-    subset through the current catalog and native row execution contracts.
-    Parameters are bound separately from statement text. Document, graph,
-    and lake SQL sources, DDL, and SQL sessions are not yet supported.
-    Reads inherit native owner-local consistency, not a global SQL
-    transaction snapshot. Statements requiring a retained multi-page
-    statement snapshot fail when that capability is unavailable.
+     Executes supported SQL statements through the current catalog and native
+    execution contracts. Stored views use CREATE [OR REPLACE] VIEW,
+    ALTER VIEW RENAME TO, and DROP VIEW [CASCADE | RESTRICT] on this same
+    endpoint. Views retain durable source identities; owner/invoker access
+    reuses native row policies and caller/owner filters without changing
+    the caller's SQL identity. Document fields can be projected with
+    jsonb_to_record and declared SQL types, including typed arrays.
+    Parameters are bound separately from statement text. Source, DDL,
+    session, and transaction capabilities are checked explicitly; not every
+    PostgreSQL statement or cross-source transaction is supported.
+    Reads require the native retained statement-snapshot capabilities of
+    their sources, not an implied global SQL transaction snapshot.
     Unsupported statement shapes fail explicitly; the server never
     silently substitutes a different query or truncates the result.
 
@@ -168,13 +173,18 @@ def sync(
 ) -> Any | SQLDiagnostic | SQLDiagnostic | SQLResponse | SQLResponse | None:
     """Execute a SQL statement
 
-     Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
-    subset through the current catalog and native row execution contracts.
-    Parameters are bound separately from statement text. Document, graph,
-    and lake SQL sources, DDL, and SQL sessions are not yet supported.
-    Reads inherit native owner-local consistency, not a global SQL
-    transaction snapshot. Statements requiring a retained multi-page
-    statement snapshot fail when that capability is unavailable.
+     Executes supported SQL statements through the current catalog and native
+    execution contracts. Stored views use CREATE [OR REPLACE] VIEW,
+    ALTER VIEW RENAME TO, and DROP VIEW [CASCADE | RESTRICT] on this same
+    endpoint. Views retain durable source identities; owner/invoker access
+    reuses native row policies and caller/owner filters without changing
+    the caller's SQL identity. Document fields can be projected with
+    jsonb_to_record and declared SQL types, including typed arrays.
+    Parameters are bound separately from statement text. Source, DDL,
+    session, and transaction capabilities are checked explicitly; not every
+    PostgreSQL statement or cross-source transaction is supported.
+    Reads require the native retained statement-snapshot capabilities of
+    their sources, not an implied global SQL transaction snapshot.
     Unsupported statement shapes fail explicitly; the server never
     silently substitutes a different query or truncates the result.
 
@@ -209,13 +219,18 @@ async def asyncio_detailed(
 ) -> Response[Any | SQLDiagnostic | SQLDiagnostic | SQLResponse | SQLResponse]:
     """Execute a SQL statement
 
-     Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
-    subset through the current catalog and native row execution contracts.
-    Parameters are bound separately from statement text. Document, graph,
-    and lake SQL sources, DDL, and SQL sessions are not yet supported.
-    Reads inherit native owner-local consistency, not a global SQL
-    transaction snapshot. Statements requiring a retained multi-page
-    statement snapshot fail when that capability is unavailable.
+     Executes supported SQL statements through the current catalog and native
+    execution contracts. Stored views use CREATE [OR REPLACE] VIEW,
+    ALTER VIEW RENAME TO, and DROP VIEW [CASCADE | RESTRICT] on this same
+    endpoint. Views retain durable source identities; owner/invoker access
+    reuses native row policies and caller/owner filters without changing
+    the caller's SQL identity. Document fields can be projected with
+    jsonb_to_record and declared SQL types, including typed arrays.
+    Parameters are bound separately from statement text. Source, DDL,
+    session, and transaction capabilities are checked explicitly; not every
+    PostgreSQL statement or cross-source transaction is supported.
+    Reads require the native retained statement-snapshot capabilities of
+    their sources, not an implied global SQL transaction snapshot.
     Unsupported statement shapes fail explicitly; the server never
     silently substitutes a different query or truncates the result.
 
@@ -253,13 +268,18 @@ async def asyncio(
 ) -> Any | SQLDiagnostic | SQLDiagnostic | SQLResponse | SQLResponse | None:
     """Execute a SQL statement
 
-     Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
-    subset through the current catalog and native row execution contracts.
-    Parameters are bound separately from statement text. Document, graph,
-    and lake SQL sources, DDL, and SQL sessions are not yet supported.
-    Reads inherit native owner-local consistency, not a global SQL
-    transaction snapshot. Statements requiring a retained multi-page
-    statement snapshot fail when that capability is unavailable.
+     Executes supported SQL statements through the current catalog and native
+    execution contracts. Stored views use CREATE [OR REPLACE] VIEW,
+    ALTER VIEW RENAME TO, and DROP VIEW [CASCADE | RESTRICT] on this same
+    endpoint. Views retain durable source identities; owner/invoker access
+    reuses native row policies and caller/owner filters without changing
+    the caller's SQL identity. Document fields can be projected with
+    jsonb_to_record and declared SQL types, including typed arrays.
+    Parameters are bound separately from statement text. Source, DDL,
+    session, and transaction capabilities are checked explicitly; not every
+    PostgreSQL statement or cross-source transaction is supported.
+    Reads require the native retained statement-snapshot capabilities of
+    their sources, not an implied global SQL transaction snapshot.
     Unsupported statement shapes fail explicitly; the server never
     silently substitutes a different query or truncates the result.
 

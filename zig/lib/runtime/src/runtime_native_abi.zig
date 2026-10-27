@@ -24,7 +24,8 @@ const builtin = @import("builtin");
 
 // Tokenizer vtables include additive token-byte decoding. Reject older
 // native handles before interpreting the added callback slot.
-pub const abi_version: u32 = 10;
+// Combined SQL/document error identities require matching archive decoders.
+pub const abi_version: u32 = 11;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

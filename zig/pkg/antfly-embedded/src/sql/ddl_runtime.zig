@@ -18,7 +18,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
 
-pub const Output = struct { command_tag: []const u8, mutation_outcome: ?catalog.MutationOutcome, receipt: ?catalog.DdlReceipt = null };
+pub const Output = struct { command_tag: []const u8, mutation_outcome: ?catalog.MutationOutcome, receipt: ?catalog.DdlReceipt = null, catalog_receipt: ?catalog.CatalogOperationReceipt = null };
 
 pub fn accepts(statement: ast.Statement) bool {
     return switch (statement) {
@@ -27,26 +27,47 @@ pub fn accepts(statement: ast.Statement) bool {
     };
 }
 
+fn generatedConstraintNamesAlloc(a: std.mem.Allocator, create: ast.CreateTable) ![]const []const u8 {
+    var count: usize = 0;
+    for (create.constraints) |constraint| if (constraint.generatedConstraintName() != null) {
+        count += 1;
+    };
+    if (count == 0) return &.{};
+    const result = try a.alloc([]const u8, count);
+    var index: usize = 0;
+    for (create.constraints) |constraint| if (constraint.generatedConstraintName()) |name| {
+        result[index] = name;
+        index += 1;
+    };
+    return result;
+}
+
 pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, statement: ast.Statement) !Output {
     const alloc = allocators.scratch;
     const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
     try backend.vtable.checkpoint(backend.ptr);
-    var generated_names: std.ArrayList([]const u8) = .empty;
-    defer generated_names.deinit(alloc);
-    if (statement == .create_table) for (statement.create_table.constraints) |constraint| {
-        if (constraint == .add_unique and constraint.add_unique.generated_name)
-            try generated_names.append(alloc, constraint.add_unique.name);
+    const preparation: @import("immutable_plan.zig").Limits = if (backend.scalar_control) |control| .{ .checkpoint = control.checkpoint, .checkpoint_context = control.ptr } else .{};
+    const generated_names = if (statement == .create_table) try generatedConstraintNamesAlloc(alloc, statement.create_table) else &.{};
+    defer alloc.free(generated_names);
+    var column_sequences: std.ArrayList(@import("../system_catalog/column_sequences.zig").Creation) = .empty;
+    defer column_sequences.deinit(alloc);
+    if (statement == .create_table) for (statement.create_table.columns) |column| {
+        if (column.sequence) |intent| try column_sequences.append(alloc, intent);
     };
     const request: catalog.Ddl = switch (statement) {
-        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAlloc(alloc, create), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names.items } },
+        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAllocWithLimits(alloc, create, preparation), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names, .column_sequences = column_sequences.items } },
         .drop_table => |drop| .{ .drop_table = drop },
         .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
         .policy_ddl => |ddl| .{ .policy_ddl = ddl },
         else => return error.UnsupportedSqlExecution,
     };
-    defer if (request == .create_table) alloc.free(request.create_table.schema_json);
+
+    defer if (request == .create_table) {
+        alloc.free(request.create_table.schema_json);
+    };
+    try backend.vtable.checkpoint(backend.ptr);
     const outcome = try dispatch(backend.ptr, allocators, request);
-    return .{ .command_tag = if (outcome.mutation_outcome == .committed_pending or (outcome.receipt != null and outcome.receipt.?.state != .ready)) "DDL PENDING" else switch (request) {
+    return .{ .command_tag = if (outcome.mutation_outcome == .committed_pending or (outcome.receipt != null and outcome.receipt.?.state != .ready) or (outcome.catalog_receipt != null and outcome.catalog_receipt.?.state == .unknown)) "DDL PENDING" else switch (request) {
         .create_table => "CREATE TABLE",
         .drop_table => "DROP TABLE",
         .policy_ddl => |ddl| switch (ddl.action) {
@@ -57,6 +78,9 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
             .disable => "ALTER TABLE DISABLE ROW LEVEL SECURITY",
         },
         .catalog_ddl => |ddl| switch (ddl.action) {
+            .comment => "COMMENT",
+            .role_default => "ALTER ROLE",
+            .alter_sequence => "ALTER SEQUENCE",
             .truncate => "TRUNCATE TABLE",
             .alter_schema => switch (ddl.schema_change orelse return error.InvalidSqlSyntax) {
                 .create_index => "CREATE INDEX",
@@ -68,6 +92,9 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .namespace => "CREATE SCHEMA",
                 .tablespace => "CREATE TABLESPACE",
                 .index => "CREATE INDEX",
+                .view => "CREATE VIEW",
+                .role => "CREATE ROLE",
+                .sequence => "CREATE SEQUENCE",
                 .table => unreachable,
             },
             .drop => switch (ddl.kind) {
@@ -75,6 +102,9 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .namespace => "DROP SCHEMA",
                 .tablespace => "DROP TABLESPACE",
                 .index => "DROP INDEX",
+                .view => "DROP VIEW",
+                .role => "DROP ROLE",
+                .sequence => "DROP SEQUENCE",
                 .table => unreachable,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
@@ -83,15 +113,232 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .tablespace => "ALTER TABLESPACE",
                 .table => "ALTER TABLE",
                 .index => "ALTER INDEX",
+                .view => "ALTER VIEW",
+                .role => "ALTER ROLE",
+                .sequence => "ALTER SEQUENCE",
             },
         },
-    }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt };
+    }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt, .catalog_receipt = outcome.catalog_receipt };
 }
 
 /// Result belongs to the caller; temporary objects are bounded by the caller's
 /// SQL statement budget. No caller-selected schema generation is introduced.
 pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anyerror![]u8 {
-    if (create.columns.len == 0 or create.columns.len > 256) return error.SqlLimitExceeded;
+    return createSchemaAllocWithLimits(alloc, create, .{});
+}
+
+test "SQL document table declarations share native validation and retain exact schemas" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try @import("compiler.zig").compile(a,
+                \\CREATE TABLE IF NOT EXISTS docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.enforce_types = true)
+                \\DOCUMENT SCHEMA doc AS JSON '{"type":"object","properties":{"title":{"type":"text"},"counter":{"type":"number","minimum":9007199254740993}}}'
+            , .{});
+            defer compiled.deinit();
+            const create = compiled.statement.create_table;
+            try std.testing.expect(create.if_not_exists);
+            try std.testing.expectEqual(@as(usize, 0), create.columns.len);
+            try std.testing.expectEqual(@as(usize, 1), create.document.?.schemas.len);
+            const bytes = try createSchemaAlloc(a, create);
+            defer a.free(bytes);
+            var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(a, bytes);
+            defer parsed.deinit(a);
+            try std.testing.expectEqual(.document, parsed.storage_mode);
+            try std.testing.expectEqualStrings("doc", parsed.default_type);
+            try std.testing.expect(parsed.enforce_types);
+            try std.testing.expectEqual(@as(usize, 1), parsed.document_schemas.len);
+            var json = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .parse_numbers = false });
+            defer json.deinit();
+            const schemas = json.value.object.get("document_schemas").?.object;
+            const minimum = schemas.get("doc").?.object.get("schema").?.object.get("properties").?.object.get("counter").?.object.get("minimum").?;
+            try std.testing.expectEqualStrings("9007199254740993", minimum.number_string);
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "SQL document table rejects invalid schemas before backend dispatch" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{", "[]", "{\"type\":\"invalid\"}", "{\"type\":\"object\",\"properties\":42}" }) |invalid| {
+        const statement = try std.fmt.allocPrint(a, "CREATE TABLE docs () WITH (antfly.storage_mode='document',antfly.default_type='doc') DOCUMENT SCHEMA doc AS JSON '{s}'", .{invalid});
+        defer a.free(statement);
+        var compiled = try @import("compiler.zig").compile(a, statement, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, createSchemaAlloc(a, compiled.statement.create_table));
+    }
+}
+
+test "SQL document table native admission rejects reserved keyword typos without invalidating stored schemas" {
+    const a = std.testing.allocator;
+    const native_schema = @import("../schema/table_schema_impl.zig");
+    const legacy =
+        \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","x-antfly-unknown":true}}}}
+    ;
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, native_schema.parseSchemaUpdateRequest(a, legacy));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, native_schema.parseCreateSchemaRequest(a, legacy));
+    var stored = try native_schema.parseSchema(a, legacy);
+    defer stored.deinit(a);
+    const recovered = try native_schema.parseStoredCreateSchemaRequest(a, legacy);
+    defer a.free(recovered);
+    try std.testing.expect(std.mem.indexOf(u8, recovered, "x-antfly-unknown") != null);
+    const valid =
+        \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","x-antfly-include-in-all":true,"x-vendor-note":true,"default":{"dynamic_templates":"business data"},"properties":{"dynamic_templates":{"type":"string"},"title":{"type":"text","x-antfly-include-in-all":true}}}}}}
+    ;
+    const accepted = try native_schema.parseSchemaUpdateRequest(a, valid);
+    defer a.free(accepted);
+    for ([_][]const u8{
+        "{\"type\":\"object\",\"dynamic_templates\":\"bad\"}",
+        "{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\",\"x-antfly-typo\":true}}}",
+        "{\"type\":\"object\",\"$defs\":{\"bad\":{\"type\":\"string\",\"x-antfly-typo\":true}}}",
+    }) |invalid| {
+        const input = try std.fmt.allocPrint(a, "{{\"document_schemas\":{{\"doc\":{{\"schema\":{s}}}}}}}", .{invalid});
+        defer a.free(input);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, native_schema.parseSchemaUpdateRequest(a, input));
+    }
+}
+
+test "SQL original document table schema rejections validate before catalog mutation" {
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0780", "sql-0783", "sql-0784" }) |id| {
+        const original = try corpus.get(id);
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, original.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, createSchemaAlloc(std.testing.allocator, compiled.statement.create_table));
+    }
+}
+
+fn coveringConstraintDeclaration(backing: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compiler = @import("compiler.zig");
+    const schema_api = @import("../schema/mod.zig");
+    var create = try compiler.compile(a, "CREATE TABLE items(id bigint, label text, CONSTRAINT covered PRIMARY KEY(id) INCLUDE(label,label,id))", .{});
+    defer create.deinit();
+    const bytes = try createSchemaAlloc(a, create.statement.create_table);
+    var parsed = try schema_api.parseValidatedTableSchema(a, bytes);
+    defer parsed.deinit(a);
+    const runtime = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer @import("../storage/schema.zig").freeSchema(a, runtime);
+    const uniques = try parsed.relationalUniqueDefinitions(a);
+    try std.testing.expectEqual(@as(usize, 1), uniques.len);
+    try std.testing.expectEqual(@as(usize, 1), uniques[0].columns.len);
+    try std.testing.expectEqualStrings("id", uniques[0].columns[0]);
+    // Declared payloads retain PostgreSQL's duplicate-column spelling. The
+    // native ordinal cover is compact and never widens the key domain.
+    try std.testing.expectEqual(@as(usize, 3), uniques[0].include_columns.len);
+    const physical = (try parsed.relationalIndexDefinitions(a)).?;
+    try std.testing.expectEqual(@as(usize, 1), physical.len);
+    try std.testing.expectEqualStrings("covered", physical[0].name);
+    try std.testing.expectEqual(@as(usize, 1), physical[0].keys.len);
+    try std.testing.expectEqual(@as(usize, 1), physical[0].include_columns.len);
+    try std.testing.expectEqualStrings("label", physical[0].include_columns[0]);
+    for (runtime.relational_columns) |column| {
+        if (std.mem.eql(u8, column.name, "label")) try std.testing.expect(column.allows_null);
+        if (std.mem.eql(u8, column.name, "id")) try std.testing.expect(!column.allows_null);
+    }
+    const paths = try @import("catalog.zig").IndexDefinition.deriveLeaky(a, a, parsed, runtime);
+    try std.testing.expectEqual(@as(usize, 1), paths.len);
+    try std.testing.expectEqualStrings("label", paths[0].include_columns[0]);
+    var candidate = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false });
+    var rename = try compiler.compile(a, "ALTER TABLE items RENAME CONSTRAINT covered TO renamed", .{});
+    defer rename.deinit();
+    try std.testing.expect(try @import("schema_ddl.zig").apply(a, &candidate, rename.statement.catalog_ddl));
+    const renamed = try std.json.Stringify.valueAlloc(a, candidate, .{});
+    var successor = try schema_api.parseValidatedTableSchema(a, renamed);
+    defer successor.deinit(a);
+    try std.testing.expectEqualStrings("renamed", (try successor.relationalIndexDefinitions(a)).?[0].name);
+    var drop = try compiler.compile(a, "ALTER TABLE items DROP CONSTRAINT renamed", .{});
+    defer drop.deinit();
+    try std.testing.expect(try @import("schema_ddl.zig").apply(a, &candidate, drop.statement.catalog_ddl));
+    var removed = try schema_api.parseValidatedTableSchema(a, try std.json.Stringify.valueAlloc(a, candidate, .{}));
+    defer removed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), removed.coveringConstraintCount());
+    try std.testing.expectEqual(@as(usize, 0), (try removed.relationalUniqueDefinitions(a)).len);
+    try std.testing.expect((try removed.relationalIndexDefinitions(a)) == null);
+}
+
+test "SQL covering constraints share native access paths without widening key semantics" {
+    try coveringConstraintDeclaration(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, coveringConstraintDeclaration, .{});
+}
+
+test "SQL covering constraint normalization preserves different payloads and validates missing columns" {
+    const a = std.testing.allocator;
+    var create = try @import("compiler.zig").compile(a, "CREATE TABLE items(id bigint, label text, UNIQUE(id), UNIQUE(id) INCLUDE(label))", .{});
+    defer create.deinit();
+    try std.testing.expectEqual(@as(usize, 2), create.statement.create_table.constraints.len);
+    var invalid = try @import("compiler.zig").compile(a, "CREATE TABLE items(id bigint, UNIQUE(id) INCLUDE(missing))", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.UndefinedColumn, createSchemaAlloc(a, invalid.statement.create_table));
+}
+
+test "SQL covering constraint native partial membership remains identical on both access paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var create = try @import("compiler.zig").compile(a, "CREATE TABLE items(id bigint, label text, CONSTRAINT covered UNIQUE(id) INCLUDE(label))", .{});
+    defer create.deinit();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, try createSchemaAlloc(a, create.statement.create_table), .{});
+    const predicate = try std.json.parseFromSliceLeaky(std.json.Value, a, "[{\"column\":\"id\",\"op\":\"gte\",\"value\":0}]", .{});
+    try schema.object.getPtr("unique_constraints").?.array.items[0].object.put(a, "where", predicate);
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(a, try std.json.Stringify.valueAlloc(a, schema, .{}));
+    defer parsed.deinit(a);
+    const physical = (try parsed.relationalIndexDefinitions(a)).?[0];
+    const unique = (try parsed.relationalUniqueDefinitions(a))[0];
+    try std.testing.expectEqual(@as(usize, 1), physical.where.len);
+    try std.testing.expectEqual(@as(usize, 1), unique.where.len);
+    try std.testing.expectEqualStrings("id", physical.where[0].field);
+    try std.testing.expectEqual(unique.where[0].op, physical.where[0].op);
+    try std.testing.expectEqualStrings(unique.where[0].value_json.?, physical.where[0].value_json.?);
+    try std.testing.expectEqualStrings("label", physical.include_columns[0]);
+}
+
+fn documentSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable, document: ast.DocumentTable, limits: @import("immutable_plan.zig").Limits) anyerror![]u8 {
+    if (create.columns.len != 0 or create.constraints.len != 0) return error.InvalidSqlSyntax;
+    if (document.schemas.len > 1) return error.UnsupportedSqlShape;
+    if (document.schemas.len != 0 and (document.default_type == null or document.default_type.?.len == 0)) return error.SqlInvalidParameterValue;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var definitions: std.json.ObjectMap = .empty;
+    for (document.schemas) |definition| {
+        if (limits.checkpoint) |check| try check(limits.checkpoint_context);
+        if (definition.name.len == 0 or definitions.contains(definition.name)) return error.SqlInvalidParameterValue;
+        const schema = std.json.parseFromSliceLeaky(std.json.Value, a, definition.schema_json, .{ .parse_numbers = false }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        if (schema != .object) return error.InvalidSchemaUpdateRequest;
+        var wrapper: std.json.ObjectMap = .empty;
+        try wrapper.put(a, "schema", schema);
+        try definitions.put(a, definition.name, .{ .object = wrapper });
+    }
+    if (document.default_type) |name| if (name.len != 0 and !definitions.contains(name)) return error.SqlInvalidParameterValue;
+    const bytes = try std.json.Stringify.valueAlloc(a, .{
+        .storage_mode = "document",
+        .default_type = document.default_type orelse "",
+        .enforce_types = document.enforce_types,
+        .document_schemas = std.json.Value{ .object = definitions },
+    }, .{});
+    // The same native validator used by public table creation owns JSON Schema
+    // semantics. SQL does not implement a second schema dialect or weaken it.
+    const validated = @import("../schema/mod.zig").parseSchemaUpdateRequest(alloc, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    errdefer alloc.free(validated);
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
+    return validated;
+}
+
+pub fn createSchemaAllocWithLimits(alloc: std.mem.Allocator, create: ast.CreateTable, limits: @import("immutable_plan.zig").Limits) anyerror![]u8 {
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
+    if (create.document) |document| return documentSchemaAlloc(alloc, create, document.*, limits);
+    if (create.columns.len == 0) return error.UnsupportedSqlShape;
+    if (create.columns.len > 256) return error.SqlLimitExceeded;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -99,6 +346,7 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
     var required: std.ArrayList([]const u8) = .empty;
     var generated: std.ArrayList(std.json.Value) = .empty;
     for (create.columns) |column| {
+        if (limits.checkpoint) |check| try check(limits.checkpoint_context);
         const primary = primary: {
             for (create.constraints) |constraint| {
                 if (constraint != .add_unique or !constraint.add_unique.primary) continue;
@@ -128,12 +376,13 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
     // base references work; any generated-to-generated reference is rejected.
     var generated_index: usize = 0;
     for (create.columns) |column| {
+        if (limits.checkpoint) |check| try check(limits.checkpoint_context);
         if (column.default_expression) |expression| {
-            const lowered = try @import("schema_expression.zig").lowerAssignment(a, schema, expression, column, false);
+            const lowered = try @import("schema_expression.zig").lowerAssignmentWithLimits(a, schema, expression, column, false, limits);
             try schema.object.getPtr("column_defaults").?.array.append(try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .column = column.name, .expression = lowered }, .{}), .{ .parse_numbers = false }));
         }
         if (column.generated_expression) |expression| {
-            const lowered = try @import("schema_expression.zig").lowerAssignment(a, schema, expression, column, true);
+            const lowered = try @import("schema_expression.zig").lowerAssignmentWithLimits(a, schema, expression, column, true, limits);
             try schema.object.getPtr("generated_columns").?.array.items[generated_index].object.put(a, "expression", lowered);
             generated_index += 1;
         }
@@ -143,9 +392,114 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
             .add_unique, .add_check, .add_foreign_key => {},
             else => return error.InvalidSqlSyntax,
         }
-        _ = try @import("schema_ddl.zig").applyCandidate(a, &schema, .{ .name = create.table, .kind = .table, .action = .alter_schema, .schema_change = constraint });
+        _ = try @import("schema_ddl.zig").applyCandidateWithLimits(a, &schema, .{ .name = create.table, .kind = .table, .action = .alter_schema, .schema_change = constraint }, limits);
     }
     return std.json.Stringify.valueAlloc(alloc, schema, .{});
+}
+
+test "SQL transaction clock defaults share owned instants fence readers and preserve restored values" {
+    const a = std.testing.allocator;
+    const Allocator = std.mem.Allocator;
+    const schema = @import("../storage/schema.zig");
+    const checks = @import("../schema/relational_checks.zig");
+    const Plan = @import("../schema/relational_expression.zig").Plan;
+    const Clock = @import("../sql/statement_clock.zig");
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var compiled = try @import("../sql/compiler.zig").compile(alloc, "CREATE TABLE clocked (a timestamptz DEFAULT now(), b timestamptz DEFAULT CURRENT_TIMESTAMP(3), c timestamptz DEFAULT transaction_timestamp(), n bigint DEFAULT 7)", .{});
+            defer compiled.deinit();
+            const definition = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(alloc, compiled.statement.create_table);
+            defer alloc.free(definition);
+            var validator = try @import("../schema/mod.zig").CompiledTableValidator.init(alloc, definition);
+            defer validator.deinit(alloc);
+            const table = validator.execution.expressions.?.table;
+            try std.testing.expect(table.requires_clock_defaults);
+            var declaration = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, definition);
+            defer declaration.deinit(alloc);
+            var binding_arena = std.heap.ArenaAllocator.init(alloc);
+            defer binding_arena.deinit();
+            const columns = try @import("document_row.zig").deriveRelationalColumnsLeaky(binding_arena.allocator(), alloc, declaration, table);
+            for (columns) |column| {
+                try std.testing.expect(column.defaulted);
+                try std.testing.expectEqual(!std.mem.eql(u8, column.name, "n"), column.clock_defaulted);
+            }
+
+            try std.testing.expectEqual(@as(u32, 34), schema.requiredReaderVersion(table));
+            const bytes = try schema.serializeSchema(alloc, table);
+            defer alloc.free(bytes);
+            const restored = try schema.deserializeSchema(alloc, bytes);
+            defer schema.freeSchema(alloc, restored);
+            try std.testing.expect(restored.requires_clock_defaults);
+            try std.testing.expect(!(@import("../common/schema_readers.zig").ReaderCapabilities{ .semantic_ceiling = 33, .encoding_ceiling = 33 }).supports(schema.readerRequirementsForSchema(table)));
+            var document = try std.json.parseFromSlice(std.json.Value, alloc, "{}", .{});
+            defer document.deinit();
+            if (validator.prepareValue(document.arena.allocator(), alloc, &document.value)) |_| return error.TestUnexpectedResult else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(@as(anyerror, error.SqlClockUnavailable), err);
+            }
+            const instant = try Clock.Instant.fromUnixMicroseconds(1_706_704_496_123_456);
+            const preparation = validator.forPreparation(.{ .io = std.testing.io, .transaction_start = instant });
+            try preparation.prepareValue(document.arena.allocator(), alloc, &document.value);
+            try std.testing.expectEqual(instant.unixNanoseconds().?, checks.signedDateTime(document.value.object.get("a").?).?);
+            try std.testing.expectEqual(instant.unixNanoseconds().?, checks.signedDateTime(document.value.object.get("c").?).?);
+            try std.testing.expectEqual((try instant.withPrecision(3)).unixNanoseconds().?, checks.signedDateTime(document.value.object.get("b").?).?);
+            // A cold validator needs no execution clock to verify saved rows.
+            var reopened = try @import("../schema/mod.zig").CompiledTableValidator.init(alloc, definition);
+            defer reopened.deinit(alloc);
+            try reopened.validateValue(alloc, &document.value);
+            const before = try std.json.Stringify.valueAlloc(alloc, document.value, .{});
+            defer alloc.free(before);
+            try validator.forPreparation(.{ .io = std.testing.io, .transaction_start = try Clock.Instant.fromUnixMicroseconds(0) }).prepareValue(document.arena.allocator(), alloc, &document.value);
+            const after = try std.json.Stringify.valueAlloc(alloc, document.value, .{});
+            defer alloc.free(after);
+            try std.testing.expectEqualStrings(before, after);
+            var node = try std.json.parseFromSlice(std.json.Value, alloc, "{\"op\":\"transaction_timestamp\"}", .{});
+            defer node.deinit();
+            if (Plan.init(alloc, table, node.value, .datetime)) |unexpected| {
+                var plan = unexpected;
+                plan.deinit();
+                return error.TestUnexpectedResult;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(@as(anyerror, error.InvalidRelationalExpressionType), err);
+            }
+        }
+    };
+    try Check.run(a);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{});
+}
+
+test "SQL original combined table declaration lowers all defaults and constraints together" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    const original = try corpus.get("sql-0669");
+    var compiled = try @import("compiler.zig").compile(a, original.sql, .{});
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 7), compiled.statement.create_table.columns.len);
+    const bytes = try createSchemaAlloc(a, compiled.statement.create_table);
+    defer a.free(bytes);
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(a, bytes);
+    defer parsed.deinit(a);
+    try std.testing.expectEqual(.relational, parsed.storage_mode);
+    try std.testing.expectEqualStrings("row", parsed.default_type);
+    var validator = try @import("../schema/mod.zig").CompiledTableValidator.init(a, bytes);
+    defer validator.deinit(a);
+    var overflow = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"00000000-0000-4000-8000-000000000001\",\"tenant_id\":\"ABC\",\"quantity\":10000000000000000}", .{ .parse_numbers = false });
+    defer overflow.deinit();
+    try std.testing.expectError(error.RelationalExpressionOverflow, validator.prepareValue(overflow.arena.allocator(), a, &overflow.value));
+    const scalar = @import("scalar.zig");
+    const columns = try a.alloc(scalar.Column, compiled.statement.create_table.columns.len);
+    defer a.free(columns);
+    for (columns, compiled.statement.create_table.columns) |*out, column| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+    var reference = try std.json.parseFromSlice(struct { cases: []const struct { read_sql: []const u8 } }, a, @import("parity_fixtures.zig").table_contract_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    var query = try @import("compiler.zig").compile(a, reference.value.cases[0].read_sql, .{});
+    defer query.deinit();
+    for (query.statement.select.columns) |projection| if (projection.expression) |expression| {
+        var program = try scalar.bind(a, expression, columns, &.{}, .{});
+        program.deinit();
+    };
 }
 
 test "SQL NUMERIC modifier declarations publish exact constrained column identity" {
@@ -169,6 +523,10 @@ pub fn columnProperty(alloc: std.mem.Allocator, column: ast.Column, nullable: bo
         try std.json.Stringify.valueAlloc(alloc, .{
             .type = switch (column.type) {
                 .array => "sql_array",
+                .numrange => "numrange",
+                .daterange => "daterange",
+                .tsrange => "tsrange",
+                .tstzrange => "tstzrange",
                 .string => "keyword",
                 .uuid => unreachable,
                 .integer => "integer",
@@ -235,6 +593,301 @@ pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.C
         return @import("schema_expression.zig").numericLiteral(alloc, if (value == .null) .null else .{ .string = value.string });
     const literal = try bindDefault(alloc, value, kind, element);
     return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }, .{}), .{ .parse_numbers = false });
+}
+
+test "SQL view DDL describes without mutation and forwards one exact catalog intent" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn ddl(raw: *anyopaque, _: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(.catalog_ddl, std.meta.activeTag(request));
+            const command = request.catalog_ddl;
+            try std.testing.expectEqual(.view, command.kind);
+            if (command.action == .create) {
+                try std.testing.expectEqualStrings("SELECT id FROM things", command.view_definition.?.query_sql);
+                try std.testing.expect(command.view_definition.?.security_invoker);
+            }
+            self.calls += 1;
+            return .{};
+        }
+    };
+    const cases = [_]struct { sql: []const u8, tag: []const u8 }{
+        .{ .sql = "CREATE VIEW v WITH (security_invoker=true) AS SELECT id FROM things", .tag = "CREATE VIEW" },
+        .{ .sql = "ALTER VIEW v RENAME TO renamed", .tag = "ALTER VIEW" },
+        .{ .sql = "DROP VIEW IF EXISTS v CASCADE", .tag = "DROP VIEW" },
+    };
+    for (cases) |case| {
+        var probe: Probe = .{};
+        const backend: catalog.Backend = .{ .ptr = &probe, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Probe.checkpoint, .ddl = Probe.ddl } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const bound = try @import("describe.zig").bind(a, backend, &compiled, &.{});
+        try std.testing.expect(bound.table == null);
+        try std.testing.expectEqual(@as(usize, 0), bound.columns.len);
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        const output = try execute(.{ .result = a, .scratch = a }, backend, compiled.statement);
+        try std.testing.expectEqualStrings(case.tag, output.command_tag);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    }
+}
+
+test "SQL DDL generated name hints use one bounded allocation and borrow compiler-owned names" {
+    const Probe = struct {
+        fn run(a: std.mem.Allocator, create: ast.CreateTable) !void {
+            const names = try generatedConstraintNamesAlloc(a, create);
+            defer a.free(names);
+            try std.testing.expectEqual(@as(usize, 2), names.len);
+            try std.testing.expect(names[0].ptr == create.constraints[0].generatedConstraintName().?.ptr);
+            try std.testing.expect(names[1].ptr == create.constraints[1].generatedConstraintName().?.ptr);
+        }
+    };
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT UNIQUE)", .{});
+    defer compiled.deinit();
+    try Probe.run(std.testing.allocator, compiled.statement.create_table);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{compiled.statement.create_table});
+    var explicit = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE t (id BIGINT CONSTRAINT sql_primary_0 PRIMARY KEY)", .{});
+    defer explicit.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const names = try generatedConstraintNamesAlloc(failing.allocator(), explicit.statement.create_table);
+    try std.testing.expectEqual(@as(usize, 0), names.len);
+}
+
+test "SQL DDL carries generated name provenance outside the editable public schema" {
+    const Fake = struct {
+        expected: []const []const u8,
+        calls: usize = 0,
+        fn ddl(raw: *anyopaque, allocators: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
+            const a = allocators.scratch;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const create = request.create_table;
+            try std.testing.expectEqual(self.expected.len, create.generated_constraint_names.len);
+            for (self.expected, create.generated_constraint_names) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+            try std.testing.expect(std.mem.indexOf(u8, create.schema_json, "name_generated") == null);
+            try std.testing.expect(std.mem.indexOf(u8, create.schema_json, "generated_constraint_names") == null);
+            const schema = try std.json.parseFromSlice(std.json.Value, a, create.schema_json, .{});
+            defer schema.deinit();
+            try std.testing.expectEqualStrings("relational", schema.value.object.get("storage_mode").?.string);
+            self.calls += 1;
+            return .{ .mutation_outcome = .committed };
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const cases = [_]struct { sql: []const u8, generated: []const []const u8 }{
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT UNIQUE)", .generated = &.{ "sql_primary_0", "sql_unique_1" } },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT sql_primary_0 PRIMARY KEY, email TEXT CONSTRAINT sql_unique_1 UNIQUE)", .generated = &.{} },
+        .{ .sql = "CREATE TABLE t (id BIGINT, PRIMARY KEY (id), CHECK (id > 0))", .generated = &.{ "sql_constraint_0", "sql_constraint_1" } },
+        .{ .sql = "CREATE TABLE t (id BIGINT CHECK (id > 0))", .generated = &.{"sql_inline_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT CONSTRAINT sql_primary_0 UNIQUE)", .generated = &.{"sql_generated_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE, CONSTRAINT sql_unique_0 CHECK (id > 0), CONSTRAINT sql_generated_0 CHECK (id < 100))", .generated = &.{"sql_generated_1"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT CHECK (id > 0), CONSTRAINT sql_inline_0 UNIQUE (id))", .generated = &.{"sql_generated_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT, CHECK (id > 0), CONSTRAINT sql_constraint_0 UNIQUE (id))", .generated = &.{"sql_generated_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT REFERENCES parent (id), CONSTRAINT sql_inline_0 CHECK (id > 0))", .generated = &.{"sql_generated_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT sql_unique_1 UNIQUE, email TEXT UNIQUE)", .generated = &.{"sql_generated_0"} },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fake: Fake = .{ .expected = case.generated };
+        const result = try execute(.{ .result = arena.allocator(), .scratch = std.testing.allocator }, .{ .ptr = &fake, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .ddl = Fake.ddl, .checkpoint = Fake.checkpoint } }, compiled.statement);
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        try std.testing.expectEqualStrings("CREATE TABLE", result.command_tag);
+    }
+}
+
+test "SQL DDL internal label disambiguation preserves explicit constraints and allocation safety" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try @import("compiler.zig").compile(a, "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT CONSTRAINT sql_primary_0 UNIQUE, CONSTRAINT sql_generated_0 CHECK (id > 0))", .{});
+            defer compiled.deinit();
+            const create = compiled.statement.create_table;
+            try std.testing.expectEqualStrings("sql_generated_1", create.constraints[0].generatedConstraintName().?);
+            try std.testing.expectEqualStrings("sql_primary_0", create.constraints[1].add_unique.name);
+            try std.testing.expect(create.constraints[1].generatedConstraintName() == null);
+            try std.testing.expectEqualStrings("sql_generated_0", create.constraints[2].add_check.name);
+            try std.testing.expect(create.constraints[2].generatedConstraintName() == null);
+            const bytes = try createSchemaAlloc(a, create);
+            defer a.free(bytes);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+            defer parsed.deinit();
+            const uniques = parsed.value.object.get("unique_constraints").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), uniques.len);
+            try std.testing.expectEqualStrings("sql_generated_1", uniques[0].object.get("name").?.string);
+            try std.testing.expectEqualStrings("sql_primary_0", uniques[1].object.get("name").?.string);
+            try std.testing.expectEqualStrings("sql_generated_0", parsed.value.object.get("checks").?.array.items[0].object.get("name").?.string);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL DDL duplicate explicit constraint names remain definite rejection" {
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE t (id BIGINT UNIQUE, CONSTRAINT repeated CHECK (id > 0), CONSTRAINT repeated CHECK (id < 100))", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlConstraintAlreadyExists, createSchemaAlloc(std.testing.allocator, compiled.statement.create_table));
+}
+
+test "SQL generated immutable planning cancellation never dispatches CREATE or publishes ALTER candidates" {
+    const Control = struct {
+        calls: usize = 0,
+        dispatches: usize = 0,
+        cancel_at: usize = std.math.maxInt(usize),
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const current = self.calls;
+            self.calls += 1;
+            if (current == self.cancel_at) return error.Cancelled;
+        }
+        fn checkpoint(raw: *anyopaque) anyerror!void {
+            try check(raw);
+        }
+        fn dispatch(raw: *anyopaque, _: catalog.DdlAllocators, _: catalog.Ddl) !catalog.DdlOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.dispatches += 1;
+            return .{ .mutation_outcome = .committed };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .scalar_control = .{ .ptr = self, .checkpoint = check }, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .ddl = dispatch, .checkpoint = checkpoint } };
+        }
+    };
+    const a = std.testing.allocator;
+    var created = try @import("compiler.zig").compile(a, "CREATE TABLE t (s TEXT, g TEXT GENERATED ALWAYS AS (CASE WHEN s IS NULL THEN lower('OK') ELSE lower(s) END) STORED)", .{});
+    defer created.deinit();
+    var control: Control = .{};
+    _ = try execute(.{ .result = a, .scratch = a }, control.backend(), created.statement);
+    try std.testing.expectEqual(@as(usize, 1), control.dispatches);
+    const create_calls = control.calls;
+    for (0..create_calls) |cut| {
+        control = .{ .cancel_at = cut };
+        try std.testing.expectError(error.Cancelled, execute(.{ .result = a, .scratch = a }, control.backend(), created.statement));
+        try std.testing.expectEqual(@as(usize, 0), control.dispatches);
+        try std.testing.expectEqual(cut + 1, control.calls);
+    }
+    var base = try @import("compiler.zig").compile(a, "CREATE TABLE t (s TEXT)", .{});
+    defer base.deinit();
+    const baseline = try createSchemaAlloc(a, base.statement.create_table);
+    defer a.free(baseline);
+    var added = try @import("compiler.zig").compile(a, "ALTER TABLE t ADD COLUMN g TEXT GENERATED ALWAYS AS (CASE WHEN s IS NULL THEN lower('OK') ELSE lower(s) END) STORED", .{});
+    defer added.deinit();
+    var alter_calls: usize = 0;
+    var cut: usize = 0;
+    while (cut == 0 or cut <= alter_calls) : (cut += 1) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var schema = try std.json.parseFromSliceLeaky(std.json.Value, owned, baseline, .{ .parse_numbers = false });
+        control = .{ .cancel_at = if (cut == 0) std.math.maxInt(usize) else cut - 1 };
+        const limits: @import("immutable_plan.zig").Limits = .{ .checkpoint = Control.check, .checkpoint_context = &control };
+        if (cut == 0) {
+            try std.testing.expect(try @import("schema_ddl.zig").applyWithLimits(owned, &schema, added.statement.catalog_ddl, limits));
+            alter_calls = control.calls;
+        } else {
+            try std.testing.expectError(error.Cancelled, @import("schema_ddl.zig").applyWithLimits(owned, &schema, added.statement.catalog_ddl, limits));
+            try std.testing.expectEqualStrings(baseline, try std.json.Stringify.valueAlloc(owned, schema, .{}));
+            try std.testing.expectEqual(cut, control.calls);
+        }
+    }
+}
+
+test "SQL DDL normalizes equivalent index constraints without merging different policies" {
+    const cases = [_]struct { sql: []const u8, count: usize, primary: bool = false, explicit: ?[]const u8 = null }{
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY UNIQUE)", .count = 1, .primary = true },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE PRIMARY KEY)", .count = 1, .primary = true },
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY CONSTRAINT named UNIQUE)", .count = 1, .primary = true, .explicit = "named" },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT named UNIQUE PRIMARY KEY)", .count = 1, .primary = true, .explicit = "named" },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT first UNIQUE CONSTRAINT second UNIQUE)", .count = 1, .explicit = "first" },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE CONSTRAINT named UNIQUE)", .count = 1, .explicit = "named" },
+        .{ .sql = "CREATE TABLE t (a BIGINT, b BIGINT, UNIQUE (a, b), UNIQUE (b, a))", .count = 2 },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE NULLS DISTINCT UNIQUE NULLS NOT DISTINCT)", .count = 2 },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE DEFERRABLE INITIALLY IMMEDIATE UNIQUE DEFERRABLE INITIALLY DEFERRED)", .count = 2 },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE UNIQUE DEFERRABLE)", .count = 2 },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const create = compiled.statement.create_table;
+        try std.testing.expectEqual(case.count, create.constraints.len);
+        if (case.count == 1) {
+            try std.testing.expectEqual(case.primary, create.constraints[0].add_unique.primary);
+            if (case.explicit) |explicit| {
+                try std.testing.expectEqualStrings(explicit, create.constraints[0].add_unique.name);
+                try std.testing.expect(create.constraints[0].generatedConstraintName() == null);
+            }
+        }
+        const bytes = try createSchemaAlloc(std.testing.allocator, create);
+        defer std.testing.allocator.free(bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.count, parsed.value.object.get("unique_constraints").?.array.items.len);
+    }
+}
+
+test "SQL DDL equivalent index normalization transfers explicit provenance with allocation safety" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try @import("compiler.zig").compile(a, "CREATE TABLE t (id BIGINT UNIQUE CONSTRAINT selected UNIQUE PRIMARY KEY, CHECK (id > 0))", .{});
+            defer compiled.deinit();
+            const create = compiled.statement.create_table;
+            try std.testing.expectEqual(@as(usize, 2), create.constraints.len);
+            try std.testing.expect(create.constraints[0].add_unique.primary);
+            try std.testing.expectEqualStrings("selected", create.constraints[0].add_unique.name);
+            try std.testing.expect(create.constraints[0].generatedConstraintName() == null);
+            const bytes = try createSchemaAlloc(a, create);
+            defer a.free(bytes);
+            const names = try generatedConstraintNamesAlloc(a, create);
+            defer a.free(names);
+            try std.testing.expectEqual(@as(usize, 1), names.len);
+            try std.testing.expectEqualStrings(create.constraints[1].generatedConstraintName().?, names[0]);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL DDL redundant declarations do not amplify published constraint schemas" {
+    const a = std.testing.allocator;
+    var baseline: ?[]u8 = null;
+    defer if (baseline) |bytes| a.free(bytes);
+    for ([_]usize{ 64, 1024 }) |count| {
+        var sql = std.Io.Writer.Allocating.init(a);
+        defer sql.deinit();
+        try sql.writer.writeAll("CREATE TABLE t (id BIGINT PRIMARY KEY");
+        for (0..count) |index| try sql.writer.print(" CONSTRAINT u{d} UNIQUE", .{index});
+        try sql.writer.writeAll(")");
+        var compiled = try @import("compiler.zig").compile(a, sql.written(), .{});
+        defer compiled.deinit();
+        const create = compiled.statement.create_table;
+        try std.testing.expectEqual(@as(usize, 1), create.constraints.len);
+        try std.testing.expect(create.constraints[0].add_unique.primary);
+        try std.testing.expectEqualStrings("u0", create.constraints[0].add_unique.name);
+        const bytes = try createSchemaAlloc(a, create);
+        if (baseline) |expected| {
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings(expected, bytes);
+        } else baseline = bytes;
+    }
+}
+
+test "SQL DDL distinct-index normalization growth is allocation safe" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator, source: []const u8) !void {
+            var compiled = try @import("compiler.zig").compile(a, source, .{});
+            defer compiled.deinit();
+            try std.testing.expectEqual(@as(usize, 32), compiled.statement.create_table.constraints.len);
+        }
+    };
+    var sql = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer sql.deinit();
+    try sql.writer.writeAll("CREATE TABLE t (");
+    for (0..32) |index| try sql.writer.print("{s}c{d} BIGINT UNIQUE", .{ if (index == 0) "" else ", ", index });
+    try sql.writer.writeAll(")");
+    try Fixture.run(std.testing.allocator, sql.written());
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{sql.written()});
 }
 
 test "SQL TRUNCATE lowers complete table set and honest durable admission receipt" {
@@ -493,6 +1146,45 @@ test "SQL constraints bind typed expressions and preserve composite FK actions" 
     try std.testing.expectEqualStrings("set_null", fk.object.get("on_delete").?.string);
     try std.testing.expectEqualStrings("deferred", fk.object.get("timing").?.string);
     try std.testing.expectEqualStrings("and", schema.object.get("checks").?.array.items[0].object.get("expression").?.object.get("op").?.string);
+}
+
+fn uniqueNullSchema(alloc: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var created = try @import("compiler.zig").compile(alloc, "CREATE TABLE items (tenant BIGINT NOT NULL, email TEXT UNIQUE NULLS NOT DISTINCT, status TEXT)", .{});
+    defer created.deinit();
+    const bytes = try createSchemaAlloc(alloc, created.statement.create_table);
+    defer alloc.free(bytes);
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    for ([_][]const u8{
+        "ALTER TABLE items ADD CONSTRAINT tenant_email UNIQUE NULLS NOT DISTINCT (tenant, email) DEFERRABLE INITIALLY DEFERRED",
+        "CREATE UNIQUE INDEX folded_email ON items (lower(email)) NULLS NOT DISTINCT WHERE status='active'",
+        "CREATE UNIQUE INDEX ordinary_email ON items (email) NULLS DISTINCT",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compile(alloc, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(try @import("schema_ddl.zig").apply(a, &schema, compiled.statement.catalog_ddl));
+    }
+    const encoded = try std.json.Stringify.valueAlloc(a, schema, .{});
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, encoded);
+    defer parsed.deinit(alloc);
+    const definitions = try parsed.relationalUniqueDefinitions(a);
+    try std.testing.expectEqual(@as(usize, 4), definitions.len);
+    for (definitions[0..3]) |definition| try std.testing.expect(definition.nulls_not_distinct);
+    try std.testing.expect(!definitions[3].nulls_not_distinct);
+    try std.testing.expect(definitions[1].deferrable);
+    try std.testing.expectEqual(.deferred, definitions[1].timing);
+    try std.testing.expectEqual(@as(usize, 1), definitions[2].keys.len);
+    try std.testing.expectEqual(@as(usize, 1), definitions[2].where.len);
+    const wire = schema.object.get("unique_constraints").?.array.items;
+    try std.testing.expectEqualStrings("index", wire[2].object.get("origin").?.string);
+    try std.testing.expectEqualStrings("index", wire[3].object.get("origin").?.string);
+}
+
+test "SQL UNIQUE null semantics survive public schema lowering and allocation failure" {
+    try uniqueNullSchema(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, uniqueNullSchema, .{});
 }
 
 test "SQL CREATE TABLE combines inline primary keys and named composite declarations" {

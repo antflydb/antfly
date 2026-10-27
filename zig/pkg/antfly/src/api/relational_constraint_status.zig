@@ -70,7 +70,7 @@ pub fn collect(alloc: std.mem.Allocator, source: anytype, reader: reads.TableRea
     try std.base64.standard.Decoder.decode(raw, encoded);
     var catalog = try catalog_mod.decode(temporary, raw);
     defer catalog.deinit();
-    const checks_digest: [32]u8 = if (validator.execution.checks) |checks| checks.fingerprint() else @splat(0);
+    const checks_digest: [32]u8 = if (validator.execution.checks) |checks| checks.validationFingerprint() else @splat(0);
     if (catalog.schema_version != parsed.version or !std.mem.eql(u8, &catalog.incarnation, &(try catalog_mod.incarnationFromTableId(table.table_id))) or
         !std.mem.eql(u8, &catalog.checks_digest, &checks_digest)) return error.PreparedGenerationChanged;
     var owners: std.ArrayList(*const metadata.RangeRecord) = .empty;

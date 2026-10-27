@@ -491,7 +491,7 @@ pub const Join = struct {
                 var offset: u64 = 0;
                 while (offset < file.size) {
                     try self.manager.check();
-                    _ = self.scratch.reset(.free_all);
+                    _ = self.scratch.reset(.{ .retain_with_limit = @min(8192, self.workspace_bytes / 16) });
                     var input = try file.readInputBlockBorrowed(offset);
                     defer input.deinit();
                     const block = input.view();
@@ -578,34 +578,40 @@ pub const Join = struct {
             if (self.active.?.build) |*file| {
                 var offset: u64 = 0;
                 while (offset < file.size) {
-                    var input = try file.readInputBlock(offset);
-                    defer input.deinit();
-                    const block = input.view();
-                    _ = self.scratch.reset(.retain_capacity);
-                    const a = self.scratch.allocator();
-                    const values = try block.batch(a, false);
-                    var keys: [256][]const Datum = undefined;
-                    const key_cells = try a.alloc(Datum, block.count() * block.keyWidth());
-                    for (keys[0..block.count()], 0..) |*key, index| {
-                        const row = key_cells[index * block.keyWidth() ..][0..block.keyWidth()];
-                        for (row, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
-                        key.* = row;
-                    }
-                    const consumed = try self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]);
-                    offset += consumed;
-                    if (consumed == block.count()) continue;
+                    const full = blk: {
+                        // Retire this source lease before repartition closes
+                        // the parent file and opens destination files.
+                        var input = try file.readInputBlock(offset);
+                        defer input.deinit();
+                        const block = input.view();
+                        _ = self.scratch.reset(.retain_capacity);
+                        const a = self.scratch.allocator();
+                        const values = try block.batch(a, false);
+                        var keys: [256][]const Datum = undefined;
+                        const key_cells = try a.alloc(Datum, block.count() * block.keyWidth());
+                        for (keys[0..block.count()], 0..) |*key, index| {
+                            const row = key_cells[index * block.keyWidth() ..][0..block.keyWidth()];
+                            for (row, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
+                            key.* = row;
+                        }
+                        const consumed = try self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]);
+                        offset += consumed;
+                        break :blk consumed != block.count();
+                    };
+                    if (!full) continue;
+                    // The failed hash build has no published output. Release
+                    // it before allocating repartition buffers; retaining it
+                    // would spend the shared statement budget twice.
+                    self.hash.?.deinit();
+                    self.hash = null;
                     // Exact ingestion summaries include unread blocks. Do
                     // not decode/replay payloads merely to choose a split bit.
                     if (try self.split(self.active.?.hashes.differences())) {
-                        self.hash.?.deinit();
-                        self.hash = null;
                         repartitioned = true;
                         break;
                     }
                     // No useful hash split remains. Keep the typed partition
                     // and replay it per probe block, not per probe row.
-                    self.hash.?.deinit();
-                    self.hash = null;
                     try self.compactSkewInput(file);
                     if (self.active.?.probes) |*probes| try self.compactSkewInput(probes);
                     self.skew = try @import("skew_join.zig").Join.create(self.manager, self.outer_left, self.outer_right);
@@ -1130,12 +1136,19 @@ test "SQL partitioned join runtime filter preserves null and skew semantics" {
 
 test "SQL partitioned join recursively splits underestimated builds within file and memory quotas" {
     const Hook = struct {
-        fn check(_: *anyopaque) !void {}
+        checks: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            // A work bound catches repeated repartition/replay without a
+            // scheduler-dependent wall-clock timeout or smaller stress input.
+            if (self.checks > 100000) return error.UnexpectedJoinWorkAmplification;
+        }
     };
     var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 256 * 1024 };
     const a = budget.allocator();
-    var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var hook: Hook = .{};
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &hook, .checkpoint = Hook.check };
     defer manager.deinit();
     {
         // Deliberately underestimate bytes: two initial partitions cannot fit.
@@ -1170,6 +1183,7 @@ test "SQL partitioned join recursively splits underestimated builds within file 
         try std.testing.expectEqual(@as(usize, 951), rights);
         try std.testing.expect(join.repartitions > 0);
         try std.testing.expect(join.partitions_loaded > 2);
+        std.debug.print("PARTITION_UNDERESTIMATE rows=1100 matches={} repartitions={} loaded={} checks={} peak_bytes={}\n", .{ matches, join.repartitions, join.partitions_loaded, hook.checks, budget.peak });
     }
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     try std.testing.expectEqual(@as(usize, 0), manager.files);

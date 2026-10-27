@@ -32,6 +32,9 @@ const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
+    kind: enum { table, view, sequence } = .table,
+    sequence_incarnation: ?[16]u8 = null,
+    definition_digest: ?[32]u8 = null,
     database: []const u8,
     namespace: []const u8,
     name: []const u8,
@@ -48,13 +51,65 @@ pub const Binding = struct {
     pub fn verify(bindings: []const Binding, table: catalog.Table) !void {
         const current = try from(table);
         for (bindings) |entry| {
+            if (entry.kind != .table) continue;
             if (!std.mem.eql(u8, entry.database, current.database) or !std.mem.eql(u8, entry.namespace, current.namespace) or !std.mem.eql(u8, entry.name, current.name)) continue;
             if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
             return;
         }
         return error.CatalogGenerationChanged;
     }
+
+    pub fn fromView(target: @import("antfly_local_sources").system_catalog_domain.Target, id: u64, generation: u32, digest: [32]u8, revision: u64) Binding {
+        return .{
+            .kind = .view,
+            .definition_digest = digest,
+            .database = target.database,
+            .namespace = target.namespace,
+            .name = target.table,
+            .physical_name = "",
+            .id = id,
+            .schema_version = generation,
+            .revision = revision,
+        };
+    }
+    pub fn verifyView(bindings: []const Binding, current: Binding) !void {
+        if (current.kind != .view or current.definition_digest == null) return error.InvalidSqlBackendResponse;
+        for (bindings) |entry| {
+            if (entry.kind != .view or entry.id != current.id) continue;
+            if (entry.schema_version != current.schema_version or entry.definition_digest == null or
+                !std.mem.eql(u8, &entry.definition_digest.?, &current.definition_digest.?)) return error.CatalogGenerationChanged;
+            // Compatible source changes and relation renames do not change a
+            // view definition. Every execution still pins a fresh catalog cut.
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
 };
+
+test "SQL prepared view manifests preserve identity across source epochs and reject retargeted definitions" {
+    const target: @import("antfly_local_sources").system_catalog_domain.Target = .{ .table = "stored" };
+    const original = Binding.fromView(target, 7, 1, @splat(1), 3);
+    var current = original;
+    current.revision = 9;
+    current.name = "renamed";
+    try Binding.verifyView(&.{original}, current);
+    current.id = 8;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(&.{original}, current));
+    current = original;
+    current.definition_digest = @splat(2);
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(&.{original}, current));
+    current = original;
+    current.schema_version = 2;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(&.{original}, current));
+    const table: catalog.Table = .{
+        .id = 7,
+        .physical_name = "",
+        .schema_version = 1,
+        .columns = &.{},
+        .scope = .{ .database = target.database, .namespace = target.namespace, .name = target.table, .revision = 3 },
+    };
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verify(&.{original}, table));
+}
 
 pub const Resource = struct {
     id: [32]u8,
@@ -75,6 +130,7 @@ pub const Resource = struct {
     /// The described types depend on the scoped setting definitions, not on
     /// the mutable session values. Execution re-reads values at its own cut.
     setting_epoch: ?u64 = null,
+    lookup_path: ?@import("../pgwire/search_path.zig").Path = null,
     parameter_types: []const ?ast.ColumnType,
     parameter_descriptors: []const @import("antfly_local_sources").sql_scalar.Type = &.{},
     bindings: []const Binding,
@@ -105,6 +161,7 @@ const Directory = struct { resources: []const Entry = &.{} };
 const Action = union(enum) { create: Resource, close: []const u8 };
 
 fn validateParameters(resource: Resource) !void {
+    if (resource.lookup_path) |path| try path.validate();
     if (resource.parameter_types.len != resource.parameter_descriptors.len or resource.parameter_descriptors.len > 1024) return error.InvalidSqlParameters;
     for (resource.parameter_types, resource.parameter_descriptors) |kind, descriptor| {
         if (kind != descriptor.kind) return error.InvalidSqlParameters;

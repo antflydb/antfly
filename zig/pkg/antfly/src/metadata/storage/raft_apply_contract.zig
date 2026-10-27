@@ -111,6 +111,10 @@ pub const StandaloneCatalogUpdate = struct {
     /// An exact physical-root proof for native schema finalization, or a
     /// binding-only first registration before any FK publication begins.
     native_owner: ?@import("../standalone_native_owner.zig").Binding = null,
+    /// Signed startup-only reporter CAS for the already admitted native root.
+    /// Possession cannot enroll a key or authorize a publication ACK.
+    native_registration: ?@import("../standalone_native_owner.zig").Registration = null,
+    native_restart: ?@import("../standalone_native_owner.zig").Restart = null,
     import_catalog: ?@import("antfly_local_sources").system_catalog_domain.State = null,
     /// Applied in the same local transaction as the standalone revision and
     /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
@@ -241,16 +245,34 @@ pub const SystemCatalogCommand = struct {
     mutation: system_catalog.Mutation,
     topology: ?TableTopologyMutation = null,
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
+    constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
+    sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
+    sql_sequence: ?@import("../../system_catalog/sequence_catalog.zig").Mutation = null,
+    column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation = &.{},
+
+    pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.column_sequences.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence, .column_sequences = self.column_sequences });
+        if (self.sql_sequence != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence });
+        if (self.sql_view != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view });
+        // Keep legacy frames byte-for-byte shaped as before while capability
+        // 34 is not activated. Old decoders must not see even a null new field.
+        if (self.constraint_name_admission == null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update });
+        try writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission });
+    }
 };
 
-pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{} };
+pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{}, namespace_id: u64 = 0 };
 
 pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {
         .apply_system_catalog,
+        .apply_schema_validation,
         .apply_restore_staging,
         .create_restore_job_with_staging,
         .apply_fk_generation_publication,
+        .begin_relational_index_publication,
+        .decide_relational_index_publication,
+        .ack_relational_index_publication,
         .apply_fk_initial_create,
         .upsert_table,
         .compare_and_replace_table,
@@ -264,17 +286,36 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
 }
 
 const store_report_update = @import("../store_report_update.zig");
+pub const StandaloneRevisionState = struct {
+    revision: u64,
+    /// Last commit that might change the visible catalog projection.
+    projection_revision: u64,
+};
+
 pub const CatalogProjectionRequest = union(enum) {
     read_store: struct { store_id: u64, reports: bool },
     read_store_group_facts: u64,
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
     catalog_read: system_catalog.Read,
     catalog_export: void,
+    catalog_checkpoint: []const u8,
+    catalog_checkpoint_projection: @import("../../system_catalog/projection.zig").Export.NativeCheckpoint,
     catalog_export_standalone_portable: void,
+    sql_snapshot_cohort: []const u8,
     catalog_list_tables: system_catalog.TableList,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
+    catalog_admission_bound: struct { mutation: system_catalog.Mutation, binding_guard: system_catalog.RelationMutationGuard },
     catalog_prepare: SystemCatalogCommand,
+    catalog_bind_column_sequences: SystemCatalogCommand,
+    catalog_column_sequence_handoffs: @import("../column_sequence_handoff.zig").Request,
+    sql_sequence_admission_head: void,
+    sql_column_identities: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
+    sql_sequence_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
+    sql_sequence_preflight: @import("../../system_catalog/sequence_catalog.zig").Mutation,
+    sql_sequence_outcome: @import("../../system_catalog/sequence_catalog.zig").Mutation,
+    sql_sequence_counter_preflight: @import("../../system_catalog/sequence_catalog.zig").CounterRequest,
+    sql_sequence_counter_outcome: @import("../../system_catalog/sequence_catalog.zig").CounterRequest,
     catalog_resolve_table: system_catalog.Target,
     catalog_resolve_identity: system_catalog.Target,
     catalog_resolve_many: system_catalog.ResolveMany,
@@ -289,19 +330,26 @@ pub const CatalogProjectionRequest = union(enum) {
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
     catalog_snapshot: void,
+    sql_setting_mutation_cut: ?[]const u8,
     sql_setting_snapshot: @import("antfly_local_sources").system_catalog_settings.Scope,
     sql_policy_snapshot: struct { table_id: u64, principal: []const u8, database: []const u8, roles: []const []const u8 },
     sql_policy_install_snapshot: @import("antfly_local_sources").system_catalog_policies.InstallRequest,
     sql_policy_publication_status: u64,
     sql_policy_publication_work: u64,
     sql_policy_begin_command: @import("antfly_local_sources").system_catalog_policies.BeginRequest,
+    sql_policy_definition_command: @import("antfly_local_sources").system_catalog_policies.Command,
     require_policy_index_mutation_allowed: u64,
     require_policy_topology_mutation_allowed: u64,
     fk_generation_publication_status: u64,
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../fk_generation_publication.zig").SourceDecisionRequest,
+    relational_index_owner_decision: @import("../relational_index_publication.zig").OwnerRequest,
     fk_initial_create_prepare: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest,
+    fk_generation_name_admission: @import("../fk_generation_publication.zig").Plan,
+    fk_initial_create_prepare_with_deadline: struct { request: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest, deadline_ns: ?u64 = null },
+    constraint_name_prepare: struct { request: system_catalog.ConstraintNamePreparation, deadline_ns: ?u64 = null },
+    constraint_name_check: struct { request: system_catalog.ConstraintNameCheck, deadline_ns: ?u64 = null },
     fk_initial_child_decision: @import("../fk_generation_publication.zig").InitialChildDecisionRequest,
     fk_initial_create_status: u64,
     fk_generation_table_locked: u64,
@@ -309,4 +357,33 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
     store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+    // Additive owned JSON projections; no storage handles cross this boundary.
+    schema_reader_floor: void,
+    standalone_revision_state: void,
+    standalone_native_reporter_observation: @import("../standalone_native_owner.zig").Registration,
+    standalone_native_reporter_progress: u64,
+    standalone_native_owner_binding: void,
+    relational_index_status: @import("../relational_index_publication.zig").StatusRequest,
+    relational_index_prepare: @import("../relational_index_publication.zig").PrepareRequest,
+    relational_index_admission_status: @import("../relational_index_publication.zig").AdmissionRequest,
+    relational_index_begin_preflight: @import("../relational_index_publication.zig").BeginRequest,
+    relational_index_publish_preflight: @import("../relational_index_publication.zig").DecidePublish,
+    relational_index_publish_status: @import("../relational_index_publication.zig").DecidePublish,
+    relational_index_cancel_preflight: @import("../relational_index_publication.zig").CancelDecision,
+    relational_index_cancel_status: @import("../relational_index_publication.zig").CancelDecision,
+    relational_index_owner_ack_status: @import("../relational_index_publication.zig").Ack,
+    relational_index_owner_ack_preflight: []const u8,
+    relational_index_source_accept_status: @import("../relational_index_delivery_journal.zig").Query,
+    relational_index_source_accept_preflight: []const u8,
+    relational_index_source_complete_preflight: []const u8,
+    relational_index_work: @import("../relational_index_work.zig").Query,
+    validate_store_root_enrollment_protocol: void,
+    /// This private projection returns owned raw bytes rather than a JSON
+    /// envelope, preserving ASVI frames across the isolated-owner boundary.
+    schema_validation_owner_read: @import("../schema_validation_read.zig").OwnerReadRequest,
+    schema_validation_discover: @import("../schema_validation_read.zig").DiscoveryRequest,
+    schema_validation_work: @import("../schema_validation_work.zig").Query,
+    schema_validation_prepare: @import("../schema_validation_admission.zig").Request,
+    schema_validation_status: @import("../schema_validation_admission.zig").StatusRequest,
+    schema_validation_receipt_read: @import("../schema_validation_receipt.zig").Request,
 };

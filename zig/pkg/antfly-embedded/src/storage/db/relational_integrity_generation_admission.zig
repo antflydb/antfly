@@ -670,3 +670,45 @@ test "parent generation publication stages then activates exact successor and re
     try std.testing.expect(scope.active_generation == null);
     try std.testing.expect(!scope.accepts(.{ .child_table = "children", .child_key = "c", .constraint_name = "fk", .constraint_generation = @splat(2) }));
 }
+
+/// Parent mutations must not consume an incomplete child-reference prefix.
+/// This durable barrier outlives the early admission ACK needed by self FKs.
+pub const pending_reference_coverage_key = "\x00\x00__metadata__:relational_integrity_child_generation_reference_coverage_pending";
+
+pub fn stageReferenceCoveragePending(txn: anytype, digest: [32]u8) !void {
+    const old = txn.get(pending_reference_coverage_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (old) |value| if (!std.mem.eql(u8, value, &digest)) return error.GenerationAdmissionChanged;
+    try txn.put(pending_reference_coverage_key, &digest);
+}
+
+pub fn requireReferenceCoverageAcknowledged(txn: anytype) !void {
+    _ = txn.get(pending_reference_coverage_key) catch |err| {
+        if (err == error.NotFound) return;
+        return err;
+    };
+    return error.ConstraintActivationInProgress;
+}
+
+pub fn stageReferenceCoverageAcknowledgement(txn: anytype, fence: @import("relational_integrity_topology_contract.zig").Fence, transitions: []const Transition, term: u64, index: u64) !void {
+    try requireAcknowledged(txn);
+    const digest = try completionReceipt(fence, transitions);
+    const applied = (try readAppliedReceipt(txn, activation_receipt_key)) orelse return error.GenerationAdmissionChanged;
+    if (!std.mem.eql(u8, &applied.digest, &digest)) return error.GenerationAdmissionChanged;
+    const topology = @import("relational_integrity_topology.zig");
+    if (try topology.current(txn) != null) return error.GenerationAdmissionChanged;
+    const completed = (try topology.completed(txn)) orelse return error.GenerationAdmissionChanged;
+    if (!completed.eql(fence)) return error.GenerationAdmissionChanged;
+    const pending = txn.get(pending_reference_coverage_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (pending) |value| {
+        if (!std.mem.eql(u8, value, &digest)) return error.GenerationAdmissionChanged;
+        try txn.delete(pending_reference_coverage_key);
+    }
+    const encoded = (AppliedReceipt{ .digest = digest, .term = term, .index = index }).encode();
+    try txn.put(acknowledged_receipt_key, &encoded);
+}

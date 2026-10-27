@@ -125,6 +125,38 @@ belonging to those integrations still need explicit scope review. Deferred cases
 continue to block this strict original-corpus gate; a publication scope exception
 must be reviewed as a change to gate policy, not hidden as a passing test.
 
+### Integration scope confirmed 2026-10-19
+
+The remaining-case implementation includes SQL publications and subscriptions,
+outbound publication of Antfly changes, PostgreSQL-style management of WASM
+extensions, and qualification of existing tablespace SQL behavior. These are
+implementation obligations, not completed capabilities or inventory waivers.
+
+- Subscriptions must reuse existing PostgreSQL CDC ingestion, backfill,
+  checkpoints and ordinary mutation enforcement. SQL subscription objects need
+  durable database-scoped ownership and publication membership; an upstream
+  publication created by a replication source is not an Antfly SQL publication.
+- Publications must publish committed Antfly changes through shared durable
+  mutation/replication machinery. Consistent snapshot-to-stream handoff,
+  transaction ordering, consumer acknowledgements, bounded retention and
+  owner-failover recovery require end-to-end evidence. A catalog entry or parser
+  node alone does not activate outbound logical replication.
+- Extension DDL must adapt the existing package/lifecycle catalog and WASM
+  runtime, with database-scoped installation, schema-qualified typed exports,
+  ownership, dependencies and durable recovery. PostgreSQL SQL compatibility
+  does not imply loading PostgreSQL C extensions. Compatibility-name no-ops do
+  not establish that an extension or its functions are installed.
+- Tablespaces already have shared catalog and SQL lowering. Qualify lifecycle,
+  inherited placement and the actual placement/rebalance consumer rather than
+  creating a second tablespace subsystem or claiming relocation from metadata
+  assignment alone.
+
+Each integration retains the same PostgreSQL oracle, native public execution,
+complete-postimage and recovery requirements as other cohorts. Unsupported
+responses and successful metadata-only operations do not close positive runtime
+contracts. This scope confirmation does not change the pinned corpus, its
+checksums or any case disposition.
+
 ## Commands and acceptance policy
 
 ```sh
@@ -271,10 +303,12 @@ from current SQL extraction is not repaired by naming this inventory check a ful
   removes its paired uniqueness rule. Unqualified PostgreSQL DROP INDEX still
   needs catalog owner resolution (see
   [namespace relation ownership](../../../zig/SYSTEM_CATALOG.md#namespace-relation-ownership)).
-- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`) maps to the durable
-  empty-generation barrier; SQL-owned sequence counters remain outside the
-  current catalog model, and the promoted-standby and asynchronous-artifact
-  online-transfer fault matrices are not established.
+- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`, `sql-1103`) uses the durable
+  empty-generation barrier. The document RESTART IDENTITY original has public
+  admission, completed publication, future-write and cold-owner evidence.
+  Owned sequence counters now exist; their transactional generation/reset
+  handoff remains unfinished, as do the promoted-standby and asynchronous-artifact
+  online-transfer fault matrices.
 - Prepared CTE/recursive/MERGE cases (`sql-0005`, `sql-0008`–`sql-0010`) have
   hosted single-owner evidence but stay unresolved pending multi-owner and
   distributed fault evidence.

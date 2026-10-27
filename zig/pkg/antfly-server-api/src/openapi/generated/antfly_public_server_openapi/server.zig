@@ -753,6 +753,14 @@ pub const ExecuteNamespaceTableGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Observe an exact index publication in an explicit namespace
+pub const GetNamespaceTableIndexPublicationPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
 /// Repair an index generation
 pub const RepairNamespaceIndexPathParams = struct {
     database_name: []const u8,
@@ -1038,6 +1046,13 @@ pub fn parsePatchNamespaceTableSchemaBody(allocator: std.mem.Allocator, body: []
     return std.json.parseFromSlice(types.TableSchemaPatch, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Observe an exact namespaced validation-only schema publication
+pub const GetNamespaceSchemaValidationPublicationPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
 /// Set namespace tablespace
 pub const SetNamespaceTableTablespacePathParams = struct {
     table_name: []const u8,
@@ -1198,6 +1213,11 @@ pub fn parseOpenSQLConnectionBody(allocator: std.mem.Allocator, body: []const u8
 pub const CloseSQLConnectionPathParams = struct {
     connection_id: []const u8,
 };
+
+/// Parse the JSON request body for getSQLCatalogOperation.
+pub fn parseGetSQLCatalogOperationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLCatalogRecoveryRequest) {
+    return std.json.parseFromSlice(types.SQLCatalogRecoveryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// Parse the JSON request body for prepareSQL.
 pub fn parsePrepareSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLPrepareRequest) {
@@ -1631,6 +1651,12 @@ pub const ExecuteGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Observe an exact index publication
+pub const GetIndexPublicationPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
 /// Repair an index generation
 pub const RepairIndexPathParams = struct {
     table_name: []const u8,
@@ -1996,6 +2022,11 @@ pub fn parsePatchSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std
     return std.json.parseFromSlice(types.TableSchemaPatch, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Observe an exact validation-only schema publication
+pub const GetSchemaValidationPublicationPathParams = struct {
+    table_name: []const u8,
+};
+
 /// Create or resume a table storage migration job
 pub const CreateTableStorageMigrationPathParams = struct {
     table_name: []const u8,
@@ -2230,6 +2261,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "dropNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication", .operation_id = "getNamespaceTableIndexPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = true },
@@ -2253,6 +2285,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query", .operation_id = "queryNamespaceRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "updateNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "patchNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema/publication", .operation_id = "getNamespaceSchemaValidationPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "setNamespaceTableTablespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "clearNamespaceTableTablespace", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "setNamespaceTablespace", .request_body = .buffered, .streaming_response = false },
@@ -2277,6 +2310,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/connections", .operation_id = "openSQLConnection", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/connections/{connection_id}", .operation_id = "closeSQLConnection", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql/operations/status", .operation_id = "getSQLCatalogOperation", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/prepared", .operation_id = "prepareSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/prepared/{prepared_id}", .operation_id = "closePreparedSQL", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/prepared/{prepared_id}/execute", .operation_id = "executePreparedSQL", .request_body = .buffered, .streaming_response = false },
@@ -2323,6 +2357,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}/publication", .operation_id = "getIndexPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/lake/catalog", .operation_id = "getLakeCatalog", .request_body = .none, .streaming_response = false },
@@ -2359,6 +2394,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "queryRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/tables/{tableName}/schema", .operation_id = "patchSchema", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/schema/publication", .operation_id = "getSchemaValidationPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/storage/migrations", .operation_id = "createTableStorageMigration", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/storage/migrations/{jobId}", .operation_id = "getTableStorageMigration", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/storage/migrations/{jobId}", .operation_id = "advanceTableStorageMigration", .request_body = .buffered, .streaming_response = false },
@@ -2461,6 +2497,7 @@ pub const routes = [_]Route{
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn getNamespaceTableIndexPublication(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn repairNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
@@ -2484,6 +2521,7 @@ pub const routes = [_]Route{
 //   fn queryNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn updateNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn patchNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn getNamespaceSchemaValidationPublication(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn setNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn clearNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn setNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
@@ -2508,6 +2546,7 @@ pub const routes = [_]Route{
 //   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn openSQLConnection(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closeSQLConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
+//   fn getSQLCatalogOperation(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn prepareSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response
 //   fn executePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response
@@ -2554,6 +2593,7 @@ pub const routes = [_]Route{
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn getIndexPublication(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn repairIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn getLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
@@ -2590,6 +2630,7 @@ pub const routes = [_]Route{
 //   fn queryRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: UpdateSchemaParams) !httpx.Response
 //   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: PatchSchemaParams) !httpx.Response
+//   fn getSchemaValidationPublication(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn createTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn advanceTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response

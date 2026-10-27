@@ -14,6 +14,7 @@
 // limitations under the License.
 
 test {
+    _ = @import("antfly_local_sources").storage_db_relational_integrity_integration_test;
     _ = @import("storage/hot_standby/restore_staging_integration_test.zig");
     _ = @import("storage/hot_standby/native_topology_receipt_integration_test.zig");
     _ = @import("storage/hot_standby/online_source_integration_test.zig");

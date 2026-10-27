@@ -252,7 +252,7 @@ test "SQL RETURNING wildcard errors and output amplification fail before writes"
     var fixture: Fixture = .{};
     var unknown = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING missing.*", .{});
     defer unknown.deinit();
-    try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, fixture.backend(true), &unknown, &.{}, .{}));
+    try std.testing.expectError(error.UndefinedTable, runtime.execute(std.testing.allocator, fixture.backend(true), &unknown, &.{}, .{}));
     var sql: std.ArrayList(u8) = .empty;
     defer sql.deinit(std.testing.allocator);
     try sql.appendSlice(std.testing.allocator, "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING ");

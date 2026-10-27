@@ -99,6 +99,29 @@ components:
       description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
       enum: [text, int16, int32, int64, float32, float64, boolean, uuid, jsonb, numeric]
 
+    SQLRangeColumnSchema:
+      type: object
+      additionalProperties: true
+      required: [type]
+      description: |
+        A relational PostgreSQL range column. JSON ingress and SQL results use
+        PostgreSQL range text. The declared subtype supplies identity even for
+        NULL, empty and unbounded values. Packed rows retain canonical binary
+        endpoints, inclusive/exclusive flags and exact NUMERIC precision.
+        Empty ranges, omitted bounds, subtype infinities and SQL NULL are
+        distinct. DATE ranges canonicalize finite endpoints to [lower,upper).
+        Timestamp endpoints use the execution's UTC zone. Requires schema
+        reader capability version 35.
+      properties:
+        type:
+          type: string
+          enum: [numrange, daterange, tsrange, tstzrange]
+        nullable:
+          type: boolean
+          default: false
+        description:
+          type: string
+
     SQLArrayColumnSchema:
       type: object
       additionalProperties: true
@@ -132,6 +155,22 @@ components:
         description:
           type: string
 
+    DocumentColumnName:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: >-
+        Document SQL alias declared by x-antfly-column-name on a JSON Schema
+        property. Nested aliases bind literal object-key segments, including
+        keys containing dots or slashes. Aliases do not create stored fields.
+        Names must be unique across physical roots and aliases within a document
+        type and must resolve to the same path across document types. Reserved
+        _id, _doc and _version names are not allowed. Aliases require a fixed
+        property path; array-item, pattern-property and conditional-schema
+        aliases are rejected. Physical root columns remain available alongside
+        aliases. Ancestor and descendant
+        columns cannot be assigned together in one SQL mutation.
+
     DocumentSchema:
       type: object
       description: Defines the structure of a document type
@@ -145,6 +184,8 @@ components:
           description: |
             A valid JSON Schema defining the document's structure.
             This is used to infer indexing rules and field types.
+          x-antfly-sql-column-name-schema:
+            $ref: "#/components/schemas/DocumentColumnName"
           x-antfly-field-mapping-schema:
             $ref: "#/components/schemas/DocumentFieldMapping"
           x-antfly-sql-type-schema:
@@ -153,6 +194,8 @@ components:
             $ref: "#/components/schemas/SQLNumericModifier"
           x-antfly-sql-array-column-schema:
             $ref: "#/components/schemas/SQLArrayColumnSchema"
+          x-antfly-sql-range-column-schema:
+            $ref: "#/components/schemas/SQLRangeColumnSchema"
 
     TtlConfig:
       type: object
@@ -290,6 +333,15 @@ components:
         Comparison values must match the column type. Integer values may also
         use exact decimal strings to avoid client-side floating-point rounding.
       properties:
+        not_valid:
+          type: boolean
+          default: false
+          description: >-
+            Enforce this CHECK on every new or changed row without asserting
+            that historical rows satisfy it. Explicit validation clears this
+            declaration only after an unpublished generation has validated all
+            rows and atomically replaced the active generation. Disposable
+            background scan coverage does not change this declaration.
         name:
           type: string
           minLength: 1
@@ -331,6 +383,13 @@ components:
         primary:
           type: boolean
           description: SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
+        include_columns:
+          type: array
+          maxItems: 256
+          description: Non-key payload columns for this constraint's covering ordered index. They never participate in uniqueness, foreign-key target identity, or primary-key nullability. Only column-key, constraint-owned declarations support INCLUDE.
+          items:
+            type: string
+            minLength: 1
         columns:
           type: array
           minItems: 1
@@ -351,6 +410,10 @@ components:
           description: Conjunction restricting uniqueness to matching rows.
           items:
             $ref: '#/components/schemas/RelationalIndexPredicate'
+        without_overlaps_column:
+          type: string
+          minLength: 1
+          description: Range-valued final key column for PostgreSQL WITHOUT OVERLAPS. Other key columns define equality groups; nonempty ranges within each group must be disjoint. The column remains in columns. Temporal keys are not equality-only foreign-key targets or ON CONFLICT arbiters.
         nulls_not_distinct:
           type: boolean
           description: When true, NULL components compare equal for uniqueness.
@@ -367,13 +430,21 @@ components:
       description: |
         Composite foreign key. Child and parent columns correspond by position
         and must have the same physical comparison types. The parent columns
-        must identify a unique key. Existing-row validation is independent of
-        new-write enforcement and is never client-writable.
+        must identify a unique key. Existing-row validation is independent of new-write enforcement.
+        Clearing NOT VALID requires coordinated historical validation.
         Enforcement and referential actions share the bounded distributed
         transaction path, including TTL expiry. Partial matching uses ordered
         support indexes on the parent; activation waits until these are ready.
         SET NULL requires every child column to accept explicit NULL.
       properties:
+        not_valid:
+          type: boolean
+          default: false
+          description: |
+            Retain historical references without requiring their parents to exist.
+            New writes and parent referential actions remain enforced. Setting
+            false on an existing unvalidated declaration requires coordinated
+            validation before publication; it cannot certify coverage itself.
         name:
           type: string
           minLength: 1
@@ -413,8 +484,11 @@ components:
     RelationalIndexPredicate:
       type: object
       additionalProperties: false
-      required: [column, op]
-      description: A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+      description: |
+        A typed partial-index conjunct. Specify either a constant truth value,
+        or a column and comparison operation, never both. Only TRUE is indexed;
+        FALSE and SQL UNKNOWN are excluded. A constant false conjunct represents
+        an empty index without inventing a column dependency.
       properties:
         column:
           type: string
@@ -426,6 +500,10 @@ components:
         collation:
           type: string
           description: String comparison collation with the same semantics as ordered keys.
+        constant:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Constant membership truth. SQL UNKNOWN is normalized to false for index membership. Requires reader capability version 26.
 
     RelationalIndexDefinition:
       type: object
@@ -472,27 +550,52 @@ components:
 
     RelationalExpressionOp:
       type: string
-      enum: [literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, and, or, not, cast, case_when, modulo, in_list, not_in_list, array]
+      enum: [literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, and, or, not, cast, case_when, modulo, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7, transaction_timestamp]
 
     RelationalExpressionType:
       type: string
-      enum: [string, blob, boolean, datetime, integer, number, numeric, sql_array]
+      enum: [string, blob, boolean, datetime, integer, number, numeric, sql_array, json, numrange, daterange, tsrange, tstzrange]
 
     RelationalScalarExpression:
       type: object
       additionalProperties: false
       required: [op]
       description: |
-        Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+        Typed scalar expression, limited to 128 nodes and 16 levels. CHECK,
+        generated-column and index expressions must be immutable. UUIDv4 and
+        UUIDv7 generation are permitted only in column defaults and require
+        reader capability version 33. They run once during owned row
+        preparation, never during schema publication or restore verification.
+        Transaction-clock defaults require reader capability version 34 and
+        use the transaction owner's captured instant, shared across rows and
+        statements in an explicit transaction. Stored values are preserved on restore.
+        The uuidv4, uuidv7 and transaction_timestamp operations take no args;
+        uuidv7 may specify shift and transaction_timestamp may specify precision.
         A literal requires type; omitted value means typed null. A column
         requires column; other
-        operations require args. Unknown or irrelevant fields are rejected.
+        operations except uuidv4, uuidv7 and transaction_timestamp require args. Unknown or irrelevant fields are rejected.
         Arithmetic operands have the same integer or number type. Integer
         division truncates toward zero. Overflow and division by zero reject
         the write. Arithmetic and string operations propagate null. ASCII case
-        operations leave non-ASCII bytes unchanged. No volatile functions are
-        accepted. Allocated results are bounded to 1 MiB each. Allocations
-        and byte-comparison operand work share a 4 MiB evaluation budget per
+        operations leave non-ASCII bytes unchanged. Volatile operations are restricted to column defaults. Allocated results are bounded to 1 MiB each.
+        The replace operation takes three text arguments and performs literal,
+        non-overlapping replacement; an empty search string leaves the input
+        unchanged. md5 takes one text argument and returns 32 lowercase hex
+        characters (a SQL compatibility fingerprint, not a security primitive).
+        Both are strict in SQL NULL and require reader capability version 27,
+        including when nested inside scalar/boolean expressions. Literal search
+        patterns are prepared with immutable plans; matching, copies and dynamic
+        pattern preparation share invocation work/cancellation admission.
+        Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require
+        reader capability version 28, even when nested in boolean programs.
+        They take one NUMERIC or float64 argument; abs also preserves integer
+        widths and float32. round and trunc optionally accept an int32 scale
+        as a second argument only for NUMERIC. Operands must already have their
+        resolved SQL types; SQL lowering inserts required promotions. NUMERIC
+        round uses ties away from zero; float64 round uses ties to even. All
+        selected arguments evaluate before strict NULL propagation. NUMERIC
+        execution never converts through float and shares invocation admission.
+        Allocations and byte-comparison operand work share a 4 MiB evaluation budget per
         row and expression set. An integer literal may use a decimal string
         for exact int64 transport; blob uses base64 and datetime uses the
         normal relational datetime representation.
@@ -558,6 +661,15 @@ components:
         A matching candidate wins over NULL candidates; otherwise a NULL
         candidate makes the result UNKNOWN. These operations require schema
         capability version 19.
+        JSON expressions require reader capability version 30. The json type
+        carries JSONB semantics, including exact numeric values and display
+        scale. jsonb_typeof and jsonb_array_length take one JSON argument;
+        array length rejects a non-array value. jsonb_extract_path and
+        jsonb_extract_path_text take a JSON argument followed by 1 to 31 text
+        path components. Negative array ordinals count from the end; a missing
+        path returns SQL NULL. JSON extraction retains JSON null; text extraction
+        converts JSON null to SQL NULL. Arguments are evaluated strictly, while
+        enclosing CASE/coalesce retain their short-circuit semantics.
       properties:
         op:
           $ref: "#/components/schemas/RelationalExpressionOp"
@@ -572,6 +684,19 @@ components:
         value:
           nullable: true
           description: Typed literal value, including null.
+        shift:
+          type: string
+          maxLength: 128
+          description: Canonical PostgreSQL interval text, accepted only on a uuidv7 default operation. SQL lowering resolves and binds calendar months, days, and microseconds before publication. Omission generates an unshifted UUID; SQL NULL shifts lower to a NULL literal instead. Infinite intervals remain representable declarations but fail when evaluated.
+        precision:
+          type: integer
+          minimum: 0
+          maximum: 6
+          x-go-type-skip-optional-pointer: false
+          description: Fractional-second precision (omission means 6), accepted only on a transaction_timestamp column default. Rounding uses the shared PostgreSQL timestamp semantics. Requires reader capability version 34.
+        json_null:
+          type: boolean
+          description: For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30.
         column:
           type: string
           minLength: 1
@@ -584,16 +709,69 @@ components:
           items:
             $ref: "#/components/schemas/RelationalScalarExpression"
 
+    RelationalColumnSequenceGeneration:
+      type: string
+      enum: [serial, by_default, always]
+      description: SQL owned-sequence default policy. Serial defaults preserve explicit values even under OVERRIDING USER VALUE; identity defaults obey PostgreSQL overriding rules.
+
+    RelationalColumnSequence:
+      type: object
+      additionalProperties: false
+      readOnly: true
+      required: [generation, incarnation, sequence_id, namespace_id, table_id, column_id, database, namespace, name]
+      description: >-
+        Backend-bound owned-sequence default, assigned atomically with the table
+        and stable attribute identity. Names are descriptive; allocation uses
+        the exact catalog incarnation and native 64-bit identities. Requires
+        reader capability 37. Preparation allocates only for absent inputs;
+        explicit NULL never requests a new value. Restore preserves stored
+        values and never consumes the sequence. Clients cannot mint ownership
+        by copying a descriptor onto a different table or column. Bulk mutation
+        APIs preserve explicit identity values, like PostgreSQL COPY; SQL
+        enforces ALWAYS and OVERRIDING rules. Implicit identity allocation uses
+        table write authority; serial defaults and explicit sequence functions
+        require sequence privileges.
+      properties:
+        generation:
+          $ref: "#/components/schemas/RelationalColumnSequenceGeneration"
+        incarnation:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+        sequence_id:
+          type: string
+          pattern: '^[1-9][0-9]{0,19}$'
+        namespace_id:
+          type: string
+          pattern: '^[1-9][0-9]{0,19}$'
+        table_id:
+          type: string
+          pattern: '^[1-9][0-9]{0,19}$'
+        column_id:
+          type: string
+          pattern: '^[1-9][0-9]{0,19}$'
+        database:
+          type: string
+          minLength: 1
+        namespace:
+          type: string
+          minLength: 1
+        name:
+          type: string
+          minLength: 1
+
     RelationalColumnExpression:
       type: object
       additionalProperties: false
-      required: [column, expression]
+      required: [column]
+      description: Exactly one of expression or the backend-bound sequence reference is required. Sequence references are column defaults only and cannot define stored generated columns.
       properties:
         column:
           type: string
           minLength: 1
         expression:
           $ref: "#/components/schemas/RelationalScalarExpression"
+        sequence:
+          $ref: "#/components/schemas/RelationalColumnSequence"
 
     ExternalLakeTableSource:
       type: object
@@ -749,14 +927,25 @@ components:
             4096 expression nodes, and 4 MiB of literal data. Evaluation has
             a shared 4 MiB allocation budget across all column expressions.
             Restore verifies stored results instead of silently recomputing
-            them. Changing, adding, or removing generated semantics through
-            an existing table's schema update requires explicit rewrite=true
+            them. On relational tables, changing, adding, or removing generated
+            semantics through a schema update requires explicit rewrite=true
             on the PUT or PATCH schema route. This returns a durable restore
             job and replaces the complete authorized dependency cohort only
             after distributed transformation and validation. Ordinary schema
             updates reject these changes, even when a table appears empty.
             Declaration reordering and default-only changes remain allowed.
-            Relational tables only.
+            Supported by relational and document tables. Document declarations
+            require one enforced document type and target declared root fields.
+            Expressions may read persisted declared roots; SQL virtual fields
+            and transport directives cannot be expression sources.
+            SQL NULL removes the generated member; a JSON null datum remains
+            present. Unknown members are preserved. SQL column assignments to
+            generated roots or their aliases are rejected, while whole-document
+            writes replace submitted generated members with computed values.
+            Document producer definitions are immutable through schema-update
+            routes, including rewrite=true. Changing these definitions requires
+            a replacement table and explicit data migration; ordinary restore
+            preserves and verifies existing computed values.
         checks:
           type: array
           maxItems: 256

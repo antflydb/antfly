@@ -67,7 +67,7 @@ pub fn Adapter(comptime native: type) type {
         outcome_transaction_id: ?types.TxnId = null,
 
         pub fn backend(self: *Self) catalog.Backend {
-            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
+            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .supports_expression_access_hints = self.transaction == null or !self.transaction.?.active, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
@@ -160,6 +160,11 @@ pub fn Adapter(comptime native: type) type {
             if (schema.storage_mode != .relational) return error.UnsupportedSqlShape;
             var candidate = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false });
             if (!try dependencies.sql_schema_ddl.apply(a, &candidate, ddl_value)) return .{};
+            // The low-level schema CAS changes future validation, not existing
+            // row validity. Tightening needs staged validation/publication;
+            // this embedded adapter has no metadata-owned rewrite service.
+            if (ddl_value.schema_change.? == .set_nullability and !ddl_value.schema_change.?.set_nullability.nullable)
+                return error.SqlSchemaRewriteRequiresMetadataOwner;
             const validation = ddl_value.schema_change.? == .validate_constraint;
             const version = if (validation) schema.version else std.math.add(u32, schema.version, 1) catch return error.SqlProgramLimitExceeded;
             try candidate.object.put(a, "version", .{ .integer = version });
@@ -519,17 +524,19 @@ pub fn Adapter(comptime native: type) type {
             const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
             var search_arena = std.heap.ArenaAllocator.init(alloc);
             defer search_arena.deinit();
-            const prepared = try search_arena.allocator().alloc(?native.public_api.query.OwnedQueryRequest, requests.len);
+            const prepared = try search_arena.allocator().alloc(?PreparedSearch, requests.len);
             @memset(prepared, null);
             defer for (prepared) |*request| if (request.*) |*owned| owned.deinit(search_arena.allocator());
             for (requests, prepared) |request, *out| if (request.request.search) |search| {
                 var selected_adapter = try self.selected(request.table.physical_name);
-                out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search);
+                if (selected_adapter.db.core.identity_namespace.table_id != request.table.id) return error.PreparedGenerationChanged;
+                out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search, request.table, request.request.fields);
             };
             var owners: [64]*DB = undefined;
             var owner_count: usize = 0;
             for (requests) |request| {
                 const selected_adapter = try self.selected(request.table.physical_name);
+                if (selected_adapter.db.core.identity_namespace.table_id != request.table.id) return error.PreparedGenerationChanged;
                 const exists = for (owners[0..owner_count]) |db| {
                     if (db == selected_adapter.db) break true;
                 } else false;
@@ -553,7 +560,7 @@ pub fn Adapter(comptime native: type) type {
                 // publication. Only the indexes used by each search are waited.
                 for (requests, prepared, 0..) |request, *search, i| if (search.*) |*owned| {
                     var selected_adapter = try self.selected(request.table.physical_name);
-                    search_sequences[i] = try selected_adapter.waitSearchIndexes(search_arena.allocator(), owned.req, visibility_deadline);
+                    search_sequences[i] = try selected_adapter.waitSearchIndexes(search_arena.allocator(), owned.query.req, visibility_deadline);
                 };
                 while (held != owner_count) {
                     errdefer {
@@ -583,7 +590,7 @@ pub fn Adapter(comptime native: type) type {
             for (requests, prepared, cursors) |request, *search, *cursor| {
                 if (search.*) |*owned| {
                     var selected_adapter = try self.selected(request.table.physical_name);
-                    cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.req);
+                    cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.*);
                 } else cursor.* = (try open(ptr, alloc, request.table, request.request)) orelse return error.SqlStatementSnapshotRequired;
                 initialized += 1;
             }
@@ -611,7 +618,17 @@ pub fn Adapter(comptime native: type) type {
             }
         };
 
-        fn prepareSearch(self: *Self, alloc: std.mem.Allocator, search: anytype) !native.public_api.query.OwnedQueryRequest {
+        const PreparedSearch = struct {
+            query: native.public_api.query.OwnedQueryRequest,
+            fields: []const []const u8,
+            highlights: bool,
+            fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                self.query.deinit(alloc);
+                alloc.free(self.fields);
+            }
+        };
+
+        fn prepareSearch(self: *Self, alloc: std.mem.Allocator, search: anytype, table: catalog.Table, projection: []const []const u8) !PreparedSearch {
             if (self.transaction) |session| if (session.active) {
                 for (session.entries.items) |entry| if (std.mem.eql(u8, entry.table.physical_name, self.table_name)) return error.SqlSearchUncommittedWrites;
             };
@@ -626,10 +643,15 @@ pub fn Adapter(comptime native: type) type {
             var owned = native.public_api.query.parsePublicQueryRequest(alloc, .{ .ptr = &resolver, .vtable = &.{ .resolve_dense_query = SemanticResolver.resolveDense } }, self.table_name, canonical) catch |err| return if (native.public_api.query.isPublicQueryValidationError(err)) error.InvalidSqlParameters else err;
             errdefer owned.deinit(alloc);
             if (owned.req.limit == 0 or owned.req.limit > 10000) return error.SqlProgramLimitExceeded;
-            owned.req.include_stored = true;
-            owned.req.fields = &.{};
-            owned.req.include_all_fields = true;
-            return owned;
+            const logical_scan: catalog.Scan = .{ .fields = projection, .limit = owned.req.limit };
+            const fields = try dependencies.sql_search_cursor.storageFields(alloc, try logical_scan.physicalFields(alloc, table));
+            owned.req.include_stored = table.storage_mode == .document;
+            owned.req.fields = if (fields.len == 0) &.{"_id"} else fields;
+            owned.req.include_all_fields = logical_scan.needsDocument(table);
+            const highlights = for (projection) |field| {
+                if (std.mem.eql(u8, field, "_highlights")) break true;
+            } else false;
+            return .{ .query = owned, .fields = fields, .highlights = highlights };
         }
 
         pub fn waitSearchIndexes(self: *Self, alloc: std.mem.Allocator, req: types.SearchRequest, deadline_ns: u64) !u64 {
@@ -659,12 +681,13 @@ pub fn Adapter(comptime native: type) type {
             return self.db.waitForCurrentIndexTargets(names.items, deadline_ns);
         }
 
-        const SearchCursor = struct {
+        const RelationalSearchCursor = struct {
             alloc: std.mem.Allocator,
             arena: std.heap.ArenaAllocator,
             result: types.SearchResult,
             reader: ?DB.RelationalRows.Reader,
             documents: ?DB.DocumentRows,
+            policy: ?@FieldType(DB.QueryReadLease, "row_policy_lease"),
             needs_document: bool,
             source_fields: []const []const u8,
             layout: *const catalog.Row.TypedLayout,
@@ -811,13 +834,38 @@ pub fn Adapter(comptime native: type) type {
                 self.retireColumns();
                 if (self.reader) |*reader| reader.deinit();
                 if (self.documents) |*documents| documents.deinit();
+                if (self.policy) |*held| held.release();
                 self.result.deinit();
                 self.arena.deinit();
                 self.alloc.destroy(self);
             }
         };
 
-        fn openSearch(self: *Self, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, search: types.SearchRequest) !catalog.Cursor {
+        const SearchProvider = struct {
+            pub const Reader = DB.RelationalRows.Reader;
+            // lookupSqlRow's native projection contract owns every
+            // selected payload in the supplied page allocator.
+            pub const typed_page_owned = true;
+            pub const Result = types.SearchResult;
+            pub const Lease = @FieldType(DB.QueryReadLease, "row_policy_lease");
+            pub fn hasSource(hit: types.SearchHit) bool {
+                return hit.source_value != null or hit.stored_data != null or hit.column_source != null;
+            }
+            pub fn document(arena: *std.heap.ArenaAllocator, hit: types.SearchHit) !std.json.Value {
+                if (hit.source_value) |value| return value;
+                if (hit.column_source) |source| return source.value(arena);
+                if (hit.stored_data) |data| return std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), data, .{ .parse_numbers = false });
+                return error.InvalidSqlBackendResponse;
+            }
+            pub fn highlights(a: std.mem.Allocator, hit: types.SearchHit) !?std.json.Value {
+                const value = (try native.public_api.query.highlightsJsonValue(a, hit.highlights)) orelse return null;
+                const encoded = try std.json.Stringify.valueAlloc(a, value, .{});
+                return try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .parse_numbers = false });
+            }
+        };
+        const SearchCursor = dependencies.sql_search_cursor.Cursor(SearchProvider);
+
+        fn openSearch(self: *Self, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, prepared: PreparedSearch) !catalog.Cursor {
             // Capture ranking and the primary reader under one apply fence.
             // The reader owns its immutable snapshot after this lease releases;
             // paging never keeps the writer-excluding lease alive.
@@ -825,9 +873,13 @@ pub fn Adapter(comptime native: type) type {
             defer lease.release();
             var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
             defer view.release();
-            if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
+            if (self.db.core.identity_namespace.table_id != table.id or view.version() != table.schema_version or
+                (view.storageMode() == .relational) != (table.storage_mode == .relational)) return error.PreparedGenerationChanged;
+            var search = prepared.query.req;
+            if (!prepared.highlights) search.highlight = null;
+            const document_root = table.storage_mode == .document and request.needsDocument(table);
             var ranked = search;
-            const delayed_hydration = search.query != .graph and search.graph_queries.len == 0 and
+            const delayed_hydration = !document_root and search.query != .graph and search.graph_queries.len == 0 and
                 search.graph_metric_queries.len == 0 and search.graph_metric_rerank == null and search.graph_query_transport == null and
                 search.hierarchy_children == null and search.highlight == null and !search.hasHitEvaluation() and search.return_mode == .parent and
                 !search.hierarchy_include_source and !search.hierarchy_include_unit and
@@ -837,7 +889,12 @@ pub fn Adapter(comptime native: type) type {
             errdefer if (documents) |*reader| reader.deinit();
             var captured = try lease.search(alloc, ranked);
             errdefer captured.result.deinit();
-            const cursor = try alloc.create(SearchCursor);
+            if (document_root) {
+                var policy = lease.row_policy_lease.clone();
+                errdefer policy.release();
+                return (try SearchCursor.init(alloc, table, request.fields, captured.result, null, policy)).iface();
+            }
+            const cursor = try alloc.create(RelationalSearchCursor);
             errdefer alloc.destroy(cursor);
             var arena = std.heap.ArenaAllocator.init(alloc);
             errdefer arena.deinit();
@@ -848,8 +905,10 @@ pub fn Adapter(comptime native: type) type {
                 if (!std.mem.eql(u8, field, "_id")) try output_names.put(a, try a.dupe(u8, field), {});
                 if (!std.mem.eql(u8, field, "_id") and !std.mem.eql(u8, field, "score") and !std.mem.eql(u8, field, "_highlights")) try fields.append(a, field);
             }
-            var reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational) try lease.relationalRows(alloc, fields.items, table.schema_version) else null;
+            var reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational) try lease.relationalRows(alloc, prepared.fields, table.schema_version) else null;
             errdefer if (reader) |*value| value.deinit();
+            var policy = if (reader == null) lease.row_policy_lease.clone() else null;
+            errdefer if (policy) |*held| held.release();
             const layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
             const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.initSearch(a, table, request.fields) else .{ .columns = &.{} };
             var source_fields: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -863,8 +922,8 @@ pub fn Adapter(comptime native: type) type {
             };
             // Finish allocating before moving the arena: a later allocation
             // could add a chunk that the cursor's earlier copy would not own.
-            cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .documents = documents, .needs_document = needs_document, .source_fields = source_fields.keys(), .layout = layout, .projection = projection };
-            return .{ .ptr = cursor, .next = SearchCursor.next, .next_columns = if (reader == null) SearchCursor.nextColumns else null, .close = SearchCursor.close };
+            cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .documents = documents, .policy = policy, .needs_document = needs_document, .source_fields = source_fields.keys(), .layout = layout, .projection = projection };
+            return .{ .ptr = cursor, .next = RelationalSearchCursor.next, .next_columns = if (reader == null) RelationalSearchCursor.nextColumns else null, .close = RelationalSearchCursor.close };
         }
 
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
@@ -894,18 +953,15 @@ pub fn Adapter(comptime native: type) type {
                         };
                     }
                 }
-                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .defaulted = catalog.hasColumnDefault(parsed, column.name), .element_type = column.sql_element_type, .numeric_modifier = column.numeric_modifier, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
-                    .string => .string,
-                    .integer => .integer,
-                    .number, .numeric => .number,
-                    .boolean => .boolean,
-                    .datetime => .datetime,
-                    .json => .json,
-                    .sql_array => .array,
-                    else => return error.UnsupportedSqlExecution,
-                }) };
+                out.* = try catalog.Column.fromRelational(column);
+                out.name = try alloc.dupe(u8, column.name);
+                out.path = try alloc.dupe(u8, column.path);
+                out.generated = generated;
+                out.defaulted = catalog.hasColumnDefault(parsed, column.name);
+                out.clock_defaulted = catalog.columnDefaultUsesClock(parsed, column.name);
+                out.type = dependencies.sql_document_row.relationalType(parsed, column.name, out.type);
             }
-            return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .columns = columns, .constraints = try catalog.Constraint.derive(alloc, parsed) };
+            return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .columns = columns, .index_definitions = try catalog.IndexDefinition.deriveLeaky(alloc, scratch.allocator(), parsed, schema), .constraints = try catalog.Constraint.derive(alloc, parsed) };
         }
 
         const Cursor = struct {
@@ -964,13 +1020,14 @@ pub fn Adapter(comptime native: type) type {
             const from = request.primary_key orelse request.after orelse "";
             const to = if (request.primary_key) |key| try std.mem.concat(temporary, u8, &.{ key, "\x00" }) else "";
             if (table.storage_mode == .document) {
+                const fields = try request.physicalFields(temporary, table);
                 const session = try self.db.openDocumentReadSession(alloc, from, to, .{
-                    .sql_document_preimage = request.include_document,
+                    .sql_document_preimage = request.needsDocument(table),
                     .include_content_hashes = request.include_primary_digest,
                     .inclusive_from = request.primary_key != null,
                     .exclusive_to = true,
                     .limit = request.limit,
-                    .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version },
+                    .relational_query = .{ .page_bytes = 256 * 1024, .fields = fields, .conditions = conditions, .schema_version = table.schema_version },
                 });
                 errdefer session.deinit();
                 const cursor = try alloc.create(DocumentCursor);
@@ -982,7 +1039,7 @@ pub fn Adapter(comptime native: type) type {
                 .inclusive_from = request.primary_key != null,
                 .exclusive_to = true,
                 .limit = request.limit,
-                .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order and self.transaction == null },
+                .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .expression_equalities = request.expression_equalities, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order and (self.transaction == null or !self.transaction.?.active) },
             });
             errdefer session.deinit();
             const projection = try dependencies.sql_document_row.Projection.init(alloc, table, request.fields);

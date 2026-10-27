@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 
 from ..models.sql_array_element_type import SQLArrayElementType
 from ..models.sql_column_type import SQLColumnType
+from ..models.sql_temporal_kind import SQLTemporalKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -23,6 +24,9 @@ class SQLColumn:
         name (str): Display label. Labels need not be unique; rows use matching ordinal positions.
         type_ (SQLColumnType): Logical SQL result type. Integer values and numbers with element_type numeric are decimal
             strings to preserve exact precision in every client.
+        temporal_kind (SQLTemporalKind | Unset): Exact temporal identity for datetime-family SQL values. Omission means
+            timestamp_tz. Intervals preserve separate calendar months, days, and microseconds and use PostgreSQL interval
+            text in JSON results.
         element_type (SQLArrayElementType | Unset): Bound SQL scalar or array-element identity, including numeric widths
             and exact NUMERIC. Never inferred from JSON value shape.
         numeric_modifier (SQLNumericModifier | Unset): PostgreSQL NUMERIC precision and signed scale. For arrays this
@@ -31,6 +35,7 @@ class SQLColumn:
 
     name: str
     type_: SQLColumnType
+    temporal_kind: SQLTemporalKind | Unset = UNSET
     element_type: SQLArrayElementType | Unset = UNSET
     numeric_modifier: SQLNumericModifier | Unset = UNSET
 
@@ -38,6 +43,10 @@ class SQLColumn:
         name = self.name
 
         type_ = self.type_.value
+
+        temporal_kind: str | Unset = UNSET
+        if not isinstance(self.temporal_kind, Unset):
+            temporal_kind = self.temporal_kind.value
 
         element_type: str | Unset = UNSET
         if not isinstance(self.element_type, Unset):
@@ -55,6 +64,8 @@ class SQLColumn:
                 "type": type_,
             }
         )
+        if temporal_kind is not UNSET:
+            field_dict["temporal_kind"] = temporal_kind
         if element_type is not UNSET:
             field_dict["element_type"] = element_type
         if numeric_modifier is not UNSET:
@@ -70,6 +81,13 @@ class SQLColumn:
         name = d.pop("name")
 
         type_ = SQLColumnType(d.pop("type"))
+
+        _temporal_kind = d.pop("temporal_kind", UNSET)
+        temporal_kind: SQLTemporalKind | Unset
+        if isinstance(_temporal_kind, Unset):
+            temporal_kind = UNSET
+        else:
+            temporal_kind = SQLTemporalKind(_temporal_kind)
 
         _element_type = d.pop("element_type", UNSET)
         element_type: SQLArrayElementType | Unset
@@ -88,6 +106,7 @@ class SQLColumn:
         sql_column = cls(
             name=name,
             type_=type_,
+            temporal_kind=temporal_kind,
             element_type=element_type,
             numeric_modifier=numeric_modifier,
         )

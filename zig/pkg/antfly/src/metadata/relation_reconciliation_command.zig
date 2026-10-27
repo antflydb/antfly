@@ -24,6 +24,9 @@ const incarnation = @import("antfly_local_sources").metadata_incarnation;
 const magic = "AFRI01";
 pub const max_encoded_bytes = magic.len + 1 + 2 * r.State.encoded_len + 1;
 pub const Publication = struct { state: r.State, prior: ?r.Generation = null, activation: protocol.Activation };
+pub fn publicationVersion(coverage: r.Coverage) u16 {
+    return if (coverage == .constraint_names) protocol.constraint_occupancy_version else protocol.relation_publication_version;
+}
 pub const Command = union(enum(u8)) {
     adopt: protocol.Activation = 1,
     start: struct { next: r.State, prior: ?r.State = null } = 2,
@@ -35,7 +38,33 @@ pub const Command = union(enum(u8)) {
     publish: Publication = 5,
 
     pub fn requiredDecoderVersion(self: @This()) u16 {
+        const occupancy = switch (self) {
+            .start => |request| request.next.coverage == .constraint_names or (if (request.prior) |prior| prior.coverage == .constraint_names else false),
+            .advance => |state| state.coverage == .constraint_names,
+            .garbage => |retired| retired.coverage == .constraint_names,
+            .publish => |request| request.state.coverage == .constraint_names,
+            .adopt => |proof| proof.version == protocol.constraint_occupancy_version,
+        };
+        if (occupancy) return protocol.constraint_occupancy_version;
         return if (self == .publish) protocol.relation_publication_version else protocol.relation_reconciliation_version;
+    }
+
+    /// Proposal admission and apply use the same exact protected membership.
+    /// A newer decoder floor is fine; changing identity/count/fingerprint is
+    /// not. Other intents carry no membership proof and keep their own CAS.
+    pub fn validateCapabilityAdmission(self: @This(), admitted: protocol.Activation) !void {
+        const required = switch (self) {
+            .adopt => |proof| blk: {
+                try validateActivation(proof);
+                break :blk proof;
+            },
+            .publish => |request| blk: {
+                try validatePublication(request);
+                break :blk request.activation;
+            },
+            else => return,
+        };
+        if (!admitted.satisfies(required)) return error.TableTopologyProtocolUpgradeRequired;
     }
 
     pub fn encodeAlloc(self: @This(), a: std.mem.Allocator) ![]u8 {
@@ -133,7 +162,8 @@ pub const Command = union(enum(u8)) {
 
 fn validatePublication(request: Publication) !void {
     _ = r.LiveRoot.initial(request.state) catch return error.InvalidRelationReconciliationCommand;
-    if (request.activation.version != protocol.relation_publication_version or request.activation.member_count == 0 or
+    const version = publicationVersion(request.state.coverage);
+    if (request.activation.version != version or request.activation.member_count == 0 or
         !incarnation.isValid(request.activation.incarnation) or std.mem.allEqual(u8, &request.activation.membership_fingerprint, 0)) return error.InvalidRelationReconciliationCommand;
     var identity: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&identity, &request.activation.incarnation) catch return error.InvalidRelationReconciliationCommand;
@@ -148,8 +178,8 @@ fn validateAdvance(state: r.State) !void {
     _ = try state.encode();
     if (state.failure != .none or state.phase == .ready or state.epoch.revision == 0) return error.InvalidRelationReconciliationCommand;
 }
-fn validateActivation(proof: protocol.Activation) !void {
-    if (proof.version != protocol.relation_reconciliation_version or proof.member_count == 0 or
+pub fn validateActivation(proof: protocol.Activation) !void {
+    if ((proof.version != protocol.relation_reconciliation_version and proof.version != protocol.constraint_occupancy_version) or proof.member_count == 0 or
         !incarnation.isValid(proof.incarnation) or std.mem.allEqual(u8, &proof.membership_fingerprint, 0)) return error.InvalidRelationReconciliationCommand;
 }
 fn validateStart(next: r.State, prior: ?r.State) !void {
@@ -159,8 +189,90 @@ fn validateStart(next: r.State, prior: ?r.State) !void {
     if (prior) |state| {
         _ = try state.encode();
         if (state.group_id != next.group_id) return error.InvalidRelationReconciliationCommand;
+        if (state.coverage == .constraint_names and next.coverage != .constraint_names) return error.InvalidRelationReconciliationCommand;
     }
     if (!std.mem.eql(u8, &next.job_id, &(try r.nextJobId(if (prior) |*state| state else null)))) return error.InvalidRelationReconciliationCommand;
+}
+
+test "system catalog relation adoption admission binds exact membership at legacy and occupancy floors" {
+    for ([_]u16{ protocol.relation_reconciliation_version, protocol.constraint_occupancy_version }) |version| {
+        const proof: protocol.Activation = .{ .version = version, .incarnation = "11111111111111111111111111111111".*, .member_count = 3, .membership_fingerprint = @splat(7) };
+        const command: Command = .{ .adopt = proof };
+        try command.validateCapabilityAdmission(proof);
+        var admitted = proof;
+        admitted.version += 1;
+        try command.validateCapabilityAdmission(admitted);
+        admitted = proof;
+        admitted.version -= 1;
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, command.validateCapabilityAdmission(admitted));
+        admitted = proof;
+        admitted.member_count = 1;
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, command.validateCapabilityAdmission(admitted));
+        admitted = proof;
+        admitted.membership_fingerprint[0] ^= 1;
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, command.validateCapabilityAdmission(admitted));
+        admitted = proof;
+        admitted.incarnation[0] = '2';
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, command.validateCapabilityAdmission(admitted));
+    }
+}
+
+test "system catalog relation adoption preserves exact legacy and occupancy capability floors" {
+    const a = std.testing.allocator;
+    var proof: protocol.Activation = .{ .version = protocol.relation_reconciliation_version, .incarnation = "11111111111111111111111111111111".*, .member_count = 3, .membership_fingerprint = @splat(7) };
+    for ([_]u16{ protocol.relation_reconciliation_version, protocol.constraint_occupancy_version }) |version| {
+        proof.version = version;
+        const command: Command = .{ .adopt = proof };
+        const bytes = try command.encodeAlloc(a);
+        defer a.free(bytes);
+        const decoded = try Command.decode(bytes);
+        try std.testing.expectEqual(version, decoded.requiredDecoderVersion());
+        try std.testing.expect(std.meta.eql(proof, decoded.adopt));
+        for (0..bytes.len) |len| try std.testing.expectError(error.InvalidRelationReconciliationCommand, Command.decode(bytes[0..len]));
+    }
+    for ([_]u16{ 0, 30, 32, 33, 35 }) |version| {
+        proof.version = version;
+        try std.testing.expectError(error.InvalidRelationReconciliationCommand, (Command{ .adopt = proof }).encodeAlloc(a));
+    }
+}
+
+test "system catalog relation namespace transaction occupancy frames require their own decoder and publication capabilities" {
+    const a = std.testing.allocator;
+    const epoch: r.Epoch = .{ .incarnation = @splat(0x11), .revision = 17 };
+    var state = try r.State.initWithCoverage(41, try r.nextJobId(null), epoch, .constraint_names);
+    const start_command: Command = .{ .start = .{ .next = state } };
+    try std.testing.expectEqual(protocol.constraint_occupancy_version, start_command.requiredDecoderVersion());
+    const start_bytes = try start_command.encodeAlloc(a);
+    defer a.free(start_bytes);
+    try std.testing.expectEqual(r.Coverage.constraint_names, (try Command.decode(start_bytes)).start.next.coverage);
+    const advance: Command = .{ .advance = state };
+    try std.testing.expectEqual(protocol.constraint_occupancy_version, advance.requiredDecoderVersion());
+    const advance_bytes = try advance.encodeAlloc(a);
+    defer a.free(advance_bytes);
+    try std.testing.expectEqual(r.Coverage.constraint_names, (try Command.decode(advance_bytes)).advance.coverage);
+    const garbage: Command = .{ .garbage = .{ .generation = r.Generation.of(&state), .coverage = .constraint_names } };
+    try std.testing.expectEqual(protocol.constraint_occupancy_version, garbage.requiredDecoderVersion());
+    const garbage_bytes = try garbage.encodeAlloc(a);
+    defer a.free(garbage_bytes);
+    try std.testing.expectEqual(r.Coverage.constraint_names, (try Command.decode(garbage_bytes)).garbage.coverage);
+    var downgrade = try r.State.init(41, try r.nextJobId(&state), epoch);
+    try std.testing.expectError(error.InvalidRelationReconciliationCommand, (Command{ .start = .{ .next = downgrade, .prior = state } }).encodeAlloc(a));
+    downgrade.coverage = .constraint_names;
+    const replacement: Command = .{ .start = .{ .next = downgrade, .prior = state } };
+    const replacement_bytes = try replacement.encodeAlloc(a);
+    defer a.free(replacement_bytes);
+    try std.testing.expectEqual(protocol.constraint_occupancy_version, (try Command.decode(replacement_bytes)).requiredDecoderVersion());
+    state.phase = .ready;
+    const proof: protocol.Activation = .{ .version = protocol.constraint_occupancy_version, .incarnation = "11111111111111111111111111111111".*, .member_count = 1, .membership_fingerprint = @splat(3) };
+    var publication: Command = .{ .publish = .{ .state = state, .activation = proof } };
+    try std.testing.expectEqual(protocol.constraint_occupancy_version, publication.requiredDecoderVersion());
+    const published = try publication.encodeAlloc(a);
+    defer a.free(published);
+    const decoded = try Command.decode(published);
+    try std.testing.expectEqual(r.Coverage.constraint_names, decoded.publish.state.coverage);
+    try std.testing.expectEqual(protocol.constraint_occupancy_version, decoded.publish.activation.version);
+    publication.publish.activation.version = protocol.relation_publication_version;
+    try std.testing.expectError(error.InvalidRelationReconciliationCommand, publication.encodeAlloc(a));
 }
 
 test "system catalog relation namespace transaction coordinator intents are bounded canonical and allocation safe" {

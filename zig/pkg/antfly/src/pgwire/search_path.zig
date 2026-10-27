@@ -39,6 +39,40 @@ pub const Path = struct {
     entries: [max_namespaces]Namespace = @splat(.{}),
     len: u8 = 0,
 
+    pub fn validate(self: Path) !void {
+        if (self.len > max_namespaces) return error.InvalidParameter;
+        for (self.entries[0..self.len], 0..) |*entry, i| {
+            if (entry.len == 0 or entry.len > entry.bytes.len) return error.InvalidParameter;
+            _ = try Namespace.init(entry.slice());
+            for (self.entries[0..i]) |*prior| if (std.mem.eql(u8, prior.slice(), entry.slice())) return error.InvalidParameter;
+        }
+    }
+
+    pub fn jsonStringify(self: Path, writer: anytype) !void {
+        try writer.beginArray();
+        for (self.entries[0..self.len]) |*entry| try writer.write(entry.slice());
+        try writer.endArray();
+    }
+
+    pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Path {
+        const names = try std.json.innerParse([]const []const u8, a, source, options);
+        var result: Path = .{};
+        for (names) |name| result.append(Namespace.init(name) catch return error.UnexpectedToken) catch return error.UnexpectedToken;
+        result.validate() catch return error.UnexpectedToken;
+        return result;
+    }
+
+    pub fn jsonParseFromValue(_: std.mem.Allocator, value: std.json.Value, _: std.json.ParseOptions) !Path {
+        if (value != .array) return error.UnexpectedToken;
+        var result: Path = .{};
+        for (value.array.items) |name| {
+            if (name != .string) return error.UnexpectedToken;
+            result.append(Namespace.init(name.string) catch return error.UnexpectedToken) catch return error.UnexpectedToken;
+        }
+        result.validate() catch return error.UnexpectedToken;
+        return result;
+    }
+
     pub fn append(self: *Path, name: Namespace) !void {
         if (self.len == max_namespaces) return error.ProgramLimitExceeded;
         self.entries[self.len] = name;
@@ -59,3 +93,24 @@ pub const Path = struct {
         return out.written();
     }
 };
+
+test "SQL durable search paths encode compact names own decoded bytes and reject invalid state" {
+    const a = std.testing.allocator;
+    var path: Path = .{};
+    try path.append(try Namespace.init("tenant"));
+    try path.append(try Namespace.init("public"));
+    const bytes = try std.json.Stringify.valueAlloc(a, path, .{});
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("[\"tenant\",\"public\"]", bytes);
+    var parsed = try std.json.parseFromSlice(Path, a, bytes, .{});
+    const owned = parsed.value;
+    parsed.deinit();
+    try std.testing.expectEqualDeep(path, owned);
+    var value = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer value.deinit();
+    var restored = try std.json.parseFromValue(Path, a, value.value, .{});
+    defer restored.deinit();
+    try std.testing.expectEqualDeep(path, restored.value);
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Path, a, "[\"public\",\"public\"]", .{}));
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Path, a, "[\"bad/path\"]", .{}));
+}

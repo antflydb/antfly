@@ -21,22 +21,17 @@ const core = @import("antfly_local_sources").storage_db_core;
 const fs = @import("antfly_runtime_fs").fs_paths;
 const Cancellation = @import("antfly_local_sources").storage_db_types.CancellationToken;
 const Sha = std.crypto.hash.sha2.Sha256;
+const schema_contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+const wire = @import("antfly_local_sources").storage_db_native_raft_snapshot_contract;
+pub const Origin = wire.Origin;
+pub const InstalledOrigin = wire.InstalledOrigin;
+pub const installed_origin_file_name = InstalledOrigin.file_name;
 pub const max_files = 1_000_000;
-pub const header_size = 80;
+pub const header_size = wire.header_size;
 const max_file_bytes: u64 = 1 << 40;
-
-pub const Identity = struct {
-    group_id: u64,
-    namespace: [24]u8,
-    through_index: u64,
-    native_term: u64,
-    native_index: u64,
-
-    pub fn validate(self: Identity) !void {
-        if (self.group_id == 0 or self.native_index > self.through_index or
-            (self.native_index == 0) != (self.native_term == 0)) return error.InvalidSnapshot;
-    }
-};
+pub const Identity = wire.Identity;
+pub const StreamReceipt = wire.StreamReceipt;
+pub const MaterializationWitness = wire.MaterializationWitness;
 
 pub const Capture = struct {
     alloc: std.mem.Allocator,
@@ -45,11 +40,13 @@ pub const Capture = struct {
     primary: core.PinnedStoreSnapshot,
 
     pub fn encodedSize(self: *const Capture) !u64 {
+        try self.identity.validate();
         const checkpoint = switch (self.primary) {
             .lsm => |*value| value,
             .logical => return error.UnsupportedSnapshotFormat,
         };
         var size: u64 = header_size + 32 + 48 + checkpoint.manifest_bytes.len;
+        if (self.identity.origin != null) size += try self.originSize();
         for (checkpoint.run_paths) |path| {
             var file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
             defer file.close(self.io);
@@ -68,6 +65,20 @@ pub const Capture = struct {
     /// The immutable checkpoint was pinned while the caller held the owner
     /// completion fence. No live state is read or recaptured during writing.
     pub fn write(self: *Capture, writer: *std.Io.Writer, cancellation: Cancellation) !void {
+        _ = try self.writeWithReceipt(writer, cancellation);
+    }
+
+    fn originSize(self: *const Capture) !usize {
+        var size: usize = Origin.encoded_len + 4;
+        if (self.identity.schema_header) |header| {
+            var buffer: [schema_contract.max_header + 44]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+            size += (try header.encode(fixed.allocator())).len;
+        }
+        return size;
+    }
+
+    pub fn writeWithReceipt(self: *Capture, writer: *std.Io.Writer, cancellation: Cancellation) !StreamReceipt {
         try cancellation.check();
         try self.identity.validate();
         const checkpoint = switch (self.primary) {
@@ -86,15 +97,26 @@ pub const Capture = struct {
             }
         }.less);
         var header: [header_size]u8 = @splat(0);
-        @memcpy(header[0..8], "NRSP1\x00\x00\x00");
+        @memcpy(header[0..8], if (self.identity.origin != null) "NRSP2\x00\x00\x00" else "NRSP1\x00\x00\x00");
         std.mem.writeInt(u64, header[8..16], self.identity.group_id, .little);
         header[16..40].* = self.identity.namespace;
         std.mem.writeInt(u64, header[40..48], self.identity.through_index, .little);
         std.mem.writeInt(u64, header[48..56], self.identity.native_term, .little);
         std.mem.writeInt(u64, header[56..64], self.identity.native_index, .little);
         std.mem.writeInt(u64, header[64..72], entries.len + 1, .little);
+        if (self.identity.origin != null) std.mem.writeInt(u64, header[72..80], try self.originSize(), .little);
         var overall = Sha.init(.{});
         try emit(writer, &overall, &header);
+        if (self.identity.origin) |origin| {
+            try emit(writer, &overall, &try origin.encode());
+            var encoded_header: [schema_contract.max_header + 44]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&encoded_header);
+            const bytes = if (self.identity.schema_header) |value| try value.encode(fixed.allocator()) else "";
+            var length: [4]u8 = undefined;
+            std.mem.writeInt(u32, &length, @intCast(bytes.len), .little);
+            try emit(writer, &overall, &length);
+            try emit(writer, &overall, bytes);
+        }
         try emitBytes(writer, &overall, 0, checkpoint.manifest_bytes);
         var previous: u64 = 0;
         var buffer: [64 * 1024]u8 = undefined;
@@ -129,8 +151,17 @@ pub const Capture = struct {
         var digest: [32]u8 = undefined;
         overall.final(&digest);
         try writer.writeAll(&digest);
+        return .{ .identity = self.identity, .footer_digest = digest };
     }
 };
+
+test "native Raft snapshot origin emission waits for the durable group decoder barrier" {
+    const protocol = @import("../../common/data_raft_protocol.zig");
+    for (0..protocol.native_snapshot_origin_protocol_version) |version|
+        try std.testing.expect(!protocol.nativeSnapshotOriginEnabled(@intCast(version)));
+    try std.testing.expect(protocol.nativeSnapshotOriginEnabled(protocol.native_snapshot_origin_protocol_version));
+    try std.testing.expect(protocol.nativeSnapshotOriginEnabled(protocol.native_snapshot_origin_protocol_version + 1));
+}
 
 fn emit(writer: *std.Io.Writer, hash: *Sha, bytes: []const u8) !void {
     try writer.writeAll(bytes);
@@ -149,15 +180,65 @@ fn emitBytes(writer: *std.Io.Writer, hash: *Sha, id: u64, bytes: []const u8) !vo
     try emit(writer, hash, &digest);
 }
 
+/// Only after full extraction, independent primary verification and repair.
+/// The caller owns the unpublished destination capability. No source-chosen
+/// path or copied destination identity is accepted by this checkpoint writer.
+pub fn persistInstalledOrigin(alloc: std.mem.Allocator, io: std.Io, root: []const u8, expected: Identity, stream_digest: [32]u8, destination_root: u128) !void {
+    try expected.validate();
+    const source_origin = expected.origin orelse return;
+    const record: InstalledOrigin = .{ .group_id = expected.group_id, .namespace = expected.namespace, .through_index = expected.through_index, .source = source_origin, .stream_digest = stream_digest, .destination_root_incarnation = destination_root };
+    const raw = try record.encode();
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, installed_origin_file_name });
+    defer alloc.free(path);
+    if (fs.createFilePortable(io, path, .{ .exclusive = true })) |file_value| {
+        var file = file_value;
+        defer file.close(io);
+        errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        var buffer: [InstalledOrigin.encoded_len]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(&raw);
+        try writer.end();
+        try file.sync(io);
+    } else |err| {
+        if (err != error.PathAlreadyExists) return err;
+        const existing = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(InstalledOrigin.encoded_len + 1));
+        defer alloc.free(existing);
+        if (!std.mem.eql(u8, existing, &raw)) return error.NativeBackupOriginMismatch;
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        try file.sync(io);
+    }
+    try fs.syncDirPortable(io, root);
+}
+
+pub fn loadInstalledOrigin(alloc: std.mem.Allocator, io: std.Io, root: []const u8, group: u64, namespace: [24]u8, destination_root: u128) !?InstalledOrigin {
+    return try @import("antfly_local_sources").storage_db_native_backup.loadInstalledOrigin(alloc, io, root, group, namespace, destination_root, .{});
+}
+
 pub fn identity(raw: []const u8) !Identity {
-    if (raw.len < header_size + 32 or !std.mem.eql(u8, raw[0..8], "NRSP1\x00\x00\x00") or
-        std.mem.readInt(u64, raw[72..80], .little) != 0) return error.InvalidSnapshot;
+    if (raw.len < header_size + 32) return error.InvalidSnapshot;
+    const v2 = std.mem.eql(u8, raw[0..8], "NRSP2\x00\x00\x00");
+    const origin_size = std.mem.readInt(u64, raw[72..80], .little);
+    var schema_header: ?schema_contract.Header = null;
+    const origin: ?Origin = if (v2) blk: {
+        if (origin_size < Origin.encoded_len + 4 or origin_size > Origin.encoded_len + 4 + schema_contract.max_header + 44 or
+            raw.len < header_size + origin_size + 32) return error.InvalidSnapshot;
+        const length = std.mem.readInt(u32, raw[header_size + Origin.encoded_len ..][0..4], .little);
+        if (origin_size != Origin.encoded_len + 4 + @as(u64, length)) return error.InvalidSnapshot;
+        if (length != 0) schema_header = schema_contract.Header.decode(raw[header_size + Origin.encoded_len + 4 ..][0..length]) catch return error.InvalidSnapshot;
+        break :blk Origin.decode(raw[header_size..][0..Origin.encoded_len]) catch return error.InvalidSnapshot;
+    } else blk: {
+        if (!std.mem.eql(u8, raw[0..8], "NRSP1\x00\x00\x00") or origin_size != 0) return error.InvalidSnapshot;
+        break :blk null;
+    };
     const value: Identity = .{
         .group_id = std.mem.readInt(u64, raw[8..16], .little),
         .namespace = raw[16..40].*,
         .through_index = std.mem.readInt(u64, raw[40..48], .little),
         .native_term = std.mem.readInt(u64, raw[48..56], .little),
         .native_index = std.mem.readInt(u64, raw[56..64], .little),
+        .origin = origin,
+        .schema_header = schema_header,
     };
     try value.validate();
     return value;
@@ -173,8 +254,8 @@ pub fn extract(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, root: []co
     const count = std.mem.readInt(u64, raw[64..72], .little);
     if (count == 0 or count > max_files) return error.InvalidSnapshot;
     var overall = Sha.init(.{});
-    overall.update(raw[0..header_size]);
-    var offset: usize = header_size;
+    var offset: usize = header_size + @as(usize, @intCast(std.mem.readInt(u64, raw[72..80], .little)));
+    overall.update(raw[0..offset]);
     var previous: u64 = 0;
     const runs = try std.fmt.allocPrint(alloc, "{s}/runs", .{root});
     defer alloc.free(runs);
@@ -257,7 +338,7 @@ test "relational index system native Raft snapshot preserves exact typed primary
     const txn_id = @as([16]u8, @splat(7));
     _ = try source.beginReplicatedTransactionAtOrderedReceipt(txn_id, 987654322, 987654322, &.{"participant"}, false, false, .{ .term = 2, .index = 6 });
     try source.writeReplicatedTransactionAtOrderedReceipt(txn_id, .{ .writes = &.{.{ .key = "prepared", .value = "{\"n\":4}" }} }, .{ .term = 2, .index = 7 });
-    try @import("../../storage/server_db_adapter.zig").applyOrdered(&source, .{ .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 1 } } }, .{ .term = 2, .index = 8 });
+    try @import("../../storage/server_db_adapter.zig").applyStorageKernelReplicatedBatchAtRaftEntry(alloc, &source, "rows", 22, .{ .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 1 } } }, .{ .term = 2, .index = 8 });
     try std.testing.expectError(error.InvalidSnapshot, @import("../../storage/server_db_adapter.zig").captureSnapshot(&source, 22, 4));
     // Requested through-index includes protocol-only entries without a native
     // mutation marker; the exact native cut remains separately authenticated.
@@ -271,13 +352,47 @@ test "relational index system native Raft snapshot preserves exact typed primary
     const canceled: std.atomic.Value(bool) = .init(true);
     try std.testing.expectError(error.Canceled, capture.write(&writer.writer, Cancellation.fromAtomic(&canceled)));
     try std.testing.expectEqual(@as(usize, 0), writer.written().len);
-    try capture.write(&writer.writer, .none);
+    const receipt = try capture.writeWithReceipt(&writer.writer, .none);
+    try std.testing.expectEqualDeep(capture.identity, receipt.identity);
+    try std.testing.expectEqualSlices(u8, &receipt.footer_digest, writer.written()[writer.written().len - 32 ..]);
+    const witness: MaterializationWitness = .{ .native_offset = 7, .native_size = writer.written().len, .stream = receipt };
+    try witness.requireFor(22, 10, 2, 7 + writer.written().len);
+    try std.testing.expectError(error.InvalidSnapshot, witness.requireFor(23, 10, 2, 7 + writer.written().len));
+    try std.testing.expectError(error.InvalidSnapshot, witness.requireFor(22, 11, 2, 7 + writer.written().len));
+    try std.testing.expectError(error.InvalidSnapshot, witness.requireFor(22, 10, 1, 7 + writer.written().len));
+    try std.testing.expectError(error.InvalidSnapshot, witness.requireFor(22, 10, 2, 8 + writer.written().len));
     try std.testing.expectEqual(try capture.encodedSize(), writer.written().len);
+    try std.testing.expectEqualStrings("NRSP2\x00\x00\x00", writer.written()[0..8]);
+    try std.testing.expectEqual(source.root_incarnation, capture.identity.origin.?.physical_root_incarnation);
+    try std.testing.expectEqual(@as(u64, 8), capture.identity.origin.?.applied.?.index);
+    try std.testing.expectEqual(@as(u64, 10), capture.identity.through_index);
+    try std.testing.expectEqualDeep(capture.identity, try identity(writer.written()));
+    for (0..header_size + Origin.encoded_len + 4 + 32) |size|
+        try std.testing.expectError(error.InvalidSnapshot, identity(writer.written()[0..size]));
     try extract(alloc, std.testing.io, writer.written(), target_path, capture.identity, .none);
+    {
+        var unpublished = try db_mod.DB.open(alloc, target_path, .{ .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
+        defer unpublished.close();
+        try std.testing.expectEqual(@as(u128, 0), unpublished.root_incarnation);
+        try std.testing.expectError(error.FileNotFound, @import("antfly_local_sources").storage_db_root_identity.load(alloc, std.testing.io, target_path));
+    }
+    const target_root = try @import("antfly_local_sources").storage_db_root_identity.loadOrCreate(alloc, std.testing.io, target_path);
     {
         var target = try db_mod.DB.open(alloc, target_path, .{ .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
         defer target.close();
+        try std.testing.expectEqual(target_root.incarnation, target.root_incarnation);
         try @import("../../storage/server_db_adapter.zig").verifySnapshot(&target, capture.identity);
+        const stream_hash = writer.written()[writer.written().len - 32 ..][0..32].*;
+        try persistInstalledOrigin(alloc, std.testing.io, target_path, capture.identity, stream_hash, target.root_incarnation);
+        try persistInstalledOrigin(alloc, std.testing.io, target_path, capture.identity, stream_hash, target.root_incarnation);
+        const installed = (try loadInstalledOrigin(alloc, std.testing.io, target_path, 22, capture.identity.namespace, target.root_incarnation)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualDeep(capture.identity.origin.?, installed.source);
+        try std.testing.expectEqualSlices(u8, &stream_hash, &installed.stream_digest);
+        try std.testing.expectError(error.NativeBackupOriginMismatch, loadInstalledOrigin(alloc, std.testing.io, target_path, 22, capture.identity.namespace, target.root_incarnation + 1));
+        var wrong_cut = capture.identity;
+        wrong_cut.origin.?.transaction_directory = @splat(9);
+        try std.testing.expectError(error.NativeBackupOriginMismatch, @import("../../storage/server_db_adapter.zig").verifySnapshot(&target, wrong_cut));
+        try std.testing.expectError(error.NativeBackupOriginMismatch, persistInstalledOrigin(alloc, std.testing.io, target_path, wrong_cut, stream_hash, target.root_incarnation));
         var actual_txn = try target.core.store.beginReadTxn();
         defer actual_txn.abort();
         var cursor = try expected_txn.openCursor();
@@ -302,4 +417,33 @@ test "relational index system native Raft snapshot preserves exact typed primary
     defer alloc.free(damaged);
     damaged[damaged.len - 1] ^= 1;
     try std.testing.expectError(error.InvalidSnapshot, extract(alloc, std.testing.io, damaged, bad_path, capture.identity, .none));
+    // Consistent checksums do not turn copied origin claims into physical
+    // evidence: independently compare them with the staged primary image.
+    @memcpy(damaged, writer.written());
+    var claimed = capture.identity;
+    claimed.origin.?.transaction_directory = @splat(9);
+    damaged[header_size..][0..Origin.encoded_len].* = try claimed.origin.?.encode();
+    Sha.hash(damaged[0 .. damaged.len - 32], damaged[damaged.len - 32 ..][0..32], .{});
+    const forged_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/forged", .{tmp.sub_path});
+    defer alloc.free(forged_path);
+    try extract(alloc, std.testing.io, damaged, forged_path, try identity(damaged), .none);
+    {
+        var target = try db_mod.DB.open(alloc, forged_path, .{ .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
+        defer target.close();
+        try std.testing.expectError(error.NativeBackupOriginMismatch, @import("../../storage/server_db_adapter.zig").verifySnapshot(&target, claimed));
+    }
+    // Released NRSP1 remains readable but never acquires an origin checkpoint.
+    const saved = capture.identity.origin;
+    capture.identity.origin = null;
+    defer capture.identity.origin = saved;
+    var legacy: std.Io.Writer.Allocating = .init(alloc);
+    defer legacy.deinit();
+    try capture.write(&legacy.writer, .none);
+    try std.testing.expectEqual(try capture.encodedSize(), legacy.written().len);
+    try std.testing.expect((try identity(legacy.written())).origin == null);
+    const legacy_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/legacy", .{tmp.sub_path});
+    defer alloc.free(legacy_path);
+    try extract(alloc, std.testing.io, legacy.written(), legacy_path, capture.identity, .none);
+    try persistInstalledOrigin(alloc, std.testing.io, legacy_path, capture.identity, @splat(5), 99);
+    try std.testing.expect(try loadInstalledOrigin(alloc, std.testing.io, legacy_path, 22, capture.identity.namespace, 99) == null);
 }

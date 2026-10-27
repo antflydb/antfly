@@ -1,0 +1,5767 @@
+{
+  "format": 1,
+  "zone": "UTC",
+  "entries": [
+    {
+      "kind": "numrange",
+      "input": "empty",
+      "sqlstate": null,
+      "text": "empty",
+      "binary": "01",
+      "lower": null,
+      "upper": null,
+      "empty": true,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "numrange",
+      "input": "(,)",
+      "sqlstate": null,
+      "text": "(,)",
+      "binary": "18",
+      "lower": null,
+      "upper": null,
+      "empty": false,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": true,
+      "upper_inf": true
+    },
+    {
+      "kind": "numrange",
+      "input": "[1,10)",
+      "sqlstate": null,
+      "text": "[1,10)",
+      "binary": "020000000a000100000000000000010000000a0001000000000000000a",
+      "lower": "1",
+      "upper": "10",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "numrange",
+      "input": "[1.00,10.000]",
+      "sqlstate": null,
+      "text": "[1.00,10.000]",
+      "binary": "060000000a000100000000000200010000000a0001000000000003000a",
+      "lower": "1.00",
+      "upper": "10.000",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": true,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "numrange",
+      "input": "(1,1)",
+      "sqlstate": null,
+      "text": "empty",
+      "binary": "01",
+      "lower": null,
+      "upper": null,
+      "empty": true,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "numrange",
+      "input": "[1,1]",
+      "sqlstate": null,
+      "text": "[1,1]",
+      "binary": "060000000a000100000000000000010000000a00010000000000000001",
+      "lower": "1",
+      "upper": "1",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": true,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "numrange",
+      "input": "(10,1)",
+      "sqlstate": "22000"
+    },
+    {
+      "kind": "numrange",
+      "input": "[NaN,NaN]",
+      "sqlstate": null,
+      "text": "[NaN,NaN]",
+      "binary": "060000000800000000c00000000000000800000000c0000000",
+      "lower": "NaN",
+      "upper": "NaN",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": true,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "numrange",
+      "input": "[Infinity,)",
+      "sqlstate": null,
+      "text": "[Infinity,)",
+      "binary": "120000000800000000d0000020",
+      "lower": "Infinity",
+      "upper": null,
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": true
+    },
+    {
+      "kind": "numrange",
+      "input": "(,Infinity)",
+      "sqlstate": null,
+      "text": "(,Infinity)",
+      "binary": "080000000800000000d0000020",
+      "lower": null,
+      "upper": "Infinity",
+      "empty": false,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": true,
+      "upper_inf": false
+    },
+    {
+      "kind": "numrange",
+      "input": "[-Infinity,Infinity]",
+      "sqlstate": null,
+      "text": "[-Infinity,Infinity]",
+      "binary": "060000000800000000f00000200000000800000000d0000020",
+      "lower": "-Infinity",
+      "upper": "Infinity",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": true,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "numrange",
+      "input": "[1e-20,1e20]",
+      "sqlstate": null,
+      "text": "[0.00000000000000000001,100000000000000000000]",
+      "binary": "060000000a0001fffb0000001400010000000a00010005000000000001",
+      "lower": "0.00000000000000000001",
+      "upper": "100000000000000000000",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": true,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "numrange",
+      "input": "[\"1.5\",\"3.00\")",
+      "sqlstate": null,
+      "text": "[1.5,3.00)",
+      "binary": "020000000c0002000000000001000113880000000a00010000000000020003",
+      "lower": "1.5",
+      "upper": "3.00",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "daterange",
+      "input": "empty",
+      "sqlstate": null,
+      "text": "empty",
+      "binary": "01",
+      "lower": null,
+      "upper": null,
+      "empty": true,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "daterange",
+      "input": "(,)",
+      "sqlstate": null,
+      "text": "(,)",
+      "binary": "18",
+      "lower": null,
+      "upper": null,
+      "empty": false,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": true,
+      "upper_inf": true
+    },
+    {
+      "kind": "daterange",
+      "input": "[2025-01-01,2025-02-01)",
+      "sqlstate": null,
+      "text": "[2025-01-01,2025-02-01)",
+      "binary": "0200000004000023ac00000004000023cb",
+      "lower": "2025-01-01",
+      "upper": "2025-02-01",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "daterange",
+      "input": "[2025-01-01,2025-02-01]",
+      "sqlstate": null,
+      "text": "[2025-01-01,2025-02-02)",
+      "binary": "0200000004000023ac00000004000023cc",
+      "lower": "2025-01-01",
+      "upper": "2025-02-02",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "daterange",
+      "input": "(2025-01-01,2025-02-01]",
+      "sqlstate": null,
+      "text": "[2025-01-02,2025-02-02)",
+      "binary": "0200000004000023ad00000004000023cc",
+      "lower": "2025-01-02",
+      "upper": "2025-02-02",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "daterange",
+      "input": "(2025-01-01,2025-01-02)",
+      "sqlstate": null,
+      "text": "empty",
+      "binary": "01",
+      "lower": null,
+      "upper": null,
+      "empty": true,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "daterange",
+      "input": "[2024-02-28,2024-02-29]",
+      "sqlstate": null,
+      "text": "[2024-02-28,2024-03-01)",
+      "binary": "020000000400002278000000040000227a",
+      "lower": "2024-02-28",
+      "upper": "2024-03-01",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "daterange",
+      "input": "[infinity,)",
+      "sqlstate": null,
+      "text": "[infinity,)",
+      "binary": "12000000047fffffff",
+      "lower": "infinity",
+      "upper": null,
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": true
+    },
+    {
+      "kind": "daterange",
+      "input": "(infinity,)",
+      "sqlstate": null,
+      "text": "(infinity,)",
+      "binary": "10000000047fffffff",
+      "lower": "infinity",
+      "upper": null,
+      "empty": false,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": true
+    },
+    {
+      "kind": "daterange",
+      "input": "(-infinity,2025-01-01]",
+      "sqlstate": null,
+      "text": "(-infinity,2025-01-02)",
+      "binary": "00000000048000000000000004000023ad",
+      "lower": "-infinity",
+      "upper": "2025-01-02",
+      "empty": false,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "daterange",
+      "input": "[infinity,infinity]",
+      "sqlstate": null,
+      "text": "[infinity,infinity]",
+      "binary": "06000000047fffffff000000047fffffff",
+      "lower": "infinity",
+      "upper": "infinity",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": true,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "daterange",
+      "input": "[5874897-12-31,5874897-12-31]",
+      "sqlstate": "22008"
+    },
+    {
+      "kind": "tsrange",
+      "input": "empty",
+      "sqlstate": null,
+      "text": "empty",
+      "binary": "01",
+      "lower": null,
+      "upper": null,
+      "empty": true,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "tsrange",
+      "input": "(,)",
+      "sqlstate": null,
+      "text": "(,)",
+      "binary": "18",
+      "lower": null,
+      "upper": null,
+      "empty": false,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": true,
+      "upper_inf": true
+    },
+    {
+      "kind": "tsrange",
+      "input": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "sqlstate": null,
+      "text": "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")",
+      "binary": "02000000080002cd987ed48000000000080002cdac9cabe000",
+      "lower": "2025-01-01 00:00:00",
+      "upper": "2025-01-02 00:00:00",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "tsrange",
+      "input": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "sqlstate": null,
+      "text": "[\"2025-01-01 00:00:00\",\"2025-01-01 00:00:00\"]",
+      "binary": "06000000080002cd987ed48000000000080002cd987ed48000",
+      "lower": "2025-01-01 00:00:00",
+      "upper": "2025-01-01 00:00:00",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": true,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "tsrange",
+      "input": "[infinity,)",
+      "sqlstate": null,
+      "text": "[infinity,)",
+      "binary": "12000000087fffffffffffffff",
+      "lower": "infinity",
+      "upper": null,
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": true
+    },
+    {
+      "kind": "tsrange",
+      "input": "(-infinity,infinity)",
+      "sqlstate": null,
+      "text": "(-infinity,infinity)",
+      "binary": "00000000088000000000000000000000087fffffffffffffff",
+      "lower": "-infinity",
+      "upper": "infinity",
+      "empty": false,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "tsrange",
+      "input": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "sqlstate": null,
+      "text": "[\"2000-01-01 00:00:00.000001\",\"2000-01-01 00:00:00.000002\")",
+      "binary": "02000000080000000000000001000000080000000000000002",
+      "lower": "2000-01-01 00:00:00.000001",
+      "upper": "2000-01-01 00:00:00.000002",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "tstzrange",
+      "input": "empty",
+      "sqlstate": null,
+      "text": "empty",
+      "binary": "01",
+      "lower": null,
+      "upper": null,
+      "empty": true,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "tstzrange",
+      "input": "(,)",
+      "sqlstate": null,
+      "text": "(,)",
+      "binary": "18",
+      "lower": null,
+      "upper": null,
+      "empty": false,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": true,
+      "upper_inf": true
+    },
+    {
+      "kind": "tstzrange",
+      "input": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "sqlstate": null,
+      "text": "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")",
+      "binary": "02000000080002cd987ed48000000000080002cdac9cabe000",
+      "lower": "2025-01-01 00:00:00+00",
+      "upper": "2025-01-02 00:00:00+00",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "tstzrange",
+      "input": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "sqlstate": null,
+      "text": "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")",
+      "binary": "02000000080002cd987ed48000000000080002cdac9cabe000",
+      "lower": "2025-01-01 00:00:00+00",
+      "upper": "2025-01-02 00:00:00+00",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "tstzrange",
+      "input": "[infinity,)",
+      "sqlstate": null,
+      "text": "[infinity,)",
+      "binary": "12000000087fffffffffffffff",
+      "lower": "infinity",
+      "upper": null,
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": true
+    },
+    {
+      "kind": "tstzrange",
+      "input": "(-infinity,infinity)",
+      "sqlstate": null,
+      "text": "(-infinity,infinity)",
+      "binary": "00000000088000000000000000000000087fffffffffffffff",
+      "lower": "-infinity",
+      "upper": "infinity",
+      "empty": false,
+      "lower_inc": false,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    },
+    {
+      "kind": "tstzrange",
+      "input": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "sqlstate": null,
+      "text": "[\"2000-01-01 00:00:00.000001+00\",\"2000-01-01 00:00:00.000002+00\")",
+      "binary": "02000000080000000000000001000000080000000000000002",
+      "lower": "2000-01-01 00:00:00.000001+00",
+      "upper": "2000-01-01 00:00:00.000002+00",
+      "empty": false,
+      "lower_inc": true,
+      "upper_inc": false,
+      "lower_inf": false,
+      "upper_inf": false
+    }
+  ],
+  "relations": [
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "empty",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "(,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "[1,10)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "(1,1)",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "[1,1]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "empty",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "(,)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "[1,10)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "[1,1]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,)",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "[1,10)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "[1,1]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,10)",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "[1,10)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "[1.00,10.000]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "[1,1]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1.00,10.000]",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "empty",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "(,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "[1,10)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "(1,1)",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "[1,1]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(1,1)",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "[1,10)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "[1,1]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1,1]",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "[1,10)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "[1,1]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "[NaN,NaN]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[NaN,NaN]",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "[1,10)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "[1,1]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "[Infinity,)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[Infinity,)",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "(,)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "[1,10)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "[1,1]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "(,Infinity)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "(,Infinity)",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "[1,10)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "[1,1]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "[-Infinity,Infinity]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[-Infinity,Infinity]",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "[1,10)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "[1,1]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "[1e-20,1e20]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[1e-20,1e20]",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "[1,10)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "[1.00,10.000]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "(1,1)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "[1,1]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "[NaN,NaN]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "[Infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "(,Infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "[-Infinity,Infinity]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "[1e-20,1e20]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "numrange",
+      "left": "[\"1.5\",\"3.00\")",
+      "right": "[\"1.5\",\"3.00\")",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "empty",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "(,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "empty",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "(,)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(,)",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01)",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2025-01-01,2025-02-01]",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-02-01]",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "empty",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "(,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(2025-01-01,2025-01-02)",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[2024-02-28,2024-02-29]",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "[infinity,)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,)",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "(infinity,)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(infinity,)",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "(-infinity,2025-01-01]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "(-infinity,2025-01-01]",
+      "right": "[infinity,infinity]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "[2025-01-01,2025-02-01)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "[2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "(2025-01-01,2025-02-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "(2025-01-01,2025-01-02)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "[2024-02-28,2024-02-29]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "(infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "(-infinity,2025-01-01]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "daterange",
+      "left": "[infinity,infinity]",
+      "right": "[infinity,infinity]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "empty",
+      "right": "empty",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "empty",
+      "right": "(,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "empty",
+      "right": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "empty",
+      "right": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "empty",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "empty",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "empty",
+      "right": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(,)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(,)",
+      "right": "(,)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(,)",
+      "right": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(,)",
+      "right": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(,)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(,)",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(,)",
+      "right": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "right": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "right": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "right": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "right": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "right": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "right": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[infinity,)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[infinity,)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[infinity,)",
+      "right": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[infinity,)",
+      "right": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[infinity,)",
+      "right": "[infinity,)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[infinity,)",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "tsrange",
+      "left": "[infinity,)",
+      "right": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(-infinity,infinity)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(-infinity,infinity)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(-infinity,infinity)",
+      "right": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(-infinity,infinity)",
+      "right": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(-infinity,infinity)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "tsrange",
+      "left": "(-infinity,infinity)",
+      "right": "(-infinity,infinity)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "(-infinity,infinity)",
+      "right": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "right": "[2025-01-01 00:00:00,2025-01-02 00:00:00)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "right": "[2025-01-01 00:00:00,2025-01-01 00:00:00]",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tsrange",
+      "left": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "right": "[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "empty",
+      "right": "empty",
+      "equal": true,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "empty",
+      "right": "(,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "empty",
+      "right": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "empty",
+      "right": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "empty",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "empty",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "empty",
+      "right": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(,)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(,)",
+      "right": "(,)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(,)",
+      "right": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(,)",
+      "right": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(,)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(,)",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(,)",
+      "right": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "right": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "right": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "right": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "right": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "right": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "right": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[infinity,)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[infinity,)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[infinity,)",
+      "right": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[infinity,)",
+      "right": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[infinity,)",
+      "right": "[infinity,)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[infinity,)",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[infinity,)",
+      "right": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(-infinity,infinity)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(-infinity,infinity)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(-infinity,infinity)",
+      "right": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(-infinity,infinity)",
+      "right": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(-infinity,infinity)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": true
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(-infinity,infinity)",
+      "right": "(-infinity,infinity)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "(-infinity,infinity)",
+      "right": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "equal": false,
+      "less": true,
+      "overlaps": true,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "right": "empty",
+      "equal": false,
+      "less": false,
+      "overlaps": false,
+      "contains": true,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "right": "(,)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "right": "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "right": "[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "right": "[infinity,)",
+      "equal": false,
+      "less": true,
+      "overlaps": false,
+      "contains": false,
+      "contained": false,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "right": "(-infinity,infinity)",
+      "equal": false,
+      "less": false,
+      "overlaps": true,
+      "contains": false,
+      "contained": true,
+      "adjacent": false
+    },
+    {
+      "kind": "tstzrange",
+      "left": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "right": "[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)",
+      "equal": true,
+      "less": false,
+      "overlaps": true,
+      "contains": true,
+      "contained": true,
+      "adjacent": false
+    }
+  ],
+  "tables": [
+    {
+      "name": "range_numrange",
+      "create": "CREATE TABLE range_numrange(id text PRIMARY KEY,value numrange NOT NULL)",
+      "seed": "INSERT INTO range_numrange(id,value) VALUES ('r0','empty'::numrange),('r1','(,)'::numrange),('r2','[1,10)'::numrange),('r3','[1.00,10.000]'::numrange),('r4','(1,1)'::numrange),('r5','[1,1]'::numrange),('r6','[NaN,NaN]'::numrange),('r7','[Infinity,)'::numrange),('r8','(,Infinity)'::numrange),('r9','[-Infinity,Infinity]'::numrange),('r10','[1e-20,1e20]'::numrange),('r11','[\"1.5\",\"3.00\")'::numrange)",
+      "read": "SELECT id,value FROM range_numrange ORDER BY id",
+      "final": {
+        "columns": [
+          "id",
+          "value"
+        ],
+        "column_oids": [
+          25,
+          3906
+        ],
+        "rows": [
+          [
+            "r0",
+            "empty"
+          ],
+          [
+            "r1",
+            "(,)"
+          ],
+          [
+            "r10",
+            "[0.00000000000000000001,100000000000000000000]"
+          ],
+          [
+            "r11",
+            "[1.5,3.00)"
+          ],
+          [
+            "r2",
+            "[1,10)"
+          ],
+          [
+            "r3",
+            "[1.00,10.000]"
+          ],
+          [
+            "r4",
+            "empty"
+          ],
+          [
+            "r5",
+            "[1,1]"
+          ],
+          [
+            "r6",
+            "[NaN,NaN]"
+          ],
+          [
+            "r7",
+            "[Infinity,)"
+          ],
+          [
+            "r8",
+            "(,Infinity)"
+          ],
+          [
+            "r9",
+            "[-Infinity,Infinity]"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "range_daterange",
+      "create": "CREATE TABLE range_daterange(id text PRIMARY KEY,value daterange NOT NULL)",
+      "seed": "INSERT INTO range_daterange(id,value) VALUES ('r0','empty'::daterange),('r1','(,)'::daterange),('r2','[2025-01-01,2025-02-01)'::daterange),('r3','[2025-01-01,2025-02-01]'::daterange),('r4','(2025-01-01,2025-02-01]'::daterange),('r5','(2025-01-01,2025-01-02)'::daterange),('r6','[2024-02-28,2024-02-29]'::daterange),('r7','[infinity,)'::daterange),('r8','(infinity,)'::daterange),('r9','(-infinity,2025-01-01]'::daterange),('r10','[infinity,infinity]'::daterange)",
+      "read": "SELECT id,value FROM range_daterange ORDER BY id",
+      "final": {
+        "columns": [
+          "id",
+          "value"
+        ],
+        "column_oids": [
+          25,
+          3912
+        ],
+        "rows": [
+          [
+            "r0",
+            "empty"
+          ],
+          [
+            "r1",
+            "(,)"
+          ],
+          [
+            "r10",
+            "[infinity,infinity]"
+          ],
+          [
+            "r2",
+            "[2025-01-01,2025-02-01)"
+          ],
+          [
+            "r3",
+            "[2025-01-01,2025-02-02)"
+          ],
+          [
+            "r4",
+            "[2025-01-02,2025-02-02)"
+          ],
+          [
+            "r5",
+            "empty"
+          ],
+          [
+            "r6",
+            "[2024-02-28,2024-03-01)"
+          ],
+          [
+            "r7",
+            "[infinity,)"
+          ],
+          [
+            "r8",
+            "(infinity,)"
+          ],
+          [
+            "r9",
+            "(-infinity,2025-01-02)"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "range_tsrange",
+      "create": "CREATE TABLE range_tsrange(id text PRIMARY KEY,value tsrange NOT NULL)",
+      "seed": "INSERT INTO range_tsrange(id,value) VALUES ('r0','empty'::tsrange),('r1','(,)'::tsrange),('r2','[2025-01-01 00:00:00,2025-01-02 00:00:00)'::tsrange),('r3','[2025-01-01 00:00:00,2025-01-01 00:00:00]'::tsrange),('r4','[infinity,)'::tsrange),('r5','(-infinity,infinity)'::tsrange),('r6','[2000-01-01 00:00:00.000001,2000-01-01 00:00:00.000002)'::tsrange)",
+      "read": "SELECT id,value FROM range_tsrange ORDER BY id",
+      "final": {
+        "columns": [
+          "id",
+          "value"
+        ],
+        "column_oids": [
+          25,
+          3908
+        ],
+        "rows": [
+          [
+            "r0",
+            "empty"
+          ],
+          [
+            "r1",
+            "(,)"
+          ],
+          [
+            "r2",
+            "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")"
+          ],
+          [
+            "r3",
+            "[\"2025-01-01 00:00:00\",\"2025-01-01 00:00:00\"]"
+          ],
+          [
+            "r4",
+            "[infinity,)"
+          ],
+          [
+            "r5",
+            "(-infinity,infinity)"
+          ],
+          [
+            "r6",
+            "[\"2000-01-01 00:00:00.000001\",\"2000-01-01 00:00:00.000002\")"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "range_tstzrange",
+      "create": "CREATE TABLE range_tstzrange(id text PRIMARY KEY,value tstzrange NOT NULL)",
+      "seed": "INSERT INTO range_tstzrange(id,value) VALUES ('r0','empty'::tstzrange),('r1','(,)'::tstzrange),('r2','[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)'::tstzrange),('r3','[2025-01-01 00:00:00+00,2025-01-02 00:00:00+00)'::tstzrange),('r4','[infinity,)'::tstzrange),('r5','(-infinity,infinity)'::tstzrange),('r6','[2000-01-01 00:00:00.000001+00,2000-01-01 00:00:00.000002+00)'::tstzrange)",
+      "read": "SELECT id,value FROM range_tstzrange ORDER BY id",
+      "final": {
+        "columns": [
+          "id",
+          "value"
+        ],
+        "column_oids": [
+          25,
+          3910
+        ],
+        "rows": [
+          [
+            "r0",
+            "empty"
+          ],
+          [
+            "r1",
+            "(,)"
+          ],
+          [
+            "r2",
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")"
+          ],
+          [
+            "r3",
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")"
+          ],
+          [
+            "r4",
+            "[infinity,)"
+          ],
+          [
+            "r5",
+            "(-infinity,infinity)"
+          ],
+          [
+            "r6",
+            "[\"2000-01-01 00:00:00.000001+00\",\"2000-01-01 00:00:00.000002+00\")"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "usage_records",
+      "create": "CREATE TABLE usage_records(id text PRIMARY KEY)",
+      "seed": "INSERT INTO usage_records(id) VALUES ('unchanged')",
+      "read": "SELECT id FROM usage_records ORDER BY id",
+      "final": {
+        "columns": [
+          "id"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "unchanged"
+          ]
+        ]
+      }
+    }
+  ],
+  "probes": [
+    {
+      "sql": "SELECT id,value,lower(value) AS lower_bound,upper(value) AS upper_bound,isempty(value) AS empty,lower_inc(value) AS lower_inc,upper_inc(value) AS upper_inc,lower_inf(value) AS lower_inf,upper_inf(value) AS upper_inf FROM range_numrange ORDER BY id",
+      "output": {
+        "columns": [
+          "id",
+          "value",
+          "lower_bound",
+          "upper_bound",
+          "empty",
+          "lower_inc",
+          "upper_inc",
+          "lower_inf",
+          "upper_inf"
+        ],
+        "column_oids": [
+          25,
+          3906,
+          1700,
+          1700,
+          16,
+          16,
+          16,
+          16,
+          16
+        ],
+        "rows": [
+          [
+            "r0",
+            "empty",
+            null,
+            null,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            "r1",
+            "(,)",
+            null,
+            null,
+            false,
+            false,
+            false,
+            true,
+            true
+          ],
+          [
+            "r10",
+            "[0.00000000000000000001,100000000000000000000]",
+            "0.00000000000000000001",
+            "100000000000000000000",
+            false,
+            true,
+            true,
+            false,
+            false
+          ],
+          [
+            "r11",
+            "[1.5,3.00)",
+            "1.5",
+            "3.00",
+            false,
+            true,
+            false,
+            false,
+            false
+          ],
+          [
+            "r2",
+            "[1,10)",
+            "1",
+            "10",
+            false,
+            true,
+            false,
+            false,
+            false
+          ],
+          [
+            "r3",
+            "[1.00,10.000]",
+            "1.00",
+            "10.000",
+            false,
+            true,
+            true,
+            false,
+            false
+          ],
+          [
+            "r4",
+            "empty",
+            null,
+            null,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            "r5",
+            "[1,1]",
+            "1",
+            "1",
+            false,
+            true,
+            true,
+            false,
+            false
+          ],
+          [
+            "r6",
+            "[NaN,NaN]",
+            "NaN",
+            "NaN",
+            false,
+            true,
+            true,
+            false,
+            false
+          ],
+          [
+            "r7",
+            "[Infinity,)",
+            "Infinity",
+            null,
+            false,
+            true,
+            false,
+            false,
+            true
+          ],
+          [
+            "r8",
+            "(,Infinity)",
+            null,
+            "Infinity",
+            false,
+            false,
+            false,
+            true,
+            false
+          ],
+          [
+            "r9",
+            "[-Infinity,Infinity]",
+            "-Infinity",
+            "Infinity",
+            false,
+            true,
+            true,
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT DISTINCT value FROM range_numrange ORDER BY value",
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          3906
+        ],
+        "rows": [
+          [
+            "empty"
+          ],
+          [
+            "(,Infinity)"
+          ],
+          [
+            "(,)"
+          ],
+          [
+            "[-Infinity,Infinity]"
+          ],
+          [
+            "[0.00000000000000000001,100000000000000000000]"
+          ],
+          [
+            "[1,1]"
+          ],
+          [
+            "[1,10)"
+          ],
+          [
+            "[1.00,10.000]"
+          ],
+          [
+            "[1.5,3.00)"
+          ],
+          [
+            "[Infinity,)"
+          ],
+          [
+            "[NaN,NaN]"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT value,COUNT(*) AS n FROM range_numrange GROUP BY value ORDER BY value",
+      "output": {
+        "columns": [
+          "value",
+          "n"
+        ],
+        "column_oids": [
+          3906,
+          20
+        ],
+        "rows": [
+          [
+            "empty",
+            2
+          ],
+          [
+            "(,Infinity)",
+            1
+          ],
+          [
+            "(,)",
+            1
+          ],
+          [
+            "[-Infinity,Infinity]",
+            1
+          ],
+          [
+            "[0.00000000000000000001,100000000000000000000]",
+            1
+          ],
+          [
+            "[1,1]",
+            1
+          ],
+          [
+            "[1,10)",
+            1
+          ],
+          [
+            "[1.00,10.000]",
+            1
+          ],
+          [
+            "[1.5,3.00)",
+            1
+          ],
+          [
+            "[Infinity,)",
+            1
+          ],
+          [
+            "[NaN,NaN]",
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT id FROM range_numrange WHERE value && '[1,10)'::numrange ORDER BY id",
+      "output": {
+        "columns": [
+          "id"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "r1"
+          ],
+          [
+            "r10"
+          ],
+          [
+            "r11"
+          ],
+          [
+            "r2"
+          ],
+          [
+            "r3"
+          ],
+          [
+            "r5"
+          ],
+          [
+            "r8"
+          ],
+          [
+            "r9"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT id,value,lower(value) AS lower_bound,upper(value) AS upper_bound,isempty(value) AS empty,lower_inc(value) AS lower_inc,upper_inc(value) AS upper_inc,lower_inf(value) AS lower_inf,upper_inf(value) AS upper_inf FROM range_daterange ORDER BY id",
+      "output": {
+        "columns": [
+          "id",
+          "value",
+          "lower_bound",
+          "upper_bound",
+          "empty",
+          "lower_inc",
+          "upper_inc",
+          "lower_inf",
+          "upper_inf"
+        ],
+        "column_oids": [
+          25,
+          3912,
+          1082,
+          1082,
+          16,
+          16,
+          16,
+          16,
+          16
+        ],
+        "rows": [
+          [
+            "r0",
+            "empty",
+            null,
+            null,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            "r1",
+            "(,)",
+            null,
+            null,
+            false,
+            false,
+            false,
+            true,
+            true
+          ],
+          [
+            "r10",
+            "[infinity,infinity]",
+            "infinity",
+            "infinity",
+            false,
+            true,
+            true,
+            false,
+            false
+          ],
+          [
+            "r2",
+            "[2025-01-01,2025-02-01)",
+            "2025-01-01",
+            "2025-02-01",
+            false,
+            true,
+            false,
+            false,
+            false
+          ],
+          [
+            "r3",
+            "[2025-01-01,2025-02-02)",
+            "2025-01-01",
+            "2025-02-02",
+            false,
+            true,
+            false,
+            false,
+            false
+          ],
+          [
+            "r4",
+            "[2025-01-02,2025-02-02)",
+            "2025-01-02",
+            "2025-02-02",
+            false,
+            true,
+            false,
+            false,
+            false
+          ],
+          [
+            "r5",
+            "empty",
+            null,
+            null,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            "r6",
+            "[2024-02-28,2024-03-01)",
+            "2024-02-28",
+            "2024-03-01",
+            false,
+            true,
+            false,
+            false,
+            false
+          ],
+          [
+            "r7",
+            "[infinity,)",
+            "infinity",
+            null,
+            false,
+            true,
+            false,
+            false,
+            true
+          ],
+          [
+            "r8",
+            "(infinity,)",
+            "infinity",
+            null,
+            false,
+            false,
+            false,
+            false,
+            true
+          ],
+          [
+            "r9",
+            "(-infinity,2025-01-02)",
+            "-infinity",
+            "2025-01-02",
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT DISTINCT value FROM range_daterange ORDER BY value",
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          3912
+        ],
+        "rows": [
+          [
+            "empty"
+          ],
+          [
+            "(,)"
+          ],
+          [
+            "(-infinity,2025-01-02)"
+          ],
+          [
+            "[2024-02-28,2024-03-01)"
+          ],
+          [
+            "[2025-01-01,2025-02-01)"
+          ],
+          [
+            "[2025-01-01,2025-02-02)"
+          ],
+          [
+            "[2025-01-02,2025-02-02)"
+          ],
+          [
+            "[infinity,infinity]"
+          ],
+          [
+            "[infinity,)"
+          ],
+          [
+            "(infinity,)"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT value,COUNT(*) AS n FROM range_daterange GROUP BY value ORDER BY value",
+      "output": {
+        "columns": [
+          "value",
+          "n"
+        ],
+        "column_oids": [
+          3912,
+          20
+        ],
+        "rows": [
+          [
+            "empty",
+            2
+          ],
+          [
+            "(,)",
+            1
+          ],
+          [
+            "(-infinity,2025-01-02)",
+            1
+          ],
+          [
+            "[2024-02-28,2024-03-01)",
+            1
+          ],
+          [
+            "[2025-01-01,2025-02-01)",
+            1
+          ],
+          [
+            "[2025-01-01,2025-02-02)",
+            1
+          ],
+          [
+            "[2025-01-02,2025-02-02)",
+            1
+          ],
+          [
+            "[infinity,infinity]",
+            1
+          ],
+          [
+            "[infinity,)",
+            1
+          ],
+          [
+            "(infinity,)",
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT id FROM range_daterange WHERE value && '[2025-01-01,2025-02-01)'::daterange ORDER BY id",
+      "output": {
+        "columns": [
+          "id"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "r1"
+          ],
+          [
+            "r2"
+          ],
+          [
+            "r3"
+          ],
+          [
+            "r4"
+          ],
+          [
+            "r9"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT id,value,lower(value) AS lower_bound,upper(value) AS upper_bound,isempty(value) AS empty,lower_inc(value) AS lower_inc,upper_inc(value) AS upper_inc,lower_inf(value) AS lower_inf,upper_inf(value) AS upper_inf FROM range_tsrange ORDER BY id",
+      "output": {
+        "columns": [
+          "id",
+          "value",
+          "lower_bound",
+          "upper_bound",
+          "empty",
+          "lower_inc",
+          "upper_inc",
+          "lower_inf",
+          "upper_inf"
+        ],
+        "column_oids": [
+          25,
+          3908,
+          1114,
+          1114,
+          16,
+          16,
+          16,
+          16,
+          16
+        ],
+        "rows": [
+          [
+            "r0",
+            "empty",
+            null,
+            null,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            "r1",
+            "(,)",
+            null,
+            null,
+            false,
+            false,
+            false,
+            true,
+            true
+          ],
+          [
+            "r2",
+            "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")",
+            "2025-01-01 00:00:00",
+            "2025-01-02 00:00:00",
+            false,
+            true,
+            false,
+            false,
+            false
+          ],
+          [
+            "r3",
+            "[\"2025-01-01 00:00:00\",\"2025-01-01 00:00:00\"]",
+            "2025-01-01 00:00:00",
+            "2025-01-01 00:00:00",
+            false,
+            true,
+            true,
+            false,
+            false
+          ],
+          [
+            "r4",
+            "[infinity,)",
+            "infinity",
+            null,
+            false,
+            true,
+            false,
+            false,
+            true
+          ],
+          [
+            "r5",
+            "(-infinity,infinity)",
+            "-infinity",
+            "infinity",
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            "r6",
+            "[\"2000-01-01 00:00:00.000001\",\"2000-01-01 00:00:00.000002\")",
+            "2000-01-01 00:00:00.000001",
+            "2000-01-01 00:00:00.000002",
+            false,
+            true,
+            false,
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT DISTINCT value FROM range_tsrange ORDER BY value",
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          3908
+        ],
+        "rows": [
+          [
+            "empty"
+          ],
+          [
+            "(,)"
+          ],
+          [
+            "(-infinity,infinity)"
+          ],
+          [
+            "[\"2000-01-01 00:00:00.000001\",\"2000-01-01 00:00:00.000002\")"
+          ],
+          [
+            "[\"2025-01-01 00:00:00\",\"2025-01-01 00:00:00\"]"
+          ],
+          [
+            "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")"
+          ],
+          [
+            "[infinity,)"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT value,COUNT(*) AS n FROM range_tsrange GROUP BY value ORDER BY value",
+      "output": {
+        "columns": [
+          "value",
+          "n"
+        ],
+        "column_oids": [
+          3908,
+          20
+        ],
+        "rows": [
+          [
+            "empty",
+            1
+          ],
+          [
+            "(,)",
+            1
+          ],
+          [
+            "(-infinity,infinity)",
+            1
+          ],
+          [
+            "[\"2000-01-01 00:00:00.000001\",\"2000-01-01 00:00:00.000002\")",
+            1
+          ],
+          [
+            "[\"2025-01-01 00:00:00\",\"2025-01-01 00:00:00\"]",
+            1
+          ],
+          [
+            "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")",
+            1
+          ],
+          [
+            "[infinity,)",
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT id FROM range_tsrange WHERE value && '[2025-01-01 00:00:00,2025-01-02 00:00:00)'::tsrange ORDER BY id",
+      "output": {
+        "columns": [
+          "id"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "r1"
+          ],
+          [
+            "r2"
+          ],
+          [
+            "r3"
+          ],
+          [
+            "r5"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT id,value,lower(value) AS lower_bound,upper(value) AS upper_bound,isempty(value) AS empty,lower_inc(value) AS lower_inc,upper_inc(value) AS upper_inc,lower_inf(value) AS lower_inf,upper_inf(value) AS upper_inf FROM range_tstzrange ORDER BY id",
+      "output": {
+        "columns": [
+          "id",
+          "value",
+          "lower_bound",
+          "upper_bound",
+          "empty",
+          "lower_inc",
+          "upper_inc",
+          "lower_inf",
+          "upper_inf"
+        ],
+        "column_oids": [
+          25,
+          3910,
+          1184,
+          1184,
+          16,
+          16,
+          16,
+          16,
+          16
+        ],
+        "rows": [
+          [
+            "r0",
+            "empty",
+            null,
+            null,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            "r1",
+            "(,)",
+            null,
+            null,
+            false,
+            false,
+            false,
+            true,
+            true
+          ],
+          [
+            "r2",
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")",
+            "2025-01-01 00:00:00+00",
+            "2025-01-02 00:00:00+00",
+            false,
+            true,
+            false,
+            false,
+            false
+          ],
+          [
+            "r3",
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")",
+            "2025-01-01 00:00:00+00",
+            "2025-01-02 00:00:00+00",
+            false,
+            true,
+            false,
+            false,
+            false
+          ],
+          [
+            "r4",
+            "[infinity,)",
+            "infinity",
+            null,
+            false,
+            true,
+            false,
+            false,
+            true
+          ],
+          [
+            "r5",
+            "(-infinity,infinity)",
+            "-infinity",
+            "infinity",
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            "r6",
+            "[\"2000-01-01 00:00:00.000001+00\",\"2000-01-01 00:00:00.000002+00\")",
+            "2000-01-01 00:00:00.000001+00",
+            "2000-01-01 00:00:00.000002+00",
+            false,
+            true,
+            false,
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT DISTINCT value FROM range_tstzrange ORDER BY value",
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          3910
+        ],
+        "rows": [
+          [
+            "empty"
+          ],
+          [
+            "(,)"
+          ],
+          [
+            "(-infinity,infinity)"
+          ],
+          [
+            "[\"2000-01-01 00:00:00.000001+00\",\"2000-01-01 00:00:00.000002+00\")"
+          ],
+          [
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")"
+          ],
+          [
+            "[infinity,)"
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT value,COUNT(*) AS n FROM range_tstzrange GROUP BY value ORDER BY value",
+      "output": {
+        "columns": [
+          "value",
+          "n"
+        ],
+        "column_oids": [
+          3910,
+          20
+        ],
+        "rows": [
+          [
+            "empty",
+            1
+          ],
+          [
+            "(,)",
+            1
+          ],
+          [
+            "(-infinity,infinity)",
+            1
+          ],
+          [
+            "[\"2000-01-01 00:00:00.000001+00\",\"2000-01-01 00:00:00.000002+00\")",
+            1
+          ],
+          [
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")",
+            2
+          ],
+          [
+            "[infinity,)",
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT id FROM range_tstzrange WHERE value && '[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)'::tstzrange ORDER BY id",
+      "output": {
+        "columns": [
+          "id"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "r1"
+          ],
+          [
+            "r2"
+          ],
+          [
+            "r3"
+          ],
+          [
+            "r5"
+          ]
+        ]
+      }
+    }
+  ],
+  "rejected": [
+    {
+      "id": "sql-0683",
+      "sql": "ALTER TABLE usage_records\n  ADD COLUMN valid_from numeric NOT NULL,\n  ADD COLUMN valid_to numeric NOT NULL,\n  ADD PERIOD FOR valid_time (valid_from, valid_to),\n  ADD CONSTRAINT usage_records_tenant_valid_key UNIQUE (tenant_id, valid_time WITHOUT OVERLAPS);",
+      "sqlstate": "42601"
+    }
+  ]
+}

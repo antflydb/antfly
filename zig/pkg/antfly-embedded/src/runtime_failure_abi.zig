@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 65;
+pub const abi_version: u32 = 75;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -797,6 +797,69 @@ pub const Status = enum(u32) {
     unsupported_exact_sort = 838,
     invalid_document_checkpoint = 839,
     too_many_active_jobs = 840,
+    catalog_occupancy_not_ready = 841,
+    immutable_relational_index_definition_conflict = 842,
+    invalid_index_publication_candidate = 843,
+    invalid_private_index_cancellation = 844,
+    invalid_private_index_claim_inventory = 845,
+    invalid_private_index_claim_receipt = 846,
+    invalid_private_index_inputs = 847,
+    invalid_private_index_native_receipt = 848,
+    invalid_private_index_owner_job = 849,
+    invalid_relational_index_progress = 850,
+    missing_relational_index_definitions = 851,
+    private_index_cancellation_pending = 852,
+    private_index_cancellation_required = 853,
+    private_index_job_required = 854,
+    private_index_owner_job_changed = 855,
+    private_index_publication_canceled = 856,
+    private_index_publication_required = 857,
+    relational_index_catalog_schema_mismatch = 858,
+    sql_invalid_power_argument = 859,
+    invalid_schema_reader_requirements = 860,
+    private_index_root_recovery_required = 861,
+    invalid_relational_index_budget = 862,
+    private_index_claim_backlog_full = 863,
+    unsupported_native_index_owner = 864,
+    invalid_schema_validation_job = 865,
+    schema_validation_job_changed = 866,
+    schema_validation_job_required = 867,
+    schema_validation_runtime_recovery_required = 868,
+    invalid_schema_owner_control = 869,
+    invalid_schema_validation_page_command = 870,
+    invalid_nullability_replay = 871,
+    schema_validation_canceled = 872,
+    schema_validation_not_ready = 873,
+    schema_validation_publication_required = 874,
+    schema_validation_cancellation_required = 875,
+    invalid_ordered_apply_receipt = 876,
+    conflicting_ordered_apply_receipt = 877,
+    index_owner_receipt_changed = 878,
+    invalid_sql_view_record = 879,
+    sql_view_cycle = 880,
+    sql_view_column_rename = 881,
+    sql_view_column_type_changed = 882,
+    sql_view_column_dropped = 883,
+    sql_dependent_objects_exist = 884,
+    sql_program_limit_exceeded = 885,
+    relational_check_violation = 886,
+    foreign_key_match_full_violation = 887,
+    conflicting_data_apply_batch = 888,
+    invalid_data_apply_batch = 889,
+    split_source_projection_not_ready = 890,
+    apply_store_group_retired = 891,
+    apply_store_shutting_down = 892,
+    schema_validation_command_rejected = 893,
+    schema_validation_preparation_changed = 894,
+    corrupt_schema_apply_outcome = 895,
+    invalid_native_backup_origin = 896,
+    native_backup_origin_mismatch = 897,
+    sequence_catalog_state_required = 898,
+    undefined_column = 899,
+    foreign_key_validation_required = 900,
+    temporal_overlap_violation = 901,
+    temporal_empty_range = 902,
+    table_transition_active = 903,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -836,13 +899,27 @@ pub const FailureIdentity = extern struct {
     }
 };
 
+test "concurrent main and SQL statuses retain distinct wire identities" {
+    const std_test = @import("std");
+    try std_test.testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
+    try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.document_artifact_publication_failed));
+    try std_test.testing.expectEqual(@as(u32, 834), @backingInt(Status.grouped_source_owner_changed));
+    try std_test.testing.expectEqual(@as(u32, 838), @backingInt(Status.catalog_occupancy_not_ready));
+}
+
+test "released native value search Status identifiers retain their numeric values" {
+    const testing = @import("std").testing;
+    try testing.expectEqual(@as(u32, 835), @backingInt(Status.value_verification_requires_scan));
+    try testing.expectEqual(@as(u32, 836), @backingInt(Status.value_verification_limit_exceeded));
+}
+
 test "released main Status identifiers retain their exact names and numeric values" {
     @setEvalBranchQuota(10_000);
     const std_test = @import("std");
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Status).@"enum".field_names, @typeInfo(Status).@"enum".field_values) |reflected_name, field_value| {
-        if (field_value <= 532) {
+        if (field_value <= 837) {
             for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
             std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
@@ -850,6 +927,6 @@ test "released main Status identifiers retain their exact names and numeric valu
             count += 1;
         }
     }
-    try std_test.testing.expectEqual(@as(usize, 464), count);
-    try std_test.testing.expectEqual(@as(u64, 0x6c3bb5270c6956ea), fingerprint);
+    try std_test.testing.expectEqual(@as(usize, 768), count);
+    try std_test.testing.expectEqual(@as(u64, 0x3d720d41936e164f), fingerprint);
 }

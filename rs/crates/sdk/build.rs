@@ -73,6 +73,7 @@ fn expand_sql_default_error_responses(spec: &mut serde_yaml::Value) {
                 "prepareSQL",
                 "executePreparedSQL",
                 "closePreparedSQL",
+                "getSQLCatalogOperation",
             ]
             .contains(&id)
             {
@@ -317,27 +318,39 @@ properties:
 "#,
     )
     .unwrap();
-    spec.get_mut("components")
+    let schemas = spec
+        .get_mut("components")
         .and_then(|value| value.get_mut("schemas"))
         .and_then(serde_yaml::Value::as_mapping_mut)
-        .expect("OpenAPI components.schemas must be a mapping")
-        .insert(
-            serde_yaml::Value::String("CreateIndexError".to_owned()),
-            create_index_error,
-        );
+        .expect("OpenAPI components.schemas must be a mapping");
+    schemas.insert(
+        serde_yaml::Value::String("CreateIndexError".to_owned()),
+        create_index_error,
+    );
+    // Preserve uncertain execution receipts and SQLSTATE by referencing the
+    // public spec models, rather than inventing a second receipt envelope.
+    schemas.insert(serde_yaml::Value::String("SQLExecutionFailure".into()), serde_yaml::from_str(
+        "oneOf:\n  - $ref: '#/components/schemas/SQLDiagnostic'\n  - $ref: '#/components/schemas/SQLResponse'\n"
+    ).unwrap());
 
     if let Some(paths) = spec.get_mut("paths").and_then(|p| p.as_mapping_mut()) {
         for (_path, methods) in paths.iter_mut() {
             if let Some(methods) = methods.as_mapping_mut() {
                 for (_method, operation) in methods.iter_mut() {
-                    let error_type = if operation
+                    let error_type = match operation
                         .get("operationId")
                         .and_then(|value| value.as_str())
-                        == Some("createIndex")
                     {
-                        "CreateIndexError"
-                    } else {
-                        "Error"
+                        Some("createIndex") => "CreateIndexError",
+                        Some("executeSQL" | "executePreparedSQL") => "SQLExecutionFailure",
+                        Some(
+                            "openSQLConnection"
+                            | "closeSQLConnection"
+                            | "prepareSQL"
+                            | "closePreparedSQL"
+                            | "getSQLCatalogOperation",
+                        ) => "SQLDiagnostic",
+                        _ => "Error",
                     };
                     let error_schema: serde_yaml::Value = serde_yaml::from_str(&format!(
                         "content:\n  application/json:\n    schema:\n      $ref: '#/components/schemas/{error_type}'\n"

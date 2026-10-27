@@ -53,6 +53,10 @@ pub fn rangesFor(alloc: std.mem.Allocator, snapshot: @import("../metadata/api.zi
 }
 
 pub fn ownerFences(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, id: publication.Id, table: records.TableRecord, ranges: []const records.RangeRecord, role: topology.Role) ![]topology.Fence {
+    return ownerFencesWithCoverage(server, alloc, context, id, table, ranges, role, .legacy);
+}
+
+pub fn ownerFencesWithCoverage(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, id: publication.Id, table: records.TableRecord, ranges: []const records.RangeRecord, role: topology.Role, coverage: publication.CatalogCoverage) ![]topology.Fence {
     const reads = server.table_reads orelse return error.UnsupportedOperation;
     const fences = try alloc.alloc(topology.Fence, ranges.len);
     for (ranges, fences) |range, *fence| {
@@ -63,8 +67,9 @@ pub fn ownerFences(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
             .cancellation = context.cancellation,
         }, .read_index)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
-        const Native = struct { namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+        const Native = struct { namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace, catalog_digest: [32]u8, next_epoch: u64, catalog_checks_identity_supported: bool = false };
         const native = try std.json.parseFromSliceLeaky(Native, alloc, response.json, .{ .ignore_unknown_fields = true });
+        if (coverage == .checks_v1 and !native.catalog_checks_identity_supported) return error.TableTopologyProtocolUpgradeRequired;
         if (native.namespace.table_id != table.table_id or
             native.namespace.shard_id != metadata.rangeDocIdentityShardId(range) or
             native.namespace.range_id != metadata.rangeDocIdentityRangeId(range)) return error.TableGenerationChanged;
@@ -95,6 +100,24 @@ fn childCatalogB64(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
 }
 
 pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, before: records.TableRecord, proposed_schema_json: []const u8) !publication.Plan {
+    return buildWithConstraintNameGuard(server, alloc, context, identity, before, proposed_schema_json, null);
+}
+
+pub fn buildWithConstraintNameGuard(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, before: records.TableRecord, proposed_schema_json: []const u8, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !publication.Plan {
+    return buildControlled(server, alloc, context, identity, before, proposed_schema_json, guard, null);
+}
+
+pub fn buildSqlDrop(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, before: records.TableRecord, guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !publication.Plan {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, before.schema_json, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGenerationPublication;
+    _ = parsed.value.object.swapRemove("foreign_keys");
+    const target = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(target);
+    return buildControlled(server, alloc, context, identity, before, target, null, guard);
+}
+
+fn buildControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, before: records.TableRecord, proposed_schema_json: []const u8, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard, sql_drop: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !publication.Plan {
     try context.ensureActive();
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
@@ -102,10 +125,13 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
         if (table.table_id == before.table_id and std.mem.eql(u8, table.name, before.name)) break table;
     } else return error.CatalogGenerationChanged;
     if (!metadata.tableDefinitionsEqual(current, before)) return error.CatalogGenerationChanged;
-    const after = try tables.prepareForeignKeyPublicationRecord(alloc, &current, proposed_schema_json);
+    const after = if (sql_drop != null)
+        try tables.prepareSqlDropPublicationRecord(alloc, &current, proposed_schema_json)
+    else
+        try tables.prepareForeignKeyPublicationRecord(alloc, &current, proposed_schema_json);
     const catalog_b64 = try childCatalogB64(server, alloc, current);
     const derived = try publication.deriveTransitions(alloc, current.table_id, current.name, current.schema_json, after.schema_json, catalog_b64);
-    if (derived.len == 0) return error.InvalidGenerationPublication;
+    if (derived.len == 0 and sql_drop == null) return error.InvalidGenerationPublication;
     var id: publication.Id = undefined;
     const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
     while (true) {
@@ -116,7 +142,7 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
     const self_parent = for (derived) |item| {
         if (std.mem.eql(u8, item.parent_table_name, current.name)) break true;
     } else false;
-    const child_fences = try ownerFences(server, alloc, context, id, current, child_ranges, if (self_parent) .child_generation_dual else .child_generation_source);
+    const child_fences = try ownerFencesWithCoverage(server, alloc, context, id, current, child_ranges, if (self_parent) .child_generation_dual else .child_generation_source, .checks_v1);
     var parents: std.ArrayList(publication.Parent) = .empty;
     for (derived) |item| {
         const parent_table = for (snapshot.tables) |table| {
@@ -130,15 +156,21 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
             break;
         };
         if (found == null) {
-            const names = try server.logicalTableNamesInArena(alloc, context, &.{parent_table.name});
-            if (names.len != 1 or !try server_mod.tablePermissionCurrentlyAllowed(identity, names[0], .admin) or
-                try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null) return error.Forbidden;
+            // A child owner may retire its own outgoing references without
+            // parent administration. The DROP-only plan validates every edge
+            // against the exact child schema and permits no successor grant.
+            // All ordinary FK schema changes retain parent authorization.
+            if (sql_drop == null) {
+                const names = try server.logicalTableNamesInArena(alloc, context, &.{parent_table.name});
+                if (names.len != 1 or !try server_mod.tablePermissionCurrentlyAllowed(identity, names[0], .admin) or
+                    try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null) return error.Forbidden;
+            }
             const dual = parent_table.table_id == current.table_id;
             const parent_ranges = if (dual) child_ranges else try rangesFor(alloc, snapshot, parent_table.table_id);
             try parents.append(alloc, .{
                 .table = try ownedTableForPlan(alloc, parent_table),
                 .ranges = parent_ranges,
-                .fences = if (dual) child_fences else try ownerFences(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent),
+                .fences = if (dual) child_fences else try ownerFencesWithCoverage(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent, .checks_v1),
                 .transitions = &.{},
             });
             found = &parents.items[parents.items.len - 1];
@@ -164,6 +196,7 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
         parent.transitions = sorted;
     }
     const result: publication.Plan = .{
+        .historical_reference_coverage = true,
         .id = id,
         .child_before = try ownedTableForPlan(alloc, current),
         .child_after = after,
@@ -171,6 +204,9 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
         .child_ranges = child_ranges,
         .child_fences = child_fences,
         .parents = try parents.toOwnedSlice(alloc),
+        .constraint_name_guard = if (guard) |value| try value.clone(alloc) else null,
+        .sql_drop = if (sql_drop) |value| try value.clone(alloc) else null,
+        .catalog_coverage = .checks_v1,
     };
     try result.validate(alloc);
     return result;

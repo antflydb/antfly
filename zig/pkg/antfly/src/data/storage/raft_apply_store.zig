@@ -640,8 +640,14 @@ pub const RaftApplyStore = struct {
                 .prepare_snapshot = prepareSnapshot,
                 .install_snapshot = installSnapshotFromRaft,
                 .apply_batch = applyBatch,
+                .requires_apply_delegate = requiresApplyDelegate,
             },
         };
+    }
+
+    fn requiresApplyDelegate(ptr: *anyopaque) bool {
+        const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        return self.native_source_delegate;
     }
 
     pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedDataBatch {
@@ -678,6 +684,31 @@ pub const RaftApplyStore = struct {
         try self.requireTransitionReadyLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return 0;
         return try shard_state_store.currentRaftBatchProtocolVersion(&group_store.store, self.alloc, group_id);
+    }
+
+    /// Control-lane point read of an exact durable normal entry. Missing retained
+    /// bytes/identity are not evidence of noncommit and never authorize replay.
+    /// No legacy identity fallback is permitted for this recovery capability.
+    pub fn committedNormalEntry(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, max_bytes: usize) ![]u8 {
+        if (group_id == 0 or term == 0 or index == 0 or max_bytes == 0 or
+            max_bytes > @import("../../storage/data_raft_projection_wire.zig").max_committed_entry_bytes) return error.InvalidDataApplyBatch;
+        const io = self.runtimeIo();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return error.NotFound;
+        var read = try group_store.store.beginReadTxn();
+        defer read.abort();
+        var identity_buf: [176]u8 = undefined;
+        const identity = try read.getLeased(try entryIdentityKeyForGroup(&identity_buf, group_id, index));
+        if (identity.len < 9 or std.mem.readInt(u64, identity[0..8], .little) != term or
+            identity[8] != @backingInt(raft_engine.core.types.EntryType.normal)) return error.ConflictingDataApplyBatch;
+        var normal_buf: [160]u8 = undefined;
+        const bytes = try read.getLeased(try normalEntryKeyForGroup(&normal_buf, group_id, index));
+        if (bytes.len > max_bytes) return error.InvalidDataApplyBatch;
+        if (identity.len != 9 and !std.mem.eql(u8, identity[9..], bytes)) return error.ConflictingDataApplyBatch;
+        return alloc.dupe(u8, bytes);
     }
 
     pub fn appliedNormalEntries(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]AppliedNormalEntry {
@@ -1509,6 +1540,7 @@ pub const RaftApplyStore = struct {
     pub const PreparedSnapshotFile = struct {
         path: []u8,
         size: u64,
+        application_manifest: []u8 = &.{},
     };
 
     pub const NativeSnapshotSource = struct {
@@ -1517,6 +1549,10 @@ pub const RaftApplyStore = struct {
         applied_index: u64,
         size: u64,
         write: *const fn (*anyopaque, *std.Io.Writer, *const std.atomic.Value(bool)) anyerror!void,
+        /// Allocator-owned bounded provenance for the stream just written;
+        /// arguments are its actual offset and total file size. The callback
+        /// must never recapture live state or claim artifact publication.
+        application_manifest: ?*const fn (*anyopaque, std.mem.Allocator, u64, u64) anyerror![]u8 = null,
         deinit: *const fn (*anyopaque) void,
     };
 
@@ -1526,6 +1562,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         applied_index: u64,
         requires_native: bool,
+        group_protocol_version: u16 = 0,
         native: ?NativeSnapshotSource = null,
         cancelled: std.atomic.Value(bool) = .init(false),
 
@@ -1554,12 +1591,14 @@ pub const RaftApplyStore = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const materialized = try self.materializeFile(alloc);
             defer alloc.free(materialized.path);
+            defer alloc.free(materialized.application_manifest);
             errdefer std.Io.Dir.cwd().deleteFile(self.owner.runtimeIo(), materialized.path) catch {};
-            return .{ .artifact = try raft_storage_mod.file_snapshot_artifact.FileSnapshotArtifact.create(
+            return .{ .artifact = try raft_storage_mod.file_snapshot_artifact.FileSnapshotArtifact.createWithApplicationManifest(
                 alloc,
                 self.owner.runtimeIo(),
                 materialized.path,
                 materialized.size,
+                materialized.application_manifest,
             ) };
         }
 
@@ -1579,6 +1618,7 @@ pub const RaftApplyStore = struct {
             errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
             var size: u64 = 0;
+            var native_offset: u64 = 0;
             {
                 var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
                 defer file.close(io);
@@ -1588,6 +1628,7 @@ pub const RaftApplyStore = struct {
                     try shard_state_store.writeNativeSnapshotPrefixTxn(&self.txn, alloc, self.group_id, &writer.interface, native.size, &self.cancelled);
                     try writer.interface.flush();
                     const prefix_size = (try file.stat(io)).size;
+                    native_offset = prefix_size;
                     try native.write(native.ptr, &writer.interface, &self.cancelled);
                     try writer.interface.flush();
                     if ((try file.stat(io)).size -| prefix_size != native.size) return error.InvalidGroupStateSnapshot;
@@ -1598,7 +1639,15 @@ pub const RaftApplyStore = struct {
                 try file.sync(io);
                 size = (try file.stat(io)).size;
             }
-            return .{ .path = path, .size = size };
+            const manifest: []u8 = if (self.native) |native|
+                if (native.application_manifest) |get| try get(native.ptr, alloc, native_offset, size) else &.{}
+            else
+                &.{};
+            if (manifest.len > raft_engine.runtime.storage_iface.SnapshotArtifact.max_application_manifest_bytes) {
+                alloc.free(manifest);
+                return error.SnapshotPayloadTooLarge;
+            }
+            return .{ .path = path, .size = size, .application_manifest = manifest };
         }
 
         fn cancelSource(ptr: *anyopaque) void {
@@ -1649,7 +1698,8 @@ pub const RaftApplyStore = struct {
 
         var txn = try group_store.store.beginReadTxn();
         errdefer txn.abort();
-        const requires_native = try shard_state_store.snapshotRequiresNativePrimary(&txn, self.alloc, group_id);
+        const protocol_version = try shard_state_store.snapshotProtocolVersion(&txn, self.alloc, group_id);
+        const requires_native = protocol_version >= @import("../../common/data_raft_protocol.zig").batch_native_snapshot_protocol_version;
 
         const readers = try shard.snapshot_readers.getOrPut(self.alloc, group_id);
         if (!readers.found_existing) readers.value_ptr.* = 0;
@@ -1665,6 +1715,7 @@ pub const RaftApplyStore = struct {
             .group_id = group_id,
             .applied_index = applied_index,
             .requires_native = requires_native,
+            .group_protocol_version = protocol_version,
         };
         return prepared;
     }
@@ -2055,7 +2106,7 @@ pub const RaftApplyStore = struct {
             .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
             .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
             .merge_page_fence => |payload| alloc.free(payload),
-            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
+            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .require_raft_batch_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
         }
     }
 
@@ -2109,7 +2160,7 @@ pub const RaftApplyStore = struct {
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
                 .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
                 .merge_page_fence => |payload| alloc.free(payload),
-                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
+                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .require_raft_batch_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
             };
             operations.deinit(alloc);
         }
@@ -2388,6 +2439,20 @@ pub const RaftApplyStore = struct {
     ) !void {
         const operation_start = operations.items.len;
         var topology_guarded = false;
+        if (@import("../schema_control_log.zig").looksLikeEnvelope(data)) {
+            // Reserved binary controls cannot fall through the legacy parser
+            // as an empty successful entry, including projection-only owners.
+            var schema = try @import("../schema_control_log.zig").decode(alloc, data);
+            defer schema.deinit();
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            // Keep the writer version unadvertised until native prepared
+            // dispatch is wired. The persisted barrier must gate this family.
+            try operations.append(alloc, .{ .require_raft_batch_protocol = .{
+                .version = @import("../schema_control_log.zig").protocol_version,
+                .owner_group_id = schema.command.binding.fence.owner_group_id,
+            } });
+            return;
+        }
         if (!data_raft_batch.looksLikeEnvelope(data)) {
             if (try parseDataOperation(alloc, data)) |operation| {
                 switch (operation) {
@@ -2414,6 +2479,14 @@ pub const RaftApplyStore = struct {
         defer decoded.deinit(alloc);
         if (decoded.protocol_barrier_version) |version| {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
+            return;
+        }
+        if (decoded.batch.req.relational_index_owner_control) |command| {
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try operations.append(alloc, .{ .require_raft_batch_protocol = .{
+                .version = data_raft_batch.index_owner_control_protocol_version,
+                .owner_group_id = command.fence().owner_group_id,
+            } });
             return;
         }
         const native_transfer = decoded.batch.req.restore_staging != null or
@@ -2571,6 +2644,33 @@ pub const RaftApplyStore = struct {
         if (topology_guarded) try operations.append(alloc, .topology_end);
     }
 };
+
+test "data raft schema controls cannot advance projection state before native decoder activation" {
+    const a = std.testing.allocator;
+    const schema = @import("../schema_control_log.zig");
+    try std.testing.expect(schema.protocol_version > @import("../../common/data_raft_protocol.zig").batch_protocol_version);
+    const command = try schema.testing.command().encodeRaft(a);
+    defer a.free(command);
+    const frame = try schema.encode(a, "rows", 11, command);
+    defer a.free(frame);
+    const entries = try raft_state_machine.encodeCommittedEntries(a, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = frame }});
+    defer a.free(entries);
+    for ([_]bool{ false, true }) |native| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(path);
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path, .native_source_delegate = native });
+        defer store.deinit();
+        const request: raft_state_machine.ApplyBatch = .{ .group_id = 72, .commit_index = 1, .entries_bytes = entries };
+        try std.testing.expectError(if (native) error.UnsupportedBatchProtocolVersion else error.StorageKernelOwnerUnavailable, store.snapshotBuilder().applyBatch(request));
+        try std.testing.expect(try store.latestBatch(72) == null);
+        const retained = try store.appliedNormalEntries(a, 72);
+        defer a.free(retained);
+        try std.testing.expectEqual(@as(usize, 0), retained.len);
+        try std.testing.expectEqual(@as(u16, 0), try store.raftBatchProtocolVersionForRequest(72));
+    }
+}
 
 test "data raft integrity transfer refuses projection only owners and retains native protocol barrier" {
     const alloc = std.testing.allocator;

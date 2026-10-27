@@ -311,6 +311,18 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_numeric_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, numeric_tests);
     b.step("sql-numeric-test", "Run isolated exact NUMERIC arithmetic row and key contracts").dependOn(&run_numeric_tests.step);
 
+    const temporal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/temporal_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_temporal_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, temporal_tests);
+    b.step("sql-temporal-test", "Verify native typed temporal domains and PostgreSQL binary precision").dependOn(&run_temporal_tests.step);
+
     const exact_float_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("pkg/antfly-embedded/src/common/json_float_decimal.zig"),
@@ -754,6 +766,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
     const owner_tests = antfly_tests_build.addTests(b, .{
+        .native_inference = embedded.native_inference,
         .apple_bridge = if (install_apple_bridge) |install| install.source else null,
         .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,
@@ -804,6 +817,15 @@ pub fn create(b: *std.Build) ?Artifacts {
     model_chunk_step.dependOn(&chunk_error_run.step);
     const error_identity_step = b.step("runtime-error-identities-test", "Validate native error names and model-aware chunk failure transport");
     error_identity_step.dependOn(&chunk_error_run.step);
+    const storage_status_run = b.addRunArtifact(b.addTest(.{
+        .root_module = production_antfly_imports.storage_boundary.failure,
+    }));
+    error_identity_step.dependOn(&storage_status_run.step);
+    const storage_identity_run = b.addRunArtifact(b.addTest(.{
+        .root_module = production_antfly_imports.storage_boundary.identity,
+    }));
+    error_identity_step.dependOn(&storage_identity_run.step);
+    model_chunk_step.dependOn(&storage_status_run.step);
     const error_provider = b.addLibrary(.{ .name = "chunk-error-test-provider", .root_module = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
         .target = target,
@@ -843,6 +865,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     unit_test_step.dependOn(&run_documents_tests.step);
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
+    unit_test_step.dependOn(&run_temporal_tests.step);
     unit_test_step.dependOn(&run_exact_float_tests.step);
     unit_test_step.dependOn(&run_capture_regex_tests.step);
     unit_test_step.dependOn(&run_sql_regex_tests.step);
@@ -1086,6 +1109,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     }
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, lmdb_engine_mod, runtime_library_artifacts);
+    const storage_failure_identity_tests = b.addTest(.{ .root_module = production_antfly_imports.storage_boundary.identity });
+    storage_owner_runs.runs[0].step.dependOn(&b.addRunArtifact(storage_failure_identity_tests).step);
     b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);
     b.step("antfly-storage-owner-source-test", "Run compiled owner source and callback regressions").dependOn(&storage_owner_runs.runs[1].step);
     for (storage_owner_runs.runs) |run| {
@@ -1141,17 +1166,28 @@ pub fn create(b: *std.Build) ?Artifacts {
         6 * 1024 * 1024 * 1024,
     );
 
-    const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
-    if (install_apple_bridge) |install| install_antfly.step.dependOn(&install.step);
+    const install_antfly: *std.Build.Step = if (target.result.os.tag == .macos and optimize == .debug and target.result.cpu.arch == b.graph.host.result.cpu.arch) native_debug: {
+        // The large Debug server exceeds Zig's Mach-O relocation range. Use
+        // the same native final linker as checked owners and storage probes.
+        const native = @import("build_support/embedded/shared_library.zig");
+        const object = b.addObject(.{ .name = "antfly-debug-entry", .root_module = antfly_main.root_module, .use_llvm = true });
+        object.entry = .enabled;
+        object.bundle_compiler_rt = false;
+        object.bundle_ubsan_rt = false;
+        const image = native.nativeExecutableLink(b, object, "antfly");
+        native.addNativeExecutableLinks(b, image, object, antfly_main.root_module);
+        break :native_debug &b.addInstallFileWithDir(image.binary, .bin, antfly_bin_name).step;
+    } else &b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name }).step;
+    if (install_apple_bridge) |install| install_antfly.dependOn(&install.step);
     const install_antfarm_assets = b.addInstallDirectory(.{
         .source_dir = b.path("pkg/antfly/antfarm"),
         .install_dir = .prefix,
         .install_subdir = "share/antfly/antfarm",
     });
-    b.getInstallStep().dependOn(&install_antfly.step);
+    b.getInstallStep().dependOn(install_antfly);
     b.getInstallStep().dependOn(&install_antfarm_assets.step);
     const antfly_step = b.step("antfly", "Build and install the top-level Antfly CLI");
-    antfly_step.dependOn(&install_antfly.step);
+    antfly_step.dependOn(install_antfly);
     antfly_step.dependOn(&install_antfarm_assets.step);
     const cli_licenses = @import("lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly", "share/licenses/antfly");
     antfly_step.dependOn(cli_licenses);

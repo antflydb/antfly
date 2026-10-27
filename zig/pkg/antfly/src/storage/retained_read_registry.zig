@@ -162,6 +162,24 @@ pub const Registry = struct {
         if (resource) |value| value.close(value.ptr);
     }
 
+    /// Extend only an existing immutable cut, never its mutation capture or a
+    /// stateful cursor. The authenticated scope AND original connection must
+    /// match. Expired/revoked cuts cannot be revived even before the sweeper
+    /// reaches them. Renewal is O(1), does not allocate or borrow the resource,
+    /// and can run while a reader holds it without changing that reader's cut.
+    pub fn renewSnapshot(self: *Registry, token: Token, scope: Scope, connection: u128, now_ns: u64, expires_ns: u64) !void {
+        if (expires_ns <= now_ns or expires_ns - now_ns > self.max_lease_ns) return error.InvalidRetainedReadLease;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const index = self.find(token) orelse return error.RetainedReadNotFound;
+        const entry = &self.slots[index].entry.?;
+        if (!std.meta.eql(entry.scope, scope) or connection == 0 or entry.connection != connection) return error.RetainedReadScopeChanged;
+        if (entry.revoked or now_ns >= entry.expires_ns) return error.RetainedReadExpired;
+        if (entry.resource.kind != .snapshot) return error.InvalidRetainedReadKind;
+        // Delayed duplicate heartbeats must not shorten a newer lease.
+        entry.expires_ns = @max(entry.expires_ns, expires_ns);
+    }
+
     /// Bounded maintenance: at most budget slots and callbacks per invocation.
     /// A periodic owner task must call this even when no new RPCs arrive.
     pub fn expire(self: *Registry, now_ns: u64, budget: usize) void {
@@ -259,6 +277,76 @@ test "retained read registry fences identity, bounds admission and defers close 
     registry.expire(100, 2);
     try std.testing.expectEqual(2, counter.closed);
     try std.testing.expectError(error.RetainedReadNotFound, registry.borrow(second, scope, .cursor, 100));
+}
+
+test "retained read snapshot renewal preserves borrowed cuts and never shortens leases" {
+    const Counter = struct {
+        closed: usize = 0,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+        }
+    };
+    var counter: Counter = .{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, 7, 1, 1, 100);
+    defer registry.deinit();
+    const scope = Scope{ .principal = @splat(7), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    const token = try registry.insert(scope, 10, 1, 50, .{ .ptr = &counter, .close = Counter.close, .kind = .snapshot, .cancellation = &cancelled });
+    var active = try registry.borrow(token, scope, .snapshot, 40);
+    defer active.deinit();
+    try registry.renewSnapshot(token, scope, 10, 40, 140);
+    try registry.renewSnapshot(token, scope, 10, 41, 70);
+    registry.expire(50, 1);
+    try active.validate(139);
+    try std.testing.expect(!cancelled.load(.acquire));
+    try std.testing.expectEqual(0, counter.closed);
+    // Revocation wins over a later renewal, even while destruction waits for
+    // the borrower. It cannot clear cancellation or resurrect the resource.
+    registry.disconnectScoped(scope, 10);
+    try std.testing.expectError(error.RetainedReadExpired, registry.renewSnapshot(token, scope, 10, 139, 239));
+    try std.testing.expect(cancelled.load(.acquire));
+    active.deinit();
+    try std.testing.expectEqual(1, counter.closed);
+    try std.testing.expectError(error.RetainedReadNotFound, registry.renewSnapshot(token, scope, 10, 139, 239));
+}
+
+test "retained read snapshot renewal rejects changed authority stale tokens and mutable resources" {
+    const Cleanup = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, 7, 1, 1, 100);
+    defer registry.deinit();
+    const scope = Scope{ .principal = @splat(7), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    const token = try registry.insert(scope, 10, 1, 50, .{ .ptr = &context, .close = Cleanup.close, .kind = .snapshot });
+    inline for (comptime std.meta.fieldNames(Scope)) |name| {
+        var changed = scope;
+        if (comptime std.mem.eql(u8, name, "principal")) changed.principal[0] += 1 else @field(changed, name) += 1;
+        try std.testing.expectError(error.RetainedReadScopeChanged, registry.renewSnapshot(token, changed, 10, 2, 100));
+    }
+    for ([_]u128{ 0, 11 }) |connection| try std.testing.expectError(error.RetainedReadScopeChanged, registry.renewSnapshot(token, scope, connection, 2, 100));
+    var stale = token;
+    stale.incarnation -= 1;
+    try std.testing.expectError(error.RetainedReadNotFound, registry.renewSnapshot(stale, scope, 10, 2, 100));
+    stale = token;
+    stale.sequence += 1;
+    try std.testing.expectError(error.RetainedReadNotFound, registry.renewSnapshot(stale, scope, 10, 2, 100));
+    try std.testing.expectError(error.InvalidRetainedReadLease, registry.renewSnapshot(token, scope, 10, 2, 2));
+    try std.testing.expectError(error.InvalidRetainedReadLease, registry.renewSnapshot(token, scope, 10, 2, 103));
+    // Expiry is authoritative even when periodic collection has not run.
+    try std.testing.expectError(error.RetainedReadExpired, registry.renewSnapshot(token, scope, 10, 50, 150));
+    try registry.close(token, scope);
+    inline for (.{ Kind.capture, Kind.cursor }) |kind| {
+        const mutable = try registry.insert(scope, 10, 100, 150, .{ .ptr = &context, .close = Cleanup.close, .kind = kind });
+        try std.testing.expectError(error.InvalidRetainedReadKind, registry.renewSnapshot(mutable, scope, 10, 101, 200));
+        try registry.close(mutable, scope);
+    }
+    const replacement = try registry.insert(scope, 10, 100, 150, .{ .ptr = &context, .close = Cleanup.close, .kind = .snapshot });
+    try std.testing.expectError(error.RetainedReadNotFound, registry.renewSnapshot(token, scope, 10, 101, 200));
+    try registry.renewSnapshot(replacement, scope, 10, 101, 200);
+    registry.expire(200, 1);
+    try std.testing.expectError(error.RetainedReadNotFound, registry.renewSnapshot(replacement, scope, 10, 201, 300));
 }
 
 test "retained read registry lost-response cleanup cannot revoke another principal" {

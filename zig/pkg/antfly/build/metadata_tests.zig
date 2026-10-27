@@ -40,6 +40,52 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
+    const presentation_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "SQL COMMENT table descriptions", "SQL COMMENT column", "system catalog resource comments", "system catalog merged service ownership", "system catalog definite naming diagnostics", "system catalog USING rewrite decoder", "system catalog schema reader publication", "schema validation publication text binding", "catalog projection schema reader facts", "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const presentation_run = addFilteredTestRunArtifact(b, presentation_tests);
+    presentation_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sql-presentation-test", "Verify bounded body-authorized SQL presentation mutations")
+        .dependOn(&presentation_run.step);
+    const historical_fk_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "FK historical reference", "system catalog relation namespace transaction FK source epochs", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const historical_fk_run = addFilteredTestRunArtifact(b, historical_fk_tests);
+    historical_fk_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-fk-historical-reference-test", "Verify explicit historical reference decoder capability and legacy publication admission")
+        .dependOn(&historical_fk_run.step);
+    const sequence_counter_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "sequence catalog", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sequence_counter_run = addFilteredTestRunArtifact(b, sequence_counter_tests);
+    sequence_counter_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sequence-counter-test", "Verify bounded sequence counter transactions, exact retry receipts and native cold reopening")
+        .dependOn(&sequence_counter_run.step);
+    const role_default_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "SQL role defaults decoder", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const role_default_run = addFilteredTestRunArtifact(b, role_default_tests);
+    role_default_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sql-role-defaults-test", "Verify role default decoder admission, apply, restore and cold replay barriers").dependOn(&role_default_run.step);
+    const sql_column_identity_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "system catalog resource comments", "system catalog SQL column identities", "SQL column identities", "SQL view catalog", "metadata raft apply store snapshot key registry covers every durable projection class", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_column_identity_run = addFilteredTestRunArtifact(b, sql_column_identity_tests);
+    sql_column_identity_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sql-column-identities-test", "Verify durable SQL source attributes with schema publication, Raft replay, snapshots and cold reopen")
+        .dependOn(&sql_column_identity_run.step);
+    b.step("antfly-metadata-sql-view-catalog-test", "Verify view record identity, replacement and source binding contracts alongside durable source attributes")
+        .dependOn(&sql_column_identity_run.step);
     const online_merge_driver_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "metadata.online_merge_driver.", "metadata module compiles" },

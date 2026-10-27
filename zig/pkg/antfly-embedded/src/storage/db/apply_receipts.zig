@@ -45,6 +45,19 @@ pub fn readOrderedApplyReceipt(
         else => return err,
     };
     defer alloc.free(raw);
+    return try decodeOrderedReceipt(raw);
+}
+
+/// Borrow only until decoding finishes; another transaction read may reuse it.
+pub fn readOrderedApplyReceiptTxn(txn: anytype) !?OrderedApplyReceipt {
+    const raw = txn.get(&internal_keys.ordered_document_applied_entry_key) catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
+    };
+    return try decodeOrderedReceipt(raw);
+}
+
+fn decodeOrderedReceipt(raw: []const u8) !OrderedApplyReceipt {
     if (raw.len != ordered_apply_receipt_value_len) return error.CorruptOrderedApplyReceipt;
     const identity: OrderedApplyReceipt = .{
         .term = std.mem.readInt(u64, raw[0..8], .little),
@@ -84,6 +97,18 @@ pub fn readReplicationAppliedSequence(alloc: Allocator, store: *docstore_mod.Doc
         else => return err,
     };
     defer alloc.free(raw);
+    if (raw.len != replication_applied_lsn_value_len) return error.CorruptReplicationAppliedSequence;
+    return std.mem.readInt(u64, raw[0..replication_applied_lsn_value_len], .little);
+}
+
+/// Read within the caller's write transaction so duplicate admission and the
+/// mutation/receipt commit share one serialized view. Consume borrowed bytes
+/// immediately: a subsequent transaction read may reuse its scratch buffer.
+pub fn readReplicationAppliedSequenceTxn(txn: anytype) !u64 {
+    const raw = txn.get(internal_keys.replication_applied_lsn_key[0..]) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
     if (raw.len != replication_applied_lsn_value_len) return error.CorruptReplicationAppliedSequence;
     return std.mem.readInt(u64, raw[0..replication_applied_lsn_value_len], .little);
 }

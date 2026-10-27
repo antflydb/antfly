@@ -107,6 +107,9 @@ pub const Handle = struct {
     row_policy_authority_issuer: ?[]u8 = null,
     storage_owner_group_id: u64 = 0,
     storage_owner_root_generation: u64 = 0,
+    /// One bounded committed schema preparation per physical owner. Its
+    /// registry pin must be drained on the control lane before owner close.
+    storage_owner_schema_preparing: std.atomic.Value(bool) = .init(false),
     storage_owner_context: ?*anyopaque = null,
     storage_owner_transaction_recovery: ?*anyopaque = null,
     storage_owner_runtime_hooks: ?*anyopaque = null,

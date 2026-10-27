@@ -25,6 +25,20 @@ const json_order = @import("json_order.zig");
 const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
+
+/// Caller has crossed canonical array/JSONB admission. Primitive arrays keep
+/// their allocation-free hash; JSONB streams normalized numeric tokens using
+/// the same logical JSON frame as scalar row hashing, with no element DOM.
+pub fn updateLogicalHash(alloc: A, view: layout.View, hasher: *std.crypto.hash.Blake3) !void {
+    if (view.kind != .jsonb) return view.updateLogicalHash(hasher);
+    const Provider = struct {
+        alloc: A,
+        pub fn hashJsonb(self: @This(), hash: *std.crypto.hash.Blake3, bytes: []const u8) !void {
+            try canonical_json.hashCanonicalJsonStorageElement(self.alloc, hash, bytes);
+        }
+    };
+    try view.updateLogicalHashWithJson(hasher, Provider{ .alloc = alloc });
+}
 pub const Options = struct {
     values: arrays.Limits = .{},
     wire_bytes: usize = 8 * 1024 * 1024,
@@ -115,7 +129,7 @@ pub const Prepared = struct {
                 continue;
             }
             const payload = if (value.element_type == .text) element.value.string else blk: {
-                const bytes = try canonical_json.canonicalJsonValueAlloc(scratch, element.value);
+                const bytes = try canonical_json.canonicalJsonbValueAlloc(scratch, element.value, work, options.wire_bytes - size);
                 jsonb[i] = bytes;
                 try work.consume(bytes.len);
                 break :blk bytes;
@@ -457,11 +471,7 @@ fn dupeBytes(a: A, bytes: []const u8, work: *arrays.Budget) ![]u8 {
 
 fn decodeJsonb(a: A, owner: A, bytes: []const u8, work: *arrays.Budget) !std.json.Value {
     var value = try json_order.parseTextLeaky(a, bytes, work);
-    try json_order.validateTextDomain(value, work, 0);
-    const canonical = try canonical_json.canonicalJsonValueAlloc(a, value);
-    defer a.free(canonical);
-    try work.consume(canonical.len);
-    if (try work.orderBytes(bytes, canonical) != .eq) return error.NonCanonicalSqlArrayStorage;
+    if (!try canonical_json.canonicalJsonbValueMatches(a, value, bytes, work)) return error.NonCanonicalSqlArrayStorage;
     try json_order.rehomeArrayAllocators(&value, owner, work, 0);
     return value;
 }
@@ -721,7 +731,7 @@ fn rawVariableFrame(a: A, kind: arrays.ElementType, text: []const u8) ![]u8 {
 
 test "SQL flat array strict JSONB restore rejects equivalent noncanonical bytes without repairing them" {
     const a = std.testing.allocator;
-    for ([_][]const u8{ " 1", "1.0", "{\"b\":1,\"a\":2}", "[1, 2]", "\"\\u0061\"" }) |text| {
+    for ([_][]const u8{ " 1", "1e0", "{\"b\":1,\"a\":2}", "{\"x\":1,\"x\":2}", "[1, 2]", "\"\\u0061\"" }) |text| {
         const bytes = try rawJsonbFrame(a, text);
         defer a.free(bytes);
         _ = try layout.View.open(.jsonb, bytes, .{}); // Directory integrity is insufficient.
@@ -899,7 +909,7 @@ test "SQL flat array rejects truncated corrupt rank directories padding offsets 
     try std.testing.expectError(error.NonCanonicalSqlArrayStorage, layout.View.open(.jsonb, variable, .{}));
 }
 
-test "SQL flat JSONB stored arrays canonicalize in-memory and parsed numeric values identically" {
+test "SQL flat JSONB stored arrays preserve scale but hash logical numeric values identically" {
     const a = std.testing.allocator;
     const pairs = [_]struct { value: std.json.Value, token: ?[]const u8 }{
         .{ .value = .{ .float = 1.0 }, .token = "1.00" },
@@ -918,7 +928,21 @@ test "SQL flat JSONB stored arrays canonicalize in-memory and parsed numeric val
             const parsed = try arrays.Value.init(.jsonb, &.{.{ .length = 1 }}, &.{arrays.Element.json(.{ .number_string = token })}, .{});
             const right = try encodeAlloc(a, parsed, .{});
             defer a.free(right);
-            try std.testing.expectEqualSlices(u8, left, right);
+            const left_view = try validateCanonical(a, .jsonb, left, .{});
+            const right_view = try validateCanonical(a, .jsonb, right, .{});
+            var left_hash = std.crypto.hash.Blake3.init(.{});
+            var right_hash = std.crypto.hash.Blake3.init(.{});
+            try updateLogicalHash(a, left_view, &left_hash);
+            try updateLogicalHash(a, right_view, &right_hash);
+            var left_digest: [32]u8 = undefined;
+            var right_digest: [32]u8 = undefined;
+            left_hash.final(&left_digest);
+            right_hash.final(&right_digest);
+            try std.testing.expectEqualSlices(u8, &left_digest, &right_digest);
+            if (std.mem.eql(u8, token, "1.00") or std.mem.eql(u8, token, "10e-1"))
+                try std.testing.expect(!std.mem.eql(u8, left, right))
+            else
+                try std.testing.expectEqualSlices(u8, left, right);
         }
         _ = try validateCanonical(a, .jsonb, left, .{});
         var decoded = try decode(a, .jsonb, left, .{});
@@ -928,6 +952,117 @@ test "SQL flat JSONB stored arrays canonicalize in-memory and parsed numeric val
     }
     try std.testing.expectError(error.InvalidJsonNumber, canonical_json.canonicalJsonValueAlloc(a, .{ .float = std.math.inf(f64) }));
     try std.testing.expectError(error.InvalidJsonNumber, canonical_json.canonicalJsonValueAlloc(a, .{ .float = std.math.nan(f64) }));
+}
+
+test "SQL flat JSONB persistence preserves PostgreSQL display and null provenance" {
+    const Fixture = struct { entries: []const struct { binary: []const u8, text: []const u8, elements: []const ?[]const u8 } };
+    const a = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("fixtures/sql_jsonb_array_storage_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 5), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        const binary = try a.alloc(u8, entry.binary.len / 2);
+        defer a.free(binary);
+        _ = try std.fmt.hexToBytes(binary, entry.binary);
+        var source = try @import("array_binary.zig").decode(a, .jsonb, binary, .{});
+        defer source.deinit();
+        const bytes = try encodeAlloc(a, source.value, .{});
+        defer a.free(bytes);
+        var stored = try decode(a, .jsonb, bytes, .{});
+        defer stored.deinit();
+        try std.testing.expectEqualSlices(arrays.Dimension, source.value.dimensions, stored.value.dimensions);
+        try std.testing.expectEqual(entry.elements.len, stored.value.elements.len);
+        for (stored.value.elements, entry.elements) |element, expected| {
+            try std.testing.expectEqual(expected == null, element.sql_null);
+            if (expected) |text| {
+                var work: arrays.Budget = .{};
+                const actual = try @import("jsonb_text.zig").format(a, element.value, 1024 * 1024, &work);
+                defer a.free(actual);
+                try std.testing.expectEqualStrings(text, actual);
+            }
+        }
+        const again = try encodeAlloc(a, stored.value, .{});
+        defer a.free(again);
+        try std.testing.expectEqualSlices(u8, bytes, again);
+        var binary_output: std.Io.Writer.Allocating = .init(a);
+        defer binary_output.deinit();
+        try @import("array_binary.zig").encode(a, stored.value, &binary_output.writer, .{});
+        try std.testing.expectEqualSlices(u8, binary, binary_output.written());
+        var text_output: std.Io.Writer.Allocating = .init(a);
+        defer text_output.deinit();
+        try @import("array_text.zig").encode(a, stored.value, &text_output.writer, .{});
+        try std.testing.expectEqualStrings(entry.text, text_output.written());
+    }
+}
+
+test "SQL flat JSONB logical hash normalizes display and remains failure atomic" {
+    const a = std.testing.allocator;
+    const frame = try rawJsonbFrame(a, "{\"a\":[1.20,0.00]}");
+    defer a.free(frame);
+    const equivalent = try rawJsonbFrame(a, "{\"a\":[1.2,0]}");
+    defer a.free(equivalent);
+    const first = try validateCanonical(a, .jsonb, frame, .{});
+    const second = try validateCanonical(a, .jsonb, equivalent, .{});
+    const Faults = struct {
+        fn run(alloc: A, view: layout.View, expected: [32]u8) !void {
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("prior continuation");
+            const before = hash;
+            updateLogicalHash(alloc, view, &hash) catch |err| {
+                var actual: [32]u8 = undefined;
+                var previous: [32]u8 = undefined;
+                hash.final(&actual);
+                before.final(&previous);
+                try std.testing.expectEqualSlices(u8, &previous, &actual);
+                return err;
+            };
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            try std.testing.expectEqualSlices(u8, &expected, &digest);
+        }
+    };
+    var left = std.crypto.hash.Blake3.init(.{});
+    var right = std.crypto.hash.Blake3.init(.{});
+    left.update("prior continuation");
+    right.update("prior continuation");
+    try updateLogicalHash(a, first, &left);
+    try updateLogicalHash(a, second, &right);
+    var expected: [32]u8 = undefined;
+    var actual: [32]u8 = undefined;
+    left.final(&expected);
+    right.final(&actual);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    try std.testing.checkAllAllocationFailures(a, Faults.run, .{ first, expected });
+    // Preserve the existing logical frame: lengths describe the normalized
+    // JSON bytes and an element must not acquire the scalar JSON root tag.
+    const legacy = try rawJsonbFrame(a, "{\"a\":[1.2,0]}");
+    defer a.free(legacy);
+    const legacy_view = try layout.View.open(.jsonb, legacy, .{});
+    const Raw = struct {
+        pub fn hashJsonb(_: @This(), hash: *std.crypto.hash.Blake3, bytes: []const u8) !void {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, bytes.len, .little);
+            hash.update(&length);
+            hash.update(bytes);
+        }
+    };
+    var old = std.crypto.hash.Blake3.init(.{});
+    old.update("prior continuation");
+    try legacy_view.updateLogicalHashWithJson(&old, Raw{});
+    old.final(&actual);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    const json_null_bytes = try rawJsonbFrame(a, "null");
+    defer a.free(json_null_bytes);
+    const sql_null_value = try arrays.Value.init(.jsonb, &.{.{ .length = 1 }}, &.{.{}}, .{});
+    const sql_null_bytes = try encodeAlloc(a, sql_null_value, .{});
+    defer a.free(sql_null_bytes);
+    var json_null_hash = std.crypto.hash.Blake3.init(.{});
+    var sql_null_hash = std.crypto.hash.Blake3.init(.{});
+    try updateLogicalHash(a, try validateCanonical(a, .jsonb, json_null_bytes, .{}), &json_null_hash);
+    try updateLogicalHash(a, try validateCanonical(a, .jsonb, sql_null_bytes, .{}), &sql_null_hash);
+    json_null_hash.final(&expected);
+    sql_null_hash.final(&actual);
+    try std.testing.expect(!std.mem.eql(u8, &expected, &actual));
 }
 
 test "SQL flat array logical hashes exclude dense compact representation choices" {
@@ -1272,7 +1407,7 @@ test "SQL flat array primitive preparation uses one output allocation and cold s
         try std.testing.expectEqual(@as(usize, 1), tracked.alloc_index);
         const view = try layout.View.open(kind, bytes, .{});
         var pg: std.Io.Writer.Discarding = .init(&.{});
-        try @import("array_binary.zig").encode(value, &pg.writer, .{});
+        try @import("array_binary.zig").encode(a, value, &pg.writer, .{});
         try std.testing.expect(bytes.len < pg.count);
         const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
         var total: u64 = 0;
@@ -1319,11 +1454,11 @@ test "SQL compact stored array views preserve codecs operations and owned clones
             var actual: std.Io.Writer.Allocating = .init(a);
             defer actual.deinit();
             if (binary) {
-                try @import("array_binary.zig").encode(source.value, &expected.writer, .{});
-                try @import("array_binary.zig").encode(compact, &actual.writer, .{});
+                try @import("array_binary.zig").encode(a, source.value, &expected.writer, .{});
+                try @import("array_binary.zig").encode(a, compact, &actual.writer, .{});
             } else {
-                try @import("array_text.zig").encode(source.value, &expected.writer, .{});
-                try @import("array_text.zig").encode(compact, &actual.writer, .{});
+                try @import("array_text.zig").encode(a, source.value, &expected.writer, .{});
+                try @import("array_text.zig").encode(a, compact, &actual.writer, .{});
             }
             try std.testing.expectEqualStrings(expected.written(), actual.written());
         }

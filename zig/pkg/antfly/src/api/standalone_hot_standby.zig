@@ -25,6 +25,7 @@ pub const Checkpoint = struct {
     size_bytes: u64,
     sha256: [32]u8,
 };
+pub const CatalogCheckpoint = @import("../system_catalog/projection.zig").CatalogCheckpoint;
 
 pub const Port = struct {
     ptr: *anyopaque,
@@ -41,6 +42,7 @@ pub const Port = struct {
         prepare_checkpoint: *const fn (*anyopaque) anyerror!void,
         apply_record: *const fn (*anyopaque, record.RecordView) anyerror!void,
         capture_checkpoint: *const fn (*anyopaque, std.Io, []const u8) anyerror!Checkpoint,
+        capture_catalog_checkpoint: ?*const fn (*anyopaque, std.mem.Allocator, std.Io, []const u8) anyerror!CatalogCheckpoint = null,
         capture_private: *const fn (*anyopaque, std.mem.Allocator, u64) anyerror!?std.json.Parsed(staging.ProvisioningProjection),
     };
 
@@ -58,6 +60,11 @@ pub const Port = struct {
 
     pub fn captureCheckpoint(self: Port, io: std.Io, path: []const u8) !Checkpoint {
         return BoundaryAbi.call("capture_checkpoint", self.boundary_dispatch, self.vtable.capture_checkpoint, .{ self.ptr, io, path });
+    }
+
+    pub fn captureCatalogCheckpoint(self: Port, alloc: std.mem.Allocator, io: std.Io, path: []const u8) !?CatalogCheckpoint {
+        const callback = self.vtable.capture_catalog_checkpoint orelse return null;
+        return try BoundaryAbi.call("capture_catalog_checkpoint", self.boundary_dispatch, callback, .{ self.ptr, alloc, io, path });
     }
 
     pub fn capturePrivate(self: Port, alloc: std.mem.Allocator, expected_epoch: u64) !?std.json.Parsed(staging.ProvisioningProjection) {

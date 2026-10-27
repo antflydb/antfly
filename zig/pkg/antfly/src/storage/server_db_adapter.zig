@@ -30,6 +30,7 @@ pub fn applyOrdered(
     req: types.BatchRequest,
     identity: types.OrderedApplyReceipt,
 ) anyerror!void {
+    if (req.relational_index_owner_control != null) return error.InvalidBatchRequest;
     const db = physicalOwner(owner);
     const mirror_scoped_restore = requiresDurableLifecycleReplication(req) and db.local_execution.replication_async_batch_mirror != null;
     // Hot standby is process-local and includes this node's Raft follower roots.
@@ -72,6 +73,135 @@ pub fn applyOrdered(
     };
 }
 
+/// The group and position originate in the committed-entry callback, not in
+/// the command. Old replay skips preparation against a newer owner catalog.
+pub fn applyOrderedGroup(owner: anytype, group_id: u64, req: types.BatchRequest, identity: types.OrderedApplyReceipt) anyerror!void {
+    const control = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+    try control.validateBatchRequest(req);
+    const command = req.relational_index_owner_control orelse return applyOrdered(owner, req, identity);
+    const fence = command.fence();
+    if (group_id == 0 or fence.owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
+    const db = physicalOwner(owner);
+    if (!fence.namespace.eql(db.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+    if (try db.orderedMutationAlreadyApplied(identity)) return;
+    applyIndexEffect(db, group_id, command, identity) catch |err| {
+        if (try db.orderedMutationAlreadyApplied(identity)) return;
+        return err;
+    };
+}
+
+fn applyIndexEffect(db: anytype, group_id: u64, command: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Command, identity: types.OrderedApplyReceipt) !void {
+    const local = @import("antfly_local_sources");
+    const prepared_ops = local.storage_db_relational_index_owner_control;
+    switch (command) {
+        .control, .cancel_control => |value| {
+            var prepared = try db.prepareRaftIndexOwnerControl(value);
+            defer prepared.deinit();
+            if (command == .cancel_control) try db.applyCommittedRaftIndexCancellationControl(&prepared, group_id, identity) else try db.applyCommittedRaftIndexOwnerControl(&prepared, group_id, identity);
+        },
+        .cancel_intent => |value| {
+            var prepared = try prepared_ops.PreparedCancellation.init(db.alloc, value);
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexCancellation(&prepared, group_id, identity);
+        },
+        .cancel_cleanup => |value| {
+            var prepared = try prepared_ops.PreparedCleanup.init(db.alloc, value);
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexCancellationCleanup(&prepared, group_id, identity);
+        },
+        .cancel_complete => |value| {
+            var prepared: prepared_ops.PreparedCancellationCompletion = .{ .alloc = db.alloc, .binding = value };
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexCancellationCompletion(&prepared, group_id, identity);
+        },
+        .cancel_artifacts => |value| {
+            var page = try local.storage_db_relational_index_gc.Page.prepareReplay(db.alloc, null, db.core, value);
+            defer if (page) |*selected| selected.deinit();
+            var prepared: prepared_ops.PreparedCancellationGc = .{
+                .binding = value.binding,
+                .work = if (page) |*selected| .{ .artifacts = selected } else .{ .artifact_selection_applied = &value },
+            };
+            try db.applyCommittedRaftIndexCancellationGc(&prepared, group_id, identity);
+        },
+        .cancel_claims => |value| {
+            const claims = local.storage_db_relational_index_owner_job.private_claims;
+            var page = blk: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :blk try claims.GcPage.prepareReplay(db.alloc, null, &read, value);
+            };
+            defer if (page) |*selected| selected.deinit();
+            var prepared: prepared_ops.PreparedCancellationGc = .{
+                .binding = value.binding,
+                .work = if (page) |*selected| .{ .claims = selected } else .{ .claim_selection_applied = &value },
+            };
+            try db.applyCommittedRaftIndexCancellationGc(&prepared, group_id, identity);
+        },
+        .cancel_release => |value| {
+            var prepared = try prepared_ops.PreparedCancellationRelease.init(db.alloc, db.core, value, .{});
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexCancellationRelease(&prepared, group_id, identity);
+        },
+        .build => |value| {
+            var prepared = try prepared_ops.PreparedBuild.replayPrepared(db.alloc, db.core, value);
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexBuild(&prepared, group_id, identity);
+        },
+        .claims => |value| {
+            var prepared = blk: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :blk try prepared_ops.PreparedClaims.init(db.alloc, &read, value);
+            };
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexClaims(&prepared, group_id, identity);
+        },
+        .consume => |value| {
+            var prepared = blk: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :blk try prepared_ops.PreparedConsumption.init(db.alloc, &read, value);
+            };
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexConsumption(&prepared, group_id, identity);
+        },
+        .inventory_validation => |value| {
+            var prepared: prepared_ops.PreparedInventoryValidation = .{ .alloc = db.alloc, .batch = blk: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :blk try local.storage_db_relational_index_owner_job.private_claims.InventoryValidation.Prepared.replay(db.alloc, &read, value);
+            } };
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexInventory(&prepared, group_id, identity);
+        },
+        .generation_validation => |value| {
+            var prepared = try prepared_ops.PreparedGenerationValidation.replay(db.alloc, db.core, value);
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexGeneration(&prepared, group_id, identity);
+        },
+        .validation_seal => |value| {
+            var prepared: prepared_ops.PreparedValidationSeal = .{ .alloc = db.alloc, .command = value };
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexValidation(&prepared, group_id, identity);
+        },
+        .install => |value| {
+            var prepared = try prepared_ops.PreparedInstall.init(db.alloc, db.core, value, .{});
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexInstallation(&prepared, group_id, identity);
+        },
+        .release => |value| {
+            var prepared = try prepared_ops.PreparedRelease.init(db.alloc, db.core, value, .{});
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexRelease(&prepared, group_id, identity);
+        },
+        .release_gc => |value| {
+            var prepared: prepared_ops.PreparedReleaseGc = .{ .alloc = db.alloc, .command = value };
+            defer prepared.deinit();
+            try db.applyCommittedRaftIndexReleaseGc(&prepared, group_id, identity);
+        },
+    }
+}
+
 pub fn captureSnapshot(owner: anytype, group_id: u64, through_index: u64) !snapshots.Capture {
     const db = physicalOwner(owner);
     if (group_id == 0) return error.InvalidSnapshot;
@@ -84,11 +214,16 @@ pub fn captureSnapshot(owner: anytype, group_id: u64, through_index: u64) !snaps
         .through_index = through_index,
         .native_term = if (pin.receipt) |value| value.term else 0,
         .native_index = if (pin.receipt) |value| value.index else 0,
+        .origin = pin.origin,
+        .schema_header = pin.schema_header,
     } };
 }
 
 pub fn verifySnapshot(owner: anytype, expected: snapshots.Identity) !void {
-    try physicalOwner(owner).verifyTransferablePrimarySnapshot(expected.namespace, if (expected.native_index == 0 and expected.native_term == 0) null else .{ .term = expected.native_term, .index = expected.native_index });
+    const cut: ?types.OrderedApplyReceipt = if (expected.native_index == 0 and expected.native_term == 0) null else .{ .term = expected.native_term, .index = expected.native_index };
+    if (expected.origin) |origin| {
+        try physicalOwner(owner).verifyTransferablePrimarySnapshotWithOrigin(expected.namespace, cut, origin);
+    } else try physicalOwner(owner).verifyTransferablePrimarySnapshot(expected.namespace, cut);
 }
 
 pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
@@ -108,7 +243,7 @@ pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     if (req.transaction != null)
         try @import("server_transaction_dispatch.zig").applyReplicatedTransactionMutationAtRaftEntry(alloc, db, table_name, group_id, req, raft_entry)
     else
-        try applyOrdered(&db, req, raft_entry);
+        try applyOrderedGroup(&db, group_id, req, raft_entry);
 }
 
 /// The seed coordinator verifies the complete manifest and every artifact before

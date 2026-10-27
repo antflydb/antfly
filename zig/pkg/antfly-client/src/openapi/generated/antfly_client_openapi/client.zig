@@ -2605,6 +2605,27 @@ pub const Client = struct {
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Observe an exact index publication in an explicit namespace
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication
+    pub fn getNamespaceTableIndexPublication(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, x_antfly_index_publication_token: []const u8) !ApiResponse(types.IndexPublicationStatus) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}/publication", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Index-Publication-Token", x_antfly_index_publication_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.IndexPublicationStatus).fromResponse(self.allocator, &resp);
+    }
+
     /// Repair an index generation
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair
     pub fn repairNamespaceIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
@@ -3079,6 +3100,25 @@ pub const Client = struct {
         return ApiResponse(PatchNamespaceTableSchemaResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Observe an exact namespaced validation-only schema publication
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema/publication
+    pub fn getNamespaceSchemaValidationPublication(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, x_antfly_schema_validation_token: []const u8) !ApiResponse(types.SchemaValidationStatus) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/schema/publication", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Schema-Validation-Token", x_antfly_schema_validation_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.SchemaValidationStatus).fromResponse(self.allocator, &resp);
+    }
+
     /// Set namespace tablespace
     /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace
     pub fn setNamespaceTableTablespace(self: *@This(), table_name: []const u8, database_name: []const u8, namespace_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(std.json.Value) {
@@ -3406,6 +3446,17 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Observe an exact retained SQL catalog operation
+    /// POST /db/v1/sql/operations/status
+    pub fn getSQLCatalogOperation(self: *@This(), body: types.SQLCatalogRecoveryRequest) !ApiResponse(types.SQLCatalogOperationReceipt) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/operations/status", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(types.SQLCatalogOperationReceipt).fromResponse(self.allocator, &resp);
     }
 
     /// Create a durable prepared SQL resource
@@ -4162,6 +4213,23 @@ pub const Client = struct {
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Observe an exact index publication
+    /// GET /db/v1/tables/{tableName}/indexes/{indexName}/publication
+    pub fn getIndexPublication(self: *@This(), table_name: []const u8, index_name: []const u8, x_antfly_index_publication_token: []const u8) !ApiResponse(types.IndexPublicationStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/publication", .{ self.base_url, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Index-Publication-Token", x_antfly_index_publication_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.IndexPublicationStatus).fromResponse(self.allocator, &resp);
+    }
+
     /// Repair an index generation
     /// POST /db/v1/tables/{tableName}/indexes/{indexName}/repair
     pub fn repairIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
@@ -4766,6 +4834,21 @@ pub const Client = struct {
         if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
         var resp = try self.http.patch(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(PatchSchemaResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Observe an exact validation-only schema publication
+    /// GET /db/v1/tables/{tableName}/schema/publication
+    pub fn getSchemaValidationPublication(self: *@This(), table_name: []const u8, x_antfly_schema_validation_token: []const u8) !ApiResponse(types.SchemaValidationStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema/publication", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Schema-Validation-Token", x_antfly_schema_validation_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.SchemaValidationStatus).fromResponse(self.allocator, &resp);
     }
 
     /// Create or resume a table storage migration job

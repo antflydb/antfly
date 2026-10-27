@@ -16,11 +16,14 @@
 const std = @import("std");
 
 pub const sql_max_request_body_bytes: usize = 4 << 20;
+pub const internal_lookup_control_max_body_bytes: usize = 16 << 20;
 
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
-    return if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) sql_max_request_body_bytes else null;
+    if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) return sql_max_request_body_bytes;
+    if (Routes.matchGroupLookup(path) != null) return internal_lookup_control_max_body_bytes;
+    return null;
 }
 
 pub const Routes = struct {
@@ -105,6 +108,9 @@ pub const Routes = struct {
     pub const fk_generation_parent_suffix = "/fk-generation-parent";
     pub const fk_generation_source_suffix = "/fk-generation-source";
     pub const fk_initial_child_suffix = "/fk-initial-child";
+    pub const relational_index_claims_suffix = "/relational-index-claims";
+    pub const relational_index_control_suffix = "/relational-index-control";
+    pub const schema_validation_prepare_suffix = "/schema-validation-prepare";
     pub const row_policy_install_suffix = "/row-policy-install";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";

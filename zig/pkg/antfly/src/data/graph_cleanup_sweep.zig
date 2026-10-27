@@ -18,6 +18,20 @@ const catalog = @import("../api/table_catalog.zig");
 const metadata = @import("../metadata/api.zig");
 const topology = @import("antfly_local_sources").common_topology_records;
 
+/// Only abort-only discovery reads use this classification. An ambiguous
+/// proposal is not a read retry and must retain its ordinary outcome handling.
+pub fn isDeferredRead(err: anyerror) bool {
+    return switch (err) {
+        error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.NotLeader, error.GroupLeaderUnavailable, error.Timeout, error.DeadlineExceeded, error.ResourceBudgetExceeded => true,
+        else => false,
+    };
+}
+
+test "graph endpoint cleanup defers bounded read pressure without hiding corruption or mutation uncertainty" {
+    for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.NotLeader, error.GroupLeaderUnavailable, error.Timeout, error.DeadlineExceeded, error.ResourceBudgetExceeded }) |err| try std.testing.expect(isDeferredRead(err));
+    for ([_]anyerror{ error.InvalidCatalogRecord, error.OutOfMemory, error.MetadataMutationOutcomeUnknown, error.InvalidReplicatedBatch }) |err| try std.testing.expect(!isDeferredRead(err));
+}
+
 /// A bounded worker round resumes this immutable routing generation rather
 /// than recapturing or searching the catalog for every visited group.
 pub const Sweep = struct {
