@@ -86,6 +86,9 @@ pub const Row = struct {
         const self: *Row = @ptrCast(@alignCast(raw));
         try @import("query/search_exec.zig").checkSearchRequestDeadline(self.req);
         if (self.raw_operands.get(path)) |value| return value;
+        // A prior operator may already have materialized this source. Reuse
+        // that value rather than building a second index for small/mixed rows.
+        if (self.full_root != null or self.values.contains(path)) return null;
         const operands = self.operands orelse return null;
         const operand = operands.paths.get(path) orelse return null;
         if (std.mem.eql(u8, path, "_id")) return null;
@@ -260,4 +263,9 @@ test "api query contract raw full fallback shares one row view and memoized oper
     try std.testing.expectEqual(@as(usize, 2), row.raw_operands.count());
     try std.testing.expectEqual(@as(usize, 0), row.full_view.?.materialized_values);
     try std.testing.expectEqual(@as(usize, 0), row.value_reads);
+    var typed: Row = .{ .a = a, .txn = null, .physical = "a", .id = "a", .req = .{}, .authority = .{}, .operands = &operands, .full_root = try std.json.parseFromSliceLeaky(V, a, row.full_bytes.?, .{}) };
+    const typed_source = typed.source();
+    try std.testing.expect(try typed_source.read_raw.?(typed_source.context, a, "body.first") == null);
+    try std.testing.expectEqual(@as(usize, 2), (try typed_source.read(typed_source.context, a, "body.first", .value)).value.array.items.len);
+    try std.testing.expect(typed.full_view == null);
 }
