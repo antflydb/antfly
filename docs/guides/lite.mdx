@@ -18,7 +18,7 @@ tags: [lite, embedded, local-first, backup, migration]
 - Does Antfly Lite need an inference runtime?
 </Questions>
 
-Antfly Lite is Antfly in one file. Documents, schemas, indexes, enrichments, and query-visible artifacts live in a local `.aflite` database that an application opens directly, with no server process. Choose Lite for development, desktop apps, edge workers, tests, and single-user deployments. Choose a normal instance when you need replication, shard placement, multi-node scaling, or cluster metadata. Everything else, from the index model to the query API, is the same code.
+Antfly Lite is Antfly in one file. Documents, schemas, indexes, enrichments, and query-visible artifacts live in a local `.aflite` database that an application opens directly, with no server process. Choose Lite for development, desktop apps, edge workers, tests, and managed databases in Antfly Cloud. Choose a normal instance when you need replication, shard placement, multi-node scaling, or cluster metadata. Everything else, from the index model to the query API, is the same code.
 
 Embedded storage query execution rejects non-null `evaluate`; use the
 [supported embedded API surface](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly-embedded/WASM.md#hosted-entry-points)
@@ -213,6 +213,26 @@ antfly lite import restored.aflite --from app.afb --replace
 ```
 
 `--replace` is required when the target holds data. Importing from another `.aflite` is a physical snapshot replacement, never a logical merge.
+
+## Move a complete Lite database to Cloud
+
+[Antfly Cloud Lite](/docs/cloud/getting-started) hosts an independent copy of a
+complete `.aflite` database. The [quickstart](/docs/guides/quickstart) starts with
+the same Lite storage engine behind the HTTP API, so applications can keep their
+requests when they switch to a Cloud endpoint and scoped API key.
+
+Create a consistent copy with `antfly lite snapshot app.aflite --out upload.aflite`,
+then choose **Bring a Lite database** in Cloud. Review compatibility before
+creating the managed database. Availability is controlled per organization during
+rollout. This creates a new database; it does not merge tables into an existing one.
+
+Later local writes do not sync. Pause application writes before the final cutover
+snapshot, verify the managed copy, then switch the application. Models, credentials
+and external media dependencies need separate compatibility and configuration.
+Cloud exports can contain standalone table namespaces; serve returned files with
+`antfly standalone --storage-engine lite --storage-path`, as shown in the
+[Cloud guide](/docs/cloud/getting-started#take-the-database-back-to-your-laptop).
+Embedded bindings require an HTTP client or adapter for Cloud access.
 
 ## Moving Between Lite and a Normal Instance
 
@@ -444,6 +464,6 @@ Then prompt it with the outcome, for example "Embed Antfly Lite in my Go applica
 
 ## Next Steps
 
-- [Quickstart](/docs/guides/quickstart): the same queries against a normal standalone instance
+- [Lite quickstart](/docs/guides/quickstart): run a local Lite server, search Wikipedia by keyword, and move the database to Cloud
 - [Document Engine](/docs/guides/document-engine): how mappings, full-text, vector, and graph indexes compose under one query, in Lite and everywhere else
 - [Backup and Restore](/docs/api/data-operations): the `.afb` format and restore options on a normal instance

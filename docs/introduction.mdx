@@ -21,7 +21,7 @@ Each of these has a guide that ends with the finished thing running:
 - [Search and AI answers on your site](/docs/guides/site-search-and-answers): live results with facets and a streaming answer box, on one table
 - [Ticket routing](/docs/guides/ticket-routing) that streams new tickets out of PostgreSQL and assigns each a team by the resolved tickets it most resembles
 - [Retrieval for a coding copilot](/docs/guides/coding-copilot-retrieval): exact symbol lookups and intent questions over a repo index, returned as a context block sized to the model's budget
-- [Image search](/docs/guides/quickstart#image-search) and [RAG](/docs/guides/quickstart#rag-retrieval-augmented-generation) over a corpus, both covered in the Quickstart
+- [Image search](/docs/guides/wikipedia-search#image-search) and [RAG](/docs/guides/wikipedia-search#rag-retrieval-augmented-generation) over a corpus, both covered in the Wikipedia walkthrough
 - An [n8n AI Agent](/docs/guides/n8n) that answers from an Antfly table over hosted MCP, with no application code in between
 
 ## Inside the Engine
@@ -35,8 +35,9 @@ Each of these has a guide that ends with the finished thing running:
 
 ## Where to Start
 
-- The [Quickstart](/docs/guides/quickstart) installs Antfly, loads 10,000 Wikipedia articles, and walks through full-text, semantic, hybrid, image search, and RAG, with every step in the CLI, cURL, TypeScript, Python, and Go
+- The [Quickstart](/docs/guides/quickstart) creates a portable Lite database, loads 10,000 Wikipedia articles, and runs keyword queries, with an optional snapshot upload to Cloud
+- [Search Wikipedia with local AI](/docs/guides/wikipedia-search) follows with semantic, hybrid, image search, and RAG over 10,000 articles
 - [Downloads](/docs/downloads) has the install script, binaries for every platform, checksums, and a Docker Compose file
-- [Antfly Cloud](/docs/cloud) if you would rather not run it yourself
+- [Antfly Cloud Lite](/docs/cloud/getting-started) to start hosted or bring your local `.aflite` snapshot
 - [SDKs](/docs/sdks) for Go, TypeScript, Python, and Rust
 - The [API reference](/docs/api) for the CLI and REST surface

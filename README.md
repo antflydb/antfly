@@ -2,9 +2,9 @@
 
 Antfly is an open-source search-and-inference database written in Zig. One engine carries full-text (BM25), dense, and sparse vector indexes plus graph traversal over the same table, and the models that chunk, embed, rerank, transcribe, OCR, and extract run inside the process. Embeddings, chunks, entities, and graph edges are generated automatically as you write data, and built-in RAG agents tie it together. The same engine runs as a single `.aflite` file, a single node with a hot standby, a multi-Raft cluster, or serverless over object storage.
 
-[![Quickstart](https://cdn.antfly.io/quickstart.gif)](https://cdn.antfly.io/quickstart.gif)
+[![Wikipedia search demo](https://cdn.antfly.io/quickstart.gif)](https://cdn.antfly.io/quickstart.gif)
 
-[Recording source](quickstart.tape) · [Recording instructions](scripts/quickstart/README.md)
+[Wikipedia walkthrough](docs/guides/wikipedia-search.mdx) · [Recording source](quickstart.tape) · [Recording instructions](scripts/quickstart/README.md)
 
 ## Quick Start
 
