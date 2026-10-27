@@ -71,7 +71,7 @@ pub fn run(a: A, io: ?std.Io, hits: []types.SearchHit, locations: *const Locatio
         defer wave.deinit();
         wave.start();
         for (0..count) |i| {
-            defer wave.release(i);
+            defer wave.releasePin(i);
             var retry: ?Pin = null;
             defer if (retry) |*pin| pin.deinit();
             var pin = try wave.get(i);

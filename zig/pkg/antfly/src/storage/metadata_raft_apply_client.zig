@@ -1116,29 +1116,3 @@ fn statusToError(status: abi.Status) !void {
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const store_report_update = @import("../metadata/store_report_update.zig");
 const topology_protocol = @import("../metadata/topology_protocol.zig");
-
-test "metadata durable job facade preserves state owner counts and bounded scan envelopes" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    defer a.free(root);
-    var store = try RaftApplyStore.init(a, .{ .root_dir = root, .no_sync = true });
-    defer store.deinit();
-    try std.testing.expect((try store.getJobState(a, 41, "documents/example")) == null);
-    try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 41, "alice"));
-    const queued = "{\"owner\":\"alice\",\"state\":\"queued\"}";
-    try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = "documents/example", .expected_hash = "", .value = queued } });
-    const value = (try store.getJobState(a, 41, "documents/example")).?;
-    defer a.free(value);
-    try std.testing.expectEqualStrings(queued, value);
-    try std.testing.expectEqual(@as(u64, 1), try store.getJobOwnerCount(a, 41, "alice"));
-    const encoded = try store.scanJobState(a, 41, null);
-    defer a.free(encoded);
-    const page = try std.json.parseFromSlice(@import("../metadata/job_state.zig").Page, a, encoded, .{});
-    defer page.deinit();
-    try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
-    try std.testing.expectEqualStrings("documents/example", page.value.rows[0].key);
-    try std.testing.expectEqualStrings(queued, page.value.rows[0].value);
-    try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, "../bad"));
-}

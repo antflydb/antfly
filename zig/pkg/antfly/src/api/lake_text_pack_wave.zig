@@ -71,7 +71,7 @@ pub fn get(self: *Self, index: usize) !?*const Pin {
 }
 /// A joined consumer can release a completed pin before the next required open.
 /// This restores cache headroom when speculative admission was saturated.
-pub fn release(self: *Self, index: usize) void {
+pub fn releasePin(self: *Self, index: usize) void {
     const job = &self.jobs[index];
     std.debug.assert(job.task == null);
     if (job.pin) |*pin| pin.deinit();
