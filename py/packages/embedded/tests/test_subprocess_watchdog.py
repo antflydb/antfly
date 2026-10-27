@@ -54,7 +54,9 @@ def test_progressing_child_can_outlive_one_call_deadline(monkeypatch):
             if self.steps == 20:
                 self.returncode = 0
                 return self.stdout, ""
-            raise subprocess.TimeoutExpired("fixture", timeout, output=self.stdout)
+            # communicate() timeouts expose bytes even with text=True; only
+            # successful completion above returns decoded text.
+            raise subprocess.TimeoutExpired("fixture", timeout, output=self.stdout.encode())
 
         def kill(self):
             pytest.fail("watchdog killed a progressing child")
