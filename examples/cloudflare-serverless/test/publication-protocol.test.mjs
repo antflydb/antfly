@@ -20,6 +20,7 @@ import{Bucket}from"./object-fixture.mjs";
 import{R2CoordinatorStore}from"../r2-coordinator-store.mjs";
 import{metadataObjectCall}from"../metadata-object-call.mjs";
 import{PreparedPublication,applyPublication}from"../prepared-publication.mjs";
+import{compactionIdentity,readCompactionReceipt,beginCompactionReceipt,finishCompactionReceipt}from"../compaction-receipt.mjs";
 import{publicationKeys,publicationSnapshot}from"../publication-view.mjs";
 import{captureReadView,metadataKeys}from"../read-view.mjs";
 import{instantiateHost}from"../../../zig/lib/objectstore/wasm/asyncify.mjs";
@@ -63,7 +64,7 @@ async function fixture(){
  const native=(tx,op,lease,owner=lease?.owner)=>leaseHost.request(req(op,{publication_owner:owner,publication_lease:lease??null}),{transport:withCommitCoordinator(raw,{objectCall:(request,body)=>metadataObjectCall(tx,request,body)})});
  const begin=()=>store.transaction(async tx=>{const lease=await native(tx,"publication_acquire",null,crypto.randomUUID());await captureReadView(tx,keys,{},()=>now);return{format:2,lease,entries:await publicationSnapshot(tx,pk)};});
  const finish=batch=>store.transaction(async tx=>{await native(tx,"publication_validate",batch.lease);await applyPublication(tx,(await publicationSnapshot(tx,pk)).map(([key])=>key),batch,{clock:()=>now});assert.equal((await native(tx,"publication_release",batch.lease)).released,true);});
- const prepare=async initial=>{const prepared=new PreparedPublication(initial),build=await instantiateHost(module,withCommitCoordinator(raw,prepared),{clock:()=>now});const result=await build.request(req("publish",{publication_lease:initial.lease}));return{prepared,result};};
+ const prepare=async(initial,options={})=>{const prepared=new PreparedPublication(initial),build=await instantiateHost(module,withCommitCoordinator(raw,prepared),{clock:()=>now});const result=await build.request(req("publish",{...options,publication_lease:initial.lease}));return{prepared,result};};
  const mutate=id=>host.request(req("mutate",{operation_id:id,mutations:[{kind:"upsert",doc_id:id,body:JSON.stringify({text:"durable "+id})}]}));
  return{bucket,keys,pk,req,host,begin,finish,prepare,mutate,native,clock:()=>now,store:()=>store,tick:ms=>now+=ms,lose:()=>lose=true,reopen:()=>store=new R2CoordinatorStore(module,bucket,namespace,{clock:()=>now,transport})};
 }
@@ -123,6 +124,48 @@ test("fully paged compaction validates protected source without changing writer 
  const before=await f.store().transaction(tx=>tx.getMany([f.keys.head,f.keys.progress+"HEAD_FENCE"]));
  const result=await f.host.request(f.req("compact"));assert.equal(result.published,false);
  assert.deepEqual(await f.store().transaction(tx=>tx.getMany([f.keys.head,f.keys.progress+"HEAD_FENCE"])),before);
+});
+
+async function keyedCompaction(f,id){
+ const identity=await compactionIdentity(id,{max_documents:1000,max_artifact_bytes:4*1024*1024});
+ const begin=()=>f.store().transaction(tx=>beginCompactionReceipt(tx,identity,async()=>{
+  const lease=await f.native(tx,"publication_acquire",null,crypto.randomUUID());
+  await captureReadView(tx,f.keys,{},f.clock);return{format:2,lease,entries:await publicationSnapshot(tx,f.pk)};
+ }));
+ const finish=(batch,result)=>f.store().transaction(tx=>finishCompactionReceipt(tx,identity,batch,result,async()=>{
+  await f.native(tx,"publication_validate",batch.lease);
+  await applyPublication(tx,(await publicationSnapshot(tx,f.pk)).map(([key])=>key),batch,{clock:f.clock});
+  assert.equal((await f.native(tx,"publication_release",batch.lease)).released,true);
+ }));
+ const prepare=async initial=>{
+  const prepared=new PreparedPublication(initial),raw=createR2Transport({database:f.bucket}),host=await instantiateHost(module,withCommitCoordinator(raw,prepared),{clock:f.clock});
+  const result=await host.request(f.req("compact",{publication_lease:initial.lease}));return{batch:prepared.batch(),result};
+ };
+ return{identity,begin,finish,prepare};
+}
+test("keyed compaction recovers an atomic receipt after a lost acknowledgement and eviction",async()=>{
+ const f=await fixture();await f.mutate("first");const publication=await f.prepare(await f.begin(),{paged_text:false});await f.finish(publication.prepared.batch());
+ const operation=await keyedCompaction(f,"maintenance/1"),initial=await operation.begin(),prepared=await operation.prepare(initial);
+ assert.equal(prepared.result.published,true);assert.ok(prepared.batch.writes.some(([key])=>key===f.keys.head));
+ f.lose();await assert.rejects(operation.finish(prepared.batch,prepared.result),/ObjectStoreTransportFailed/);f.reopen();
+ const replay=await operation.begin();assert.equal(replay.complete,true);assert.deepEqual(replay.result,prepared.result);
+ const before=await f.store().transaction(tx=>tx.get(f.keys.progress+"HEAD_FENCE"));
+ assert.deepEqual(await operation.finish(prepared.batch,{published:true,version:"999",artifact_count:999}),prepared.result);
+ assert.deepEqual(await f.store().transaction(tx=>tx.get(f.keys.progress+"HEAD_FENCE")),before,"receipt replay cannot reacquire or release ownership");
+ const changed=await compactionIdentity("maintenance/1",{max_documents:2000,max_artifact_bytes:4*1024*1024});
+ await assert.rejects(f.store().transaction(tx=>readCompactionReceipt(tx,changed)),/CompactionOperationConflict/);
+});
+test("keyed compaction fences an expired attempt and never records an uncommitted result",async()=>{
+ const f=await fixture();await f.mutate("first");const publication=await f.prepare(await f.begin());await f.finish(publication.prepared.batch());
+ const operation=await keyedCompaction(f,"maintenance/takeover"),old=await operation.begin(),stale=await operation.prepare(old);
+ await assert.rejects(operation.begin(),/WorkLeaseLost/);f.tick(31000);
+ const next=await operation.begin();assert.notEqual(next.lease.token,old.lease.token);
+ await assert.rejects(operation.finish(stale.batch,stale.result),/WorkLeaseLost/);
+ assert.equal((await f.store().transaction(tx=>readCompactionReceipt(tx,operation.identity))).state,"pending");
+ const current=await operation.prepare(next);await operation.finish(current.batch,current.result);
+ assert.deepEqual((await operation.begin()).result,current.result);
+ await assert.rejects(compactionIdentity("😀".repeat(65),{max_documents:1000,max_artifact_bytes:1}),/OperationId/);
+ await assert.rejects(compactionIdentity("\ud800",{max_documents:1000,max_artifact_bytes:1}),/OperationId/);
 });
 
 

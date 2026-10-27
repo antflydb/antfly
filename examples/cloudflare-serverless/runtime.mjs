@@ -84,6 +84,11 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     const coordinator={objectCall:(request,body)=>rpc("objectCall",request,body,readHints?.forHead(request,body)),openReadView:options=>rpc("openReadView",{...options,trace_id:trace.id})};
     let publicationView;
     if(env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)){
+      if(input.op==="compact"&&input.operation_id!==undefined){
+        publicationView=await rpc("beginCompaction",input.operation_id);
+        if(publicationView.complete){operationSucceeded=true;return publicationView.result;}
+        preparedPublication=new PreparedPublication(publicationView);publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
+      }
       if(input.op==="publish"&&env.BATCHED_PUBLICATION!=="false"){
         try{publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16));preparedPublication=new PreparedPublication(publicationView);publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);}
         catch(error){if(!unsupportedRpc(error,"beginPublication"))throw error;}
@@ -121,7 +126,9 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
         emitOperationMetrics=()=>{if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: "antfly.operation", trace_id:trace.id, op: input.op, exact_scan:input.exact_scan===true, role, ...metrics, operation_outcome:operationSucceeded?"ok":"error", operation_elapsed_ms:performance.now()-runtimeStarted, physical,
           ...resources(),cache_retained_bytes: cache.retainedBytes(), wasm_linear_total_bytes: kernel?kernel.memoryBytes(): Object.values(lanes).reduce((sum, instance) => sum + (instance?.memoryBytes() ?? 0), 0)}));};
       } });
-    if(preparedPublication){const batch=preparedPublication.batch(),head=batch.writes.find(([key])=>key===`antfly/progress/${env.ANTFLY_INCARNATION}/HEAD`);await rpc("finalizePublication",batch,{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes},head?readHints?.forHead({op:"put",key:head[0]},head[1].body):undefined);publicationFinalized=true;}
+    if(preparedPublication){const batch=preparedPublication.batch(),head=batch.writes.find(([key])=>key===`antfly/progress/${env.ANTFLY_INCARNATION}/HEAD`),hints=head?readHints?.forHead({op:"put",key:head[0]},head[1].body):undefined;
+      if(input.op==="compact")await rpc("finalizeCompaction",input.operation_id,batch,result,hints);
+      else await rpc("finalizePublication",batch,{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes},hints);publicationFinalized=true;}
     operationSucceeded=true;return result;
   } catch (error) {
     if (/IntegrityMismatch/.test(String(error))) cache.clear();

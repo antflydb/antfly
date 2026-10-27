@@ -323,6 +323,15 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         return std.json.Stringify.valueAlloc(a, .{ .yielded = false, .wal_appends = stats.wal_appends, .enriched_documents = stats.enriched_documents, .enriched_namespaces = stats.enriched_namespaces, .model_documents = stats.model_documents, .fallback_documents = stats.fallback_documents, .failed_documents = stats.failed_documents, .stage_failures = stats.stage_failures, .idle_namespaces = stats.idle_namespaces, .checkpoint_hits = context.hits, .checkpoint_writes = context.writes, .provider_calls = context.provider_calls }, .{});
     }
     if (req.op == .compact) {
+        const work = @import("serverless/build/work_lease.zig");
+        var held: ?work.HeldLease = if (req.publication_lease) |lease| .{
+            .provider = try progress.workLeaseProvider(),
+            .io = host_io,
+            .namespace = req.namespace,
+            .owner_id = lease.owner,
+            .acquisition = .{ .fencing_token = try std.fmt.parseInt(u64, lease.token, 10), .expires_at_unix_ns = try std.fmt.parseInt(u64, lease.expires, 10), .took_over = false },
+            .ttl_ns = 30 * std.time.ns_per_s,
+        } else null;
         _ = progress.getHead(req.namespace) catch |err| switch (err) {
             error.FileNotFound => return std.json.Stringify.valueAlloc(a, .{ .published = false, .version = "0", .artifact_count = @as(usize, 0) }, .{}),
             else => return err,
@@ -330,7 +339,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         var compactor = @import("serverless/build/compactor.zig").Compactor.init(a, &artifacts, &manifests, &progress);
         compactor.max_documents = req.compaction_max_documents;
         compactor.max_artifact_bytes = req.compaction_max_artifact_bytes;
-        var result = try compactor.compactHeadGuardedUntil(req.namespace, null, .{ .io = host_io, .cooperative = cancellation });
+        var result = try compactor.compactHeadGuardedUntil(req.namespace, if (held) |*lease| lease.guard() else null, if (held) |*lease| lease.cancellation(.{ .io = host_io, .cooperative = cancellation }) else .{ .io = host_io, .cooperative = cancellation });
         defer result.deinit(a);
         var version: [20]u8 = undefined;
         return std.json.Stringify.valueAlloc(a, .{ .published = result.published, .version = try std.fmt.bufPrint(&version, "{d}", .{result.version}), .artifact_count = result.artifact_count }, .{});

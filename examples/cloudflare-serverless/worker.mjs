@@ -127,6 +127,11 @@ export default {
         return Response.json(await env.AI.run(env.AI_MODEL, args, { gateway: { id: env.AI_GATEWAY } }));
       }
       if (args.op === "prune_checkpoints") return Response.json(await pruneEmbeddingCheckpoints(env));
+      if(args.op==="compact_status"){
+        if(env.COORDINATOR_BACKEND!=="r2")throw Error("CompactionReceiptsRequireR2");
+        return Response.json(await env.COMMITS.getByName(env.ANTFLY_INCARNATION).compactionStatus(args.operation_id),env.WORKER_VERSION?{headers:{"X-Antfly-Version":env.WORKER_VERSION.id}}:undefined);
+      }
+      if(args.op==="compact"&&args.operation_id!==undefined&&env.COORDINATOR_BACKEND!=="r2")throw Error("CompactionReceiptsRequireR2");
       if (args.op === "collect_metadata" || args.op === "migrate_coordinator") {
         const stub = env.COMMITS.getByName(env.ANTFLY_INCARNATION);
         const result = await background(env,{op:args.op,job_id:args.job_id});

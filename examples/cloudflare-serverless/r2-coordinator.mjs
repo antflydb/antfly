@@ -25,6 +25,7 @@ import {encode} from "./r2-coordinator-store.mjs";
 import {publicationKeys,publicationCall,publicationSnapshot} from "./publication-view.mjs";
 import {metadataKernel,readObservationKernel,buildKernel,sharedCache,boundRows,kernelMetrics} from "./kernels.mjs";
 import {MaintenanceTickets} from "./maintenance-tickets.mjs";
+import {compactionIdentity,readCompactionReceipt,beginCompactionReceipt,finishCompactionReceipt} from "./compaction-receipt.mjs";
 import {PreparedWal} from "./prepared-wal.mjs";
 import {metadataKeys} from "./read-view.mjs";
 import {MutationGroups} from "./mutation-groups.mjs";
@@ -105,6 +106,33 @@ export class R2CommitCoordinator extends DurableObject {
       await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),{immutable:false});
       return{format:2,lease,budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};
     },{priority:"maintenance"});
+  }
+  compactionIdentity(id){return compactionIdentity(id,{max_documents:Number(this.env.COMPACTION_MAX_DOCUMENTS??1000),max_artifact_bytes:Number(this.env.COMPACTION_MAX_ARTIFACT_BYTES??4*1024*1024)});}
+  async compactionStatus(id){
+    const identity=await this.compactionIdentity(id);
+    return this.transaction(async tx=>{const prior=await readCompactionReceipt(tx,identity);return prior?.state==="complete"?{state:"complete",result:prior.result}:{state:prior?.state??"unknown"};});
+  }
+  async beginCompaction(id){
+    const identity=await this.compactionIdentity(id),keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
+    return this.transaction(tx=>beginCompactionReceipt(tx,identity,async()=>{
+      const lease=await this.nativePublication(tx,"publication_acquire",null,crypto.randomUUID());
+      await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),{immutable:false});
+      return{format:2,lease,budget:16,entries:await publicationSnapshot(tx,keys)};
+    }),{priority:"maintenance"});
+  }
+  async finalizeCompaction(id,batch,result,readHints){
+    const identity=await this.compactionIdentity(id),keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
+    return this.transaction(tx=>finishCompactionReceipt(tx,identity,batch,result,async receipt=>{
+      await this.nativePublication(tx,"publication_validate",batch?.lease);
+      const entries=await publicationSnapshot(tx,keys);
+      await applyPublication(tx,entries.map(([key])=>key),batch);
+      const head=await tx.get(keys[0]),version=head?new TextDecoder().decode(head.body).trim():"0";
+      if(version!==receipt.version)throw Error("InvalidCompactionResult");
+      const written=batch.writes.find(([key])=>key===keys[0]);
+      if(receipt.published!==Boolean(written))throw Error("InvalidCompactionResult");
+      if(written)writeReadHints(tx,this.env.ANTFLY_INCARNATION,version,readHints);
+      if(!(await this.nativePublication(tx,"publication_release",batch.lease)).released)throw Error("WorkLeaseLost");
+    }),{priority:"maintenance"});
   }
   async finalizePublication(batch,observation,readHints){
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);

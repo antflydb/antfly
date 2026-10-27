@@ -79,6 +79,25 @@ test('native read capsules activate after compatible readers and survive erased 
  }finally{await f.close();}
 });
 
+test('keyed compaction exposes durable status and replays its original outcome after later publication',{timeout:120000},async()=>{
+ const f=await fixture('compaction-receipts');
+ try{
+  f.options.bindings.PAGED_TEXT='true';await f.reopen();
+  const input={op:'compact',operation_id:'maintenance/first'};
+  assert.deepEqual(await f.call({op:'compact_status',operation_id:input.operation_id}),{state:'unknown'});
+  await f.call({op:'mutate',operation_id:'first',mutations:[{kind:'upsert',doc_id:'first',body:'{"text":"first"}'}]});
+  while((await f.call({op:'publish'})).has_more){}
+  const result=await f.call(input);assert.equal(result.published,false);
+  assert.deepEqual(await f.call({op:'compact_status',operation_id:input.operation_id}),{state:'complete',result});
+  await f.call({op:'mutate',operation_id:'second',mutations:[{kind:'upsert',doc_id:'second',body:'{"text":"second"}'}]});
+  while((await f.call({op:'publish'})).has_more){}
+  await f.call({},'/wipe-platform');await f.reopen();
+  assert.deepEqual(await f.call(input),result);assert.equal((await f.call({op:'count'})).count,'2');
+  f.options.bindings.COMPACTION_MAX_DOCUMENTS='2000';await f.reopen();
+  assert.match((await f.call(input,'/api',409)).error,/CompactionOperationConflict/);
+ }finally{await f.close();}
+});
+
 test("R2-native coordination survives eviction, both collectors, reindex and erased platform storage",{timeout:240000},async()=>{
   const f=await fixture("r2-native-fixture",false,true);
   try {
