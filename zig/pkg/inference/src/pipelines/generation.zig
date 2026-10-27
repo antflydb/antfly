@@ -13129,9 +13129,17 @@ pub const NativeGenerationPipeline = struct {
     /// Output of a successful step forward pass: the heap-allocated logits row
     /// buffer and the maximum query sequence length used to size each row.
     /// Caller owns the logits buffer.
+    const packed_head_rows = @import("packed_head_rows.zig");
+    const PrefixLogitsLayout = packed_head_rows.PrefixLogitsLayout;
+
+    fn prefillHasHostRow(work: *const PendingPrefillBatchWork, layout: PrefixLogitsLayout) bool {
+        return !work.wants_greedy and (layout == .all_host_rows or work.wants_last_logits);
+    }
+
     const StepForwardResult = struct {
         greedy_tokens: ?[]u32 = null,
         packed_greedy_tokens: ?[]u32 = null,
+        prefix_logits_layout: PrefixLogitsLayout = .all_host_rows,
         // Additional outputs, step-major: (steps - 1) * cohort rows.
         second_greedy_tokens: ?[]u32 = null,
         logits: ?[]f32,
@@ -13795,12 +13803,20 @@ pub const NativeGenerationPipeline = struct {
                 gpu_choices = @import("../ops/metal_compute.zig").MetalCompute.reserveLightOnFrameArgmax(cb, claimed.len, cfg.vocab_size);
         }
         var greedy_prefills: usize = 0;
-        var host_prefills: usize = 0;
         for (claimed) |item| if (item.phase == .prefill) {
             const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-            if (work.wants_greedy) greedy_prefills += 1 else host_prefills += 1;
+            if (work.wants_greedy) greedy_prefills += 1;
         };
         if (cuda_packed) gpu_choices = all_decode_greedy and (prefill_count < claimed.len or greedy_prefills > 0);
+        const prefix_logits_layout: PrefixLogitsLayout = if (cuda_packed and gpu_choices) .final_host_rows else .all_host_rows;
+        var host_prefills: usize = 0;
+        var active_heads: [packed_head_rows.capacity]bool = @splat(true);
+        for (claimed, 0..) |item, index| if (item.phase == .prefill) {
+            const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+            host_prefills += @intFromBool(prefillHasHostRow(work, prefix_logits_layout));
+            if (cuda_packed and gpu_choices) active_heads[index] = work.wants_last_logits;
+        };
+        const head_rows = try packed_head_rows.Plan.init(active_heads[0..claimed.len]);
         const needs_logits = scheduledStepNeedsLogits(claimed);
         const shared_frame = !cuda_packed and self.packed_shared_frame and gpu_choices;
         const trace_frame = platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3");
@@ -13810,7 +13826,8 @@ pub const NativeGenerationPipeline = struct {
         const host_rows = if (!needs_logits) 0 else if (gpu_choices) host_prefills else claimed.len;
         const logits_bytes = try std.math.mul(usize, try std.math.mul(usize, host_rows, cfg.vocab_size), 2 * @sizeOf(f32));
         const positions_bytes = try std.math.mul(usize, total, 3 * @sizeOf(u32));
-        const host_bytes = try std.math.add(usize, try std.math.add(usize, logits_bytes, positions_bytes), (if (claimed.len > 64) @as(usize, 64) else 32) * 1024);
+        const head_metadata_bytes = @sizeOf(packed_head_rows.Plan) + @sizeOf(@TypeOf(active_heads)) + claimed.len * @sizeOf(u32);
+        const host_bytes = try std.math.add(usize, try std.math.add(usize, logits_bytes, positions_bytes), (if (claimed.len > 64) @as(usize, 64) else 32) * 1024 + head_metadata_bytes);
         var recurrent_groups: usize = 0;
         var recurrent_rows: usize = 0;
         var attention_groups: usize = 0;
@@ -13824,7 +13841,7 @@ pub const NativeGenerationPipeline = struct {
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_input_frames={d} packed_cuda_steps={d}\n", .{ @intFromBool(!cuda_packed), @intFromBool(cuda_packed) });
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_decode_rows={d} packed_cpu_logit_rows={d} packed_standalone_wide_heads={d}\n", .{ if (needs_logits and gpu_choices) claimed.len - prefill_count else 0, host_rows, @intFromBool(needs_logits and !gpu_choices and claimed.len > 16) });
             if (trace_frame) std.debug.print("LIGHTONOCR3 packed_shared_frame={d} packed_forward_submissions={d}\n", .{ @intFromBool(shared_frame), cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits -| before_submits });
-            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_prefill_rows={d} packed_skipped_prefix_heads={d}\n", .{ if (needs_logits and gpu_choices) greedy_prefills else 0, if (!needs_logits) prefill_count else 0 });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_prefill_rows={d} packed_skipped_prefix_heads={d}\n", .{ if (needs_logits and gpu_choices) greedy_prefills else 0, if (!needs_logits) prefill_count else claimed.len - head_rows.count });
         };
         const session = self.session orelse return error.InvalidBatchDecodeState;
         var host_lease = try session.admitHostPreprocess(host_bytes);
@@ -13898,11 +13915,13 @@ pub const NativeGenerationPipeline = struct {
         forward_completed = true;
         if (!needs_logits) return .{ .logits = null, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
 
-        // One gather selects every page's final row. In the shared-frame path
-        // the model borrows the producer frame, which is still active here.
+        // Intermediate prefix rows update KV/state but never produce a
+        // choice. Exclude them from the head and restore scheduler order
+        // after argmax. Metal retains its established complete-row layout.
+        if (head_rows.count == 0) return error.InvalidBatchDecodeState;
         var last_indices: [gpt_arch.max_packed_qwen_items]i64 = undefined;
-        for (claimed, 0..) |_, row| last_indices[row] = @intCast(offsets[row] + lengths[row] - 1);
-        const last = try cb.embeddingLookup(hidden.hidden, last_indices[0..claimed.len], claimed.len, cfg.hidden_size);
+        for (head_rows.items[0..head_rows.count], 0..) |item, row| last_indices[row] = @intCast(offsets[item] + lengths[item] - 1);
+        const last = try cb.embeddingLookup(hidden.hidden, last_indices[0..head_rows.count], head_rows.count, cfg.hidden_size);
         defer cb.free(last);
         const head = try gpt_arch.getLmHeadWeight(cb, cfg);
         defer cb.free(head);
@@ -13922,7 +13941,7 @@ pub const NativeGenerationPipeline = struct {
             }
             try cb.decoderRuntimeSetActiveFrameRegime(.decode);
         }
-        const logits = try cb.linearNoBias(last, head, claimed.len, cfg.hidden_size, cfg.vocab_size);
+        const logits = try cb.linearNoBias(last, head, head_rows.count, cfg.hidden_size, cfg.vocab_size);
         defer cb.free(logits);
         // Gather prefix logits before argmax closes the borrowed frame. Only
         // host arrays escape this forward; all device views retire below.
@@ -13931,8 +13950,8 @@ pub const NativeGenerationPipeline = struct {
         if (shared_frame and host_rows != 0) {
             var rows: [gpt_arch.max_packed_qwen_items]i64 = undefined;
             var count: usize = 0;
-            for (claimed, 0..) |item, index| if (item.phase == .prefill and !@as(*PendingPrefillBatchWork, @ptrCast(@alignCast(item.work_ptr))).wants_greedy) {
-                rows[count] = @intCast(index);
+            for (claimed, 0..) |item, index| if (item.phase == .prefill and prefillHasHostRow(@ptrCast(@alignCast(item.work_ptr)), prefix_logits_layout)) {
+                rows[count] = @intCast(head_rows.row_by_item[index]);
                 count += 1;
             };
             gathered_prefix_logits = try cb.embeddingLookup(logits, rows[0..count], count, cfg.vocab_size);
@@ -13950,8 +13969,14 @@ pub const NativeGenerationPipeline = struct {
         if (cuda_packed and gpu_choices) {
             // Greedy prefix and decode rows share the existing suppressed
             // device argmax. Sampled prefixes retain admitted F32 logits.
-            tokens = try cb.argmaxRowsSuppress(logits, 0, claimed.len, cfg.vocab_size, cfg.suppressTokenIds(), a) orelse return error.ResidentImageOperationUnavailable;
-            if (tokens.?.len != claimed.len) return error.InvalidBatchDecodeState;
+            const compact = try cb.argmaxRowsSuppress(logits, 0, head_rows.count, cfg.vocab_size, cfg.suppressTokenIds(), a) orelse return error.ResidentImageOperationUnavailable;
+            if (head_rows.count == claimed.len) {
+                tokens = compact;
+                if (compact.len != claimed.len) return error.InvalidBatchDecodeState;
+            } else {
+                defer a.free(compact);
+                tokens = try head_rows.scatter(a, compact, cfg.vocab_size);
+            }
         }
         // A fully device-greedy packet has no vocabulary rows for the CPU.
         // Keep an owned empty slice for the existing publication contract;
@@ -13959,8 +13984,8 @@ pub const NativeGenerationPipeline = struct {
         const host = if (gpu_choices and host_rows == 0) try a.alloc(f32, 0) else if (gathered_prefix_logits) |tensor| try cb.toFloat32(tensor, a) else if (gpu_choices) blk: {
             var rows: [gpt_arch.max_packed_qwen_items]i64 = undefined;
             var count: usize = 0;
-            for (claimed, 0..) |item, index| if (item.phase == .prefill and !@as(*PendingPrefillBatchWork, @ptrCast(@alignCast(item.work_ptr))).wants_greedy) {
-                rows[count] = @intCast(index);
+            for (claimed, 0..) |item, index| if (item.phase == .prefill and prefillHasHostRow(@ptrCast(@alignCast(item.work_ptr)), prefix_logits_layout)) {
+                rows[count] = @intCast(head_rows.row_by_item[index]);
                 count += 1;
             };
             const prefix_logits = try cb.embeddingLookup(logits, rows[0..count], count, cfg.vocab_size);
@@ -13968,7 +13993,7 @@ pub const NativeGenerationPipeline = struct {
             break :blk try cb.toFloat32(prefix_logits, a);
         } else try cb.toFloat32(logits, a);
         gpt_arch.applyFinalLogitSoftcapInPlace(cfg, host);
-        return .{ .logits = host, .packed_greedy_tokens = tokens, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
+        return .{ .logits = host, .packed_greedy_tokens = tokens, .prefix_logits_layout = prefix_logits_layout, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
     }
 
     fn forwardScheduledStep(
@@ -14260,6 +14285,7 @@ pub const NativeGenerationPipeline = struct {
         vocab_size: usize,
         greedy_tokens: ?[]const u32 = null,
         packed_greedy_tokens: ?[]const u32 = null,
+        prefix_logits_layout: PrefixLogitsLayout = .all_host_rows,
         second_greedy_tokens: ?[]const u32 = null,
         logits: ?[]const f32,
         max_query_seq_len: usize,
@@ -14274,7 +14300,7 @@ pub const NativeGenerationPipeline = struct {
                 }
             };
             if (self.packed_greedy_tokens) |tokens| {
-                dispatchPackedGreedyResults(self.vocab_size, claimed, self.logits, tokens);
+                dispatchPackedGreedyResultsWithLayout(self.vocab_size, claimed, self.logits, tokens, self.prefix_logits_layout);
                 return;
             }
             if (self.greedy_tokens) |tokens| {
@@ -14378,6 +14404,7 @@ pub const NativeGenerationPipeline = struct {
             .second_greedy_tokens = result.second_greedy_tokens,
             .max_query_seq_len = result.max_query_seq_len,
             .last_rows_only = result.last_rows_only,
+            .prefix_logits_layout = result.prefix_logits_layout,
         });
     }
 
@@ -14483,6 +14510,10 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn dispatchPackedGreedyResults(vocab_size: usize, claimed: []const runtime.scheduler.native_generate.StepItem, logits: ?[]const f32, tokens: []const u32) void {
+        dispatchPackedGreedyResultsWithLayout(vocab_size, claimed, logits, tokens, .all_host_rows);
+    }
+
+    fn dispatchPackedGreedyResultsWithLayout(vocab_size: usize, claimed: []const runtime.scheduler.native_generate.StepItem, logits: ?[]const f32, tokens: []const u32, layout: PrefixLogitsLayout) void {
         var prefills: usize = 0;
         var valid = tokens.len == claimed.len;
         for (claimed) |item| switch (item.phase) {
@@ -14490,7 +14521,7 @@ pub const NativeGenerationPipeline = struct {
                 const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                 if (work.wants_greedy) {
                     valid = valid and work.wants_last_logits;
-                } else prefills += 1;
+                } else if (prefillHasHostRow(work, layout)) prefills += 1;
             },
             .decode => {
                 const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
@@ -14525,7 +14556,7 @@ pub const NativeGenerationPipeline = struct {
                         break :blk null;
                     };
                 }
-                row += @intFromBool(!work.wants_greedy);
+                row += @intFromBool(prefillHasHostRow(work, layout));
                 work.ready.store(true, .release);
             },
             .waiting => unreachable,
@@ -20502,4 +20533,29 @@ test "LightOnOCR3 packed prefix publication separates device choices host logits
             try std.testing.expect(sampled.failure == null);
         }
     }
+}
+
+test "LightOnOCR3 CUDA final prefix logits layout skips intermediate rows and preserves sampled peer bytes" {
+    const P = NativeGenerationPipeline;
+    const a = std.testing.allocator;
+    var sampled = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = true };
+    defer if (sampled.logits) |values| a.free(values);
+    var greedy = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = true, .wants_greedy = true };
+    var middle = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = false };
+    const Item = runtime.scheduler.native_generate.StepItem;
+    const items = [_]Item{
+        .{ .work_ptr = &middle, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+        .{ .work_ptr = &greedy, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+        .{ .work_ptr = &sampled, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+    };
+    var logits = [_]f32{ 0.3, 0.2, 0.1 };
+    const publisher = P.SuccessfulStepPublisher{ .vocab_size = 3, .logits = &logits, .max_query_seq_len = 1, .packed_greedy_tokens = &.{ 0, 2, 1 }, .prefix_logits_layout = .final_host_rows };
+    publisher.publish(&items);
+    try std.testing.expect(middle.ready.load(.acquire) and greedy.ready.load(.acquire) and sampled.ready.load(.acquire));
+    try std.testing.expect(middle.failure == null and greedy.failure == null and sampled.failure == null);
+    try std.testing.expect(middle.logits == null and middle.greedy_token == null and greedy.logits == null);
+    try std.testing.expectEqual(@as(?u32, 2), greedy.greedy_token);
+    try std.testing.expectEqualSlices(f32, &logits, sampled.logits.?);
+    @memset(&logits, 999);
+    try std.testing.expectEqual(@as(f32, 0.3), sampled.logits.?[0]);
 }
