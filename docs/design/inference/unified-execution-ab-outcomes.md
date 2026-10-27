@@ -79,3 +79,31 @@ No fresh CUDA hardware performance result is claimed here.
 
 The two task-created baseline worktrees were audited for production identity,
 and their benchmark-only patches retained before removal.
+
+## Latest main integration
+
+Implementation is committed as `75cc5a2f22`. Merge `b1026fb50f` incorporates
+`origin/main` through `031742c340`, including 85 previously unmerged commits.
+The sole conflict was the split-GQA scratch source assertion; both the two
+encoder-retention checks and the four total scratch references are retained.
+The merge does not change either Q8 implementation file, so the CPU comparison
+above still describes exactly those production kernels.
+
+After merging, 167 selected source tests, the combined Metal/CUDA compile check,
+all generated-source checks, 167 Metal device runtime cases, 50 v2 device
+conformance cases and 26 tooling tests pass. This machine lacks Apple's offline
+`metal` utility: the offline attempt is retained as an unavailable-tool failure,
+and the device run uses the previously audited real runtime compiler adapter.
+It produces no offline AIR artifact. Native CUDA's 119-file closure still
+matches the earlier compiler audit; main does change Metal host eligibility
+and pipeline initialization, covered here by fresh device correctness checks.
+The final affected-pipeline group selects 458 cases: 396 pass and 62 skip
+(including unavailable CUDA/fixture-gated cases), with no failures. The
+8,019-file post-merge source manifest matches the completed validation.
+No new hardware performance measurement for those upstream policy changes is
+claimed.
+
+Glowworm's controller was checked read-only and is still waiting behind earlier
+qualification controllers and active LightOnOCR work. No other job was stopped.
+The task-scoped cache audit retains 6.1 GiB of active cache and 0.1 GiB output;
+no other worktree or user cache was considered. No branch was pushed.
