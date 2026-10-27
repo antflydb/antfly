@@ -78,13 +78,15 @@ pub const ProviderCapabilities = lib.ProviderCapabilities;
 pub const providerCapabilities = lib.providerCapabilities;
 pub const max_candidate_count = lib.max_candidate_count;
 
-/// Long-lived resources shared by reranking requests. This keeps HTTP
-/// connections warm and lets ADC refresh single-flight per credential/scope.
+/// Long-lived resources shared by read post-processing. Reranking and
+/// decision evaluation retain separate transport policies while reusing
+/// connections and credential refresh across requests.
 pub const Runtime = struct {
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     io: std.Io,
     http: httpx.Client,
     credentials: google_auth.CredentialManager,
+    providers: managed_embedder.ProviderRuntime,
     admission: request_admission.RequestAdmission = request_admission.RequestAdmission.init(16),
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) Runtime {
@@ -99,6 +101,7 @@ pub const Runtime = struct {
                 .cookies_enabled = false,
             }),
             .credentials = google_auth.CredentialManager.init(alloc, io),
+            .providers = managed_embedder.ProviderRuntime.init(alloc, io),
         };
     }
 
@@ -171,6 +174,7 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        self.providers.deinit();
         self.credentials.deinit();
         self.http.deinit();
         self.* = undefined;
@@ -526,6 +530,20 @@ pub fn rerankContentWithOptions(
             try request_context.check();
             return try alloc.dupe(f32, result.scores);
         },
+        .cloudflare => {
+            var auth = try RequestAuthentication.init(alloc, cfg, options.secret_store);
+            defer auth.deinit(alloc);
+            const token = auth.token orelse return error.InvalidRerankerConfig;
+            const endpoint = if (cfg.url.len > 0) try alloc.dupe(u8, cfg.url) else try lib.cloudflare.nativeUrl(alloc, cfg.account_id.?, cfg.model);
+            defer alloc.free(endpoint);
+            var quota = try acquireQuotaForEndpoint(cfg, options, endpoint, auth.identity(cfg), "", "", policy);
+            defer quota.release();
+            const scores = try rerankCloudflare(alloc, http, cfg, endpoint, token, request_context, quota.limiter().observer(0), query, documents);
+            errdefer alloc.free(scores);
+            try validateScores(scores, documents.len);
+            try request_context.check();
+            return scores;
+        },
         .cohere => {
             var auth = try RequestAuthentication.init(alloc, cfg, options.secret_store);
             defer auth.deinit(alloc);
@@ -618,7 +636,65 @@ fn acquireQuotaForEndpoint(cfg: Config, options: Options, endpoint: []const u8, 
         .project = project,
         .location = location,
         .credentials = source,
+        .gateway_id = cfg.gateway_id orelse "",
     } }, policy);
+}
+
+fn rerankCloudflare(
+    a: std.mem.Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    endpoint: []const u8,
+    token: []const u8,
+    context: inference_request_context.RequestContext,
+    observer: httpx.AttemptObserver,
+    query: []const u8,
+    documents: []const []const u8,
+) ![]f32 {
+    const Context = lib.cloudflare.wire.types.BgeRerankerBaseInputContextsItem;
+    const contexts = try a.alloc(Context, documents.len);
+    defer a.free(contexts);
+    for (documents, contexts) |document, *item| item.* = .{ .text = document };
+    const body = try std.json.Stringify.valueAlloc(a, lib.cloudflare.wire.types.BgeRerankerBaseInput{ .query = query, .contexts = contexts, .top_k = @intCast(documents.len) }, .{ .emit_null_optional_fields = false });
+    defer a.free(body);
+    const authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    defer a.free(authorization);
+    var headers: [2][2][]const u8 = undefined;
+    headers[0] = .{ "Authorization", authorization };
+    if (cfg.gateway_id) |id| headers[1] = .{ "cf-aig-gateway-id", id };
+    var response = try http.post(endpoint, .{
+        .json = body,
+        .headers = headers[0..if (cfg.gateway_id != null) @as(usize, 2) else 1],
+        .attempt_observer = observer,
+        .max_retries = 0,
+        .follow_redirects = false,
+        .cookies_enabled = false,
+        .timeout_ms = try context.remainingTimeoutMs(),
+        .cancellation = httpCancellation(context.cancellation),
+    });
+    defer response.deinit();
+    if (!response.ok()) return statusError(response.status.code);
+    const Body = struct { success: bool, result: lib.cloudflare.wire.types.BgeRerankerBaseOutput };
+    var parsed = std.json.parseFromSlice(Body, a, response.body orelse return error.InvalidRerankerResponse, .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidRerankerResponse,
+    };
+    defer parsed.deinit();
+    if (!parsed.value.success) return error.InvalidRerankerResponse;
+    const scores = try a.alloc(f32, documents.len);
+    errdefer a.free(scores);
+    const seen = try a.alloc(bool, documents.len);
+    defer a.free(seen);
+    @memset(seen, false);
+    for (parsed.value.result.response orelse return error.InvalidRerankerResponse) |item| {
+        const id = std.math.cast(usize, item.id orelse return error.InvalidRerankerResponse) orelse return error.InvalidRerankerResponse;
+        const score: f32 = @floatCast(item.score orelse return error.InvalidRerankerResponse);
+        if (id >= scores.len or seen[id] or !std.math.isFinite(score)) return error.InvalidRerankerResponse;
+        seen[id] = true;
+        scores[id] = score;
+    }
+    for (seen) |present| if (!present) return error.InvalidRerankerResponse;
+    return scores;
 }
 
 fn rerankCohere(
@@ -722,6 +798,46 @@ test "reranking runtime maps Cohere scores back to input order" {
             out.* = rerankDocuments(a, test_client, .{
                 .provider = .cohere,
                 .model = "rerank-v4.0-pro",
+                .url = base_url,
+                .api_key = "test-token",
+                .field = "body",
+            }, "query", &.{ "first", "second" }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ alloc, &client, server.baseUrl(), &scores, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), scores.?[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), scores.?[1], 0.0001);
+}
+
+test "reranking runtime maps Cloudflare scores back to input order" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(alloc, io, &.{.{
+        .method = .POST,
+        .path = "/",
+        .respond = .{ .body = "{\"success\":true,\"result\":{\"response\":[{\"id\":1,\"score\":0.9},{\"id\":0,\"score\":0.25}]}}" },
+    }});
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var scores: ?[]f32 = null;
+    defer if (scores) |value| alloc.free(value);
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(a: std.mem.Allocator, test_client: *httpx.Client, base_url: []const u8, out: *?[]f32, err_out: *?anyerror) std.Io.Cancelable!void {
+            out.* = rerankDocuments(a, test_client, .{
+                .provider = .cloudflare,
+                .account_id = "account",
+                .model = "@cf/baai/bge-reranker-base",
                 .url = base_url,
                 .api_key = "test-token",
                 .field = "body",

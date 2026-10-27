@@ -3430,6 +3430,7 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .compare_and_set_job_state) return metadata_topology_protocol.job_state_version;
     const namespace_indexes = switch (command) {
         .apply_restore_staging, .apply_system_catalog => |bytes| bytes,
         .upsert_table => |table| table.indexes_json,

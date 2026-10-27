@@ -10,6 +10,7 @@ components:
     GeneratorProvider:
       type: string
       enum:
+        - cloudflare
         - gemini
         - vertex
         - bedrock
@@ -27,6 +28,7 @@ components:
         A unified configuration for a generative AI provider.
       allOf:
         - oneOf:
+            - $ref: "#/components/schemas/CloudflareGeneratorConfig"
             - $ref: "#/components/schemas/GoogleGeneratorConfig"
             - $ref: "#/components/schemas/VertexGeneratorConfig"
             - $ref: "#/components/schemas/BedrockGeneratorConfig"
@@ -352,6 +354,54 @@ components:
         name:
           type: string
           description: "Optional tool name for tool messages when model templates need it."
+
+    CloudflareGeneratorConfig:
+      type: object
+      description: Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum: [cloudflare]
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        frequency_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+        presence_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+      required: [provider, account_id, model]
 
     GoogleGeneratorConfig:
       type: object
