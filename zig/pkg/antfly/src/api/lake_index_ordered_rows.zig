@@ -216,7 +216,7 @@ pub const ReverseBuilder = struct {
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
         const self = try a.create(ReverseBuilder);
         self.* = .{ .a = a, .pages = undefined, .builder = undefined };
-        self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
+        self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .prefix_keys = true, .streaming = true };
         self.pages.admitPublication();
         var storage = self.pages.store();
         storage.reduce = @import("lake_index_predicate_ranges.zig").reduce;
@@ -242,7 +242,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
     var read_bytes: u64 = 256 * 1024 * 1024;
     var write_bytes: u64 = 512 * 1024 * 1024;
-    var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .streaming = true, .io = sort.manager.io };
+    var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .prefix_keys = true, .streaming = true, .io = sort.manager.io };
     pages.admitPublication();
     if (delta.sparse_slots and delta.dictionary_edits != null and delta.retired_slots != null and delta.retired_slots.?.len == 0 and delta.retired_rows.len == 0 and sort.total == 0) {
         const previous = delta.previous orelse return error.InvalidNativeLakeRowIndex;
@@ -536,7 +536,7 @@ fn persistRoot(a: A, result_alloc: A, store: *stores.ArtifactStore, root: Root, 
         var reads: u64 = 256 * 1024 * 1024;
         var writes: u64 = 512 * 1024 * 1024;
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
-        var dictionary_pages: page_store.PageStore = .{ .domain = root.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+        var dictionary_pages: page_store.PageStore = .{ .domain = root.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .prefix_keys = true, .streaming = true };
         dictionary_pages.admitPublication();
         const prior: ?file_dictionary.Previous = if (previous_root) |old| if (old.file_dictionary) |dictionary| .{ .roots = dictionary, .files = old.files, .fingerprints = old.file_fingerprints, .same_snapshot = std.mem.eql(u8, old.source, root.source) and std.mem.eql(u8, old.snapshot, root.snapshot) } else null else null;
         persisted.file_dictionary = try file_dictionary.publishWithOptions(a, dictionary_pages.store(), root.source, root.snapshot, root.files, root.file_fingerprints, prior, .{ .shared = root.public_navigation, .manager = manager });
@@ -648,7 +648,7 @@ pub fn publishRunCheckpoint(a: A, out: A, store: *stores.ArtifactStore, sort: *l
     }
     var reads: u64 = 256 * 1024 * 1024;
     var writes: u64 = 512 * 1024 * 1024;
-    var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .prefix_keys = true, .streaming = true };
     pages.admitPublication();
     while (incoming) |page| {
         const match = for (runs.items, 0..) |run, index| {
@@ -2595,4 +2595,52 @@ test "external lake covering batches clean up every allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(a, Sweep.run, .{ &reader, @as([]const rows.RowRef, &.{ entries[0].ref, entries[1].ref }) });
+}
+
+test "external lake metadata navigation compressed publication packs wide keys and bounds identity scan reads" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("ordered-compressed-publication");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(5), .attempt = @splat(1) };
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 8 * 1024 * 1024);
+    defer sort.deinit();
+    const key = try ca.alloc(u8, 131000);
+    @memset(key, 'w');
+    const count = 40;
+    for (0..count) |i| {
+        @memcpy(key[key.len - 16 ..], &coordinate(0, .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = i }));
+        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key })}, .values = &.{}, .ordinal = i });
+    }
+    const files: []const local.serverless_external_source_types.FileEntry = &.{.{ .file_id = @constCast("a"), .object_uri = @constCast("file://a"), .byte_len = 1, .row_count = count, .row_groups = &.{} }};
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = @constCast(files) };
+    const ref = try publish(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{}, .none);
+    const root = try loadRoot(ca, store, ref, .none, null);
+    var reader: Reader = undefined;
+    try reader.init(a, &store, root, @splat(3), "", null, .none);
+    defer reader.deinit();
+    const bytes_before = reader.remaining_reads;
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 256 * 1024 };
+    var output = std.heap.ArenaAllocator.init(budget.allocator());
+    defer output.deinit();
+    const page = try reader.nextBoundaryPage(output.allocator(), count);
+    try std.testing.expectEqual(@as(usize, count), page.refs.len);
+    for (page.refs, 0..) |row, i| try std.testing.expectEqual(@as(u64, i), row.external.row_ordinal);
+    try std.testing.expect(bytes_before - reader.remaining_reads < 2 * 1024 * 1024);
+    for (reader.cursor.?.frames[0..reader.cursor.?.depth]) |frame| {
+        try std.testing.expect(frame.page.prefix.len > 100000);
+        try std.testing.expectEqual(@as(usize, 0), reader.cursor.?.materialized.capacity);
+    }
+    try std.testing.expect(!budget.isExhausted());
 }
