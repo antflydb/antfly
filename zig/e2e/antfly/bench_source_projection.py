@@ -41,7 +41,7 @@ def file_info(path):
     }
 
 
-def measure(read, operation):
+def measure(read, operation, *, expected_status=None):
     before = read()
     peaks = dict(before)
     stop = threading.Event()
@@ -63,7 +63,11 @@ def measure(read, operation):
     finally:
         stop.set()
         sampler.join()
-    assert response.ok, (response.status_code, response.text[:4096])
+    assert (
+        response.ok
+        if expected_status is None
+        else response.status_code == expected_status
+    ), (response.status_code, response.text[:4096])
     for key in ("rss_bytes", "footprint_bytes"):
         if after[key] is not None:
             peaks[key] = max(peaks[key] or 0, after[key])

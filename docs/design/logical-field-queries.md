@@ -930,9 +930,42 @@ revision and authorization proofs remain mandatory.
 
 Computed results retain validated JSON spans through worker hydration and final
 HTTP encoding. This avoids repeated DOM construction, unescaping/re-escaping and
-numeric conversion. Duplicate keys, malformed JSON and incomplete or mismatched
+repeated numeric conversion. Duplicate keys, malformed JSON and incomplete or mismatched
 execution receipts fail closed. Public encoding strips the private execution
-marker while preserving selected value lexemes. Growing serialization buffers
+marker while preserving logical values with the same numeric semantics as the
+typed VM. Growing serialization buffers
 use independently reclaimable scratch (preserving quota wrappers); only exact
 result bytes remain in the response owner. The public JSON shape stays
 `_computed: object`; the raw representation is an internal Zig wire optimization.
+
+
+### Numeric representation and execution receipts
+
+The raw output path is an optimization of the typed VM, not a separate value
+model. Direct fields, selected CASE arms, aliases and ordinary JSON operations
+must agree regardless of output order or whether another output materialized the
+source first. JSON numbers use the existing typed parser/formatter, recursively
+inside arrays and objects. This includes floating-point rounding, underflow and
+negative zero. Explicit SQL numeric operators retain their existing typed rules.
+The streaming path must not introduce a lossless/approximate distinction merely
+because a field can be forwarded. Canonical value-identity ABI golden vectors
+cover these boundaries; this change does not alter that ABI.
+
+The request retains the bound immutable program and prepares unconditional field
+read sets once. Exact encoded-input address/length witnesses govern borrowing
+through hydration finalization and response encoding. Each row can read its
+unconditional direct fields together under one pinned scope. CASE inputs remain
+lazy, and unsupported source layouts use ordinary reads. Scope lifetime ends
+before row scratch; request program ownership ends separately from value copies.
+
+A selected projected hit may own a local completed-output receipt. Ordinary
+candidates carry only a nullable pointer. Exact immutable copies rebind their
+own receipt, moves transfer ownership, and replacing/freeing bytes retires it.
+Receipts certify syntax/execution for the request fingerprint, never revision,
+membership or authorization. No public JSON input can carry one. Transported
+outputs validate the complete binding set, syntax and fingerprint locally before
+regaining a receipt. Producer-standard trailing markers can be omitted by a
+borrowed object view during serialization without another payload-sized object.
+Other worker layouts keep the strict general fallback. Explicit immutable object
+receipts cannot disable validation for ordinary caller-constructed or parsed raw
+values; generic RawValue remains slice-sized.

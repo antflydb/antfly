@@ -3073,7 +3073,7 @@ def test_select_numeric_outputs_are_independent_of_materialization_order(
     stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
     # Submit literal numeric spellings, without Python float coercion.
     document = (
-        '{"n":1e-400,"nested":{"a":[1.234567890123456789,1e-400]},"padding":'
+        '{"n":1e-400,"nested":{"a":[1.234567890123456789,1e-400,-0.0]},"zero":-0.0,"padding":'
         + json.dumps("x" * padding)
         + "}"
     )
@@ -3084,7 +3084,7 @@ def test_select_numeric_outputs_are_independent_of_materialization_order(
         timeout=60,
     )
     assert inserted.status_code == 201, inserted.text
-    for field in ("n", "nested"):
+    for field in ("n", "nested", "zero"):
         direct = {"field": field}
         typed = {
             "call": "jsonb_extract_path",
@@ -3103,6 +3103,14 @@ def test_select_numeric_outputs_are_independent_of_materialization_order(
                 "case": [{"when": {"literal": True}, "then": {"field": field}}],
                 "else": {"literal": None},
             }
+            selected["field_identity"] = {
+                "call": "value_identity",
+                "args": [{"field": field}],
+            }
+            selected["alias_identity"] = {
+                "call": "value_identity",
+                "args": [{"ref": "direct"}],
+            }
             response = requests.post(
                 stateful_api.url + f"/tables/{table}/query",
                 json={"query": {"match_all": {}}, "fields": [], "select": selected},
@@ -3117,6 +3125,7 @@ def test_select_numeric_outputs_are_independent_of_materialization_order(
                 == values["alias"]
                 == values["branch"]
             ), hit
+            assert values["field_identity"] == values["alias_identity"], hit
             if outputs is not None:
                 assert values == outputs
             outputs = values

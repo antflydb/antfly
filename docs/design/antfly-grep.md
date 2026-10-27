@@ -842,7 +842,7 @@ Computed output stays as validated JSON spans through worker decoding and final
 serialization. Native scalar reads parse their authenticated row views directly;
 growing encoding buffers use reclaimable scratch before exact output ownership.
 This removes repeated payload DOMs and unescaping/re-escaping. SQL semantics,
-lazy CASE, strict duplicate/malformed JSON rejection, original numeric lexemes,
+lazy CASE, strict duplicate/malformed JSON rejection, typed JSON numeric semantics,
 revision proofs and authorization remain enforced. See the shared
 [projection execution contract](logical-field-queries.md#projection-execution-and-ownership).
 
@@ -904,8 +904,9 @@ rather than preparing a second view. Direct
 JSON columns and the selected CASE branch can forward validated raw spans to
 `_computed`; CASE conditions and operations still use the shared SQL VM. Alias
 outputs keep those spans until a consumer needs a typed value, then materialize
-once. Numeric coercions, array fanout and unsupported paths use the typed
-reference path. Both paths enforce cancellation, nesting, work and output
+once. Numbers are normalized with the same parser and formatter as typed JSON,
+including nested values. SQL numeric coercions, array fanout and unsupported
+paths use the typed reference path. Both paths enforce cancellation, nesting, work and output
 budgets. This is request-local reuse; no global cache retains user parameters,
 source bytes, snapshots or permissions across requests.
 
@@ -923,8 +924,9 @@ do not trigger repeated repair. Captured object parents are not
 hashed again. Exact path resolution is mandatory: an array or opaque object's
 certificate cannot prove a descendant's existence or identity. Missing records
 in older sidecars retain the reference read and bounded repair. Composite
-canonicalization declines optional certificates beyond 128 levels before DOM
-allocation; ordinary document ingestion does not require a certificate. Reuse
+canonicalization uses a bounded streaming walker and declines optional
+certificates beyond 128 levels; ordinary document ingestion does not require a
+certificate. Reuse
 still checks revision, content proof, directory binding, ancestry, kind, length
 and raw digest. It avoids canonicalizing an unchanged large array/object during
 metadata updates, while continuing to validate and rewrite the incoming primary
@@ -1028,3 +1030,207 @@ native borrowed-program retrieval, raw/VM work-budget equivalence,
 allocation-failure cleanup, Go SDK tests, 356 Python query/resolver cases,
 OpenAPI regeneration, Apache boundary (2,553 files) and control catalog
 checks passed. Local tests do not replace maintainer-approved PR CI.
+
+
+### Numeric consistency, bounded reuse and media materialization follow-up
+
+A direct `select` field, an alias, a selected CASE arm and a typed SQL JSON
+operation must return the same logical numbers regardless of output order or
+whether another output materialized the source first. The native path now uses
+the existing typed JSON number parser and formatter, including numbers inside
+arrays and objects. For example, `1e-400` follows the current VM's underflow to
+zero; the fast path cannot preserve a different numeric value. SQL numeric
+casts retain their separate type/precision rules. Changing the canonical ABI
+would require an explicit compatibility change; this fix does not change it.
+
+One streaming walker handles numeric normalization, logical-value work budgets
+and canonical identity encoding. Output strings can retain their original escape
+spelling, while identity hashing uses the default typed canonical spelling.
+The scanner supplies syntax/UTF-8 validation and fragmented-string cancellation;
+strict duplicate-key policy is established by the admitted source, not replaced
+by this walker. Unchanged output borrows the existing extent. A changed numeric
+encoding allocates only the resulting wire bytes, not a payload DOM. Opaque
+identity hashing retains only bounded scanner/container state and declines
+optional certificates beyond 128 levels. Ordinary document format remains ASCH25.
+
+Hydration finalization now borrows the admitted program under the same exact
+encoded-input witness as response encoding. Unconditional direct-field operands
+are deduplicated once in that immutable plan. Each selected row can read these
+operands together through one pinned scope and shared projected view. Conditional
+operands remain lazy; untaken CASE branches are not prefetched. The scope closes
+before row scratch is released. Unsupported selectors retain the reference path.
+
+Completed native outputs carry an owned, optional receipt bound to their exact
+immutable bytes and program fingerprint. Ordinary candidates carry only a nullable
+pointer; receipt storage is allocated only for projected hits. Cloning copies and
+rebinds the receipt after copying the complete immutable bytes; moves transfer
+ownership, replacements retire it, and allocation failures release both objects.
+These are syntax/execution receipts, never read grants. Transported outputs must
+validate their syntax, binding set and fingerprint locally. Standard marker-last
+outputs can then regain a local receipt; other layouts use the general fallback.
+The public serializer emits leading computed members plus their closing brace,
+omitting the private trailer without copying the payload into a second object.
+Only explicit immutable producer objects skip another generic raw-JSON validation;
+ordinary constructors and parsed values preserve their validation behavior.
+Generic `RawValue` retains its original slice-sized representation.
+
+Media source groups use at most four concurrent queries under one ingress
+identity and shared deadline. Isolated job arenas share the request memory budget;
+no child uses the parent arena concurrently, and every child is joined/canceled
+before its arena is freed. Scheduling failure degrades to inline work. Each group
+still executes the ordinary authorized query and independently checks every
+reference's revision, identity and permissions. Complete filters are encoded and
+interned once with exact equality, including collision checks; comparisons do not
+serialize them repeatedly. Temporary interned encodings die before source reads.
+A regression groups 128 distinct filters with a bounded 2 MiB grouping budget.
+
+Identical materialized URLs share decoding, digest and image inspection only
+within the request, after source lookup. Every reference still checks its own
+digest, MIME, length and pixel cap. Decode scratch is reclaimed through the
+existing budget rather than retained in the request arena. The expanded JSON
+limit is computed from the compact request and exact source-to-URL substitutions;
+verified base64 data URLs are JSON-safe ASCII, so they need no second image-sized
+counting-encoder pass. Deep source/filter data is rejected before recursive
+cloning or fixed-depth serialization. These changes do not cache authorization
+or claim lower model billing or improved relevance.
+
+The isolated ReleaseFast digest benchmark uses five alternating trials and
+32 hashes per trial on synthetic opaque arrays. Both paths check the same typed
+identity ABI. Figures are medians per hash; allocation figures are allocator byte
+volume, not peak memory or process RSS. Both implementations run in the same
+binary with the same allocator, outside HTTP/storage and corpus construction.
+
+| Workload | DOM reference µs → streaming µs | Allocated bytes, reference → streaming |
+|---|---:|---:|
+| opaque_ascii | 424.86 → 367.52 | 591293 → 129 |
+| opaque_escaped | 1906.86 → 1642.73 | 654331 → 129 |
+| opaque_unicode | 734.32 → 513.85 | 591265 → 129 |
+| opaque_small | 0.43 → 0.31 | 1477 → 129 |
+
+Reproduce from `zig/` with pinned Zig 0.17.0:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig run -O ReleaseFast --dep identity \
+  -Mroot=tools/bench_canonical_json.zig \
+  -Midentity=pkg/antfly-embedded/src/common/value_identity.zig
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig test --dep canonical \
+  -Mroot=tools/test_canonical_json.zig \
+  -Mcanonical=pkg/antfly-embedded/src/common/canonical_json.zig
+```
+
+The paired media driver is `zig/e2e/antfly/bench_media_materialization.py`.
+It covers tiny/large PNGs, shared/distinct masks and duplicated/unique payloads.
+Every invocation stops at `ModelRequired`, after source materialization and
+verification but before any model/provider execution. Separate one/two-shard
+server fixtures check successful materialization plus digest, permission and
+revision rejection. Its timings measure source work, not inference latency.
+Raw logs/reports remain ignored under `output/projection-followup/`.
+
+
+### Release qualification for the bounded-reuse follow-up (2026-10-27)
+The measured ReleaseFast executable uses production source `915e5493a2b8`,
+including `main` through `7dabd028d66d`. Its SHA-256 is
+`d2a0401ddb9573148dcadf2c524772dd8fd566469e00fc2c2dc8fe84fd8e508f`
+(251,319,128 bytes). The preserved performance baseline uses runtime source
+`952f4161577b`, `main` through `ca4339f030a6`, and SHA-256
+`e4b1d40f6e707e39cfe388f65be91af10da70435f766896c701dd08e0025afbe`.
+**The candidate includes newer main changes; whole-server deltas do not isolate
+all effects of this follow-up.** The separate same-binary digest comparison above
+isolates that kernel. Both server executables report `antfly dev (zig runtime)`.
+
+The final current-source build passed. The indexed HTTP suite passed 49 cases;
+seven opt-in profiling cases were skipped. It covers one/two-shard projections,
+numeric order/alias/identity equivalence, source masks, retained pagination,
+authorization, media claim rejection and persisted SVI1/SVI2 upgrade/old-reader
+rollback. The rollback executable is the older SHA-256
+`7456751926649113da3802df93fa6354005d01b3bb16a12218d8db90d2100db0`;
+the performance baseline already understands SVI2 and cannot establish that
+rollback property.
+
+The paired source driver ran five alternating trials, five reads per phase,
+eight documents and two metadata updates per trial on a shared 14-logical-CPU
+macOS ARM64 host. Large target values are approximately 256 KiB; mixed data also
+contains small/numeric/wide values. `small64` uses tiny values; `wide64` uses large
+ASCII targets. Both add 60 distinct metadata outputs. Each run verifies output
+hashes against ordinary reference reads and across binaries, certificate reuse,
+and identities after metadata updates. Storage/filesystem caches are warm after
+ingestion. CPU is whole-process CPU including background work; sampled RSS is
+neither allocation volume nor a hard peak bound. Values below are medians,
+baseline → candidate.
+
+| Workload | Full computed elapsed ms | Full computed CPU ms | Full computed RSS MiB | Conditional CPU ms |
+|---|---:|---:|---:|---:|
+| ascii | 11.33 → 8.65 | 9.97 → 7.30 | 204.1 → 203.5 | 0.77 → 0.71 |
+| mixed | 15.02 → 11.24 | 13.91 → 10.02 | 207.0 → 207.7 | 0.74 → 0.71 |
+| opaque | 12.11 → 8.80 | 10.59 → 7.59 | 203.6 → 205.1 | 0.75 → 0.73 |
+| small64 | 3.30 → 4.39 | 2.03 → 1.89 | 176.5 → 176.4 | 2.34 → 2.08 |
+| wide64 | 13.09 → 9.75 | 11.76 → 8.45 | 204.8 → 206.0 | 2.17 → 1.70 |
+| escaped | 33.80 → 23.47 | 32.48 → 22.20 | 216.4 → 217.9 | 0.68 → 0.58 |
+| unicode | 36.07 → 25.40 | 35.39 → 24.29 | 204.0 → 206.5 | 0.66 → 0.65 |
+
+Controls retain the actual costs outside computed reads. Positive percentages
+mean more candidate CPU; negative percentages mean less. These are observed
+shared-host deltas, not regression tolerances or performance guarantees.
+
+| Workload | Ordinary-read CPU change | Ingestion CPU change | Metadata-update CPU change |
+|---|---:|---:|---:|
+| ascii | -6.7% | +3.7% | +3.7% |
+| mixed | -2.1% | +0.7% | -1.3% |
+| opaque | +3.5% | -2.9% | -1.7% |
+| small64 | -6.7% | -10.0% | +3.7% |
+| wide64 | +4.3% | +3.1% | -0.9% |
+| escaped | -3.0% | -1.5% | +0.5% |
+| unicode | -1.2% | +0.9% | -4.1% |
+
+The model-free media comparison uses five alternating trials and five requests
+per trial, with four images per request. Tiny PNGs are 1×1; large PNGs are
+256×256 random RGBA data. Distinct-mask cases exercise separate source groups;
+shared-mask cases already batch into one query. Duplicate cases reuse identical
+payloads across distinct parent documents. Every request reaches `ModelRequired`
+after materialization and verification, before any provider call. Median values
+are baseline → candidate.
+
+| Media workload | Elapsed ms | Server CPU ms | Sampled RSS MiB |
+|---|---:|---:|---:|
+| tiny_shared_duplicates | 0.87 → 0.83 | 1.36 → 1.24 | 167.97 → 167.81 |
+| tiny_distinct_unique | 1.54 → 1.11 | 2.62 → 2.74 | 168.12 → 188.55 |
+| large_shared_duplicates | 15.47 → 11.14 | 15.10 → 10.68 | 205.19 → 203.98 |
+| large_distinct_unique | 16.38 → 5.83 | 16.00 → 12.54 | 215.42 → 229.86 |
+| large_distinct_duplicates | 16.38 → 4.62 | 16.09 → 12.07 | 207.06 → 228.94 |
+
+Concurrency reduces large distinct-source latency while increasing sampled RSS
+by roughly 14–22 MiB in these cases. Tiny distinct-source CPU increases about
+4.5%; this is a latency/memory tradeoff, not free throughput. Four concurrent
+groups and the shared request quota bound scheduling and materialized payloads;
+process RSS also includes runtime thread/allocator state outside those payloads.
+No model latency, billing, quality, cold-cache behavior or cross-host guarantee is
+measured. Large computed-source CPU falls about 27–32% here, while ordinary reads,
+writes, small values and RSS do not improve uniformly.
+
+Reproduce the source comparison from the repository root, substituting the
+preserved prior executable for `/path/to/baseline/antfly`:
+
+```sh
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_source_projection.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 --documents 8 --value-bytes 262144 \
+  --metadata-updates 2 --workload ascii \
+  --output output/projection-followup/source-ascii.json
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_media_materialization.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 \
+  --output output/projection-followup/media.json
+```
+
+Repeat source runs with `mixed`, `opaque`, `escaped` and `unicode`. Add
+`--metadata-outputs 60` for `ascii` (wide64) and `small` (small64). Reports retain
+binary hashes, corpus/output hashes, host details, all samples and medians.
+
+A separate five-trial small64 repeat retained the same hashes and observed full
+computed elapsed 2.03 → 1.98 ms, CPU 1.54 → 1.48 ms and sampled RSS
+170.8 → 170.4 MiB. Conditional elapsed was 2.13 → 2.10 ms and CPU
+1.66 → 1.60 ms. Metadata updates were 8.82 → 9.14 ms and CPU
+10.01 → 10.50 ms. The first run's full-read latency regression did not repeat;
+both runs are retained rather than selecting a favorable sample. Metadata-update
+CPU was about 4–5% higher in both small runs. These results support reduced read
+work, not a universally better latency, memory or write-cost claim.

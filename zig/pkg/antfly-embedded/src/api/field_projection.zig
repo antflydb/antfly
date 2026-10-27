@@ -987,3 +987,35 @@ test "api query contract optional producer receipts clone independently and rele
     };
     try std.testing.checkAllAllocationFailures(a, Copy.run, .{ &hit, plan.fingerprint });
 }
+
+test "api query contract raw numeric provenance preserves aliases and identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, a,
+        \\[ {"name":"n","expression":{"field":"n"}}, {"name":"copy","expression":{"ref":"n"}},
+        \\  {"name":"from_field","expression":{"call":"value_identity","args":[{"field":"n"}]}},
+        \\  {"name":"from_alias","expression":{"call":"value_identity","args":[{"ref":"n"}]}},
+        \\  {"name":"from_copy","expression":{"call":"value_identity","args":[{"ref":"copy"}]}} ]
+    , .{});
+    var plan = try Plan.init(a, .{ .fields = fields });
+    defer plan.deinit();
+    const Mock = struct {
+        json: JsonSource,
+        original: []const u8,
+        fn raw(ptr: *anyopaque, _: A, _: []const u8) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.original;
+        }
+        fn read(ptr: *anyopaque, alloc: A, path: []const u8, kind: sql.ColumnRead) !sql.Datum {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.json.source().read(&self.json, alloc, path, kind);
+        }
+    };
+    for ([_][]const u8{ "-0.0", "1e-400", "1.234567890123456789", "{\"a\":[-0.0,1e-400,1.234567890123456789]}" }) |original| {
+        var source: Mock = .{ .original = original, .json = .{ .id = "a", .root = try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"n\":{s}}}", .{original}), .{}) } };
+        const normal = try plan.evaluate(a, .{ .context = &source, .read = Mock.read }, null, .{});
+        const encoded = try plan.evaluateEncoded(a, a, .{ .context = &source, .read = Mock.read, .read_raw = Mock.raw }, null, .{});
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, normal, .{}), encoded);
+    }
+}

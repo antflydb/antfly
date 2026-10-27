@@ -4960,3 +4960,19 @@ endpoints with `mode: source`. There is no separate Cloud `/sources` API. The
 Cloud session adapter pins authenticated query identity and catalog/source policy
 headers across pagination, asset reads and token renewal; the gateway enforces
 current row permissions.
+
+Projection delivery uses the same numeric semantics for direct fields, aliases,
+CASE arms and typed JSON operations, including nested numbers and underflow.
+Request-owned programs and unconditional read sets avoid repeated binding; CASE
+branches remain lazy. Immutable completed-output receipts avoid repeated
+validation/copying, and opaque identity hashing streams without a payload DOM.
+Media lookup uses at most four concurrent groups under the existing request
+budget; identical payload inspection is shared only within the request, while
+claims remain checked per reference.
+
+The [bounded-reuse qualification](../../../docs/design/antfly-grep.md#release-qualification-for-the-bounded-reuse-follow-up-2026-10-27)
+records source/media controls, hashes, costs and reproduction commands. Large
+computed reads use 27–32% less CPU in those paired runs. Distinct-source media
+latency improves with higher sampled RSS; small writes do not uniformly improve.
+The server comparison includes newer main changes and is not an isolated or
+universal performance guarantee. Document format and canonical ABI are unchanged.
