@@ -31,15 +31,6 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
-
-// MTLLanguageVersion uses the public (major << 16) | minor encoding. Keep
-// runtime-gated Metal 4 kernels available when building with a pre-26 SDK;
-// shader compilation still requires macOS 26.1 and retains the normal fallback.
-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
-#define TERMITE_METAL_LANGUAGE_VERSION_4_0 MTLLanguageVersion4_0
-#else
-#define TERMITE_METAL_LANGUAGE_VERSION_4_0 ((MTLLanguageVersion)(4u << 16))
-#endif
 #include <math.h>
 #include <limits.h>
 #include <errno.h>
@@ -30299,8 +30290,8 @@ static void termite_metal_initialize_lightonocr3_mpp(termite_metal_decode_runtim
     // Optional Metal 4 TensorOps: preserve old devices and failed PSOs.
     if (@available(macOS 26.1, *)) {
         MTLCompileOptions *tensor_options = [MTLCompileOptions new];
-        tensor_options.languageVersion = TERMITE_METAL_LANGUAGE_VERSION_4_0;
-        tensor_options.mathMode = MTLMathModeSafe;
+        tensor_options.languageVersion = MTLLanguageVersion4_0;
+        tensor_options.fastMathEnabled = NO;
         NSError *tensor_error = nil;
         id<MTLLibrary> tensor_library = [device newLibraryWithSource:termite_metal_lightonocr3_tensor_source()
                                                              options:tensor_options
@@ -30358,6 +30349,7 @@ static void termite_metal_initialize_lightonocr3_recurrent(termite_metal_decode_
     if (runtime->device.argumentBuffersSupport != MTLArgumentBuffersTier2) return;
     MTLCompileOptions *options = [MTLCompileOptions new];
     options.languageVersion = MTLLanguageVersion3_1;
+    options.fastMathEnabled = NO;
     if (![options respondsToSelector:@selector(setMathMode:)]) return;
     options.mathMode = MTLMathModeSafe;
     NSError *error = nil;
@@ -41690,7 +41682,8 @@ static void termite_metal_initialize_lighton_prefill_ffn(termite_metal_decode_ru
     r->lighton_prefill_ffn_initialization_attempted = true;
     if (@available(macOS 26.1, *)) {
         MTLCompileOptions *options = [MTLCompileOptions new];
-        options.languageVersion = TERMITE_METAL_LANGUAGE_VERSION_4_0;
+        options.languageVersion = MTLLanguageVersion4_0;
+        options.fastMathEnabled = NO;
         options.mathMode = MTLMathModeSafe;
         NSError *error = nil;
         id<MTLLibrary> library = [r->device newLibraryWithSource:termite_metal_lighton_prefill_ffn_source()
