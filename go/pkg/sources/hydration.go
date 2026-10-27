@@ -289,7 +289,7 @@ func (c *CollaborationConnector) authorizeCurrent(ctx context.Context, config Co
 				return &RevisionChangedError{Expected: configString(item.Metadata, "etag"), Actual: event.ETag}
 			}
 			limited, known := item.Metadata["details_visible"].(bool)
-			if calendarPrivateVisibility(event.Visibility) && c.calendarRoles[ref.Container] == "reader" && (!known || limited) {
+			if calendarPrivateVisibility(event.Visibility) && !calendarCanReadPrivateDetails(c.calendarRoles[ref.Container]) && (!known || limited) {
 				return fmt.Errorf("%w: private Calendar event detail access revoked", ErrInvalidInput)
 			}
 			c.scopeChecks[eventKey] = time.Now()

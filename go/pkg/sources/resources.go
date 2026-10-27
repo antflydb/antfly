@@ -105,7 +105,7 @@ func (c *CollaborationConnector) ListResources(ctx context.Context, resource, pa
 				return page, err
 			}
 			for _, calendar := range result.Items {
-				page.Data = append(page.Data, Resource{ID: calendar.ID, Name: calendar.Summary, Readable: calendar.AccessRole == "reader" || calendar.AccessRole == "writer" || calendar.AccessRole == "owner"})
+				page.Data = append(page.Data, Resource{ID: calendar.ID, Name: calendar.Summary, Readable: calendarCanReadEvents(calendar.AccessRole)})
 			}
 			page.NextCursor = result.Next
 		default:

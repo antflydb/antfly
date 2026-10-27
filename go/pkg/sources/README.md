@@ -293,3 +293,7 @@ threads only within the current operation and access-check window. New audits
 always recheck live grants. Moderators use the complete private archive endpoint;
 ordinary readers use joined private archives. Complete archive pagination and
 absence reconciliation retain accessible messages after a thread is archived.
+
+Calendar `writerWithoutPrivateAccess` is selectable like `reader`: ordinary events
+remain readable, while retained private/confidential details cannot be renewed or
+reused through this restricted role. Unknown and free/busy-only roles are rejected.

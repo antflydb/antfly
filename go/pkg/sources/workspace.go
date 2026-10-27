@@ -61,6 +61,22 @@ func (c *CollaborationConnector) gmailAccount(ctx context.Context) (string, erro
 	}
 	return p.Email, nil
 }
+
+// Calendar read access and private-detail access are separate capabilities.
+// writerWithoutPrivateAccess can read ordinary events, like reader, while only
+// writer and owner can rely on calendar-wide access to private details.
+func calendarCanReadEvents(role string) bool {
+	switch role {
+	case "reader", "writerWithoutPrivateAccess", "writer", "owner":
+		return true
+	default:
+		return false
+	}
+}
+func calendarCanReadPrivateDetails(role string) bool {
+	return role == "writer" || role == "owner"
+}
+
 func (c *CollaborationConnector) calendarID(ctx context.Context, id string) (string, error) {
 	var entry struct {
 		ID         string `json:"id"`
@@ -69,7 +85,7 @@ func (c *CollaborationConnector) calendarID(ctx context.Context, id string) (str
 	if err := c.get(ctx, "calendar", "/users/me/calendarList/"+url.PathEscape(id), &entry); err != nil {
 		return "", err
 	}
-	if entry.ID == "" || (entry.AccessRole != "reader" && entry.AccessRole != "writer" && entry.AccessRole != "owner") {
+	if entry.ID == "" || !calendarCanReadEvents(entry.AccessRole) {
 		return "", fmt.Errorf("calendar requires event read access")
 	}
 	if c.calendarRoles == nil {
@@ -423,7 +439,7 @@ func (c *CollaborationConnector) calendarLoad(ctx context.Context, config Collab
 	meta := map[string]any{"calendar_id": ref.Container, "etag": event.ETag, "ical_uid": event.ICalUID, "recurring_event_id": event.RecurringEventID, "start": event.Start, "end": event.End, "original_start_time": event.OriginalStartTime, "recurrence": event.Recurrence, "organizer": event.Organizer, "attendees": event.Attendees}
 	meta["status"] = event.Status
 	meta["visibility"] = event.Visibility
-	meta["details_visible"] = !calendarPrivateVisibility(event.Visibility) || c.calendarRoles[ref.Container] == "writer" || c.calendarRoles[ref.Container] == "owner"
+	meta["details_visible"] = !calendarPrivateVisibility(event.Visibility) || calendarCanReadPrivateDetails(c.calendarRoles[ref.Container])
 	text := event.Summary + "\n" + string(htmlText([]byte(event.Description))) + "\n" + event.Location
 	if event.Status == "cancelled" {
 		text = "Canceled occurrence\n" + text

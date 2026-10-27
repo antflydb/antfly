@@ -185,7 +185,7 @@ func boolPointer(v bool) *bool { return &v }
 
 func TestCalendarPrivacyNormalizationAndGrantRevocation(t *testing.T) {
 	for _, visibility := range []string{"private", "confidential", "public", "default"} {
-		for _, role := range []string{"reader", "writer", "owner"} {
+		for _, role := range []string{"reader", "writerWithoutPrivateAccess", "writer", "owner"} {
 			t.Run(visibility+"/"+role, func(t *testing.T) {
 				c := &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, Services: []string{"calendar"}, APIBase: "https://fixture.test", calendarRoles: map[string]string{"cal": role}}
 				c.HTTPClient = fixtureClient(t, func(r *http.Request) (int, any) {
@@ -198,15 +198,24 @@ func TestCalendarPrivacyNormalizationAndGrantRevocation(t *testing.T) {
 				ref := collaborationRef{Resource: "calendar", Container: "cal", ID: "event"}
 				material, err := c.calendarLoad(t.Context(), CollaborationConfig{}, ref)
 				require.NoError(t, err)
-				restricted := calendarPrivateVisibility(visibility) && role == "reader"
+				restricted := calendarPrivateVisibility(visibility) && (role == "reader" || role == "writerWithoutPrivateAccess")
 				require.Equal(t, !restricted, material.Metadata["details_visible"])
 				raw, _ := json.Marshal(ref)
-				item := Item{Metadata: map[string]any{"acquisition": string(raw), "details_visible": true, "etag": "v1"}}
-				err = c.AuthorizeInventory(t.Context(), Request{Mode: ImportModeSource, Config: SourceConfig(`{"resource":"calendar","calendar_ids":["cal"]}`)}, Inventory{Objects: []Item{item}})
-				if restricted {
-					require.Error(t, err)
-				} else {
-					require.NoError(t, err)
+				item := Item{ContentRef: strings.Repeat("a", 64), Metadata: map[string]any{"acquisition": string(raw), "details_visible": true, "etag": "v1"}}
+				c.ContentStore = &FileAcquisitionContentStore{Directory: t.TempDir()}
+				request := Request{Mode: ImportModeSource, Config: SourceConfig(`{"resource":"calendar","calendar_ids":["cal"]}`)}
+				inventory := Inventory{Objects: []Item{item}}
+				for name, check := range map[string]func() error{
+					"renewal":            func() error { return c.AuthorizeInventory(t.Context(), request, inventory) },
+					"pinned publication": func() error { return c.ValidateInventory(t.Context(), request, inventory) },
+					"retained read":      func() error { return c.CheckAccess(t.Context(), request, item) },
+				} {
+					err := check()
+					if restricted {
+						require.Error(t, err, name)
+					} else {
+						require.NoError(t, err, name)
+					}
 				}
 			})
 		}
