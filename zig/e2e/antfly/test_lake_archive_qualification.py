@@ -1017,6 +1017,7 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
                 "bucket": [i // 64 for i in range(count)],
                 "constant": [0] * count,
                 "keep": [i < 64 for i in range(count)],
+                "keep_tail": [i >= count - 64 for i in range(count)],
                 "body": [
                     "control quasar"
                     if i < 64
@@ -1040,6 +1041,7 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
     }
     properties.update(
         keep={"type": "boolean"},
+        keep_tail={"type": "boolean"},
         body={"type": "string", "x-antfly-field": {"type": "text"}},
     )
     definition = {
@@ -1088,14 +1090,27 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
                     server.restart()
                 for term, descending in (("quasar", False), ("pulsar", True)):
                     request = {
-                        "full_text_search": {
-                            "match_phrase": "control " + term,
-                            "field": "body",
-                        },
+                        # Keep text deliberately broad: sparse Boolean and
+                        # phrase candidates correctly choose postings now. A
+                        # residual with no matches beyond the first primary
+                        # group still requires the authenticated boundary proof.
+                        "full_text_search": {"match": "control", "field": "body"},
                         "fields": ["id", "bucket"],
                         "limit": 20,
                         "profile": True,
-                        "filter_query": {"range": {"path": "/bucket", "gte": 0}},
+                        "filter_query": {
+                            "conjuncts": [
+                                {"range": {"path": "/bucket", "gte": 0}},
+                                {
+                                    "term": {
+                                        "path": "/keep"
+                                        if term == "quasar"
+                                        else "/keep_tail",
+                                        "value": True,
+                                    }
+                                },
+                            ]
+                        },
                     }
                     oracle = client.query(
                         {
