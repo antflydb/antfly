@@ -290,24 +290,38 @@ fn equalFields(left: []const []const u8, right: []const []const u8) bool {
     }
     return true;
 }
-fn sameFilter(a: A, left: Reference, right: Reference) !bool {
-    if (!std.mem.eql(u8, left.table, right.table)) return false;
-    const l = try std.json.Stringify.valueAlloc(a, left.filter_query, .{});
-    defer a.free(l);
-    const r = try std.json.Stringify.valueAlloc(a, right.filter_query, .{});
-    defer a.free(r);
-    return std.mem.eql(u8, l, r);
-}
 /// First union fields within a parent, then batch parents with the SAME mask.
 /// Never form a Cartesian product of unrelated image selectors across rows.
 /// All storage belongs to the request arena; at most 32 references per query.
 pub fn groups(a: A, references: []const Reference) ![]Group {
+    // Intern each canonical filter once. Comparisons remain exact, including
+    // collision checks, without encoding large filters inside quadratic loops.
+    const scratch = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(a);
+    var filter_arena = std.heap.ArenaAllocator.init(scratch);
+    defer filter_arena.deinit();
+    const work = filter_arena.allocator();
+    const filters = try work.alloc([]const u8, references.len);
+    var interned: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer interned.deinit(work);
+    for (references, filters) |reference, *filter| {
+        if (reference.filter_query == null) {
+            filter.* = "null";
+            continue;
+        }
+        const encoded = try std.json.Stringify.valueAlloc(scratch, reference.filter_query, .{});
+        defer scratch.free(encoded);
+        filter.* = interned.get(encoded) orelse inserted: {
+            const owned = try work.dupe(u8, encoded);
+            try interned.put(work, owned, owned);
+            break :inserted owned;
+        };
+    }
     var parents: std.ArrayList(Group) = .empty;
     for (references, 0..) |reference, i| {
         const slot = found: {
             for (parents.items, 0..) |parent, j| {
                 const first = references[parent.references.items[0]];
-                if (parent.references.items.len < 32 and std.mem.eql(u8, first.document_id, reference.document_id) and try sameFilter(a, first, reference)) break :found j;
+                if (parent.references.items.len < 32 and std.mem.eql(u8, first.document_id, reference.document_id) and std.mem.eql(u8, first.table, reference.table) and filters[parent.references.items[0]].ptr == filters[i].ptr) break :found j;
             }
             try parents.append(a, .{});
             break :found parents.items.len - 1;
@@ -326,7 +340,7 @@ pub fn groups(a: A, references: []const Reference) ![]Group {
             for (output.items, 0..) |other, i| {
                 if (other.references.items.len + parent.references.items.len <= 32 and
                     equalFields(other.fields.items, parent.fields.items) and equalFields(other.images.items, parent.images.items) and
-                    try sameFilter(a, references[other.references.items[0]], references[parent.references.items[0]])) break :found i;
+                    std.mem.eql(u8, references[other.references.items[0]].table, references[parent.references.items[0]].table) and filters[other.references.items[0]].ptr == filters[parent.references.items[0]].ptr) break :found i;
             }
             try output.append(a, .{});
             break :found output.items.len - 1;
@@ -373,4 +387,26 @@ test "httpx inference gateway batches same parents and equal masks without Carte
     const bounded = try groups(a, &limited);
     try std.testing.expectEqual(@as(usize, 3), bounded.len);
     for (bounded) |group| try std.testing.expect(group.references.items.len <= 32);
+}
+
+test "httpx inference gateway grouping large distinct filters retains linear bounded storage" {
+    var input = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer input.deinit();
+    const a = input.allocator();
+    const padding = try a.alloc(u8, 3072);
+    @memset(padding, 'x');
+    var references: [128]Reference = undefined;
+    for (&references, 0..) |*reference, i| {
+        var filter: std.json.ObjectMap = .empty;
+        var ids: std.json.Array = .init(a);
+        try ids.append(.{ .string = try std.fmt.allocPrint(a, "filter-{d}-{s}", .{ i, padding }) });
+        try filter.put(a, "ids", .{ .array = ids });
+        reference.* = .{ .table = "docs", .document_id = try std.fmt.allocPrint(a, "doc-{d}", .{i}), .field = "images.preview", .revision_field = "revision", .revision = "r1", .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .mime_type = "image/png", .byte_length = 68, .filter_query = .{ .object = filter } };
+    }
+    var budget: @import("antfly_local_sources").sql_memory_budget = .{ .backing = std.testing.allocator, .limit = 2 * 1024 * 1024 };
+    var bounded = std.heap.ArenaAllocator.init(budget.allocator());
+    defer bounded.deinit();
+    const grouped = try groups(bounded.allocator(), &references);
+    try std.testing.expectEqual(references.len, grouped.len);
+    try std.testing.expect(!budget.exhausted);
 }
