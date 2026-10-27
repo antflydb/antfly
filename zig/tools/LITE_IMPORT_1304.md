@@ -15,7 +15,7 @@ comments describe several different generations of the importer and database.
 | Foreground writes invalidate a completed detached proof | Capture records the originating header. Locally authored append-only descendants can inherit its proof. Adopting a foreign header, replacing the inode, or an uncertain publication rejects inheritance. |
 | Short-lived processes repeatedly abandon the verified free pool | Clean native owner shutdown publishes an opaque metadata certificate binding both recovery slots and the complete canonical allocator ledger. Cold reopen checks it before opening index sources. Only an already verified writer can publish it. Stale certificates fall back to detached verification and append-only admission. |
 | Both recovery slots reread identical payloads | The active graph records checked immutable leaf bounds. The fallback still validates its own ordering, duplicate references and page limits, while reusing eligible payload checks. Exact active ownership, pending retirements and CRC checks remain mandatory. |
-| Normal exit leaves lease markers and retained runtimes | Proof readers now borrow allocator/executor lifetime separately from mutating maintenance captures. They do not force a fresh foreground runtime on every request. Their last release immediately collects retired runtimes. Detaching the artifact registry expires idle cached descriptors while preserving explicit readers and active uses. A bounded marker sweep runs before the detached proof, including turns canceled before the proof completes. |
+| Normal exit leaves lease markers and retained runtimes | Main separates proof-reader lifetime from mutating maintenance captures, preserving foreground runtimes and collecting retired runtimes at the last release. This branch expires idle cached descriptors at artifact-registry detach while preserving explicit readers and active uses. A bounded marker sweep runs before the detached proof, including turns canceled before the proof completes. |
 
 A proof is still an integrity traversal, and an external writer invalidates a
 captured generation. The clean-close certificate hashes both recovery slots,
@@ -102,3 +102,61 @@ On an APFS clone of the supplied 9.7 GB file, the supplied baseline library took
 1.256 seconds to open and 143.954 seconds for `CREATE TABLE` as its first authored
 statement; open/write/close took 145.438 seconds. The clone was isolated from the
 original database and used the same Python C ABI caller as the candidate probe.
+
+## Paired release results
+
+The baseline is the issue's supplied `55d97ce423` library, not a rebuild of the
+latest main. The candidate uses ReleaseFast, stripping, Metal off and CUDA off.
+These are single local runs with other builds active, including open and close.
+Both runs use the same frozen home and unchanged importer executable, with dense
+indexing disabled. The first four threads are the specified original rollout
+followed by three small cases; the remaining eleven follow the supplied list's
+order. The table below records that exact order.
+
+| Measurement | Supplied baseline | Candidate |
+| --- | ---: | ---: |
+| All 15 processes, seconds | 635.999 | 308.113 |
+| Final file, bytes | 5,077,012,480 | 2,388,078,592 |
+| Unlocked lease markers after normal exit | 3 | 0 |
+| Retained raw history rows | 130,476 | 130,476 |
+| Retained normalized thread rows | 41,913 | 41,913 |
+| First authored SQL on the supplied 9.7 GB clone, seconds | 143.954 | 3.394 |
+| Open / write / close on that clone, seconds | 145.438 | 4.765 |
+
+The candidate leaves zero UUID lease markers after **every** imported thread.
+The first frozen import takes 26.280 seconds and produces 398,159,872 bytes,
+compared with 34.364 seconds and 354,414,592 bytes in the supplied baseline. Thus
+the initial candidate file is larger; cross-process reuse reduces the final
+15-thread file by 53%. Two heavy imports are slower in this run, so the aggregate
+elapsed-time improvement does not imply an improvement for every thread.
+
+| Thread prefix | Baseline seconds | Candidate seconds |
+| --- | ---: | ---: |
+| `01a0fea3` | 34.364 | 26.280 |
+| `01a160c8` | 8.237 | 1.613 |
+| `01a15bbc` | 6.204 | 1.020 |
+| `01a15c87` | 5.442 | 0.966 |
+| `01a17088` | 13.444 | 9.276 |
+| `01a16af2` | 32.733 | 26.704 |
+| `01a16ae2` | 24.665 | 5.244 |
+| `01a169a8` | 67.679 | 82.332 |
+| `01a16660` | 27.814 | 7.251 |
+| `01a1648c` | 68.576 | 8.661 |
+| `01a166ae` | 44.707 | 13.767 |
+| `01a160c2` | 35.589 | 4.792 |
+| `01a14c96` | 88.095 | 103.164 |
+| `01a157b2` | 88.111 | 2.499 |
+| `01a15cbd` | 90.337 | 14.544 |
+
+The harness records both executable hashes in each result. The candidate library
+SHA-256 is `5fad269cece2777510e60baa07ccc0d318a2868e152240389bb8f5e0a9b06c83`;
+the importer SHA-256 is
+`2aa1eb2ce2b59d6b8e316d0b2dd65350732d0317c5ac8ae00a49184bd054deda`.
+
+A full integrity traversal of the final candidate file passes: zero tail bytes,
+2,230,930 internal live-and-retired records checked, 2,226,473 live internal
+records, and 1,121,815,079 live bytes. Its estimated compact size is 1,546,596,352
+bytes. These are internal storage records, not millions of external index files.
+The 47-step release build and its 134-function public export boundary pass. The
+expanded C ABI close/reopen regression includes real SQL primary-key index
+sources and preserves certified ownership through their lease publications.
