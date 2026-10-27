@@ -27,7 +27,7 @@ import time
 
 root = Path.cwd()
 sys.path.insert(0, str(root / "zig/e2e/antfly"))
-import conftest as h
+import conftest as h  # noqa: E402 -- load the checked-in E2E harness after its path setup.
 
 spec = importlib.util.spec_from_file_location(
     "delivery_bench", root / "zig/tools/benchmark_lake_archive.py"
@@ -35,8 +35,8 @@ spec = importlib.util.spec_from_file_location(
 b = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = b
 spec.loader.exec_module(b)
-import pyarrow as pa
-import pyarrow.parquet as pq
+import pyarrow as pa  # noqa: E402 -- runtime dependencies follow harness setup.
+import pyarrow.parquet as pq  # noqa: E402
 
 label, binary_arg, source = sys.argv[1:]
 case = os.environ.get("DELIVERY_CASE", "source")

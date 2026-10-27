@@ -1050,3 +1050,87 @@ qualification document after executable freezing, with no production-source chan
 All **36 selected real Parquet/Iceberg E2Es pass without skips** against the final
 frozen executable, including the new wide covering regression. No runtime source
 changed in the final main merge.
+
+
+### Shared range waves and field-major result delivery
+
+Navigation and covering delivery now share one authenticated range-wave planner.
+Navigation retains its 1 MiB range cap and bounded gap policy. Covering reads use
+at most 4 MiB per range, merge exact adjacency only, and process at most 16 units
+per wave. Requested unit digests and immutable raw-cache keys remain independent
+of transport grouping. Cold ranges use joined shared I/O tasks; warm decoded
+stripes retain their existing leases without refetching evicted raw bytes or
+acquiring the same decoded entry twice. Uncached single-unit buffers can transfer
+ownership without another large copy.
+
+The native regression reads three adjacent required stripes in **one pack-range
+request**, with a maximum range of **1,689 bytes**, excluding the unused 2 MiB
+value stripe. A directory fetch is separate from this pack-range count. Decoded
+warm stripes make **zero provider reads even with raw and physical residency
+disabled**. The shared navigation tests also verify corrupt data, range caps,
+duplicates, allocation failures and gap-byte admission before provider I/O.
+
+Stored-source hydration now traverses each field across the returned selection,
+retaining four cursors while checking cancellation in 64-position tiles. A compact
+permutation preserves result rank; metadata scales with returned hits. The native
+256-row, eight-field comparison reduces both column opens and decoded chunks from
+**32 to 8**, with identical exact integer values and no legacy whole-row decodes.
+It also checks identity failures, cancellation and allocation faults. This is a
+measured reduction in component work, not a claim of fourfold query speedup.
+
+The real Parquet regression now uses 256 rows, nine projected fields and 192-hit
+pages, with nullable integers beyond 2^53, both cursor directions, hidden highlights,
+restart and the original Parquet object unavailable during queries.
+
+Reproduce broad cases and narrow controls with the checked-in runner:
+
+```sh
+DELIVERY_CASE=source zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/delivery_tiles.py LABEL /path/to/immutable-antfly SOURCE_COMMIT
+DELIVERY_CASE=cover zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/delivery_tiles.py LABEL /path/to/immutable-antfly SOURCE_COMMIT
+DELIVERY_CASE=source DELIVERY_NARROW=1 zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/delivery_tiles.py LABEL /path/to/immutable-antfly SOURCE_COMMIT
+DELIVERY_CASE=cover DELIVERY_NARROW=1 zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/delivery_tiles.py LABEL /path/to/immutable-antfly SOURCE_COMMIT
+```
+
+Each case uses the same 256-row Parquet data, native ID ordering, a 256-hit result
+and three restarts with first/warm queries. Broad cases project ten scalar fields;
+narrow controls project two. Source cases store native source columns; cover cases
+disable text source storage and use an ordered index with included scalar fields.
+Restart samples retain OS/persistent caches and readiness warming. Runs are
+sequential local Debug observations on a shared host; no build, E2E or cache cleanup
+from this task overlaps measured queries. Main integration and host variation are
+explicit comparison qualifications. No isolated causal, Release, empty-cache,
+real-cloud or archive-scale latency claim is made.
+
+
+The [range/field delivery observation](native-range-field-delivery-v1-observation.json)
+records all 26 reports, binary/source/input hashes, raw timing/profile samples and
+78 exact paired-page comparisons (156 responses). Complete hits, scores, sources,
+sort keys, totals and collector work counts match in every pair. The primary
+comparison builds the reviewed implementation plus the same main revision
+(`f67134b93c3b`) against the final implementation (`4fa6ccbd8bf3`). Both include main
+`a507489e93d8`; the control build temporarily restores the six changed production
+modules to the merged control revision, records their hashes, and restores final
+sources and the installed executable afterward. Its build metadata consequently
+reports the later HEAD with a dirty source overlay; the observation records the
+actual source overrides explicitly.
+
+| Query | Same-main control warm median | Final warm median | Control restarted median | Final restarted median |
+|---|---:|---:|---:|---:|
+| Ten-field stored source | 69.49 ms | 68.63 ms | 82.16 ms | 82.55 ms |
+| Ten-field covering projection | 83.37 ms | 84.53 ms | 100.60 ms | 101.39 ms |
+| Two-field stored-source control | 55.58 ms | 55.50 ms | 68.42 ms | 68.80 ms |
+| Two-field covering control | 75.40 ms | 75.85 ms | 90.20 ms | 92.19 ms |
+
+These whole-query medians are close. The structural gains above are qualified;
+no additional large end-to-end latency gain is established. Earlier comparisons
+against the pre-main reviewed binary, their slower observations and a reversed
+broad-cover run are retained rather than selected away. A duplicate warm decoded
+residency lookup was replaced with retained leases before final qualification.
+
+Final validation: the production CLI builds; 368 targeted native checks pass with
+one declared benchmark skip, zero failures and zero leaks. The benchmark tooling's
+19 checks, Apache boundary (2,555 sources), license, formatting and whitespace
+checks pass. All 36 selected real Parquet/Iceberg E2Es pass without skips against
+the final frozen executable (286.39 seconds), including the expanded nine-field
+projection regression. Production source and installed executable hashes match
+the frozen final binary; main `a507489e93d8` is merged.
