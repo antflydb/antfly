@@ -23,7 +23,8 @@ import{createHash}from'node:crypto';
 const gate=JSON.parse(await readFile(process.argv[2])),artifacts=[];
 async function artifact(path){const bytes=await readFile(path),sha256=createHash('sha256').update(bytes).digest('hex');artifacts.push({path:resolve(path),sha256});return bytes;}
 const native=(await artifact(process.argv[3])).toString(),node=(await artifact(process.argv[4])).toString(),worker=(await artifact(process.argv[5])).toString();
-if(![...native.matchAll(/([0-9]+) passed; [0-9]+ skipped; 0 failed; 0 leaked/g)].some(match=>Number(match[1])>=545)||/error:|FAIL|[1-9][0-9]* leaked|[1-9][0-9]* failed/.test(native)||!passingNodeTestLog(node,249)||!passingNodeTestLog(worker,18))throw Error('complete passing test logs required');
+if(![...native.matchAll(/([0-9]+) passed; [0-9]+ skipped; 0 failed; 0 leaked/g)].some(match=>Number(match[1])>=545)||/error:|FAIL|[1-9][0-9]* leaked|[1-9][0-9]* failed/.test(native)||!passingNodeTestLog(node,250)||!passingNodeTestLog(worker,18))throw Error('complete passing test logs required');
+if(!/advanced checkpoint probes overlap obsolete tail I\/O and drain before returning/.test(node))throw Error('checkpoint overlap safety regression missing');
 if(!/durable hints retain the manifest and facts within escaped native root capacity/.test(node))throw Error('escaped hint root capacity regression missing');
 if(!/persisted diagnostic access probes constrain scope/.test(node))throw Error('persisted diagnostic access safety regression missing');
 for(const pattern of[/redundant diagnostic coverage requires uninterrupted overlap/,/overlapping diagnostic sockets repair one connection/])if(!pattern.test(node))throw Error('redundant diagnostic coverage regression missing');

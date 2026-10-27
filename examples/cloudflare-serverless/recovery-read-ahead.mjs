@@ -21,6 +21,30 @@ const decoder=new TextDecoder(),encoder=new TextEncoder();
 const hex=value=>{const bytes=typeof value==="string"?encoder.encode(value):value;if(!bytes||bytes.length!==16||!Array.from(bytes).every(n=>Number.isInteger(n)&&n>=0&&n<=255))return null;return Array.from(bytes,n=>n.toString(16).padStart(2,"0")).join("");};
 const state=value=>value&&hex(value.epoch)&&hex(value.owner)&&Number.isSafeInteger(value.next)&&value.next>=0&&value.next<=64&&Number.isSafeInteger(value.revision)&&value.revision>=0?value:null;
 const parse=result=>{try{return JSON.parse(decoder.decode(result.body));}catch{return null;}};
+
+// A warm reader knows the previous proof keys. If CHECKPOINT advances while
+// their probes are in flight, start its new proof keys immediately. Native
+// recovery remains the authority; all obsolete I/O settles before returning.
+export function warmRecoveryReadAhead(transport,{base,cursor,reserve=()=>{}}={}){
+ const prior=state(cursor);if(typeof base!=='string'||!base.length||!prior)throw Error('InvalidRecoveryCursor');
+ const keys=value=>[`${base}/epochs/${hex(value.epoch)}/SEALED`,`${base}/epochs/${hex(value.epoch)}/${String(value.next).padStart(20,'0')}.json`],checkpoint=base+'/CHECKPOINT';let primed=false;const pending=new Map();
+ // Reserve the maximum four speculative keys before native admission. This
+ // remains inside the existing per-observation operation and transfer bounds.
+ reserve(4,4*16384);
+ return async(request,body)=>{
+  if(request.op!=='get')return transport(request,body);
+  if(request.key===checkpoint&&!primed){
+   primed=true;
+   const start=key=>{if(!pending.has(key))pending.set(key,Promise.resolve().then(()=>transport({...request,key,max_response_bytes:16384},new Uint8Array())).then(value=>({value}),error=>({error})));return pending.get(key);};
+   const floor=start(checkpoint);for(const key of keys(prior))start(key);
+   const result=await floor,fresh=state(result.value&&parse(result.value)?.state);
+   if(fresh&&fresh.revision>prior.revision)for(const key of keys(fresh))start(key);
+   await Promise.all(pending.values());
+  }
+  if(pending.has(request.key)){const result=await pending.get(request.key);pending.delete(request.key);if(result.error)throw result.error;return result.value;}
+  return transport(request,body);
+ };
+}
 export function recoveryReadAhead(transport,{window=8,initialWindow=window,reserve=()=>{},cursor,followSeals=false}={}){
  if(!Number.isInteger(window)||window<1||window>16||!Number.isInteger(initialWindow)||initialWindow<1||initialWindow>window)throw new Error("InvalidRecoveryWindow");
  let current,base,slots=new Map(),covered=false,width=initialWindow;

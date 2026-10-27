@@ -1306,3 +1306,34 @@ The corrected reproduction retains manifest and facts after reopening the
 metadata store, uses zero physical metadata-page reads and remains within the
 existing root budget. This addresses a reproduced capacity cliff; its effect on
 live p95 still requires a fresh deployment and qualification.
+
+## Overlap probes for an advanced checkpoint
+
+The subsequent deployed hint-fit diagnostic remains failed: candidate read p95
+is 1,363 ms, and a shared writer-tail reset cancels the last two writes before
+verification. A compaction request also encounters `ECONNRESET`; the client
+preserves its existing rule against replaying unkeyed maintenance after an
+ambiguous transport failure. There are zero observed resource signals before
+the capture gap. Neither canceled calls nor the incomplete write population
+establish a successful performance or correctness result.
+
+The captured read traces show metadata observation can still require several
+physical I/O waves despite zero metadata-page reads. A native-backed regression
+reproduces one avoidable dependency: when CHECKPOINT advances, the new floor's
+seal and tail probes wait for an obsolete tail probe to finish. The warm reader
+now starts the fresh floor's probes as soon as CHECKPOINT arrives, overlapping
+them with the old probes. It reuses each primed result once and leaves checkpoint,
+epoch, owner and commit-prefix validation to native recovery.
+
+At most five distinct keys are in flight: CHECKPOINT plus the old and new
+seal/tail pairs. The four possible speculative keys reserve their operation and
+64 KiB transfer allowance before native admission, inside the existing limits.
+Shared keys are deduplicated. Every old probe settles before the wrapper returns,
+including errors on unused results; native deadline/drain accounting therefore
+continues to retain capacity until outstanding I/O settles. Negative probes
+remain scoped to one observation.
+
+The regression holds the old tail, proves the new tail starts before releasing
+it, verifies the read has not returned early, then checks the new value and lack
+of writer ownership. Existing coverage also checks negative-probe freshness and
+owner replacement. This is a tested overlap improvement, not a live gate pass.

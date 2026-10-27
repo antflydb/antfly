@@ -6,7 +6,7 @@ capacity or complete native feature parity.
 
 The current candidate uses Antfly-native transactional coordination in R2;
 SQLite below describes the initial deployment and migration history. The latest
-local evidence passes 660 native tests (six skipped), 249 Node tests, 18 persisted
+local evidence passes 660 native tests (six skipped), 250 Node tests, 18 persisted
 Worker tests, the 50,000-document capacity fixture, the 1,000-document reindex
 fixture and both frozen ANN comparisons. The three-pair live gate remains
 unpassed. The approved control is `c44896ac8c` with its original native modules.

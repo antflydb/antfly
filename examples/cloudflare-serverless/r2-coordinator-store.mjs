@@ -16,7 +16,7 @@
 // Cloudflare-independent adapter for the shared native ordered metadata store.
 import {normalizeReadHints} from "./publication-read-hints.mjs";
 import {RequestPool} from "./request-pool.mjs";
-import {recoveryReadAhead} from "./recovery-read-ahead.mjs";
+import {recoveryReadAhead,warmRecoveryReadAhead} from "./recovery-read-ahead.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {IdleCheckpoint} from "./idle-checkpoint.mjs";
 import {instrumentTransport} from "./performance.mjs";
@@ -140,14 +140,7 @@ export class R2CoordinatorStore {
     const guarded=async(request,body)=>{if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");return raw(request,body);};
     let transport,proofTransport=guarded;
     if(captured&&this.base){
-      const epoch=hex(captured.epoch),keys=[this.base+"/CHECKPOINT",`${this.base}/epochs/${epoch}/SEALED`,`${this.base}/epochs/${epoch}/${String(captured.next).padStart(20,"0")}.json`];let prefetched;
-      reserve(2,32768);
-      proofTransport=async(request,body)=>{
-        if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");
-        if(request.key===keys[0]&&!prefetched){const results=await Promise.all(keys.map(key=>raw({...request,key,max_response_bytes:16384},new Uint8Array()).then(value=>({value}),error=>({error}))));prefetched=new Map(keys.map((key,i)=>[key,results[i]]));}
-        if(prefetched?.has(request.key)){const result=prefetched.get(request.key);prefetched.delete(request.key);if(result.error)throw result.error;return result.value;}
-        return raw(request,body);
-      };
+      proofTransport=warmRecoveryReadAhead(guarded,{base:this.base,cursor:captured,reserve});
     }
     // An authenticated warm cursor identifies the three initial proof keys.
     // Fetch them in one wave; native recovery still selects and validates the

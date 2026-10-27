@@ -508,6 +508,16 @@ test('warm unowned proof reads overlap checkpoint and tail without reusing negat
  const replacement=new R2CoordinatorStore(module,bucket,'parallel-observer-proof',{clock:()=>now});await replacement.transaction(tx=>tx.put('value',3));assert.equal(await observer.readOnly(tx=>tx.get('value')),3,'native recovery follows a replaced owner');assert.equal(observer.acquired,false);
 });
 
+test('advanced checkpoint probes overlap obsolete tail I/O and drain before returning',async()=>{
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let now=Date.now(),hold=false,oldKey,newKey,release,notify,returned=false;const held=new Promise(r=>release=r),newStarted=new Promise(r=>notify=r),calls=[];
+ const writer=new R2CoordinatorStore(module,bucket,'checkpoint-proof-overlap',{clock:()=>now});await writer.transaction(tx=>tx.put('value',1));
+ const observer=new R2CoordinatorStore(module,bucket,'checkpoint-proof-overlap',{clock:()=>now,transport:async(request,body)=>{calls.push(request.key);if(hold&&request.key===newKey)notify();if(hold&&request.key===oldKey)await held;return raw(request,body);}});assert.equal(await observer.readOnly(tx=>tx.get('value')),1);
+ const key=state=>writer.base+'/epochs/'+Array.from(state.epoch,n=>n.toString(16).padStart(2,'0')).join('')+'/'+String(state.next).padStart(20,'0')+'.json';oldKey=key(observer.observedState);await writer.transaction(tx=>tx.put('value',2));now+=1001;await writer.checkpointHint();newKey=key(writer.state);assert.notEqual(oldKey,newKey);calls.length=0;hold=true;
+ const reading=observer.readOnly(tx=>tx.get('value')).then(value=>{returned=true;return value;});
+ try{assert.equal(await Promise.race([newStarted.then(()=>true),new Promise(r=>setTimeout(()=>r(false),250))]),true,'fresh checkpoint probes must not wait for the obsolete tail');assert.equal(returned,false,'unused old I/O must still drain before returning');}finally{hold=false;release();await reading;}
+ assert.equal(await reading,2);assert.equal(calls.filter(k=>k===newKey).length,1,'reuse each primed result once without an extra GET');assert.equal(observer.acquired,false);
+});
+
 test('ambiguous metadata deadlines retain native reservations and recover the late durable commit', {timeout:5000},async()=>{
  const{RequestPool}=await import('../request-pool.mjs'),{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs'),compact=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-compact.wasm',import.meta.url)));
  const bucket=new Bucket(),raw=createR2Transport({database:bucket});let created=0,hold=false,release,entered;const held=new Promise(r=>release=r),started=new Promise(r=>entered=r);
