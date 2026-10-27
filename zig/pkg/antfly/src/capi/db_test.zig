@@ -6784,6 +6784,53 @@ test "capi native resolver maintenance retries transient inference and survives 
     try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
 }
 
+test "capi native close certifies allocator before the next process opens sources" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-certified-reopen");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    for (0..3) |process| {
+        var handle: ?*anyopaque = null;
+        const result = if (process == 0) antfly_db_create_with_options(path, &options, &handle) else antfly_db_open_with_options(path, &options, &handle);
+        try std.testing.expectEqual(capi.ErrorCode.ok, result);
+        defer if (handle != null) antfly_db_close(handle);
+        const owner = blk: {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            break :blk guard.connection.?.owner;
+        };
+        owner.stopping.store(true, .release);
+        owner.wake.set(shared.handleLockIo());
+        owner.worker.?.join();
+        owner.worker = null;
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            if (process != 0) try std.testing.expect(file.free_pages_verified);
+            const reused = (try file.allocatorStats()).?.reused_pages;
+            const large: [32768]u8 = @splat('x');
+            for (0..12) |_| try file.putCatalogRecord("test/free-pool", &large);
+            try file.deleteCatalogRecord("test/free-pool");
+            _ = try file.reclaimPages(4096);
+            if (process != 0) try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
+            try std.testing.expect((try file.check()).valid);
+        }
+        antfly_db_close(handle);
+        handle = null;
+        var probe = try lite_backend.native.NativeFile.openWithIo(a, shared.handleLockIo(), path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        try std.testing.expect(try probe.inheritAllocatorCertificate());
+    }
+}
+
 test "capi native foreground reuses free pages during a captured worker turn" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;

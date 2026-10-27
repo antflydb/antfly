@@ -201,6 +201,92 @@ test "lite allocator detached verification cancels and refuses stale checkpoints
     try std.testing.expect((try captured.check()).valid);
 }
 
+test "lite allocator v4 clean certificate carries checked ownership across processes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "certified-reopen.aflite");
+    defer a.free(path);
+    const large: [32768]u8 = @splat('v');
+    {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer file.close();
+        for (0..12) |_| try file.putDocument("doc", &large);
+        _ = try file.reclaimPages(4096);
+        try std.testing.expect(try file.certifyAllocator());
+        try std.testing.expect((try file.check()).valid);
+    }
+    {
+        var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        try std.testing.expect(!file.free_pages_verified);
+        try std.testing.expect(try file.inheritAllocatorCertificate());
+        const reused = (try file.allocatorStats()).?.reused_pages;
+        for (0..4) |_| try file.putDocument("doc", &large);
+        try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
+        try std.testing.expect((try file.check()).valid);
+        try std.testing.expect(try file.certifyAllocator());
+    }
+    {
+        var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        try std.testing.expect(try file.inheritAllocatorCertificate());
+        const fallback = 1 - file.header.active_checkpoint;
+        file.header.checkpoints[fallback].commit_sequence += 1;
+        try std.testing.expect(!try file.inheritAllocatorCertificate());
+        file.header.checkpoints[fallback].commit_sequence -= 1;
+        const state = try file.loadLedger(file.activeCheckpoint());
+        state.counts.items[0] ^= 1;
+        try std.testing.expect(!try file.inheritAllocatorCertificate());
+        state.counts.items[0] ^= 1;
+        try std.testing.expect(try file.inheritAllocatorCertificate());
+        // An older writer knows nothing about certificates. Its ordinary
+        // publication invalidates the stored header binding automatically.
+        try file.putDocument("foreign", "publication without a new seal");
+    }
+    {
+        var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        try std.testing.expect(!try file.inheritAllocatorCertificate());
+        try std.testing.expect(!file.free_pages_verified);
+        try std.testing.expect(!try file.certifyAllocator());
+        try file.completeAllocatorVerification();
+        try std.testing.expect(try file.certifyAllocator());
+        try std.testing.expect((try file.check()).valid);
+    }
+}
+
+test "lite allocator v4 interrupted certificate preserves the previous checkpoint" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (0..12) |after| {
+        var name: [64]u8 = undefined;
+        const path = try testPath(a, tmp, try std.fmt.bufPrint(&name, "certificate-failure-{d}.aflite", .{after}));
+        defer a.free(path);
+        {
+            var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+            defer file.close();
+            try file.putDocument("doc", "durable");
+            file.test_page_write_fail_after = after;
+            _ = file.certifyAllocator() catch |err| switch (err) {
+                error.TestPageWriteFailure => false,
+                else => return err,
+            };
+            file.test_page_write_fail_after = null;
+        }
+        var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer reopened.close();
+        // Failed appends may leave an unpublished tail. Recovery must still
+        // retain a fully checked committed prefix and the durable document.
+        const prefix = try checkpointPrefixSize(reopened.activeCheckpoint(), reopened.header.page_size);
+        try std.testing.expect((try reopened.checkAtFileSizeWithCancel(prefix, null)).valid);
+        const value = (try reopened.getDocumentAlloc(a, "doc")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("durable", value);
+    }
+}
+
 test "lite allocator v4 detached proof follows local append-only commits and enables reuse" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4170,12 +4256,124 @@ pub const NativeFile = struct {
         self.free_pages_verified = true;
     }
 
-    fn headerFingerprint(self: *NativeFile) [32]u8 {
+    const allocator_certificate_key = "\x00AFCERT/allocator-v1";
+    const allocator_certificate_magic = "AFACERT1";
+    const allocator_certificate_size = 72;
+
+    fn fingerprintHeader(header: Header) [32]u8 {
         var encoded: [header_size]u8 = undefined;
-        encodeHeader(&encoded, self.transaction_header orelse self.header);
+        encodeHeader(&encoded, header);
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(&encoded, &digest, .{});
         return digest;
+    }
+
+    fn headerFingerprint(self: *NativeFile) [32]u8 {
+        return fingerprintHeader(self.transaction_header orelse self.header);
+    }
+
+    /// Hash the complete canonical allocator state, not the physical encoding
+    /// or hash-map iteration order. Loading already checks every ledger CRC.
+    /// The pending list is ordered by monotonic ID on mutation and recovery.
+    fn allocatorFingerprint(state: *const allocator_v4.State) ![32]u8 {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("Antfly checked allocator v1");
+        var root: [128]u8 = undefined;
+        allocator_v4.State.encodeRoot(state.root, &root);
+        hash.update(&root);
+        var counters: [4096]u8 = undefined;
+        var start: usize = 0;
+        while (start < state.counts.items.len) {
+            const n = @min(counters.len / 4, state.counts.items.len - start);
+            for (state.counts.items[start..][0..n], 0..) |value, k|
+                std.mem.writeInt(u32, counters[k * 4 ..][0..4], value, .little);
+            hash.update(counters[0 .. n * 4]);
+            start += n;
+        }
+        var previous: u64 = 0;
+        var id = state.first_pending;
+        var count: usize = 0;
+        while (id != 0) {
+            const item = state.pending.get(id) orelse return error.InvalidNativeAllocator;
+            if (id <= previous or item.id != id or count >= state.pending.count()) return error.InvalidNativeAllocator;
+            var encoded: [40]u8 = @splat(0);
+            std.mem.writeInt(u64, encoded[0..8], id, .little);
+            std.mem.writeInt(u64, encoded[8..16], item.epoch, .little);
+            std.mem.writeInt(u64, encoded[16..24], item.page, .little);
+            std.mem.writeInt(u64, encoded[24..32], item.length, .little);
+            encoded[32] = @backingInt(item.kind);
+            hash.update(&encoded);
+            count += 1;
+            previous = id;
+            id = item.next;
+        }
+        if (count != state.pending.count()) return error.InvalidNativeAllocator;
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+
+    /// A clean native writer can carry its checked ownership invariant across
+    /// processes. Both recovery slots and the complete loaded ledger must match;
+    /// old writers, crash fallback and changed/corrupt state invalidate the seal.
+    /// Explicit integrity checks and ordinary primitive opens still walk graphs.
+    pub fn inheritAllocatorCertificate(self: *NativeFile) !bool {
+        if (!self.header.indexed_reclamation or self.transaction_header != null or
+            self.durable_header != null or self.checkpoint_publication_uncertain) return false;
+        const certificate = (try self.getCatalogRecordAlloc(self.allocator, allocator_certificate_key)) orelse return false;
+        defer self.allocator.free(certificate);
+        if (certificate.len != allocator_certificate_size or !std.mem.eql(u8, certificate[0..8], allocator_certificate_magic)) return false;
+        const header_hash = self.headerFingerprint();
+        if (!std.mem.eql(u8, certificate[8..40], &header_hash)) return false;
+        const state = try self.loadLedger(self.activeCheckpoint());
+        const ownership_hash = try allocatorFingerprint(state);
+        if (!std.mem.eql(u8, certificate[40..72], &ownership_hash)) return false;
+        self.free_pages_verified = true;
+        self.allocator_verification_base = null;
+        return true;
+    }
+
+    /// Publish only from an already checked writer, at a clean durability
+    /// boundary. This is one normal metadata mutation per owner close, never
+    /// a per-statement checkpoint. The certificate record is allocated before
+    /// its hash is filled, so it includes its own exact allocator ownership.
+    pub fn certifyAllocator(self: *NativeFile) !bool {
+        if (self.read_only) return error.ReadOnly;
+        if (!self.header.indexed_reclamation or !self.free_pages_verified or
+            self.transaction_header != null or self.durable_header != null or
+            self.checkpoint_publication_uncertain) return false;
+        const before = self.activeCheckpoint();
+        const roots = try self.readCatalogRoots(before.catalog_root_page, before);
+        var pages = try self.pageAllocatorFromFreeMap(before);
+        defer pages.deinit();
+        const empty: [allocator_certificate_size]u8 = @splat(0);
+        const record = try pages.writeCatalog(.{ .previous_page = 0, .key = allocator_certificate_key, .value = &empty });
+        var editor = IndexEditor.init(self, before, roots.index);
+        editor.accounting_pages = &pages;
+        defer editor.deinit();
+        try editor.put(allocator_certificate_key, record);
+        var next = before;
+        next.commit_sequence += 1;
+        next.catalog_root_page = try self.writeCatalogRoot(&pages, record, try editor.finish(&pages), before.catalog_root_page);
+        next.free_map_root_page = try pages.allocate();
+        next.page_count = pages.next_page_id;
+        try self.persistAllocator(&pages, &next);
+        var published = self.header;
+        published.active_checkpoint = 1 - self.header.active_checkpoint;
+        published.checkpoints[published.active_checkpoint] = next;
+        var certificate: [allocator_certificate_size]u8 = undefined;
+        @memcpy(certificate[0..8], allocator_certificate_magic);
+        @memcpy(certificate[8..40], &fingerprintHeader(published));
+        @memcpy(certificate[40..72], &try allocatorFingerprint(pages.ledger.?));
+        var encoded = std.ArrayListUnmanaged(u8).empty;
+        defer encoded.deinit(self.allocator);
+        try encodeCatalogEntry(self.allocator, &encoded, .{ .previous_page = 0, .key = allocator_certificate_key, .value = &certificate });
+        // All pending batches, including the placeholder, have been flushed by
+        // persistAllocator. Replace only this unpublished standalone record.
+        try self.writePage(record, .catalog, encoded.items);
+        try self.syncIfRequired();
+        try self.publishCheckpoint(next);
+        return true;
     }
 
     /// Read-generation locks join the same-owner frontier only while pinned.

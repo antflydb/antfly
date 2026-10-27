@@ -695,6 +695,16 @@ pub const Owner = struct {
         var options = self.options;
         options.externally_locked = true;
         if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
+        // Certify before opening index sources, whose lease publications can
+        // advance the header. The probe is borrowed only by synchronous open.
+        var certified: ?native.NativeFile = null;
+        defer if (certified) |*file| file.close();
+        if (self.options.profile == .native and self.options.open_mode == .writer and
+            (options.allocator_verification_owner == null or !options.allocator_verification_owner.?.free_pages_verified))
+        {
+            certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
+            if (try certified.?.inheritAllocatorCertificate()) options.allocator_verification_owner = &certified.?;
+        }
         const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
         errdefer h.closeHandle(replacement);
         try self.bindGroupSourceState(replacement);
@@ -1503,8 +1513,36 @@ pub const Owner = struct {
         self.maintenance_schedules.deinit(alloc);
     }
 
+    fn certifyAllocatorOnClose(self: *Owner) !void {
+        if (self.options.profile != .native or self.options.open_mode != .writer) return;
+        const io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(io);
+        defer self.gate.mutex.unlock(io);
+        var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
+        defer lease.close();
+        var tip = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
+        defer tip.close();
+        for ([_]?*h.Handle{ self.current, self.maintenance_snapshot }) |candidate| {
+            const root = candidate orelse continue;
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            store.mutex.lock();
+            defer store.mutex.unlock();
+            const file = &store.file;
+            if (!file.free_pages_verified or file.read_only or !std.meta.eql(file.header, tip.header) or
+                (try file.file.stat(file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) continue;
+            try file.sync();
+            _ = try file.certifyAllocator();
+            return;
+        }
+    }
+
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
+        self.certifyAllocatorOnClose() catch |err| {
+            // Failure only loses the optimization; the previous checkpoint
+            // remains recoverable and the next owner uses ordinary proof.
+            std.log.warn("native Lite allocator certificate deferred: {s}", .{@errorName(err)});
+        };
         if (self.maintenance_snapshot) |snapshot| closeMaintenanceSnapshot(snapshot);
         if (self.embedding_memo) |*memo| memo.deinit(&self.embedding_memo_budget);
         for (self.retired.items) |retired| h.closeHandle(retired);

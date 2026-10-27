@@ -1,6 +1,7 @@
 # Lite import qualification for issue 1304
 
-The branch starts at `origin/main` commit `031742c340`. The issue and both
+The branch started at `origin/main` commit `031742c340` and was rebased onto
+`6647f3ce7b` while the fixes were being qualified. The issue and both
 comments describe several different generations of the importer and database.
 
 ## Findings and ownership
@@ -12,14 +13,24 @@ comments describe several different generations of the importer and database.
 | A maintenance turn repeatedly scans `liveStats` | Main already gates exact size assessment by growth and reclamation activity and retains cached assessment status. |
 | First authored write runs a whole-file allocator proof | Native connection owners now append while their detached proof is pending. No unverified free page can be consumed. Ordinary manually owned files retain synchronous verification. |
 | Foreground writes invalidate a completed detached proof | Capture records the originating header. Locally authored append-only descendants can inherit its proof. Adopting a foreign header, replacing the inode, or an uncertain publication rejects inheritance. |
+| Short-lived processes repeatedly abandon the verified free pool | Clean native owner shutdown publishes an opaque metadata certificate binding both recovery slots and the complete canonical allocator ledger. Cold reopen checks it before opening index sources. Only an already verified writer can publish it. Stale certificates fall back to detached verification and append-only admission. |
 | Both recovery slots reread identical payloads | The active graph records checked immutable leaf bounds. The fallback still validates its own ordering, duplicate references and page limits, while reusing eligible payload checks. Exact active ownership, pending retirements and CRC checks remain mandatory. |
 | Normal exit leaves lease markers and retained runtimes | Proof readers now borrow allocator/executor lifetime separately from mutating maintenance captures. They do not force a fresh foreground runtime on every request. Their last release immediately collects retired runtimes. Detaching the artifact registry expires idle cached descriptors while preserving explicit readers and active uses. A bounded marker sweep runs before the detached proof, including turns canceled before the proof completes. |
 
 A proof is still an integrity traversal, and an external writer invalidates a
-captured generation. Proofs are not persisted across processes. A process which
-closes before verification completes can append without ever reusing the old
-free pool. The append window is bounded by the existing storage admission limit;
-there is no bypass of the configured file-size cap.
+captured generation. The clean-close certificate hashes both recovery slots,
+allocator roots, every ownership count and each ordered pending retirement with
+BLAKE3. Reopen loads the CRC-checked ledger and matches the complete digest; no
+file-size, timestamp or sampled-page shortcut is used. Explicit integrity checks
+still traverse the graphs. Certificate publication is one regular metadata
+checkpoint at owner shutdown, never a checkpoint per SQL statement. It changes
+neither the wire format nor old-reader compatibility: an older writer's next
+publication simply invalidates the certificate. Interrupted publication preserves
+the previous committed prefix; an unpublished tail uses ordinary recovery.
+
+A legacy file without a valid certificate can append while its detached proof
+runs. If that process closes before verification completes, it cannot certify
+that state. The append window remains bounded by the configured file-size cap.
 
 ## Source volume is not the cited JSONL size
 
@@ -69,7 +80,9 @@ databases are not repository fixtures.
 
 ## Validation
 
-The allocator/reclamation gate passes 71 tests. The targeted proof and lease gate
+The allocator/reclamation gate passes 73 tests, including cross-process certificate
+reuse, changed recovery headers, altered ownership counters and interrupted
+certificate writes. The targeted proof and lease gate
 passes seven tests, including corrupt values, incorrect positive reference counts
 and denied optional read-window admission. The new owner-detach gate passes all
 six lease tests, including active reads against a retired inode after Store close.
