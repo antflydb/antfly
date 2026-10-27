@@ -249,6 +249,7 @@ SOURCE_MODULES = {
     "antfly_query_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_query_openapi/root.zig",
     ),
+    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
