@@ -70,6 +70,7 @@ pub const Context = struct {
     inference_linalg_mod: *std.Build.Module,
     antfly_platform_mod: *std.Build.Module,
     runtime_abi_mod: *std.Build.Module,
+    document_runs_mod: *std.Build.Module,
     enable_system_blas: bool,
     blas_root: ?[]const u8,
     enable_metal: bool,
@@ -208,6 +209,7 @@ fn configureCommand(ctx: Context, spec: CommandSpec, exe: *std.Build.Step.Compil
         .jinja = ctx.jinja_mod,
         .platform = ctx.antfly_platform_mod,
         .runtime_abi = ctx.runtime_abi_mod,
+        .document_runs = ctx.document_runs_mod,
     }));
     configureNative(ctx, exe, spec.native_link, spec.imports);
     if (spec.release_metadata) {
@@ -275,6 +277,7 @@ pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Ste
             // checks share an executable. A union of imports would mask missing
             // dependency declarations in standalone commands.
             module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);
+            module.addImport("antfly_document_runs", ctx.document_runs_mod);
             for (command.imports) |dependency| {
                 const name = @tagName(dependency);
                 if (!check.root_module.import_table.contains(name))
@@ -360,6 +363,7 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
 
 fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import, pjrt: ?*std.Build.Module) void {
     module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);
+    module.addImport("antfly_document_runs", ctx.document_runs_mod);
     for (imports) |import| {
         const dependency = if (import == .pjrt) (pjrt orelse continue) else ctx.moduleFor(import);
         module.addImport(@tagName(import), dependency);
@@ -466,6 +470,7 @@ pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {
         .inference_linalg_mod = ctx.graph.inference_linalg_mod,
         .antfly_platform_mod = ctx.graph.platform_mod,
         .runtime_abi_mod = ctx.graph.runtime_abi_mod,
+        .document_runs_mod = ctx.graph.document_runs_mod,
         .enable_system_blas = ctx.backend.enable_system_blas,
         .blas_root = ctx.backend.blas_root,
         .enable_metal = ctx.backend.enable_metal,

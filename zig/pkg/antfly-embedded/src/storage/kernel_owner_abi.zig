@@ -80,7 +80,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Retained memory-run materialization preserves output visibility and lineage.
 // Physical checkpoint join observations survive metadata and issuer lifetimes.
 // Maintenance rounds carry bounded-selection continuation state.
-pub const abi_version: u32 = 210;
+pub const abi_version: u32 = 211;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -803,6 +803,9 @@ pub const MetadataProjectionKind = enum(u32) {
     resolver_namespace_replacement_matches = 69,
     resolver_catalog_read = 70,
     resolver_projection_valid = 71,
+    job_state = 72,
+    job_state_scan = 73,
+    job_owner_count = 74,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };

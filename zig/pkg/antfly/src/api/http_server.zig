@@ -1815,6 +1815,12 @@ pub const ApiHttpServerConfig = struct {
     /// a docstore at this path, else `<session_store_path>.research_jobs`.
     research_job_store: ?*backend_erased.Store = null,
     research_job_store_path: ?[]const u8 = null,
+    /// Document metadata uses its own namespace in the existing durable store.
+    document_job_store: ?*backend_erased.Store = null,
+    document_job_store_path: ?[]const u8 = null,
+    document_artifact_store: ?@import("../serverless/artifacts/store.zig").ArtifactStore = null,
+    document_artifact_path: ?[]const u8 = null,
+
     research_job_retention_ms: ?u64 = null,
     repair_job_store_path: ?[]const u8 = null,
     repair_job_retention_ms: ?u64 = null,
@@ -4093,6 +4099,12 @@ pub const ApiHttpServer = struct {
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    document_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{ .namespace = .documents } },
+    document_artifact_files: ?@import("../serverless/artifacts/fs_store.zig").FsStore = null,
+    document_artifact_configured: ?*@import("lake_index_store.zig").Store = null,
+    document_work_in_flight: std.atomic.Value(usize) = .init(0),
+    document_cursor: usize = 0,
+    document_schedule_mutex: std.atomic.Mutex = .unlocked,
     research_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     research_state_key: [32]u8 = undefined,
     research_state_key_ready: std.atomic.Value(bool) = .init(false),
@@ -4118,6 +4130,8 @@ pub const ApiHttpServer = struct {
     restore_jobs_closing: std.atomic.Value(bool) = .init(false),
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
     session_maintenance_owner_id: u64 = 0,
+    document_job_owner_id: std.atomic.Value(u64) = .init(0),
+    scheduled_documents: [4]?[]const u8 = @splat(null),
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
     lake_gc_owner_id: u64 = 0,
     lake_gc_in_flight: std.atomic.Value(bool) = .init(false),
@@ -4203,6 +4217,7 @@ pub const ApiHttpServer = struct {
         repair: u64 = 0,
         restore: u64 = 0,
         session_maintenance: u64 = 0,
+        documents: u64 = 0,
         lake_gc: u64 = 0,
         backup_maintenance: u64 = 0,
         index_installation: u64 = 0,
@@ -4215,6 +4230,7 @@ pub const ApiHttpServer = struct {
         errdefer {
             if (ids.repair != 0) active.durable_jobs.closeOwner(ids.repair);
             if (ids.restore != 0) active.durable_jobs.closeOwner(ids.restore);
+            if (ids.documents != 0) active.durable_jobs.closeOwner(ids.documents);
             if (ids.session_maintenance != 0) active.durable_jobs.closeOwner(ids.session_maintenance);
             if (ids.lake_gc != 0) active.durable_jobs.closeOwner(ids.lake_gc);
             if (ids.backup_maintenance != 0) active.durable_jobs.closeOwner(ids.backup_maintenance);
@@ -4223,6 +4239,7 @@ pub const ApiHttpServer = struct {
         ids.repair = try active.allocOwnerId();
         ids.restore = try active.allocOwnerId();
         ids.session_maintenance = try active.allocOwnerId();
+        ids.documents = try active.allocOwnerId();
         ids.lake_gc = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
         ids.index_installation = try active.allocOwnerId();
@@ -4386,6 +4403,7 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
+            .document_job_store = research_jobs.Store.init(state_alloc, .{ .namespace = .documents }),
             .research_job_store = research_jobs.Store.init(state_alloc, .{
                 .path = cfg.research_job_store_path,
                 .retention_ms = cfg.research_job_retention_ms,
@@ -4401,6 +4419,7 @@ pub const ApiHttpServer = struct {
             .repair_job_owner_id = owner_ids.repair,
             .restore_job_owner_id = .init(owner_ids.restore),
             .session_maintenance_owner_id = owner_ids.session_maintenance,
+            .document_job_owner_id = .init(owner_ids.documents),
             .lake_gc_owner_id = owner_ids.lake_gc,
             .backup_maintenance_owner_id = owner_ids.backup_maintenance,
             .index_installation_owner_id = owner_ids.index_installation,
@@ -5544,6 +5563,45 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.artifact_reprocess_job_store.attachOpenedStore(opened);
         }
+        if (cfg.document_job_store orelse cfg.research_job_store) |store| {
+            try server.document_job_store.attachRuntime(store);
+        } else if (cfg.document_job_store_path orelse cfg.research_job_store_path orelse cfg.session_store_path) |base_path| {
+            const path = if (cfg.document_job_store_path != null) try alloc.dupe(u8, base_path) else try std.fmt.allocPrint(alloc, "{s}.document_jobs", .{base_path});
+            defer alloc.free(path);
+            const opened = try alloc.create(research_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try research_jobs.OpenedStore.open(alloc, path);
+            errdefer opened.deinit();
+            try server.document_job_store.attachOpenedStore(opened);
+        }
+        if (cfg.document_artifact_store == null) {
+            if (cfg.node_config) |config| if (config.storage.artifacts.connection != null) {
+                const Configured = @import("lake_index_store.zig").Store;
+                const configured = try alloc.create(Configured);
+                errdefer alloc.destroy(configured);
+                configured.* = try Configured.open(alloc, config, cfg.secret_store, false);
+                errdefer configured.deinit();
+                const namespace = try std.fmt.allocPrint(alloc, "{s}/document-jobs", .{configured.implementation.prefix});
+                alloc.free(configured.implementation.prefix);
+                configured.implementation.prefix = namespace;
+                configured.implementation.shared_namespace = configured.opened.s3_client != null or configured.opened.gcs_client != null;
+                const locator = configured.locator;
+                const identity = try std.json.Stringify.valueAlloc(alloc, .{ .protocol = locator.protocol, .bucket = locator.bucket, .prefix = namespace, .root = locator.root, .tls = locator.tls }, .{});
+                defer alloc.free(identity);
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(identity, &digest, .{});
+                configured.implementation.namespace_identity = digest;
+                server.document_artifact_configured = configured;
+                server.cfg.document_artifact_store = configured.artifactStore();
+            };
+        }
+        if (server.cfg.document_artifact_store == null) {
+            if (cfg.document_artifact_path orelse cfg.document_job_store_path orelse cfg.research_job_store_path orelse cfg.session_store_path orelse cfg.native_lake_artifact_base_dir) |base_path| {
+                const path = if (cfg.document_artifact_path != null) try alloc.dupe(u8, base_path) else if (cfg.document_job_store_path == null and cfg.research_job_store_path == null and cfg.session_store_path == null) try std.fmt.allocPrint(alloc, "{s}/document-artifacts", .{base_path}) else try std.fmt.allocPrint(alloc, "{s}.document_artifacts", .{base_path});
+                defer alloc.free(path);
+                server.document_artifact_files = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(alloc, path);
+            }
+        }
         if (cfg.research_job_store) |store| {
             try server.research_job_store.attachRuntime(store);
         } else if (cfg.research_job_store_path orelse cfg.session_store_path) |base_path| {
@@ -5675,6 +5733,8 @@ pub const ApiHttpServer = struct {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
             const restore_owner_id = self.restore_job_owner_id.load(.acquire);
             if (restore_owner_id != 0) runtime.durable_jobs.closeOwner(restore_owner_id);
+            const documents_owner = self.document_job_owner_id.load(.acquire);
+            if (documents_owner != 0) runtime.durable_jobs.closeOwner(documents_owner);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
             if (self.lake_gc_owner_id != 0) runtime.durable_jobs.closeOwner(self.lake_gc_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
@@ -5699,6 +5759,12 @@ pub const ApiHttpServer = struct {
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
         self.research_job_store.deinit();
+        self.document_job_store.deinit();
+        if (self.document_artifact_files) |*files| files.deinit();
+        if (self.document_artifact_configured) |configured| {
+            configured.deinit();
+            self.alloc.destroy(configured);
+        }
         self.repair_job_store.deinit();
         self.restore_job_store.deinit();
         self.scheduled_restore_jobs.deinit(self.alloc);
@@ -5768,6 +5834,7 @@ pub const ApiHttpServer = struct {
 
     pub fn attachReplicatedRestoreJobStore(self: *ApiHttpServer, persistence: restore_jobs.ReplicatedPersistence) !void {
         try self.restore_job_store.attachReplicated(persistence);
+        if (persistence.job_state.valid()) try self.document_job_store.attachReplicated(persistence.job_state);
     }
 
     /// Rotates worker ownership and rebuilds the runnable queue from replicated
@@ -5791,6 +5858,10 @@ pub const ApiHttpServer = struct {
 
     fn prepareRestoreLeadershipLocked(self: *ApiHttpServer, runtime: *db_mod.background_runtime.BackendRuntime, leadership_term: u64) !void {
         self.restore_leadership_term.store(0, .release);
+        platform_sync.lockYielding(&self.document_schedule_mutex);
+        const previous_documents_owner = self.document_job_owner_id.swap(0, .acq_rel);
+        self.document_schedule_mutex.unlock();
+        if (previous_documents_owner != 0) runtime.durable_jobs.closeOwner(previous_documents_owner);
         const previous_owner_id = self.restore_job_owner_id.swap(0, .acq_rel);
         // Wake both classes of sleepers after publishing the ownership change.
         // The earlier admission-pause signal keeps dispatch responsive; this
@@ -5805,6 +5876,15 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
         self.restore_jobs_resumed.store(false, .release);
         try self.restore_job_store.prepareReplicatedLeadership(self.alloc, leadership_term);
+        const document_ready = ready: {
+            self.document_job_store.prepareReplicatedLeadership(leadership_term) catch |err| {
+                std.log.warn("document job authority preparation deferred err={s}", .{@errorName(err)});
+                break :ready false;
+            };
+            break :ready true;
+        };
+        self.document_cursor = 0;
+        if (document_ready) self.document_job_owner_id.store(try runtime.allocOwnerId(), .release);
         self.restore_job_owner_id.store(try runtime.allocOwnerId(), .release);
         self.restore_leadership_term.store(leadership_term, .release);
         self.restore_dispatch_paused.store(false, .release);
@@ -6224,7 +6304,10 @@ pub const ApiHttpServer = struct {
         // Durable transaction, repair, and reprocess job checkpoints are
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
-        if (!self.mutationBackgroundExecutionPermitted()) return;
+        if (!self.mutationBackgroundExecutionPermitted()) {
+            try self.scheduleDocumentsOnce();
+            return;
+        }
         self.recoverBackupCohortSlice() catch |err| switch (err) {
             error.UnsupportedOperation, error.Canceled, error.DeadlineExceeded => {},
             else => std.log.warn("backup cohort recovery deferred err={s}", .{@errorName(err)}),
@@ -6308,6 +6391,7 @@ pub const ApiHttpServer = struct {
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
         self.research_job_store.cleanupExpiredJobs();
+        try self.scheduleDocumentsOnce();
         self.repair_job_store.cleanupExpiredJobs();
         if (self.cfg.backend_runtime) |runtime| {
             _ = runtime.durable_jobs.poll(32) catch |err| {
@@ -6329,6 +6413,93 @@ pub const ApiHttpServer = struct {
     fn memoryDropIndex(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, name: []const u8) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try self.source.dropIndex(a, table, name);
+    }
+
+    pub fn documentJobsFailoverSafe(self: *const ApiHttpServer) bool {
+        return self.document_job_store.replicated != null and (if (self.cfg.document_artifact_store) |store| store.shared_across_owners and store.namespace_identity != null else false);
+    }
+    pub fn documentExecutionPermitted(self: *ApiHttpServer) bool {
+        if (self.cfg.deployment_mode == .distributed and (self.cfg.restore_execution_guard == null or !self.documentJobsFailoverSafe())) return false;
+        const term = self.restore_leadership_term.load(.acquire);
+        if (self.document_job_store.replicated != null and (term == 0 or self.document_job_store.replicated_term.load(.acquire) != term)) return false;
+        const coordinated = self.documentJobsFailoverSafe();
+        return !self.restore_jobs_closing.load(.acquire) and (self.mutationBackgroundExecutionPermitted() or coordinated) and self.restoreExecutionPermitted();
+    }
+    pub fn scheduleDocumentsOnce(self: *ApiHttpServer) !void {
+        if (!self.document_schedule_mutex.tryLock()) return;
+        defer self.document_schedule_mutex.unlock();
+        const module = @import("document_jobs.zig");
+        const runs = @import("antfly_readers").document_runs;
+        if (self.document_job_store.replicated != null and self.document_job_owner_id.load(.acquire) == 0 and self.restoreExecutionPermitted()) {
+            const term = self.restore_leadership_term.load(.acquire);
+            if (term == 0) return;
+            try self.document_job_store.prepareReplicatedLeadership(term);
+            if (term != self.restore_leadership_term.load(.acquire)) return;
+            const runtime = self.cfg.backend_runtime orelse return;
+            self.document_job_owner_id.store(try runtime.allocOwnerId(), .release);
+        }
+        if (!self.document_job_store.durable() or !self.documentExecutionPermitted()) return;
+        var persistence = module.context(self) catch return;
+        const Owner = struct {
+            server: *ApiHttpServer,
+            term: u64,
+            fn cancelled(raw: *const anyopaque) bool {
+                const owner: *const @This() = @ptrCast(@alignCast(raw));
+                return !owner.server.documentExecutionPermitted() or owner.server.restore_leadership_term.load(.acquire) != owner.term;
+            }
+            fn check(raw: *anyopaque) !void {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                if (!owner.server.documentExecutionPermitted() or owner.server.restore_leadership_term.load(.acquire) != owner.term) return error.DocumentRunLeaseLost;
+            }
+        };
+        var owner_scope = Owner{ .server = self, .term = self.restore_leadership_term.load(.acquire) };
+        persistence.authority = .{ .ptr = &owner_scope, .check_fn = Owner.check };
+        persistence.cancellation = .{ .ptr = &owner_scope, .is_cancelled_fn = Owner.cancelled };
+        const count = @min(32, self.document_job_store.documentCount());
+        for (0..count) |_| {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const outer = (try self.document_job_store.nextDocument(a, &self.document_cursor)) orelse return;
+            const record = try std.json.parseFromSliceLeaky(runs.Record, a, outer.request, .{});
+            const now_ms = research_jobs.nowMillis();
+            if (outer.maintenance_not_before_ms > now_ms) continue;
+            if (record.retention_until_ms != 0 and now_ms >= record.retention_until_ms) {
+                if (!self.documentExecutionPermitted()) return;
+                _ = try persistence.collectExpired(a, record.run_id, record.owner, 32);
+                continue;
+            }
+            if (record.not_before_ms > now_ms or record.retired or record.state == .succeeded or record.state == .failed or record.state == .cancelled or (record.state == .running and record.lease_until_ms > now_ms)) continue;
+            const runtime = self.cfg.backend_runtime orelse return;
+            if (runtime.threaded_jobs == null or self.document_job_owner_id.load(.acquire) == 0) return;
+            if (self.document_work_in_flight.load(.acquire) >= 4) return;
+            var duplicate = false;
+            for (self.scheduled_documents) |entry| if (entry) |id| {
+                if (std.mem.eql(u8, id, record.run_id)) {
+                    duplicate = true;
+                    break;
+                }
+            };
+            if (duplicate) continue;
+            const slot = for (self.scheduled_documents, 0..) |entry, index| {
+                if (entry == null) break index;
+            } else return;
+            const Work = module.Work(ApiHttpServer);
+            const work = try self.alloc.create(Work);
+            errdefer self.alloc.destroy(work);
+            const id = try self.alloc.dupe(u8, record.run_id);
+            errdefer self.alloc.free(id);
+            const owner = try self.alloc.dupe(u8, record.owner);
+            errdefer self.alloc.free(owner);
+            work.* = .{ .server = self, .id = id, .owner = owner, .term = self.restore_leadership_term.load(.acquire), .slot = slot };
+            self.scheduled_documents[slot] = id;
+            _ = self.document_work_in_flight.fetchAdd(1, .acq_rel);
+            runtime.durable_jobs.submit(.{ .owner_id = self.document_job_owner_id.load(.acquire), .class = .maintenance, .ptr = work, .run = Work.run, .deinit = Work.deinit }) catch |err| {
+                _ = self.document_work_in_flight.fetchSub(1, .acq_rel);
+                self.scheduled_documents[slot] = null;
+                return err;
+            };
+        }
     }
 
     const MemoryMaintenanceWork = struct {
@@ -6499,7 +6670,7 @@ pub const ApiHttpServer = struct {
             adapter.context = context;
             adapter.request = .{ .deadline_ns = work.deadline.end };
             const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
-            const runtime = try Runtime.createOwned(a, server.inferenceIo(), .{ .antfly_provider = server.antfly_provider, .inference_api_url = server.configuredInferenceAPIURL(), .secret_store = server.cfg.secret_store, .source_table = table });
+            const runtime = try Runtime.createOwned(a, server.inferenceIo(), .{ .provider_runtime = &server.embedding_provider_runtime, .antfly_provider = server.antfly_provider, .inference_api_url = server.configuredInferenceAPIURL(), .secret_store = server.cfg.secret_store, .source_table = table });
             defer runtime.deinit();
             var bridge: @import("antfly_local_sources").memory_models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = server.inferenceIo(), .deadline_ns = inference_deadline, .max_response_bytes = state.config.max_input_bytes }), .alloc = a, .embedding_options = .{ .deadline_ns = inference_deadline, .bounded_http_request = true, .antfly_provider = server.antfly_provider, .io = server.inferenceIo(), .secret_store = server.cfg.secret_store, .inference_api_url = server.configuredInferenceAPIURL(), .source_table = table } };
             const token = try std.fmt.allocPrint(a, "worker:{d}:{s}", .{ state.revision, if (pending) |item| item.id else "maintenance" });
@@ -16141,9 +16312,10 @@ pub const ApiHttpServer = struct {
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_team = normalized.execution_team, .execution_remote_query = normalized.execution_remote_query };
         var binding = try self.bindCatalogQuery(alloc, normalized, logical_name, body, &identity, &resolver);
         defer binding.deinit();
+        const bound_body = binding.bound_body orelse body;
         // Retrieval must use the same bound engine and publication as HTTP
         // search. Object tables have no native data shards to query.
-        if (try self.tryObjectTableQuery(binding.physical, body, identity, null, binding.label, if (binding.join) |*join| join else null, &resolver, binding.dispatch)) |value| {
+        if (try self.tryObjectTableQuery(binding.physical, bound_body, identity, null, binding.label, if (binding.join) |*join| join else null, &resolver, binding.dispatch)) |value| {
             var response = value;
             defer response.deinit(self.alloc);
             if (response.status != 200) return switch (response.status) {
@@ -16164,7 +16336,7 @@ pub const ApiHttpServer = struct {
             alloc,
             source,
             binding.physical,
-            body,
+            bound_body,
             row_filter,
             identity,
             normalized.deadline_ns,
@@ -22801,6 +22973,7 @@ pub const ApiHttpServer = struct {
         join: ?distributed_join.ParsedSupportedJoinRequest,
         dispatch: BoundQueryDispatch,
         revision: ?u64 = null,
+        bound_body: ?[]const u8 = null,
 
         pub fn deinit(self: *@This()) void {
             self.arena.deinit();
@@ -22873,7 +23046,11 @@ pub const ApiHttpServer = struct {
             if (definition.storage_engine != .object) break :bound null;
             break :bound .{ .table_id = definition.table_id, .generation = definition.object_storage_generation };
         } else null;
-        return .{ .arena = arena, .physical = physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context, .incarnation = incarnation }, .revision = result.revision };
+        // Graph readers compare physical identities. Bind only this proved
+        // full primary target; never infer a foreign route from its basename.
+        const primary_names: []const []const u8 = if (target.isDefault()) &.{ primary_key, target.table } else &.{primary_key};
+        const bound_body = if (primary_foreign or parsed_request.value.graph_queries == null) null else try @import("graph_primary_table_binding.zig").bind(a, body, primary_names, physical);
+        return .{ .arena = arena, .physical = physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context, .incarnation = incarnation }, .revision = result.revision, .bound_body = bound_body };
     }
 
     /// Select borrowed physical records before collecting per-table status or
@@ -23175,7 +23352,9 @@ pub const ApiHttpServer = struct {
         const logical = if (self.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = input.database, .namespace = input.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*value| value.deinit(self.alloc);
-        var request = borrowed_context;
+        // Native storage/provider requests carry platform-monotonic budgets.
+        // Translate once while retaining the ingress fanout capability.
+        var request = try borrowed_context.platformDeadline();
         request.native_service = .memory;
         request.row_policy_credential = &identity;
         request.table_read_authorization = .{ .ptr = &identity, .allows = MemoryIngressCredential.read };
@@ -23245,7 +23424,7 @@ pub const ApiHttpServer = struct {
         var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .index_catalog = self.memoryIndexCatalog(), .context = context, .request = request, .resource_ptr = &resources, .resource_fn = MemoryResourceReader.read };
         const models = @import("antfly_local_sources").memory_models;
         const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
-        const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
+        const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .provider_runtime = &self.embedding_provider_runtime, .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
         defer runtime.deinit();
         var bridge: models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = self.inferenceIo(), .deadline_ns = request.deadline_ns, .cancellation = request.cancellation }), .alloc = a, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.inferenceIo(), .bounded_http_request = true, .deadline_ns = request.deadline_ns, .cancellation = request.cancellation, .secret_store = self.cfg.secret_store, .inference_api_url = self.configuredInferenceAPIURL(), .source_table = table } };
         const result = try (module.memory.Service{ .backend = bridge.backend(), .context = context }).execute(self.alloc, input.action, input.id, try @import("antfly-json").stringifyValueAlloc(a, input.body), input.idempotency_key);
@@ -23962,7 +24141,7 @@ pub const ApiHttpServer = struct {
         var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none, .execution_team = resolver.execution_team }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
         if (bridge) |*value| value.table_name = binding.physical;
-        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
+        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, binding.bound_body orelse body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
     }
 
     /// The native catalog is the authority for existence and incarnation. This
@@ -24242,10 +24421,10 @@ pub const ApiHttpServer = struct {
                     const policy = try resolveEffectiveRowFilterJson(a, identity, binding.physical);
                     defer if (policy) |filter| a.free(filter);
                     if (runner.overlay and policy != null) return error.UnsupportedQueryRequest;
-                    var native_query = leaf_query;
+                    var native_query = binding.bound_body orelse leaf_query;
                     const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(scratch, bound.schema_json);
                     if (bound.storage.engine != .object and external == null) {
-                        var request = try std.json.parseFromSliceLeaky(std.json.Value, scratch, leaf_query, .{});
+                        var request = try std.json.parseFromSliceLeaky(std.json.Value, scratch, native_query, .{ .parse_numbers = false });
                         if (!request.object.contains("remote_snapshot")) {
                             var wait: @import("runnable_fanout_owner.zig").RemoteWait = .{ .borrow = if (runner.context.execution_team) |original| original.borrow else null };
                             var store = try @import("lake_index_store.zig").Store.openNativeFor(scratch, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir, artifactContext(runner, &wait));
@@ -24663,7 +24842,7 @@ pub const ApiHttpServer = struct {
 
             const line_label = response_label orelse binding.label;
             const line_join = if (binding.join) |*value| value else bound_join;
-            var query_response: query_api.QueryResponse = if (self.tryObjectTableQuery(table_name, line, line_identity, cancellation, line_label, line_join, &catalog_resolver, binding.dispatch) catch |err| return self.publicQueryOperationErrorResponse(table_name, line, err)) |value| object: {
+            var query_response: query_api.QueryResponse = if (self.tryObjectTableQuery(table_name, binding.bound_body orelse line, line_identity, cancellation, line_label, line_join, &catalog_resolver, binding.dispatch) catch |err| return self.publicQueryOperationErrorResponse(table_name, line, err)) |value| object: {
                 var response = value;
                 if (response.status != 200) return response;
                 defer response.deinit(self.alloc);
@@ -24676,7 +24855,7 @@ pub const ApiHttpServer = struct {
                     self.alloc,
                     source,
                     table_name,
-                    line,
+                    binding.bound_body orelse line,
                     row_filter_json,
                     line_identity,
                     if (cancellation) |value| value.token() else null,
@@ -28188,7 +28367,7 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
             ) == null) {
                 if (physical_evidence_available) try validatePublicMappedSortCoverage(field.field, mapping);
             }
-            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, cursor[i]);
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, mapping.missing_null_policy, cursor[i]);
             continue;
         }
 
@@ -28197,8 +28376,8 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
             query_req.primary_text_index_name orelse query_req.index_name,
             physical,
             null,
-        )) |field_type| {
-            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, field_type, cursor[i]);
+        )) |evidence| {
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, evidence.field_type, evidence.policy, cursor[i]);
             continue;
         }
 
@@ -28418,6 +28597,7 @@ fn validatePublicObservedSortField(capability: storage_schema.FieldCapability, e
         recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", "missing_doc_values_capability");
         return error.UnsupportedExactSort;
     }
+    if (std.mem.eql(u8, capability.missing_null_policy, "nulls_ordered")) return capability.field_type;
     if (!std.mem.eql(u8, capability.doc_value_coverage, "covered") or
         !std.mem.eql(u8, capability.queryability_state, "queryable"))
     {
@@ -28432,6 +28612,7 @@ fn validatePublicObservedSortField(capability: storage_schema.FieldCapability, e
 }
 
 fn validatePublicMappedSortCoverage(field: []const u8, mapping: storage_schema.FieldMapping) !void {
+    if (mapping.missing_null_policy == .nulls_ordered) return;
     const coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
     const queryability = storage_schema.mappingQueryabilityStateName(mapping);
     const detail = if (!std.mem.eql(u8, coverage, "covered")) coverage else queryability;
@@ -28439,8 +28620,8 @@ fn validatePublicMappedSortCoverage(field: []const u8, mapping: storage_schema.F
     return error.UnsupportedExactSort;
 }
 
-fn validatePublicMappedSortCursor(field: []const u8, field_type: storage_schema.AntflyType, value: std.json.Value) !void {
-    const valid = switch (field_type) {
+fn validatePublicMappedSortCursor(field: []const u8, field_type: storage_schema.AntflyType, policy: storage_schema.MissingNullPolicy, value: std.json.Value) !void {
+    const valid = if (value == .null) policy == .nulls_ordered else switch (field_type) {
         .keyword, .link => value == .string,
         .numeric => publicSortCursorValueIsNumeric(value),
         .datetime => publicSortCursorValueIsDateLike(value),
@@ -28458,7 +28639,8 @@ fn publicSortCursorValueIsReplayable(value: std.json.Value) bool {
         .bool, .integer, .string => true,
         .float => |number| std.math.isFinite(number),
         .number_string => |text| publicJsonNumberStringIsFinite(text),
-        .null, .array, .object => false,
+        .null => true,
+        .array, .object => false,
     };
 }
 
@@ -28490,12 +28672,15 @@ fn publicJsonNumberStringIsFinite(text: []const u8) bool {
     return std.math.isFinite(value);
 }
 
+const PublicSortEvidence = struct { field_type: storage_schema.AntflyType, policy: storage_schema.MissingNullPolicy };
+
 fn validatePublicSortCapabilityEvidence(
     observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
     preferred_index_name: ?[]const u8,
     field: []const u8,
     expected_type: ?storage_schema.AntflyType,
-) !?storage_schema.AntflyType {
+) !?PublicSortEvidence {
+    var preferred_policy: storage_schema.MissingNullPolicy = .nulls_ordered;
     var matched_preferred = false;
     var preferred_type: ?storage_schema.AntflyType = null;
     for (observed_dynamic_capability_sets) |set| {
@@ -28506,12 +28691,14 @@ fn validatePublicSortCapabilityEvidence(
             if (!std.mem.eql(u8, capability_field, field)) continue;
             const effective_expected = expected_type orelse preferred_type;
             preferred_type = try validatePublicObservedSortField(capability, effective_expected);
+            if (!std.mem.eql(u8, capability.missing_null_policy, "nulls_ordered")) preferred_policy = .missing_rejected;
             matched_preferred = true;
         }
     }
-    if (matched_preferred) return preferred_type;
+    if (matched_preferred) return .{ .field_type = preferred_type.?, .policy = preferred_policy };
     if (preferred_index_name != null) return null;
 
+    var fallback_policy: storage_schema.MissingNullPolicy = .nulls_ordered;
     var matched_fallback = false;
     var fallback_type: ?storage_schema.AntflyType = null;
     for (observed_dynamic_capability_sets) |set| {
@@ -28520,10 +28707,11 @@ fn validatePublicSortCapabilityEvidence(
             if (!std.mem.eql(u8, capability_field, field)) continue;
             const effective_expected = expected_type orelse fallback_type;
             fallback_type = try validatePublicObservedSortField(capability, effective_expected);
+            if (!std.mem.eql(u8, capability.missing_null_policy, "nulls_ordered")) fallback_policy = .missing_rejected;
             matched_fallback = true;
         }
     }
-    return if (matched_fallback) fallback_type else null;
+    return if (matched_fallback) .{ .field_type = fallback_type.?, .policy = fallback_policy } else null;
 }
 
 fn recordPublicSortCapabilityRejection(field: []const u8, reason: []const u8, detail: []const u8) void {
@@ -31173,6 +31361,17 @@ fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std
         try out.ensureUnusedCapacity(alloc, 1);
         out.appendAssumeCapacity(try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin));
         return try out.toOwnedSlice(alloc);
+    }
+
+    // Signed inference grants are independent of table scope. Older hosts
+    // ignore this additive claim and fail closed for non-admin job owners.
+    if (payload.get("inference_operations")) |operations| {
+        if (operations != .array) return error.Unauthorized;
+        for (operations.array.items) |operation| {
+            const name = jsonStringValue(operation) orelse return error.Unauthorized;
+            const permission: usermgr.PermissionType = if (std.mem.eql(u8, name, "read")) .read else if (std.mem.eql(u8, name, "write")) .write else return error.Unauthorized;
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .inference, "*", permission));
+        }
     }
 
     const tables_value = payload.get("tables");
@@ -35099,6 +35298,14 @@ test "api http public sort capability gate resolves logical keyword fields" {
     const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order, schema);
     defer std.testing.allocator.free(fields);
     try std.testing.expectEqualStrings("title.keyword", fields[0]);
+    const null_cursor = [_]std.json.Value{ .null, .{ .string = "doc:a" } };
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order, .search_after = &null_cursor }, schema, &.{}, false));
+    var nullable_schema = schema;
+    var nullable_fields = [_]storage_schema.ExactField{ schema.exact_fields[0], schema.exact_fields[1] };
+    nullable_fields[1].mapping.missing_null_policy = .nulls_ordered;
+    nullable_schema.exact_fields = &nullable_fields;
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order, .search_after = &null_cursor }, nullable_schema, &.{}, false);
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order, .search_after = &null_cursor }, nullable_schema, &.{}, true);
     // Routed admission validates the same physical mapping as the shard.
     try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order }, schema, &.{}, false);
 }
@@ -60112,6 +60319,133 @@ test "system catalog restore listing shares one projection and honors legacy ren
     try std.testing.expectEqual(@as(usize, 2), fake.snapshots);
 }
 
+test "system catalog graph primary qualifiers bind full target without namespace collisions" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        expected: system_catalog.Target,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(input == .resolve_many);
+            try std.testing.expectEqual(@as(usize, 1), input.resolve_many.targets.len);
+            const target = input.resolve_many.targets[0];
+            try std.testing.expectEqualStrings(self.expected.database, target.database);
+            try std.testing.expectEqualStrings(self.expected.namespace, target.namespace);
+            try std.testing.expectEqualStrings(self.expected.table, target.table);
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 10, .name = "table:primary" }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 7, .tables = &tables }, .{});
+        }
+    };
+    for ([_]system_catalog.Target{ .{ .table = "docs" }, .{ .database = "tenant", .namespace = "blue", .table = "docs" } }) |primary| {
+        var fake = Fake{ .expected = primary };
+        var server = ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, null, null);
+        defer server.deinit();
+        const key = try primary.resourceNameAlloc(a);
+        defer a.free(key);
+        const foreign = try (system_catalog.Target{ .database = "tenant", .namespace = "red", .table = "docs" }).resourceNameAlloc(a);
+        defer a.free(foreign);
+        const body = try std.json.Stringify.valueAlloc(a, .{ .graph_queries = .{ .q = .{
+            .index = "graph",
+            .match = .{
+                .anchor = "a",
+                .nodes = .{ .a = .{ .table = key }, .b = .{ .table = foreign }, .c = .{ .table = "docs" }, .d = .{ .table = "table:primary" }, .e = struct {}{} },
+                .edges = &[_]struct { from: []const u8, to: []const u8 }{ .{ .from = "a", .to = "b" }, .{ .from = "a", .to = "c" }, .{ .from = "a", .to = "d" }, .{ .from = "a", .to = "e" } },
+            },
+            .@"return" = .{ .bindings = &[_][]const u8{"a"} },
+        } } }, .{});
+        defer a.free(body);
+        var identity: ?AuthenticatedIdentity = null;
+        var bound = try server.bindCatalogQuery(a, .{}, key, body, &identity, null);
+        defer bound.deinit();
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bound.bound_body.?, .{});
+        defer parsed.deinit();
+        const nodes = parsed.value.object.get("graph_queries").?.object.get("q").?.object.get("match").?.object.get("nodes").?.object;
+        try std.testing.expectEqualStrings("table:primary", nodes.get("a").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings(foreign, nodes.get("b").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings(if (primary.isDefault()) "table:primary" else "docs", nodes.get("c").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings("table:primary", nodes.get("d").?.object.get("table").?.string);
+        try std.testing.expect(!nodes.get("e").?.object.contains("table"));
+        const selector_body = try std.json.Stringify.valueAlloc(a, .{ .graph_queries = .{
+            .walk = .{ .index = "graph", .traverse = .{ .start = .{ .identities = &[_]struct { key: []const u8, table: []const u8 }{.{ .key = "a", .table = key }} } } },
+            .path = .{ .index = "graph", .shortest_path = .{ .from = .{ .key = "a", .table = key }, .to = .{ .key = "b", .table = foreign } } },
+            .paths = .{ .index = "graph", .k_shortest_paths = .{ .from = .{ .key = "a", .table = "table:primary" }, .to = .{ .key = "b", .table = key }, .k = @as(u32, 2) } },
+        } }, .{});
+        defer a.free(selector_body);
+        var selectors = try server.bindCatalogQuery(a, .{}, key, selector_body, &identity, null);
+        defer selectors.deinit();
+        var selected = try std.json.parseFromSlice(std.json.Value, a, selectors.bound_body.?, .{});
+        defer selected.deinit();
+        const operations = selected.value.object.get("graph_queries").?.object;
+        const start = operations.get("walk").?.object.get("traverse").?.object.get("start").?.object.get("identities").?.array.items[0];
+        try std.testing.expectEqualStrings("table:primary", start.object.get("table").?.string);
+        const path = operations.get("path").?.object.get("shortest_path").?.object;
+        try std.testing.expectEqualStrings("table:primary", path.get("from").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings(foreign, path.get("to").?.object.get("table").?.string);
+        const paths = operations.get("paths").?.object.get("k_shortest_paths").?.object;
+        try std.testing.expectEqualStrings("table:primary", paths.get("from").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings("table:primary", paths.get("to").?.object.get("table").?.string);
+    }
+}
+
+test "system catalog retrieval executes bound primary graph qualifiers" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        queries: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try std.testing.expect(input == .resolve_many);
+            try std.testing.expectEqual(@as(usize, 1), input.resolve_many.targets.len);
+            try std.testing.expectEqualStrings("docs", input.resolve_many.targets[0].table);
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 10, .name = "table:primary" }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 7, .tables = &tables }, .{});
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+        fn query(raw: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.queries += 1;
+            try std.testing.expectEqualStrings("table:primary", table_name);
+            try std.testing.expectEqual(@as(usize, if (self.queries <= 2) 1 else 0), req.graph_queries.len);
+            for (req.graph_queries) |operation| {
+                if (operation.query.match_pattern) |pattern| {
+                    try std.testing.expectEqual(@as(usize, 1), pattern.nodes.len);
+                    try std.testing.expectEqualStrings("table:primary", pattern.nodes[0].table.?);
+                } else {
+                    const identities = operation.query.start_nodes.identities;
+                    try std.testing.expectEqualStrings("table:primary", identities[0].table.?);
+                    try std.testing.expectEqualStrings("foreign", identities[1].table.?);
+                }
+            }
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}") };
+        }
+    };
+    var fake: Fake = .{};
+    const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, reads, null);
+    defer server.deinit();
+    const bodies = [_][]const u8{
+        \\{"graph_queries":{"q":{"index":"graph","match":{"anchor":"a","nodes":{"a":{"table":"docs"}},"edges":[]},"return":{"bindings":["a"]}}}}
+        ,
+        \\{"graph_queries":{"q":{"index":"graph","traverse":{"start":{"identities":[{"key":"a","table":"docs"},{"key":"b","table":"foreign"}]},"max_depth":1}}}}
+        ,
+        \\{"query":{"match_all":{}}}
+        ,
+    };
+    for (bodies) |body| {
+        var response = try server.executeCatalogRetrievalQuery(a, .{}, "docs", body, null);
+        defer response.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, bodies.len), fake.queries);
+}
+
 test "system catalog binds primary and nested joins once without conflating literal names" {
     const alloc = std.testing.allocator;
     const Fake = struct {
@@ -65218,7 +65552,12 @@ test "native memory worker budgets slow semantic publication independently from 
             return std.json.parseFromSliceLeaky(memory.memory.types.State, a, (try backend.get(backend.ptr, a, "control")).?.json, .{});
         }
     };
-    const a = std.testing.allocator;
+    // This fixture measures model/publication budgets, not allocation stack
+    // unwinding. Keep safety and leak checks without tracing every DB scratch
+    // allocation through the large test executable's debug information.
+    var fixture_heap: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.testing.expectEqual(@as(usize, 0), fixture_heap.deinit()) catch @panic("memory budget fixture leaked");
+    const a = fixture_heap.allocator();
     var directory = try TestDirectory.init("memory-worker-semantic-budget");
     defer directory.cleanup();
     var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
@@ -65368,4 +65707,75 @@ test "trusted principal table operations preserve discovery hints without granti
     try std.testing.expect(clone.mcp_creation_discovery);
     try std.testing.expect(!permissionsAllow(clone.permissions, .table, "new_table", .admin));
     try std.testing.expect(!permissionsAllow(clone.permissions, .table, "antfly_sources", .admin));
+}
+
+test "trusted principal inference operations grant no table or administrative authority" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"inference_operations":["read","write"]}
+    , .{});
+    defer parsed.deinit();
+    const permissions = try trustedPrincipalPermissionsFromPayload(a, parsed.value.object);
+    defer freePermissions(a, permissions);
+    try std.testing.expect(permissionsAllow(permissions, .inference, "*", .read));
+    try std.testing.expect(permissionsAllow(permissions, .inference, "*", .write));
+    try std.testing.expect(!permissionsAllow(permissions, .inference, "*", .admin));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "docs", .read));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "docs", .write));
+}
+test "trusted principal inference operations reject malformed and expanded grants" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"inference_operations":"write"}
+        ,
+        \\{"inference_operations":["admin"]}
+        ,
+        \\{"inference_operations":["*"]}
+        ,
+        \\{"inference_operations":[7]}
+    }) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.Unauthorized, trustedPrincipalPermissionsFromPayload(a, parsed.value.object));
+    }
+}
+
+test "httpx inference gateway document authority recovery does not block existing restore ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/deferred-document-authority", .{tmp.sub_path});
+    defer a.free(path);
+    var opened = try research_jobs.OpenedStore.open(a, path);
+    defer opened.deinit();
+    var backend = @import("document_run_storage.zig").SharedJobStateTestBackend{ .store = opened.docstore, .term = 7, .partitioned = true };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone, .backend_runtime = runtime.ptr() }, .{ .ptr = undefined, .vtable = &.{ .status = Source.status } }, null, null);
+    defer server.deinit();
+    const runs = @import("antfly_readers").document_runs;
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try std.testing.expect(try server.document_job_store.compareDocumentRun(@as(?runs.Version, null), runs.Record{ .run_id = "legacy", .owner = "alice", .identity = identity, .limits = .{}, .inputs = &.{} }, research_jobs.nowMillis));
+    try server.document_job_store.attachReplicated(backend.capability());
+    try std.testing.expect(!server.documentExecutionPermitted());
+    try server.prepareRestoreLeadership(7);
+    const restore_owner = server.restore_job_owner_id.load(.acquire);
+    try std.testing.expect(restore_owner != 0);
+    try std.testing.expectEqual(@as(u64, 7), server.restore_leadership_term.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.document_job_owner_id.load(.acquire));
+    try std.testing.expect(!server.documentExecutionPermitted());
+    backend.partitioned = false;
+    try server.scheduleDocumentsOnce();
+    try std.testing.expectEqual(restore_owner, server.restore_job_owner_id.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 7), server.document_job_store.replicated_term.load(.acquire));
+    try std.testing.expect(server.document_job_owner_id.load(.acquire) != 0);
+    try std.testing.expect(server.documentExecutionPermitted());
+    const migrated = (try backend.capability().get(a, "documents/legacy")).?;
+    defer a.free(migrated);
+    try std.testing.expect(migrated.len > 0);
 }

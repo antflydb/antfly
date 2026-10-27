@@ -208,6 +208,9 @@ const RemoteInferenceConnection = struct {
     url: []const u8,
     api_key: ?[]const u8,
     preserve_api_path: bool = false,
+    credential_env: ?[:0]const u8 = null,
+    capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
 };
 
 const ResolvedInferenceConnection = union(enum) {
@@ -253,6 +256,9 @@ pub const InvocationRequest = struct {
     content_type: []const u8 = "application/json",
     query: ?[]const u8 = null,
     body_source: runtime_http_abi.RequestBodySource = .{},
+    document_store: @import("antfly_runtime_abi").document_abi.View = .{},
+    /// Freeable, invocation-owned transport memory, distinct from request arenas.
+    document_allocator: ?Allocator = null,
 };
 
 pub fn invokeInferenceConnectionWithMethod(
@@ -288,6 +294,8 @@ pub fn invokeInferenceConnectionWithRequest(
     request: InvocationRequest,
 ) !InvokeResult {
     const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
+    const durable_remote = request.document_store.configured() and resolved == .remote;
+    if (durable_remote and (method != .post or (!std.mem.eql(u8, operation, "read") and !std.mem.eql(u8, operation, "extract")) or request.body_source.read != null or request.query != null)) return error.UnsupportedInferenceFeature;
     if (resolved == .local) {
         const target = resolved.local;
         if (!target.valid(inference_connection_abi.Capability.streaming_response))
@@ -319,6 +327,7 @@ pub fn invokeInferenceConnectionWithRequest(
             .query = .init(request.query),
             .content_type = .init(request.content_type),
             .body_source = request.body_source,
+            .document_store = request.document_store,
         });
         if (!status.isOk()) {
             response.deinit(&abi_alloc);
@@ -343,24 +352,86 @@ pub fn invokeInferenceConnectionWithRequest(
     const base = std.mem.trimEnd(u8, raw_url, "/");
     const prefix = try inferenceApiBaseAlloc(alloc, remote);
     defer alloc.free(prefix);
-    const operation_url = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "{s}/ml/v1/{s}", .{ std.mem.trimEnd(u8, base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/ai/v1")) @as(usize, 6) else 0)], "/"), operation[3..] }) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
+    const routed_operation = if (durable_remote) try std.fmt.allocPrint(alloc, "{s}/execute", .{operation}) else try alloc.dupe(u8, operation);
+    defer alloc.free(routed_operation);
+    const operation_url = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "{s}/ml/v1/{s}", .{ std.mem.trimEnd(u8, base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/ai/v1")) @as(usize, 6) else 0)], "/"), operation[3..] }) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, routed_operation });
     defer alloc.free(operation_url);
     const url = if (request.query) |query| try std.fmt.allocPrint(alloc, "{s}?{s}", .{ operation_url, query }) else try alloc.dupe(u8, operation_url);
     defer alloc.free(url);
 
-    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, remote.api_key);
+    const resolved_key = if (remote.credential_env) |name| key: {
+        var source = try common_secrets.SecretValue.initConfigOrEnv(alloc, remote.api_key, name);
+        defer source.deinit(alloc);
+        break :key try source.resolveOwned(alloc, secret_store);
+    } else try resolveInferenceApiKey(alloc, secret_store, remote.api_key);
     defer if (resolved_key) |key| alloc.free(key);
     const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
     defer if (auth) |value| alloc.free(value);
     const timeout_ms = try remainingInferenceInvocationMs(deadline_ns, platform_time.monotonicNs());
     const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms});
     defer alloc.free(timeout_header);
-    const headers = if (auth) |value| &[_][2][]const u8{
-        .{ "Authorization", value },
-        .{ "Content-Type", request.content_type },
-        .{ "X-Antfly-Inference-Attempts-Remaining", "1" },
-        .{ "X-Antfly-Inference-Timeout-Ms", timeout_header },
-    } else &[_][2][]const u8{ .{ "Content-Type", request.content_type }, .{ "X-Antfly-Inference-Attempts-Remaining", "1" }, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header } };
+    var header_buffer: [8][2][]const u8 = undefined;
+    header_buffer[0] = .{ "Content-Type", request.content_type };
+    header_buffer[1] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
+    header_buffer[2] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
+    var header_count: usize = 3;
+    if (auth) |value| {
+        header_buffer[header_count] = .{ "Authorization", value };
+        header_count += 1;
+    }
+    if (remote.capability_token) |value| {
+        header_buffer[header_count] = .{ "X-Antfly-Capability-Token", value };
+        header_count += 1;
+    }
+    if (remote.capability_revision) |value| {
+        header_buffer[header_count] = .{ "X-Antfly-Capability-Revision", value };
+        header_count += 1;
+    }
+    const protocol = @import("antfly_readers").document_stream;
+    var token_budget_header: ?[]u8 = null;
+    defer if (token_budget_header) |value| alloc.free(value);
+    var routing_request: ?std.json.Parsed(std.json.Value) = null;
+    defer if (routing_request) |*parsed| parsed.deinit();
+    if (durable_remote) {
+        header_buffer[0][1] = protocol.content_type;
+        routing_request = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .duplicate_field_behavior = .@"error" });
+        if (routing_request.?.value != .object) return error.InvalidInferenceRequest;
+        const model = routing_request.?.value.object.get("model") orelse return error.InvalidInferenceRequest;
+        if (model != .string or model.string.len == 0 or model.string.len > 2048) return error.InvalidInferenceRequest;
+        header_buffer[header_count] = .{ "X-Antfly-Document-Model", model.string };
+        header_count += 1;
+        const transport_allocator = request.document_allocator orelse alloc;
+        var scope_client = try @import("antfly_readers").document_rpc.Client.initBound(transport_allocator, request.document_store, http.?.io);
+        defer scope_client.deinit();
+        var scope_arena = std.heap.ArenaAllocator.init(transport_allocator);
+        defer scope_arena.deinit();
+        const record = try scope_client.store().loadAt(scope_arena.allocator(), scope_client.id, scope_client.owner, platform_time.realtimeNs() / std.time.ns_per_ms);
+        token_budget_header = try std.fmt.allocPrint(alloc, "{d}", .{record.limits.tokens - record.used.tokens});
+        header_buffer[header_count] = .{ "X-Antfly-Document-Token-Budget", token_budget_header.? };
+        header_count += 1;
+    }
+    const headers = header_buffer[0..header_count];
+    if (durable_remote) {
+        var transport = try protocol.Owner.init(request.document_allocator orelse alloc, (http orelse return error.InferenceTransportUnavailable).io, request.document_store, body);
+        defer transport.deinit();
+        var response = try http.?.requestToWriter(.POST, url, .{
+            .headers = headers,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
+            .attempt_observer = request.attempt_observer,
+            .body_stream = .{ .context = &transport.upload, .read = protocol.Queue.read },
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
+        }, &transport, null, null);
+        defer response.deinit();
+        const final = transport.final orelse return error.InferenceTransportUnavailable;
+        if (!transport.parser.complete()) return error.InvalidDocumentCheckpoint;
+        const response_body = try alloc.dupe(u8, final.body());
+        errdefer alloc.free(response_body);
+        return .{ .status = @intCast(final.header.code), .body = response_body, .content_type = try alloc.dupe(u8, "application/json") };
+    }
     if (stream.start != null and stream.write != null and stream.close != null) {
         var writer = @import("antfly_local_sources").common_provider_registry.tasks.StreamWriter{ .sink = stream };
         var response = try (http orelse return error.InferenceTransportUnavailable).requestToWriter(switch (method) {
@@ -461,16 +532,29 @@ fn resolveInferenceConnection(
     }
 
     const config = node_config orelse return error.ConnectionNotFound;
-    if (std.mem.startsWith(u8, connection_id, "transcribers/")) {
-        const cfg = config.transcribers.getConfig(connection_id["transcribers/".len..]) catch return error.ConnectionNotFound;
-        if (cfg.provider != .antfly) return error.ProviderNotAntflyCompatible;
-        // Preserve the alias identity even when it inherits the runtime URL.
-        // Only the actual process-local target delegates admission locally.
-        const uses_default = cfg.resolvedUrl() == null;
-        if (uses_default) if (local_target) |target| return .{ .local = target };
-        const url = cfg.resolvedUrl() orelse config.inference.api_url orelse return error.ConnectionURLMissing;
-        if (!validInferenceURL(url)) return error.InvalidConnectionURL;
-        return .{ .remote = .{ .url = url, .api_key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) config.inference.api_key else null), .preserve_api_path = !uses_default } };
+    inline for (.{ "readers", "transcribers" }) |family| {
+        const prefix = family ++ "/";
+        if (std.mem.startsWith(u8, connection_id, prefix)) {
+            if (comptime std.mem.eql(u8, family, "readers")) {
+                if (!std.mem.eql(u8, operation, "read")) return error.UnsupportedInferenceOperation;
+            }
+            const cfg = @field(config, family).getConfig(connection_id[prefix.len..]) catch return error.ConnectionNotFound;
+            if (cfg.provider != .antfly) return error.ProviderNotAntflyCompatible;
+            // Only the process-local target delegates admission. Explicit
+            // provider endpoints retain their own credential and mount scope.
+            const uses_default = cfg.resolvedUrl() == null;
+            if (uses_default) if (local_target) |target| return .{ .local = target };
+            const url = cfg.resolvedUrl() orelse config.inference.api_url orelse return error.ConnectionURLMissing;
+            if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+            return .{ .remote = .{
+                .url = url,
+                .api_key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) config.inference.api_key else null),
+                .preserve_api_path = !uses_default,
+                .credential_env = if (comptime std.mem.eql(u8, family, "readers")) "ANTFLY_INFERENCE_API_KEY" else null,
+                .capability_token = if (comptime std.mem.eql(u8, family, "readers")) cfg.capability_token else null,
+                .capability_revision = if (comptime std.mem.eql(u8, family, "readers")) cfg.capability_revision else null,
+            } };
+        }
     }
     if (std.mem.eql(u8, connection_id, common_config.default_inference_connection_id)) {
         const url = config.inference.api_url orelse return error.ConnectionNotFound;
@@ -2623,4 +2707,21 @@ test "httpx inference gateway discovers remote chains synthesis and data only ta
     try std.testing.expectEqualStrings("synthesizers", result.models[1].kind.groupKey());
     try std.testing.expectEqualStrings("generators", result.models[2].kind.groupKey());
     try std.testing.expectEqualStrings("embedders", result.models[3].kind.groupKey());
+}
+
+test "httpx inference gateway reader aliases scope remote credentials and admission" {
+    const a = std.testing.allocator;
+    var cfg = try common_config.Config.parseFromSlice(a, "{\"inference\":{\"api_url\":\"https://runtime\",\"api_key\":\"default-token\"}}");
+    defer cfg.deinit();
+    try cfg.readers.registerConfig("inherited", .{ .provider = .antfly, .model = "agent" });
+    try cfg.readers.registerConfig("remote", .{ .provider = .antfly, .model = "agent", .api_url = "https://remote/custom/api", .api_key = "reader-token", .capability_token = "lease", .capability_revision = "revision" });
+    const inherited = try resolveInferenceConnection(&cfg, null, "readers/inherited", "read");
+    try std.testing.expectEqualStrings("default-token", inherited.remote.api_key.?);
+    const explicit = try resolveInferenceConnection(&cfg, null, "readers/remote", "read");
+    try std.testing.expectEqualStrings("reader-token", explicit.remote.api_key.?);
+    try std.testing.expect(explicit.remote.preserve_api_path);
+    try std.testing.expectEqualStrings("lease", explicit.remote.capability_token.?);
+    try std.testing.expectEqualStrings("revision", explicit.remote.capability_revision.?);
+    try std.testing.expectEqual(InferenceAdmissionOwner.caller, try inferenceConnectionAdmissionOwner(&cfg, null, "readers/remote", "read"));
+    try std.testing.expectError(error.UnsupportedInferenceOperation, resolveInferenceConnection(&cfg, null, "readers/remote", "generate"));
 }

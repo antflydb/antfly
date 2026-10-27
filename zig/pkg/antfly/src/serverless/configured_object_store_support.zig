@@ -282,7 +282,7 @@ fn openCredentialedBindingObjectStoreFor(
     const node_config = options.node_config orelse return error.ExternalLakeCredentialRefNotFound;
     const connection = node_config.connections.get(credential.ref_id) orelse return error.ExternalLakeCredentialRefNotFound;
     if (connection.kind != .external_io) return error.UnsupportedExternalLakeCredentialRef;
-    if (!hasConnectionCapability(connection, "lake_read") or (!options.read_only and !hasConnectionCapability(connection, "lake_write"))) return error.UnsupportedExternalLakeCredentialRef;
+    if (!hasConnectionCapability(connection, "lake.read") or (!options.read_only and !hasConnectionCapability(connection, "lake.write"))) return error.UnsupportedExternalLakeCredentialRef;
     const external_io = connection.external_io orelse return error.UnsupportedExternalLakeCredentialRef;
 
     var parsed = try remote_uri.parseAlloc(alloc, binding.source_uri);
@@ -560,7 +560,7 @@ test "credentialed binding object store opens scoped filesystem source" {
         \\  "connections": {{
         \\    "prod-lake-read": {{
         \\      "kind": "external_io",
-        \\      "capabilities": ["lake_read"],
+        \\      "capabilities": ["lake.read"],
         \\      "external_io": {{
         \\        "protocol": "filesystem",
         \\        "root": {s}
@@ -607,7 +607,7 @@ test "serverless external source credentialed binding opens scoped gcs source wi
         \\  "connections": {
         \\    "prod-gcs-lake-read": {
         \\      "kind": "external_io",
-        \\      "capabilities": ["lake_read"],
+        \\      "capabilities": ["lake.read"],
         \\      "external_io": {
         \\        "protocol": "gcs",
         \\        "buckets": ["lake-bucket"],
@@ -686,7 +686,7 @@ test "serverless external source credentialed binding opens scoped s3 source wit
         \\  "connections": {
         \\    "prod-s3-lake-read": {
         \\      "kind": "external_io",
-        \\      "capabilities": ["lake_read"],
+        \\      "capabilities": ["lake.read"],
         \\      "external_io": {
         \\        "protocol": "s3",
         \\        "endpoint": "http://127.0.0.1:9000",
@@ -772,7 +772,7 @@ test "serverless external source resolves s3 credential secrets" {
         \\  "connections": {
         \\    "prod-s3-lake-read": {
         \\      "kind": "external_io",
-        \\      "capabilities": ["lake_read"],
+        \\      "capabilities": ["lake.read"],
         \\      "external_io": {
         \\        "protocol": "s3",
         \\        "endpoint": "${secret:s3.lake.endpoint}",
@@ -828,7 +828,7 @@ test "serverless external source resolves gcs bearer token secret" {
         \\  "connections": {
         \\    "prod-gcs-lake-read": {
         \\      "kind": "external_io",
-        \\      "capabilities": ["lake_read"],
+        \\      "capabilities": ["lake.read"],
         \\      "external_io": {
         \\        "protocol": "gcs",
         \\        "buckets": ["lake-bucket"],
@@ -883,4 +883,41 @@ test "credential-free binding object store opens read-only without creating file
 
     try std.testing.expectEqualStrings("external-lake", opened.bucket);
     try std.testing.expect(!(try opened.client.bucketExists("external-lake")));
+}
+
+test "credentialed binding lake capabilities keep read and write workflow authority separate" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(cwd);
+    const root = try std.fs.path.resolve(a, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer a.free(root);
+    const root_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    defer a.free(root_json);
+    const cases = [_]struct { capabilities: []const u8, read: bool, write: bool }{
+        .{ .capabilities = "[\"lake.read\"]", .read = true, .write = false },
+        .{ .capabilities = "[\"lake.read\",\"lake.write\"]", .read = true, .write = true },
+        .{ .capabilities = "[\"lake.write\"]", .read = false, .write = false },
+        .{ .capabilities = "[\"read\",\"write\",\"storage.primary\",\"restore.read\"]", .read = false, .write = false },
+        .{ .capabilities = "[\"lake_read\",\"lake_write\"]", .read = false, .write = false },
+        .{ .capabilities = "[\"lake.read\",\"lake_write\"]", .read = true, .write = false },
+    };
+    const binding: catalog_binding.Binding = .{ .table_id = "events", .format = .parquet, .source_uri = "file:///events", .credential_ref = .{ .ref_id = "source", .scope = "events" }, .schema_fingerprint = "v1" };
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(a, "{{\"connections\":{{\"source\":{{\"kind\":\"external_io\",\"capabilities\":{s},\"external_io\":{{\"protocol\":\"filesystem\",\"root\":{s}}}}}}}}}", .{ case.capabilities, root_json });
+        defer a.free(json);
+        var cfg = try common_config.Config.parseFromSlice(a, json);
+        defer cfg.deinit();
+        for ([_]bool{ true, false }) |read_only| {
+            const options: BindingObjectStoreOpenOptions = .{ .node_config = &cfg, .file_bucket = "source", .read_only = read_only };
+            if (if (read_only) case.read else case.write) {
+                var opened = try openBindingObjectStoreAlloc(a, binding, options);
+                defer opened.deinit();
+                try std.testing.expectEqualStrings("source", opened.bucket);
+            } else {
+                try std.testing.expectError(error.UnsupportedExternalLakeCredentialRef, openBindingObjectStoreAlloc(a, binding, options));
+            }
+        }
+    }
 }

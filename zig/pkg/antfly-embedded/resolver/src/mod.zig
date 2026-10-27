@@ -290,6 +290,7 @@ pub const Resolver = struct {
     curation_index: curation.Index = .{},
     curation_enabled: bool = false,
     alias_index: ?curation.RedirectIndex = null,
+    query_policy_lease: ?policy_cache.Lease = null,
     /// Mention labels this resolver consumes; empty is a catch-all. Lets
     /// several resolvers partition one extraction artifact by label (e.g.
     /// `event` mentions to an events table, everything else to entities).
@@ -506,6 +507,7 @@ pub const Resolver = struct {
     }
 
     pub fn deinit(self: *Resolver) void {
+        if (self.query_policy_lease) |lease| lease.release();
         if (self.scorer) |*s| s.deinit();
         self.arena.deinit();
         self.* = undefined;
@@ -691,6 +693,75 @@ pub const Resolver = struct {
             .canonical_name = try a.dupe(u8, entity.text),
             .surface_form = try a.dupe(u8, entity.text),
         };
+    }
+
+    /// Legacy source-owned policies keep their full semantics without the
+    /// native query slice's forward-path bound. The cached value owns its data.
+    pub fn installCachedPolicy(self: *Resolver, aliases: []const KeyAlias, merges: []const KeyAlias, suppress: []const u8, state: []const u8) !void {
+        const lease = try policy_cache.acquire(aliases, merges, suppress, state);
+        if (self.query_policy_lease) |old| old.release();
+        self.query_policy_lease = lease;
+        self.aliases = lease.aliases();
+        self.alias_index = lease.redirects();
+        self.curation_index = lease.index();
+        self.curation_enabled = suppress.len != 0 or state.len != 0;
+    }
+
+    /// Compose only the requested/incident forward paths against one leased
+    /// immutable declaration. Admission owns identity; live heads own mutations.
+    pub fn installQueryPolicy(self: *Resolver, a: std.mem.Allocator, identity: ?[]const u8, configured_aliases: []const KeyAlias, suppress: []const u8, native_aliases: []const KeyAlias, state: []const u8, seeds: []const []const u8) !void {
+        const configured = if (identity) |id| try policy_cache.acquireDeclared(id, configured_aliases, suppress) else try policy_cache.acquire(configured_aliases, &.{}, suppress, "");
+        return self.installPreparedQueryPolicy(a, configured, suppress, native_aliases, state, seeds);
+    }
+    /// A complete native query projection needs no full configured alias index.
+    pub fn installQueryProjection(self: *Resolver, a: std.mem.Allocator, identity: ?[]const u8, suppress: []const u8, aliases: []const KeyAlias, state: []const u8, seeds: []const []const u8) !void {
+        const configured = try policy_cache.acquireDeclaredNegatives(identity, suppress);
+        return self.installPreparedQueryPolicy(a, configured, suppress, aliases, state, seeds);
+    }
+    fn installPreparedQueryPolicy(self: *Resolver, a: std.mem.Allocator, configured: policy_cache.Lease, suppress: []const u8, native_aliases: []const KeyAlias, state: []const u8, seeds: []const []const u8) !void {
+        errdefer configured.release();
+        var index = try curation.Index.init(a, "", state);
+        var native: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (native_aliases) |edge| {
+            const entry = try native.getOrPut(a, edge.key);
+            if (entry.found_existing) return error.InvalidResolverAlias;
+            entry.value_ptr.* = edge.target;
+        }
+        var starts: std.ArrayList([]const u8) = .empty;
+        try starts.appendSlice(a, seeds);
+        var pairs = index.distinct.keyIterator();
+        while (pairs.next()) |pair| {
+            const split = std.mem.indexOfScalar(u8, pair.*, 0).?;
+            try starts.appendSlice(a, &.{ pair.*[0..split], pair.*[split + 1 ..] });
+        }
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var effective: std.ArrayList(KeyAlias) = .empty;
+        for (starts.items) |start| {
+            var key = start;
+            var path_nodes: usize = 0;
+            while (true) {
+                if ((try seen.getOrPut(a, key)).found_existing) break;
+                // Native pages bound discovery independently. Their union may
+                // contain arbitrarily many short, disjoint paths; keep the
+                // safety bound on each traversal rather than the whole query.
+                path_nodes += 1;
+                if (path_nodes > 16384) return error.ResolverCurationLimitExceeded;
+                const target = native.get(key) orelse if (!index.removed_aliases.contains(key)) configured.target(key) else null;
+                const next = target orelse break;
+                const edge: KeyAlias = .{ .key = try a.dupe(u8, key), .target = try a.dupe(u8, next) };
+                try effective.append(a, edge);
+                key = edge.target;
+            }
+        }
+        const redirects = try curation.RedirectIndex.init(a, effective.items);
+        index.bindConfigured(configured.index());
+        try index.bindRedirects(a, redirects);
+        if (self.query_policy_lease) |old| old.release();
+        self.query_policy_lease = configured;
+        self.aliases = effective.items;
+        self.alias_index = redirects;
+        self.curation_index = index;
+        self.curation_enabled = suppress.len != 0 or state.len != 0;
     }
 
     pub fn installAliases(self: *Resolver, aliases: []const KeyAlias) !void {
@@ -1588,10 +1659,13 @@ pub const WorkStats = struct {
 };
 
 pub fn fingerprint(alloc: std.mem.Allocator, value: anytype) ![32]u8 {
-    const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
-    defer alloc.free(bytes);
+    _ = alloc;
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
+    try std.json.Stringify.value(value, .{}, &writer.writer);
+    try writer.writer.flush();
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    writer.hasher.final(&digest);
     return digest;
 }
 
@@ -1939,7 +2013,16 @@ pub const CandidateValidator = struct {
     validate: *const fn (*anyopaque, std.mem.Allocator, Candidate) anyerror!void,
 };
 
+/// Request-scoped policy hydration. The first call precedes blocking; the
+/// second includes bounded candidates and supplies distinct-pair policy.
+pub const QueryPolicy = struct {
+    resolver: *Resolver,
+    ptr: *anyopaque,
+    prepare: *const fn (*anyopaque, std.mem.Allocator, *Resolver, []const ExtractedEntity, ?[]const []const Candidate) anyerror!void,
+};
+
 pub const ResolutionStage = struct {
+    query_policy: ?QueryPolicy = null,
     doc_ref_binding: ?struct { ptr: *anyopaque, bind: *const fn (*anyopaque, []const u8) anyerror!?[]const u8 } = null,
     resolver: *const Resolver,
     config_generation: u64,
@@ -2004,6 +2087,27 @@ pub const ResolutionStage = struct {
         extraction_key: []const u8,
         existing: ?[]const u8,
     ) !?[]u8 {
+        const policy = self.query_policy orelse return self.computePreparedCachedAlloc(gpa, store, provider, extraction_key, existing, null);
+        const saved = policy.resolver.*;
+        policy.resolver.query_policy_lease = null;
+        defer {
+            if (policy.resolver.query_policy_lease) |lease| lease.release();
+            policy.resolver.* = saved;
+        }
+        var stage = self;
+        stage.resolver = policy.resolver;
+        return stage.computePreparedCachedAlloc(gpa, store, provider, extraction_key, existing, policy.resolver);
+    }
+
+    fn computePreparedCachedAlloc(
+        self: ResolutionStage,
+        gpa: std.mem.Allocator,
+        store: ArtifactStore,
+        provider: ?CandidateProvider,
+        extraction_key: []const u8,
+        existing: ?[]const u8,
+        current: ?*Resolver,
+    ) !?[]u8 {
         const extraction = try store.get(gpa, extraction_key);
         defer if (extraction) |e| gpa.free(e);
         if (extraction == null) return null;
@@ -2034,6 +2138,7 @@ pub const ResolutionStage = struct {
 
         // Reject only the unkeyable mention before blocking; keep its siblings.
         // Invalid templates and resource failures still fail the operation.
+        if (self.query_policy) |policy| try policy.prepare(policy.ptr, parsed.arena.allocator(), current.?, parsed.entities, null);
         const admitted_count = parsed.entities.len;
         const alias_mask = try parsed.arena.allocator().alloc(bool, admitted_count);
         var kept: usize = 0;
@@ -2200,6 +2305,8 @@ pub const ResolutionStage = struct {
                 for (indices.items, blocked) |i, candidates| lists[i] = candidates;
             }
         }
+
+        if (self.query_policy) |policy| try policy.prepare(policy.ptr, parsed.arena.allocator(), current.?, parsed.entities, lists);
 
         // Refetched candidates can still reuse features: only their consumed
         // input fields participate in a feature digest. New/deleted candidates
@@ -3860,4 +3967,155 @@ test "resolver reviewed targets follow current redirects without changing the se
 
 test {
     _ = policy_cache;
+}
+
+test "resolution stage query policy hydrates before blocking and before candidate admission" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ slug _entity.text }}",
+        \\  "scorer": { "comparisons": [{ "name": "name", "left": "canonical_text", "right": "canonical_name",
+        \\    "levels": [{ "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 }] }],
+        \\    "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } } }
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:query", "{\"entities\":[{\"id\":\"e0\",\"label\":\"person\",\"text\":\"Ada Lovelace\"}]}");
+    var candidate = FixedCandidate{ .doc_ref = .{ .table = "entities", .key = "person/ada" }, .label = "person", .name = "Ada Lovelace" };
+    const Loader = struct {
+        target: *Resolver,
+        calls: usize = 0,
+        fn prepare(ptr: *anyopaque, a: std.mem.Allocator, target: *Resolver, entities: []const ExtractedEntity, lists: ?[]const []const Candidate) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try testing.expectEqual(self.target, target);
+            try testing.expectEqual(@as(usize, 1), entities.len);
+            self.calls += 1;
+            if (lists) |values| {
+                try testing.expectEqual(@as(usize, 2), self.calls);
+                try testing.expectEqualStrings("person/ada", values[0][0].doc_ref.key);
+                try target.curation_index.keys.put(a, "person/ada", {});
+            } else try testing.expectEqual(@as(usize, 1), self.calls);
+        }
+    };
+    var loader: Loader = .{ .target = &resolver };
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .query_policy = .{ .resolver = &resolver, .ptr = &loader, .prepare = Loader.prepare } };
+    const raw = (try stage.computeAlloc(testing.allocator, map.store(), candidate.provider(), "ext:query")).?;
+    defer testing.allocator.free(raw);
+    var resolution = try parseResolution(testing.allocator, raw);
+    defer resolution.deinit();
+    try testing.expectEqual(@as(usize, 2), loader.calls);
+    try testing.expectEqual(Decision.new, resolution.entities[0].decision);
+    try testing.expectEqualStrings("ada_lovelace", resolution.entities[0].doc_ref.key);
+}
+
+test "query policy attachment reuses configured indexes and compiles only incident paths" {
+    var inputs = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer inputs.deinit();
+    const a = inputs.allocator();
+    const declared = try a.alloc(KeyAlias, 10000);
+    for (declared, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/declared-{d}", .{i}), .target = "entity/root" };
+    declared[0] = .{ .key = "entity/a", .target = "entity/b" };
+    declared[1] = .{ .key = "entity/b", .target = "entity/c" };
+    var target = try Resolver.initFromParts(a, "entities", "entity/{{_entity.text}}", .{}, false, "");
+    defer target.deinit();
+    const suppress = "{\"keys\":[\"entity/blocked\"],\"texts\":[\"configured noise\"],\"min_text_chars\":2}";
+    const state = "{\"distinct\":[{\"from\":\"entity/declared-500\",\"to\":\"entity/other\"}],\"removed_aliases\":[\"entity/b\"],\"suppress\":{\"texts\":[\"live noise\"]}}";
+    try target.installQueryPolicy(a, "attachment-regression", declared, suppress, &.{.{ .key = "entity/b", .target = "entity/moved" }}, state, &.{"entity/a"});
+    try std.testing.expectEqualStrings("entity/moved", try target.canonicalKey("entity/a"));
+    try std.testing.expectEqual(@as(usize, 3), target.aliases.len);
+    try std.testing.expect(try target.curation_index.pinnedDistinct(a, "entity/root", "entity/other"));
+    try std.testing.expect(target.curation_index.keySuppressed("entity/blocked"));
+    try std.testing.expectEqual(curation.Reason.text, (try target.curation_index.textReason(a, "Configured Noise")).?);
+    try std.testing.expectEqual(curation.Reason.text, (try target.curation_index.textReason(a, "Live Noise")).?);
+    const configured = target.query_policy_lease.?.policy;
+    var bytes: usize = 0;
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        try target.installQueryPolicy(scratch.allocator(), "attachment-regression", declared, suppress, &.{}, "", &.{"entity/outside"});
+        try std.testing.expect(configured == target.query_policy_lease.?.policy);
+        try std.testing.expectEqual(@as(usize, 0), target.aliases.len);
+        bytes += scratch.queryCapacity();
+    }
+    try std.testing.expect(bytes < 128 * 1024);
+    std.debug.print("QUERY ATTACHMENT configured_aliases=10000 phases=10 arena_bytes={d} compiled_edges=0\n", .{bytes});
+    try target.installQueryPolicy(a, "attachment-regression", declared, suppress, &.{}, "{\"removed_aliases\":[\"entity/b\"]}", &.{"entity/a"});
+    try std.testing.expectEqualStrings("entity/b", try target.canonicalKey("entity/a"));
+}
+
+test "query policy attachment accepts wide page unions and bounds individual paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const edges = try a.alloc(KeyAlias, 9000);
+    const seeds = try a.alloc([]const u8, edges.len);
+    for (edges, seeds, 0..) |*edge, *seed, i| {
+        edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/a-{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/b-{d}", .{i}) };
+        seed.* = edge.key;
+    }
+    var target = try Resolver.initFromParts(a, "entities", "entity/{{_entity.text}}", .{}, false, "");
+    defer target.deinit();
+    try target.installQueryPolicy(a, null, &.{}, "", edges, "", seeds);
+    for (edges) |edge| try std.testing.expectEqualStrings(edge.target, try target.canonicalKey(edge.key));
+    try std.testing.expectEqual(edges.len, target.aliases.len);
+    // Shared suffixes are visited once, and cycles still fail closed.
+    try std.testing.expectError(error.InvalidResolverAliasCycle, target.installQueryPolicy(a, null, &.{}, "", &.{ .{ .key = "a", .target = "b" }, .{ .key = "b", .target = "a" } }, "", &.{"a"}));
+    const chain = try a.alloc(KeyAlias, 16384);
+    for (chain, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(a, "chain/{d}", .{i}), .target = try std.fmt.allocPrint(a, "chain/{d}", .{i + 1}) };
+    try std.testing.expectError(error.ResolverCurationLimitExceeded, target.installQueryPolicy(a, null, &.{}, "", chain, "", &.{"chain/0"}));
+    // A failed attachment preserves the last valid policy and its lease.
+    try std.testing.expectEqualStrings(edges[8999].target, try target.canonicalKey(edges[8999].key));
+    std.debug.print("QUERY ATTACHMENT seeds=9000 disjoint_nodes=18000 canonical_results=9000 path_limit=16384\n", .{});
+}
+
+test "query policy attachment preserves its prior lease on allocation failure" {
+    const Scenario = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var target = try Resolver.initFromParts(a, "entities", "entity/{{_entity.text}}", .{}, false, "");
+            defer target.deinit();
+            try target.installQueryPolicy(a, "attachment-oom", &.{.{ .key = "a", .target = "b" }}, "{\"keys\":[\"blocked\"]}", &.{.{ .key = "b", .target = "c" }}, "{\"distinct\":[{\"from\":\"a\",\"to\":\"other\"}]}", &.{"a"});
+            try std.testing.expectEqualStrings("c", try target.canonicalKey("a"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "legacy query policy attachment retains full large pin sets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pairs = try a.alloc(curation.Pair, 9000);
+    for (pairs, 0..) |*pair, i| pair.* = .{ .from = try std.fmt.allocPrint(a, "from-{d}", .{i}), .to = try std.fmt.allocPrint(a, "to-{d}", .{i}) };
+    const state = try std.json.Stringify.valueAlloc(a, .{ .distinct = pairs }, .{});
+    var target = try Resolver.initFromParts(a, "entities", "entity/{{_entity.text}}", .{}, false, "");
+    defer target.deinit();
+    try target.installCachedPolicy(&.{}, &.{}, "", state);
+    try std.testing.expectEqual(@as(usize, 9000), target.curation_index.distinct.count());
+    try std.testing.expect(try target.curation_index.pinnedDistinct(a, "from-8999", "to-8999"));
+}
+
+test "native execution projections retain only negatives across large profile identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var target = try Resolver.initFromParts(a, "entities", "entity/{{_entity.text}}", .{}, false, "");
+    defer target.deinit();
+    // The source identity may describe a profile larger than the policy cache.
+    // Only the bounded effective paths and configured negatives reach attachment.
+    const suppress = "{\"keys\":[\"entity/blocked\"],\"texts\":[\"noise\"]}";
+    try target.installQueryProjection(a, "large-profile-projection", suppress, &.{.{ .key = "entity/a", .target = "entity/b" }}, "", &.{"entity/a"});
+    const retained = target.query_policy_lease.?.policy;
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        try target.installQueryProjection(scratch.allocator(), "large-profile-projection", suppress, &.{.{ .key = "entity/a", .target = "entity/b" }}, "", &.{"entity/a"});
+        try std.testing.expect(retained == target.query_policy_lease.?.policy);
+        try std.testing.expectEqual(@as(usize, 0), target.query_policy_lease.?.aliases().len);
+        try std.testing.expectEqualStrings("entity/b", target.alias_index.?.canonical("entity/a"));
+        try std.testing.expect(target.curation_index.keySuppressed("entity/blocked"));
+        try std.testing.expect(scratch.queryCapacity() < 16 * 1024);
+    }
+    std.debug.print("NATIVE PROJECTION phases=10 retained_configured_aliases=0 arena_bytes_per_phase<16384\n", .{});
 }

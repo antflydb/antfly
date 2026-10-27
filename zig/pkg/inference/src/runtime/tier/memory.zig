@@ -2765,6 +2765,7 @@ pub fn estimateGptGenerationForKvPolicy(
     var kv_bytes: usize = 0;
     for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
         if (config.layerSharesKv(layer)) continue;
+        if (config.usesCompactQwen35Kv() and config.layerUsesQwen35LinearAttention(layer)) continue;
         var layer_capacity_tokens = if (backend == .metal) metal_capacity_tokens else page_aligned_tokens;
         if (split_gemma_kv and config.layerUsesSlidingAttention(layer)) {
             const ring_pages = storage_runtime.swaRingPageCount(

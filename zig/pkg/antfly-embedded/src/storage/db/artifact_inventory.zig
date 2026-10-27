@@ -228,6 +228,28 @@ fn get(txn: anytype, key: []const u8) ![]const u8 {
         else => return err,
     };
 }
+/// Content identity fences this scalar cache across publication, rollback and
+/// restored histories. No cached value borrows a transaction or catalog buffer.
+pub const SemanticDigestCache = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    entry: ?struct { catalog: [32]u8, semantic: [32]u8 } = null,
+    pub fn get(self: *SemanticDigestCache, alloc: std.mem.Allocator, value: Catalogs) ![32]u8 {
+        const identity = value.digest();
+        {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.mutex.unlock();
+            if (self.entry) |cached| if (std.mem.eql(u8, &cached.catalog, &identity)) return cached.semantic;
+        }
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const semantic = try value.semanticDigest(arena.allocator());
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.entry = .{ .catalog = identity, .semantic = semantic };
+        return semantic;
+    }
+};
+
 pub fn catalogs(txn: anytype) !Catalogs {
     return .{ .indexes = try get(txn, index_key), .enrichments = try get(txn, enrichment_key), .resolvers = try get(txn, resolver_key) };
 }
@@ -466,4 +488,21 @@ test "ordered artifact inventory covers every config generation and rejects stal
     try std.testing.expectError(error.ArtifactCatalogEpochChanged, stageOrdered(alloc, &txn, command, 11));
     try txn.put(index_key, "untracked-corruption");
     try std.testing.expectError(error.ArtifactCatalogDrift, local(&txn));
+}
+
+test "resolver curation semantic cache fences content generations and rollback without allocations" {
+    var cache: SemanticDigestCache = .{};
+    var old: Catalogs = .{ .resolvers = "[{\"name\":\"r\",\"config_generation\":1}]" };
+    const first = try cache.get(std.testing.allocator, old);
+    var empty: [0]u8 = .{};
+    var bounded = std.heap.FixedBufferAllocator.init(&empty);
+    try std.testing.expectEqualDeep(first, try cache.get(bounded.allocator(), old));
+    var next = old;
+    next.resolvers = "[{\"name\":\"r\",\"config_generation\":2}]";
+    try std.testing.expectError(error.OutOfMemory, cache.get(bounded.allocator(), next));
+    const second = try cache.get(std.testing.allocator, next);
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    try std.testing.expectEqualDeep(first, try cache.get(std.testing.allocator, old));
+    old.resolvers = "[{\"name\":\"different\",\"config_generation\":1}]";
+    try std.testing.expectError(error.OutOfMemory, cache.get(bounded.allocator(), old));
 }

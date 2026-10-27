@@ -72,6 +72,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 }
 
 pub const ProviderKind = enum {
+    cloudflare,
     openai,
     openrouter,
     ollama,
@@ -372,6 +373,8 @@ pub const AntflyProvider = struct {
         context: ?RequestContext,
     ) anyerror![]u8 = null,
 
+    document_json: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, bool, RequestContext) anyerror![]u8 = null,
+
     pub fn decideJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
         const callback = self.decide_json orelse return error.UnsupportedDecisionProvider;
         return AntflyProviderBoundary.call("decide_json", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, context });
@@ -457,6 +460,7 @@ pub const ProviderRuntime = struct {
     http_mutex: std.atomic.Mutex = .unlocked,
     http_client: std.atomic.Value(?*httpx.Client) = .init(null),
     generation_http_client: std.atomic.Value(?*httpx.Client) = .init(null),
+    asset_http_client: std.atomic.Value(?*httpx.Client) = .init(null),
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) ProviderRuntime {
         return .{
@@ -475,36 +479,54 @@ pub const ProviderRuntime = struct {
     /// retain per-request URLs, authentication, cancellation, and deadlines;
     /// the client owns only reusable DNS/TLS/connection state.
     pub fn httpClient(self: *ProviderRuntime) !*httpx.Client {
-        return self.pooledHttpClient(&self.http_client, remote_embedding_max_response_bytes, max_embedding_request_timeout_ms, false);
+        return self.pooledHttpClient(&self.http_client, .{ .response_limit = remote_embedding_max_response_bytes, .io_timeout_ms = max_embedding_request_timeout_ms });
     }
 
     /// A client's response ceiling is a hard transport cap, even when a caller
     /// supplies a larger request limit. Generation therefore has its own
     /// reusable pool, while embedding retains its smaller family safeguards.
     pub fn generationHttpClient(self: *ProviderRuntime) !*httpx.Client {
-        return self.pooledHttpClient(&self.generation_http_client, httpx.types.default_max_body_size, 300_000, true);
+        return self.pooledHttpClient(&self.generation_http_client, .{ .response_limit = httpx.types.default_max_body_size, .io_timeout_ms = 300_000, .cancel_on_shutdown = true });
     }
 
-    fn pooledHttpClient(self: *ProviderRuntime, slot: *std.atomic.Value(?*httpx.Client), response_limit: usize, timeout_ms: u64, cancel_on_shutdown: bool) !*httpx.Client {
+    /// Media/task adapters apply their own operation ceilings within this
+    /// stable outer envelope. Keep large audio/read responses out of the
+    /// smaller embedding and ordinary generation pools.
+    pub fn assetHttpClient(self: *ProviderRuntime) !*httpx.Client {
+        return self.pooledHttpClient(&self.asset_http_client, .{ .response_limit = 64 << 20, .io_timeout_ms = 300_000, .request_timeout_ms = 300_000, .cancel_on_shutdown = true });
+    }
+
+    const HttpPolicy = struct {
+        response_limit: usize,
+        io_timeout_ms: u64,
+        request_timeout_ms: u64 = 0,
+        cancel_on_shutdown: bool = false,
+    };
+
+    fn pooledHttpClient(self: *ProviderRuntime, slot: *std.atomic.Value(?*httpx.Client), policy: HttpPolicy) !*httpx.Client {
         if (slot.load(.acquire)) |client| return client;
         lockAtomic(&self.http_mutex);
         defer self.http_mutex.unlock();
         if (slot.load(.acquire)) |client| return client;
         const client = try self.alloc.create(httpx.Client);
         errdefer self.alloc.destroy(client);
+        var timeouts = httpx.Timeouts.uniform(policy.io_timeout_ms);
+        timeouts.request_ms = policy.request_timeout_ms;
         client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, self.io, .{
             .keep_alive = true,
+            .outbound = .{ .max_active = 20, .max_per_endpoint = 5, .max_waiters = 20 },
+            .cache_resolved_addresses = true,
             .cookies_enabled = false,
-            .max_response_size = response_limit,
-            .timeouts = httpx.Timeouts.uniform(timeout_ms),
-            .cancel_in_flight_on_shutdown = cancel_on_shutdown,
+            .max_response_size = policy.response_limit,
+            .timeouts = timeouts,
+            .cancel_in_flight_on_shutdown = policy.cancel_on_shutdown,
         });
         slot.store(client, .release);
         return client;
     }
 
     pub fn deinit(self: *ProviderRuntime) void {
-        inline for (.{ &self.generation_http_client, &self.http_client }) |slot| if (slot.swap(null, .acq_rel)) |client| {
+        inline for (.{ &self.asset_http_client, &self.generation_http_client, &self.http_client }) |slot| if (slot.swap(null, .acq_rel)) |client| {
             client.deinit();
             self.alloc.destroy(client);
         };
@@ -583,12 +605,20 @@ const max_embedding_request_timeout_ns: u64 = max_embedding_request_timeout_ms *
 const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
 
+// Advance logical operation time in timeout regressions without sleeping
+// through production-sized budgets. Test artifacts run cases serially; the
+// atomic also lets a real HTTP listener advance time from its worker thread.
+const TestClock = if (builtin.is_test) struct {
+    var offset_ns: std.atomic.Value(u64) = .init(0);
+} else struct {};
+
 fn monotonicNowNs() u64 {
     var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
-        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
-        else => return 0,
-    }
+    const now: u64 = switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => 0,
+    };
+    return if (builtin.is_test) now +| TestClock.offset_ns.load(.monotonic) else now;
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -615,6 +645,7 @@ pub const ManagedEmbeddingEntry = struct {
     provider: ProviderKind,
     model: []u8,
     base_url: []u8,
+    gateway_id: ?[]const u8 = null,
     source_table: []u8 = "",
     region: []u8 = "",
     project_id: []u8 = "",
@@ -728,6 +759,7 @@ pub const ManagedEmbeddingEntry = struct {
         if (self.lookup_aliases.len > 0) alloc.free(self.lookup_aliases);
         alloc.free(self.model);
         alloc.free(self.base_url);
+        if (self.gateway_id) |id| alloc.free(id);
         if (self.source_table.len > 0) alloc.free(self.source_table);
         if (self.region.len > 0) alloc.free(self.region);
         if (self.project_id.len > 0) alloc.free(self.project_id);
@@ -788,6 +820,7 @@ fn managedEmbeddingEndpointIdentity(entry: *const ManagedEmbeddingEntry) provide
         .region = entry.region,
         .project = entry.project_id,
         .location = entry.location,
+        .gateway_id = entry.gateway_id orelse "",
         .credentials = managedEmbeddingCredentialSourceIdentity(entry),
     };
 }
@@ -797,7 +830,7 @@ fn managedEmbeddingCredentialSourceIdentity(
 ) credential_source_identity.CredentialSourceIdentity {
     const Identity = credential_source_identity.CredentialSourceIdentity;
     return switch (entry.provider) {
-        .openai, .openrouter, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
+        .cloudflare, .openai, .openrouter, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
         .vertex => Identity.googleAdc(if (entry.credentials_path.len > 0) entry.credentials_path else null),
         // Managed Bedrock currently exposes the process-wide AWS default
         // chain. Profile and web-identity constructors live in the shared
@@ -1713,13 +1746,29 @@ pub const ManagedEmbedder = struct {
         context: RequestContext,
     ) ![]const []const f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        return self.embedTaskBatchUnchecked(alloc, embedding_name, texts, dims, .retrieval_document, context);
+    }
+
+    /// Explicit task execution shares the same provider, quota, credentials,
+    /// deadlines and sanitization as indexing, without imposing a retrieval role.
+    pub fn embedTaskBatchWithContext(self: *ManagedEmbedder, alloc: std.mem.Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType, context: RequestContext) ![]const []const f32 {
+        try context.check();
+        var sanitized = try db_embedder.sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
+        defer sanitized.deinit(alloc);
+        const vectors = try self.embedTaskBatchUnchecked(alloc, embedding_name, sanitized.texts(), dims, task_type, context);
+        errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+        try context.check();
+        return vectors;
+    }
+
+    fn embedTaskBatchUnchecked(self: *ManagedEmbedder, alloc: std.mem.Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType, context: RequestContext) ![]const []const f32 {
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (configured.sparse) return error.UnsupportedEmbeddingProvider;
         var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
         var entry = configured.requestOverlay(alloc);
         defer entry.auth_header_cache.deinit(alloc);
         applyRequestContext(&entry, context, &cancellation);
-        return try embedBatchWithEntry(alloc, &entry, texts, dims);
+        return try embedBatchWithEntryForTask(alloc, &entry, texts, dims, task_type);
     }
 
     fn embedDenseBatchPlanned(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
@@ -2760,6 +2809,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         try alloc.dupe(u8, "");
     defer alloc.free(project_id);
     const endpoint = switch (provider) {
+        .cloudflare => try embeddings_types.cloudflare.baseUrl(alloc, embedder_cfg.account_id, if (embedder_cfg.url.len > 0) embedder_cfg.url else null),
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
         .openrouter => try resolveOpenRouterBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
@@ -4033,6 +4083,7 @@ fn validateCatalogOwnerSemanticIdentity(
     // deployment endpoint and later metadata validation must not re-resolve it.
     if (embedder_cfg.url.len > 0) {
         const endpoint = switch (provider) {
+            .cloudflare => try embeddings_types.cloudflare.baseUrl(alloc, embedder_cfg.account_id, if (embedder_cfg.url.len > 0) embedder_cfg.url else null),
             .openai, .ollama => try appendPathIfMissing(alloc, embedder_cfg.url, "/v1"),
             .openrouter => try normalizeOpenRouterBaseUrl(alloc, embedder_cfg.url),
             .cohere => try appendPathIfMissing(alloc, embedder_cfg.url, "/v2"),
@@ -4852,6 +4903,7 @@ fn buildManagedEmbeddingEntry(
     const base_url = if (semantic_binding) |binding|
         try alloc.dupe(u8, if (binding.embedded) "" else binding.endpoint)
     else switch (provider) {
+        .cloudflare => try embeddings_types.cloudflare.baseUrl(alloc, embedder_cfg.account_id, if (embedder_cfg.url.len > 0) embedder_cfg.url else null),
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
         .openrouter => try resolveOpenRouterBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
@@ -4865,6 +4917,8 @@ fn buildManagedEmbeddingEntry(
             try resolveAntflyInferenceBaseUrl(alloc, embedder_cfg, options),
     };
     errdefer alloc.free(base_url);
+    const gateway_id = if (embedder_cfg.gateway_id) |id| try alloc.dupe(u8, id) else null;
+    errdefer if (gateway_id) |id| alloc.free(id);
     const input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else @constCast("");
     errdefer if (input_type.len > 0) alloc.free(input_type);
     const query_input_type = if (embedder_cfg.query_input_type.len > 0) try alloc.dupe(u8, embedder_cfg.query_input_type) else @constCast("");
@@ -4881,6 +4935,7 @@ fn buildManagedEmbeddingEntry(
         @constCast("");
     errdefer if (source_table.len > 0) alloc.free(source_table);
     var api_key = switch (provider) {
+        .cloudflare => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "CLOUDFLARE_API_TOKEN"),
         .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
         .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
         .cohere => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
@@ -4909,6 +4964,7 @@ fn buildManagedEmbeddingEntry(
         .model = owned_model,
         .model_identity = model_identity,
         .base_url = base_url,
+        .gateway_id = gateway_id,
         .source_table = source_table,
         .region = provider_region,
         .project_id = project_id,
@@ -4954,6 +5010,7 @@ fn resolveDeclaredEmbeddingDimensions(cfg: indexes_openapi.EmbeddingsIndexConfig
     }
     if (cfg.embedder) |embedder| {
         const declared = switch (embedder) {
+            .cloudflare_embedder_config => |value| value.dimensions orelse value.dimension,
             .ollama_embedder_config => null,
             .open_ai_embedder_config => |value| value.dimensions,
             .open_router_embedder_config => |value| value.dimensions,
@@ -5198,6 +5255,7 @@ fn parseEmbeddingsIndexConfigFromValue(
 
 fn parseEmbedderProvider(embedder: embeddings_types.Config) !ProviderKind {
     return switch (embedder.provider) {
+        .cloudflare => .cloudflare,
         .openai => .openai,
         .openrouter => .openrouter,
         .ollama => .ollama,
@@ -5255,6 +5313,7 @@ fn envOptionalU32(name: [:0]const u8) ?u32 {
 
 fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
+        .cloudflare => "ANTFLY_CLOUDFLARE_EMBED_REQUESTS_PER_MINUTE",
         .openai => "ANTFLY_OPENAI_EMBED_REQUESTS_PER_MINUTE",
         .openrouter => "ANTFLY_OPENROUTER_EMBED_REQUESTS_PER_MINUTE",
         .ollama => "ANTFLY_OLLAMA_EMBED_REQUESTS_PER_MINUTE",
@@ -5268,6 +5327,7 @@ fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
 
 fn providerBurstEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
+        .cloudflare => "ANTFLY_CLOUDFLARE_EMBED_BURST",
         .openai => "ANTFLY_OPENAI_EMBED_BURST",
         .openrouter => "ANTFLY_OPENROUTER_EMBED_BURST",
         .ollama => "ANTFLY_OLLAMA_EMBED_BURST",
@@ -6540,7 +6600,7 @@ fn embedSparseBatchWithEntry(
             try validateSparseBatch(embeddings, texts.len);
             return embeddings;
         },
-        .openai, .openrouter, .ollama, .bedrock, .cohere, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
+        .cloudflare, .openai, .openrouter, .ollama, .bedrock, .cohere, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
     }
 }
 
@@ -6763,9 +6823,13 @@ fn embedBatchWithEntry(
 }
 
 fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) []const u8 {
+    // Retrieval overrides must not change an explicitly requested routing task.
+    if (task_type == .clustering) return "clustering";
+    if (task_type == .classification) return "classification";
     const role_override = switch (task_type) {
         .retrieval_query => entry.query_input_type,
         .retrieval_document => entry.document_input_type,
+        else => unreachable,
     };
     if (role_override.len > 0) return role_override;
     // Backward-compatible expert override: the legacy field applies to both
@@ -6774,6 +6838,7 @@ fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingT
     return switch (task_type) {
         .retrieval_query => "search_query",
         .retrieval_document => "search_document",
+        else => unreachable,
     };
 }
 
@@ -6796,6 +6861,13 @@ pub fn testEmbeddingTaskRouting() !void {
     try std.testing.expectEqualStrings("search_document", effectiveInputType(&entry, .retrieval_document));
     try std.testing.expect(effectiveInstruction(&entry, .retrieval_query) == null);
     try std.testing.expect(effectiveInstruction(&entry, .retrieval_document) == null);
+    var overridden = entry;
+    overridden.input_type = @constCast("search_document");
+    overridden.document_input_type = @constCast("custom_document");
+    try std.testing.expectEqualStrings("clustering", effectiveInputType(&overridden, .clustering));
+    try std.testing.expectEqualStrings("classification", effectiveInputType(&overridden, .classification));
+    try std.testing.expectEqualStrings("CLUSTERING", effectiveProviderTaskType(&overridden, .clustering));
+    try std.testing.expectEqualStrings("CLASSIFICATION", effectiveProviderTaskType(&overridden, .classification));
 
     const query_context = embeddingRequestContext(&entry, .retrieval_query);
     try std.testing.expectEqual(EmbeddingTaskType.retrieval_query, query_context.task_type);
@@ -6911,6 +6983,7 @@ fn embedBatchWithEntryForTaskOnce(
         @tagName(entry.provider),
     );
     switch (entry.provider) {
+        .cloudflare => return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims, task_type),
         .openai, .openrouter, .ollama => {
             if (entry.requests_per_minute > 0 and texts.len > entry.burst) {
                 return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims, task_type);
@@ -6928,6 +7001,7 @@ fn embedBatchWithEntryForTaskOnce(
                 try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, task_type);
                 try context.check();
+                if ((task_type == .clustering or task_type == .classification) and local.embed_dense_texts_with_context == null) return error.UnsupportedEmbeddingTaskType;
                 if ((context.model_identity != null or context.model_revision != null) and local.embed_dense_texts_with_context == null) return error.InvalidEmbeddingIdentity;
                 if (trace_batch) provider_started = monotonicNowNs();
                 const vectors = (if (local.embed_dense_texts_with_context) |embed_with_context|
@@ -7005,6 +7079,7 @@ fn effectiveProviderTaskType(entry: *const ManagedEmbeddingEntry, task_type: Emb
     const role_override = switch (task_type) {
         .retrieval_query => entry.query_input_type,
         .retrieval_document => entry.document_input_type,
+        .clustering, .classification => "",
     };
     return if (role_override.len > 0) role_override else task_type.canonical();
 }
@@ -7269,7 +7344,7 @@ fn embedBatchWithOpenAiCompatiblePacedChunks(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    const chunk_size = @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
+    const chunk_size = if (entry.provider == .cloudflare) @min(@as(usize, 100), if (entry.requests_per_minute > 0) @max(@as(usize, 1), @as(usize, entry.burst)) else 100) else @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
     var out = std.ArrayListUnmanaged([]const f32).empty;
     errdefer {
         for (out.items) |vector| alloc.free(vector);
@@ -7301,6 +7376,7 @@ fn embedBatchWithOpenAiCompatible(
     const Response = struct {
         data: []const struct {
             embedding: []const f32,
+            index: ?usize = null,
         },
     };
 
@@ -7313,7 +7389,7 @@ fn embedBatchWithOpenAiCompatible(
     const json_body = try httpx.json.Json.stringify(alloc, Request{
         .model = .{ .string = entry.model },
         .input = .{ .array = input_array },
-        .dimensions = if (dims > 0) dims else null,
+        .dimensions = if (entry.provider != .cloudflare and dims > 0) dims else null,
     });
     defer alloc.free(json_body);
 
@@ -7323,13 +7399,17 @@ fn embedBatchWithOpenAiCompatible(
         null;
     defer if (auth_header) |value| alloc.free(value);
 
-    var headers_buf: [2][2][]const u8 = undefined;
+    var headers_buf: [3][2][]const u8 = undefined;
     headers_buf[0] = .{ "content-type", "application/json" };
-    const header_count: usize = if (auth_header != null) 2 else 1;
+    var header_count: usize = if (auth_header != null) 2 else 1;
     if (auth_header) |value| {
         headers_buf[1] = .{ "authorization", value };
     }
 
+    if (entry.gateway_id) |id| {
+        headers_buf[header_count] = .{ "cf-aig-gateway-id", id };
+        header_count += 1;
+    }
     try checkEntryDispatchDeadline(entry);
 
     var fallback_http: ?httpx.Client = null;
@@ -7357,15 +7437,16 @@ fn embedBatchWithOpenAiCompatible(
     if (parsed.value.data.len != texts.len) return error.InvalidEmbeddingResponse;
 
     const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
-    var initialized: usize = 0;
+    @memset(vectors, &.{});
     errdefer {
-        for (vectors[0..initialized]) |vector| alloc.free(@constCast(vector));
+        for (vectors) |vector| if (vector.len > 0) alloc.free(vector);
         alloc.free(vectors);
     }
     for (parsed.value.data, 0..) |item, i| {
+        const index = item.index orelse if (entry.provider == .cloudflare) return error.InvalidEmbeddingResponse else i;
+        if (index >= vectors.len or vectors[index].len != 0) return error.InvalidEmbeddingResponse;
         try validateDenseVector(item.embedding, dims);
-        vectors[i] = try alloc.dupe(f32, item.embedding);
-        initialized += 1;
+        vectors[index] = try alloc.dupe(f32, item.embedding);
     }
     return vectors;
 }
@@ -10740,6 +10821,77 @@ test "managed embedder endpoint access denial survives HTTP probing and runtime 
     try std.testing.expectEqual(error.InferenceEndpointAccessDenied, abi.errorFromStatus(abi.statusFromError(error.InferenceEndpointAccessDenied)));
 }
 
+test "managed embedder Cloudflare compatibility preserves indexed results without resizing" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expect(!parsed.value.object.contains("dimensions"));
+            try std.testing.expectEqualStrings("gateway", req.header("cf-aig-gateway-id").?);
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/embeddings", .assert_request = Check.request, .respond = .{ .body = "{\"data\":[{\"index\":1,\"embedding\":[0,1]},{\"index\":0,\"embedding\":[1,0]}]}" } }});
+    defer server.deinit();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(alloc: std.mem.Allocator, http: *httpx.Client, url: []const u8, out: *?anyerror) std.Io.Cancelable!void {
+            var entry = ManagedEmbeddingEntry{ .alloc = alloc, .index_name = @constCast("test"), .provider = .cloudflare, .model = @constCast("@cf/test/embedding"), .base_url = @constCast(url), .gateway_id = "gateway", .dimensions = 2, .shared_http_client = http };
+            defer entry.auth_header_cache.deinit(alloc);
+            const vectors = embedBatchWithOpenAiCompatible(alloc, &entry, &.{ "first", "second" }, 2, .retrieval_document) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+            std.testing.expectEqualSlices(f32, &.{ 1, 0 }, vectors[0]) catch |err| {
+                out.* = err;
+            };
+            std.testing.expectEqualSlices(f32, &.{ 0, 1 }, vectors[1]) catch |err| {
+                out.* = err;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &failure }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (failure) |err| return err;
+}
+
+test "managed embedder Cloudflare configuration survives every allocation failure" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var cfg = try embeddings_types.parseConfigFromSlice(a,
+                \\{"provider":"cloudflare","account_id":"account","gateway_id":"gateway","model":"@cf/baai/bge-base-en-v1.5","dimensions":768,"api_key":"fixture"}
+            );
+            defer cfg.deinit(a);
+            var copy = try cfg.clone(a);
+            defer copy.deinit(a);
+            try std.testing.expectEqualStrings("account", copy.account_id.?);
+            try std.testing.expect(copy.account_id.?.ptr != cfg.account_id.?.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "managed embedder Cloudflare index declarations retain fixed dimensions" {
+    for ([_]bool{ true, false }) |alias| {
+        const config = indexes_openapi.EmbeddingsIndexConfig{ .embedder = .{ .cloudflare_embedder_config = .{
+            .provider = "cloudflare",
+            .account_id = "account",
+            .model = "@cf/baai/bge-base-en-v1.5",
+            .dimensions = if (alias) null else 768,
+            .dimension = if (alias) 768 else null,
+        } } };
+        try std.testing.expectEqual(@as(?u32, 768), try resolveDeclaredEmbeddingDimensions(config));
+    }
+}
+
 test "new Google admission pins defaults and preserves explicit legacy execution" {
     const alloc = std.testing.allocator;
     var input = try std.json.parseFromSlice(std.json.Value, alloc,
@@ -10924,6 +11076,8 @@ test "managed embedder cold activation precedes default probe and query inferenc
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    TestClock.offset_ns.store(0, .monotonic);
+    defer TestClock.offset_ns.store(0, .monotonic);
     const Service = struct {
         loaded: bool = false,
         delay: u64 = 31 * std.time.ns_per_s,
@@ -10937,8 +11091,9 @@ test "managed embedder cold activation precedes default probe and query inferenc
                 defer load.deinit();
                 try std.testing.expectEqualStrings("cold", load.value.model);
                 try std.testing.expectEqualStrings("embedder", load.value.task);
-                // Exceed the real inference-only default, not a test override.
-                try std.testing.io.sleep(.fromNanoseconds(@intCast(self.delay)), .awake);
+                // Cross the real inference-only default in logical time.
+                // Keep real HTTP framing and the unchanged production budget.
+                _ = TestClock.offset_ns.fetchAdd(self.delay, .monotonic);
                 self.loaded = true;
                 _ = self.activations.fetchAdd(1, .monotonic);
                 break :loading "{\"state\":\"loaded\"}";

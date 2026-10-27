@@ -97,12 +97,20 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
-    const memory_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/memory_policy_test_root.zig"),
-        .imports = &.{.{ .name = "antfly_resolver", .module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/resolver/src/memory_contract.zig"), .target = target, .optimize = optimize }) }},
-        .target = target,
-        .optimize = optimize,
-    }) });
+    const memory_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/memory_policy_test_root.zig"),
+            .imports = &.{
+                // Native memory also exercises shared query-policy attachment.
+                // Use the real deterministic core; no model/runtime is linked.
+                .{ .name = "antfly_resolver", .module = shared.resolver_mod },
+                .{ .name = "antfly_hash", .module = shared.hash_mod },
+                .{ .name = "antfly_platform", .module = shared.platform_mod },
+            },
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
     b.step("memory-test", "Run native memory policy, temporal, isolation and replay contracts").dependOn(&b.addRunArtifact(memory_tests).step);
     @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
     @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);
@@ -581,6 +589,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_structured_tests = b.addRunArtifact(structured_tests);
     b.step("lib-structured-test", "Run constrained output, evidence and generated extraction tests").dependOn(&run_structured_tests.step);
     const decisions_test_module = b.createModule(.{ .root_source_file = b.path("lib/decisions/root.zig"), .target = target, .optimize = optimize });
+    decisions_test_module.addImport("antfly_cloudflare", b.modules.get("antfly_cloudflare").?);
     decisions_test_module.addImport("antfly_structured", b.modules.get("antfly_structured").?);
     const decisions_tests = b.addTest(.{
         .root_module = decisions_test_module,
@@ -592,6 +601,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_decisions_unit_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, decisions_tests);
     run_decisions_unit_tests.addArgs(&.{ "--skip-test-filter", "^evidence.test." });
     b.step("lib-decisions-test", "Run shared decision wire and generated contract tests").dependOn(&run_decisions_tests.step);
+
+    const cloudflare_test_module = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/root.zig"), .target = target, .optimize = optimize });
+    var cloudflare_imports = b.modules.get("antfly_cloudflare").?.import_table.iterator();
+    while (cloudflare_imports.next()) |entry| cloudflare_test_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const cloudflare_tests = b.addTest(.{ .root_module = cloudflare_test_module });
+    b.step("lib-cloudflare-test", "Run Cloudflare wire and response validation tests").dependOn(&b.addRunArtifact(cloudflare_tests).step);
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -726,12 +741,16 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_mod = platform_mod,
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
+    const documents_tests = b.addTest(.{ .root_module = b.modules.get("antfly_documents").? });
+    const run_documents_tests = b.addRunArtifact(documents_tests);
+    b.step("lib-documents-test", "Run checked OOXML, DrawingML, slide and layout tests without inference").dependOn(&run_documents_tests.step);
     const pdf_integration = antfly_tests_build.createPdfIntegration(b, .{
         .root = b.path("pkg/antfly"),
         .fixture = b.path("lib/pdf/integration_fixture.zig"),
         .imports = production_antfly_imports,
         .optimize = optimize,
     });
+    b.step("lib-pdf-unit-test", "Run shared PDF unit tests without OCR integration").dependOn(&run_lib_pdf_tests.step);
     const pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
     pdf_test_step.dependOn(&run_lib_pdf_tests.step);
     pdf_test_step.dependOn(&pdf_integration.run.step);
@@ -923,6 +942,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&run_documents_tests.step);
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
     unit_test_step.dependOn(&run_exact_float_tests.step);
@@ -968,6 +988,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_png_tests.step);
     lib_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     lib_test_step.dependOn(&run_lib_pdf_tests.step);
+    lib_test_step.dependOn(&run_documents_tests.step);
     lib_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
     lib_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
     lib_test_step.dependOn(&run_lib_scraping_tests.step);

@@ -1352,7 +1352,36 @@ const LocalStandaloneMetadata = struct {
 
     const RestorePersistence = antfly.public_api.restore_jobs.ReplicatedPersistence;
     fn restorePersistence(self: *LocalStandaloneMetadata) RestorePersistence {
-        return RestorePersistence.fromLocal(self, .{ .load = restoreJobsLoad, .get = restoreJobsGet, .put = restoreJobsPut, .create = restoreJobsCreate, .create_with_staging = restoreJobsCreateWithStaging, .delete = restoreJobsDelete, .delete_many = restoreJobsDeleteMany, .delete_matching = restoreJobsDeleteMatching });
+        return RestorePersistence.fromLocal(self, .{ .job_state = .{ .get = jobStateGet, .scan = jobStateScan, .cas = jobStateCas }, .load = restoreJobsLoad, .get = restoreJobsGet, .put = restoreJobsPut, .create = restoreJobsCreate, .create_with_staging = restoreJobsCreateWithStaging, .delete = restoreJobsDelete, .delete_many = restoreJobsDeleteMany, .delete_matching = restoreJobsDeleteMatching });
+    }
+    fn jobStateGet(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8) !?[]u8 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).getJobState(a, group_ids.main_metadata_group_id, key);
+    }
+    fn jobStateScan(ptr: *anyopaque, a: std.mem.Allocator, after: ?[]const u8) ![]u8 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).scanJobState(a, group_ids.main_metadata_group_id, after);
+    }
+    fn jobStateCas(ptr: *anyopaque, key: []const u8, expected: ?[]const u8, value: []const u8, term: u64) !bool {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        var locked = try self.lockMutation();
+        defer locked.deinit();
+        try self.requireRestoreJobTermLocked(term);
+        if (expected == null and std.mem.startsWith(u8, key, "documents/")) {
+            var parsed = try std.json.parseFromSlice(struct { owner: []const u8, state: enum { queued, running, succeeded, failed, cancelled } }, self.alloc, value, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const existing = try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key);
+            defer if (existing) |bytes| self.alloc.free(bytes);
+            if (existing == null and (parsed.value.state == .queued or parsed.value.state == .running) and try self.lifecycle_store.?.getJobOwnerCount(self.alloc, group_ids.main_metadata_group_id, parsed.value.owner) >= 16) return error.TooManyActiveJobs;
+        }
+        try self.applyJobCommandLocked(.{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected orelse "", .value = value } });
+        const current = (try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key)) orelse return false;
+        defer self.alloc.free(current);
+        return std.mem.eql(u8, current, value);
     }
     fn migrateRestoreJobs(self: *LocalStandaloneMetadata, legacy: *antfly.storage_backend_erased.Store) !void {
         const store = self.lifecycle_store orelse return;
@@ -2016,6 +2045,12 @@ const LocalStandaloneMetadata = struct {
             if (table) |value| {
                 tables[0] = try antfly.metadata.table_manager.cloneTable(self.alloc, value.*);
                 copied_table = true;
+                if (std.mem.indexOf(u8, value.indexes_json, "\"projection_only\"") != null) {
+                    const store = self.lifecycle_store orelse return error.MissingMetadataStore;
+                    const indexes = try @import("../metadata/resolver_catalog_read.zig").executionIndexesAlloc(store, self.alloc, group_ids.main_metadata_group_id, value.name, self.durable_revision, true);
+                    self.alloc.free(tables[0].indexes_json);
+                    tables[0].indexes_json = indexes;
+                }
             }
             const refs = if (table) |value| generation.indexed.table_range_refs.get(value.table_id) orelse &.{} else &.{};
             const ranges = try self.alloc.alloc(antfly.metadata.RangeRecord, refs.len);
@@ -2689,20 +2724,22 @@ const LocalStandaloneMetadata = struct {
                 try context.ensureActive();
                 const previous = self.durable_revision;
                 try self.lifecycle_store.?.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_resolver_authority = body });
-                const current = (try self.lifecycle_store.?.getTable(alloc, group_ids.main_metadata_group_id, write.table_id)) orelse return error.TableNotFound;
-                defer antfly.metadata.table_manager.freeTable(alloc, current);
-                const revision = try self.lifecycle_store.?.standaloneRevision();
-                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
-                    try self.manager.upsertTable(current);
-                    self.epoch = revision;
-                    self.durable_revision = revision;
-                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 const receipt_id = try write.receipt(alloc);
                 defer alloc.free(receipt_id);
                 const result = try self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, .{ .table_name = "native", .table_id = write.table_id, .mode = .authority, .authority = .{ .mode = .receipt, .id = receipt_id }, .standalone = true });
                 errdefer alloc.free(result);
                 const view = try std.json.parseFromSlice(@import("../metadata/resolver_authority.zig").View, alloc, result, .{});
                 defer view.deinit();
+                const revision = try self.lifecycle_store.?.standaloneRevision();
+                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+                    if (view.value.definition_changed orelse true) {
+                        const current = (try self.lifecycle_store.?.getTable(alloc, group_ids.main_metadata_group_id, write.table_id)) orelse return error.TableNotFound;
+                        defer antfly.metadata.table_manager.freeTable(alloc, current);
+                        try self.manager.upsertTable(current);
+                    }
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 if (!view.value.receipt) return error.ResolverCurationConflict;
                 return result;
             },
@@ -3725,22 +3762,26 @@ const LocalStandaloneMetadata = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const group = group_ids.main_metadata_group_id;
-        const job = (try store.pendingResolverNamespaceTable(a, group)) orelse {
+        if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
+        const work = (try store.pendingResolverNamespaceWork(a, group, true)) orelse {
             const id = (try store.pendingResolverNamespaceDrop(a, group)) orelse return;
             const fence = try store.getTableTransitionFence(group, id);
             try self.applyJobCommandLocked(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
             return;
         };
-        const sources = try store.pendingResolverNamespaceSources(a, group);
-        try store.updateStandaloneCatalog(group, self.durable_revision, .{ .table_replacements = &.{.{ .expected = job, .replacement = job }} });
-        // Certify the new projection only after each touched table is refreshed.
         self.durable_revision = 0;
-        for (sources) |source| {
-            const actual = (try store.getTable(a, group, source.table_id)) orelse continue;
+        try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
+        // Scoped publication changes execution bindings, never source DDL.
+        // Only lifecycle/bootstrap passes need to refresh the table manager.
+        self.durable_revision = 0;
+        for (work.refresh_sources) |source_id| {
+            const actual = (try store.getTable(a, group, source_id)) orelse continue;
             try self.manager.upsertTable(actual);
         }
-        self.durable_revision = try store.standaloneRevision();
-        self.epoch = self.durable_revision;
+        const after = try store.standaloneRevision();
+        if (after != work.advance.catalog_revision + 1) return error.CatalogGenerationChanged;
+        self.durable_revision = after;
+        self.epoch = after;
     }
 
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {
@@ -16484,4 +16525,129 @@ test "system catalog native memory ownership provisions privately and survives s
     try std.testing.expectEqual(system_catalog.ServiceOwner.memory, definitions.value.tables[0].?.query_definition.?.native_service.?);
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }}, .include_query_definitions = true } }));
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .table, .name = "memory_team", .new_name = "public_copy" } } }));
+}
+
+test "system catalog resolver curation standalone record commits retain large destination definitions" {
+    if (comptime !control_only_storage_sources) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resolver-owner", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = root,
+        .replica_catalog_path = path,
+        .backend_runtime = backend.ptr(),
+        .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, metadata.catalogSource(), metadata.statusSource());
+    defer server.deinit();
+    metadata.data_server = &server;
+    _ = try metadata.ensureNativeOwnerBindingLocked();
+    const group = group_ids.main_metadata_group_id;
+    const store = metadata.lifecycle_store.?;
+    const domain = @import("../metadata/resolver_authority.zig");
+    const padding = try a.alloc(u8, 1024 * 1024);
+    @memset(padding, 'x');
+    const table: antfly.metadata.TableRecord = .{ .table_id = 7, .name = "entities", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .unrelated = padding }, .{}) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const template = "entity/{{_key}}";
+    var namespace: @import("antfly_local_sources").storage_db_resolver_curation.Namespace = .{ .key_template = template, .revision = 1 };
+    var write: domain.Write = .{ .table_id = 7, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, table), .bootstrap = .{ .expected_indexes = try @import("antfly_resolver").fingerprint(a, table.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = template }, namespace)} };
+    const source = metadata.statusSource();
+    _ = try source.systemCatalog(a, .{}, .{ .resolver_authority_mutate = write });
+    const definition = metadata.manager.tables.get(7).?.indexes_json;
+    const before = namespace;
+    namespace.revision = 2;
+    namespace.state.suppress.keys = &.{"entity/noise"};
+    write.bootstrap = null;
+    write.catalog_revision = try store.standaloneRevision();
+    write.patches = &.{try domain.records.difference(a, before, namespace)};
+    var buffer: [64 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    const result = try source.systemCatalog(bounded.allocator(), .{}, .{ .resolver_authority_mutate = write });
+    const receipt = try std.json.parseFromSliceLeaky(domain.View, a, result, .{});
+    try std.testing.expect(receipt.receipt);
+    try std.testing.expectEqual(@as(?bool, false), receipt.definition_changed);
+    try std.testing.expectEqual(definition.ptr, metadata.manager.tables.get(7).?.indexes_json.ptr);
+    try std.testing.expectEqual(try store.standaloneRevision(), metadata.durable_revision);
+    // Receipt replay also certifies the immutable definition without reloading it.
+    bounded.reset();
+    _ = try source.systemCatalog(bounded.allocator(), .{}, .{ .resolver_authority_mutate = write });
+    try std.testing.expectEqual(definition.ptr, metadata.manager.tables.get(7).?.indexes_json.ptr);
+}
+
+test "standalone shared document state follows metadata HA replay and fenced ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    defer a.free(path);
+    const checkpoint = try std.fmt.allocPrint(a, "{s}/metadata.checkpoint", .{root});
+    defer a.free(checkpoint);
+    const log = try std.fmt.allocPrintSentinel(a, "{s}/primary-log", .{root}, 0);
+    defer a.free(log);
+    const slots = try std.fmt.allocPrintSentinel(a, "{s}/primary-slots", .{root}, 0);
+    defer a.free(slots);
+    var primary = try antfly.hot_standby.primary.Primary.open(a, log, slots, .{ .cluster_id = 77, .timeline_id = 1, .epoch = 1 }, .{});
+    defer primary.close();
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    defer metadata.deinit();
+    const baseline = try metadata.lifecycle_store.?.exportHotStandbyCheckpoint(std.testing.io, checkpoint);
+    var barrier: antfly.db.MutationBarrier = .{};
+    var transition_mutex: std.atomic.Mutex = .unlocked;
+    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .mutation_barrier = &barrier, .transition_mutex = &transition_mutex }));
+    const capability = metadata.restorePersistence().job_state;
+    const queued = "{\"owner\":\"alice\",\"state\":\"queued\",\"checkpoint\":\"immutable-source\"}";
+    const running = "{\"owner\":\"alice\",\"state\":\"running\",\"checkpoint\":\"accepted-page\"}";
+    try std.testing.expect(try capability.compareExchange("documents/ha-run", null, queued, 1));
+    var queued_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(queued, &queued_hash, .{});
+    try std.testing.expect(try capability.compareExchange("documents/ha-run", &queued_hash, running, 1));
+    try std.testing.expectError(error.NotLeader, capability.compareExchange("documents/ha-run", null, queued, 2));
+    const standby_root = try std.fmt.allocPrint(a, "{s}/standby", .{root});
+    defer a.free(standby_root);
+    var standby = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = standby_root });
+    defer standby.deinit();
+    try standby.importHotStandbyCheckpoint(std.testing.io, checkpoint, baseline.size_bytes);
+    const entries = try primary.log.iterateFrom(a, 1);
+    defer antfly.hot_standby.replication_log.freeEntries(a, entries);
+    var count: usize = 0;
+    for (entries) |entry| if (entry.record.kind == .metadata_mutation and entry.record.table_id == 0 and entry.record.shard_id == 0) {
+        try standby.applyHotStandbyRecord(entry.record);
+        count += 1;
+    };
+    try std.testing.expect(count >= 2);
+    const mirrored = (try standby.getJobState(a, group_ids.main_metadata_group_id, "documents/ha-run")).?;
+    defer a.free(mirrored);
+    try std.testing.expectEqualStrings(running, mirrored);
+    try std.testing.expectEqual(@as(u64, 1), try standby.getJobOwnerCount(a, group_ids.main_metadata_group_id, "alice"));
+    // Migrating terminal history must remain possible at the active-job limit.
+    for (0..15) |index| {
+        var key: [64]u8 = undefined;
+        try std.testing.expect(try capability.compareExchange(try std.fmt.bufPrint(&key, "documents/quota-{d}", .{index}), null, queued, 1));
+    }
+    try std.testing.expectError(error.TooManyActiveJobs, capability.compareExchange("documents/over-quota", null, queued, 1));
+    try std.testing.expect(try capability.compareExchange("documents/terminal-history", null, "{\"owner\":\"alice\",\"state\":\"succeeded\"}", 1));
+    try std.testing.expectEqual(@as(u64, 16), try metadata.lifecycle_store.?.getJobOwnerCount(a, group_ids.main_metadata_group_id, "alice"));
+    // The existing HA write gate is the external fencing authority. Once it
+    // denies the old primary, even a previously retained job capability fails.
+    const Denied = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.NotLeader;
+        }
+    };
+    metadata.hot_standby_gate = .{ .borrowed = .{ .ptr = &metadata, .check_fn = Denied.check } };
+    try std.testing.expectError(error.NotLeader, capability.compareExchange("documents/ha-run", &queued_hash, queued, 1));
 }

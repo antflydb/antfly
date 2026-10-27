@@ -26,6 +26,8 @@ const A = std.mem.Allocator;
 const ReadContext = local.serverless_query_lake_read_context.Context;
 const Execution = local.common_request_admission.runnable_scheduler.Execution;
 pub const CachedRead = struct {
+    /// Admission mode for field-sort windows; never changes artifact authority.
+    lazy_lineage: bool = false,
     metrics: ?*@import("lake_query_metrics.zig").Metrics = null,
     cache: *local.serverless_query_lake_serving_cache.Cache,
     scope: [32]u8,

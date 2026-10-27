@@ -2967,6 +2967,20 @@ export class AntflyClient {
       if (!data) throw new Error("pinEntitiesDistinct: empty response");
       return data;
     },
+    progress: async (
+      tableName: string,
+      key: string,
+      query?: { limit?: number; cursor?: string },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/entities/{key}/progress",
+        { signal: options?.signal, params: { path: { tableName, key }, query } }
+      );
+      if (error) throw new Error(`listEntityResolverProgress: ${error.error}`);
+      if (!data) throw new Error("listEntityResolverProgress: empty response");
+      return data;
+    },
     state: async (tableName: string, key: string, options?: { signal?: AbortSignal }) => {
       const { data, error } = await this.client.GET(
         "/db/v1/tables/{tableName}/entities/{key}/redirects",
@@ -3423,6 +3437,25 @@ export class AntflyClient {
       );
       if (error) throw new Error(`pinEntitiesDistinct: ${error.error}`);
       if (!data) throw new Error("pinEntitiesDistinct: empty response");
+      return data;
+    },
+    progress: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      key: string,
+      query?: { limit?: number; cursor?: string },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/progress",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, key }, query },
+        }
+      );
+      if (error) throw new Error(`listEntityResolverProgress: ${error.error}`);
+      if (!data) throw new Error("listEntityResolverProgress: empty response");
       return data;
     },
     state: async (

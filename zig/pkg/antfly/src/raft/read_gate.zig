@@ -781,3 +781,100 @@ test "frozen quorum admission lends CPU preserves captured proof and retires reg
         }
     }
 }
+
+test "enrichment read gate rejects exhausted budgets before quorum admission" {
+    const Recorder = struct {
+        calls: usize = 0,
+        fn wait(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+    var recorder: Recorder = .{};
+    const gate = EnrichmentReadGate.init(.{ .ptr = &recorder, .vtable = &.{ .wait_read_safe = Recorder.wait } });
+    try std.testing.expectError(error.Timeout, gate.prepareLookup(7, "key", .{ .execution_deadline_ns = 0 }, .read_index));
+    try std.testing.expectError(error.Timeout, gate.prepareSearch(7, .{ .execution_deadline_ns = 0 }, .read_index));
+    try std.testing.expectError(error.Timeout, gate.prepareScan(7, "a", "z", .{ .execution_deadline_ns = 0 }, .read_index));
+    var canceled = std.atomic.Value(bool).init(true);
+    const token = db_types.CancellationToken.fromAtomic(&canceled);
+    try std.testing.expectError(error.Canceled, gate.prepareLookup(7, "key", .{ .cancellation = token }, .read_index));
+    try std.testing.expectError(error.Canceled, gate.prepareSearch(7, .{ .cancellation = token }, .read_index));
+    try std.testing.expectError(error.Canceled, gate.prepareScan(7, "a", "z", .{ .cancellation = token }, .read_index));
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+    // Stale reads still do not acquire quorum authority.
+    try gate.prepareLookup(7, "key", .{}, .stale);
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+}
+
+test "enrichment read gate forwards relative budgets and cancellation to quorum owner" {
+    const Recorder = struct {
+        calls: usize = 0,
+        signal: *std.atomic.Value(bool),
+        fn legacy(_: *anyopaque, _: u64, _: []const u8) !void {
+            return error.LegacyBarrierUsed;
+        }
+        fn controlled(ptr: *anyopaque, group: u64, _: []const u8, controls: ReadSafetyBarrier.Controls) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(@as(?u32, 1251), controls.timeout_ms);
+            self.calls += 1;
+            // Changing the borrowed source must be visible to the owner.
+            self.signal.store(true, .release);
+            try std.testing.expect(controls.cancellation.isCancelled());
+        }
+    };
+    const Clock = struct {
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = 9_000_000_000_000_000_000 };
+        }
+    };
+    var io = std.testing.io;
+    var vtable = io.vtable.*;
+    vtable.now = Clock.now;
+    io.vtable = &vtable;
+    var canceled = std.atomic.Value(bool).init(false);
+    var recorder = Recorder{ .signal = &canceled };
+    const gate = EnrichmentReadGate.init(.{ .ptr = &recorder, .vtable = &.{ .wait_read_safe = Recorder.legacy, .wait_read_safe_controlled = Recorder.controlled } });
+    try std.testing.expectError(error.Canceled, gate.prepareLookup(7, "key", .{
+        .execution_deadline_ns = 9_000_000_001_250_000_001,
+        .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
+        .cancellation = db_types.CancellationToken.fromAtomic(&canceled),
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+}
+
+test "enrichment read gate composes scan execution waits with original controls" {
+    const Boundary = @import("antfly_local_sources").common_execution_wait.Boundary;
+    const Probe = struct {
+        began: usize = 0,
+        ended: usize = 0,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.began += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ended += 1;
+        }
+        fn legacy(_: *anyopaque, _: u64, _: []const u8) !void {
+            return error.LegacyBarrierUsed;
+        }
+        fn controlled(raw: *anyopaque, _: u64, _: []const u8, controls: ReadSafetyBarrier.Controls) !void {
+            try std.testing.expect(!controls.cancellation.isCancelled());
+            try std.testing.expect(controls.timeout_ms.? > 0 and controls.timeout_ms.? <= 1000);
+            const boundary = controls.execution_wait.?;
+            try std.testing.expectEqual(raw, boundary.ptr);
+            try boundary.beginWait();
+            try boundary.endWait();
+        }
+    };
+    var probe: Probe = .{};
+    const boundary: Boundary = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end };
+    const gate = EnrichmentReadGate.init(.{ .ptr = &probe, .vtable = &.{ .wait_read_safe = Probe.legacy, .wait_read_safe_controlled = Probe.controlled } });
+    const now = @import("antfly_platform").time.monotonicNs();
+    try gate.prepareScan(7, "a", "z", .{ .execution_deadline_ns = now +| std.time.ns_per_s, .execution_wait = boundary }, .read_index);
+    try std.testing.expectEqual(@as(usize, 1), probe.began);
+    try std.testing.expectEqual(@as(usize, 1), probe.ended);
+    try std.testing.expectError(error.Timeout, gate.prepareScan(7, "a", "z", .{ .execution_deadline_ns = 0, .execution_wait = boundary }, .read_index));
+    try std.testing.expectEqual(@as(usize, 1), probe.began);
+}

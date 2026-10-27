@@ -77,7 +77,7 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/attempt/cancel", .operation_id = "cancelRemoteAttempt", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/attempt/capabilities", .operation_id = "getRemoteOwnedReadCapabilities", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/attempt/capabilities", .operation_id = "getRemoteOwnedReadCapabilities", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/attempt/fence", .operation_id = "fenceRemoteAttempts", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/attempt/status", .operation_id = "getRemoteAttemptStatus", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/owned-query/{root_incarnation}/{reporter_incarnation}", .operation_id = "executeProcessOwnedGroupQuery", .request_body = .buffered, .streaming_response = false },

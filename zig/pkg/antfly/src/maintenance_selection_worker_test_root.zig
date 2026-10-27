@@ -101,3 +101,34 @@ comptime {
     @export(&denySync, .{ .name = "antfly_storage_wal_sync" });
     @export(&denyTruncate, .{ .name = "antfly_storage_wal_truncate_prefix" });
 }
+
+test "data runtime background provider clients preserve shared bounded admission" {
+    const std = @import("std");
+    const Provider = @import("antfly_local_sources").inference_managed_embedder.ProviderRuntime;
+    var owner = Provider.init(std.testing.allocator, std.testing.io);
+    defer owner.deinit();
+    const clients = .{ try owner.httpClient(), try owner.generationHttpClient(), try owner.assetHttpClient() };
+    const repeated = .{ try owner.httpClient(), try owner.generationHttpClient(), try owner.assetHttpClient() };
+    inline for (clients, repeated) |client, same| {
+        try std.testing.expect(client == same);
+        const Admission = @TypeOf(client.outbound);
+        var held: [20]Admission.Lease = undefined;
+        var acquired: usize = 0;
+        defer for (held[0..acquired]) |*lease| lease.release();
+        const hosts = [_][]const u8{ "a", "b", "c", "d", "e" };
+        for (&held, 0..) |*lease, i| {
+            lease.* = try client.outbound.acquire(hosts[i / 4], 443, .{});
+            acquired += 1;
+        }
+        // A new endpoint still shares the service-wide bound. Oversized queue
+        // metadata forces immediate refusal without timing or network traffic.
+        if (client.outbound.acquire("extra", 443, .{ .retained_bytes = 65 << 20 })) |value| {
+            var unexpected = value;
+            unexpected.release();
+            return error.TestExpectedError;
+        } else |err| try std.testing.expectEqual(error.OutboundCapacityUnavailable, err);
+        held[0].release();
+        var next = try client.outbound.acquire("extra", 443, .{});
+        next.release();
+    }
+}

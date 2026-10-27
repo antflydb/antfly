@@ -1070,7 +1070,9 @@ pub const InvertedIndexBuilder = struct {
         var keys = self.terms.keyIterator();
         var n: usize = 0;
         while (keys.next()) |key| : (n += 1) sorted[n] = key.*;
-        std.mem.sort([]const u8, sorted, {}, struct {
+        // Hash-map keys are unique: stability cannot change dictionary order.
+        // Use an in-place sort without the stable merge machinery.
+        std.sort.pdq([]const u8, sorted, {}, struct {
             fn lessThan(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.order(u8, a, b) == .lt;
             }
@@ -1128,7 +1130,8 @@ pub const InvertedIndexBuilder = struct {
                 i += 1;
             }
         }
-        std.mem.sort([]const u8, sorted_terms, {}, struct {
+        // Unique dictionary keys have no equal-key stability requirement.
+        std.sort.pdq([]const u8, sorted_terms, {}, struct {
             fn lessThan(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.order(u8, a, b) == .lt;
             }
@@ -5053,6 +5056,29 @@ pub const PostingsIterator = struct {
         return try self.takeCurrentScoring();
     }
 
+    /// Arbitrary-order point membership, sharing one decoded document chunk.
+    /// Independent of the forward cursor: callers may probe backwards or jump
+    /// between chunks. Positions are never read. Do not interleave with next().
+    pub fn containsDoc(self: *PostingsIterator, target: u32) !bool {
+        if (self.is_one_hit) return self.one_hit_doc == target;
+        self.decode_positions = false;
+        if (self.current_chunk_meta == null or self.doc_values.items.len == 0 or
+            target < self.current_chunk_min_doc or target > self.current_chunk_meta.?.max_doc)
+        {
+            self.next_chunk_index = 0;
+            const index = try self.nextChunkIndexForTarget(target);
+            if (index >= self.chunkCount()) return false;
+            try self.loadChunk(index);
+        }
+        var lower: usize = 0;
+        var upper = self.doc_values.items.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            if (self.doc_values.items[middle] < target) lower = middle + 1 else upper = middle;
+        }
+        return lower < self.doc_values.items.len and self.doc_values.items[lower] == target;
+    }
+
     /// Return a chunk's conservative BM25 upper bound using the iterator's
     /// decoded chunk table. The raw compact metadata stores delta-coded chunk
     /// IDs, so random access through `BlockMaxInfo.maxImpact` must reconstruct
@@ -8797,6 +8823,10 @@ test "PostingsIterator advanceTo uses sparse skip data for long postings" {
     const hit = (try iter.advanceTo(33)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u32, 33), hit.doc_id);
     try std.testing.expectEqual(@as(u32, 34), hit.freq);
+    var point = try lookup.iterator(alloc);
+    defer point.deinit();
+    for ([_]u32{ 39, 0, 33, 2, 32, 1, 17, 17, 39, 40 }) |target| try std.testing.expectEqual(target < 40, try point.containsDoc(target));
+    try std.testing.expectEqual(@as(u64, 0), point.decodedPositionRecords());
 }
 
 test "PostingsIterator decode_positions=false skips position decode" {
@@ -11683,6 +11713,60 @@ test "logical value inline postings benchmark" {
                 try std.testing.expectEqual(@as(usize, 0), budget.live);
                 std.debug.print("INLINE_POSTINGS_BENCH {{\"locations\":{d},\"occurrences\":{d},\"trial\":{d},\"compact\":{},\"terms\":{d},\"ns\":{d},\"peak_bytes\":{d},\"allocations\":{d}}}\n", .{ locations, occurrences, trial, compact, count, elapsed, budget.peak, budget.alloc_calls });
             };
+        }
+    }
+}
+
+test "unique term dictionaries preserve canonical bytes across insertion orders" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const hits = try arena.allocator().alloc(InvertedIndexBuilder.TermHit, 263);
+    for (hits[0..257], 0..) |*hit, i| hit.* = .{
+        .term = try std.fmt.allocPrint(arena.allocator(), "common-prefix-{x:0>4}", .{i}),
+        .freq = 1,
+    };
+    for (hits[257..], [_][]const u8{ "a", "a\x00", "aa", "z", "é", "\xff" }) |*hit, term| hit.* = .{ .term = term, .freq = 1 };
+    var allocated_baseline: ?[]u8 = null;
+    defer if (allocated_baseline) |bytes| a.free(bytes);
+    var streamed_baseline: ?[]u8 = null;
+    defer if (streamed_baseline) |bytes| a.free(bytes);
+    for (0..2) |order| {
+        if (order == 1) std.mem.reverse(InvertedIndexBuilder.TermHit, hits);
+        var builder = InvertedIndexBuilder.init(a, .{});
+        defer builder.deinit();
+        try builder.addDocument(0, hits);
+        try builder.addDocument(1, hits);
+        const bytes = try builder.build();
+        defer a.free(bytes);
+        var streamed = MergeMemorySink{ .alloc = a };
+        defer streamed.deinit();
+        try builder.writeToSink(a, &streamed);
+        if (order == 0) {
+            allocated_baseline = try a.dupe(u8, bytes);
+            streamed_baseline = try a.dupe(u8, streamed.output.items);
+        } else {
+            try std.testing.expectEqualSlices(u8, allocated_baseline.?, bytes);
+            try std.testing.expectEqualSlices(u8, streamed_baseline.?, streamed.output.items);
+        }
+        for ([_][]const u8{ bytes, streamed.output.items }) |encoded| {
+            var reader = try InvertedIndexReader.init(a, encoded);
+            for (hits) |hit| try std.testing.expect(try reader.lookupChecked(hit.term) != null);
+            var iterator = try reader.rangeTermIterator("", null);
+            defer iterator.deinit();
+            var previous: ?[]u8 = null;
+            defer if (previous) |term| a.free(term);
+            var count: usize = 0;
+            while (try iterator.next()) |entry| {
+                if (previous) |term| {
+                    try std.testing.expect(std.mem.order(u8, term, entry.term) == .lt);
+                    a.free(term);
+                    previous = null;
+                }
+                previous = try a.dupe(u8, entry.term);
+                count += 1;
+            }
+            try std.testing.expectEqual(hits.len, count);
         }
     }
 }

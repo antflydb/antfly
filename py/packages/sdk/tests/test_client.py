@@ -1025,6 +1025,79 @@ class TestAntflyClient:
             with pytest.raises(AntflyException):
                 client.get("users", "user:1")
 
+    def test_get_record_and_typed_missing(self) -> None:
+        from antfly import AntflyHTTPError, AntflyNotFoundError
+
+        client = AntflyClient(base_url="http://test")
+
+        def handler(request):
+            if "missing" in request.url.path:
+                return httpx.Response(404, json={"error": "not found"})
+            if "forbidden" in request.url.path:
+                return httpx.Response(403, json={"error": "denied"})
+            return httpx.Response(200, json={"name": "John Doe"}, headers={"X-Antfly-Version": "123"})
+
+        install_transport(client, httpx.MockTransport(handler))
+        assert client.get("users", "user:1") == {"name": "John Doe"}
+        assert client.get_with_version("users", "user:1") == ({"name": "John Doe"}, "123")
+        with pytest.raises(AntflyNotFoundError):
+            client.get("users", "missing")
+        with pytest.raises(AntflyHTTPError) as error:
+            client.get("users", "forbidden")
+        assert error.value.status_code == 403
+        client.close()
+
+    def test_public_transport_projection_snapshot_and_inference(self) -> None:
+        calls = []
+        client = AntflyClient(base_url="http://test")
+
+        def handler(request):
+            calls.append(request)
+            if request.url.path.endswith("/query"):
+                assert json.loads(request.content)["remote_snapshot"] == "snapshot-token"
+                return httpx.Response(200, json={"responses": []})
+            if "/documents/" in request.url.path:
+                assert request.url.params["fields"] == "_embeddings"
+                return httpx.Response(200, json={"_embeddings": {"v": [1, 0]}})
+            return httpx.Response(200, json={"data": []})
+
+        install_transport(client, httpx.MockTransport(handler))
+        assert client.get("t", "a/b", fields=["_embeddings"])["_embeddings"]["v"] == [1, 0]
+        client.query("t", search_after=["a"], remote_snapshot="snapshot-token")
+        assert client.embed({"model": "m", "input": ["x"]}) == {"data": []}
+        assert client.rerank({"model": "r", "query": "q", "documents": ["x"]}) == {"data": []}
+        assert client.models() == {"data": []}
+        assert len(calls) == 5
+        with pytest.raises(ValueError):
+            client.request("GET", "https://other.example/")
+        client.close()
+
+    def test_batch_preserves_outcomes_and_sync_controls(self) -> None:
+        client = AntflyClient(base_url="http://test")
+
+        def handler(request):
+            body = json.loads(request.content)
+            assert body["sync_level"] == "full_index"
+            assert body["transforms"][0]["upsert"] is True
+            return httpx.Response(
+                201,
+                json={
+                    "status": "committed_repair_required",
+                    "inserted": 1,
+                    "failure": {"code": "repair", "message": "repair required", "retryable": False},
+                },
+            )
+
+        install_transport(client, httpx.MockTransport(handler))
+        result = client.batch(
+            "users",
+            sync_level="full_index",
+            transforms=[{"key": "u", "upsert": True, "operations": [{"op": "$set", "path": "$.name", "value": "Ada"}]}],
+        )
+        assert result.to_dict()["status"] == "committed_repair_required"
+        assert result.to_dict()["failure"]["retryable"] is False
+        client.close()
+
     @patch("antfly.client.Client")
     def test_batch_rejects_oversized_request(self, mock_client_class: MagicMock) -> None:
         """Test client-side write request size enforcement."""
@@ -1045,7 +1118,7 @@ class TestAntflyClient:
         expected_content = json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
         mock_httpx = MagicMock()
-        configure_response(mock_httpx, 201, {"inserted": 1})
+        configure_response(mock_httpx, 201, {"status": "committed", "inserted": 1})
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
 
         client = AntflyClient(base_url="http://localhost:8080", max_write_request_bytes=len(expected_content))

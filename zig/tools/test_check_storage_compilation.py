@@ -75,6 +75,21 @@ class LiteralSourceOwnership(unittest.TestCase):
             self.assertNotIn("\n\n\n", rendered)
             self.assertIn("\n\ncomptime {}\n", rendered)
 
+    def test_control_catalog_rejects_duplicate_source_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "pkg/antfly-embedded/src"
+            local.mkdir(parents=True)
+            (local / "source_catalog.zig").write_text(
+                'pub const same = @import("leaf.zig");\n' * 2
+            )
+            (local / "leaf.zig").write_text("")
+            with mock.patch.object(measurement, "ZIG_ROOT", root):
+                with self.assertRaisesRegex(
+                    ValueError, "duplicate source catalog entry: same"
+                ):
+                    measurement.control_catalog_contents()
+
     def test_control_catalog_is_current_and_has_no_physical_imports(self):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"
@@ -200,10 +215,16 @@ class BuildFailureEvidence(unittest.TestCase):
     def test_contract_reuses_both_caches_when_disk_has_headroom(self):
         self.exercise_contract_cache(low_disk=False)
 
+    def test_measured_audit_selects_only_its_qualified_profile(self):
+        with mock.patch.object(
+            measurement, "qualified_audit_memory", return_value=True
+        ):
+            self.exercise_contract_cache(low_disk=False, measured_memory=True)
+
     def test_disk_pressure_rollover_discards_both_caches_and_keeps_mutations(self):
         self.exercise_contract_cache(low_disk=True)
 
-    def exercise_contract_cache(self, *, low_disk):
+    def exercise_contract_cache(self, *, low_disk, measured_memory=False):
         expected = (
             ("cold", set()),
             ("warm", set()),
@@ -237,12 +258,21 @@ class BuildFailureEvidence(unittest.TestCase):
         first_cache = None
         first_global = None
 
-        def fake_build(command, cwd, *, progress, env):
+        def fake_build(
+            command, cwd, *, progress, env, timeout_seconds, compiler_timeout_seconds
+        ):
             nonlocal first_cache, first_global
             label, rebuilt = expected[len(seen)]
+            self.assertEqual(timeout_seconds, 3600 if label.endswith("cold") else 1800)
+            self.assertEqual(compiler_timeout_seconds, 1800)
             local_cache = Path(command[command.index("--cache-dir") + 1])
             self.assertNotIn("--global-cache-dir", command)
             self.assertIn("-Dstrip=true", command)
+            if measured_memory:
+                self.assertIn("-Dnative-linux-ownership-memory=true", command)
+                self.assertIn("-Dcpu=baseline", command)
+                self.assertIn("-Dcuda=false", command)
+                self.assertIn("-Dinference-optimize=debug", command)
             global_cache = Path(env["ZIG_GLOBAL_CACHE_DIR"])
             self.assertEqual(
                 (global_cache / "p" / archive_name).read_bytes(), b"pinned source"
@@ -336,10 +366,92 @@ class BuildFailureEvidence(unittest.TestCase):
             self.assertFalse(first_global.exists())
             self.assertEqual(len(json.loads(report.read_text())), len(expected))
 
+    def test_active_process_diagnostics_exclude_other_builds(self):
+        snapshot = """100 1 20 30:00 0:00 S python measure.py
+101 100 30 29:59 0:01 S maker build
+102 101 7000 28:00 27:40 R zig build-lib --name antfly-storage-kernel -Mroot=storage.zig
+200 1 90000 40:00 39:50 R zig build-lib --name unrelated
+"""
+        rows = measurement.process_diagnostics(snapshot, 100)
+        self.assertEqual([row["pid"] for row in rows], [100, 101, 102])
+        compiler = rows[-1]
+        self.assertEqual(compiler["artifact"], "antfly-storage-kernel")
+        self.assertEqual(compiler["cpu_time"], "27:40")
+        self.assertEqual(compiler["rss_bytes"], 7000 * 1024)
+        self.assertNotIn("command", compiler)
+        self.assertEqual(measurement.process_diagnostics("", 100), [])
+
+    def test_active_compiler_response_file_identifies_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "args.rsp").write_text('"--name" "api-tests" "-Mroot=pkg/api.zig"')
+            rows = measurement.process_diagnostics(
+                "100 1 7000 28:00 27:40 R /bin/zig test @args.rsp", 100, root
+            )
+            self.assertEqual(rows[0]["artifact"], "api-tests")
+            self.assertEqual(rows[0]["source_root"], "pkg/api.zig")
+            self.assertNotIn("command", rows[0])
+            (root / "args.rsp").unlink()
+            rows = measurement.process_diagnostics(
+                "100 1 7000 28:00 27:40 R /bin/zig test @args.rsp", 100, root
+            )
+            self.assertIsNone(rows[0]["artifact"])
+
+    def test_audit_memory_profile_requires_the_measured_compiler(self):
+        with (
+            mock.patch.object(measurement.sys, "platform", "linux"),
+            mock.patch.object(measurement.platform, "machine", return_value="x86_64"),
+            mock.patch.object(
+                measurement.shutil,
+                "which",
+                return_value=str(measurement.QUALIFIED_AUDIT_COMPILER),
+            ),
+        ):
+            self.assertTrue(measurement.qualified_audit_memory("zig"))
+            self.assertFalse(measurement.qualified_audit_memory("zig", jobs=3))
+            with mock.patch.object(
+                measurement.shutil, "which", return_value="/opt/zig/zig"
+            ):
+                self.assertFalse(measurement.qualified_audit_memory("zig"))
+            with mock.patch.object(measurement.sys, "platform", "darwin"):
+                self.assertFalse(measurement.qualified_audit_memory("zig"))
+            with mock.patch.object(
+                measurement.platform, "machine", return_value="aarch64"
+            ):
+                self.assertFalse(measurement.qualified_audit_memory("zig"))
+
+    def test_cgroup_measurement_distinguishes_anonymous_and_file_memory(self):
+        with (
+            mock.patch.object(measurement.sys, "platform", "linux"),
+            mock.patch.object(
+                measurement.Path,
+                "read_text",
+                return_value="anon 100\nfile 900\nfile_dirty 50\ninactive_file 700\n",
+            ),
+        ):
+            self.assertEqual(
+                measurement.cgroup_memory_stat(),
+                {
+                    "anon": 100,
+                    "file": 900,
+                    "file_dirty": 50,
+                    "inactive_file": 700,
+                },
+            )
+            with mock.patch.object(
+                measurement.Path, "read_text", side_effect=FileNotFoundError
+            ):
+                self.assertEqual(measurement.cgroup_memory_stat(), {})
+
     def test_timeout_preserves_output_and_measurements(self):
         with (
             tempfile.TemporaryDirectory() as directory,
             mock.patch.object(measurement.subprocess, "check_output", return_value=""),
+            mock.patch.object(
+                measurement,
+                "active_build_processes",
+                return_value=[{"artifact": "storage", "cpu_time": "29:59"}],
+            ) as diagnostics,
         ):
             code, output, measured = measurement.measured_build(
                 [
@@ -355,7 +467,32 @@ class BuildFailureEvidence(unittest.TestCase):
         self.assertIn("compiler diagnostic", output)
         self.assertTrue(measured["timed_out"])
         self.assertFalse(measured["cpu_accounting_complete"])
+        diagnostics.assert_called_once()
+        self.assertEqual(measured["active_processes"][0]["cpu_time"], "29:59")
         self.assertGreater(measured["wall_seconds"], 0)
+
+    def test_compiler_watchdog_allows_a_later_unit_without_extending_a_stuck_one(self):
+        watchdog = measurement.CompilerWatchdog(1800, 0)
+        first = {"pid": 1, "executable": "zig", "elapsed": "29:59"}
+        self.assertFalse(watchdog.expired(1799, [first]))
+        later = {"pid": 2, "executable": "zig", "elapsed": "00:14"}
+        self.assertFalse(watchdog.expired(1814, [later]))
+        # Another compiler's progress cannot hide an overlong concurrent unit.
+        first["elapsed"] = "30:01"
+        self.assertTrue(watchdog.expired(1815, [first, later]))
+
+    def test_compiler_watchdog_bounds_idle_orchestration_and_unknown_clocks(self):
+        watchdog = measurement.CompilerWatchdog(10, 0)
+        self.assertFalse(watchdog.expired(9, [{"executable": "maker"}]))
+        self.assertTrue(watchdog.expired(10, [{"executable": "maker"}]))
+        unknown = {"pid": 1, "executable": "zig", "elapsed": "unknown"}
+        self.assertFalse(watchdog.expired(11, [unknown]))
+        self.assertTrue(watchdog.expired(21, [unknown]))
+        self.assertTrue(
+            watchdog.expired(
+                22, [{"pid": 2, "executable": "zig", "elapsed": "1-00:00:01"}]
+            )
+        )
 
     def test_report_replaces_previous_running_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

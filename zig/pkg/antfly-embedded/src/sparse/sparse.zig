@@ -8410,6 +8410,11 @@ test "sparse streamed compaction keeps input pages pinned across competing publi
 }
 
 test "sparse streamed compaction releases snapshots blocks and scratch on allocation failures" {
+    // Fault injection and leak checks stay enabled; per-allocation stack
+    // unwinding is unrelated to the ownership contract exercised below.
+    var checked_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked_allocator.deinit() != 0) @panic("sparse allocation fixture leaked allocations");
+    const a = checked_allocator.allocator();
     const Probe = struct {
         var nonce: u64 = 0;
         fn random(_: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
@@ -8417,7 +8422,7 @@ test "sparse streamed compaction releases snapshots blocks and scratch on alloca
             std.mem.writeInt(u64, bytes[0..8], nonce, .little);
             nonce += 1;
         }
-        fn run(output: Allocator) !void {
+        fn run(output: Allocator, fixture: Allocator) !void {
             // Private scratch filenames must repeat across fault-injection
             // runs: random formatting lengths change allocator growth counts.
             nonce = 0;
@@ -8425,14 +8430,14 @@ test "sparse streamed compaction releases snapshots blocks and scratch on alloca
             var vtable = io.vtable.*;
             vtable.randomSecure = random;
             io.vtable = &vtable;
-            const a = std.testing.allocator;
-            var index = try SparseIndex.open(a, "unused", .{ .backend = .mem, .chunk_size = 1 });
+            const fixture_alloc = fixture;
+            var index = try SparseIndex.open(fixture_alloc, "unused", .{ .backend = .mem, .chunk_size = 1 });
             defer index.close();
             const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
             try index.batchWithOptions(&.{.{ .doc_id = "a", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 2, -3 } } }}, &.{}, bulk);
             try index.batchWithOptions(&.{.{ .doc_id = "b", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 5, -7 } } }}, &.{}, bulk);
-            var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = io, .directory = "/tmp" } })).?;
-            defer task.deinit(a);
+            var task = (try index.beginSegmentCompactionTask(fixture_alloc, .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = io, .directory = "/tmp" } })).?;
+            defer task.deinit(fixture_alloc);
             var result = try SparseIndex.executeSegmentCompactionTask(output, &task, 1);
             defer result.deinit(output);
             try std.testing.expect(task.snapshot == null);
@@ -8441,12 +8446,12 @@ test "sparse streamed compaction releases snapshots blocks and scratch on alloca
     };
     // Force grow/copy allocation paths instead of address-dependent in-place
     // remaps, so each fault index denotes the same allocation on every run.
-    var vtable = std.testing.allocator.vtable.*;
+    var vtable = a.vtable.*;
     vtable.resize = Allocator.noResize;
     vtable.remap = Allocator.noRemap;
-    const backing: Allocator = .{ .ptr = std.testing.allocator.ptr, .vtable = &vtable };
-    try Probe.run(backing);
-    try std.testing.checkAllAllocationFailures(backing, Probe.run, .{});
+    const backing: Allocator = .{ .ptr = a.ptr, .vtable = &vtable };
+    try Probe.run(backing, a);
+    try std.testing.checkAllAllocationFailures(backing, Probe.run, .{a});
 }
 
 test "sparse staged generations hide partial output recover intents and retain old readers" {
@@ -8600,7 +8605,12 @@ test "sparse physical translation borrows one map block instead of retaining poi
 }
 
 test "sparse background directory pages stage routes before activation and reclaim abandoned output" {
-    const a = std.testing.allocator;
+    // This allocation-heavy paging fixture tests ownership and routing, not
+    // stack unwinding. Keep canaries and leak checks without capturing a stack
+    // for each temporary cursor/page allocation.
+    var checked_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked_allocator.deinit() != 0) @panic("sparse directory fixture leaked allocations");
+    const a = checked_allocator.allocator();
     var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
     defer index.close();
     var terms: [130]u32 = undefined;
@@ -8658,12 +8668,19 @@ test "sparse background directory pages stage routes before activation and recla
 }
 
 test "sparse locator refresh stops after a generation retires between bounded batches" {
-    const a = std.testing.allocator;
+    // Retain checked ownership across the full 257-record retirement race
+    // without collecting a diagnostic stack for every temporary allocation.
+    var checked_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked_allocator.deinit() != 0) @panic("sparse locator fixture leaked allocations");
+    const a = checked_allocator.allocator();
     var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
     defer index.close();
     const vector: SparseVector = .{ .indices = &.{1}, .values = &.{2} };
-    var ids: [512][16]u8 = undefined;
-    var writes: [512]SparseWrite = undefined;
+    // One complete 256-record refresh quantum plus one record is enough to
+    // prove retirement between batches. A second full quantum only repeats
+    // corpus construction and locator verification without another boundary.
+    var ids: [257][16]u8 = undefined;
+    var writes: [257]SparseWrite = undefined;
     for (&writes, &ids, 0..) |*write, *id, i| write.* = .{ .doc_id = try std.fmt.bufPrint(id, "doc-{d:0>4}", .{i}), .vec = vector };
     const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
     try index.batchWithOptions(writes[0..256], &.{}, bulk);
@@ -8677,6 +8694,7 @@ test "sparse locator refresh stops after a generation retires between bounded ba
     try index.batchWithOptions(&.{.{ .doc_id = "later", .vec = vector }}, &.{}, bulk);
     const Gate = struct {
         index: *SparseIndex,
+        alloc: Allocator,
         enters: usize = 0,
         leaves: usize = 0,
         fn enter(raw: *anyopaque) !void {
@@ -8684,23 +8702,23 @@ test "sparse locator refresh stops after a generation retires between bounded ba
             self.enters += 1;
             // A competing compaction fully installs the newer locators after
             // the first 256 old records have been refreshed.
-            if (self.enters == 2) try std.testing.expect(try self.index.compactSegmentsWithOptions(std.testing.allocator, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } }));
+            if (self.enters == 2) try std.testing.expect(try self.index.compactSegmentsWithOptions(self.alloc, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } }));
         }
         fn leave(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.leaves += 1;
         }
     };
-    var gate: Gate = .{ .index = &index };
+    var gate: Gate = .{ .index = &index, .alloc = a };
     try SparseIndex.completeSegmentCompactionTask(a, &task, &result, .{ .ptr = &gate, .enter = Gate.enter, .leave = Gate.leave });
     try std.testing.expectEqual(@as(usize, 2), gate.enters);
     try std.testing.expectEqual(gate.enters, gate.leaves);
     var read = try index.beginReadTxn();
     defer read.abort();
     for (writes) |write| {
-        const locator = (try readLocator(std.testing.allocator, &read, write.doc_id)).?;
+        const locator = (try readLocator(a, &read, write.doc_id)).?;
         try std.testing.expect(locator.segment != result.generation.?);
-        try std.testing.expect((try locatedForwardBytes(std.testing.allocator, &read, write.doc_id)) != null);
+        try std.testing.expect((try locatedForwardBytes(a, &read, write.doc_id)) != null);
     }
 }
 

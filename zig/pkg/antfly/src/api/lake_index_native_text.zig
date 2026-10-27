@@ -33,10 +33,15 @@ pub const term_directory = @import("lake_index_term_directory.zig");
 // Includes v8 ordered producer identities and stored projection coverage.
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
 // V11 authenticates independent serving packs and original-source spans.
-// Protocol 42 fences paged source spans and larger byte-targeted serving packs.
-pub const metadata_version: u16 = 11;
+// V13/protocol 83 share source dictionaries across compact range pages.
+// V14/protocol 85 add authenticated typed routing bounds and ordering-key trees.
+// V15/protocol 86 add a complete ordered-endpoint directory.
+// V16/protocol 88 group endpoints by physical layout and attest native nulls.
+// V17/protocol 89 bound interval witnesses and verify nullable projections.
+// Historical JSON, v12 page-local dictionaries and v9-v15 roots remain readable.
+pub const metadata_version: u16 = 17;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == 9 or version == 10 or version == metadata_version;
+    return version == 9 or version == 10 or version == 11 or version == 12 or version == 13 or version == 14 or version == 15 or version == 16 or version == metadata_version;
 }
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
@@ -56,7 +61,16 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     defer parsed.deinit();
     const field = if (parsed.value == .object) parsed.value.object.get("field") else null;
     const selected: ?[]const u8 = if (!store_source and @import("lake_row_input_recipes.zig").configurationReusable(parsed.value) and field != null and field.? == .string) field.?.string else null;
-    const original = try state.recipe(a, table, config, if (selected) |path| &.{path} else null);
+    var original = try state.recipe(a, table, config, if (selected) |path| &.{path} else null);
+    var table_schema = try std.json.parseFromSlice(std.json.Value, a, table.schema_json, .{});
+    defer table_schema.deinit();
+    const sort = if (table_schema.value == .object) table_schema.value.object.get("index_sort") else null;
+    if ((sort != null and sort.? == .array and sort.?.array.items.len != 0) or hasDisabledMapping(table_schema.value)) {
+        var ordering = std.crypto.hash.Blake3.init(.{});
+        ordering.update("native-lake-physical-projection-and-order-v2");
+        ordering.update(&original);
+        ordering.final(&original);
+    }
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
     // v2 stores the complete declared relational row even when `field`
@@ -66,6 +80,23 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;
+}
+
+fn hasDisabledMapping(value: std.json.Value) bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("x-antfly-field")) |mapping| if (mapping == .object) {
+                if (mapping.object.get("index")) |flag| if (flag == .bool and !flag.bool) return true;
+            };
+            var fields = object.iterator();
+            while (fields.next()) |field| if (hasDisabledMapping(field.value_ptr.*)) return true;
+        },
+        .array => |array| for (array.items) |item| {
+            if (hasDisabledMapping(item)) return true;
+        },
+        else => {},
+    }
+    return false;
 }
 
 test "external lake stored source recipe attests production without changing source free identity" {
@@ -86,6 +117,7 @@ pub const SegmentRouting = struct {
     doc_count: u32,
     fields: []const Field,
     descriptor: ?artifacts.ChunkRef = null,
+    sort_bound: ?@import("lake_index_sort_bounds.zig").Bound = null,
     /// Authenticated live native ordinal ranges; empty means unmasked.
     live: []const text_directory.Interval = &.{},
 };
@@ -108,10 +140,17 @@ pub fn validateMembers(members: []const Member, domain: [32]u8, lower: u32, coun
     if (next != try std.math.add(u32, lower, count)) return error.InvalidNativeLakeTextCorpus;
 }
 pub const FileGroup = struct {
+    sort_bounds: []const ?@import("lake_index_sort_bounds.zig").Bound = &.{},
     file: state.File,
     sources: []const source_spans.Span = &.{},
     source_pages: []const artifacts.ChunkRef = &.{},
     source_count: u32 = 0,
+    /// Borrowed decoded query view, never serialized into publication metadata.
+    source_view: ?source_spans.View = null,
+    source_paged: ?source_spans.Paged = null,
+    /// Writer evidence for efficient inverse-route deletion. Legacy manifests
+    /// delete every span start, a superset covering older uncoalesced routes.
+    coalesced_source_routes: bool = false,
     /// Historical v10 compaction coordinates, normalized before serving.
     members: []const Member = &.{},
     segments: []const artifacts.ChunkRef,
@@ -132,18 +171,37 @@ pub const FileGroup = struct {
     parts: []const []const source_spans.Span = &.{},
     masked: bool = false,
     live_collection: ?Collection = null,
+    pub fn jsonStringify(self: FileGroup, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(FileGroup).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "source_view") and !std.mem.eql(u8, field, "source_paged")) {
+                try stream.objectField(field);
+                try stream.write(@field(self, field));
+            }
+        }
+        try stream.endObject();
+    }
+    pub fn sourceLen(self: FileGroup) usize {
+        return if (self.source_paged) |paged| paged.count else if (self.source_view) |view| view.ranges.len else self.sources.len;
+    }
+    pub fn sourceAt(self: FileGroup, i: usize) source_spans.Span {
+        return if (self.source_view) |view| view.at(i) else self.sources[i];
+    }
     pub fn validate(self: FileGroup, domain: [32]u8) !void {
         if (self.source_pages.len != 0) {
-            if (self.source_count == 0 or self.source_count > source_spans.max_spans or self.sources.len != self.source_count) return error.InvalidNativeLakeTextCorpus;
+            if (self.source_count == 0 or self.source_count > source_spans.max_spans or self.sourceLen() != self.source_count) return error.InvalidNativeLakeTextCorpus;
             for (self.source_pages) |page| try text_directory.validateRef(page, domain);
         }
-        if (self.sources.len != 0) {
-            if (self.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
-            const last = self.sources[self.sources.len - 1];
-            try source_spans.validateMode(self.sources, if (self.admissions.len != 0) self.admissions[0].doc_count else try std.math.add(u32, last.pack_lower, last.count), domain, self.masked);
+        if (self.source_paged) |paged| {
+            if (self.segments.len != 1 or self.masked or self.source_view != null or self.sources.len != 0 or self.source_pages.len == 0 or self.source_count != paged.count or !std.mem.eql(u8, &paged.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
+        } else if (self.sourceLen() != 0) {
+            if (self.segments.len != 1 or (self.source_view != null and self.sources.len != 0)) return error.InvalidNativeLakeTextCorpus;
+            const last = self.sourceAt(self.sourceLen() - 1);
+            const count = if (self.admissions.len != 0) self.admissions[0].doc_count else try std.math.add(u32, last.pack_lower, last.count);
+            if (self.source_view) |view| try view.validateMode(count, domain, self.masked) else try source_spans.validateMode(self.sources, count, domain, self.masked);
         }
         if (self.parts.len != 0) {
-            if (self.sources.len != 0 or self.parts.len != self.segments.len or self.parts.len != self.admissions.len or self.live_collection == null or self.physical_manifest == null) return error.InvalidNativeLakeTextCorpus;
+            if (self.sourceLen() != 0 or self.parts.len != self.segments.len or self.parts.len != self.admissions.len or self.live_collection == null or self.physical_manifest == null) return error.InvalidNativeLakeTextCorpus;
             var live: u64 = 0;
             for (self.parts, self.admissions) |part, admission| {
                 try source_spans.validateMode(part, admission.doc_count, domain, true);
@@ -472,7 +530,7 @@ pub fn servingRootPublication(a: A, store: stores.ArtifactStore, outer: Root, to
 }
 fn servingRootInner(a: A, store: stores.ArtifactStore, outer: Root, token: Cancellation, cache: ?artifacts.CachedRead, publication: bool) !Root {
     const ref = outer.serving orelse outer.compacted orelse return outer;
-    const root = if (outer.serving != null) try loadRootDirectoryInner(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cache, publication) else (try loadRootDirectoryAutoInner(a, store, ref, token, cache, publication)).root;
+    const root = (try loadRootDirectoryAutoInner(a, store, ref, token, cache, publication)).root;
     if (root.serving != null or root.compacted != null or !rebuild.bindingsEqual(root.binding, outer.binding) or !std.mem.eql(u8, &root.recipe, &outer.recipe) or !std.mem.eql(u8, &root.domain, &outer.domain) or root.collection == null or outer.collection == null or root.collection.?.documents != outer.collection.?.documents or root.collection.?.fields.len != outer.collection.?.fields.len or root.stored_projection != outer.stored_projection or !std.mem.eql(u8, root.config_json, outer.config_json)) return error.InvalidNativeLakeTextCorpus;
     return root;
 }
@@ -1087,6 +1145,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     defer schema.deinit(a);
     const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, schema);
     defer local.storage_schema.freeSchema(a, runtime);
+    const index_sort = try mapper.indexSortFieldsForSchemaAlloc(a, runtime);
+    defer a.free(index_sort);
     var declarations: std.ArrayList(Declared) = .empty;
     errdefer declarations.deinit(out);
     for (desired.artifacts) |want| {
@@ -1103,6 +1163,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const config = try std.json.parseFromSliceLeaky(std.json.Value, ca, spec.config_json, .{});
         const store_source = try storesSource(config);
         const selected_field: ?[]const u8 = if (config.object.get("field")) |field| if (field == .string) field.string else null else null;
+        const effective_sort: []const local.segment.SegmentIndexSortField = if (selected_field != null and !store_source) &.{} else index_sort;
         var binding = want.binding;
         if (selected_field == null or store_source) {
             const paths = try ca.alloc([]const u8, runtime.relational_columns.len);
@@ -1112,7 +1173,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v12:{s}", .{want.binding.index_config_hash});
         const recipe = try sourceRecipe(ca, table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
-            if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
+            if (declaration.artifact.kind == .text_segment and (declaration.artifact.metadata_version == 13 or declaration.artifact.metadata_version == 14 or declaration.artifact.metadata_version == 16 or declaration.artifact.metadata_version == metadata_version) and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
         } else null;
         var exact_seed: ?Root = null;
         var seed_artifact: ?[]const u8 = null;
@@ -1133,7 +1194,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         var seed: ?Root = if (exact_seed) |root| root else for (candidates) |declaration| {
-            if (declaration.artifact.kind != .text_segment or declaration.artifact.metadata_version != metadata_version or !std.mem.eql(u8, declaration.name, want.name)) continue;
+            if (declaration.artifact.kind != .text_segment or (declaration.artifact.metadata_version != 13 and declaration.artifact.metadata_version != 14 and declaration.artifact.metadata_version != 16 and declaration.artifact.metadata_version != metadata_version) or !std.mem.eql(u8, declaration.name, want.name)) continue;
             var old = declaration.binding;
             old.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(old, binding)) continue;
@@ -1297,6 +1358,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             var summaries: std.ArrayList(?statistics.Ref) = .empty;
             var forwards: std.ArrayList(?statistics.Ref) = .empty;
             var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+            var sort_bounds: std.ArrayList(?@import("lake_index_sort_bounds.zig").Bound) = .empty;
             if (!changed) {
                 if (paged_seed or (baseline != null and reference_seed)) continue;
                 const previous_group = if (manifest_seed) try loadRecordedFile(fa, store.*, previous_refs.get(file.id) orelse return error.InvalidNativeLakeTextCorpus, seed.?.domain, cancellation) else previous_groups.get(file.id) orelse return error.InvalidNativeLakeTextCorpus;
@@ -1307,6 +1369,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 group.forwards = previous_group.forwards;
                 group.opening_packs = previous_group.opening_packs;
                 group.admissions = previous_group.admissions;
+                group.sort_bounds = previous_group.sort_bounds;
                 group.descriptors = previous_group.descriptors;
                 group.physical_manifest = previous_group.physical_manifest;
                 group.parts = previous_group.parts;
@@ -1339,7 +1402,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer capture_manager.deinit();
             var output_manager: local.sql_spill.Manager = .{ .alloc = a, .io = capture_manager.io, .context = &capture_check, .checkpoint = capture_manager.checkpoint, .max_bytes = 768 * 1024 * 1024, .async_writes = false };
             defer output_manager.deinit();
-            var compactor: Compactor = .{ .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .forwards = &forwards, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            var compactor: Compactor = .{ .index_sort = effective_sort, .ordered_coordinates = effective_sort.len != 0 and provider.fragment_rows != null and std.mem.startsWith(u8, source.inventory.files[file_ordinal].etag, "so1-"), .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .forwards = &forwards, .admissions = &admissions, .sort_bounds = &sort_bounds, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
             defer compactor.deinit();
             if (provider.rowsForFile(file_ordinal)) |selected| if (selected.len != 0 and selected.len < source.inventory.files[file_ordinal].row_count / 2 and file.key_digest != null) {
                 const old = if (previous_refs.get(file.id)) |record| try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation) else previous_groups.get(file.id);
@@ -1487,6 +1550,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
             group.statistics_replaces = compactor.statistics_replaces;
             group.admissions = admissions.items;
+            group.sort_bounds = if (sort_bounds.items.len == segments.items.len) sort_bounds.items else &.{};
             _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
@@ -1850,8 +1914,11 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
             try v.pages(entry.route.summary);
             if (v.maintenance_only) return;
             for (entry.source_pages) |page| try v.leaf(page);
-            const spans = if (entry.source_pages.len != 0 and entry.sources.len == 0) try source_spans.load(v.a, v.store, entry.source_pages, entry.source_count, v.domain, v.cancellation, null, null) else entry.sources;
-            for (spans) |span| try v.leaf(span.physical);
+            if (entry.source_pages.len != 0 and entry.sources.len == 0) {
+                const view = try source_spans.loadView(v.a, v.store, entry.source_pages, entry.source_count, v.domain, v.cancellation, null, null, false);
+                try view.validateMode(entry.interval.count, v.domain, entry.route.live.len != 0);
+                for (view.sources) |source| try v.leaf(source.physical);
+            } else for (entry.sources) |span| try v.leaf(span.physical);
             try v.leaf(entry.route.descriptor orelse return error.InvalidNativeLakeTextCorpus);
             try v.pages(entry.route.summary);
             try v.segment(entry.route.ref, true);
@@ -1899,6 +1966,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
         try validator.pages(root.directories.files);
         try validator.pages(root.directories.segments);
         try validator.pages(root.directories.routing);
+        try validator.pages(root.directories.ordered);
         try validator.pages(root.serving_inventory);
         try validator.pages(root.segment_files);
         try validator.pages(root.serving_routes);
@@ -1953,7 +2021,7 @@ pub fn checkpointBasePublication(a: A, store: stores.ArtifactStore, root: Root, 
 }
 fn checkpointBaseInner(a: A, store: stores.ArtifactStore, root: Root, cancellation: Cancellation, publication: bool) !Root {
     const ref = root.checkpoint_base orelse return error.InvalidNativeLakeTextCorpus;
-    const base = try loadRootDirectoryInner(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, null, publication);
+    const base = (try loadRootDirectoryAutoInner(a, store, ref, cancellation, null, publication)).root;
     if (base.checkpoint_base != null or base.serving == null or !std.mem.eql(u8, &base.domain, &root.domain) or !std.mem.eql(u8, &base.recipe, &root.recipe)) return error.InvalidNativeLakeTextCorpus;
     return base;
 }
@@ -2065,6 +2133,8 @@ const Compactor = struct {
     };
     a: A,
     encoder: ?*EncoderPipeline = null,
+    index_sort: []const local.segment.SegmentIndexSortField = &.{},
+    ordered_coordinates: bool = false,
     context: local.serverless_query_lake_read_context.Context = .{},
     row_patch: ?struct { base: FileGroup, rows: []const u64, intervals: []const []const text_directory.Interval = &.{} } = null,
     patch_arena: ?std.heap.ArenaAllocator = null,
@@ -2078,6 +2148,7 @@ const Compactor = struct {
     forward_complete: bool = true,
     statistics_replaces: ?[64]u8 = null,
     admissions: *std.ArrayList(local.segment.SegmentReader.Admission),
+    sort_bounds: ?*std.ArrayList(?@import("lake_index_sort_bounds.zig").Bound) = null,
     cancellation: Cancellation,
     file_ordinal: usize,
     opening: ?*@import("lake_index_text_opening_pack.zig").Collector = null,
@@ -2367,7 +2438,7 @@ const Compactor = struct {
         defer if (mapping) |*value| value.deinit();
         var sink = staged.sink();
         if (reusable) sink.term_observer.?.posting = null;
-        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = &.{.{ .field = "_id", .desc = false }}, .source_map = if (mapping) |*value| value else null });
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = if (self.ordered_coordinates) self.index_sort else &.{.{ .field = "_id", .desc = false }}, .source_map = if (mapping) |*value| value else null });
         try staged.seal();
         if (reusable and live != 0) {
             try mapping.?.finishOutput(live);
@@ -2484,6 +2555,7 @@ const Compactor = struct {
         var reader = try local.segment.SegmentReader.initSource(a, source);
         defer reader.deinit();
         try self.admissions.append(out, try reader.admission(out));
+        if (self.sort_bounds) |bounds| try bounds.append(out, try @import("lake_index_sort_bounds.zig").Bound.fromReader(out, &reader));
         const contributions: statistics.Contributions = .{ .global = self.global, .directory = self.directory, .segment = term_directory.identity(ref.artifact_id) };
         const summary = (if (captured != null and !captured.?.disabled) captured.?.publishConsuming(store, cancellation, self.io, contributions) else statistics.publishReaderConsuming(a, store, &reader, cancellation, self.io, contributions)) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
         if (self.forwards) |list| {
@@ -2496,7 +2568,7 @@ const Compactor = struct {
     }
 };
 fn flush(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, store_source: bool) !void {
-    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .index_sort = compactor.index_sort });
 }
 fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, build_options: mapper.BuildTextSegmentsOptions) !void {
     try compactor.finishEncoding();
@@ -2573,7 +2645,9 @@ const EncoderPipeline = struct {
         adaptive.threshold = threshold;
         var sink = adaptive.sink();
         sink.term_observer = if (captured) |value| value.observer() else null;
-        try mapper.writeTextSegmentFromProjectionBatchToSink(workspace, chunk, analysis_, options, &sink);
+        var verified_options = options;
+        verified_options.attest_index_sort_in_place = true;
+        try mapper.writeTextSegmentFromProjectionBatchToSink(workspace, chunk, analysis_, verified_options, &sink);
         if (captured) |value| try value.seal();
         return if (adaptive.staged) |staged| blk: {
             try staged.seal();
@@ -2699,7 +2773,7 @@ fn flushRetained(compactor: *Compactor, arena: *std.heap.ArenaAllocator, leases:
             arena.* = .init(compactor.a);
             leases.* = .{};
             transferred = true;
-            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .index_sort = compactor.index_sort });
             return;
         }
     }
@@ -2774,12 +2848,38 @@ test "external lake text statistics wire upgrade fences new roots and admits his
     var ref: Ref = .{ .kind = .text_segment, .metadata_version = 9, .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
     const recovered = try loadRootDirectory(ca, store, ref, .none, null);
     try std.testing.expectEqual(metadata_version, recovered.version);
+    var v13 = legacy;
+    v13.version = 13;
+    const v13_bytes = try std.json.Stringify.valueAlloc(ca, v13, .{});
+    var v13_uploaded = try store.putWithCancellation(v13_bytes, .none);
+    defer v13_uploaded.deinit(a);
+    const retained_v13 = try loadRootDirectory(ca, store, .{ .kind = .text_segment, .metadata_version = 13, .artifact_id = v13_uploaded.artifact_id, .checksum = v13_uploaded.checksum, .byte_len = v13_uploaded.byte_len }, .none, null);
+    try std.testing.expectEqual(metadata_version, retained_v13.version);
     // Metadata identity is checked against the authenticated body before any
     // normalization. Neither future formats nor a falsely advertised v10 pass.
     ref.metadata_version = metadata_version;
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadRootDirectory(ca, store, ref, .none, null));
     ref.metadata_version = metadata_version + 1;
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadRootDirectory(ca, store, ref, .none, null));
+    var historical = legacy;
+    historical.version = 11;
+    historical.collection = .{ .documents = 0, .fields = &.{} };
+    const old_inner_bytes = try std.json.Stringify.valueAlloc(ca, historical, .{});
+    var old_inner = try store.putWithCancellation(old_inner_bytes, .none);
+    defer old_inner.deinit(a);
+    const old_inner_ref: artifacts.ChunkRef = .{ .artifact_id = old_inner.artifact_id, .checksum = old_inner.checksum, .byte_len = old_inner.byte_len };
+    historical.serving = old_inner_ref;
+    const old_outer_bytes = try std.json.Stringify.valueAlloc(ca, historical, .{});
+    var old_outer = try store.putWithCancellation(old_outer_bytes, .none);
+    defer old_outer.deinit(a);
+    const old_outer_ref: artifacts.ChunkRef = .{ .artifact_id = old_outer.artifact_id, .checksum = old_outer.checksum, .byte_len = old_outer.byte_len };
+    const old_root = (try loadRootDirectoryAuto(ca, store, old_outer_ref, .none, null)).root;
+    const old_serving = try servingRoot(ca, store, old_root, .none, null);
+    try std.testing.expectEqual(metadata_version, old_serving.version);
+    var current = old_root;
+    current.checkpoint_base = old_outer_ref;
+    const checkpoint = try checkpointBasePublication(ca, store, current, .none);
+    try std.testing.expectEqual(metadata_version, checkpoint.version);
     try std.testing.expect(metadata_version > 9 and local.metadata_lake_index_catalog.native_reader_protocol > 33);
 }
 

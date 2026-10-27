@@ -525,6 +525,22 @@ func (c *InferenceClient) decide(ctx context.Context, body oapi.DecisionRequest)
 	return resp.JSON200, nil
 }
 
+// Read reads image batches or complete PDF/PPTX document sources. Document
+// results retain page/slide identity and may explicitly report unresolved pages.
+func (c *InferenceClient) Read(ctx context.Context, req oapi.InferenceReadRequest) (*oapi.InferenceReadResponse, error) {
+	resp, err := c.client.ReadImagesWithResponse(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("sending read request: %w", err)
+	}
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
+	}
+	if resp.JSON200 == nil {
+		return nil, fmt.Errorf("unexpected empty read response (status %d)", resp.StatusCode())
+	}
+	return resp.JSON200, nil
+}
+
 // Extract runs schema-driven extraction through the canonical Antfly inference
 // extraction endpoint.
 func (c *InferenceClient) Extract(ctx context.Context, req oapi.ExtractionRequest) (*oapi.ExtractionResponse, error) {

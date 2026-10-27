@@ -16,6 +16,8 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
+    _ = @import("serverless/configured_object_store_support.zig");
+    _ = @import("api/lake_ordering_keys.zig");
     _ = @import("api/lake_native_refresh_test.zig");
     _ = @import("serverless/lake_wal.zig");
     _ = @import("serverless/lake_ingestion.zig");
@@ -65,6 +67,7 @@ test {
     _ = @import("api/lake_row_identity_reader.zig");
     _ = @import("api/lake_row_identity.zig");
     _ = @import("api/lake_row_fragments.zig");
+    _ = @import("api/lake_row_input_recipes.zig");
     _ = @import("api/lake_row_payloads.zig");
     _ = @import("api/lake_index_page_ranges.zig");
     _ = @import("api/lake_index_navigation_pages.zig");

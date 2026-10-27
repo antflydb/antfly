@@ -826,8 +826,12 @@ pub const KvStorageRuntime = struct {
     /// Request-local CUDA FP16 reservation. No token is made visible and no
     /// device allocation occurs until its layer receives a real suffix write.
     pub fn reserveDeviceTokenCapacity(self: *KvStorageRuntime, sequence_id: SequenceId, token_capacity: usize, token_limit: usize) !void {
-        if (self.storage.config.backend != .cuda or self.storage.config.dtype != .f16 or
-            self.storage.config.sliding_window_size != null) return error.DeviceWriteUnsupported;
+        if (self.storage.config.backend != .cuda or self.storage.config.dtype != .f16) return error.DeviceWriteUnsupported;
+        // A finite context bound is compatible with stable reserved slots
+        // when the entire reservation stays below it: no trim can occur in
+        // that interval. Preserve the configured retention limit unchanged.
+        if (self.storage.config.sliding_window_size) |window|
+            if (token_limit > window) return error.DeviceWriteUnsupported;
         const page_size: usize = self.storage.config.page_size_tokens;
         if (page_size == 0 or token_capacity == 0 or token_capacity > token_limit) return error.KvCapacityTooSmall;
         const initial_pages = try std.math.divCeil(usize, token_capacity, page_size);
@@ -1587,4 +1591,32 @@ test "KvStorageRuntime denied tail table growth returns the acquired block befor
     try std.testing.expectEqual(id, try runtime.reserveTailBlock(sequence));
     try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(id).?.refcount);
     try runtime.releaseSequence(sequence);
+}
+
+test "LightOnOCR3 CUDA graph reservation remains within a finite retention window" {
+    const allocator = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(allocator, .{
+        .backend = .cuda,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+        .sliding_window_size = 16,
+    });
+    defer runtime.deinit();
+    const sequence = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(sequence, 2);
+    const before = runtime.storage.liveBlocks();
+    try std.testing.expectError(error.DeviceWriteUnsupported, runtime.reserveDeviceTokenCapacity(sequence, 10, 17));
+    try std.testing.expectEqual(before, runtime.storage.liveBlocks());
+    try std.testing.expectEqual(@as(usize, 0), (try runtime.sequenceMut(sequence)).device_capacity_limit_tokens);
+    try runtime.reserveDeviceTokenCapacity(sequence, 10, 16);
+    try std.testing.expectEqual(@as(?usize, 2), runtime.tokenCount(sequence));
+    try std.testing.expectEqual(@as(?u32, 16), runtime.storage.config.sliding_window_size);
+    try std.testing.expectEqual(@as(usize, 12), (try runtime.sequenceMut(sequence)).initial_device_capacity_tokens);
+    try std.testing.expectEqual(@as(usize, 16), (try runtime.sequenceMut(sequence)).device_capacity_limit_tokens);
+    try runtime.appendTokens(sequence, 14);
+    try std.testing.expectEqual(@as(usize, 0), try runtime.trimSequenceToSlidingWindow(sequence));
+    try std.testing.expectEqual(@as(?usize, 16), runtime.tokenCount(sequence));
 }

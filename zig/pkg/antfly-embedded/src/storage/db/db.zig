@@ -430,7 +430,7 @@ const RowPolicyOutputCheckpoint = struct {
     }
 };
 const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
-const public_schema_json_key = "\x00\x00__metadata__:schema_json";
+const public_schema_json_key = @import("../internal_keys.zig").public_schema_json_key;
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 // Legacy singleton keys remain readable for crash recovery across upgrades.
 const replication_batch_outbox_key = durable_outbox.replication_batch_outbox_key;
@@ -3111,11 +3111,27 @@ const DocumentPrimaryReadWindow = struct {
 };
 const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
 
+var next_query_schema_identity: std.atomic.Value(u64) = .init(1);
+
 pub const DB = struct {
     pub fn createStandaloneResourceManager(allocator: Allocator) !*resource_manager_mod.ResourceManager {
         return resource_manager_mod.SharedResourceManager.create(allocator, standaloneResourceManagerOptions(allocator));
     }
 
+    /// Content-only proof for this physical owner and immutable catalog cut.
+    /// Native heads, grants and live logical bindings are validated separately.
+    pub const ResolverQuerySchemaEpoch = struct {
+        instance: u64,
+        core: usize,
+        namespace: DocIdentityNamespace,
+        catalog: u64,
+        schema_generation: u64,
+        schema_version: ?u32,
+    };
+    query_schema_identity: std.atomic.Value(u64) = .init(0),
+    resolver_query_schema_mutex: std.atomic.Mutex = .unlocked,
+    resolver_query_schema_epoch: ?ResolverQuerySchemaEpoch = null,
+    resolver_query_schema_digest: [32]u8 = undefined,
     /// Installed only after immutable query-cut admission. Never persisted.
     retained_value_scope: ?@import("../../search/value_membership.zig").Scope = null,
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
@@ -3406,6 +3422,15 @@ pub const DB = struct {
         failed_check: ?u16,
     };
 
+    /// A process-local incarnation prevents epoch ABA across reopened or
+    /// refreshed immutable DB snapshots, including allocator address reuse.
+    pub fn querySchemaIdentity(self: *DB) u64 {
+        const existing = self.query_schema_identity.load(.acquire);
+        if (existing != 0) return existing;
+        const fresh = next_query_schema_identity.fetchAdd(1, .monotonic);
+        std.debug.assert(fresh != 0);
+        return self.query_schema_identity.cmpxchgStrong(0, fresh, .acq_rel, .acquire) orelse fresh;
+    }
     pub fn constraintValidationStatus(self: *DB) !ConstraintValidationStatus {
         if (comptime storage_engine.enabled) return storage_engine.call("constraintValidationStatus", .{self});
         try self.lockApplySharedForPortableRuntime();
@@ -12480,7 +12505,7 @@ pub const DB = struct {
         for (state.entries.items) |entry| {
             var unavailable = indexRepairIntentBlocksService(entry.intent);
             if (!unavailable) {
-                if (entry.intent.trigger == .incomplete_bulk_publish) {
+                if ((entry.intent.trigger == .incomplete_bulk_publish or entry.intent.trigger == .text_projection_upgrade)) {
                     const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.intent.index_name);
                     unavailable = checkpoint.status != .clean or checkpoint.config_hash != entry.intent.config_hash;
                 }
@@ -12564,7 +12589,7 @@ pub const DB = struct {
             }
             return;
         }
-        if (!unavailable and intent.trigger == .incomplete_bulk_publish) {
+        if (!unavailable and (intent.trigger == .incomplete_bulk_publish or intent.trigger == .text_projection_upgrade)) {
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, index_name);
             unavailable = checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash;
         }
@@ -13021,7 +13046,7 @@ pub const DB = struct {
         // admission; the ordinary replay-repair exception is not authority.
         if (intent.work_class == .initial_build) return intent.phase != .cleanup;
         return switch (intent.trigger) {
-            .incomplete_bulk_publish => intent.phase != .cleanup,
+            .incomplete_bulk_publish, .text_projection_upgrade => intent.phase != .cleanup,
             // Only an operator-requested rebuild starts from a generation that
             // is still proven healthy. Coverage mismatch or missing proof is
             // fail-closed until replacement validation publishes cleanup.
@@ -14284,7 +14309,7 @@ pub const DB = struct {
             .operator_generation_rebuild, .operator_generation_validation, .storage_format_migration, .artifact_baseline_adoption => 0,
             .artifact_coverage_mismatch, .replay_artifact_unavailable => 1,
             .artifact_counter_missing => 2,
-            .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid, .catalog_admission => 3,
+            .incomplete_bulk_publish, .text_projection_upgrade, .root_generation_rebuild, .projection_generation_invalid, .catalog_admission => 3,
         };
     }
 
@@ -15359,10 +15384,20 @@ pub const DB = struct {
                 },
                 .rebuild_from_artifacts => {},
             }
-            // Both allowlisted publication failures are currently HBC dense
-            // index failures. Do not let future reuse of either error name
-            // silently broaden automatic reconstruction.
-            if (cfg.kind != .dense_vector) {
+            // Re-audit the exact producer/kind pair before admitting durable
+            // mutation work. A verified text projection upgrade uses the same
+            // leader-owned shadow generation machinery as dense recovery.
+            const failure = self.core.index_manager.failedIndexLoadSnapshot(cfg.name) orelse {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            };
+            if (!failure.token.eql(candidate.token)) {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            }
+            if (!index_manager_mod.IndexManager.automaticLoadRebuildSupported(cfg.kind, failure.err_name)) {
                 result.terminal += 1;
                 candidate.classified = true;
                 continue;
@@ -15385,6 +15420,7 @@ pub const DB = struct {
                 .root_generation = state_identity.root_generation,
                 .index_name = index_name,
                 .kind = cfg.kind,
+                .trigger = if (cfg.kind == .full_text) .text_projection_upgrade else .incomplete_bulk_publish,
                 .config_hash = types.indexConfigHash(cfg),
                 .detected_sequence = target_sequence,
                 .target_sequence = target_sequence,
@@ -15867,12 +15903,12 @@ pub const DB = struct {
                 return result;
             }
         }
-        // Only startup discovery creates incomplete_bulk_publish intents, so
+        // Only startup discovery creates publication/projection-upgrade intents, so
         // this durable provenance is the authority to reclaim quarantine
         // ownership. Operator and generation-health intents may coexist with
         // retry/manual load failures but must not be reclassified as automatic
         // destructive recovery merely because they share an index name.
-        if (entry.intent.trigger == .incomplete_bulk_publish and
+        if ((entry.intent.trigger == .incomplete_bulk_publish or entry.intent.trigger == .text_projection_upgrade) and
             entry.intent.phase != .rolling_back)
         {
             // Retryable terminal phases release their quarantine claim so an
@@ -19289,8 +19325,8 @@ pub const DB = struct {
                 const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                 break :blk try std.json.Stringify.valueAlloc(a, ready, .{});
             },
-            .retirement => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").load(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try (try @import("artifact_inventory.zig").catalogs(&read)).semanticDigest(owned))), .{}),
-            .retirement_page => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").preparePage(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try (try @import("artifact_inventory.zig").catalogs(&read)).semanticDigest(owned))), .{}),
+            .retirement => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").load(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try self.core.index_manager.artifact_semantic_cache.get(owned, try @import("artifact_inventory.zig").catalogs(&read)))), .{}),
+            .retirement_page => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").preparePage(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try self.core.index_manager.artifact_semantic_cache.get(owned, try @import("artifact_inventory.zig").catalogs(&read)))), .{}),
             .backfill_page => try std.json.Stringify.valueAlloc(a, try baseline.preparePage(owned, &read, query.definition, baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation)), .{}),
             .readiness => blk: {
                 const completion = @import("artifact_completion_progress.zig");
@@ -32224,6 +32260,25 @@ pub const DB = struct {
         return try self.core.deleteEnrichment(kind, name);
     }
 
+    pub fn resolverReplayObservation(self: *DB, alloc: Allocator) !types.ResolverReplayObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolverReplayObservation", .{ self, alloc });
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var result: types.ResolverReplayObservation = .{
+            .backfill_pending = try resolution_runtime_mod.hasDurableReresolveBacklog(self.core.store),
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
+        };
+        if (self.core.nextDerivedSequence() == 0) {
+            const count = try @import("range_cardinality.zig").loadOrProveEmpty(alloc, self.core.store);
+            result.empty = count != null and count.? == 0;
+        }
+        result.resolution.blocked_reason = try alloc.dupe(u8, result.resolution.blocked_reason);
+        errdefer alloc.free(result.resolution.blocked_reason);
+        result.promotion.blocked_reason = try alloc.dupe(u8, result.promotion.blocked_reason);
+        return result;
+    }
+
     pub fn pendingWorkStats(self: *DB) db_core.PendingWorkStats {
         if (comptime storage_engine.enabled) return storage_engine.call("pendingWorkStats", .{self}) catch @panic("incompatible storage owner");
         return .{
@@ -37430,6 +37485,7 @@ pub const DB = struct {
             item.repair_degraded = false;
         } else switch (intent.trigger) {
             .incomplete_bulk_publish,
+            .text_projection_upgrade,
             .root_generation_rebuild,
             .projection_generation_invalid,
             .operator_generation_validation,
@@ -83233,6 +83289,10 @@ test "db enrichments precomputes generated enrichments into the committed batch"
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
+        // Inspect the foreground transaction and its exact first watermark.
+        // Independent replay may legitimately publish another observation.
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
@@ -111631,6 +111691,81 @@ test "db completed managed admission emits an initial build clear edge" {
     try std.testing.expectEqual(IndexRepairAdmission.serviceable, hook.admission.?);
 }
 
+test "db managed admission cannot deadlock replay coverage deletion" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("coverage-catalog-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copied\"}]}" });
+    const manager = db.core.index_manager;
+    // Retain the current plan without filling the single-flight cache. Replay
+    // must use this plan even when a new admission makes the cache cold.
+    manager.invalidateWritePlanSnapshot();
+    var plan = try manager.writePlanSnapshotAlloc(a);
+    defer plan.deinit();
+    var guard = try manager.lockManagedIndexApply(.{ .name = "text", .kind = .full_text });
+    defer guard.unlock();
+    const State = struct {
+        db: *DB,
+        plan: *const index_manager_mod.IndexManager.WritePlanSnapshot,
+        cancel: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        deletion_error: ?anyerror = null,
+        writer_error: ?anyerror = null,
+        fn write(self: *@This()) void {
+            self.db.core.index_manager.catalog_mutex.lockExclusiveIo(std.testing.io, @as(?types.CancellationToken, types.CancellationToken.fromAtomic(&self.cancel))) catch |err| {
+                self.writer_error = err;
+                return;
+            };
+            self.db.core.index_manager.catalog_mutex.unlockExclusive();
+        }
+        fn erase(self: *@This()) void {
+            defer self.done.store(true, .release);
+            local_mutation.deleteDerivedCoverageForDocKeysWithPlan(std.testing.allocator, self.db.core.store, self.db.core.index_manager, "text", &.{"doc"}, self.plan) catch |err| {
+                self.deletion_error = err;
+            };
+        }
+    };
+    var state = State{ .db = &db, .plan = &plan };
+    const writer = try std.Thread.spawn(.{}, State.write, .{&state});
+    var writer_joined = false;
+    defer if (!writer_joined) {
+        state.cancel.store(true, .release);
+        writer.join();
+    };
+    const catalog = &manager.catalog_mutex;
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (catalog.exclusive_waiters.load(.acquire) == 0 and monotonicTimeNs() < deadline)
+        @import("antfly_platform").time.yieldNow();
+    try std.testing.expect(catalog.exclusive_waiters.load(.acquire) != 0);
+    const deletion = try std.Thread.spawn(.{}, State.erase, .{&state});
+    var deletion_joined = false;
+    defer if (!deletion_joined) {
+        state.cancel.store(true, .release);
+        deletion.join();
+    };
+    while (!state.done.load(.acquire) and catalog.shared_waiters.load(.acquire) == 0 and monotonicTimeNs() < deadline)
+        @import("antfly_platform").time.yieldNow();
+    const nested = catalog.shared_waiters.load(.acquire) != 0;
+    const completed_without_canceling_writer = state.done.load(.acquire);
+    // Rescue the old nested-acquisition path so a regression fails promptly
+    // and joins both threads instead of hanging the unit process.
+    state.cancel.store(true, .release);
+    writer.join();
+    writer_joined = true;
+    deletion.join();
+    deletion_joined = true;
+    try std.testing.expect(!nested and completed_without_canceling_writer);
+    try std.testing.expectEqual(@as(?anyerror, null), state.deletion_error);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), state.writer_error);
+}
+
 test "db managed admission rejects regressed identity evidence" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -120394,6 +120529,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     // boundary and producer assistance are deterministic.
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
+        .start_optional_runtime_workers = false,
     });
     defer db.close();
 
@@ -120420,6 +120556,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         _ = try db.indexTextKernelDocuments("ft_v1", &docs);
     }
 
+    // Disabling derived workers alone does not stop optional merge workers.
+    // This fixture owns the scheduler directly until its explicit runtimes start.
+    if (db.text_merge_runtime) |automatic| try std.testing.expect(!automatic.isStarted());
     const before = db.core.index_manager.textMergeStatsSnapshot();
     try std.testing.expect(before.pending_segments > 8);
 
@@ -120427,7 +120566,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var held_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
     var held_task_active = true;
     defer if (held_task_active) {
+        resources.apply_mutex.lockExclusive();
         resources.index_manager.cancelTextMergeTask(&held_task);
+        resources.apply_mutex.unlockExclusive();
         held_task.deinit(resources.index_manager.alloc);
     };
 
@@ -120474,7 +120615,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     byte_permit.release();
     byte_only_runtime.deinit();
 
+    resources.apply_mutex.lockExclusive();
     resources.index_manager.cancelTextMergeTask(&held_task);
+    resources.apply_mutex.unlockExclusive();
     held_task.deinit(resources.index_manager.alloc);
     held_task_active = false;
 
@@ -120495,6 +120638,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
 
     const outcome = runtime.applyBackpressure();
     try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.drained, outcome);
+    // Retire the worker before comparing two separately acquired snapshots;
+    // crossing the low watermark does not promise the scheduler stays idle.
+    _ = runtime.stop();
 
     const after = runtime.stats();
     try std.testing.expect(after.pending_segments <= 4);
@@ -120641,7 +120787,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     // process-wide byte dimension. A younger request for another index must
     // not consume the remaining bytes merely because the older waiter is also
     // blocked on its index-local segment ceiling.
-    const mixed_byte_limit = resources.index_manager.textMergeStatsSnapshot().pending_bytes +| 100;
+    const mixed_byte_limit = runtime.stats().pending_bytes +| 100;
     var mixed_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
         alloc,
         resources.index_manager,

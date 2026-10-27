@@ -687,6 +687,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_benchmark_lake_archive.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
           tools/test_test_cache_lifetime.py
@@ -1231,6 +1232,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_benchmark_lake_archive.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
           tools/test_test_cache_lifetime.py
@@ -1916,7 +1918,17 @@ jobs:
       - name: Test embedded SDK against the installed C ABI
         env:
           ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/embedded-sdk-native-models
+          ANTFLY_SDK_NATIVE_REPORT_DIR: ${{ runner.temp }}/embedded-sdk-native-reports
         run: scripts/ci/test-embedded-sdk-native.sh "${RUNNER_TEMP}/native-sdk" "${{ matrix.sdk }}"
+
+      - name: Retain Python native test results and timings
+        if: always() && matrix.sdk == 'python'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: embedded-sdk-python-results-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/embedded-sdk-native-reports
+          if-no-files-found: ignore
+          retention-days: 14
 
   pgwire-driver-conformance:
     if: >-

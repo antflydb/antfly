@@ -252,3 +252,23 @@ Inline media uses `{"type": "media", "mime_type": ..., "data": ...}` with base64
 data; immutable HTTP/S3 sources use a version-pinned source reference. See the
 [shared contract](../../../docs/plans/model-aware-media-chunking.md) for policies,
 security, limits and database integration.
+
+### Reliable writes and cursor reads (0.2.1)
+
+`batch(..., sync_level="full_index")` returns a typed `BatchResponse`. Inspect
+`status`: `committed_pending` has not established requested visibility, while
+`committed_repair_required` means the document committed but materialization
+needs repair. Do not replay a committed mutation to repair indexing. Timeouts
+can have unknown commit outcomes; this client does not automatically retry them.
+Atomic `transforms` are accepted as a list of mappings.
+
+Lookup raises `AntflyNotFoundError` only for HTTP 404; other HTTP errors retain
+`status_code` on `AntflyHTTPError`. `get(..., fields=["_embeddings"])` reads
+persisted vectors, and `get_with_version()` returns the document and exact OCC
+version token. Ordered pagination must replay the response's `remote_snapshot`
+alongside `search_after`; `query()` exposes both.
+
+`embed()`, `rerank()`, and `models()` provide bounded public inference JSON
+access. `request()` is the public authenticated transport for other `/db/v1/`
+and `/ai/v1/` operations. Use `close()` or a context manager to release the
+client's HTTP pool.

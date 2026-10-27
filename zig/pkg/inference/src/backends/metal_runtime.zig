@@ -1097,11 +1097,21 @@ fn getenvFlagEnabled(comptime name: [*:0]const u8) bool {
 /// Qualified serving defaults share one hardware policy. Explicit false values
 /// disable a feature; explicit true values still allow qualification elsewhere.
 /// Model and request eligibility remain the responsibility of each caller.
-pub fn qualifiedM4FeatureEnabled(comptime name: [*:0]const u8, default_eligible: bool) bool {
+/// One opt-in serving preset; individual explicit overrides remain authoritative.
+/// Precision and admission limits are not changed by this profile.
+pub fn lightOnThroughputProfileEnabled() bool {
+    return @import("antfly_platform").env.getenvBool("ANTFLY_LIGHTONOCR3_THROUGHPUT") and appleSimdgroupDeviceDefault();
+}
+
+pub fn lightOnThroughputFeatureEnabled(comptime name: [*:0]const u8) bool {
+    return @import("antfly_platform").env.getenvBoolDefault(name, lightOnThroughputProfileEnabled());
+}
+
+pub fn appleSimdgroupFeatureEnabled(comptime name: [*:0]const u8, default_eligible: bool) bool {
     // HTTP admission can first read a flag from several concurrent callers.
     // Use the stateless parser here; the hardware decision is initialized once
     // in Metal. No mutable per-flag cache is needed on these serving paths.
-    return @import("antfly_platform").env.getenvBoolDefault(name, default_eligible and qualifiedM4DeviceDefault());
+    return @import("antfly_platform").env.getenvBoolDefault(name, default_eligible and appleSimdgroupDeviceDefault());
 }
 
 fn a4bHighMemoryFastPathEnabled() bool {
@@ -3834,12 +3844,12 @@ fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntimeWithFlush(
     const sink_count: usize = if (sinks) |slice| slice.len else 0;
 
     const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
-    var output = try MetalTensor.deviceAllocate(
-        @ptrCast(runtime),
-        q_rows * attention_input_size * @sizeOf(f32),
-        .private,
-        &attention_shape,
-    );
+    const destination: ?MetalTensor = if (@hasField(@TypeOf(request), "destination")) request.destination else null;
+    const output_bytes = q_rows * attention_input_size * @sizeOf(f32);
+    var output = if (destination) |target| blk: {
+        if (!target.isDevice() or target.elemCount() != q_rows * attention_input_size or target.deviceByteLen() != output_bytes) return error.InvalidAttentionShape;
+        break :blk try target.retainedView(0, output_bytes, &attention_shape);
+    } else try MetalTensor.deviceAllocate(@ptrCast(runtime), output_bytes, .private, &attention_shape);
     errdefer output.deinit();
 
     const rc = if (key_positions) |positions|
@@ -3967,12 +3977,12 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnFrame(
     if (request.page_size == 0 or request.block_token_offsets.len == 0) return null;
 
     const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
-    var output = try MetalTensor.deviceAllocate(
-        @ptrCast(frame_runtime),
-        q_rows * attention_input_size * @sizeOf(f32),
-        .private,
-        &attention_shape,
-    );
+    const destination: ?MetalTensor = if (@hasField(@TypeOf(request), "destination")) request.destination else null;
+    const output_bytes = q_rows * attention_input_size * @sizeOf(f32);
+    var output = if (destination) |target| blk: {
+        if (!target.isDevice() or target.elemCount() != q_rows * attention_input_size or target.deviceByteLen() != output_bytes) return error.InvalidAttentionShape;
+        break :blk try target.retainedView(0, output_bytes, &attention_shape);
+    } else try MetalTensor.deviceAllocate(@ptrCast(frame_runtime), output_bytes, .private, &attention_shape);
     errdefer output.deinit();
 
     const rc = termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
@@ -10888,6 +10898,37 @@ pub fn tryRawLinearHost(
     }
 }
 
+pub extern fn antfly_metal_lighton_prefill_ffn_enabled(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn antfly_metal_lighton_prefill_ffn_can_apply(runtime: ?*RawMetalDecodeRuntime, gate: usize, up: usize, down: usize, rows: usize, hidden: usize, intermediate: usize) c_int;
+pub extern fn antfly_metal_lighton_prefill_ffn_apply(runtime: ?*RawMetalDecodeRuntime, gate: usize, up: usize, down: usize, rows: usize, hidden: usize, intermediate: usize, input: ?*anyopaque, input_offset: usize, norm: ?*anyopaque, norm_offset: usize, gated: ?*anyopaque, gated_offset: usize, output: ?*anyopaque, output_offset: usize) c_int;
+
+pub fn lightOnPrefillFfnEnabled(self: anytype) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return antfly_metal_lighton_prefill_ffn_enabled(runtime) != 0;
+}
+
+/// Private BF16 scratch preserves the prefill operands without allocating
+/// unused F32 capacity. Only the final F32 tensor is exposed to the model.
+pub fn decoderRuntimeTryApplyLightOnPrefillFfn(self: anytype, request: anytype) !?MetalTensor {
+    if (request.activation != .silu or !request.input.isDevice() or request.input.ndim() != 2 or
+        request.input.dim(0) <= 0 or request.input.dim(1) <= 0 or request.input.deviceByteOffset() % 16 != 0 or
+        @as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return null;
+    const runtime = self.raw_decode_runtime orelse return null;
+    const rows: usize = @intCast(request.input.dim(0));
+    if (antfly_metal_lighton_prefill_ffn_can_apply(runtime, request.gate_slot, request.up_slot, request.down_slot, rows, request.hidden_size, request.intermediate_size) == 0) return null;
+    const hidden_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, request.hidden_size), @sizeOf(f32));
+    // i16 is a two-byte storage carrier; the Metal kernels read BF16 bits.
+    var norm_scratch = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, .i16, .private, &.{ @intCast(rows), @intCast(request.hidden_size) });
+    defer norm_scratch.deinit();
+    var gated_scratch = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, .i16, .private, &.{ @intCast(rows), @intCast(request.intermediate_size) });
+    defer gated_scratch.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, hidden_bytes, .private, &.{ @intCast(rows), @intCast(request.hidden_size) });
+    errdefer output.deinit();
+    const rc = antfly_metal_lighton_prefill_ffn_apply(runtime, request.gate_slot, request.up_slot, request.down_slot, rows, request.hidden_size, request.intermediate_size, request.input.deviceHandle(), request.input.deviceByteOffset(), norm_scratch.deviceHandle(), norm_scratch.deviceByteOffset(), gated_scratch.deviceHandle(), gated_scratch.deviceByteOffset(), output.deviceHandle(), output.deviceByteOffset());
+    if (rc != 0) return error.MetalLightOnPrefillFfnFailed;
+    return output;
+}
+
 /// BF16 gate/up projection plus SiLU/multiply. The raw selector admits measured
 /// device/shapes by default and explicit experiments elsewhere. Capability or
 /// rollout misses retain the FFN fallback; admitted failures propagate to cleanup.
@@ -10896,7 +10937,8 @@ pub fn decoderRuntimeTryApplyBf16GateUp(self: anytype, request: anytype) !?Metal
         getenvFlagEnabled("TERMITE_METAL_DISABLE_BF16_MM") or
         getenvFlagEnabled("TERMITE_METAL_DISABLE_BF16_TILED")) return null;
     if (request.activation != .silu or !request.input.isDevice() or request.input.ndim() != 2) return null;
-    if (request.input.dim(0) < 32 or request.input.dim(1) <= 0 or
+    // The C selector admits qualified OCR cohorts and declines unsupported rows.
+    if (request.input.dim(0) <= 0 or request.input.dim(1) <= 0 or
         @as(usize, @intCast(request.input.dim(1))) != request.in_dim) return null;
     const runtime = self.raw_decode_runtime orelse return null;
     const rows: usize = @intCast(request.input.dim(0));
@@ -13446,7 +13488,7 @@ test "metal prefill direct KV is selected-only, bounded, rollback-safe, and coun
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "params.contiguous_blocks = 1u"));
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, "termite_metal_record_prefill_kv_route(runtime, use_prefill_direct_kv)"));
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "apple_gpu_family == 9u && [device.name hasPrefix:@\"Apple M4\"]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "[device supportsFamily:MTLGPUFamilyApple7]"));
     try std.testing.expect(std.mem.indexOf(u8, source, "TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD").? <
         std.mem.indexOf(u8, source, "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD").?);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD"));
@@ -13469,7 +13511,7 @@ test "metal prepared frame fast path is qualified, diagnosable, and shares lifec
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_FORCE_DIAGNOSTIC_COMMAND_BUFFERS"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "apple_gpu_family == 9u && [device.name hasPrefix:@\"Apple M4\"]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "[device supportsFamily:MTLGPUFamilyApple7]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "id<MTLCommandBuffer> command_buffer = [queue commandBuffer]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->workload_profile_active == 0"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->prepared_frame_diagnostics_forced = termite_metal_prepared_frame_diagnostics_enabled()"));
@@ -13570,7 +13612,7 @@ test "A4B exact-shape expert kernels have an umbrella gate and rollback" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint32_t route_values[8] = { 0u, 17u, 33u, 49u, 65u, 81u, 97u, 127u }"));
 }
 
-test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host dispatch" {
+test "metal Q4_0 MMV portfolio is Apple SIMD-group eligible, observable, and cloned into host dispatch" {
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
@@ -13585,13 +13627,13 @@ test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host
     }) |environment_name| {
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, environment_name));
     }
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const BOOL is_m4_gemma4_ffn = runtime->apple_m4_device"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const BOOL is_gemma4_ffn = runtime->apple_simdgroup_device"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "global_override != TERMITE_METAL_Q4_0_MMV_VARIANT_AUTO"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->q4_0_mmv_workload_variant_overrides[workload]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, ".q4_0_mmv_workload = TERMITE_METAL_Q4_0_MMV_WORKLOAD_ATTENTION"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, ".q4_0_mmv_workload = TERMITE_METAL_Q4_0_MMV_WORKLOAD_FFN_GATE_UP"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, ".q4_0_mmv_workload = TERMITE_METAL_Q4_0_MMV_WORKLOAD_FFN_DOWN"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.apple_m4_device = source_runtime->apple_m4_device"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.apple_simdgroup_device = source_runtime->apple_simdgroup_device"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sizeof(runtime.q4_0_mmv_workload_variant_overrides)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.q4_0_mmv_trace_emitted = source_runtime->q4_0_mmv_trace_emitted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.q4_0_mmv_trace_workload_mask = source_runtime->q4_0_mmv_trace_workload_mask"));
@@ -13691,7 +13733,7 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid ="));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid = 0u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_device_default() != 0"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_enabled();"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_enabled(runtime);"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "scratch_runtime->submitted_frame_cb != nil || output_offset"));
 
     const variants = [_]struct {
@@ -14564,17 +14606,17 @@ pub extern fn termite_metal_device_available() c_int;
 pub extern fn termite_metal_copy_device_name(buffer: [*c]u8, capacity: usize) usize;
 pub extern fn termite_metal_copy_compiler_identity(buffer: [*c]u8, capacity: usize) usize;
 pub extern fn termite_metal_device_info_get(info: *MetalDeviceInfo) c_int;
-pub extern fn termite_metal_qualified_m4_device_default() c_int;
+pub extern fn termite_metal_apple_simdgroup_device_default() c_int;
 pub extern fn termite_metal_pipelined_decode_frame_device_default() c_int;
 
 /// Hardware qualification is independent of the prepared-frame rollback flags.
-pub fn qualifiedM4DeviceDefault() bool {
+pub fn appleSimdgroupDeviceDefault() bool {
     if (comptime !build_options.enable_metal) return false;
     if (comptime @import("builtin").os.tag != .macos) return false;
-    return termite_metal_qualified_m4_device_default() != 0;
+    return termite_metal_apple_simdgroup_device_default() != 0;
 }
 
-test "M4 qualified feature defaults honor explicit false and model isolation" {
+test "Apple SIMD-group feature defaults honor explicit false and model isolation" {
     const builtin = @import("builtin");
     if (comptime !builtin.link_libc or (builtin.os.tag != .macos and builtin.os.tag != .linux)) return error.SkipZigTest;
     // Exercise the serving parser with isolated environment names.
@@ -14588,7 +14630,7 @@ test "M4 qualified feature defaults honor explicit false and model isolation" {
             _ = unsetenv(name);
         };
         try std.testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
-        try std.testing.expect(!qualifiedM4FeatureEnabled(name, true));
+        try std.testing.expect(!appleSimdgroupFeatureEnabled(name, true));
     }
     const enable = "TERMITE_METAL_TEST_M4_EXPLICIT_ENABLE";
     const old_enable = if (std.c.getenv(enable)) |v| try std.testing.allocator.dupeSentinel(u8, std.mem.span(v), 0) else null;
@@ -14599,7 +14641,7 @@ test "M4 qualified feature defaults honor explicit false and model isolation" {
         _ = unsetenv(enable);
     };
     try std.testing.expectEqual(@as(c_int, 0), setenv(enable, "1", 1));
-    try std.testing.expect(qualifiedM4FeatureEnabled(enable, false));
+    try std.testing.expect(appleSimdgroupFeatureEnabled(enable, false));
 
     const unset = "TERMITE_METAL_TEST_M4_UNSET";
     const old_unset = if (std.c.getenv(unset)) |v| try std.testing.allocator.dupeSentinel(u8, std.mem.span(v), 0) else null;
@@ -14610,12 +14652,12 @@ test "M4 qualified feature defaults honor explicit false and model isolation" {
         _ = unsetenv(unset);
     };
     try std.testing.expectEqual(@as(c_int, 0), unsetenv(unset));
-    try std.testing.expect(!qualifiedM4FeatureEnabled(unset, false));
-    try std.testing.expectEqual(qualifiedM4DeviceDefault(), qualifiedM4FeatureEnabled(unset, true));
+    try std.testing.expect(!appleSimdgroupFeatureEnabled(unset, false));
+    try std.testing.expectEqual(appleSimdgroupDeviceDefault(), appleSimdgroupFeatureEnabled(unset, true));
 }
 
 /// Device-qualified default for pipelined decode frames: true only where the
-/// fast prepared frame qualified (M4-family). Explicit enable/disable env
+/// fast prepared frame eligible (Apple7+). Explicit enable/disable env
 /// flags still take precedence.
 pub fn pipelinedDecodeFrameDeviceDefault() bool {
     if (comptime !build_options.enable_metal) return false;
@@ -19176,6 +19218,12 @@ fn probeMetalDeviceAvailable() bool {
 pub extern fn termite_metal_provider_create() ?*RawMetalProvider;
 pub extern fn termite_metal_provider_destroy(provider: ?*RawMetalProvider) void;
 pub extern fn termite_metal_decode_runtime_create() ?*RawMetalDecodeRuntime;
+pub extern fn termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
+pub extern fn termite_metal_decode_runtime_lightonocr3_batch_projection_available(runtime: ?*RawMetalDecodeRuntime, rows: usize, in_dim: usize) c_int;
+pub extern fn termite_metal_decode_runtime_clear_lightonocr3_vision_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_require_lighton_vision_mpp(runtime: ?*RawMetalDecodeRuntime, required: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_set_lightonocr3_projections(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
+pub extern fn termite_metal_decode_runtime_lighton_frame_policy_snapshots(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
 pub extern fn termite_metal_decode_runtime_embeddinggemma2_rms_norm_threads(runtime: ?*RawMetalDecodeRuntime, rows: usize, hidden_size: usize) u32;
 pub extern fn termite_metal_decode_runtime_destroy(runtime: ?*RawMetalDecodeRuntime) void;
@@ -20435,6 +20483,12 @@ pub extern fn termite_metal_decode_runtime_sdpa_segments_f32_device(
 pub extern fn termite_metal_decode_runtime_masked_mean_rows(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, mask: [*c]const i64, rows: usize, width: usize, dimensions: usize, active: usize, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn termite_metal_decode_runtime_masked_mean_rows_normalized(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, mask: [*c]const i64, rows: usize, width: usize, dimensions: usize, active: usize, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn termite_metal_decode_runtime_sdpa_grouped_f32_device(runtime: ?*RawMetalDecodeRuntime, q: ?*anyopaque, q_offset: usize, k: ?*anyopaque, k_offset: usize, v: ?*anyopaque, v_offset: usize, ranges: [*c]const u32, query_positions: [*c]const i32, key_positions: [*c]const i32, metadata: ?*anyopaque, metadata_offset: usize, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, window: u32, scores: ?*anyopaque, query_tile: usize, score_stride: usize, key_block: usize, output: ?*anyopaque, output_offset: usize, check_ctx: ?*anyopaque, check_fn: *const fn (?*anyopaque) callconv(.c) c_int) c_int;
+pub extern fn termite_metal_with_autorelease_pool(context: *anyopaque, callback: *const fn (*anyopaque) callconv(.c) void) void;
+pub extern fn termite_metal_decode_runtime_qwen35_core_batch_begin(runtime: ?*RawMetalDecodeRuntime, rows: usize) c_int;
+pub extern fn termite_metal_decode_runtime_qwen35_core_batch_end(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_qwen35_core_batch_abort(runtime: ?*RawMetalDecodeRuntime) void;
+pub extern fn termite_metal_decode_runtime_qwen35_core_available(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_qwen35_core_device(runtime: ?*RawMetalDecodeRuntime, handles: [*]const ?*anyopaque, offsets: [*]const usize, seq: usize, key_heads: usize, value_heads: usize, dim: usize, kernel: usize, initialized: c_int) c_int;
 pub extern fn termite_metal_decode_runtime_apply_mrope_device(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,
@@ -47086,6 +47140,149 @@ test "metal native decoder runtime bf16 multi-row linear matches identity projec
     }
 }
 
+test "LightOnOCR3 prefill fused FFN wrapper retains private scratch through submit and cancellation" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const flags = [_][:0]const u8{
+        "TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_FFN",
+        "TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS",
+        "TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_FFN",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PACK_REUSE",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_PLANNED_MPP",
+    };
+    var original: [flags.len]?[:0]u8 = @splat(null);
+    defer for (flags, original) |name, value| {
+        if (value) |saved| {
+            _ = setenv(name, saved.ptr, 1);
+            allocator.free(saved);
+        } else _ = unsetenv(name);
+    };
+    for (flags, 0..) |name, i| {
+        if (std.c.getenv(name)) |value| original[i] = try allocator.dupeSentinel(u8, std.mem.span(value), 0);
+    }
+    for (flags, 0..) |name, i| {
+        if (i < 3) {
+            try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+        } else try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    }
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    termite_metal_decode_runtime_set_lightonocr3_projections(runtime, 1);
+    termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(runtime, 1);
+    const rows = 128;
+    const hidden = 2560;
+    const intermediate = 9216;
+    const weights = try allocator.alloc(u16, hidden * intermediate);
+    defer allocator.free(weights);
+    const bias = try allocator.alloc(f32, intermediate);
+    defer allocator.free(bias);
+    @memset(weights, 0);
+    @memset(bias, 1);
+    for (0..2) |slot| try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16(runtime, slot, std.mem.sliceAsBytes(weights).ptr, weights.len * 2, bias.ptr, hidden, intermediate));
+    @memset(bias, 0);
+    for (0..hidden) |col| weights[col * intermediate + col] = 0x3f80;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16(runtime, 2, std.mem.sliceAsBytes(weights).ptr, weights.len * 2, bias.ptr, intermediate, hidden));
+    const data = try allocator.alloc(f32, rows * hidden);
+    defer allocator.free(data);
+    @memset(data, 0);
+    var input = try testDeviceTensorFromSlice(runtime, data, &.{ rows, hidden });
+    defer input.deinit();
+    const request = .{
+        .input = input,
+        .gate_slot = @as(usize, 0),
+        .up_slot = @as(usize, 1),
+        .down_slot = @as(usize, 2),
+        .hidden_size = @as(usize, hidden),
+        .intermediate_size = @as(usize, intermediate),
+        .activation = ops.DecoderRuntimeActivationKind.silu,
+    };
+    try std.testing.expect((try decoderRuntimeTryApplyLightOnPrefillFfn(&provider, request)) == null);
+    for (0..3) |iteration| {
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_begin_frame(runtime));
+        var frame = true;
+        defer if (frame) {
+            _ = termite_metal_decode_runtime_cancel_frame(runtime);
+        };
+        try setActiveFrameRegime(runtime, .prefill);
+        var output = (try decoderRuntimeTryApplyLightOnPrefillFfn(&provider, request)) orelse return error.UnexpectedNull;
+        defer output.deinit();
+        // Scratch owners have already been released by the helper at this point.
+        if (iteration == 1) {
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_cancel_frame(runtime));
+        } else {
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_submit_frame(runtime));
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_wait_frame(runtime));
+            const actual = try tensorHostSlice(&output);
+            for (actual) |value| try std.testing.expectEqual(@as(f32, 0.73046875), value);
+        }
+        frame = false;
+    }
+}
+
+test "LightOnOCR3 batched gate up wrapper reaches qualified device kernel" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    termite_metal_decode_runtime_set_lightonocr3_projections(runtime, 1);
+    const allocator = std.testing.allocator;
+    const Case = struct { rows: usize, hidden: usize, intermediate: usize };
+    for ([_]Case{ .{ .rows = 2, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 3, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 4, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 2, .hidden = 2560, .intermediate = 9216 }, .{ .rows = 3, .hidden = 2560, .intermediate = 9216 }, .{ .rows = 5, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 6, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 8, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 4, .hidden = 2560, .intermediate = 9216 } }) |case| {
+        const weights = try allocator.alloc(u16, case.hidden * case.intermediate);
+        defer allocator.free(weights);
+        const bias = try allocator.alloc(f32, case.intermediate);
+        defer allocator.free(bias);
+        @memset(weights, 0);
+        @memset(bias, 0);
+        for (0..case.intermediate) |col| weights[col * case.hidden + col % case.hidden] = 0x3f80;
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16(runtime, 0, std.mem.sliceAsBytes(weights).ptr, weights.len * 2, bias.ptr, case.hidden, case.intermediate));
+        @memset(weights, 0);
+        for (0..case.intermediate) |col| weights[col * case.hidden + (col + 1) % case.hidden] = 0x3f00;
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16(runtime, 1, std.mem.sliceAsBytes(weights).ptr, weights.len * 2, bias.ptr, case.hidden, case.intermediate));
+        const input = try allocator.alloc(f32, case.rows * case.hidden);
+        defer allocator.free(input);
+        for (input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 97)) - 48)) * 0.01;
+        var device_input = try testDeviceTensorFromSlice(runtime, input, &.{ @intCast(case.rows), @intCast(case.hidden) });
+        defer device_input.deinit();
+        var frame = false;
+        if ((case.hidden == 1024 and case.rows < 5) or (case.hidden == 2560 and case.rows < 4)) {
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_begin_frame(runtime));
+            frame = true;
+        }
+        defer if (frame) {
+            _ = termite_metal_decode_runtime_cancel_frame(runtime);
+        };
+        try std.testing.expect(termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, case.rows, case.hidden, case.intermediate) != 0);
+        var output = (try decoderRuntimeTryApplyBf16GateUp(&provider, .{
+            .gate_slot = @as(usize, 0),
+            .up_slot = @as(usize, 1),
+            .input = device_input,
+            .in_dim = case.hidden,
+            .out_dim = case.intermediate,
+            .activation = ops.DecoderRuntimeActivationKind.silu,
+        })) orelse return error.UnexpectedNull;
+        defer output.deinit();
+        if (frame) {
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_submit_frame(runtime));
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_wait_frame(runtime));
+            frame = false;
+        }
+        const actual = try tensorHostSlice(&output);
+        try std.testing.expectEqual(case.rows * case.intermediate, actual.len);
+        for (0..case.rows) |row| for (0..case.intermediate) |col| {
+            const gate = input[row * case.hidden + col % case.hidden];
+            const up = input[row * case.hidden + (col + 1) % case.hidden] * 0.5;
+            try std.testing.expectApproxEqAbs(gate / (1 + @exp(-gate)) * up, actual[row * case.intermediate + col], 2e-6);
+        };
+    }
+}
+
 test "metal native decoder runtime bf16 fused gate up preserves scalar FFN tails offsets and precision" {
     if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
     const metal_native_provider = @import("metal_native_provider.zig");
@@ -47131,9 +47328,18 @@ test "metal native decoder runtime bf16 fused gate up preserves scalar FFN tails
     // production rollout. Enable BF16_VECTOR_LOADS and TRACE_DENSE_LINEAR_SHAPES
     // to qualify vector fusion at M64/M511, mixed tails and offset260 fallback.
     for ([_]Case{
-        .{ .rows = 32 },                      .{ .rows = 33 },                     .{ .rows = 64 },                                  .{ .rows = 65 },
-        .{ .rows = 128 },                     .{ .rows = 129 },                    .{ .rows = 511 },                                 .{ .rows = 64, .k = 128, .n = 128 },
-        .{ .rows = 511, .k = 128, .n = 128 }, .{ .rows = 65, .k = 132, .n = 133 }, .{ .rows = 64, .k = 128, .n = 128, .guard = 65 },
+        .{ .rows = 1, .k = 128, .n = 128 },
+        .{ .rows = 32 },
+        .{ .rows = 33 },
+        .{ .rows = 64 },
+        .{ .rows = 65 },
+        .{ .rows = 128 },
+        .{ .rows = 129 },
+        .{ .rows = 511 },
+        .{ .rows = 64, .k = 128, .n = 128 },
+        .{ .rows = 511, .k = 128, .n = 128 },
+        .{ .rows = 65, .k = 132, .n = 133 },
+        .{ .rows = 64, .k = 128, .n = 128, .guard = 65 },
     }) |case| {
         const rows = case.rows;
         const k = case.k;
@@ -47180,7 +47386,10 @@ test "metal native decoder runtime bf16 fused gate up preserves scalar FFN tails
         {
             try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_should_apply_bf16_gate_up(runtime, 0, 1, guard * 4, rows, k, n));
         }
-        for ([_]usize{ 0, 1, 31, std.math.maxInt(usize) }) |unsupported_rows| {
+        // The aligned single-row GEMV is supported independently of the
+        // tiled multi-row path. Unaligned tails still decline that route.
+        try std.testing.expectEqual(@as(c_int, if (k % 128 == 0 and n % 128 == 0) 1 else 0), termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, 1, k, n));
+        for ([_]usize{ 0, 31, std.math.maxInt(usize) }) |unsupported_rows| {
             try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, unsupported_rows, k, n));
         }
         try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, rows, k + 1, n));
@@ -49729,3 +49938,69 @@ test "embeddinggemma2 Metal multiplication plans retain full tiles tails and des
 pub extern fn antfly_metal_rotary_table(runtime: ?*RawMetalDecodeRuntime, output: ?*anyopaque, offset: usize, dim: u32, x: u32, y: u32, theta: f32, vision: u32) c_int;
 
 pub extern fn antfly_metal_video_position(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, rows: u32, grid_x: u32, grid_y: u32, axis: u32) c_int;
+
+/// Prepared recurrent decoder blocks borrow model-owned slots and frame-safe
+/// persistent buffers. Zero declines before any encode; negative is fatal.
+pub extern fn termite_metal_decode_runtime_lighton_prepared_linear_block(
+    runtime: ?*RawMetalDecodeRuntime,
+    slots: [*]const usize,
+    norms: [*]const ?*anyopaque,
+    norm_offsets: [*]const usize,
+    input: ?*anyopaque,
+    input_offset: usize,
+    buffers: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    states: [*]const ?*anyopaque,
+    state_offsets: [*]const usize,
+    rows: usize,
+    hidden: usize,
+    intermediate: usize,
+    value_heads: usize,
+) c_int;
+
+pub extern fn termite_metal_decode_runtime_set_lighton_activation_pool(runtime: ?*RawMetalDecodeRuntime, limit: usize) c_int;
+pub extern fn termite_metal_decode_runtime_set_lighton_prefill_activation_pool(runtime: ?*RawMetalDecodeRuntime, limit: usize) c_int;
+pub extern fn termite_metal_decode_runtime_lighton_prefill_activation_pool_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_activation_pool_stats(runtime: ?*RawMetalDecodeRuntime, out: *[4]u64) void;
+
+pub extern fn termite_metal_decode_runtime_lighton_wide_projection_tiles(runtime: ?*RawMetalDecodeRuntime) u64;
+
+pub extern fn termite_metal_decode_runtime_argmax_on_frame_calls(runtime: ?*RawMetalDecodeRuntime) u64;
+
+pub extern fn termite_metal_decode_runtime_lighton_wide_mpp_stats(runtime: ?*RawMetalDecodeRuntime, values: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_standalone_wide_head_calls(runtime: ?*RawMetalDecodeRuntime) u64;
+
+pub extern fn termite_metal_buffer_allocated_size(handle: ?*anyopaque) usize;
+
+pub extern fn termite_metal_decode_runtime_stream_frames_available(runtime: ?*RawMetalDecodeRuntime) c_int;
+
+// Scoped by MetalCompute's decode batch. Every error path aborts collection;
+// the owning forward retains responsibility for draining its frame.
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_begin(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_end(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_abort(runtime: ?*RawMetalDecodeRuntime) void;
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_stats(runtime: ?*RawMetalDecodeRuntime, out: *[3]u64) void;
+
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_release(runtime: ?*RawMetalDecodeRuntime) c_int;
+
+pub extern fn termite_metal_decode_runtime_lighton_prefill_pack_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_decode_pack_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_vision_pack_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_mpp_encoder_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+
+pub extern fn termite_metal_decode_runtime_lighton_wide_gate_up_calls(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_lighton_full64_gate_up_calls(runtime: ?*RawMetalDecodeRuntime) u64;
+
+pub extern fn termite_metal_decode_runtime_lighton_recurrent_group_rows(runtime: ?*RawMetalDecodeRuntime) usize;
+pub extern fn termite_metal_decode_runtime_lighton_short_prefill_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_wide_recurrent_stats(runtime: ?*RawMetalDecodeRuntime, out: *[3]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_batch_argmax_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+
+pub extern fn termite_metal_decode_runtime_set_lighton_vision_workspace_cache(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_lighton_vision_workspace_stats(runtime: ?*RawMetalDecodeRuntime, out: *[3]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_large_vision_pack_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+
+// Narrow helpers for two-step Qwen OCR decode. No new shader arithmetic.
+pub extern fn antfly_metal_lighton_embed_tokens(runtime: ?*RawMetalDecodeRuntime, slot: usize, rows: usize, dim: usize, output: ?*anyopaque, output_offset: usize) c_int;
+pub extern fn antfly_metal_lighton_read_tokens(runtime: ?*RawMetalDecodeRuntime, output: [*]u32, rows: usize) c_int;
+pub extern fn antfly_metal_lighton_prefill_pack_streaming(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;

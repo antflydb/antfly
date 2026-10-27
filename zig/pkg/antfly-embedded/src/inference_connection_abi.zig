@@ -97,6 +97,7 @@ pub const InvokeContext = extern struct {
     query: http_abi.OptionalBytes = .{},
     content_type: http_abi.OptionalBytes = .{},
     body_source: http_abi.RequestBodySource = .{},
+    document_store: @import("antfly_runtime_abi").document_abi.View = .{},
 };
 
 pub const Target = extern struct {

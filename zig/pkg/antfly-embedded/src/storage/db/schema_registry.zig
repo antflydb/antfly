@@ -80,7 +80,8 @@ pub const Epoch = struct {
             if (validator.schema.version != owned_schema.version) return error.InvalidSchemaUpdateRequest;
             const derived = try schema_api.deriveRuntimeTableSchema(alloc, validator.schema);
             defer schema_mod.freeSchema(alloc, derived);
-            if (!(try schema_mod.schemasEqual(alloc, owned_schema, derived)))
+            if (!(try schema_mod.schemasEqual(alloc, owned_schema, derived)) and
+                !(try schema_mod.matchesExcludedSourceEpoch(alloc, owned_schema, derived)))
                 return error.InvalidSchemaUpdateRequest;
         }
         var physical_layout = try row_codec.PhysicalLayout.init(alloc, owned_schema);
@@ -885,4 +886,34 @@ test "banked acquisition remains safe across repeated concurrent replacement" {
     defer current.release();
     try std.testing.expectEqual(@as(u32, 1_001), current.version());
     try std.testing.expectEqual(schema_mod.StorageMode.document, current.storageMode());
+}
+
+test "schema binding accepts only the complete known excluded source epoch" {
+    const a = std.testing.allocator;
+    const fields = [_]schema_mod.FullTextField{
+        .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        .{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" },
+        .{ .path = "secret", .emitted_name = "secret", .analyzer = "standard" },
+    };
+    const canonical: schema_mod.TableSchema = .{
+        .version = 3,
+        .full_text_documents = &.{.{ .name = "doc", .fields = &fields }},
+        .exact_fields = &.{
+            .{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } },
+            .{ .field = "secret", .source_field = "secret", .mapping = .{ .field_type = .text, .do_index = false } },
+        },
+    };
+    var known = canonical;
+    known.full_text_documents = &.{.{ .name = "doc", .fields = fields[0..1] }};
+    try std.testing.expect(!try schema_mod.schemasEqual(a, known, canonical));
+    try std.testing.expect(try schema_mod.matchesExcludedSourceEpoch(a, known, canonical));
+    var unrelated = known;
+    unrelated.ttl_duration_ns = 42;
+    try std.testing.expect(!try schema_mod.matchesExcludedSourceEpoch(a, unrelated, canonical));
+    var subset = canonical;
+    subset.full_text_documents = &.{.{ .name = "doc", .fields = &.{ fields[0], fields[2] } }};
+    try std.testing.expect(!try schema_mod.matchesExcludedSourceEpoch(a, subset, canonical));
+    var lost_enabled = canonical;
+    lost_enabled.full_text_documents = &.{.{ .name = "doc", .fields = &.{} }};
+    try std.testing.expect(!try schema_mod.matchesExcludedSourceEpoch(a, lost_enabled, canonical));
 }

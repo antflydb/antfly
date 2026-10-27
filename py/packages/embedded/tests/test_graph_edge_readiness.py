@@ -36,6 +36,10 @@ from antfly_embedded._library import find_library
 
 pytestmark = pytest.mark.usefixtures("require_native")
 
+# Persisted resolver pin indexes require this feature epoch, not the latest
+# reader supported by the library (plain databases must still remain at 1).
+LITE_RESOLVER_PIN_INDEX_READER_VERSION = 23
+
 
 def _index(stats: dict, name: str) -> dict:
     return next(item for item in stats["indexes"] if item["name"] == name)
@@ -420,6 +424,11 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         assert len(restored.edges(config["name"], "topic/qwen_embedding", "uses", 0)) == 1
         assert restored.edges(config["name"], "concept/qwen_embedding", "uses", 0) == []
     with antfly_embedded.open_with_options(restored_path, destination_options) as restored:
+        # Reopen starts durable replay recovery. This case tests namespace
+        # migration and alias persistence, not catalog admission racing a
+        # worker (which may correctly return Busy). Settle that owned work
+        # before resetting the namespace; keep runtime fencing fail-fast.
+        restored.run_until_idle()
         assert (
             restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"]
             == "topic/qwen_embedding"
@@ -864,6 +873,7 @@ def test_same_name_and_template_across_source_tables(tmp_path, storage, shared):
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
 def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, storage):
+    expected_reader = LITE_RESOLVER_PIN_INDEX_READER_VERSION if storage == antfly_embedded.Storage.LITE else 3
     options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
     path = tmp_path / ("replace.aflite" if storage == antfly_embedded.Storage.LITE else "replace")
     with _open_graph_test(path, options) as db:
@@ -873,9 +883,9 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         config["resolvers"][0]["promote"] = True
         config["replaces"] = "knowledge_v1"
         db.add_index(config)
-        # Lite persists resolver projection jobs; directory storage retains
+        # Lite persists resolver pin indexes; directory storage retains
         # the identity catalog's reader requirement without that file format.
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
         before = db.list_resolver_identities()
         # Existing-target replacement must reject non-graph old indexes before
         # registering changed inline resolver config, for either storage mode.
@@ -888,7 +898,7 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         assert db.list_resolver_identities() == before
         db.add_index(config)
     with _open_graph_test(path, options) as db:
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
         assert db.list_resolver_identities() == before
 
 
@@ -1002,27 +1012,51 @@ for path, accepted in [(sys.argv[2], True), (sys.argv[3], False), (sys.argv[4], 
     # registration commit, when its connection refreshes the catalog.
     live = tmp_path / "previous-live-writer.aflite"
     graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
-    with antfly_embedded.create_hosted(live) as db:
-        db.add_index(graph)
-        db.batch_json({"inserts": {"source": {"links": ["before"]}}})
-        db.run_until_idle()
+    # Seed with the historical writer too: current full-text artifacts use a
+    # newer section format. This case tests fencing a writer already open when
+    # a new catalog feature is published, not opening newer index bytes.
     writer_script = r"""
-import ctypes, sys
+import ctypes, json, sys
 class Slice(ctypes.Structure):
     _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+class Buffer(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
 lib = ctypes.CDLL(sys.argv[1])
-lib.antfly_lite_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
-lib.antfly_lite_open.restype = ctypes.c_int
-lib.antfly_db_batch_json.argtypes = [ctypes.c_void_p, Slice]
+lib.antfly_lite_create_hosted.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_lite_create_hosted.restype = ctypes.c_int
+lib.antfly_db_batch_json.argtypes = [ctypes.c_void_p, Slice, ctypes.POINTER(Buffer)]
+lib.antfly_buffer_free.argtypes = [ctypes.POINTER(Buffer)]
 lib.antfly_db_batch_json.restype = ctypes.c_int
+lib.antfly_db_add_index_json.argtypes = [ctypes.c_void_p, Slice]
+lib.antfly_db_add_index_json.restype = ctypes.c_int
+lib.antfly_db_run_until_idle.argtypes = [ctypes.c_void_p]
+lib.antfly_db_run_until_idle.restype = ctypes.c_int
 lib.antfly_db_close.argtypes = [ctypes.c_void_p]
 handle = ctypes.c_void_p()
-assert lib.antfly_lite_open(sys.argv[2].encode(), ctypes.byref(handle)) == 0
+assert lib.antfly_lite_create_hosted(sys.argv[2].encode(), ctypes.byref(handle)) == 0
+def invoke(name, payload):
+    data = json.dumps(payload).encode()
+    buffer = ctypes.create_string_buffer(data)
+    args = [handle, Slice(ctypes.cast(buffer, ctypes.c_void_p), len(data))]
+    output = Buffer()
+    if name == "antfly_db_batch_json": args.append(ctypes.byref(output))
+    try:
+        code = getattr(lib, name)(*args)
+    finally:
+        if output.ptr: lib.antfly_buffer_free(ctypes.byref(output))
+    assert code == 0, (name, code)
+invoke("antfly_db_add_index_json", {"name":"old", "type":"graph", "edge_types":[{"name":"R", "field":"links"}]})
+invoke("antfly_db_batch_json", {"inserts":{"source":{"links":["before"]}}})
+assert lib.antfly_db_run_until_idle(handle) == 0
 print("ready", flush=True)
 assert sys.stdin.readline().strip() == "write"
 request = b'{"inserts":{"source":{"links":["obsolete"]}}}'
 buffer = ctypes.create_string_buffer(request)
-code = lib.antfly_db_batch_json(handle, Slice(ctypes.cast(buffer, ctypes.c_void_p), len(request)))
+output = Buffer()
+try:
+    code = lib.antfly_db_batch_json(handle, Slice(ctypes.cast(buffer, ctypes.c_void_p), len(request)), ctypes.byref(output))
+finally:
+    if output.ptr: lib.antfly_buffer_free(ctypes.byref(output))
 assert code != 0, "old writer admitted mutation across the replacement fence"
 lib.antfly_db_close(handle)
 """
@@ -1038,7 +1072,12 @@ lib.antfly_db_close(handle)
 
         assert writer.stdout is not None
         ready, _, _ = select.select([writer.stdout], [], [], 30)
-        assert ready and writer.stdout.readline().strip() == "ready"
+        line = writer.stdout.readline().strip() if ready else ""
+        if line != "ready":
+            if writer.poll() is None:
+                writer.kill()
+            _, stderr = writer.communicate(timeout=30)
+            pytest.fail(f"previous reader failed to initialize: exit={writer.returncode}, stdout={line!r}\n{stderr}")
         with antfly_embedded.open_hosted(live) as db:
             db.add_index(dict(graph, name="new", replaces="old"))
             _, stderr = writer.communicate("write\n", timeout=30)
@@ -1382,6 +1421,7 @@ def test_named_replacement_does_not_permanently_upgrade_root(tmp_path, storage, 
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
 def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
+    expected_reader = LITE_RESOLVER_PIN_INDEX_READER_VERSION if storage == antfly_embedded.Storage.LITE else 3
     path = tmp_path / ("aggregate-fence.aflite" if storage == antfly_embedded.Storage.LITE else "aggregate-fence")
     options = antfly_embedded.OpenOptions(storage=storage)
     graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
@@ -1395,10 +1435,10 @@ def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
         with db.open_table("source") as table:
             table.add_index(_resolver_graph("knowledge", "concepts", destination="source"))
         assert db.cancel_replacement("new")
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
     with _open_graph_test(path, options) as db:
         # Permanent aggregation is durable, even before opening the child.
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
 
 
 @pytest.mark.parametrize("promote", [False, True])

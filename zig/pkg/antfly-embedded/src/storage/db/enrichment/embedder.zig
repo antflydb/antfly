@@ -732,12 +732,12 @@ pub const SparseEmbedder = struct {
     }
 };
 
-const SanitizedTextBatch = struct {
+pub const SanitizedTextBatch = struct {
     original: []const []const u8,
     sanitized: ?[][]const u8 = null,
     owned: ?[]?[]u8 = null,
 
-    fn texts(self: @This()) []const []const u8 {
+    pub fn texts(self: @This()) []const []const u8 {
         return self.sanitized orelse self.original;
     }
 
@@ -774,7 +774,7 @@ const SanitizedContentParts = struct {
     }
 };
 
-fn sanitizeUtf8BatchForEmbeddingAlloc(alloc: Allocator, texts: []const []const u8) !SanitizedTextBatch {
+pub fn sanitizeUtf8BatchForEmbeddingAlloc(alloc: Allocator, texts: []const []const u8) !SanitizedTextBatch {
     var has_invalid = false;
     for (texts) |text| {
         if (!std.unicode.utf8ValidateSlice(text)) {

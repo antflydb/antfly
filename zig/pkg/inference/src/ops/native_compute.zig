@@ -1227,6 +1227,14 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
         return error.UnsupportedTensorType;
     }
 
+    // Slices can own storage without a refcount. A reshape alias must retain
+    // that storage before its source wrapper is released by the caller.
+    if (source.owned and source.shared_data_refcount == null) {
+        const refcount = try source.allocator.create(usize);
+        refcount.* = 1;
+        source.shared_data_refcount = refcount;
+    }
+
     if (source.owned and source.shared_data_refcount != null) {
         source.shared_data_refcount.?.* += 1;
         errdefer source.shared_data_refcount.?.* -= 1;
@@ -53573,6 +53581,56 @@ test "native integer numeric views retain exact bytes and propagate allocation f
     const exact = (try cb.exportTensorData(output, a)).?;
     defer a.free(exact.payload.bytes);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 9007199254740994 }), exact.payload.bytes);
+}
+
+test "LightOnOCR3 partial M-RoPE rotates each head prefix and preserves its tail" {
+    const allocator = std.testing.allocator;
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const tokens = 2;
+    const heads = 2;
+    const dim = 16;
+    const rotary_dim = 6;
+    var input: [tokens * heads * dim]f32 = undefined;
+    for (&input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i + 1)) / 10;
+    const tensor = try cb.fromFloat32Shape(&input, &.{ tokens, heads * dim });
+    defer cb.free(tensor);
+    const positions = [_]u32{ 1, 4, 2, 5, 3, 6 };
+    const output = (try cb.partialMrope(tensor, tokens, heads, dim, 10000, 1, &positions, .{ 1, 1, 1 })) orelse return error.UnexpectedNull;
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, allocator);
+    defer allocator.free(values);
+    for (0..tokens) |token| {
+        for (0..heads) |head| {
+            const offset = (token * heads + head) * dim;
+            var expected: [rotary_dim]f32 = undefined;
+            const axes = [_]u32{ positions[token], positions[tokens + token], positions[2 * tokens + token] };
+            try mropeCore(&expected, input[offset..][0..rotary_dim], 1, rotary_dim, 10000, 1, &axes, .{ 1, 1, 1 });
+            for (values[offset..][0..rotary_dim], expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-5);
+            try std.testing.expectEqualSlices(f32, input[offset + rotary_dim ..][0 .. dim - rotary_dim], values[offset + rotary_dim ..][0 .. dim - rotary_dim]);
+        }
+    }
+}
+
+test "LightOnOCR3 query gate projection splits within each attention head" {
+    const allocator = std.testing.allocator;
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 101, 102, 3, 4, 103, 104, 5, 6, 105, 106, 7, 8, 107, 108 }, &.{ 2, 8 });
+    defer cb.free(input);
+    const split = try cb.splitPerHeadGate(input, 2, 2, 2);
+    defer cb.free(split.query);
+    defer cb.free(split.gate);
+    const query = try cb.toFloat32(split.query, allocator);
+    defer allocator.free(query);
+    const gate = try cb.toFloat32(split.gate, allocator);
+    defer allocator.free(gate);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, query);
+    try std.testing.expectEqualSlices(f32, &.{ 101, 102, 103, 104, 105, 106, 107, 108 }, gate);
 }
 
 test "native embedding rows preserve shape through Gemma PLE arithmetic and layer slicing" {

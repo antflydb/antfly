@@ -205,6 +205,8 @@ pub const Adapter = struct {
                 const normalized = try self.context.platformDeadline();
                 return .{
                     .registry = &config.registry,
+                    .provider_runtime = &self.server.embedding_provider_runtime,
+                    .limits = self.server.embedding_provider_runtime.limits,
                     .io = self.server.embedding_provider_runtime.io,
                     .parallel_work = self.runnable == null and !self.serial_execution,
                     .parent_execution = if (self.runnable != null) .{
@@ -212,7 +214,7 @@ pub const Adapter = struct {
                         .checkpoint = checkpoint,
                         .resource_wait = .{ .begin = spillWaitBegin, .end = spillWaitEnd },
                     } else null,
-                    .http = try self.server.embedding_provider_runtime.httpClient(),
+                    .http = try self.server.embedding_provider_runtime.assetHttpClient(),
                     .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation, .runnable = self.providerRunnable() },
                     .secret_store = self.server.cfg.secret_store,
                     .antfly_provider = self.server.antfly_provider,

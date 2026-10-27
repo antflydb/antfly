@@ -5194,6 +5194,201 @@ fn sqlSessionStatement(handle: ?*anyopaque, session_id: u64, statement: []const 
     try std.testing.expectEqual(capi.ErrorCode.ok, status);
 }
 
+test "capi SQL conflict owner probes leave unrelated namespaces unopened" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-conflict-point-catalog");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE target(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE unrelated(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE plain(body TEXT)");
+    try sqlFkRecoveryStatement(handle, "INSERT INTO target(id) VALUES ('existing')");
+    try sqlRefreshCleanGeneration(handle);
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    const root = guard.handle;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sql = @import("antfly_local_sources").capi_sql;
+    var adapter = sql.Adapter(antfly){ .handle = root, .db = &root.db, .table_name = "default" };
+    const backend = adapter.backend();
+    const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "target" }, .write);
+    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), arena.allocator(), table, .{ .columns = &.{"id"} }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), owners.len);
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    try std.testing.expect(root.embedded_tables.contains("target"));
+    try std.testing.expect(!root.embedded_tables_discovered);
+    var selected = sql.Adapter(antfly){ .handle = root, .db = &root.embedded_tables.get("target").?.db, .table_name = "target" };
+    const metadata = try selected.localCatalog(arena.allocator(), table.schema_version);
+    try std.testing.expectEqual(@as(usize, 3), metadata.table.len);
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    try std.testing.expect(!root.embedded_tables_discovered);
+    _ = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "plain" }, .write);
+    var plain = sql.Adapter(antfly){ .handle = root, .db = &root.embedded_tables.get("plain").?.db, .table_name = "plain" };
+    try std.testing.expect(try plain.localRequiresCoordination());
+    try std.testing.expectEqual(@as(usize, 2), root.embedded_tables.count());
+    try std.testing.expect(!root.embedded_tables.contains("unrelated"));
+}
+
+test "capi native idle maintenance verifies allocator outside connection and writer gates" {
+    const a = std.testing.allocator;
+    const native = @import("antfly_local_sources").storage_lite_native;
+    inline for (.{ false, true }) |cancel| {
+        inline for (.{ false, true }) |replace| {
+            var directory = try TestDirectory.init("capi-allocator-proof-gates");
+            defer directory.cleanup();
+            const path = try tempTestAflitePath(a, directory.path(), "database");
+            defer a.free(path);
+            defer cleanupTestFile(path);
+            var options: capi.OpenOptions = .{};
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+            options.storage_kind = capi.storage_kind_lite;
+            options.profile = capi.profile_hosted;
+            var handle: ?*anyopaque = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+            defer antfly_db_close(handle);
+            const marker_path = try std.fmt.allocPrint(a, "{s}/.aflite-lease-0123456789abcdef0123456789abcdef", .{std.fs.path.dirname(path).?});
+            defer a.free(marker_path);
+            const marker = try std.Io.Dir.cwd().createFile(shared.handleLockIo(), marker_path, .{});
+            marker.close(shared.handleLockIo());
+            const owner = blk: {
+                const guard = public.enterHandle(handle, .exclusive).?;
+                defer guard.leave();
+                guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+                break :blk guard.connection.?.owner;
+            };
+            const Owner = @TypeOf(owner.*);
+            const Probe = struct {
+                owner: *Owner,
+                calls: usize = 0,
+                failure: ?anyerror = null,
+                fn notify(ptr: *anyopaque, _: *native.NativeFile) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.inspect() catch |err| {
+                        self.failure = err;
+                    };
+                }
+                fn inspect(self: *@This()) !void {
+                    self.calls += 1;
+                    if (!self.owner.gate.mutex.tryLock()) return error.TestUnexpectedResult;
+                    defer self.owner.gate.mutex.unlock(shared.handleLockIo());
+                    var lease = try native.lockWriterPathWithIo(std.testing.allocator, shared.handleLockIo(), self.owner.path);
+                    defer lease.close();
+                    if (replace) {
+                        const previous = self.owner.current.?;
+                        {
+                            // Model a captured mutating runtime forcing refresh.
+                            // The independent proof must keep its borrowed owner
+                            // alive even after the mutating capture is released.
+                            previous.maintenance_references += 1;
+                            defer previous.maintenance_references -= 1;
+                            try std.testing.expect(try self.owner.refresh() != previous);
+                        }
+                        self.owner.collectRetired();
+                        try std.testing.expectEqual(@as(usize, 1), self.owner.retired.items.len);
+                    }
+                    if (!replace) {
+                        const file = &self.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+                        file.defer_allocator_verification = true;
+                        defer file.defer_allocator_verification = false;
+                        const current = self.owner.current.?;
+                        try file.putCatalogRecord("proof/local-append", "foreground progress");
+                        try std.testing.expect(try self.owner.refresh() == current);
+                        try std.testing.expect(!file.free_pages_verified);
+                    }
+                    if (cancel) self.owner.verification_cancel.request();
+                }
+            };
+            var probe: Probe = .{ .owner = owner };
+            owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
+            defer owner.test_after_allocator_capture = null;
+            if (cancel) {
+                try std.testing.expectError(error.MaintenanceCanceled, owner.maintenanceTurnForTest());
+            } else {
+                try std.testing.expect(try owner.maintenanceTurnForTest());
+            }
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(shared.handleLockIo(), marker_path, .{}));
+            if (probe.failure) |err| return err;
+            try std.testing.expectEqual(@as(usize, 1), probe.calls);
+            // Completion must release the retired proof owner before another API call.
+            try std.testing.expectEqual(@as(usize, 0), owner.retired.items.len);
+            const guard = public.enterHandle(handle, .read).?;
+            defer guard.leave();
+            // A foreign reopen breaks lineage; locally authored appends preserve it.
+            if (!replace) try std.testing.expectEqual(!cancel, guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            try std.testing.expectEqual(@as(usize, 0), guard.handle.maintenance_references);
+            try std.testing.expectEqual(@as(usize, 0), guard.handle.allocator_verification_references);
+        }
+    }
+}
+
+test "capi SQL staged transcript upserts keep large values and unrelated namespaces lazy" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-transcript-upserts");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE threads(id TEXT PRIMARY KEY, title TEXT)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE history(id TEXT PRIMARY KEY, body TEXT)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE unrelated(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "INSERT INTO history(id,body) VALUES ('existing','old')");
+    try sqlRefreshCleanGeneration(handle);
+
+    var session: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, struct {
+        extern fn antfly_db_sql_session_open(?*anyopaque, *u64) capi.ErrorCode;
+    }.antfly_db_sql_session_open(handle, &session));
+    try sqlSessionStatement(handle, session, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    try sqlSessionStatement(handle, session, "INSERT INTO threads(id,title) VALUES ('thread','transcript') ON CONFLICT(id) DO UPDATE SET title=excluded.title");
+    // #1304 combines a value larger than 1 MiB with conflict resolution after
+    // another table has staged writes. That path needs the complete metadata
+    // catalog, but must not construct unrelated table/index runtimes.
+    const body = try a.alloc(u8, 1024 * 1024 + 128 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    const statement = try std.fmt.allocPrint(a, "INSERT INTO history(id,body) VALUES ('existing','{s}') ON CONFLICT(id) DO UPDATE SET body=excluded.body", .{body});
+    defer a.free(statement);
+    try sqlSessionStatement(handle, session, statement);
+    try sqlSessionStatement(handle, session, "INSERT INTO history(id,body) VALUES ('new','tail') ON CONFLICT(id) DO UPDATE SET body=excluded.body");
+    try sqlSessionStatement(handle, session, "COMMIT");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expectEqual(@as(usize, 2), guard.handle.embedded_tables.count());
+        try std.testing.expect(guard.handle.embedded_tables.contains("threads"));
+        try std.testing.expect(guard.handle.embedded_tables.contains("history"));
+        try std.testing.expect(!guard.handle.embedded_tables.contains("unrelated"));
+        try std.testing.expect(!guard.handle.embedded_tables_discovered);
+    }
+    // Reopening the generation must retain the complete large conflict update.
+    try sqlRefreshCleanGeneration(handle);
+    var response: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("{\"statement\":\"SELECT body FROM history WHERE id='existing'\"}"), &response));
+    defer freeRawBuffer(response.ptr, response.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.ptr.?[0..response.len], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings(body, rows[0].array.items[0].string);
+}
+
 test "capi SQL refreshed generations retain complete FK catalogs and unqualified indexes" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-refreshed-integrity");
@@ -5220,11 +5415,12 @@ test "capi SQL refreshed generations retain complete FK catalogs and unqualified
     try sqlSessionStatement(handle, session, "DELETE FROM child WHERE id IN (SELECT id FROM child WHERE parent_id='p' ORDER BY id DESC OFFSET 8)");
     try sqlRefreshCleanGeneration(handle);
     try sqlSessionStatement(handle, session, "COMMIT");
-    // Discovery is cached per generation, independently of durable recovery.
+    // Integrity uses the full schema catalog without constructing every
+    // namespace runtime merely to discover inbound constraints.
     {
         const guard = public.enterHandle(handle, .exclusive).?;
         defer guard.leave();
-        try std.testing.expect(guard.handle.embedded_tables_discovered);
+        try std.testing.expect(!guard.handle.embedded_tables_discovered);
         try std.testing.expectEqual(@as(usize, 2), guard.handle.embedded_tables.count());
         try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
     }
@@ -5256,13 +5452,20 @@ test "capi SQL refreshed generations retain complete FK catalogs and unqualified
             var failing = std.testing.FailingAllocator.init(original_alloc, .{ .fail_index = 0 });
             root.alloc = failing.allocator();
             defer root.alloc = original_alloc;
-            try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(arena.allocator(), view.version()));
+            // Metadata enumeration succeeds even when opening a provider is
+            // unavailable. Referencing that owner still fails closed.
+            const metadata = try adapter.localCatalog(arena.allocator(), view.version());
+            try std.testing.expectEqual(@as(usize, 2), metadata.table.len);
+            const backend = adapter.backend();
+            try std.testing.expectError(error.OutOfMemory, backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "parent" }, .read));
             try std.testing.expectEqual(@as(usize, 1), root.embedded_table_errors.count());
         }
+        const backend = adapter.backend();
+        _ = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "parent" }, .read);
         const recovered = try adapter.localCatalog(arena.allocator(), view.version());
         try std.testing.expectEqual(@as(usize, 2), recovered.table.len);
         try std.testing.expectEqual(@as(usize, 0), root.embedded_table_errors.count());
-        try std.testing.expect(root.embedded_tables_discovered);
+        try std.testing.expect(!root.embedded_tables_discovered);
         try std.testing.expectEqual(@as(u64, 0), root.sql_ddl_recovery_scans);
     }
     try sqlRefreshCleanGeneration(handle);
@@ -5365,14 +5568,21 @@ test "capi SQL recovery stays clean across row writes reads and cursors" {
 test "capi SQL reclamation assessment and copy release the foreground gate" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
+    const native = @import("antfly_local_sources").storage_lite_native;
     const Store = @import("antfly_local_sources").storage_lite_docstore.Store;
     for ([_]bool{ false, true }) |independent| {
         for ([_]Store.MaintenancePhase{ .assessment, .copy, .verification }) |phase| {
-            if (phase == .verification and !independent) continue;
             const Gate = struct {
                 phase: Store.MaintenancePhase,
+                failure: ?anyerror = null,
                 started: std.Io.Event = .unset,
                 allowed: std.Io.Event = .unset,
+                fn allocatorCaptured(ptr: *anyopaque, _: *native.NativeFile) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    notify(ptr, .verification) catch |err| {
+                        self.failure = err;
+                    };
+                }
                 fn notify(ptr: *anyopaque, current: Store.MaintenancePhase) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (current != self.phase) return;
@@ -5424,13 +5634,16 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 store.maintenance_policy.options.assessment_bytes = 4096;
                 store.maintenance_policy.options.minimum_reclaim_bytes = 4096;
                 store.maintenance_policy.next_assessment_size = 0;
-                store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
+                if (phase != .verification) store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
                 if (phase == .verification) {
                     store.file.free_pages_verified = false;
                     guard.connection.?.owner.maintenance_pending = true;
+                    // Verification now runs at the owner capture boundary.
+                    guard.connection.?.owner.test_after_allocator_capture = .{ .ptr = &gate, .notify = Gate.allocatorCaptured };
                 }
                 break :blk guard.connection.?.owner;
             };
+            defer connection.test_after_allocator_capture = null;
             var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started };
             const before_capture = connection.current.?;
             const background = try std.Thread.spawn(.{}, @TypeOf(driver).run, .{&driver});
@@ -5471,6 +5684,7 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
             background.join();
             joined = true;
             try driver.result();
+            if (gate.failure) |err| return err;
             try std.testing.expect(completed);
             try std.testing.expectEqual(capi.ErrorCode.ok, foreground.status);
             const guard = public.enterHandle(handle, .exclusive).?;
@@ -6100,6 +6314,11 @@ test "capi SQL missing namespace forces coordinated catalog validation" {
     try guard.handle.embedded_table_errors.put(guard.handle.alloc, "broken", "InvalidSchema");
     try std.testing.expect(try adapter.localRequiresCoordination());
     try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(alloc, 1));
+    // A named namespace with missing declarations is equally unavailable;
+    // metadata-only discovery must not silently discard possible constraints.
+    const name = try guard.handle.alloc.dupe(u8, "broken");
+    try guard.handle.embedded_table_records.putNoClobber(guard.handle.alloc, name, 2);
+    try std.testing.expect(try adapter.localRequiresCoordination());
 }
 
 test "capi SQL maintenance capture queues after bounded foreground contention" {
@@ -6180,6 +6399,56 @@ test "capi SQL runtime refresh fences serving inputs while reusing lease and sha
         else
             try std.testing.expect(before != after);
     }
+}
+
+test "capi graph replacement retains indexed serving edges across deferred reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-replacement-visible-reopen");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    // A manual owner makes the source visibility and unfinished replacement
+    // deterministic, rather than racing a background replay or using sleeps.
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"old","kind":"graph","edge_types":[{"name":"links","field":"links"}]}
+    )));
+    var inserted: capi.Buffer = .{};
+    // No-gap replacement preserves the old generation's visible contents.
+    // A write-only receipt does not establish that those contents are indexed.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .fromSlice(
+        \\{"inserts":{"a":{"links":["b"]},"b":{}},"sync_level":"full_index"}
+    ), &inserted));
+    freeRawBuffer(inserted.ptr, inserted.len);
+    antfly_db_close(handle);
+    handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","kind":"graph","replaces":"old","edge_types":[{"name":"links","field":"links"}]}
+    )));
+    {
+        const guard = public.enterHandle(handle, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.handle.database().core.index_manager.get("old") != null);
+        try std.testing.expect(guard.handle.database().core.index_manager.get("new") == null);
+    }
+    var response: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(handle, .fromSlice(
+        \\{"graph_queries":{"q":{"index":"old","traverse":{"start":{"keys":["a"]},"direction":"out","edge_types":["links"],"max_depth":1,"limit":10}}},"limit":1}
+    ), &response));
+    defer freeRawBuffer(response.ptr, response.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.ptr.?[0..response.len], .{});
+    defer parsed.deinit();
+    const nodes = parsed.value.object.get("responses").?.array.items[0].object.get("graph_results").?.object.get("q").?.object.get("nodes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), nodes.len);
+    try std.testing.expectEqualStrings("b", nodes[0].object.get("key").?.string);
 }
 
 test "capi native replacement wait observes its background owner without rebuilding" {
@@ -6513,6 +6782,223 @@ test "capi native resolver maintenance retries transient inference and survives 
     if (stats.promotion.catch_up_required) std.debug.print("resolver reopen stats={f} publications={f}\n", .{ std.json.fmt(stats, .{}), std.json.fmt(owner.publication_stats, .{}) });
     try std.testing.expect(!stats.promotion.catch_up_required);
     try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
+}
+
+test "capi native bounded admission coalesces allocator proof outside publication gates" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-capacity-proof");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    var second: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &second));
+    defer antfly_db_close(second);
+    var limit: u64 = 0;
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const store = guard.handle.owned_lite_backend.?.native_docstore.?;
+        const file = &store.file;
+        try file.completeAllocatorVerification();
+        const large: [32768]u8 = @splat('v');
+        var keys: [32][32]u8 = undefined;
+        var batch: [32]lite_backend.native.CatalogMutation = undefined;
+        for (&batch, &keys, 0..) |*mutation, *key, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "test/free-{d}", .{i}), .value = &large };
+        try file.putCatalogBatch(&batch);
+        for (&batch) |*mutation| mutation.* = .{ .key = mutation.key, .is_delete = true };
+        try file.putCatalogBatch(&batch);
+        for (0..8) |_| _ = try file.reclaimPages(4096);
+        try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 64);
+        limit = (try file.file.stat(file.runtime())).size;
+        store.maintenance_policy.options.max_storage_bytes = limit;
+        file.max_file_bytes = limit;
+        file.free_pages_verified = false;
+        owner.maintenance_storage_pending = true;
+    }
+    const Probe = struct {
+        owner: @TypeOf(owner),
+        path: []const u8,
+        second: ?*anyopaque,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        worker: ?std.Thread = null,
+        worker_failure: ?anyerror = null,
+        waiting: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        fn write(self: *@This()) !void {
+            const guard = public.enterHandle(self.second, .exclusive).?;
+            defer guard.leave();
+            try std.testing.expect(guard.entry_error == null);
+            try std.testing.expect(guard.connection.?.owner == self.owner);
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = "second", .value = "{\"body\":\"waits for reader teardown\"}" }}, .sync_level = .write });
+        }
+        fn run(self: *@This()) void {
+            self.write() catch |err| {
+                self.worker_failure = err;
+            };
+            self.done.store(true, .release);
+        }
+        fn onWait(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waiting.store(true, .release);
+        }
+        fn check(self: *@This(), reader: *lite_backend.native.NativeFile) !void {
+            try std.testing.expect(self.owner.gate.mutex.tryLock());
+            self.owner.gate.mutex.unlock(shared.handleLockIo());
+            var lease = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
+            lease.close();
+            // The worker yields to the admission proof instead of duplicating
+            // its graph walk or waiting for it while holding the owner gate.
+            for (0..2) |_| try std.testing.expect(try self.owner.maintenanceTurnForTest());
+            try std.testing.expect(!self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            const cursor = self.owner.maintenance_table_cursor;
+            self.owner.maintenance_table_cursor = 1;
+            defer self.owner.maintenance_table_cursor = cursor;
+            try std.testing.expect(self.owner.maintenanceWaitMillisForTest(true) >= 100);
+            try std.testing.expectEqual(@as(usize, 1), self.calls);
+            // Reproduce the interval after publishing verification but before
+            // closing its reader. The second connection must still queue off
+            // the publication gates, rather than fail to reuse at the cap.
+            try reader.completeAllocatorVerification();
+            self.owner.gate.mutex.lockUncancelable(shared.handleLockIo());
+            {
+                defer self.owner.gate.mutex.unlock(shared.handleLockIo());
+                var publication = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
+                defer publication.close();
+                try self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(reader);
+            }
+            self.worker = try std.Thread.spawn(.{}, run, .{self});
+            const io = shared.handleLockIo();
+            const deadline = std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s;
+            while (!self.waiting.load(.acquire) and !self.done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.CapacityWaitTimeout;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(self.waiting.load(.acquire));
+            try std.testing.expect(!self.done.load(.acquire));
+            try std.testing.expect(self.owner.gate.mutex.tryLock());
+            self.owner.gate.mutex.unlock(io);
+            var available = try lite_backend.native.lockWriterPathWithIo(a, io, self.path);
+            available.close();
+        }
+        fn notify(raw: *anyopaque, reader: *lite_backend.native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.check(reader) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var probe = Probe{ .owner = owner, .path = path, .second = second };
+    defer if (probe.worker) |worker| worker.join();
+    owner.test_capacity_wait = .{ .ptr = &probe, .notify = Probe.onWait };
+    defer owner.test_capacity_wait = null;
+    owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_allocator_capture = null;
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+        try std.testing.expect(file.free_pages_verified);
+        const reused = (try file.allocatorStats()).?.reused_pages;
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"reuses capacity\"}" }}, .sync_level = .write });
+        try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
+        try std.testing.expect((try file.file.stat(file.runtime())).size <= limit);
+        try std.testing.expect((try file.check()).valid);
+    }
+    if (probe.worker) |worker| {
+        worker.join();
+        probe.worker = null;
+    }
+    if (probe.failure) |err| return err;
+    if (probe.worker_failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    // Completion restores immediate progress between namespaces, rather than
+    // charging every table another wait quantum.
+    const cursor = owner.maintenance_table_cursor;
+    owner.maintenance_table_cursor = 1;
+    defer owner.maintenance_table_cursor = cursor;
+    try std.testing.expectEqual(@as(i64, 0), owner.maintenanceWaitMillisForTest(true));
+}
+
+test "capi native close certifies allocator before the next process opens sources" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-certified-reopen");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    for (0..3) |process| {
+        var handle: ?*anyopaque = null;
+        const result = if (process == 0) antfly_db_create_with_options(path, &options, &handle) else antfly_db_open_with_options(path, &options, &handle);
+        try std.testing.expectEqual(capi.ErrorCode.ok, result);
+        defer if (handle != null) antfly_db_close(handle);
+        const owner = blk: {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            break :blk guard.connection.?.owner;
+        };
+        owner.stopping.store(true, .release);
+        owner.wake.set(shared.handleLockIo());
+        owner.worker.?.join();
+        owner.worker = null;
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            if (process == 0) try file.completeAllocatorVerification() else try std.testing.expect(file.free_pages_verified);
+            const reused = (try file.allocatorStats()).?.reused_pages;
+            const large: [32768]u8 = @splat('x');
+            for (0..12) |_| try file.putCatalogRecord("test/free-pool", &large);
+            try file.deleteCatalogRecord("test/free-pool");
+            _ = try file.reclaimPages(4096);
+            if (process != 0) try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
+            try std.testing.expect((try file.check()).valid);
+            try std.testing.expect(file.free_pages_verified);
+        }
+        // Exercise the certificate with real managed SQL index sources too;
+        // opening their read leases must preserve inherited verification.
+        if (process == 0) try sqlFkRecoveryStatement(handle, "CREATE TABLE certified(n BIGINT PRIMARY KEY)");
+        var statement: [160]u8 = undefined;
+        try sqlFkRecoveryStatement(handle, try std.fmt.bufPrint(&statement, "INSERT INTO certified(_id,n) VALUES ('row-{d}',{d})", .{ process, process }));
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            try std.testing.expect(file.free_pages_verified);
+            try std.testing.expect((try file.check()).valid);
+        }
+        antfly_db_close(handle);
+        handle = null;
+        var probe = try lite_backend.native.NativeFile.openWithIo(a, shared.handleLockIo(), path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        try std.testing.expect(try probe.inheritAllocatorCertificate());
+    }
 }
 
 test "capi native foreground reuses free pages during a captured worker turn" {

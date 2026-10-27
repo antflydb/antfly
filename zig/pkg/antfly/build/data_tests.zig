@@ -67,7 +67,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const maintenance_selection_tests = b.addTest(.{
         .name = "data-maintenance-selection-tests",
         .root_module = options.maintenance_selection_module,
-        .filters = &.{ "data runtime maintenance bounded selection", "data runtime background maintenance is due for dense posting cadence without lsm debt" },
+        .filters = &.{ "data runtime maintenance bounded selection", "data runtime background maintenance is due for dense posting cadence without lsm debt", "data runtime background provider clients preserve shared bounded admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = 7 * 1024 * 1024 * 1024,
     });

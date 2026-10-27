@@ -31,7 +31,7 @@ pub const StatusDetail = error_abi.Detail;
 /// an older context before the callee reads beyond its layout.
 // Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
 // Fence merged logical-query layouts and failure/guard contracts.
-pub const abi_version: u32 = 61;
+pub const abi_version: u32 = 62;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

@@ -3958,7 +3958,7 @@ pub const Server = struct {
             }
         }
         stream.protected_body_deadline_ms = null;
-        if (self.router.hasBodyLimits()) {
+        {
             var method: ?types.Method = null;
             var request_target: ?[]const u8 = null;
             if (stream.request_headers) |headers| for (headers) |header| {
@@ -4782,6 +4782,9 @@ test "route body limits resolve before transport body admission" {
     }.h;
     try server.postWithBodyLimit("/bounded/:id", 64, handler);
     try server.post("/global", handler);
+    server.config.max_streamed_body_size = 1024 * 1024 * 1024;
+    try server.routeStreamingRawWithBodyLimit(.POST, "/duplex", 1024 * 1024 * 1024, handler);
+    try std.testing.expectEqual(@as(?usize, 1024 * 1024 * 1024), Server.resolveRequestBodyLimit(&server, .POST, "/duplex"));
 
     try std.testing.expectEqual(@as(?usize, 64), Server.resolveRequestBodyLimit(&server, .POST, "/bounded/7?x=1"));
     try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/global"));

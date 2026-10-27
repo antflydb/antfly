@@ -53550,6 +53550,12 @@ fn implementationTests() type {
             defer status_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             defer source.deinit();
+            // DB workers borrow the source and status cache through visibility
+            // callbacks. Drain them before either callback target is destroyed.
+            defer {
+                source.quiesce();
+                write_cache.closeAllDbsLocked() catch @panic("activation fixture retained DB leases");
+            }
             source.write_cache = &write_cache;
             source.runtime_status_cache = &status_cache;
 
@@ -53653,6 +53659,7 @@ fn implementationTests() type {
             var outer_cache = ProvisionedTableWriteCache.init(alloc);
             defer outer_cache.deinit();
             var outer_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+            defer outer_source.deinit();
             outer_source.write_cache = &outer_cache;
             _ = outer_source.withLocalWriteOwner(&source);
 
@@ -61500,6 +61507,11 @@ fn implementationTests() type {
             defer status_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             defer source.deinit();
+            // Keep both callback targets alive until the DB workers drain.
+            defer {
+                source.quiesce();
+                write_cache.closeAllDbsLocked() catch @panic("create fixture retained DB leases");
+            }
             source.write_cache = &write_cache;
             source.runtime_status_cache = &status_cache;
 

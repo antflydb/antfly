@@ -42,6 +42,7 @@ const Owner = struct {
     predicate_lower: []const u8 = "",
     predicate_upper: ?[]const u8 = null,
     predicate_count: u64 = 0,
+    predicate_blocks: ?u64 = null,
     metadata: ?@import("lake_index_decoded_metadata.zig").Owned(ordered.VerifiedRoot) = null,
     table: catalog.Table,
     request: catalog.Scan,
@@ -555,7 +556,16 @@ pub const Predicate = struct {
     cursor: catalog.Cursor,
     scan: bool = false,
     complete_order: bool = false,
+    // Minted only after an identity-only cursor proves the complete filter's
+    // normalized conditions under its leased publication and tuple bounds.
+    filter_proof: ?[32]u8 = null,
     work: u64 = 0,
+    pub fn provesFilter(self: Predicate, json: []const u8) bool {
+        const expected = self.filter_proof orelse return false;
+        var actual: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(json, &actual, .{});
+        return std.mem.eql(u8, &expected, &actual);
+    }
     pub fn deinit(self: *Predicate) void {
         self.cursor.close(self.cursor.ptr);
     }
@@ -564,7 +574,8 @@ pub const Predicate = struct {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         return owner.predicate_count;
     }
-    /// Estimate complete reverse paths, including remote request overhead.
+    /// Estimate reverse leaves and shared internal paths, including remote
+    /// request overhead. Each bounded tile shares its internal navigation.
     /// This influences path choice only; authenticated read budgets remain the
     /// execution authority and exact predicates are always rechecked.
     pub fn membershipWork(self: Predicate, candidates: u64) u64 {
@@ -572,7 +583,20 @@ pub const Predicate = struct {
         if (self.scan) return std.math.maxInt(u64);
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         const reverse = owner.reader.root.reverse orelse return std.math.maxInt(u64);
-        return candidates *| (@as(u64, reverse.height) + 1) *| (64 + tree.target_page_bytes / 1024);
+        const tiles = 1 + (candidates - 1) / 128;
+        return candidates *| (64 + tree.target_page_bytes / 1024) +| tiles *| reverse.height *| (tree.target_page_bytes / 1024);
+    }
+    /// Full membership has a conversion cost as well as a predicate scan.
+    /// Exact shared maps consume compressed predicate blocks; incompatible
+    /// coordinates must also map matching rows into the text ordinal space.
+    pub fn materializationWork(self: Predicate, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) u64 {
+        if (self.scan) return std.math.maxInt(u64);
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        const conversions = if (self.sharesCoordinates(target)) owner.predicate_blocks orelse owner.predicate_count else owner.predicate_count;
+        return self.work +| conversions *| 64;
+    }
+    pub fn scanMaterializationWork(self: Predicate, scan_work: u64) u64 {
+        return scan_work +| self.estimatedRows() *| 64;
     }
     pub fn hasMembership(self: Predicate) bool {
         if (self.scan) return false;
@@ -607,6 +631,54 @@ pub const Predicate = struct {
             return err;
         };
     }
+    /// Both readers must carry the exact authenticated coordinate dictionary
+    /// and row map. Cut labels alone, or an absent witness, grant no shortcut.
+    pub fn sharesCoordinates(self: Predicate, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        const left = owner.row_resolver orelse return target == null;
+        const right = target orelse return !left.relocated;
+        if (left.coordinate_space) |space| if (right.coordinate_space) |other| return std.mem.eql(u8, &space, &other);
+        return false;
+    }
+    fn rebaseSharedCoordinates(self: Predicate, a: A, source: ?local.serverless_query_lake_serving.ServingSource.RowResolver, refs: []const local.storage_rowsource_types.RowRef) !?[]const local.storage_rowsource_types.RowRef {
+        if (!self.sharesCoordinates(source)) return null;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        const source_id = if (source) |binding| binding.source else owner.reader.root.source;
+        const snapshot_id = if (source) |binding| binding.snapshot else owner.reader.root.snapshot;
+        // Rebinding labels is permitted only after the map/dictionary proof.
+        // Validate the incoming index cut before using the target reader's cut.
+        for (refs) |ref| {
+            if (ref != .external) return error.InvalidNativeLakeRowIndex;
+            if (!std.mem.eql(u8, ref.external.source_id, source_id) or !std.mem.eql(u8, ref.external.snapshot_id, snapshot_id)) return error.ExternalLakeSnapshotMismatch;
+        }
+        const result = try a.dupe(local.storage_rowsource_types.RowRef, refs);
+        for (result) |*ref| {
+            ref.external.source_id = owner.reader.root.source;
+            ref.external.snapshot_id = owner.reader.root.snapshot;
+        }
+        return result;
+    }
+    /// Probe original index coordinates directly when their exact proof agrees.
+    /// A decline leaves output untouched and retains ordinary source translation.
+    pub fn containsInSpaceMany(self: *Predicate, source: ?local.serverless_query_lake_serving.ServingSource.RowResolver, refs: []const local.storage_rowsource_types.RowRef, output: []bool) !bool {
+        if (refs.len != output.len or refs.len > 128) return error.InvalidNativeLakeRowIndex;
+        if (!self.sharesCoordinates(source)) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        var workspace: local.sql_memory_budget = .{ .backing = owner.a, .limit = 4 * 1024 * 1024 };
+        var scratch = std.heap.ArenaAllocator.init(workspace.allocator());
+        defer scratch.deinit();
+        const rebased = (self.rebaseSharedCoordinates(scratch.allocator(), source, refs) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted()) return error.QueryCandidateBudgetExceeded;
+            return err;
+        }).?;
+        owner.reader.containsPhysicalMany(scratch.allocator(), rebased, owner.predicate_lower, owner.predicate_upper, output) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted()) return error.QueryCandidateBudgetExceeded;
+            return err;
+        };
+        return true;
+    }
     pub fn intersectsPhysical(self: *Predicate, first: local.storage_rowsource_types.RowRef, last: local.storage_rowsource_types.RowRef) !?bool {
         if (self.scan) return null;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -624,11 +696,7 @@ pub const Predicate = struct {
     pub fn blocksMatch(self: Predicate, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) bool {
         if (self.scan) return false;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
-        if (owner.reader.root.predicates == null) return false;
-        const left = owner.row_resolver orelse return target == null;
-        const right = target orelse return !left.relocated;
-        if (left.coordinate_space) |space| if (right.coordinate_space) |other| return std.mem.eql(u8, &space, &other);
-        return false;
+        return owner.reader.root.predicates != null and self.sharesCoordinates(target);
     }
     pub fn nextBlocks(self: *Predicate, a: A) ![]const ordered.predicate_blocks.Block {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -944,6 +1012,9 @@ fn generatedCoveringField(table: catalog.Table, field: []const u8) bool {
 /// and rows are upper estimates: no guessed selectivity or LIMIT credit.
 /// Null means the inventory has not established a row-count estimate.
 pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSource, conditions: []const catalog.Condition) ?u64 {
+    // A lazy directory retains its authoritative file count while the eager
+    // file list is unloaded. Missing projected statistics cannot mean free I/O.
+    if (source.fileCount() != source.inventory.files.len) return null;
     var count: u64 = 0;
     for (conditions, 0..) |condition, i| {
         var duplicate = false;
@@ -972,6 +1043,7 @@ pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSou
 
 pub fn predicateResidualWork(source: *local.serverless_query_lake_serving.ServingSource, conditions: []const catalog.Condition, candidates: u64) u64 {
     if (candidates == 0) return 0;
+    if (source.fileCount() != source.inventory.files.len) return std.math.maxInt(u64);
     var bytes: u64 = 0;
     var groups: u64 = 0;
     var requests: u64 = 0;
@@ -1119,6 +1191,7 @@ fn appendStrongBound(a: A, conditions: *std.ArrayList(catalog.Condition), next: 
 pub const SearchOrder = struct {
     values: []const std.json.Value = &.{},
     id_descending: bool = false,
+    filter_query_json: []const u8 = "",
 };
 pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool, search_order: SearchOrder) !?Predicate {
     return tryOpenOrderedPredicateFor(a, server, table, request, context, source, reverse, search_order, null);
@@ -1136,15 +1209,23 @@ pub fn tryOpenOrderedPredicateFor(a: A, server: *server_api.ApiHttpServer, table
     errdefer if (best) |cursor| cursor.close(cursor.ptr);
     var best_cost: u64 = std.math.maxInt(u64);
     var best_complete = false;
+    var best_reverse = false;
+    var best_filter_proof: ?[32]u8 = null;
     for (indexes) |index| {
         const indexed = (try orderedCandidate(ca, table, index, request)) orelse continue;
         var cost: u64 = 0;
-        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, true, execution)) orelse continue;
+        const cursor = (try openWithPolicy(a, server, table, indexed.scan, context, source, .automatic, &cost, true, execution)) orelse continue;
         if (!cursor.order_satisfied) {
             cursor.close(cursor.ptr);
             continue;
         }
-        const complete = preparePublicOrderFor(a, cursor, index, parsed, indexed, reverse, search_order, execution) catch |err| {
+        // Physical tuple reversal and public-ID tie reversal are independent.
+        // Cursor.init combines its direction with id_descending, so compensate
+        // for the physical reversal while retaining the public request order.
+        var physical_order = search_order;
+        physical_order.id_descending = search_order.id_descending != indexed.reversed;
+        const physical_reverse = reverse != indexed.reversed;
+        const complete = preparePublicOrderFor(a, cursor, index, parsed, indexed.scan, physical_reverse, physical_order, execution) catch |err| {
             cursor.close(cursor.ptr);
             return err;
         };
@@ -1153,10 +1234,15 @@ pub fn tryOpenOrderedPredicateFor(a: A, server: *server_api.ApiHttpServer, table
             best = cursor;
             best_cost = cost;
             best_complete = complete;
+            best_reverse = physical_reverse;
+            best_filter_proof = orderedFilterProof(a, table, search_order.filter_query_json, indexed.scan.conditions) catch |err| switch (err) {
+                error.OutOfMemory, error.InvalidArgument => null,
+                else => return err,
+            };
         } else cursor.close(cursor.ptr);
     }
     if (best) |cursor| {
-        if (reverse and !best_complete) {
+        if (best_reverse and !best_complete) {
             if (execution) |active| try Owner.bindCoordinator(cursor.ptr, active);
             defer if (execution != null) Owner.releaseCoordinator(cursor.ptr);
             const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
@@ -1164,7 +1250,7 @@ pub fn tryOpenOrderedPredicateFor(a: A, server: *server_api.ApiHttpServer, table
             owner.reader.cursor.?.deinit();
             owner.reader.cursor = replacement;
         }
-        return .{ .cursor = cursor, .complete_order = best_complete };
+        return .{ .cursor = cursor, .complete_order = best_complete, .filter_proof = best_filter_proof };
     }
     return null;
 }
@@ -1173,6 +1259,59 @@ fn preparePublicOrderFor(a: A, cursor: catalog.Cursor, definition: local.storage
     if (execution) |active| try Owner.bindCoordinator(cursor.ptr, active);
     defer if (execution != null) Owner.releaseCoordinator(cursor.ptr);
     return preparePublicOrder(a, cursor, definition, parsed, request, reverse, search_order);
+}
+
+/// Bind a complete compiled row predicate to the exact normalized conditions
+/// enforced by this identity-only cursor. Necessary subsets, residuals and
+/// scalar domains with kind-sensitive equality retain their row checks.
+fn orderedFilterProof(a: A, table: catalog.Table, json: []const u8, enforced: []const catalog.Condition) !?[32]u8 {
+    if (json.len == 0) return null;
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, ca, json, .{});
+    const compiled = try local.storage_db_query_graph_exec.compilePatternFilter(ca, parsed.value);
+    var conditions: std.ArrayList(catalog.Condition) = .empty;
+    if (!try @import("lake_index_text_predicate.zig").exactConditions(ca, compiled, &conditions) or conditions.items.len == 0 or
+        !try compatibleSearchConditions(ca, table, conditions.items)) return null;
+    var normalized: std.ArrayList(catalog.Condition) = .empty;
+    for (conditions.items) |condition| {
+        const column = try table.column(condition.column);
+        // JSON terms distinguish scalar kinds and signed floating zero. A
+        // numeric/datetime tuple equality alone cannot prove that contract.
+        if (condition.op == .eq and (column.type == .number or column.type == .datetime)) return null;
+        var bound = condition;
+        bound.value = try local.sql_lake_values.conditionValue(ca, condition.value, column);
+        try appendStrongBound(ca, &normalized, bound, column);
+    }
+    for (normalized.items) |condition| {
+        const column = try table.column(condition.column);
+        const found = for (enforced) |bound| {
+            if (!std.mem.eql(u8, condition.column, bound.column)) continue;
+            if (try conditionImplies(ca, column, bound, condition)) break true;
+        } else false;
+        if (!found) return null;
+    }
+    var proof: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(json, &proof, .{});
+    return proof;
+}
+
+// Pagination can strengthen a predicate bound. Compare in the declared SQL
+// domain (including exact integers and signed nanoseconds), not JSON string
+// order, and preserve exclusivity at equal endpoints.
+fn conditionImplies(a: A, column: catalog.Column, actual: catalog.Condition, required: catalog.Condition) !bool {
+    const lower = actual.op == .eq or actual.op == .gt or actual.op == .gte;
+    const upper = actual.op == .eq or actual.op == .lt or actual.op == .lte;
+    if (!lower and !upper) return false;
+    const order = try local.sql_scalar.compareDatums(try local.sql_lake_values.comparisonDatum(a, local.sql_scalar.Datum.json(actual.value), column), try local.sql_lake_values.comparisonDatum(a, local.sql_scalar.Datum.json(required.value), column));
+    return switch (required.op) {
+        .eq => actual.op == .eq and order == .eq,
+        .gt, .gte => lower and (order == .gt or (order == .eq and (required.op == .gte or actual.op == .gt))),
+        .lt, .lte => upper and (order == .lt or (order == .eq and (required.op == .lte or actual.op == .lt))),
+        else => false,
+    };
 }
 
 /// The bounded text coordinator preserves a compatible global ordered seek
@@ -1190,18 +1329,23 @@ pub fn hasOrderedPredicatePlan(a: A, table: catalog.Table, request: catalog.Scan
         const indexed = (try orderedCandidate(ca, table, index, request)) orelse continue;
         var equal: usize = 0;
         for (index.keys) |key| {
-            const constant = for (indexed.conditions) |condition| {
+            const constant = for (indexed.scan.conditions) |condition| {
                 if (condition.op == .eq and condition.value != .null and std.mem.eql(u8, key.column, condition.column)) break true;
             } else false;
             if (!constant) break;
             equal += 1;
         }
-        if (indexed.index_range != null and orderedBy(index, indexed, equal)) return true;
+        if (indexed.scan.index_range != null and orderedBy(index, indexed.scan, equal)) return true;
     }
     return false;
 }
 
-fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan) !?catalog.Scan {
+const OrderedCandidate = struct { scan: catalog.Scan, reversed: bool };
+
+/// Search NULL order differs from SQL defaults. A required scalar comparison
+/// can prove NULLs absent; otherwise physical placement must match, including
+/// reversal. Normalize only this private scan, never the public request.
+fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan) !?OrderedCandidate {
     var conditions: std.ArrayList(catalog.Condition) = .empty;
     for (request.conditions) |condition| for (index.keys) |key| {
         if (key.expression_json == null and std.mem.eql(u8, key.column, condition.column)) {
@@ -1213,7 +1357,43 @@ fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_
     };
     var candidate = request;
     candidate.conditions = conditions.items;
-    return chooseAccess(a, &.{index}, candidate);
+    var equal: usize = 0;
+    for (index.keys) |key| {
+        const constant = for (conditions.items) |condition| {
+            if (condition.op == .eq and condition.value != .null and std.mem.eql(u8, key.column, condition.column)) break true;
+        } else false;
+        if (!constant) break;
+        equal += 1;
+    }
+    if (request.order.len == 0 or equal + request.order.len > index.keys.len) return null;
+    const physical = try a.alloc(catalog.Scan.Order, request.order.len);
+    var reversed: ?bool = null;
+    for (request.order, index.keys[equal..][0..request.order.len], physical) |wanted, key, *order| {
+        if (key.expression_json != null or key.collation != null or !std.mem.eql(u8, key.column, wanted.column)) return null;
+        const reverse = wanted.descending != (key.direction == .desc);
+        if (reversed) |prior| if (prior != reverse) return null;
+        reversed = reverse;
+        const nulls_first = switch (key.nulls) {
+            .default => key.direction == .desc,
+            .first => true,
+            .last => false,
+        };
+        if (wanted.nulls_first != (nulls_first != reverse)) {
+            const column = try table.column(key.column);
+            const nonnull = !column.nullable or for (conditions.items) |condition| {
+                if (!std.mem.eql(u8, key.column, condition.column)) continue;
+                if (condition.op == .is_not_null) break true;
+                if (condition.value != .null) switch (condition.op) {
+                    .eq, .gt, .gte, .lt, .lte => break true,
+                    else => {},
+                };
+            } else false;
+            if (!nonnull) return null;
+        }
+        order.* = .{ .column = wanted.column, .descending = key.direction == .desc, .nulls_first = nulls_first };
+    }
+    candidate.order = physical;
+    return .{ .scan = (try chooseAccess(a, &.{index}, candidate)) orelse return null, .reversed = reversed.? };
 }
 
 fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder) !bool {
@@ -1830,6 +2010,10 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
         owner.predicate_lower = lower;
         owner.predicate_upper = upper;
         owner.predicate_count = if (empty_range) 0 else try owner.reader.countRange(ca, lower, upper);
+        // Same tuple bounds as the row index; count block records without
+        // decoding or materializing their bitmaps. Key cardinality matters:
+        // 16K distinct IDs have 16K blocks, unlike one categorical value.
+        owner.predicate_blocks = if (root.predicates) |blocks| if (empty_range) 0 else try tree.countRange(ca, owner.reader.pages.store(), blocks, lower, upper) else null;
     }
     if (estimated_cost) |cost| {
         if (identities_only) {
@@ -1942,6 +2126,9 @@ test "external lake predicate costs prefer selective seeks and broad projected s
     var groups = [_]external.RowGroup{.{ .ordinal = 0, .row_count = 10000, .column_chunks = &chunks }};
     var files = [_]external.FileEntry{.{ .file_id = @constCast("file"), .object_uri = @constCast("file://file"), .byte_len = 100016384, .row_count = 10000, .row_groups = &groups }};
     var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    source.selected_catalog_view = false;
+    source.file_navigation = null;
+    source.plan_lease = null;
     source.inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file://source"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &files };
     const lower: catalog.Condition = .{ .column = "amount", .op = .gte, .value = .{ .integer = 0 } };
     const upper: catalog.Condition = .{ .column = "amount", .op = .lt, .value = .{ .integer = 10000 } };
@@ -1979,6 +2166,110 @@ test "external lake predicate costs prefer selective seeks and broad projected s
     // An inventory with no files is genuinely empty, unlike an unread footer.
     source.inventory.files = &.{};
     try std.testing.expectEqual(@as(?u64, 0), predicateScanWork(&source, &.{lower}));
+    // An unloaded list behind a nonempty directory is unknown, not empty.
+    var navigation: local.serverless_query_lake_serving.ServingSource.FileNavigation = undefined;
+    navigation.count = 8;
+    source.file_navigation = navigation;
+    try std.testing.expectEqual(@as(?u64, null), predicateScanWork(&source, &.{lower}));
+    try std.testing.expectEqual(std.math.maxInt(u64), predicateResidualWork(&source, &.{lower}, 1));
+    try std.testing.expectEqual(@as(u64, 0), predicateResidualWork(&source, &.{lower}, 0));
+    navigation.count = 0;
+    source.file_navigation = navigation;
+    try std.testing.expectEqual(@as(?u64, 0), predicateScanWork(&source, &.{lower}));
+}
+
+test "external lake metadata probe costs amortize internal paths and retain broad fallback" {
+    var owner: Owner = undefined;
+    owner.reader.root.reverse = .{ .digest = @splat(1), .bytes = 256, .height = 1, .records = 16384 };
+    const predicate: Predicate = .{ .cursor = .{ .ptr = &owner, .next = undefined, .close = undefined } };
+    const complete = predicateIndexWork(16384, 1024, true);
+    try std.testing.expectEqual(@as(u64, 0), predicate.membershipWork(0));
+    try std.testing.expect(predicate.membershipWork(16) + predicate.membershipWork(5) < complete);
+    try std.testing.expect(predicate.membershipWork(16384) > complete);
+    try std.testing.expect(predicate.membershipWork(128) < 128 * predicate.membershipWork(1));
+    try std.testing.expect(predicate.membershipWork(std.math.maxInt(u64)) >= complete);
+}
+
+test "external lake dynamic exact keys ordered filter proof binds exact conditions and retains residuals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "other", .path = "other", .type = .integer } }, .external_indexes = .{ .catalog_json = "", .indexes_json = "{}", .desired = @splat(0), .schema_json =
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"other":{"type":"integer"}}}}}}
+    } };
+    const enforced = [_]catalog.Condition{.{ .column = "id", .op = .gte, .value = try local.sql_lake_values.conditionValue(a, .{ .integer = 0 }, try table.column("id")) }};
+    const json =
+        \\{"range":{"id":{"gte":0}}}
+    ;
+    const proof = (try orderedFilterProof(a, table, json, &enforced)).?;
+    const predicate: Predicate = .{ .cursor = undefined, .filter_proof = proof };
+    try std.testing.expect(predicate.provesFilter(json));
+    try std.testing.expect(!predicate.provesFilter(
+        \\{"range":{"id":{"gte":1}}}
+    ));
+    var stronger = [_]catalog.Condition{.{ .column = "id", .op = .gte, .value = try local.sql_lake_values.conditionValue(a, .{ .integer = 10 }, try table.column("id")) }};
+    try std.testing.expect(try orderedFilterProof(a, table, json, &stronger) != null);
+    const exclusive =
+        \\{"range":{"id":{"gt":10}}}
+    ;
+    try std.testing.expect(try orderedFilterProof(a, table, exclusive, &stronger) == null);
+    stronger[0].op = .gt;
+    try std.testing.expect(try orderedFilterProof(a, table, exclusive, &stronger) != null);
+    stronger[0].op = .lte;
+    try std.testing.expect(try orderedFilterProof(a, table,
+        \\{"range":{"id":{"lt":11}}}
+    , &stronger) != null);
+    try std.testing.expect(try orderedFilterProof(a, table,
+        \\{"range":{"id":{"lt":10}}}
+    , &stronger) == null);
+    // Normalization can collapse redundant weaker bounds without widening the
+    // exact source predicate. Missing residuals and Boolean branches cannot.
+    try std.testing.expect(try orderedFilterProof(a, table,
+        \\{"conjuncts":[{"range":{"id":{"gte":-1}}},{"range":{"id":{"gte":0}}}]}
+    , &enforced) != null);
+    for ([_][]const u8{
+        \\{"conjuncts":[{"range":{"id":{"gte":0}}},{"range":{"other":{"gte":0}}}]}
+        ,
+        \\{"disjuncts":[{"range":{"id":{"gte":0}}},{"range":{"id":{"lt":-10}}}]}
+        ,
+        \\{"bool":{"must":[{"range":{"id":{"gte":0}}}],"must_not":[{"term":{"id":3}}]}}
+        ,
+        \\{"range":{"id":{"gte":1}}}
+        ,
+        \\{"term":{"id":null}}
+        ,
+    }) |residual| try std.testing.expect(try orderedFilterProof(a, table, residual, &enforced) == null);
+}
+
+test "external lake dynamic exact keys ordered search proves reverse and NULL exclusion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var columns = [_]catalog.Column{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "other", .path = "other", .type = .integer } };
+    const table: catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &columns };
+    const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "id", .owner_kind = .table, .owner_name = "id", .access_method = .ordered_tuple, .keys = &.{.{ .column = "id" }} };
+    for ([_]bool{ false, true }) |descending| {
+        var scan: catalog.Scan = .{ .fields = &.{}, .limit = 20, .order = &.{.{ .column = "id", .descending = descending, .nulls_first = !descending }} };
+        // NULL placement differs from the SQL index. No row predicate means
+        // no proof, even if the current fixture happens to contain no NULLs.
+        try std.testing.expect(try orderedCandidate(a, table, index, scan) == null);
+        scan.conditions = &.{.{ .column = "id", .op = .gte, .value = .{ .integer = 0 } }};
+        const candidate = (try orderedCandidate(a, table, index, scan)).?;
+        try std.testing.expectEqual(descending, candidate.reversed);
+        try std.testing.expect(orderedBy(index, candidate.scan, 0));
+        try std.testing.expect(!candidate.scan.order[0].descending);
+        try std.testing.expect(!candidate.scan.order[0].nulls_first);
+        // NULL equality does not establish the non-NULL domain.
+        scan.conditions = &.{.{ .column = "id", .op = .is_null, .value = .null }};
+        try std.testing.expect(try orderedCandidate(a, table, index, scan) == null);
+        scan.conditions = &.{};
+        columns[0].nullable = false;
+        try std.testing.expect(try orderedCandidate(a, table, index, scan) != null);
+        columns[0].nullable = true;
+    }
+    const compound: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "compound", .owner_kind = .table, .owner_name = "compound", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "id" }, .{ .column = "other" } } };
+    const mixed: catalog.Scan = .{ .fields = &.{}, .limit = 20, .conditions = &.{.{ .column = "id", .op = .gte, .value = .{ .integer = 0 } }}, .order = &.{ .{ .column = "id", .descending = false }, .{ .column = "other", .descending = true } } };
+    try std.testing.expect(try orderedCandidate(a, table, compound, mixed) == null);
 }
 
 test "external lake ordered access plans equality prefixes ranges directions and exact order proofs" {
@@ -2459,4 +2750,70 @@ test "external lake covering waves overlap cold blocks retain admission and join
         wave.deinit();
         try std.testing.expectEqual(before, scheduler.pull_bytes);
     }
+}
+
+test "external lake direct metadata probes require exact maps and validate source cuts" {
+    const a = std.testing.allocator;
+    const Resolver = local.serverless_query_lake_serving.ServingSource.RowResolver;
+    const RowRef = local.storage_rowsource_types.RowRef;
+    var owner: Owner = undefined;
+    owner.reader.root.source = "metadata-native";
+    owner.reader.root.snapshot = "metadata-cut";
+    var target: Resolver = undefined;
+    target.relocated = true;
+    target.coordinate_space = @splat(7);
+    target.source = "metadata-native";
+    target.snapshot = "metadata-cut";
+    owner.row_resolver = target;
+    var source = target;
+    source.source = "text-native";
+    source.snapshot = "text-cut";
+    var predicate: Predicate = .{ .cursor = .{ .ptr = &owner, .next = undefined, .close = undefined } };
+    const refs = [_]RowRef{.{ .external = .{ .source_id = source.source, .snapshot_id = source.snapshot, .file_id = "fragment", .row_group_ordinal = 9, .row_ordinal = (1 << 40) + 7 } }};
+    const rebased = (try predicate.rebaseSharedCoordinates(a, source, &refs)).?;
+    defer a.free(rebased);
+    try std.testing.expectEqualStrings("metadata-native", rebased[0].external.source_id);
+    try std.testing.expectEqualStrings("metadata-cut", rebased[0].external.snapshot_id);
+    try std.testing.expectEqualStrings(refs[0].external.file_id, rebased[0].external.file_id);
+    try std.testing.expectEqual(refs[0].external.row_ordinal, rebased[0].external.row_ordinal);
+    try std.testing.expectEqual(refs[0].external.row_group_ordinal, rebased[0].external.row_group_ordinal);
+    var wrong_cut = refs;
+    wrong_cut[0].external.snapshot_id = "unrelated-cut";
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, predicate.rebaseSharedCoordinates(a, source, &wrong_cut));
+    var other = source;
+    other.coordinate_space = @splat(8);
+    try std.testing.expect((try predicate.rebaseSharedCoordinates(a, other, &refs)) == null);
+    var allowed = [_]bool{true};
+    try std.testing.expect(!try predicate.containsInSpaceMany(other, &refs, &allowed));
+    try std.testing.expect(allowed[0]);
+    other.coordinate_space = null;
+    try std.testing.expect(!predicate.sharesCoordinates(other));
+    const Fault = struct {
+        fn run(out: A, value: Predicate, binding: Resolver, input: []const RowRef) !void {
+            const result = (try value.rebaseSharedCoordinates(out, binding, input)).?;
+            defer out.free(result);
+            try std.testing.expectEqual(input.len, result.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fault.run, .{ predicate, source, &refs });
+}
+
+test "external lake metadata materialization costs count blocks and coordinate conversion" {
+    var owner: Owner = undefined;
+    owner.row_resolver = null;
+    owner.predicate_count = 16384;
+    owner.predicate_blocks = 16384;
+    const value: Predicate = .{ .work = 2312, .cursor = .{ .ptr = &owner, .next = undefined, .close = undefined } };
+    try std.testing.expect(value.materializationWork(null) > 64 * 128);
+    const distinct = value.materializationWork(null);
+    owner.predicate_blocks = 4;
+    try std.testing.expectEqual(@as(u64, 2312 + 4 * 64), value.materializationWork(null));
+    try std.testing.expect(value.materializationWork(null) < distinct);
+    owner.predicate_blocks = null;
+    try std.testing.expectEqual(distinct, value.materializationWork(null));
+    try std.testing.expect(value.scanMaterializationWork(1000) > 1000);
+    owner.predicate_count = 0;
+    owner.predicate_blocks = 0;
+    try std.testing.expectEqual(@as(u64, 2312), value.materializationWork(null));
+    try std.testing.expectEqual(std.math.maxInt(u64), value.scanMaterializationWork(std.math.maxInt(u64)));
 }

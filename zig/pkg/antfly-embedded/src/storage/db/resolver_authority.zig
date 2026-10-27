@@ -16,11 +16,14 @@
 //! Native destination-owned curation records. The enclosing native transaction
 //! owns revision comparison, record/index edits and publication of its head.
 //! A single-entity read touches its redirect component and incident policy only.
+pub const routes = @import("resolver_namespace_routes.zig");
 const std = @import("std");
 const resolver = @import("antfly_resolver");
 const c = resolver.curation;
 const policy = @import("resolver_namespace.zig");
 const A = std.mem.Allocator;
+pub const static_profiles = @import("resolver_static_profiles.zig");
+pub const query_context = @import("resolver_query_context.zig");
 pub const lite_prefix = "\x00\x00__metadata__:resolver_authority:v1:";
 pub const lite_marker = lite_prefix ++ "version";
 pub const Row = struct { key: []const u8, value: []const u8 };
@@ -32,6 +35,7 @@ pub const Backend = struct {
     remove: *const fn (*anyopaque, A, []const u8) anyerror!void,
     scan: *const fn (*anyopaque, A, []const u8, ?[]const u8, u32) anyerror!Page,
 };
+pub const Stamp = struct { revision: u64, fingerprint: [32]u8 };
 pub const Head = struct {
     version: u8 = 1,
     key_template: []const u8,
@@ -48,8 +52,45 @@ pub const Kind = enum { redirect, suppressed, suppression, distinct, redirect_or
 pub const Edit = struct { kind: Kind, id: []const u8, value: ?std.json.Value };
 pub const Patch = struct { expected_revision: u64, next: Head, edits: []const Edit };
 pub const QueueHead = struct { version: u8 = 1, revision: u64 = 0, count: u32 = 0, bytes: u64 = 0, receipt_scope: ?c.ReceiptScope = null };
-pub const QueuePatch = struct { expected_revision: u64, revision: u64, receipt_scope: ?c.ReceiptScope = null, proposals: []const c.Proposal = &.{} };
-pub const AliasProfile = struct { key_template: []const u8, aliases: []const resolver.KeyAlias, suppress_json: []const u8 = "" };
+pub const QueuePatch = struct { expected_revision: u64, revision: u64, receipt_scope: ?c.ReceiptScope = null, proposals: []const c.Proposal = &.{}, retain_evidence: bool = false };
+const ProposalHeader = struct {
+    version: u8 = 1,
+    proposal: c.Proposal,
+    evidence_hash: [32]u8,
+    capacity: u64,
+};
+fn evidenceHash(a: A, value: ?std.json.Value) ![32]u8 {
+    var result: [32]u8 = undefined;
+    @import("antfly_hash").Sha256.hash(try encode(a, value), &result, .{});
+    return result;
+}
+fn proposalHeaderValue(a: A, value: c.Proposal) !ProposalHeader {
+    var header = value;
+    header.evidence = null;
+    return .{ .proposal = header, .evidence_hash = try evidenceHash(a, value.evidence), .capacity = c.proposalCapacityBytes(.{ .proposals = &.{value} }) };
+}
+pub const EdgeMask = struct { ptr: *anyopaque, enabled: *const fn (*anyopaque, A, []const u8) anyerror!bool };
+pub const AliasLookup = struct {
+    ptr: *anyopaque,
+    expand: *const fn (*anyopaque, A, []const u8, bool, EdgeMask) anyerror![]const resolver.KeyAlias,
+    node: ?*const fn (*anyopaque, A, []const u8) anyerror!?query_context.QueryNode = null,
+    seek_node: ?*const fn (*anyopaque, A, []const u8, ?[]const u8) anyerror!?query_context.QueryNode = null,
+    profile_active: ?*const fn (*anyopaque, A, []const u8) anyerror!bool = null,
+    profile_epoch: ?*const fn (*anyopaque, A) anyerror!u64 = null,
+};
+pub const AliasProfile = struct { id: []const u8 = "", key_template: []const u8, aliases: []const resolver.KeyAlias, suppress_json: []const u8 = "" };
+/// A request-local key: modern bindings already carry immutable static
+/// identity. Only legacy curated overlays need additional content hashing.
+pub fn admissionProfileKey(a: A, cfg: anytype) ![]const u8 {
+    if (cfg.admission_profile.len > 0 and cfg.merges.len == 0 and cfg.curation_json.len == 0) return cfg.admission_profile;
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
+    try std.json.Stringify.value(.{ cfg.admission_profile, if (cfg.admission_profile.len == 0) cfg.aliases else &.{}, if (cfg.admission_profile.len == 0) cfg.suppress_json else "", cfg.key_template, cfg.merges, cfg.curation_json }, .{}, &writer.writer);
+    try writer.writer.flush();
+    var digest: [32]u8 = undefined;
+    writer.hasher.final(&digest);
+    return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+}
 pub fn effectiveAliases(a: A, namespace: policy.Namespace, profiles: []const AliasProfile, key: []const u8, into: ?[]const u8) ![]const resolver.KeyAlias {
     const Edge = struct { target: []const u8, conflict: bool = false };
     var authoritative: std.StringHashMapUnmanaged(void) = .empty;
@@ -106,36 +147,128 @@ pub fn planningAliases(a: A, namespace: policy.Namespace, effective: []const res
     return effective;
 }
 
-pub fn validateProfile(a: A, namespace: policy.Namespace, static: []const resolver.KeyAlias, suppress_json: []const u8) !void {
-    var curated: std.StringHashMapUnmanaged(void) = .empty;
-    var removed: std.StringHashMapUnmanaged(void) = .empty;
-    for (namespace.merges) |alias| try curated.put(a, alias.key, {});
-    for (namespace.state.removed_aliases) |id| try removed.put(a, id, {});
-    var aliases: std.ArrayList(resolver.KeyAlias) = .empty;
-    for (static) |alias| if (!curated.contains(alias.key) and !removed.contains(alias.key)) try aliases.append(a, alias);
-    try aliases.appendSlice(a, namespace.merges);
-    _ = try c.RedirectIndex.init(a, static);
-    _ = try c.RedirectIndex.init(a, namespace.merges);
-    const redirects = try c.RedirectIndex.init(a, aliases.items);
-    var index = try c.Index.init(a, suppress_json, try encode(a, namespace.state));
-    try index.bindRedirects(a, redirects);
-    for (namespace.state.distinct) |pair| if (std.mem.eql(u8, redirects.canonical(pair.from), redirects.canonical(pair.to))) return error.ResolverDistinctPair;
-    for (aliases.items) |alias| {
-        const target = redirects.canonical(alias.target);
-        if (index.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
-        if (try index.pinnedDistinct(a, alias.key, target)) return error.ResolverDistinctPair;
+/// An overlay only adds outgoing edges at terminal nodes of the validated
+/// curated graph. Base paths can therefore jump straight to their terminal;
+/// profile-local compression never copies the curated canonical map.
+const ProfileRedirects = struct {
+    base: c.RedirectIndex,
+    canonical_keys: std.StringHashMapUnmanaged([]const u8) = .empty,
+    fn init(a: A, base: c.RedirectIndex, aliases: []const resolver.KeyAlias) !ProfileRedirects {
+        var result: ProfileRedirects = .{ .base = base };
+        var edges: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (aliases) |alias| try edges.put(a, alias.key, alias.target);
+        var path: std.ArrayList([]const u8) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (aliases) |alias| {
+            path.clearRetainingCapacity();
+            seen.clearRetainingCapacity();
+            var current = alias.key;
+            const target = walk: while (true) {
+                if (result.canonical_keys.get(current)) |known| break :walk known;
+                const next = edges.get(current) orelse break :walk current;
+                if ((try seen.getOrPut(a, current)).found_existing) return error.InvalidResolverAliasCycle;
+                try path.append(a, current);
+                current = base.canonical(next);
+            };
+            for (path.items) |key| try result.canonical_keys.put(a, key, target);
+        }
+        return result;
     }
+    fn canonical(self: ProfileRedirects, key: []const u8) []const u8 {
+        const terminal = self.base.canonical(key);
+        return self.canonical_keys.get(terminal) orelse terminal;
+    }
+};
+const ProfileValidation = struct {
+    namespace: policy.Namespace,
+    base: c.RedirectIndex,
+    negative: c.Index,
+    incoming: std.StringHashMapUnmanaged(void) = .empty,
+    blocked: std.ArrayList([]const u8) = .empty,
+    distinct: std.StringHashMapUnmanaged(std.ArrayList(c.Pair)) = .empty,
+    fn init(a: A, namespace: policy.Namespace) !ProfileValidation {
+        var result: ProfileValidation = .{
+            .namespace = namespace,
+            .base = try c.RedirectIndex.init(a, namespace.merges),
+            .negative = try c.Index.init(a, "", try encode(a, namespace.state)),
+        };
+        for (namespace.merges) |alias| {
+            const target = result.base.canonical(alias.target);
+            const slot = try result.incoming.getOrPut(a, target);
+            if (!slot.found_existing and result.negative.keySuppressed(target)) try result.blocked.append(a, target);
+        }
+        for (namespace.state.distinct) |pair| {
+            const from = result.base.canonical(pair.from);
+            const to = result.base.canonical(pair.to);
+            if (std.mem.eql(u8, from, to)) return error.ResolverDistinctPair;
+            for ([_][]const u8{ from, to }) |endpoint| {
+                const slot = try result.distinct.getOrPut(a, endpoint);
+                if (!slot.found_existing) slot.value_ptr.* = .empty;
+                try slot.value_ptr.append(a, pair);
+            }
+        }
+        return result;
+    }
+    fn validate(self: ProfileValidation, a: A, static: []const resolver.KeyAlias, suppress_json: []const u8) !void {
+        _ = try c.RedirectIndex.init(a, static);
+        var added: std.ArrayList(resolver.KeyAlias) = .empty;
+        for (static) |alias| if (!self.base.canonical_keys.contains(alias.key) and !self.negative.removed_aliases.contains(alias.key)) try added.append(a, alias);
+        const overlay = try ProfileRedirects.init(a, self.base, added.items);
+        const local_negative = try c.Index.init(a, suppress_json, "");
+        for (self.blocked.items) |terminal| if (std.mem.eql(u8, overlay.canonical(terminal), terminal)) return error.SuppressedResolverRedirectTarget;
+        // Every changed curated path ends at the target of an added edge.
+        // Unchanged paths were checked once; source-local key rules can check
+        // their terminal directly through the shared incoming directory.
+        for (added.items) |alias| {
+            const target = overlay.canonical(alias.target);
+            if (self.negative.keySuppressed(target) or local_negative.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
+            if (self.distinct.get(alias.key)) |pairs| for (pairs.items) |pair| {
+                if (std.mem.eql(u8, overlay.canonical(pair.from), overlay.canonical(pair.to))) return error.ResolverDistinctPair;
+            };
+        }
+        var keys = local_negative.keys.keyIterator();
+        while (keys.next()) |key| if (std.mem.eql(u8, overlay.canonical(key.*), key.*) and self.incoming.contains(key.*)) return error.SuppressedResolverRedirectTarget;
+    }
+};
+pub fn validateProfile(a: A, namespace: policy.Namespace, static: []const resolver.KeyAlias, suppress_json: []const u8) !void {
+    const context = try ProfileValidation.init(a, namespace);
+    try context.validate(a, static, suppress_json);
 }
 pub fn validateProfiles(a: A, namespace: policy.Namespace, profiles: []const AliasProfile) !void {
+    const context = try ProfileValidation.init(a, namespace);
     var checked: std.StringHashMapUnmanaged(void) = .empty;
     for (profiles) |profile| if (std.mem.eql(u8, namespace.key_template, profile.key_template)) {
-        const key = try encode(a, .{ profile.aliases, profile.suppress_json });
+        const key = if (profile.id.len > 0) profile.id else try encode(a, .{ profile.aliases, profile.suppress_json });
         if ((try checked.getOrPut(a, key)).found_existing) continue;
-        try validateProfile(a, namespace, profile.aliases, profile.suppress_json);
+        try context.validate(a, profile.aliases, profile.suppress_json);
     };
 }
 
-pub const Snapshot = struct { head: Head, namespace: policy.Namespace };
+pub const Snapshot = struct {
+    head: Head,
+    namespace: policy.Namespace,
+    /// Query-only projection: merges include the effective configured paths.
+    /// Never persisted as namespace corrections or sent to older readers.
+    complete_aliases: bool = false,
+    /// Query-only configured negatives, qualified by the enrolled profile.
+    configured_suppression: ?c.Suppression = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("head");
+        try writer.write(self.head);
+        try writer.objectField("namespace");
+        try writer.write(self.namespace);
+        if (self.complete_aliases) {
+            try writer.objectField("complete_aliases");
+            try writer.write(true);
+        }
+        if (self.configured_suppression) |suppression| {
+            try writer.objectField("configured_suppression");
+            try writer.write(suppression);
+        }
+        try writer.endObject();
+    }
+};
 fn parse(comptime T: type, a: A, bytes: []const u8) !T {
     return std.json.parseFromSliceLeaky(T, a, bytes, .{ .allocate = .alloc_always });
 }
@@ -144,13 +277,17 @@ fn encode(a: A, value: anytype) ![]const u8 {
 }
 fn hash(a: A, value: []const u8) ![]const u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+    @import("antfly_hash").Sha256.hash(value, &digest, .{});
     return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
+pub var test_query_base_loads: std.atomic.Value(usize) = .init(0);
+pub var test_proposal_key_scans: std.atomic.Value(usize) = .init(0);
+pub var test_head_enumerations: std.atomic.Value(usize) = .init(0);
 pub const Store = struct {
     a: A,
     backend: Backend,
     prefix: []const u8,
+    pin_changes: ?*std.StringHashMapUnmanaged(void) = null,
     max_namespace_bytes: ?u64 = c.max_state_bytes,
     max_queue_bytes: ?u64 = c.max_state_bytes,
     max_queue_count: ?u32 = 4096,
@@ -218,6 +355,7 @@ pub const Store = struct {
         return result.items;
     }
     pub fn heads(self: Store) ![]const Head {
+        if (comptime @import("builtin").is_test) _ = test_head_enumerations.fetchAdd(1, .monotonic);
         const prefix = try self.keyPath("head/");
         var result: std.ArrayList(Head) = .empty;
         var after: ?[]const u8 = null;
@@ -277,6 +415,13 @@ pub const Store = struct {
         }
         return values.snapshot(h);
     }
+    pub const ForwardNode = struct { target: ?[]const u8, suppressed: bool };
+    /// Minimal point state for path-compressed execution caches. Callers pin
+    /// the namespace head and invalidate their cache whenever it changes.
+    pub fn forwardNode(self: Store, template: []const u8, id: []const u8) !ForwardNode {
+        const alias = try self.get(resolver.KeyAlias, template, .redirect, id);
+        return .{ .target = if (alias) |value| value.target else null, .suppressed = try self.backend.get(self.backend.ptr, self.a, try self.record(template, .suppressed, id)) != null };
+    }
     /// Forward and reverse redirect indexes bound discovery to the affected
     /// components. Distinct endpoints add only their forward canonical paths.
     pub fn forwardScope(self: Store, template: []const u8, seeds: []const []const u8) !?Snapshot {
@@ -296,21 +441,1275 @@ pub const Store = struct {
         }
         return values.snapshot(h);
     }
-    /// Point policy reads include only the connected key component and the
-    /// queried normalized text rule, independent of unrelated namespace size.
-    pub fn mentionPolicy(self: Store, template: []const u8, key: []const u8, text: []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
-        var snapshot = (try self.componentWithAliases(template, &.{key}, static_aliases)) orelse return null;
-        if (try self.get([]const u8, template, .text, try c.normalize(self.a, text))) |rule|
-            snapshot.namespace.state.suppress.texts = try self.a.dupe([]const u8, &.{rule});
+    const PinReady = struct { endpoints: u64 };
+    const PinCount = struct { key: []const u8, count: u64 };
+    fn pinReadyPath(self: Store, template: []const u8) ![]const u8 {
+        return self.keyPath(try std.fmt.allocPrint(self.a, "pin-ready/{s}", .{try hash(self.a, template)}));
+    }
+    fn pinCountPath(self: Store, template: []const u8, id: []const u8) ![]const u8 {
+        return self.keyPath(try std.fmt.allocPrint(self.a, "pin-count/{s}/{s}", .{ try hash(self.a, template), try hash(self.a, id) }));
+    }
+    fn pinCount(self: Store, template: []const u8, id: []const u8) !u64 {
+        const raw = try self.backend.get(self.backend.ptr, self.a, try self.pinCountPath(template, id)) orelse return 0;
+        return (try parse(PinCount, self.a, raw)).count;
+    }
+    fn pinChild(self: Store, template: []const u8, parent: []const u8, child: []const u8, present: bool) !void {
+        const path = try std.mem.concat(self.a, u8, &.{ try self.adjacent(template, "pin-child", parent), try hash(self.a, child) });
+        if (present) try self.backend.put(self.backend.ptr, self.a, path, try encode(self.a, child)) else try self.backend.remove(self.backend.ptr, self.a, path);
+    }
+    fn setPinCount(self: Store, template: []const u8, id: []const u8, count: u64) !void {
+        if (self.pin_changes) |changes| try changes.put(self.a, try self.a.dupe(u8, id), {});
+        const path = try self.pinCountPath(template, id);
+        if (count == 0) try self.backend.remove(self.backend.ptr, self.a, path) else try self.backend.put(self.backend.ptr, self.a, path, try encode(self.a, PinCount{ .key = id, .count = count }));
+    }
+    fn ownPin(self: Store, template: []const u8, id: []const u8) !bool {
+        return (try self.backend.scan(self.backend.ptr, self.a, try self.adjacent(template, "distinct-key", id), null, 1)).rows.len != 0;
+    }
+    /// Linear, atomic adoption for old namespaces. Ordinary edits maintain the
+    /// sparse index incrementally; readers never infer readiness from a head.
+    pub fn ensurePinIndex(self: Store, template: []const u8) !void {
+        const ready = try self.pinReadyPath(template);
+        if (try self.backend.get(self.backend.ptr, self.a, ready) != null) return;
+        const Node = struct { target: ?[]const u8 = null, incoming: usize = 0, pins: u64 = 0 };
+        var nodes: std.StringArrayHashMapUnmanaged(Node) = .empty;
+        inline for (.{ Kind.redirect, Kind.distinct }) |kind| {
+            var after: ?[]const u8 = null;
+            while (true) {
+                const page = try self.backend.scan(self.backend.ptr, self.a, try self.records(template, kind), after, 128);
+                for (page.rows) |row| {
+                    if (kind == .redirect) {
+                        const alias = try parse(resolver.KeyAlias, self.a, row.value);
+                        const from = try nodes.getOrPut(self.a, alias.key);
+                        if (!from.found_existing) from.value_ptr.* = .{};
+                        from.value_ptr.target = alias.target;
+                        const to = try nodes.getOrPut(self.a, alias.target);
+                        if (!to.found_existing) to.value_ptr.* = .{};
+                        to.value_ptr.incoming += 1;
+                    } else {
+                        const pair = try parse(c.Pair, self.a, row.value);
+                        for ([_][]const u8{ pair.from, pair.to }) |id| {
+                            const node = try nodes.getOrPut(self.a, id);
+                            if (!node.found_existing) node.value_ptr.* = .{};
+                            node.value_ptr.pins = 1;
+                        }
+                    }
+                }
+                after = page.next;
+                if (after == null) break;
+            }
+        }
+        var total: u64 = 0;
+        for (nodes.values()) |node| total += node.pins;
+        var leaves: std.ArrayList(usize) = .empty;
+        for (nodes.values(), 0..) |node, i| if (node.incoming == 0) try leaves.append(self.a, i);
+        var offset: usize = 0;
+        while (offset < leaves.items.len) : (offset += 1) {
+            const node = nodes.values()[leaves.items[offset]];
+            if (node.target) |target| {
+                const i = nodes.getIndex(target).?;
+                nodes.values()[i].pins = try std.math.add(u64, nodes.values()[i].pins, node.pins);
+                nodes.values()[i].incoming -= 1;
+                if (nodes.values()[i].incoming == 0) try leaves.append(self.a, i);
+            }
+        }
+        if (offset != nodes.count()) return error.InvalidResolverAliasCycle;
+        for (nodes.keys(), nodes.values()) |id, node| if (node.pins != 0) {
+            try self.setPinCount(template, id, node.pins);
+            if (node.target) |target| try self.pinChild(template, target, id, true);
+        };
+        try self.backend.put(self.backend.ptr, self.a, ready, try encode(self.a, PinReady{ .endpoints = total }));
+    }
+    const PinDelta = struct { key: []const u8, amount: i128 };
+    /// Union the affected ancestor paths, then propagate each aggregate once.
+    /// Cuts describe a detached forest; all old source weights are captured
+    /// before this pass so update order cannot multiply or double-count work.
+    fn propagatePins(self: Store, template: []const u8, deltas: []const PinDelta, cuts: std.StringHashMapUnmanaged(void)) !void {
+        const Node = struct { delta: i128 = 0, next: ?usize = null, incoming: usize = 0 };
+        var nodes: std.StringArrayHashMapUnmanaged(Node) = .empty;
+        for (deltas) |delta| {
+            if (delta.amount == 0) continue;
+            const entry = try nodes.getOrPut(self.a, delta.key);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            entry.value_ptr.delta = try std.math.add(i128, entry.value_ptr.delta, delta.amount);
+        }
+        var offset: usize = 0;
+        while (offset < nodes.count()) : (offset += 1) {
+            const id = nodes.keys()[offset];
+            if (cuts.contains(id)) continue;
+            const edge = try self.get(resolver.KeyAlias, template, .redirect, id) orelse continue;
+            const target = try nodes.getOrPut(self.a, edge.target);
+            if (!target.found_existing) target.value_ptr.* = .{};
+            target.value_ptr.incoming += 1;
+            nodes.values()[offset].next = nodes.getIndex(edge.target).?;
+        }
+        var leaves: std.ArrayList(usize) = .empty;
+        for (nodes.values(), 0..) |node, i| if (node.incoming == 0) try leaves.append(self.a, i);
+        offset = 0;
+        while (offset < leaves.items.len) : (offset += 1) {
+            const i = leaves.items[offset];
+            const node = nodes.values()[i];
+            if (node.delta != 0) {
+                const old = try self.pinCount(template, nodes.keys()[i]);
+                const value = try std.math.add(i128, @as(i128, old), node.delta);
+                const count = std.math.cast(u64, value) orelse return error.InvalidCatalogRecord;
+                try self.setPinCount(template, nodes.keys()[i], count);
+                if (node.next) |next| try self.pinChild(template, nodes.keys()[next], nodes.keys()[i], count != 0);
+            }
+            if (node.next) |next| {
+                nodes.values()[next].delta = try std.math.add(i128, nodes.values()[next].delta, node.delta);
+                nodes.values()[next].incoming -= 1;
+                if (nodes.values()[next].incoming == 0) try leaves.append(self.a, next);
+            }
+        }
+        if (offset != nodes.count()) return error.InvalidResolverAliasCycle;
+    }
+    /// Query policy is projected at one native read cut. Rendering follows only
+    /// forward edges; scoring also needs incident distinct pins and their paths.
+    /// Text suppression is always a point lookup, never a namespace export.
+    const QueryGraph = struct { head: Stamp, fingerprint: [32]u8, bytes: u64 };
+    fn queryGraphPath(self: Store, template: []const u8) ![]const u8 {
+        return self.keyPath(try std.fmt.allocPrint(self.a, "query-graph/{s}", .{try hash(self.a, template)}));
+    }
+    fn graphKind(kind: Kind) bool {
+        return kind == .redirect or kind == .removed_alias or kind == .distinct;
+    }
+    fn queryGraph(self: Store, h: Head) !QueryGraph {
+        if (try self.backend.get(self.backend.ptr, self.a, try self.queryGraphPath(h.key_template))) |raw| {
+            const graph = try parse(QueryGraph, self.a, raw);
+            if (graph.head.revision == h.revision and std.mem.eql(u8, &graph.head.fingerprint, &h.fingerprint)) return graph;
+        }
+        // An older writer or restored legacy snapshot has no qualified graph
+        // stamp. The complete lineage remains a conservative cache identity.
+        return .{ .head = .{ .revision = h.revision, .fingerprint = h.fingerprint }, .fingerprint = h.fingerprint, .bytes = h.bytes };
+    }
+    fn putQueryGraph(self: Store, h: Head, fingerprint: [32]u8, bytes: u64) !void {
+        try self.backend.put(self.backend.ptr, self.a, try self.queryGraphPath(h.key_template), try encode(self.a, QueryGraph{ .head = .{ .revision = h.revision, .fingerprint = h.fingerprint }, .fingerprint = fingerprint, .bytes = bytes }));
+    }
+    const RoutingStamp = struct { head: Stamp, fingerprint: [32]u8 };
+    fn routingPath(self: Store, template: []const u8) ![]const u8 {
+        return self.keyPath(try std.fmt.allocPrint(self.a, "query-routing/{s}", .{try hash(self.a, template)}));
+    }
+    fn routingFingerprint(self: Store, h: Head) ![32]u8 {
+        if (try self.backend.get(self.backend.ptr, self.a, try self.routingPath(h.key_template))) |raw| {
+            const stamp = try parse(RoutingStamp, self.a, raw);
+            if (stamp.head.revision == h.revision and std.mem.eql(u8, &stamp.head.fingerprint, &h.fingerprint)) return stamp.fingerprint;
+        }
+        return h.fingerprint;
+    }
+    fn putRouting(self: Store, h: Head, fingerprint: [32]u8) !void {
+        try self.backend.put(self.backend.ptr, self.a, try self.routingPath(h.key_template), try encode(self.a, RoutingStamp{ .head = .{ .revision = h.revision, .fingerprint = h.fingerprint }, .fingerprint = fingerprint }));
+    }
+    pub const QueryProfile = struct {
+        id: []const u8,
+        // Complete native lookups need no full-profile loader. Legacy or
+        // explicitly bulk callers supply the loader and its build estimate.
+        ptr: ?*anyopaque = null,
+        load: ?*const fn (*anyopaque, A) anyerror![]const resolver.KeyAlias = null,
+        estimated_bytes: usize = std.math.maxInt(usize),
+        lookup: ?AliasLookup = null,
+    };
+    pub const InlineQueryProfile = struct {
+        aliases: []const resolver.KeyAlias,
+        pub fn estimate(self: InlineQueryProfile) usize {
+            var bytes: usize = 0;
+            for (self.aliases) |alias| bytes +|= 1024 +| (alias.key.len +| alias.target.len) *| 8;
+            return bytes;
+        }
+        pub fn load(ptr: *anyopaque, a: A) ![]const resolver.KeyAlias {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return parse([]const resolver.KeyAlias, a, try encode(a, self.aliases));
+        }
+    };
+    pub const PreparedQuery = struct {
+        lease: ?query_context.Lease,
+        lookup: ?AliasLookup = null,
+        indexed: bool = false,
+        pin_discovery: bool = true,
+        profile_id: []const u8 = "",
+        routing_id: [32]u8 = @splat(0),
+        graph_id: [32]u8 = @splat(0),
+        stamp: Stamp,
+        template: []const u8,
+        distinct: bool,
+        pub fn release(self: PreparedQuery) void {
+            if (self.lease) |lease| lease.release();
+        }
+    };
+    /// Published native lookups keep foreground work bounded independently of
+    /// cache residency. Full compilation is reserved for explicit bulk/legacy
+    /// profiles without a complete lookup, at the caller's pinned read cut.
+    pub fn prepareQuery(self: Store, template: []const u8, profile: QueryProfile, distinct: bool) !?PreparedQuery {
+        const h = (try self.head(template)) orelse return null;
+        var composed = distinct;
+        if (distinct) if (try self.backend.get(self.backend.ptr, self.a, try self.pinReadyPath(template))) |raw| {
+            composed = (try parse(PinReady, self.a, raw)).endpoints != 0;
+        };
+        const graph_state = try self.queryGraph(h);
+        const static_estimate = profile.estimated_bytes *| 4;
+        const native_indexed = if (profile.lookup) |lookup| lookup.node != null and lookup.seek_node != null else false;
+        if (!native_indexed and profile.load == null) return error.InvalidCatalogRecord;
+        const indexed = native_indexed or (composed and std.mem.allEqual(u8, &h.fingerprint, 0)) or static_estimate > query_context.Cache.max_bytes or (composed and graph_state.bytes *| 128 > query_context.Cache.max_bytes / 2);
+        var result: PreparedQuery = .{ .lease = null, .indexed = indexed, .pin_discovery = composed, .profile_id = profile.id, .routing_id = try self.routingFingerprint(h), .graph_id = graph_state.fingerprint, .stamp = .{ .revision = h.revision, .fingerprint = h.fingerprint }, .template = template, .distinct = distinct };
+        if (indexed and profile.lookup != null and profile.lookup.?.seek_node != null) {
+            result.lookup = profile.lookup;
+            return result;
+        }
+        const BaseLoader = struct {
+            profile: QueryProfile,
+            fn load(ptr: *anyopaque, a: A) !query_context.Graph {
+                const loader: *@This() = @ptrCast(@alignCast(ptr));
+                if (comptime @import("builtin").is_test) _ = test_query_base_loads.fetchAdd(1, .monotonic);
+                const callback = loader.profile.load orelse return error.InvalidCatalogRecord;
+                const ptr_ = loader.profile.ptr orelse return error.InvalidCatalogRecord;
+                return .{ .aliases = try callback(ptr_, a), .shared_profile = true };
+            }
+        };
+        var base_loader: BaseLoader = .{ .profile = profile };
+        var key: [32]u8 = undefined;
+        @import("antfly_hash").Sha256.hash(try encode(self.a, .{ template, profile.id, @as(?[32]u8, null) }), &key, .{});
+        const base = (try query_context.tryAcquire(key, true, .{ .ptr = &base_loader, .load = BaseLoader.load, .estimated_bytes = static_estimate +| 4096 })) orelse legacy: {
+            if (profile.lookup != null and profile.lookup.?.seek_node != null) {
+                result.indexed = true;
+                result.lookup = profile.lookup;
+                return result;
+            }
+            // Legacy inline profiles lack a persistent node projection. They
+            // still need their immutable static index to answer exactly.
+            break :legacy try query_context.acquire(key, true, .{ .ptr = &base_loader, .load = BaseLoader.load });
+        };
+        errdefer base.release();
+        result.lease = base;
+        if (!composed or indexed) return result;
+        const Loader = struct {
+            store: Store,
+            base: query_context.Lease,
+            template: []const u8,
+            fn load(ptr: *anyopaque, a: A) !query_context.Graph {
+                const loader: *@This() = @ptrCast(@alignCast(ptr));
+                var store = loader.store;
+                store.a = a;
+                var values: Values = .{};
+                inline for (.{ Kind.redirect, Kind.removed_alias, Kind.distinct }) |kind| {
+                    const prefix = try store.records(loader.template, kind);
+                    var after: ?[]const u8 = null;
+                    while (true) {
+                        const page = try store.backend.scan(store.backend.ptr, a, prefix, after, 128);
+                        for (page.rows) |row| try values.append(a, kind, row.value);
+                        after = page.next;
+                        if (after == null) break;
+                    }
+                }
+                return .{ .base = loader.base, .composed = true, .native_aliases = values.aliases.items, .removed = values.removed.items, .pairs = values.distinct.items };
+            }
+        };
+        var loader: Loader = .{ .store = self, .base = base, .template = template };
+        @import("antfly_hash").Sha256.hash(try encode(self.a, .{ template, profile.id, @as(?[32]u8, graph_state.fingerprint) }), &key, .{});
+        // Only overlay data and the potentially affected static frontier need
+        // build room. The immutable profile is already charged by its lease.
+        const estimate = (graph_state.bytes *| 128) +| (base.context.nodes.nodes.len *| 512) +| 4096;
+        const overlay = (try query_context.tryAcquire(key, true, .{ .ptr = &loader, .load = Loader.load, .estimated_bytes = @intCast(estimate) })) orelse {
+            result.indexed = true;
+            if (profile.lookup != null and profile.lookup.?.seek_node != null) {
+                base.release();
+                result.lease = null;
+                result.lookup = profile.lookup;
+            }
+            return result;
+        };
+        base.release();
+        result.lease = overlay;
+        return result;
+    }
+    fn appendTextPolicy(self: Store, template: []const u8, texts: []const []const u8, snapshot: *Snapshot) !void {
+        var rules: std.ArrayList([]const u8) = .empty;
+        var normalized: std.StringHashMapUnmanaged(void) = .empty;
+        for (texts) |text| {
+            const key = try c.normalize(self.a, text);
+            if ((try normalized.getOrPut(self.a, key)).found_existing) continue;
+            if (try self.get([]const u8, template, .text, key)) |rule| try rules.append(self.a, rule);
+        }
+        snapshot.namespace.state.suppress.texts = rules.items;
+    }
+    pub fn textPolicy(self: Store, template: []const u8, texts: []const []const u8) !?Snapshot {
+        const h = (try self.head(template)) orelse return null;
+        var snapshot = (Values{}).snapshot(h);
+        try self.appendTextPolicy(template, texts, &snapshot);
         return snapshot;
+    }
+    const StaticQueryLookup = struct {
+        context: ?*const query_context.Context,
+        fn node(ptr: *anyopaque, _: A, id: []const u8) !?query_context.QueryNode {
+            const self_: *@This() = @ptrCast(@alignCast(ptr));
+            return self_.context.?.nodes.by_key.get(id);
+        }
+        fn seekNode(ptr: *anyopaque, _: A, digest: []const u8, canonical: ?[]const u8) !?query_context.QueryNode {
+            const self_: *@This() = @ptrCast(@alignCast(ptr));
+            return self_.context.?.nodes.seek(digest, canonical);
+        }
+        fn expand(ptr: *anyopaque, a: A, id: []const u8, forward_only: bool, mask: EdgeMask) ![]const resolver.KeyAlias {
+            const self_: *@This() = @ptrCast(@alignCast(ptr));
+            const context = self_.context.?;
+            var result: std.ArrayList(resolver.KeyAlias) = .empty;
+            if (context.static_targets.get(id)) |target| if (try mask.enabled(mask.ptr, a, id)) try result.append(a, .{ .key = id, .target = target });
+            if (!forward_only) if (context.static_reverse.get(id)) |edges| for (edges.items) |edge| {
+                if (try mask.enabled(mask.ptr, a, edge.key)) try result.append(a, edge);
+            };
+            return result.items;
+        }
+    };
+    fn queryForwardIndexed(self: Store, template: []const u8, seeds: []const []const u8, lookup: AliasLookup, include_configured: bool) !?Snapshot {
+        const h = (try self.head(template)) orelse return null;
+        var values: Values = .{};
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        const Allow = struct {
+            fn enabled(_: *anyopaque, _: A, _: []const u8) !bool {
+                return true;
+            }
+        };
+        var unused: u8 = 0;
+        for (seeds) |seed| {
+            var id = seed;
+            while (true) {
+                if ((try seen.getOrPut(self.a, id)).found_existing) break;
+                if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin, Kind.removed_alias }) |kind| if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
+                if (try self.get(resolver.KeyAlias, template, .redirect, id)) |edge| {
+                    try values.aliases.append(self.a, edge);
+                    id = edge.target;
+                    continue;
+                }
+                if (try self.get([]const u8, template, .removed_alias, id) != null) break;
+                const edges = try lookup.expand(lookup.ptr, self.a, id, true, .{ .ptr = &unused, .enabled = Allow.enabled });
+                if (edges.len == 0) break;
+                if (edges.len != 1 or !std.mem.eql(u8, edges[0].key, id)) return error.InvalidResolverAlias;
+                if (include_configured) try values.aliases.append(self.a, edges[0]);
+                id = edges[0].target;
+            }
+        }
+        var snapshot = values.snapshot(h);
+        snapshot.complete_aliases = include_configured;
+        return snapshot;
+    }
+    const QueryCanonical = struct {
+        store: Store,
+        template: []const u8,
+        lookup: AliasLookup,
+        static_only: bool,
+        memo: std.StringHashMapUnmanaged([]const u8) = .empty,
+        memo_buffer: ?*std.heap.FixedBufferAllocator = null,
+        frame: ?*std.heap.FixedBufferAllocator = null,
+        fn remember(self: *@This(), id: []const u8, root: []const u8) !void {
+            if (self.memo_buffer) |buffer| {
+                const a = buffer.allocator();
+                // Optional path compression never makes an exact streamed
+                // lookup fail when its bounded memo is full.
+                const owned_id = a.dupe(u8, id) catch return;
+                const owned_root = a.dupe(u8, root) catch return;
+                self.memo.put(a, owned_id, owned_root) catch return;
+            } else try self.memo.put(self.store.a, id, root);
+        }
+        fn canonical(self: *@This(), seed: []const u8) ![]const u8 {
+            if (self.memo.get(seed)) |known| return known;
+            const a = self.store.a;
+            if (self.static_only) {
+                const node = try self.lookup.node.?(self.lookup.ptr, a, seed);
+                const root = if (node) |value| value.canonical else seed;
+                try self.remember(seed, root);
+                return root;
+            }
+            var path: std.ArrayList([]const u8) = .empty;
+            var visiting: std.StringHashMapUnmanaged(void) = .empty;
+            var id = seed;
+            const Allow = struct {
+                fn enabled(_: *anyopaque, _: A, _: []const u8) !bool {
+                    return true;
+                }
+            };
+            var unused: u8 = 0;
+            const terminal = walk: while (true) {
+                if (self.memo.get(id)) |known| break :walk known;
+                if ((try visiting.getOrPut(a, id)).found_existing) return error.InvalidResolverAliasCycle;
+                try path.append(a, id);
+                if (try self.store.get(resolver.KeyAlias, self.template, .redirect, id)) |edge| {
+                    id = edge.target;
+                    continue;
+                }
+                if (try self.store.get([]const u8, self.template, .removed_alias, id) != null) break :walk id;
+                const edges = try self.lookup.expand(self.lookup.ptr, a, id, true, .{ .ptr = &unused, .enabled = Allow.enabled });
+                if (edges.len == 0) break :walk id;
+                if (edges.len != 1 or !std.mem.eql(u8, edges[0].key, id)) return error.InvalidResolverAlias;
+                id = edges[0].target;
+            };
+            // Discovery paths are not result paths: unrelated pin endpoints
+            // must never consume the query's returned-forward-path allowance.
+            for (path.items) |node| try self.remember(node, terminal);
+            return terminal;
+        }
+    };
+    fn queryPinNodes(self: Store, template: []const u8, component_scope: ?[]const u8, canonical: *QueryCanonical, roots: std.StringHashMapUnmanaged(void), starts: *std.StringHashMapUnmanaged(void), membership: ?*RoutingBuild) !void {
+        const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "pin-count/{s}/", .{try hash(self.a, template)}));
+        var digest: [64]u8 = @splat('0');
+        while (true) {
+            // Only selected/frozen membership entries outlive each posting.
+            // Cursor and path scratch are reused for every posting.
+            if (canonical.frame) |frame| {
+                frame.reset();
+                if (canonical.memo_buffer) |buffer| {
+                    if (buffer.end_index > buffer.buffer.len / 2) {
+                        buffer.reset();
+                        canonical.memo = .empty;
+                    }
+                } else canonical.memo = .empty;
+            }
+            const a = canonical.store.a;
+            const node = (try canonical.lookup.seek_node.?(canonical.lookup.ptr, a, &digest, component_scope)) orelse return;
+            const before = try std.mem.concat(a, u8, &.{ prefix, &node.digest });
+            before[before.len - 1] -= 1;
+            const page = try self.backend.scan(self.backend.ptr, a, prefix, before, 1);
+            if (page.rows.len == 0) return;
+            const row = page.rows[0];
+            if (!std.mem.startsWith(u8, row.key, prefix) or row.key.len != prefix.len + 64) return error.InvalidCatalogRecord;
+            const posting_digest = row.key[prefix.len..];
+            if (!std.mem.eql(u8, posting_digest, &node.digest)) {
+                @memcpy(&digest, posting_digest);
+                continue;
+            }
+            const posting = try parse(PinCount, a, row.value);
+            if (posting.count == 0 or !std.mem.eql(u8, posting.key, node.key)) return error.InvalidCatalogRecord;
+            const root = if (canonical.static_only) node.canonical else try canonical.canonical(node.key);
+            if (membership) |builder| try builder.add(root, node.key) else if (roots.contains(root)) try starts.put(self.a, try self.a.dupe(u8, node.key), {});
+            digest = node.digest;
+            digest[digest.len - 1] += 1;
+        }
+    }
+    const RoutingBuild = struct {
+        a: A,
+        seen: std.StringHashMapUnmanaged(void) = .empty,
+        routes: std.ArrayList(query_context.Route) = .empty,
+        bytes: usize = 0,
+        fn add(self: *@This(), root: []const u8, component_scope: []const u8) !void {
+            if ((try self.seen.getOrPut(self.a, try encode(self.a, .{ root, component_scope }))).found_existing) return;
+            self.bytes +|= @sizeOf(query_context.Route) +| root.len +| component_scope.len;
+            if (self.bytes > 1024 * 1024) return error.OutOfMemory;
+            try self.routes.append(self.a, .{ .root = try self.a.dupe(u8, root), .component = try self.a.dupe(u8, component_scope) });
+        }
+    };
+    fn freezeRoutes(a: A, builder: RoutingBuild) !query_context.Graph {
+        const items = try a.alloc(query_context.Route, builder.routes.items.len);
+        for (items, builder.routes.items) |*route, value| route.* = .{ .root = try a.dupe(u8, value.root), .component = try a.dupe(u8, value.component) };
+        std.mem.sort(query_context.Route, items, {}, struct {
+            fn less(_: void, left: query_context.Route, right: query_context.Route) bool {
+                const order = std.mem.order(u8, left.root, right.root);
+                return if (order == .eq) std.mem.lessThan(u8, left.component, right.component) else order == .lt;
+            }
+        }.less);
+        return .{ .routes = items };
+    }
+    fn queryPinMembership(self: Store, prepared: PreparedQuery, lookup: AliasLookup, changes: bool) !?query_context.Lease {
+        if (prepared.profile_id.len == 0 or std.mem.allEqual(u8, &prepared.stamp.fingerprint, 0)) return null;
+        var key: [32]u8 = undefined;
+        @import("antfly_hash").Sha256.hash(try encode(self.a, .{ "pin-membership-v2", prepared.template, prepared.profile_id, prepared.graph_id }), &key, .{});
+        const Loader = struct {
+            store: Store,
+            template: []const u8,
+            lookup: AliasLookup,
+            changes: bool,
+            fn load(ptr: *anyopaque, a: A) !query_context.Graph {
+                const loader: *@This() = @ptrCast(@alignCast(ptr));
+                const scratch = try query_context.RoutingScratch.init();
+                defer scratch.deinit();
+                var bounded: std.heap.FixedBufferAllocator = .init(scratch.bytes[0 .. 4 * 1024 * 1024]);
+                var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes[4 * 1024 * 1024 .. 6 * 1024 * 1024]);
+                var memo: std.heap.FixedBufferAllocator = .init(scratch.bytes[6 * 1024 * 1024 ..]);
+                var store = loader.store;
+                store.a = bounded.allocator();
+                var temporary = store;
+                temporary.a = frame.allocator();
+                var canonical: QueryCanonical = .{ .store = temporary, .template = loader.template, .lookup = loader.lookup, .static_only = !loader.changes, .frame = &frame, .memo_buffer = &memo };
+                var builder: RoutingBuild = .{ .a = store.a };
+                var ignored: std.StringHashMapUnmanaged(void) = .empty;
+                try store.queryPinNodes(loader.template, null, &canonical, .empty, &ignored, &builder);
+                return freezeRoutes(a, builder);
+            }
+        };
+        var loader: Loader = .{ .store = self, .template = prepared.template, .lookup = lookup, .changes = changes };
+        return query_context.tryRouting(key, .{ .ptr = &loader, .load = Loader.load }) catch |err| switch (err) {
+            error.OutOfMemory => null,
+            else => return err,
+        };
+    }
+    const PinProjectionGC = struct { epoch: u64, after: ?[]const u8 = null, complete: bool = false };
+    pub fn queryPinsCleanupCurrent(self: Store, template: []const u8, lookup: AliasLookup) !bool {
+        const epoch_fn = lookup.profile_epoch orelse return true;
+        if (try self.head(template) == null) return true;
+        const path = try self.keyPath(try std.fmt.allocPrint(self.a, "query-pins-gc-v1/{s}", .{try hash(self.a, template)}));
+        const raw = (try self.backend.get(self.backend.ptr, self.a, path)) orelse return false;
+        const state = try parse(PinProjectionGC, self.a, raw);
+        return state.complete and state.epoch == try epoch_fn(lookup.ptr, self.a);
+    }
+    /// Immutable profile enrollment epochs let bounded owner maintenance
+    /// reclaim retired profiles without a directory scan on foreground reads.
+    fn pruneQueryPins(self: Store, template: []const u8, lookup: AliasLookup, limit: u32, progress: *bool) !bool {
+        const active = lookup.profile_active orelse return true;
+        const epoch_fn = lookup.profile_epoch orelse return true;
+        const epoch = try epoch_fn(lookup.ptr, self.a);
+        const namespace = try hash(self.a, template);
+        const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "query-pins-v1/{s}/", .{namespace}));
+        const state_path = try self.keyPath(try std.fmt.allocPrint(self.a, "query-pins-gc-v1/{s}", .{namespace}));
+        const raw = try self.backend.get(self.backend.ptr, self.a, state_path);
+        var state: PinProjectionGC = if (raw) |value| try parse(PinProjectionGC, self.a, value) else .{ .epoch = epoch };
+        if (state.epoch != epoch) state = .{ .epoch = epoch };
+        if (state.complete) return true;
+        var remaining = limit;
+        while (remaining > 2) {
+            const page = try self.backend.scan(self.backend.ptr, self.a, prefix, if (state.after) |after| try std.mem.concat(self.a, u8, &.{ prefix, after }) else null, 1);
+            if (page.rows.len == 0) {
+                state.complete = true;
+                state.after = null;
+                break;
+            }
+            const relative = page.rows[0].key[prefix.len..];
+            if (relative.len < 65 or relative[64] != '/') return error.InvalidCatalogRecord;
+            const profile = relative[0..64];
+            if (try active(lookup.ptr, self.a, profile)) {
+                state.after = try std.mem.concat(self.a, u8, &.{ profile, "~" });
+                remaining -= 1;
+                continue;
+            }
+            const retired = try std.fmt.allocPrint(self.a, "{s}{s}/", .{ prefix, profile });
+            // Remove readiness before any member page, even if an immutable
+            // profile is re-enrolled while cleanup is paused between turns.
+            try self.backend.remove(self.backend.ptr, self.a, try std.mem.concat(self.a, u8, &.{ retired, "state" }));
+            remaining -= 1;
+            const obsolete = try self.backend.scan(self.backend.ptr, self.a, retired, null, remaining - 1);
+            for (obsolete.rows) |row| try self.backend.remove(self.backend.ptr, self.a, row.key);
+            remaining -= @intCast(obsolete.rows.len);
+            state.after = if (obsolete.next == null) try std.mem.concat(self.a, u8, &.{ profile, "~" }) else try self.a.dupe(u8, profile);
+            if (obsolete.next != null) break;
+        }
+        try self.backend.put(self.backend.ptr, self.a, state_path, try encode(self.a, state));
+        progress.* = true;
+        return state.complete;
+    }
+    const PinEditHead = struct { sequence: u64 = 0, graph: [32]u8 };
+    const PinEdit = struct { sequence: u64, before: [32]u8, graph: [32]u8, boundaries: []const []const u8 = &.{}, routing: []const []const u8 = &.{}, rebuild: bool = false };
+    fn pinEditRoot(self: Store, template: []const u8) ![]const u8 {
+        return self.keyPath(try std.fmt.allocPrint(self.a, "pin-edits-v1/{s}/", .{try hash(self.a, template)}));
+    }
+    fn pinEditSlot(self: Store, template: []const u8, sequence: u64) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "{s}slot/{d:0>3}", .{ try self.pinEditRoot(template), sequence % 256 });
+    }
+    fn pinEditHead(self: Store, template: []const u8, graph: [32]u8) !PinEditHead {
+        const path = try std.mem.concat(self.a, u8, &.{ try self.pinEditRoot(template), "head" });
+        return if (try self.backend.get(self.backend.ptr, self.a, path)) |raw| try parse(PinEditHead, self.a, raw) else .{ .graph = graph };
+    }
+    fn appendPinEdit(self: Store, template: []const u8, before: [32]u8, graph: [32]u8, boundaries: []const []const u8, routing: []const []const u8) !void {
+        const head_path = try std.mem.concat(self.a, u8, &.{ try self.pinEditRoot(template), "head" });
+        const raw = (try self.backend.get(self.backend.ptr, self.a, head_path)) orelse return;
+        const old = try parse(PinEditHead, self.a, raw);
+        if (!std.mem.eql(u8, &old.graph, &before)) return error.InvalidCatalogRecord;
+        const sequence = try std.math.add(u64, old.sequence, 1);
+        const rebuild = boundaries.len > 256 or routing.len > 128;
+        var edit: PinEdit = .{ .sequence = sequence, .before = before, .graph = graph, .boundaries = if (rebuild) &.{} else boundaries, .routing = if (rebuild) &.{} else routing, .rebuild = rebuild };
+        var bytes: [64 * 1024]u8 = undefined;
+        var bounded: std.heap.FixedBufferAllocator = .init(&bytes);
+        const payload = encode(bounded.allocator(), edit) catch |err| blk: {
+            if (err != error.OutOfMemory) return err;
+            edit.rebuild = true;
+            edit.boundaries = &.{};
+            edit.routing = &.{};
+            break :blk try encode(self.a, edit);
+        };
+        try self.backend.put(self.backend.ptr, self.a, try self.pinEditSlot(template, sequence), try self.a.dupe(u8, payload));
+        try self.backend.put(self.backend.ptr, self.a, try std.mem.concat(self.a, u8, &.{ try self.pinEditRoot(template), "head" }), try encode(self.a, PinEditHead{ .sequence = sequence, .graph = graph }));
+    }
+    fn pinEdit(self: Store, template: []const u8, sequence: u64) !?PinEdit {
+        const raw = (try self.backend.get(self.backend.ptr, self.a, try self.pinEditSlot(template, sequence))) orelse return null;
+        const edit = try parse(PinEdit, self.a, raw);
+        return if (edit.sequence == sequence and !edit.rebuild) edit else null;
+    }
+    const PinRepair = struct {
+        stage: enum { seed, expand, paths, members, cleanup } = .seed,
+        sequence: u64,
+        index: usize = 0,
+        after: ?[]const u8 = null,
+        root: ?[]const u8 = null,
+        cursor: ?[]const u8 = null,
+        routing: bool = false,
+        target: u64,
+    };
+    pub const PinProjection = struct {
+        graph: [32]u8,
+        phase: enum { clear, build, ready, repair } = .clear,
+        format: u8 = 0,
+        sequence: ?u64 = null,
+        static_only: bool = false,
+        static_base: bool = false,
+        repair: ?PinRepair = null,
+        after: ?[]const u8 = null,
+        walk: ?PinWalk = null,
+    };
+    const PinWalk = struct { key: []const u8, current: []const u8, hops: u32 = 0, root: ?[]const u8 = null };
+    const PinPath = struct { key: []const u8, root: []const u8 };
+    const PinMember = struct { root: []const u8, key: []const u8 };
+    fn putPinPath(self: Store, root: []const u8, value: PinPath) !void {
+        try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}path/{s}", .{ root, try hash(self.a, value.key) }), try encode(self.a, value));
+        try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}root-path/{s}/{s}", .{ root, try hash(self.a, value.root), try hash(self.a, value.key) }), try encode(self.a, value));
+    }
+    fn putPinMember(self: Store, root: []const u8, value: PinMember) !void {
+        try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}member/{s}/{s}", .{ root, try hash(self.a, value.root), try hash(self.a, value.key) }), try encode(self.a, value));
+        try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}boundary/{s}", .{ root, try hash(self.a, value.key) }), try encode(self.a, value));
+    }
+    fn repairItem(self: Store, root: []const u8, kind: []const u8, id: []const u8) !void {
+        try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}dirty-{s}/{s}", .{ root, kind, try hash(self.a, id) }), try encode(self.a, id));
+    }
+    fn pinProjectionRoot(self: Store, template: []const u8, profile: []const u8) ![]const u8 {
+        if (profile.len != 64) return error.InvalidResolverCurationRequest;
+        for (profile) |byte| if (!std.ascii.isHex(byte)) return error.InvalidResolverCurationRequest;
+        return self.keyPath(try std.fmt.allocPrint(self.a, "query-pins-v1/{s}/{s}/", .{ try hash(self.a, template), profile }));
+    }
+    fn hasQueryOverrides(self: Store, template: []const u8) !bool {
+        return (try self.backend.scan(self.backend.ptr, self.a, try self.records(template, .redirect), null, 1)).rows.len != 0 or
+            (try self.backend.scan(self.backend.ptr, self.a, try self.records(template, .removed_alias), null, 1)).rows.len != 0;
+    }
+    pub fn queryPinsIndexed(self: Store, template: []const u8, profile: []const u8) !bool {
+        const h = (try self.head(template)) orelse return true;
+        if (try self.backend.get(self.backend.ptr, self.a, try self.pinReadyPath(template))) |raw| if ((try parse(PinReady, self.a, raw)).endpoints == 0) return true;
+        const path = try std.mem.concat(self.a, u8, &.{ try self.pinProjectionRoot(template, profile), "state" });
+        const raw = (try self.backend.get(self.backend.ptr, self.a, path)) orelse return false;
+        const state = try parse(PinProjection, self.a, raw);
+        return state.format == 2 and state.phase == .ready and std.mem.eql(u8, &state.graph, &(try self.queryGraph(h)).fingerprint);
+    }
+    /// Owner work only. A turn clears or builds a bounded page in the caller's
+    /// native transaction. Immutable profile identity and exact graph lineage
+    /// fence the ready marker; partial and superseded generations are unreadable.
+    fn pinEditsAvailable(self: Store, template: []const u8, state: PinProjection, latest: PinEditHead) !bool {
+        const sequence = state.sequence orelse return false;
+        if (latest.sequence < sequence or latest.sequence - sequence > 256) return false;
+        var graph = state.graph;
+        var next = sequence;
+        while (next < latest.sequence) {
+            next += 1;
+            const event = (try self.pinEdit(template, next)) orelse return false;
+            if (!std.mem.eql(u8, &event.before, &graph)) return false;
+            graph = event.graph;
+        }
+        return std.mem.eql(u8, &graph, &latest.graph);
+    }
+    fn seedPinBoundary(self: Store, root: []const u8, id: []const u8) !void {
+        try self.repairItem(root, "boundary", id);
+        const path = try std.fmt.allocPrint(self.a, "{s}boundary/{s}", .{ root, try hash(self.a, id) });
+        if (try self.backend.get(self.backend.ptr, self.a, path)) |raw| {
+            const old = try parse(PinMember, self.a, raw);
+            try self.repairItem(root, "root", old.root);
+        }
+    }
+    /// Advance exactly one boundary step. The caller owns a single shared
+    /// hop/write budget and persists the constant-size walk between turns.
+    fn advancePinBoundary(self: Store, template: []const u8, root: []const u8, id: []const u8, state: *PinProjection, lookup: AliasLookup, static_only: bool, incremental: bool, remaining: *u32, scratch: *std.heap.FixedBufferAllocator) !bool {
+        if (remaining.* < 4) return false;
+        if (static_only) state.static_base = true;
+        scratch.reset();
+        const temporary = Store{ .a = scratch.allocator(), .backend = self.backend, .prefix = self.prefix };
+        const manifest = try std.fmt.allocPrint(self.a, "{s}boundary/{s}", .{ root, try hash(self.a, id) });
+        if (state.walk == null) {
+            const node = if (try temporary.pinCount(template, id) != 0) try lookup.node.?(lookup.ptr, temporary.a, id) else null;
+            if (node == null) {
+                var cost: u32 = 1;
+                if (incremental) if (try self.backend.get(self.backend.ptr, self.a, manifest)) |raw| {
+                    const old = try parse(PinMember, self.a, raw);
+                    try self.backend.remove(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}member/{s}/{s}", .{ root, try hash(self.a, old.root), try hash(self.a, id) }));
+                    try self.backend.remove(self.backend.ptr, self.a, manifest);
+                    cost = 2;
+                };
+                remaining.* -= cost;
+                return true;
+            }
+            state.walk = .{ .key = try self.a.dupe(u8, id), .current = try self.a.dupe(u8, id), .root = if (static_only) try self.a.dupe(u8, node.?.canonical) else null };
+        }
+        const walk = &state.walk.?;
+        if (!std.mem.eql(u8, walk.key, id)) return error.InvalidCatalogRecord;
+        const path_key = try std.fmt.allocPrint(temporary.a, "{s}path/{s}", .{ root, try hash(temporary.a, walk.current) });
+        const known = if (try self.backend.get(self.backend.ptr, temporary.a, path_key)) |value| try parse(PinPath, temporary.a, value) else null;
+        if (known) |value| if (!std.mem.eql(u8, value.key, walk.current)) return error.InvalidCatalogRecord;
+        if (walk.root) |terminal| {
+            if (static_only or std.mem.eql(u8, walk.current, terminal) or known != null) {
+                if (known) |value| if (!std.mem.eql(u8, value.root, terminal)) return error.InvalidCatalogRecord;
+                if (incremental) {
+                    if (try self.backend.get(self.backend.ptr, self.a, manifest)) |raw| {
+                        const old = try parse(PinMember, self.a, raw);
+                        try self.backend.remove(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}member/{s}/{s}", .{ root, try hash(self.a, old.root), try hash(self.a, id) }));
+                    }
+                    try self.repairItem(root, "root", terminal);
+                }
+                remaining.* -= if (incremental) @as(u32, 4) else 2;
+                try self.putPinMember(root, .{ .root = terminal, .key = walk.key });
+                state.walk = null;
+                return true;
+            }
+            const next = (try temporary.queryPinNext(template, lookup, walk.current)) orelse return error.InvalidCatalogRecord;
+            remaining.* -= 2;
+            try self.putPinPath(root, .{ .key = walk.current, .root = terminal });
+            walk.current = try self.a.dupe(u8, next);
+        } else if (known) |value| {
+            remaining.* -= 1;
+            walk.root = try self.a.dupe(u8, value.root);
+            walk.current = walk.key;
+        } else if (try temporary.queryPinNext(template, lookup, walk.current)) |next| {
+            remaining.* -= 1;
+            if (walk.hops >= 16383) return error.ResolverCurationLimitExceeded;
+            walk.hops += 1;
+            walk.current = try self.a.dupe(u8, next);
+        } else {
+            remaining.* -= 2;
+            // Roots themselves are dependencies of every path ending here.
+            try self.putPinPath(root, .{ .key = walk.current, .root = walk.current });
+            walk.root = walk.current;
+            walk.current = walk.key;
+        }
+        return false;
+    }
+    fn advancePinRepair(self: Store, template: []const u8, root: []const u8, state: *PinProjection, latest: PinEditHead, lookup: AliasLookup, limit: u32) !void {
+        const scratch = try query_context.RoutingScratch.init();
+        defer scratch.deinit();
+        var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes);
+        var budget = limit;
+        const repair = &state.repair.?;
+        if (repair.target != latest.sequence) {
+            // Coalesce new edits without discarding the affected boundary set.
+            // Revisit only that set if a previous cut was partly repaired.
+            repair.* = .{ .sequence = state.sequence.? + 1, .target = latest.sequence };
+            state.walk = null;
+        }
+        while (budget >= 4) {
+            switch (repair.stage) {
+                .seed => {
+                    if (repair.sequence > repair.target) {
+                        repair.stage = .expand;
+                        repair.after = null;
+                        continue;
+                    }
+                    const event = (try self.pinEdit(template, repair.sequence)) orelse return error.InvalidCatalogRecord;
+                    if (repair.index < event.boundaries.len) {
+                        try self.seedPinBoundary(root, event.boundaries[repair.index]);
+                        repair.index += 1;
+                        budget -= 2;
+                    } else if (repair.index < event.boundaries.len + event.routing.len) {
+                        const id = event.routing[repair.index - event.boundaries.len];
+                        const path = try std.fmt.allocPrint(self.a, "{s}path/{s}", .{ root, try hash(self.a, id) });
+                        const old_root: ?[]const u8 = if (try self.backend.get(self.backend.ptr, self.a, path)) |raw|
+                            (try parse(PinPath, self.a, raw)).root
+                        else if (state.static_base) blk: {
+                            break :blk if (try lookup.node.?(lookup.ptr, self.a, id)) |node| node.canonical else null;
+                        } else null;
+                        if (old_root) |value| {
+                            try self.repairItem(root, "root", value);
+                            try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}repair-root/{s}", .{ root, try hash(self.a, value) }), try encode(self.a, value));
+                        }
+                        repair.routing = true;
+                        repair.index += 1;
+                        budget -= 2;
+                    } else {
+                        repair.sequence += 1;
+                        repair.index = 0;
+                        budget -= 1;
+                    }
+                },
+                .expand, .paths => {
+                    const prefix = try std.mem.concat(self.a, u8, &.{ root, "repair-root/" });
+                    if (repair.root == null) {
+                        const page = try self.backend.scan(self.backend.ptr, self.a, prefix, repair.after, 1);
+                        if (page.rows.len == 0) {
+                            repair.stage = if (repair.stage == .expand) .paths else .members;
+                            repair.after = null;
+                            continue;
+                        }
+                        repair.root = try parse([]const u8, self.a, page.rows[0].value);
+                        repair.after = page.rows[0].key;
+                        repair.cursor = null;
+                    }
+                    const members = try std.fmt.allocPrint(self.a, "{s}{s}/{s}/", .{ root, if (repair.stage == .expand) "member" else "root-path", try hash(self.a, repair.root.?) });
+                    const page = try self.backend.scan(self.backend.ptr, self.a, members, repair.cursor, @max(1, budget / 2));
+                    for (page.rows) |row| {
+                        if (repair.stage == .expand) {
+                            try self.repairItem(root, "boundary", (try parse(PinMember, self.a, row.value)).key);
+                            budget -= 1;
+                        } else {
+                            const path = try parse(PinPath, self.a, row.value);
+                            try self.backend.remove(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}path/{s}", .{ root, try hash(self.a, path.key) }));
+                            try self.backend.remove(self.backend.ptr, self.a, row.key);
+                            budget -= 2;
+                        }
+                    }
+                    repair.cursor = page.next;
+                    if (page.next == null) repair.root = null;
+                    if (page.rows.len == 0) budget -= 1;
+                },
+                .members => {
+                    const prefix = try std.mem.concat(self.a, u8, &.{ root, "dirty-boundary/" });
+                    const page = try self.backend.scan(self.backend.ptr, self.a, prefix, repair.after, @max(1, budget / 4));
+                    var offset: usize = 0;
+                    while (offset < page.rows.len and budget >= 4) {
+                        const row = page.rows[offset];
+                        const id = try parse([]const u8, self.a, row.value);
+                        if (try self.advancePinBoundary(template, root, id, state, lookup, !try self.hasQueryOverrides(template), true, &budget, &frame)) {
+                            repair.after = row.key;
+                            offset += 1;
+                        }
+                    }
+                    if (offset == page.rows.len and page.next == null) {
+                        repair.stage = .cleanup;
+                        repair.after = null;
+                    }
+                },
+                .cleanup => {
+                    const prefix = try std.mem.concat(self.a, u8, &.{ root, "dirty-" });
+                    var page = try self.backend.scan(self.backend.ptr, self.a, prefix, null, budget);
+                    if (page.rows.len == 0) page = try self.backend.scan(self.backend.ptr, self.a, try std.mem.concat(self.a, u8, &.{ root, "repair-root/" }), null, budget);
+                    for (page.rows) |row| try self.backend.remove(self.backend.ptr, self.a, row.key);
+                    budget -= @intCast(page.rows.len);
+                    if (page.rows.len == 0) {
+                        state.graph = latest.graph;
+                        state.sequence = latest.sequence;
+                        state.static_only = !try self.hasQueryOverrides(template);
+                        state.phase = .ready;
+                        state.repair = null;
+                        return;
+                    }
+                },
+            }
+        }
+    }
+    pub fn advanceQueryPins(self: Store, template: []const u8, profile: []const u8, lookup: AliasLookup, limit: u32) !bool {
+        if (limit < 4 or limit > 4096 or lookup.node == null or lookup.seek_node == null) return error.InvalidResolverCurationRequest;
+        const h = (try self.head(template)) orelse return true;
+        const graph = (try self.queryGraph(h)).fingerprint;
+        const journal = try std.mem.concat(self.a, u8, &.{ try self.pinEditRoot(template), "head" });
+        const pins = if (try self.backend.get(self.backend.ptr, self.a, try self.pinReadyPath(template))) |raw| (try parse(PinReady, self.a, raw)).endpoints else 1;
+        if (pins != 0 and try self.backend.get(self.backend.ptr, self.a, journal) == null) {
+            // Only the qualified projection owner enrolls journaling. Native
+            // memory identity stores without static consumers retain their old
+            // row contract and incur no unused edit log or new reader floor.
+            try self.backend.put(self.backend.ptr, self.a, journal, try encode(self.a, PinEditHead{ .graph = graph }));
+            return false;
+        }
+        var pruned = false;
+        if (!try self.pruneQueryPins(template, lookup, limit, &pruned)) return false;
+        if (try self.backend.get(self.backend.ptr, self.a, try self.pinReadyPath(template))) |raw| if ((try parse(PinReady, self.a, raw)).endpoints == 0) return true;
+        const latest = try self.pinEditHead(template, graph);
+        const root = try self.pinProjectionRoot(template, profile);
+        const state_path = try std.mem.concat(self.a, u8, &.{ root, "state" });
+        const raw = try self.backend.get(self.backend.ptr, self.a, state_path);
+        var state: PinProjection = if (raw) |value| try parse(PinProjection, self.a, value) else .{ .graph = graph };
+        if (state.format != 2 or !std.mem.eql(u8, &state.graph, &graph)) {
+            if (state.format == 2 and (state.phase == .ready or state.phase == .repair) and try self.pinEditsAvailable(template, state, latest)) {
+                if (state.repair == null) state.repair = .{ .sequence = state.sequence.? + 1, .target = latest.sequence };
+                state.phase = .repair;
+            } else state = .{ .graph = graph, .format = 2, .sequence = latest.sequence, .static_only = !try self.hasQueryOverrides(template), .static_base = !try self.hasQueryOverrides(template) };
+        }
+        if (state.phase == .ready) return true;
+        if (try lookup.seek_node.?(lookup.ptr, self.a, &@as([64]u8, @splat('0')), null) == null) {
+            state = .{ .graph = graph, .format = 2, .sequence = latest.sequence, .static_only = !try self.hasQueryOverrides(template), .static_base = !try self.hasQueryOverrides(template), .phase = .ready };
+            try self.backend.put(self.backend.ptr, self.a, state_path, try encode(self.a, state));
+            return true;
+        }
+        if (pruned) return false;
+        if (state.phase == .repair) {
+            try self.advancePinRepair(template, root, &state, latest, lookup, limit);
+        } else {
+            if (state.phase == .clear) {
+                const page = try self.backend.scan(self.backend.ptr, self.a, root, null, limit);
+                var deleted: usize = 0;
+                for (page.rows) |row| {
+                    if (std.mem.eql(u8, row.key, state_path)) continue;
+                    try self.backend.remove(self.backend.ptr, self.a, row.key);
+                    deleted += 1;
+                }
+                if (page.next == null) state.phase = .build;
+                if (deleted != 0) {
+                    try self.backend.put(self.backend.ptr, self.a, state_path, try encode(self.a, state));
+                    return false;
+                }
+            }
+            const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "pin-count/{s}/", .{try hash(self.a, template)}));
+            const page = try self.backend.scan(self.backend.ptr, self.a, prefix, if (state.after) |after| try std.mem.concat(self.a, u8, &.{ prefix, after }) else null, limit);
+            const scratch = try query_context.RoutingScratch.init();
+            defer scratch.deinit();
+            var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes);
+            var budget = limit;
+            var offset: usize = 0;
+            while (offset < page.rows.len and budget >= 4) {
+                const row = page.rows[offset];
+                const posting = try parse(PinCount, self.a, row.value);
+                if (posting.count == 0) return error.InvalidCatalogRecord;
+                if (try self.advancePinBoundary(template, root, posting.key, &state, lookup, state.static_only, false, &budget, &frame)) {
+                    state.after = try self.a.dupe(u8, row.key[prefix.len..]);
+                    offset += 1;
+                }
+            }
+            if (offset == page.rows.len and page.next == null) {
+                state.after = null;
+                state.phase = .ready;
+            }
+        }
+        try self.backend.put(self.backend.ptr, self.a, state_path, try encode(self.a, state));
+        return state.phase == .ready;
+    }
+    fn queryPinNext(self: Store, template: []const u8, lookup: AliasLookup, id: []const u8) !?[]const u8 {
+        if (try self.get(resolver.KeyAlias, template, .redirect, id)) |edge| return edge.target;
+        if (try self.get([]const u8, template, .removed_alias, id) != null) return null;
+        const Allow = struct {
+            fn enabled(_: *anyopaque, _: A, _: []const u8) !bool {
+                return true;
+            }
+        };
+        var unused: u8 = 0;
+        const edges = try lookup.expand(lookup.ptr, self.a, id, true, .{ .ptr = &unused, .enabled = Allow.enabled });
+        if (edges.len == 0) return null;
+        if (edges.len != 1 or !std.mem.eql(u8, edges[0].key, id)) return error.InvalidResolverAlias;
+        return edges[0].target;
+    }
+    fn pinRootsCurrent(self: Store, prepared: PreparedQuery, state: PinProjection, roots: std.StringHashMapUnmanaged(void), lookup: AliasLookup) !bool {
+        if (state.format != 2 or (state.phase != .ready and state.phase != .repair)) return false;
+        if (state.repair) |repair| if (repair.stage == .cleanup) return false;
+        const sequence = state.sequence orelse return false;
+        const latest = try self.pinEditHead(prepared.template, prepared.graph_id);
+        // A bounded read-side proof can keep unaffected roots indexed while
+        // their owner repairs another component. Larger gaps use exact fallback.
+        if (latest.sequence < sequence or latest.sequence - sequence > 16 or !std.mem.eql(u8, &latest.graph, &prepared.graph_id)) return false;
+        if (!try self.pinEditsAvailable(prepared.template, state, latest)) return false;
+        const root = try self.pinProjectionRoot(prepared.template, prepared.profile_id);
+        var selected = roots.keyIterator();
+        while (selected.next()) |id| if (try self.backend.get(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}dirty-root/{s}", .{ root, try hash(self.a, id.*) })) != null) return false;
+        const scratch = try query_context.RoutingScratch.init();
+        defer scratch.deinit();
+        var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes);
+        var budget: usize = 128;
+        const static_only = !try self.hasQueryOverrides(prepared.template);
+        var next = sequence;
+        while (next < latest.sequence) {
+            next += 1;
+            const event = (try self.pinEdit(prepared.template, next)).?;
+            for ([_][]const []const u8{ event.boundaries, event.routing }, 0..) |keys, kind| for (keys) |id| {
+                if (budget == 0) return false;
+                budget -= 1;
+                const path = try std.fmt.allocPrint(self.a, "{s}{s}/{s}", .{ root, if (kind == 0) "boundary" else "path", try hash(self.a, id) });
+                if (try self.backend.get(self.backend.ptr, self.a, path)) |raw| {
+                    const old = try parse(PinMember, self.a, raw);
+                    if (roots.contains(old.root)) return false;
+                } else if (kind == 1 and state.static_base) {
+                    if (try lookup.node.?(lookup.ptr, self.a, id)) |node| if (roots.contains(node.canonical)) return false;
+                }
+                if (static_only) {
+                    const node = try lookup.node.?(lookup.ptr, self.a, id);
+                    if (roots.contains(if (node) |value| value.canonical else id)) return false;
+                } else {
+                    var current = id;
+                    while (true) {
+                        if (budget == 0) return false;
+                        budget -= 1;
+                        frame.reset();
+                        const temporary = Store{ .a = frame.allocator(), .backend = self.backend, .prefix = self.prefix };
+                        if (try temporary.queryPinNext(prepared.template, lookup, current)) |target| current = try self.a.dupe(u8, target) else break;
+                    }
+                    if (roots.contains(current)) return false;
+                }
+            };
+        }
+        return true;
+    }
+    fn projectedQueryPins(self: Store, prepared: PreparedQuery, roots: std.StringHashMapUnmanaged(void), lookup: AliasLookup, starts: *std.StringHashMapUnmanaged(void)) !bool {
+        if (prepared.profile_id.len != 64) return false;
+        const root = try self.pinProjectionRoot(prepared.template, prepared.profile_id);
+        const raw = (try self.backend.get(self.backend.ptr, self.a, try std.mem.concat(self.a, u8, &.{ root, "state" }))) orelse return false;
+        const state = try parse(PinProjection, self.a, raw);
+        if (!(state.phase == .ready and std.mem.eql(u8, &state.graph, &prepared.graph_id)) and !try self.pinRootsCurrent(prepared, state, roots, lookup)) return false;
+        var iterator = roots.keyIterator();
+        while (iterator.next()) |id| {
+            const prefix = try std.fmt.allocPrint(self.a, "{s}member/{s}/", .{ root, try hash(self.a, id.*) });
+            var after: ?[]const u8 = null;
+            while (true) {
+                const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
+                for (page.rows) |row| {
+                    const member = try parse(PinMember, self.a, row.value);
+                    if (!std.mem.eql(u8, member.root, id.*)) return error.InvalidCatalogRecord;
+                    try starts.put(self.a, member.key, {});
+                }
+                after = page.next;
+                if (after == null) break;
+            }
+        }
+        return true;
+    }
+    fn staticQueryPins(self: Store, template: []const u8, lookup: AliasLookup, roots: std.StringHashMapUnmanaged(void), starts: *std.StringHashMapUnmanaged(void)) !void {
+        const scratch = try query_context.RoutingScratch.init();
+        defer scratch.deinit();
+        var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes);
+        var temporary = self;
+        temporary.a = frame.allocator();
+        var canonical: QueryCanonical = .{ .store = temporary, .template = template, .lookup = lookup, .static_only = true, .frame = &frame };
+        var iterator = roots.keyIterator();
+        while (iterator.next()) |root| try self.queryPinNodes(template, root.*, &canonical, roots, starts, null);
+    }
+    fn queryIndexedPins(self: Store, h: Head, prepared: PreparedQuery, seeds: []const []const u8, lookup: AliasLookup, include_configured: bool) !Snapshot {
+        const template = h.key_template;
+        const pin_ready = try self.backend.get(self.backend.ptr, self.a, try self.pinReadyPath(template));
+        if (pin_ready) |raw| if ((try parse(PinReady, self.a, raw)).endpoints == 0) return (try self.queryForwardIndexed(template, seeds, lookup, include_configured)).?;
+        const changes = try self.hasQueryOverrides(template);
+        var canonical: QueryCanonical = .{ .store = self, .template = template, .lookup = lookup, .static_only = !changes };
+        var roots: std.StringHashMapUnmanaged(void) = .empty;
+        for (seeds) |seed| try roots.put(self.a, try canonical.canonical(seed), {});
+        var starts: std.StringHashMapUnmanaged(void) = .empty;
+        var root_iterator = roots.keyIterator();
+        while (root_iterator.next()) |root| try starts.put(self.a, root.*, {});
+        var pairs: []const c.Pair = &.{};
+        if (pin_ready != null) {
+            // A pin can reach a configured path only through a profile node
+            // with nonzero durable native pin weight. Join those two sparse
+            // indexes directly; unrelated native overrides never participate.
+            if (try self.projectedQueryPins(prepared, roots, lookup, &starts)) {
+                // Static and curated graphs share complete root postings.
+            } else if (!changes) {
+                try self.staticQueryPins(template, lookup, roots, &starts);
+            } else if (try self.queryPinMembership(prepared, lookup, changes)) |membership| {
+                defer membership.release();
+                var iterator = roots.keyIterator();
+                while (iterator.next()) |root| for (membership.context.routesFor(root.*)) |member| try starts.put(self.a, try self.a.dupe(u8, member.component), {});
+            } else {
+                // Cache admission is optional. Stream the same exact join in
+                // reusable scratch, retaining only selected endpoints.
+                const scratch = try query_context.RoutingScratch.init();
+                defer scratch.deinit();
+                var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes[0 .. 6 * 1024 * 1024]);
+                var memo: std.heap.FixedBufferAllocator = .init(scratch.bytes[6 * 1024 * 1024 ..]);
+                var temporary = self;
+                temporary.a = frame.allocator();
+                var streaming: QueryCanonical = .{ .store = temporary, .template = template, .lookup = lookup, .static_only = !changes, .frame = &frame, .memo_buffer = &memo };
+                try self.queryPinNodes(template, null, &streaming, roots, &starts, null);
+            }
+            const selected = try self.a.alloc([]const u8, starts.count());
+            var iterator = starts.keyIterator();
+            for (selected) |*id| id.* = iterator.next().?.*;
+            pairs = (try self.pinnedQuery(template, selected, &.{}, (Values{}).snapshot(h))).namespace.state.distinct;
+        } else {
+            // Released read-only files lack propagated pin postings until a
+            // writer adopts them. Stream pairs, without reverse-alias walks.
+            var legacy: std.ArrayList(c.Pair) = .empty;
+            var after: ?[]const u8 = null;
+            while (true) {
+                const page = try self.backend.scan(self.backend.ptr, self.a, try self.records(template, .distinct), after, 128);
+                for (page.rows) |row| {
+                    const pair = try parse(c.Pair, self.a, row.value);
+                    if (roots.contains(try canonical.canonical(pair.from)) or roots.contains(try canonical.canonical(pair.to))) try legacy.append(self.a, pair);
+                }
+                after = page.next;
+                if (after == null) break;
+            }
+            pairs = legacy.items;
+        }
+        var selected: std.ArrayList([]const u8) = .empty;
+        try selected.appendSlice(self.a, seeds);
+        for (pairs) |pair| try selected.appendSlice(self.a, &.{ pair.from, pair.to });
+        var result = (try self.queryForwardIndexed(template, selected.items, lookup, include_configured)).?;
+        result.namespace.state.distinct = pairs;
+        return result;
+    }
+    pub fn queryPrepared(self: Store, prepared: PreparedQuery, seeds: []const []const u8, texts: []const []const u8, distinct: bool) !Snapshot {
+        return self.queryPreparedInternal(prepared, seeds, texts, distinct, false);
+    }
+    pub fn queryExecutionPrepared(self: Store, prepared: PreparedQuery, seeds: []const []const u8, texts: []const []const u8, distinct: bool) !Snapshot {
+        return self.queryPreparedInternal(prepared, seeds, texts, distinct, true);
+    }
+    fn queryPreparedInternal(self: Store, prepared: PreparedQuery, seeds: []const []const u8, texts: []const []const u8, distinct: bool, include_configured: bool) !Snapshot {
+        if (distinct and !prepared.distinct) return error.InvalidResolverCurationRequest;
+        const h = (try self.head(prepared.template)) orelse return error.ResolverCurationConflict;
+        if (h.revision != prepared.stamp.revision or !std.mem.eql(u8, &h.fingerprint, &prepared.stamp.fingerprint)) return error.ResolverCurationConflict;
+        if (seeds.len == 0) {
+            var snapshot = (try self.textPolicy(prepared.template, texts)).?;
+            snapshot.complete_aliases = include_configured;
+            return snapshot;
+        }
+        if (prepared.indexed) {
+            var local: StaticQueryLookup = .{ .context = if (prepared.lease) |lease| lease.context else null };
+            const lookup = prepared.lookup orelse AliasLookup{ .ptr = &local, .expand = StaticQueryLookup.expand, .node = StaticQueryLookup.node, .seek_node = StaticQueryLookup.seekNode };
+            var snapshot = if (distinct and prepared.pin_discovery) try self.queryIndexedPins(h, prepared, seeds, lookup, include_configured) else (try self.queryForwardIndexed(prepared.template, seeds, lookup, include_configured)).?;
+            try self.appendTextPolicy(prepared.template, texts, &snapshot);
+            return snapshot;
+        }
+        const context = prepared.lease.?.context;
+        var selected: std.ArrayList([]const u8) = .empty;
+        try selected.appendSlice(self.a, seeds);
+        var values: Values = .{};
+        var pairs: std.StringHashMapUnmanaged(void) = .empty;
+        if (distinct and context.composed and seeds.len != 0) for (seeds) |seed| {
+            if (context.pins.get(context.redirects.canonical(seed))) |incident| for (incident.items) |pair| {
+                if ((try pairs.getOrPut(self.a, try c.pairKey(self.a, pair.from, pair.to))).found_existing) continue;
+                // No response string may borrow an evictable cache lease.
+                const owned = try parse(c.Pair, self.a, try encode(self.a, pair));
+                try values.distinct.append(self.a, owned);
+                try selected.appendSlice(self.a, &.{ owned.from, owned.to });
+            };
+        };
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (selected.items) |seed| {
+            var id = seed;
+            while (true) {
+                if ((try seen.getOrPut(self.a, id)).found_existing) break;
+                if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin }) |kind| if (try self.backend.get(self.backend.ptr, self.a, try self.record(prepared.template, kind, id))) |raw| try values.append(self.a, kind, raw);
+                const native_target = if (context.composed) context.native_targets.get(id) else if (try self.get(resolver.KeyAlias, prepared.template, .redirect, id)) |alias| alias.target else null;
+                if (native_target) |target| {
+                    const owned: resolver.KeyAlias = .{ .key = try self.a.dupe(u8, id), .target = try self.a.dupe(u8, target) };
+                    try values.aliases.append(self.a, owned);
+                    id = owned.target;
+                    continue;
+                }
+                const removed = if (context.composed) context.removed.contains(id) else try self.backend.get(self.backend.ptr, self.a, try self.record(prepared.template, .removed_alias, id)) != null;
+                if (removed) {
+                    try values.removed.append(self.a, try self.a.dupe(u8, id));
+                    break;
+                }
+                const next = context.static_targets.get(id) orelse break;
+                if (include_configured) try values.aliases.append(self.a, .{ .key = try self.a.dupe(u8, id), .target = try self.a.dupe(u8, next) });
+                id = next;
+            }
+        }
+        var snapshot = values.snapshot(h);
+        snapshot.complete_aliases = include_configured;
+        try self.appendTextPolicy(prepared.template, texts, &snapshot);
+        return snapshot;
+    }
+    pub fn queryPolicy(self: Store, template: []const u8, seeds: []const []const u8, texts: []const []const u8, static_aliases: []const resolver.KeyAlias, distinct: bool) !?Snapshot {
+        if (seeds.len == 0) return self.textPolicy(template, texts);
+        if (static_aliases.len != 0) {
+            var loader: InlineQueryProfile = .{ .aliases = static_aliases };
+            const id = try (static_profiles.Definition{ .key_template = template, .aliases = static_aliases }).identity(self.a);
+            const prepared = (try self.prepareQuery(template, .{ .id = id, .ptr = &loader, .load = InlineQueryProfile.load, .estimated_bytes = loader.estimate() }, distinct)) orelse return null;
+            defer prepared.release();
+            return try self.queryPrepared(prepared, seeds, texts, distinct);
+        }
+        var snapshot = (try self.queryForward(template, seeds, &.{}, 16384)) orelse return null;
+        if (distinct) {
+            if (try self.backend.get(self.backend.ptr, self.a, try self.pinReadyPath(template))) |raw_ready| {
+                if ((try parse(PinReady, self.a, raw_ready)).endpoints != 0) snapshot = try self.pinnedQuery(template, seeds, &.{}, snapshot);
+            } else if ((try self.backend.scan(self.backend.ptr, self.a, try self.records(template, .distinct), null, 1)).rows.len != 0)
+                snapshot = (try self.component(template, seeds)).?;
+        }
+        try self.appendTextPolicy(template, texts, &snapshot);
+        return snapshot;
+    }
+    pub fn queryExecutionPolicy(self: Store, template: []const u8, seeds: []const []const u8, texts: []const []const u8, static_aliases: []const resolver.KeyAlias, distinct: bool) !?Snapshot {
+        if (static_aliases.len != 0 and seeds.len != 0) {
+            var loader: InlineQueryProfile = .{ .aliases = static_aliases };
+            const id = try (static_profiles.Definition{ .key_template = template, .aliases = static_aliases }).identity(self.a);
+            const prepared = (try self.prepareQuery(template, .{ .id = id, .ptr = &loader, .load = InlineQueryProfile.load, .estimated_bytes = loader.estimate() }, distinct)) orelse return null;
+            defer prepared.release();
+            return try self.queryExecutionPrepared(prepared, seeds, texts, distinct);
+        }
+        var snapshot = (try self.queryPolicy(template, seeds, texts, &.{}, distinct)) orelse return null;
+        snapshot.complete_aliases = true;
+        return snapshot;
+    }
+    fn queryForward(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias, limit: usize) !?Snapshot {
+        const h = try self.head(template) orelse return null;
+        var edges: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (static_aliases) |alias| try edges.put(self.a, alias.key, alias.target);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var values: Values = .{};
+        for (seeds) |seed| {
+            var id = seed;
+            while (true) {
+                if ((try seen.getOrPut(self.a, id)).found_existing) break;
+                if (seen.count() > limit) return error.ResolverCurationLimitExceeded;
+                inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin, Kind.removed_alias }) |kind| if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
+                if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
+                    try values.aliases.append(self.a, alias);
+                    id = alias.target;
+                } else {
+                    if (try self.get([]const u8, template, .removed_alias, id) != null) break;
+                    id = edges.get(id) orelse break;
+                }
+            }
+        }
+        return values.snapshot(h);
+    }
+    fn pinnedQuery(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias, initial: Snapshot) !Snapshot {
+        const graph = initial;
+        var native_keys: std.StringHashMapUnmanaged(void) = .empty;
+        for (graph.namespace.merges) |alias| try native_keys.put(self.a, alias.key, {});
+        const policy_index = try c.Index.init(self.a, "", try encode(self.a, graph.namespace.state));
+        var effective: std.ArrayList(resolver.KeyAlias) = .empty;
+        for (static_aliases) |alias| if (!native_keys.contains(alias.key) and !policy_index.removed_aliases.contains(alias.key)) try effective.append(self.a, alias);
+        try effective.appendSlice(self.a, graph.namespace.merges);
+        const redirects = try c.RedirectIndex.init(self.a, effective.items);
+        var canonical: std.StringHashMapUnmanaged(void) = .empty;
+        var pending: std.ArrayList([]const u8) = .empty;
+        for (seeds) |seed| {
+            const id = redirects.canonical(seed);
+            if (!(try canonical.getOrPut(self.a, id)).found_existing) try pending.append(self.a, id);
+        }
+        var visited: std.StringHashMapUnmanaged(void) = .empty;
+        var pairs: std.StringHashMapUnmanaged(c.Pair) = .empty;
+        var offset: usize = 0;
+        while (offset < pending.items.len) : (offset += 1) {
+            const id = pending.items[offset];
+            if ((try visited.getOrPut(self.a, id)).found_existing or try self.pinCount(template, id) == 0) continue;
+            inline for (.{ "distinct-key", "pin-child" }) |kind| {
+                var after: ?[]const u8 = null;
+                while (true) {
+                    const page = try self.backend.scan(self.backend.ptr, self.a, try self.adjacent(template, kind, id), after, 128);
+                    for (page.rows) |row| {
+                        if (comptime std.mem.eql(u8, kind, "pin-child")) try pending.append(self.a, try parse([]const u8, self.a, row.value)) else try pairs.put(self.a, row.key[row.key.len - 64 ..], try parse(c.Pair, self.a, row.value));
+                    }
+                    after = page.next;
+                    if (after == null) break;
+                }
+            }
+        }
+        if (pairs.count() == 0) return initial;
+        var selected: std.ArrayList([]const u8) = .empty;
+        try selected.appendSlice(self.a, seeds);
+        var values: std.ArrayList(c.Pair) = .empty;
+        var it = pairs.valueIterator();
+        while (it.next()) |pair| {
+            try values.append(self.a, pair.*);
+            try selected.appendSlice(self.a, &.{ pair.from, pair.to });
+        }
+        var result = (try self.queryForward(template, selected.items, static_aliases, 16384)).?;
+        result.namespace.state.distinct = values.items;
+        return result;
+    }
+    pub fn mentionPolicy(self: Store, template: []const u8, key: []const u8, text: []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
+        return self.queryPolicy(template, &.{key}, &.{text}, static_aliases, false);
     }
     pub fn component(self: Store, template: []const u8, seeds: []const []const u8) !?Snapshot {
         return self.componentWithAliases(template, seeds, &.{});
     }
     pub fn componentWithAliases(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
+        return self.componentGraph(template, seeds, static_aliases, null, true);
+    }
+    pub fn componentIndexed(self: Store, template: []const u8, seeds: []const []const u8, lookup: AliasLookup) !?Snapshot {
+        return self.componentGraph(template, seeds, &.{}, lookup, true);
+    }
+    fn componentGraph(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias, lookup: ?AliasLookup, include_cascades: bool) !?Snapshot {
+        const Mask = struct {
+            store: Store,
+            template: []const u8,
+            cache: std.StringHashMapUnmanaged(bool) = .empty,
+            fn enabled(ptr: *anyopaque, a: A, id: []const u8) !bool {
+                const context: *@This() = @ptrCast(@alignCast(ptr));
+                if (context.cache.get(id)) |value| return value;
+                const active = try context.store.get(resolver.KeyAlias, context.template, .redirect, id) == null and try context.store.backend.get(context.store.backend.ptr, a, try context.store.record(context.template, .removed_alias, id)) == null;
+                try context.cache.put(a, try a.dupe(u8, id), active);
+                return active;
+            }
+        };
+        var masks: Mask = .{ .store = self, .template = template };
+        const mask: EdgeMask = .{ .ptr = &masks, .enabled = Mask.enabled };
         var forward: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
         var reverse: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
         for (static_aliases) |alias| {
+            if (!try mask.enabled(mask.ptr, self.a, alias.key)) continue;
             const from = try forward.getOrPut(self.a, alias.key);
             if (!from.found_existing) from.value_ptr.* = .empty;
             try from.value_ptr.append(self.a, alias.target);
@@ -329,6 +1728,10 @@ pub const Store = struct {
             const id = pending.items[offset];
             if ((try seen.getOrPut(self.a, id)).found_existing) continue;
             if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+            if (lookup) |indexed| for (try indexed.expand(indexed.ptr, self.a, id, false, mask)) |edge| {
+                try pending.append(self.a, edge.key);
+                try pending.append(self.a, edge.target);
+            };
             if (forward.get(id)) |edges| try pending.appendSlice(self.a, edges.items);
             if (reverse.get(id)) |edges| try pending.appendSlice(self.a, edges.items);
             if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
@@ -339,17 +1742,20 @@ pub const Store = struct {
                 if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
             }
             inline for (.{ "incoming", "cascade", "distinct-key" }) |name| {
-                const prefix = try self.adjacent(template, name, id);
-                var after: ?[]const u8 = null;
-                while (true) {
-                    const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
-                    for (page.rows) |row| {
-                        if (comptime std.mem.eql(u8, name, "distinct-key")) {
-                            if (!(try pairs.getOrPut(self.a, row.key[row.key.len - 64 ..])).found_existing) try values.distinct.append(self.a, try parse(c.Pair, self.a, row.value));
-                        } else try pending.append(self.a, try parse([]const u8, self.a, row.value));
+                const enabled = if (comptime std.mem.eql(u8, name, "cascade")) include_cascades else true;
+                if (enabled) {
+                    const prefix = try self.adjacent(template, name, id);
+                    var after: ?[]const u8 = null;
+                    while (true) {
+                        const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
+                        for (page.rows) |row| {
+                            if (comptime std.mem.eql(u8, name, "distinct-key")) {
+                                if (!(try pairs.getOrPut(self.a, row.key[row.key.len - 64 ..])).found_existing) try values.distinct.append(self.a, try parse(c.Pair, self.a, row.value));
+                            } else try pending.append(self.a, try parse([]const u8, self.a, row.value));
+                        }
+                        after = page.next;
+                        if (after == null) break;
                     }
-                    after = page.next;
-                    if (after == null) break;
                 }
             }
         }
@@ -363,6 +1769,8 @@ pub const Store = struct {
                 const id = paths.items[path_offset];
                 if ((try seen.getOrPut(self.a, id)).found_existing) continue;
                 if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin, Kind.removed_alias }) |kind| if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
+                if (lookup) |indexed| for (try indexed.expand(indexed.ptr, self.a, id, true, mask)) |edge| try paths.append(self.a, edge.target);
                 if (forward.get(id)) |edges| try paths.appendSlice(self.a, edges.items);
                 if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
                     try values.aliases.append(self.a, alias);
@@ -404,8 +1812,49 @@ pub const Store = struct {
         for (id) |byte| if (!std.ascii.isHex(byte)) return error.InvalidResolverCurationRequest;
         return self.keyPath(try std.mem.concat(self.a, u8, &.{ "queue/proposal/", id }));
     }
+    fn proposalHeaderPath(self: Store, id: []const u8) ![]const u8 {
+        _ = try self.proposalPath(id);
+        return self.keyPath(try std.mem.concat(self.a, u8, &.{ "queue/header/", id }));
+    }
+    fn proposalRecord(self: Store, id: []const u8) !?ProposalHeader {
+        if (try self.backend.get(self.backend.ptr, self.a, try self.proposalHeaderPath(id))) |raw| {
+            const header = try parse(ProposalHeader, self.a, raw);
+            if (header.version != 1 or header.proposal.evidence != null or !std.mem.eql(u8, id, header.proposal.id)) return error.InvalidCatalogRecord;
+            return header;
+        }
+        // Legacy rows acquire their compact header on first mutation. Never
+        // scan/migrate an unrelated queue, including unbounded memory queues.
+        return if (try self.backend.get(self.backend.ptr, self.a, try self.proposalPath(id))) |raw| try proposalHeaderValue(self.a, try parse(c.Proposal, self.a, raw)) else null;
+    }
+    pub fn proposalHeader(self: Store, id: []const u8) !?c.Proposal {
+        return if (try self.proposalRecord(id)) |header| header.proposal else null;
+    }
     pub fn proposal(self: Store, id: []const u8) !?c.Proposal {
-        return if (try self.backend.get(self.backend.ptr, self.a, try self.proposalPath(id))) |raw| try parse(c.Proposal, self.a, raw) else null;
+        const header = try self.proposalRecord(id) orelse return null;
+        const raw = try self.backend.get(self.backend.ptr, self.a, try self.proposalPath(id)) orelse return error.InvalidCatalogRecord;
+        return try self.joinProposal(try parse(c.Proposal, self.a, raw), header);
+    }
+    fn joinProposal(self: Store, body: c.Proposal, header: ProposalHeader) !c.Proposal {
+        if (header.version != 1 or header.proposal.evidence != null or !std.mem.eql(u8, body.id, header.proposal.id)) return error.InvalidCatalogRecord;
+        var value = header.proposal;
+        value.evidence = body.evidence;
+        if (!std.mem.eql(u8, &header.evidence_hash, &(try evidenceHash(self.a, value.evidence)))) return error.InvalidCatalogRecord;
+        return value;
+    }
+    fn scannedProposal(self: Store, raw: []const u8) !c.Proposal {
+        const body = try parse(c.Proposal, self.a, raw);
+        const header = try self.backend.get(self.backend.ptr, self.a, try self.proposalHeaderPath(body.id)) orelse return body;
+        return self.joinProposal(body, try parse(ProposalHeader, self.a, header));
+    }
+    fn nextProposalRecord(self: Store, patch: QueuePatch, value: c.Proposal, previous: ?ProposalHeader) !ProposalHeader {
+        if (!patch.retain_evidence) return proposalHeaderValue(self.a, value);
+        const old = previous orelse return error.ResolverCurationConflict;
+        if (value.evidence != null) return error.InvalidResolverCurationRequest;
+        var unchanged = value;
+        unchanged.state = old.proposal.state;
+        unchanged.decided = old.proposal.decided;
+        if (!std.mem.eql(u8, try encode(self.a, unchanged), try encode(self.a, old.proposal))) return error.ResolverCurationConflict;
+        return .{ .proposal = value, .evidence_hash = old.evidence_hash, .capacity = try std.math.sub(u64, try std.math.add(u64, old.capacity, c.proposalCapacityBytes(.{ .proposals = &.{value} })), c.proposalCapacityBytes(.{ .proposals = &.{old.proposal} })) };
     }
     fn proposalIndexes(self: Store, value: c.Proposal) ![]const []const u8 {
         const result = try self.a.alloc([]const u8, if (value.state == .open) (if (value.into != null) @as(usize, 5) else 4) else 3);
@@ -422,7 +1871,7 @@ pub const Store = struct {
     /// It commits with a plain rejection and lets receipt replay avoid all
     /// consumer work without mistaking a rejected distinct pin for queue-only.
     pub fn markQueueOnly(self: Store, id: []const u8) !void {
-        const value = try self.proposal(id) orelse return error.NotFound;
+        const value = try self.proposalHeader(id) orelse return error.NotFound;
         if (value.state != .rejected) return error.ResolverCurationConflict;
         try self.backend.put(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/queue-only/{s}", .{id})), try encode(self.a, id));
     }
@@ -438,24 +1887,33 @@ pub const Store = struct {
         const page = try self.backend.scan(self.backend.ptr, self.a, prefix, if (after) |id| try std.mem.concat(self.a, u8, &.{ prefix, id }) else null, limit + 1);
         var values: std.ArrayList(c.Proposal) = .empty;
         for (page.rows[0..@min(limit, page.rows.len)]) |row| {
-            const value = if (state == null and action == null) try parse(c.Proposal, self.a, row.value) else (try self.proposal(row.key[row.key.len - 64 ..])) orelse return error.InvalidCatalogRecord;
+            const value = if (state == null and action == null) try self.scannedProposal(row.value) else (try self.proposal(row.key[row.key.len - 64 ..])) orelse return error.InvalidCatalogRecord;
             try values.append(self.a, value);
         }
         return .{ .proposals = values.items, .next_cursor = if (page.rows.len > limit) values.items[values.items.len - 1].id else null };
     }
     pub fn proposalsForKeys(self: Store, keys: []const []const u8) !c.State {
+        return self.proposalsForKeysMode(keys, false);
+    }
+    pub fn proposalHeadersForKeys(self: Store, keys: []const []const u8) !c.State {
+        return self.proposalsForKeysMode(keys, true);
+    }
+    fn proposalsForKeysMode(self: Store, keys: []const []const u8, headers_only: bool) !c.State {
         const h = try self.queueHead();
         var values: std.ArrayList(c.Proposal) = .empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var seen_keys: std.StringHashMapUnmanaged(void) = .empty;
         for (keys) |key| {
+            if ((try seen_keys.getOrPut(self.a, key)).found_existing) continue;
             const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/key/{s}/", .{try hash(self.a, key)}));
             var after: ?[]const u8 = null;
             while (true) {
+                if (comptime @import("builtin").is_test) _ = test_proposal_key_scans.fetchAdd(1, .monotonic);
                 const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
                 for (page.rows) |row| {
                     const id = row.key[row.key.len - 64 ..];
                     if ((try seen.getOrPut(self.a, id)).found_existing) continue;
-                    const value = (try self.proposal(id)) orelse return error.InvalidCatalogRecord;
+                    const value = (if (headers_only) try self.proposalHeader(id) else try self.proposal(id)) orelse return error.InvalidCatalogRecord;
                     if (value.state == .open) try values.append(self.a, value);
                 }
                 after = page.next;
@@ -464,8 +1922,63 @@ pub const Store = struct {
         }
         return .{ .receipt_scope = h.receipt_scope, .proposals = values.items };
     }
+    const Ownership = @import("resolver_ownership_index.zig");
+    pub const OwnershipProgress = struct { revision: u64, after: ?[]const u8 = null, complete: bool = false };
+    fn ownershipProgress(self: Store) !?OwnershipProgress {
+        const raw = try self.backend.get(self.backend.ptr, self.a, try self.keyPath("queue/ownership-progress")) orelse return null;
+        return try parse(OwnershipProgress, self.a, raw);
+    }
+    fn ownershipIndex(self: Store, direction: []const u8) !Ownership.Index {
+        return .{ .a = self.a, .backend = self.backend, .root = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/ownership/{s}/", .{direction})) };
+    }
+    fn indexOwnedKey(self: Store, key: []const u8) !void {
+        const member = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/ownership/member/{s}", .{try hash(self.a, key)}));
+        if (try self.backend.get(self.backend.ptr, self.a, member) != null) return;
+        try (try self.ownershipIndex("forward")).insert(try Ownership.encodedKey(self.a, key, false), key);
+        try (try self.ownershipIndex("reverse")).insert(try Ownership.encodedKey(self.a, key, true), key);
+        try self.backend.put(self.backend.ptr, self.a, member, try encode(self.a, key));
+    }
+    pub fn ownershipIndexed(self: Store) !bool {
+        const h = try self.queueHead();
+        if (h.revision == 0) return true;
+        const progress = (try self.ownershipProgress()) orelse return false;
+        return progress.complete and progress.revision == h.revision;
+    }
+    /// Owner work only: the watermark and index afterimages share the queue's
+    /// writer transaction. Concurrent new writers enroll new keys immediately;
+    /// an older writer advancing only the queue revision resets the cut safely.
+    pub fn advanceOwnershipIndex(self: Store, limit: u32) !bool {
+        if (limit == 0 or limit > 4096) return error.InvalidResolverCurationRequest;
+        const h = try self.queueHead();
+        var progress = (try self.ownershipProgress()) orelse OwnershipProgress{ .revision = h.revision };
+        if (progress.revision != h.revision) progress = .{ .revision = h.revision };
+        if (progress.complete) return true;
+        const prefix = try self.keyPath("queue/owned/");
+        const after = if (progress.after) |id| try std.mem.concat(self.a, u8, &.{ prefix, id }) else null;
+        const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, limit);
+        for (page.rows) |row| try self.indexOwnedKey(try parse([]const u8, self.a, row.value));
+        progress.after = if (page.next) |key| try self.a.dupe(u8, key[prefix.len..]) else null;
+        progress.complete = page.next == null;
+        try self.backend.put(self.backend.ptr, self.a, try self.keyPath("queue/ownership-progress"), try encode(self.a, progress));
+        return progress.complete;
+    }
     pub fn ownsKeyTemplate(self: Store, template: []const u8) !bool {
         if (try self.head(template) != null) return true;
+        const first = std.mem.indexOf(u8, template, "{{") orelse {
+            return try self.backend.get(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/owned/{s}", .{try hash(self.a, template)}))) != null;
+        };
+        if (try self.ownershipIndexed()) {
+            const last = std.mem.lastIndexOf(u8, template, "}}") orelse return false;
+            const forward = try self.ownershipIndex("forward");
+            const prefix_cut = (try forward.prefix(try Ownership.encodedKey(self.a, template[0..first], false))) orelse return false;
+            const suffix = try Ownership.encodedKey(self.a, template[last + 2 ..], true);
+            const reverse = try self.ownershipIndex("reverse");
+            const tail = (try reverse.prefix(suffix)) orelse return false;
+            if (first == 0 and suffix.len == 0) return true;
+            return if (prefix_cut.refs <= tail.refs) forward.matches(prefix_cut, template) else reverse.matches(tail, template);
+        }
+        // Read-only old snapshots retain ownership until bounded owner work
+        // publishes the complete queue-revision-fenced index.
         const prefix = try self.keyPath("queue/owned/");
         var after: ?[]const u8 = null;
         while (true) {
@@ -487,12 +2000,13 @@ pub const Store = struct {
             const path = try self.proposalPath(value.id);
             if ((try seen.getOrPut(self.a, path)).found_existing) return error.InvalidResolverCurationRequest;
             _ = try c.parseState(self.a, try encode(self.a, c.State{ .receipt_scope = h.receipt_scope, .proposals = &.{value} }));
-            if (try self.backend.get(self.backend.ptr, self.a, path)) |old| {
-                const previous = try parse(c.Proposal, self.a, old);
-                if (previous.state != .open and !std.mem.eql(u8, old, try encode(self.a, value))) return error.ResolverCurationConflict;
-                bytes = try std.math.sub(u64, bytes, c.proposalCapacityBytes(.{ .proposals = &.{previous} }));
+            const previous = try self.proposalRecord(value.id);
+            const next = try self.nextProposalRecord(patch, value, previous);
+            if (previous) |old| {
+                if (old.proposal.state != .open and !std.mem.eql(u8, try encode(self.a, old), try encode(self.a, next))) return error.ResolverCurationConflict;
+                bytes = try std.math.sub(u64, bytes, old.capacity);
             } else count = try std.math.add(u32, count, 1);
-            bytes = try std.math.add(u64, bytes, c.proposalCapacityBytes(.{ .proposals = &.{value} }));
+            bytes = try std.math.add(u64, bytes, next.capacity);
         }
         if (self.max_queue_bytes) |maximum| if (bytes > maximum) return error.ResolverCurationLimitExceeded;
         if (self.max_queue_count) |maximum| if (count > maximum) return error.ResolverCurationLimitExceeded;
@@ -500,21 +2014,31 @@ pub const Store = struct {
     pub fn applyQueue(self: Store, patch: QueuePatch) !void {
         try self.preflightQueue(patch);
         var h = try self.queueHead();
+        const old_revision = h.revision;
+        var ownership = (try self.ownershipProgress()) orelse if (old_revision == 0) OwnershipProgress{ .revision = 0, .complete = true } else null;
         if (h.revision == 0) h.receipt_scope = patch.receipt_scope;
         for (patch.proposals) |value| {
             const path = try self.proposalPath(value.id);
-            if (try self.backend.get(self.backend.ptr, self.a, path)) |raw| {
-                const old = try parse(c.Proposal, self.a, raw);
-                h.bytes -= c.proposalCapacityBytes(.{ .proposals = &.{old} });
-                for (try self.proposalIndexes(old)) |index| try self.backend.remove(self.backend.ptr, self.a, index);
+            const previous = try self.proposalRecord(value.id);
+            const next = try self.nextProposalRecord(patch, value, previous);
+            if (previous) |old| {
+                h.bytes -= old.capacity;
+                for (try self.proposalIndexes(old.proposal)) |index| try self.backend.remove(self.backend.ptr, self.a, index);
             } else h.count += 1;
-            const raw = try encode(self.a, value);
-            h.bytes += c.proposalCapacityBytes(.{ .proposals = &.{value} });
-            try self.backend.put(self.backend.ptr, self.a, path, raw);
+            h.bytes += next.capacity;
+            // The original body owns immutable evidence. Decisions update the
+            // small header and indexes; public reads join evidence on demand.
+            if (previous == null or !std.mem.eql(u8, &previous.?.evidence_hash, &next.evidence_hash)) try self.backend.put(self.backend.ptr, self.a, path, try encode(self.a, value));
+            try self.backend.put(self.backend.ptr, self.a, try self.proposalHeaderPath(value.id), try encode(self.a, next));
             try self.backend.put(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/owned/{s}", .{try hash(self.a, value.key)})), try encode(self.a, value.key));
+            try self.indexOwnedKey(value.key);
             for (try self.proposalIndexes(value)) |index| try self.backend.put(self.backend.ptr, self.a, index, try encode(self.a, value.id));
         }
         h.revision = patch.revision;
+        if (ownership) |*progress| if (progress.revision == old_revision) {
+            progress.revision = h.revision;
+            try self.backend.put(self.backend.ptr, self.a, try self.keyPath("queue/ownership-progress"), try encode(self.a, progress.*));
+        };
         try self.backend.put(self.backend.ptr, self.a, try self.keyPath("queue/head"), try encode(self.a, h));
     }
     /// One-time import preserves the legacy revision, including revision zero.
@@ -533,11 +2057,20 @@ pub const Store = struct {
             h.bytes = try std.math.add(u64, h.bytes, row.value.len);
         }
         if (self.max_namespace_bytes) |maximum| if (h.bytes > maximum) return error.ResolverCurationLimitExceeded;
-        std.crypto.hash.sha2.Sha256.hash(try encode(self.a, namespace), &h.fingerprint, .{});
+        @import("antfly_hash").Sha256.hash(try encode(self.a, namespace), &h.fingerprint, .{});
         for (rows) |row| {
             try self.backend.put(self.backend.ptr, self.a, try self.record(h.key_template, row.kind, row.id), row.value);
             try self.indexRecord(h.key_template, row.kind, row.id, row.value, true);
         }
+        if (namespace.state.distinct.len == 0) {
+            try self.backend.put(self.backend.ptr, self.a, try self.pinReadyPath(h.key_template), try encode(self.a, PinReady{ .endpoints = 0 }));
+        } else try self.ensurePinIndex(h.key_template);
+        var graph_bytes: u64 = 0;
+        for (rows) |row| if (graphKind(row.kind)) {
+            graph_bytes += row.value.len;
+        };
+        try self.putQueryGraph(h, h.fingerprint, graph_bytes);
+        try self.putRouting(h, h.fingerprint);
         try self.indexHead(h);
         try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
     }
@@ -601,30 +2134,113 @@ pub const Store = struct {
         if (self.max_namespace_bytes) |maximum| if (bytes > maximum) return error.ResolverCurationLimitExceeded;
     }
     pub fn apply(self: Store, patch: Patch) !void {
-        try self.preflight(patch);
-        const previous = try self.head(patch.next.key_template);
+        var changes: std.StringHashMapUnmanaged(void) = .empty;
+        var mutation = self;
+        const enrolled = try self.backend.get(self.backend.ptr, self.a, try std.mem.concat(self.a, u8, &.{ try self.pinEditRoot(patch.next.key_template), "head" })) != null;
+        mutation.pin_changes = if (enrolled) &changes else null;
+        try mutation.preflight(patch);
+        const previous = try mutation.head(patch.next.key_template);
         if ((if (previous) |h| h.revision else 0) != patch.expected_revision or patch.next.revision <= patch.expected_revision) return error.ResolverCurationConflict;
+        var graph = if (previous) |h| try mutation.queryGraph(h) else QueryGraph{ .head = .{ .revision = 0, .fingerprint = @splat(0) }, .fingerprint = @splat(0), .bytes = 0 };
+        var routing_fingerprint = if (previous) |h| try mutation.routingFingerprint(h) else @as([32]u8, @splat(0));
+        var routing_edits: std.ArrayList(Edit) = .empty;
+        for (patch.edits) |edit| if (edit.kind == .redirect or edit.kind == .removed_alias) {
+            try routing_edits.append(mutation.a, edit);
+        };
+        if (routing_edits.items.len != 0) @import("antfly_hash").Sha256.hash(try encode(mutation.a, .{ routing_fingerprint, patch.next.key_template, routing_edits.items }), &routing_fingerprint, .{});
+        var graph_edits: std.ArrayList(Edit) = .empty;
+        for (patch.edits) |edit| if (graphKind(edit.kind)) {
+            try graph_edits.append(mutation.a, edit);
+            if (try mutation.backend.get(mutation.backend.ptr, mutation.a, try mutation.record(patch.next.key_template, edit.kind, edit.id))) |raw| graph.bytes = try std.math.sub(u64, graph.bytes, raw.len);
+            if (edit.value) |value| graph.bytes = try std.math.add(u64, graph.bytes, (try encode(mutation.a, value)).len);
+        };
+        if (graph_edits.items.len != 0) @import("antfly_hash").Sha256.hash(try encode(mutation.a, .{ graph.fingerprint, patch.next.key_template, graph_edits.items }), &graph.fingerprint, .{});
+        try mutation.ensurePinIndex(patch.next.key_template);
+        var detached: std.StringHashMapUnmanaged(void) = .empty;
+        var endpoints: std.StringHashMapUnmanaged(bool) = .empty;
+        for (patch.edits) |edit| if (edit.kind == .distinct) {
+            if (try mutation.get(c.Pair, patch.next.key_template, .distinct, edit.id)) |pair| for ([_][]const u8{ pair.from, pair.to }) |id| if (!endpoints.contains(id)) try endpoints.put(mutation.a, id, try mutation.ownPin(patch.next.key_template, id));
+            if (edit.value) |value| {
+                const pair = try parse(c.Pair, mutation.a, try encode(mutation.a, value));
+                for ([_][]const u8{ pair.from, pair.to }) |id| if (!endpoints.contains(id)) try endpoints.put(mutation.a, id, try mutation.ownPin(patch.next.key_template, id));
+            }
+        };
+        // Capture all old subtree weights before updating any ancestor.
+        var deltas: std.ArrayList(PinDelta) = .empty;
+        for (patch.edits) |edit| if (edit.kind == .redirect) try detached.put(mutation.a, edit.id, {});
+        for (patch.edits) |edit| if (edit.kind == .redirect) {
+            if (try mutation.get(resolver.KeyAlias, patch.next.key_template, .redirect, edit.id)) |edge| {
+                const count = try mutation.pinCount(patch.next.key_template, edit.id);
+                if (count != 0) {
+                    try mutation.pinChild(patch.next.key_template, edge.target, edit.id, false);
+                    try deltas.append(mutation.a, .{ .key = edge.target, .amount = -@as(i128, count) });
+                }
+            }
+        };
+        try mutation.propagatePins(patch.next.key_template, deltas.items, detached);
         var h = patch.next;
         h.bytes = if (previous) |old| old.bytes else 0;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         for (patch.edits) |edit| {
-            const path = try self.record(h.key_template, edit.kind, edit.id);
-            if ((try seen.getOrPut(self.a, path)).found_existing) return error.InvalidResolverCurationRequest;
-            if (try self.backend.get(self.backend.ptr, self.a, path)) |old| {
+            const path = try mutation.record(h.key_template, edit.kind, edit.id);
+            if ((try seen.getOrPut(mutation.a, path)).found_existing) return error.InvalidResolverCurationRequest;
+            if (try mutation.backend.get(mutation.backend.ptr, mutation.a, path)) |old| {
                 h.bytes = try std.math.sub(u64, h.bytes, old.len);
-                try self.indexRecord(h.key_template, edit.kind, edit.id, old, false);
+                try mutation.indexRecord(h.key_template, edit.kind, edit.id, old, false);
             }
             if (edit.value) |value_json| {
-                const raw = try encode(self.a, value_json);
+                const raw = try encode(mutation.a, value_json);
                 h.bytes = try std.math.add(u64, h.bytes, raw.len);
-                if (self.max_namespace_bytes) |maximum| if (h.bytes > maximum) return error.ResolverCurationLimitExceeded;
-                try self.backend.put(self.backend.ptr, self.a, path, raw);
-                try self.indexRecord(h.key_template, edit.kind, edit.id, raw, true);
-            } else try self.backend.remove(self.backend.ptr, self.a, path);
+                if (mutation.max_namespace_bytes) |maximum| if (h.bytes > maximum) return error.ResolverCurationLimitExceeded;
+                try mutation.backend.put(mutation.backend.ptr, mutation.a, path, raw);
+                try mutation.indexRecord(h.key_template, edit.kind, edit.id, raw, true);
+            } else try mutation.backend.remove(mutation.backend.ptr, mutation.a, path);
         }
-        std.crypto.hash.sha2.Sha256.hash(try encode(self.a, .{ if (previous) |old| old.fingerprint else @as([32]u8, @splat(0)), h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, patch.edits }), &h.fingerprint, .{});
-        if (previous == null) try self.indexHead(h);
-        try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
+        var pin_ready = try parse(PinReady, mutation.a, (try mutation.backend.get(mutation.backend.ptr, mutation.a, try mutation.pinReadyPath(h.key_template))).?);
+        deltas.clearRetainingCapacity();
+        var changed_endpoints = endpoints.iterator();
+        while (changed_endpoints.next()) |entry| {
+            const now = try mutation.ownPin(h.key_template, entry.key_ptr.*);
+            if (now != entry.value_ptr.*) {
+                try deltas.append(mutation.a, .{ .key = entry.key_ptr.*, .amount = if (now) 1 else -1 });
+                pin_ready.endpoints = if (now) try std.math.add(u64, pin_ready.endpoints, 1) else try std.math.sub(u64, pin_ready.endpoints, 1);
+            }
+        }
+        try mutation.propagatePins(h.key_template, deltas.items, detached);
+        if (endpoints.count() != 0) try mutation.backend.put(mutation.backend.ptr, mutation.a, try mutation.pinReadyPath(h.key_template), try encode(mutation.a, pin_ready));
+        deltas.clearRetainingCapacity();
+        for (patch.edits) |edit| if (edit.kind == .redirect) {
+            if (try mutation.get(resolver.KeyAlias, h.key_template, .redirect, edit.id)) |edge| {
+                const count = try mutation.pinCount(h.key_template, edit.id);
+                if (count != 0) try deltas.append(mutation.a, .{ .key = edge.target, .amount = @as(i128, count) });
+            }
+        };
+        // The final forest is now complete. Contributions from an attached
+        // descendant flow through attached ancestors in one topological pass.
+        try mutation.propagatePins(h.key_template, deltas.items, .empty);
+        for (patch.edits) |edit| if (edit.kind == .redirect) {
+            if (try mutation.get(resolver.KeyAlias, h.key_template, .redirect, edit.id)) |edge| {
+                if (try mutation.pinCount(h.key_template, edit.id) != 0) try mutation.pinChild(h.key_template, edge.target, edit.id, true);
+            }
+        };
+        @import("antfly_hash").Sha256.hash(try encode(mutation.a, .{ if (previous) |old| old.fingerprint else @as([32]u8, @splat(0)), h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, patch.edits }), &h.fingerprint, .{});
+        if (enrolled and graph_edits.items.len != 0) {
+            var routing: std.ArrayList([]const u8) = .empty;
+            for (routing_edits.items) |edit| try routing.append(mutation.a, edit.id);
+            var boundaries: std.ArrayList([]const u8) = .empty;
+            var it = changes.keyIterator();
+            while (it.next()) |id| try boundaries.append(mutation.a, id.*);
+            std.mem.sort([]const u8, boundaries.items, {}, struct {
+                fn less(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.lessThan(u8, left, right);
+                }
+            }.less);
+            try mutation.appendPinEdit(h.key_template, (if (previous) |old| try mutation.queryGraph(old) else graph).fingerprint, graph.fingerprint, boundaries.items, routing.items);
+        }
+        try mutation.putQueryGraph(h, graph.fingerprint, graph.bytes);
+        try mutation.putRouting(h, routing_fingerprint);
+        if (previous == null) try mutation.indexHead(h);
+        try mutation.backend.put(mutation.backend.ptr, mutation.a, try mutation.headPath(h.key_template), try encode(mutation.a, h));
     }
 };
 
@@ -655,6 +2271,59 @@ pub fn unionNamespaces(a: A, left: policy.Namespace, right: policy.Namespace) !p
     var it = records.valueIterator();
     while (it.next()) |row| try values.append(a, row.kind, row.value);
     return values.snapshot(.{ .key_template = right.key_template, .revision = right.revision, .min_text_chars = right.state.suppress.min_text_chars }).namespace;
+}
+
+/// Streaming union of bounded query pages. Only unique facts survive a page;
+/// transport bytes and duplicate paths can be released before the next read.
+pub const QueryPolicyUnion = struct {
+    suppression_projected: ?bool = null,
+    configured_keys: std.StringArrayHashMapUnmanaged(void) = .empty,
+    configured_texts: std.StringArrayHashMapUnmanaged(void) = .empty,
+    configured_min_text_chars: u32 = 0,
+    complete_aliases: ?bool = null,
+    head: ?Head = null,
+    seen: std.StringHashMapUnmanaged([]const u8) = .empty,
+    values: Store.Values = .{},
+    pub fn add(self: *QueryPolicyUnion, a: A, scratch: A, part: Snapshot) !void {
+        const projected = part.configured_suppression != null;
+        if (self.suppression_projected) |prior| {
+            if (prior != projected) return error.ResolverCurationConflict;
+        } else self.suppression_projected = projected;
+        if (part.configured_suppression) |suppression| {
+            self.configured_min_text_chars = @max(self.configured_min_text_chars, suppression.min_text_chars);
+            for (suppression.keys) |key| if (!self.configured_keys.contains(key)) try self.configured_keys.put(a, try a.dupe(u8, key), {});
+            for (suppression.texts) |text| if (!self.configured_texts.contains(text)) try self.configured_texts.put(a, try a.dupe(u8, text), {});
+        }
+        if (self.complete_aliases) |complete| {
+            if (complete != part.complete_aliases) return error.ResolverCurationConflict;
+        } else self.complete_aliases = part.complete_aliases;
+        if (self.head) |h| {
+            if (!std.mem.eql(u8, part.head.key_template, h.key_template) or part.head.revision != h.revision or !std.mem.eql(u8, &part.head.fingerprint, &h.fingerprint)) return error.ResolverCurationConflict;
+        } else {
+            self.head = part.head;
+            self.head.?.key_template = try a.dupe(u8, part.head.key_template);
+        }
+        for (try flatten(scratch, part.namespace)) |record_value| {
+            const key = try std.fmt.allocPrint(scratch, "{s}\x00{s}", .{ @tagName(record_value.kind), record_value.id });
+            if (self.seen.get(key)) |prior| {
+                if (!std.mem.eql(u8, prior, record_value.value)) return error.ResolverCurationConflict;
+                continue;
+            }
+            try self.seen.put(a, try a.dupe(u8, key), try a.dupe(u8, record_value.value));
+            try self.values.append(a, record_value.kind, record_value.value);
+        }
+    }
+    pub fn finish(self: QueryPolicyUnion) !Snapshot {
+        var result = self.values.snapshot(self.head orelse return error.InvalidResolverCurationRequest);
+        result.complete_aliases = self.complete_aliases orelse false;
+        if (self.suppression_projected orelse false) result.configured_suppression = .{ .keys = self.configured_keys.keys(), .texts = self.configured_texts.keys(), .min_text_chars = self.configured_min_text_chars };
+        return result;
+    }
+};
+pub fn unionQueryPolicies(a: A, parts: []const Snapshot) !Snapshot {
+    var joined: QueryPolicyUnion = .{};
+    for (parts) |part| try joined.add(a, a, part);
+    return joined.finish();
 }
 
 pub fn difference(a: A, before: policy.Namespace, after: policy.Namespace) !Patch {
@@ -698,6 +2367,7 @@ test "native resolver authority seeks a component and patches only changed recor
     const patch = try difference(a, component.namespace, next);
     try std.testing.expectEqual(@as(usize, 2), patch.edits.len);
     try store.apply(patch);
+    // A namespace without a qualified static owner enrolls no unused log.
     try std.testing.expect(memory.writes < 8);
     try std.testing.expectError(error.ResolverCurationConflict, store.apply(patch));
     const unrelated = (try store.component(before.key_template, &.{"entity/a43"})).?;
@@ -855,13 +2525,27 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         if (!std.mem.eql(u8, raw, "1")) return error.InvalidMetadataBatch;
         return;
     }
-    var parts: [5][]const u8 = undefined;
+    var parts: [6][]const u8 = undefined;
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, tail, '/');
     while (it.next()) |part| {
         if (count == parts.len or part.len == 0) return error.InvalidMetadataBatch;
         parts[count] = part;
         count += 1;
+    }
+    if ((count == 2 and std.mem.eql(u8, parts[0], "pin-ready")) or (count == 3 and std.mem.eql(u8, parts[0], "pin-count"))) {
+        for (parts[1..count]) |part| {
+            if (part.len != 64) return error.InvalidMetadataBatch;
+            for (part) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        }
+        if (count == 2) {
+            _ = try parse(Store.PinReady, a, raw);
+        } else {
+            const value = try parse(Store.PinCount, a, raw);
+            try c.validKey(value.key);
+            if (value.count == 0 or !std.mem.eql(u8, parts[2], try hash(a, value.key))) return error.InvalidMetadataBatch;
+        }
+        return;
     }
     if (count == 2 and std.mem.eql(u8, parts[0], "head-route-node")) {
         if (parts[1].len != 64 or (!std.mem.eql(u8, raw, "0") and !std.mem.eql(u8, raw, "1"))) return error.InvalidMetadataBatch;
@@ -895,6 +2579,84 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         for (parts[1]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
         return;
     }
+    if (std.mem.eql(u8, parts[0], "pin-edits-v1")) {
+        if (raw.len > 64 * 1024) return error.InvalidMetadataBatch;
+        if (count != 3 and count != 4) return error.InvalidMetadataBatch;
+        if (parts[1].len != 64) return error.InvalidMetadataBatch;
+        for (parts[1]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        if (count == 3 and std.mem.eql(u8, parts[2], "head")) {
+            _ = try parse(Store.PinEditHead, a, raw);
+            return;
+        }
+        if (count != 4 or !std.mem.eql(u8, parts[2], "slot") or parts[3].len != 3) return error.InvalidMetadataBatch;
+        const slot = std.fmt.parseInt(u16, parts[3], 10) catch return error.InvalidMetadataBatch;
+        const event = try parse(Store.PinEdit, a, raw);
+        if (slot >= 256 or event.sequence == 0 or event.sequence % 256 != slot or event.boundaries.len > 256 or event.routing.len > 128) return error.InvalidMetadataBatch;
+        for (event.boundaries) |id| try c.validKey(id);
+        for (event.routing) |id| try c.validKey(id);
+        return;
+    }
+    if (count == 2 and std.mem.eql(u8, parts[0], "query-pins-gc-v1")) {
+        if (parts[1].len != 64) return error.InvalidMetadataBatch;
+        for (parts[1]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        const state = try parse(Store.PinProjectionGC, a, raw);
+        if (state.complete and state.after != null) return error.InvalidMetadataBatch;
+        if (state.after) |after| {
+            if (after.len != 64 and !(after.len == 65 and after[64] == '~')) return error.InvalidMetadataBatch;
+            for (after[0..64]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        }
+        return;
+    }
+    if (count == 1 and (std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v1") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v2") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v3"))) {
+        if (!std.mem.eql(u8, raw, "1")) return error.InvalidMetadataBatch;
+        return;
+    }
+    if (std.mem.eql(u8, parts[0], "query-pins-v1")) {
+        if (count != 4 and count != 5 and count != 6) return error.InvalidMetadataBatch;
+        for (parts[1..3]) |digest| {
+            if (digest.len != 64) return error.InvalidMetadataBatch;
+            for (digest) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        }
+        if (count == 4 and std.mem.eql(u8, parts[3], "state")) {
+            const state = try parse(Store.PinProjection, a, raw);
+            if (state.phase == .ready and (state.after != null or state.walk != null or state.repair != null)) return error.InvalidMetadataBatch;
+            if (state.format != 0 and state.format != 2) return error.InvalidMetadataBatch;
+            if (state.repair) |repair| {
+                if (state.phase != .repair or state.sequence == null or repair.sequence > repair.target +| 1 or repair.index > 384) return error.InvalidMetadataBatch;
+                if (repair.root) |id| try c.validKey(id);
+            } else if (state.phase == .repair) return error.InvalidMetadataBatch;
+            if (state.walk) |walk| {
+                if ((state.phase != .build and state.phase != .repair) or walk.hops > 16383) return error.InvalidMetadataBatch;
+                try c.validKey(walk.key);
+                try c.validKey(walk.current);
+                if (walk.root) |terminal| try c.validKey(terminal);
+            }
+            if (state.after) |after| {
+                if (after.len != 64) return error.InvalidMetadataBatch;
+                for (after) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+            }
+            return;
+        }
+        if (count == 5 and (std.mem.eql(u8, parts[3], "path") or std.mem.eql(u8, parts[3], "boundary"))) {
+            const path = try parse(Store.PinPath, a, raw);
+            try c.validKey(path.key);
+            try c.validKey(path.root);
+            if (!std.mem.eql(u8, parts[4], try hash(a, path.key))) return error.InvalidMetadataBatch;
+            return;
+        }
+        if (count == 5 and (std.mem.eql(u8, parts[3], "dirty-boundary") or std.mem.eql(u8, parts[3], "dirty-root") or std.mem.eql(u8, parts[3], "repair-root"))) {
+            const id = try parse([]const u8, a, raw);
+            try c.validKey(id);
+            if (!std.mem.eql(u8, parts[4], try hash(a, id))) return error.InvalidMetadataBatch;
+            return;
+        }
+        if (count != 6 or (!std.mem.eql(u8, parts[3], "member") and !std.mem.eql(u8, parts[3], "root-path"))) return error.InvalidMetadataBatch;
+        const member = try parse(Store.PinMember, a, raw);
+        try c.validKey(member.root);
+        try c.validKey(member.key);
+        if (!std.mem.eql(u8, parts[4], try hash(a, member.root)) or !std.mem.eql(u8, parts[5], try hash(a, member.key))) return error.InvalidMetadataBatch;
+        return;
+    }
     if (count == 2 and std.mem.eql(u8, parts[0], "queue") and std.mem.eql(u8, parts[1], "head")) {
         const h = try parse(QueueHead, a, raw);
         if (h.version != 1 or h.bytes > c.max_state_bytes or h.count > 4096) return error.InvalidMetadataBatch;
@@ -907,8 +2669,66 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         if (!std.mem.eql(u8, parts[2], proposal.id)) return error.InvalidMetadataBatch;
         return;
     }
+    if (count == 3 and std.mem.eql(u8, parts[0], "queue") and std.mem.eql(u8, parts[1], "header")) {
+        const header = try parse(ProposalHeader, a, raw);
+        if (header.version != 1 or header.proposal.evidence != null or !std.mem.eql(u8, parts[2], header.proposal.id)) return error.InvalidMetadataBatch;
+        _ = try c.parseState(a, try encode(a, c.State{ .proposals = &.{header.proposal} }));
+        return;
+    }
+    if (count == 2 and std.mem.eql(u8, tail, "queue/ownership-progress")) {
+        const progress = try parse(Store.OwnershipProgress, a, raw);
+        if (progress.complete and progress.after != null) return error.InvalidMetadataBatch;
+        if (progress.after) |after| {
+            if (after.len != 64) return error.InvalidMetadataBatch;
+            for (after) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        }
+        return;
+    }
+    if (count >= 4 and std.mem.eql(u8, parts[0], "queue") and std.mem.eql(u8, parts[1], "ownership")) {
+        if (count == 4 and std.mem.eql(u8, parts[2], "member")) {
+            const owned_key = try parse([]const u8, a, raw);
+            try c.validKey(owned_key);
+            if (!std.mem.eql(u8, parts[3], try hash(a, owned_key))) return error.InvalidMetadataBatch;
+            return;
+        }
+        if (!std.mem.eql(u8, parts[2], "forward") and !std.mem.eql(u8, parts[2], "reverse")) return error.InvalidMetadataBatch;
+        if (count != 5 and count != 6) return error.InvalidMetadataBatch;
+        if (parts[4].len != 64) return error.InvalidMetadataBatch;
+        for (parts[4]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        if (count == 5 and std.mem.eql(u8, parts[3], "node")) {
+            const node = try parse(Store.Ownership.Node, a, raw);
+            if (node.refs == 0) return error.InvalidMetadataBatch;
+            if (node.terminal) |owned_key| {
+                try c.validKey(owned_key);
+                const indexed = try Store.Ownership.encodedKey(a, owned_key, std.mem.eql(u8, parts[2], "reverse"));
+                if (!std.mem.eql(u8, parts[4], try hash(a, indexed))) return error.InvalidMetadataBatch;
+            }
+            return;
+        }
+        if (count == 6 and std.mem.eql(u8, parts[3], "edge")) {
+            const edge = try parse(Store.Ownership.Edge, a, raw);
+            if (edge.label.len == 0 or edge.child.len != 64 or parts[5].len != 2) return error.InvalidMetadataBatch;
+            for (edge.label) |byte| if (!std.ascii.isHex(byte) or (byte >= 'A' and byte <= 'F')) return error.InvalidMetadataBatch;
+            if (!std.mem.eql(u8, parts[5], try std.fmt.allocPrint(a, "{x:0>2}", .{edge.label[0]}))) return error.InvalidMetadataBatch;
+            for (edge.child) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+            return;
+        }
+        return error.InvalidMetadataBatch;
+    }
+    if (count == 2 and std.mem.eql(u8, parts[0], "query-routing")) {
+        if (parts[1].len != 64) return error.InvalidMetadataBatch;
+        for (parts[1]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        _ = try parse(Store.RoutingStamp, a, raw);
+        return;
+    }
+    if (count == 2 and std.mem.eql(u8, parts[0], "query-graph")) {
+        if (parts[1].len != 64) return error.InvalidMetadataBatch;
+        for (parts[1]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        _ = try parse(Store.QueryGraph, a, raw);
+        return;
+    }
     // Index envelopes contain a typed key/ID or an incident distinct pair.
-    if (count == 4 and (std.mem.eql(u8, parts[0], "incoming") or std.mem.eql(u8, parts[0], "cascade") or std.mem.eql(u8, parts[0], "distinct-key"))) {
+    if (count == 4 and (std.mem.eql(u8, parts[0], "incoming") or std.mem.eql(u8, parts[0], "cascade") or std.mem.eql(u8, parts[0], "pin-child") or std.mem.eql(u8, parts[0], "distinct-key"))) {
         for (parts[1..4]) |part| {
             if (part.len != 64) return error.InvalidMetadataBatch;
             for (part) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
@@ -941,17 +2761,23 @@ const TestMemory = struct {
     a: A,
     rows: std.StringHashMapUnmanaged([]const u8) = .empty,
     reads: usize = 0,
+    read_bytes: usize = 0,
+    write_bytes: usize = 0,
     writes: usize = 0,
     visited: usize = 0,
+    distinct_rows: usize = 0,
     scans: usize = 0,
     fn get(ptr: *anyopaque, _: A, key: []const u8) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.reads += 1;
-        return self.rows.get(key);
+        const raw = self.rows.get(key);
+        if (raw) |value| self.read_bytes += value.len;
+        return raw;
     }
     fn put(ptr: *anyopaque, _: A, key: []const u8, raw: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.writes += 1;
+        self.write_bytes += raw.len;
         try self.rows.put(self.a, key, raw);
     }
     fn remove(ptr: *anyopaque, _: A, key: []const u8) !void {
@@ -963,17 +2789,19 @@ const TestMemory = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.scans += 1;
         var rows: std.ArrayList(Row) = .empty;
+        // Match storage's bounded page allocation, including one lookahead.
+        // A fixture must not materialize the entire suffix for a one-row seek.
         var it = self.rows.iterator();
         while (it.next()) |v| if (std.mem.startsWith(u8, v.key_ptr.*, prefix) and (after == null or std.mem.order(u8, v.key_ptr.*, after.?) == .gt)) {
-            try rows.append(alloc, .{ .key = v.key_ptr.*, .value = v.value_ptr.* });
+            var at: usize = 0;
+            while (at < rows.items.len and std.mem.lessThan(u8, rows.items[at].key, v.key_ptr.*)) at += 1;
+            if (at > limit) continue;
+            if (rows.items.len > limit) _ = rows.pop();
+            try rows.insert(alloc, at, .{ .key = v.key_ptr.*, .value = v.value_ptr.* });
         };
-        std.mem.sort(Row, rows.items, {}, struct {
-            fn less(_: void, l: Row, r: Row) bool {
-                return std.mem.lessThan(u8, l.key, r.key);
-            }
-        }.less);
         const count = @min(limit, rows.items.len);
         self.visited += count;
+        if (std.mem.endsWith(u8, prefix, "/distinct/")) self.distinct_rows += count;
         return .{ .rows = rows.items[0..count], .next = if (count < rows.items.len) rows.items[count - 1].key else null };
     }
 };
@@ -1068,6 +2896,174 @@ test "native resolver authority prefix routes exclude ten thousand unrelated nam
     try std.testing.expect(memory.reads < 32 and memory.scans <= 2 and memory.visited == 2);
 }
 
+test "resolver curation shared profile overlays preserve composed graph validation" {
+    const Reference = struct {
+        fn validate(a: A, namespace: policy.Namespace, static: []const resolver.KeyAlias, suppress: []const u8) !void {
+            var curated: std.StringHashMapUnmanaged(void) = .empty;
+            var removed: std.StringHashMapUnmanaged(void) = .empty;
+            for (namespace.merges) |alias| try curated.put(a, alias.key, {});
+            for (namespace.state.removed_aliases) |key| try removed.put(a, key, {});
+            var aliases: std.ArrayList(resolver.KeyAlias) = .empty;
+            for (static) |alias| if (!curated.contains(alias.key) and !removed.contains(alias.key)) try aliases.append(a, alias);
+            try aliases.appendSlice(a, namespace.merges);
+            _ = try c.RedirectIndex.init(a, static);
+            _ = try c.RedirectIndex.init(a, namespace.merges);
+            const redirects = try c.RedirectIndex.init(a, aliases.items);
+            var negative = try c.Index.init(a, suppress, try encode(a, namespace.state));
+            try negative.bindRedirects(a, redirects);
+            for (namespace.state.distinct) |pair| if (std.mem.eql(u8, redirects.canonical(pair.from), redirects.canonical(pair.to))) return error.ResolverDistinctPair;
+            for (aliases.items) |alias| {
+                const target = redirects.canonical(alias.target);
+                if (negative.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
+                if (try negative.pinnedDistinct(a, alias.key, target)) return error.ResolverDistinctPair;
+            }
+        }
+    };
+    var rng = std.Random.DefaultPrng.init(93821);
+    const random = rng.random();
+    for (0..256) |_| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var names: [32][]const u8 = undefined;
+        for (&names, 0..) |*name, i| name.* = try std.fmt.allocPrint(a, "n{d}", .{i});
+        var curated: [16]resolver.KeyAlias = undefined;
+        for (&curated, 0..) |*alias, i| alias.* = .{ .key = names[i], .target = names[random.intRangeAtMost(usize, i + 1, 31)] };
+        var static: [8]resolver.KeyAlias = undefined;
+        for (&static, 0..) |*alias, i| alias.* = .{ .key = names[i + 16], .target = names[random.uintLessThan(usize, 32)] };
+        var pairs: [4]c.Pair = undefined;
+        for (&pairs) |*pair| pair.* = .{ .from = names[random.uintLessThan(usize, 32)], .to = names[random.uintLessThan(usize, 32)] };
+        var suppressed: [3][]const u8 = undefined;
+        var local_keys: [3][]const u8 = undefined;
+        var removed: [3][]const u8 = undefined;
+        for (&suppressed, &local_keys, &removed) |*global, *local_key, *tombstone| {
+            global.* = names[random.uintLessThan(usize, 32)];
+            local_key.* = names[random.uintLessThan(usize, 32)];
+            tombstone.* = names[random.uintLessThan(usize, 32)];
+        }
+        const namespace: policy.Namespace = .{ .key_template = "n{{_key}}", .merges = &curated, .state = .{ .distinct = &pairs, .suppress = .{ .keys = &suppressed }, .removed_aliases = &removed } };
+        const suppress = try encode(a, .{ .keys = local_keys });
+        const expected = if (Reference.validate(a, namespace, &static, suppress)) |_| true else |_| false;
+        const actual = if (validateProfile(a, namespace, &static, suppress)) |_| true else |_| false;
+        try std.testing.expectEqual(expected, actual);
+    }
+}
+
+test "resolver curation shared profile validation keeps a large curated graph once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const merged = try a.alloc(resolver.KeyAlias, 500);
+    for (merged, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "base-{d}", .{i}), .target = "terminal" };
+    const profiles = try a.alloc(AliasProfile, 500);
+    for (profiles, 0..) |*profile, i| profile.* = .{ .id = try std.fmt.allocPrint(a, "profile-{d}", .{i}), .key_template = "{{_key}}", .aliases = &.{}, .suppress_json = try encode(a, .{ .keys = &[_][]const u8{try std.fmt.allocPrint(a, "unrelated-{d}", .{i})} }) };
+    const buffer = try a.alloc(u8, 2 * 1024 * 1024);
+    var bounded = std.heap.FixedBufferAllocator.init(buffer);
+    try validateProfiles(bounded.allocator(), .{ .key_template = "{{_key}}", .merges = merged }, profiles);
+}
+
+test "resolver curation masked static edges do not expand unrelated components or suppression rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const backend: Backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = backend };
+    const Txn = struct {
+        memory: *TestMemory,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.memory.rows.get(key) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key: []const u8, raw: []const u8) !void {
+            try TestMemory.put(self.memory, self.memory.a, key, raw);
+        }
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            try TestMemory.remove(self.memory, self.memory.a, key);
+        }
+    };
+    var txn: Txn = .{ .memory = &memory };
+    const template = "entity/{{_key}}";
+    const aliases = try a.alloc(resolver.KeyAlias, 17001);
+    aliases[0] = .{ .key = "entity/seed", .target = "entity/hub" };
+    for (aliases[1..], 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/noise-{d}", .{i}), .target = "entity/hub" };
+    const keys = try a.alloc([]const u8, 10001);
+    keys[0] = "entity/terminal";
+    for (keys[1..], 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "entity/blocked-{d}", .{i});
+    const definition: static_profiles.Definition = .{ .key_template = template, .aliases = aliases, .suppress_json = try encode(a, .{ .keys = keys, .texts = &.{"irrelevant text policy"} }) };
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{}, &.{definition});
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .removed_aliases = &.{"entity/seed"} } };
+    try store.adoptNamespace(namespace);
+    var reader: static_profiles.Reader = .{ .a = a, .backend = backend, .key_template = template, .root = "profiles/" };
+    const removed = (try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup())).?;
+    try std.testing.expectEqual(@as(usize, 0), removed.namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 0), reader.visits);
+    const empty = try reader.values();
+    try std.testing.expectEqual(@as(usize, 1), empty.len);
+    try std.testing.expectEqualStrings("", empty[0].suppress_json);
+    namespace.revision = 2;
+    namespace.merges = &.{.{ .key = "entity/seed", .target = "entity/terminal" }};
+    namespace.state.removed_aliases = &.{};
+    try store.apply(try difference(a, removed.namespace, namespace));
+    reader = .{ .a = a, .backend = backend, .key_template = template, .root = "profiles/" };
+    const redirected = (try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup())).?;
+    try std.testing.expectEqual(@as(usize, 1), redirected.namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 0), reader.visits);
+    const profiles = try reader.values();
+    try std.testing.expect(profiles[0].suppress_json.len < 64);
+    try std.testing.expectError(error.SuppressedResolverRedirectTarget, validateProfiles(a, redirected.namespace, profiles));
+}
+
+test "resolver curation proposal headers preserve evidence without reading or rewriting bodies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const evidence = try a.alloc(u8, 12 * 1024);
+    @memset(evidence, 'x');
+    var evidence_object: std.json.ObjectMap = .empty;
+    try evidence_object.put(a, "text", .{ .string = evidence });
+    const plan = try c.propose(a, .{}, &.{}, .{ .action = .merge, .key = "entity/a", .into = "entity/b", .evidence = .{ .object = evidence_object } }, .{});
+    const proposal_value = plan.state.proposals[0];
+    try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .proposals = plan.state.proposals });
+    const body_path = try store.proposalPath(proposal_value.id);
+    const original_body = memory.rows.get(body_path).?;
+    const original_bytes = (try store.queueHead()).bytes;
+    memory.read_bytes = 0;
+    memory.write_bytes = 0;
+    const headers = try store.proposalHeadersForKeys(&.{"entity/a"});
+    try std.testing.expectEqual(@as(usize, 1), headers.proposals.len);
+    try std.testing.expect(headers.proposals[0].evidence == null);
+    const decision = try c.decide(a, headers, &.{}, &.{}, proposal_value.id, .{ .accept = false }, .{});
+    try store.applyQueue(.{ .expected_revision = 1, .revision = 2, .proposals = decision.state.proposals, .retain_evidence = true });
+    try std.testing.expect(memory.read_bytes < 8 * 1024);
+    try std.testing.expect(memory.write_bytes < 4 * 1024);
+    try std.testing.expect(original_body.ptr == memory.rows.get(body_path).?.ptr);
+    const result = (try store.proposal(proposal_value.id)).?;
+    try std.testing.expectEqual(c.ProposalState.rejected, result.state);
+    try std.testing.expectEqualStrings(evidence, result.evidence.?.object.get("text").?.string);
+    memory.read_bytes = 0;
+    const page = try store.proposalPage(null, null, null, 1);
+    try std.testing.expectEqual(c.ProposalState.rejected, page.proposals[0].state);
+    try std.testing.expectEqualStrings(evidence, page.proposals[0].evidence.?.object.get("text").?.string);
+    try std.testing.expect(memory.read_bytes < 4 * 1024);
+    try std.testing.expectEqual(c.proposalCapacityBytes(.{ .proposals = &.{result} }), (try store.queueHead()).bytes);
+    try std.testing.expect((try store.queueHead()).bytes < original_bytes);
+    var forged = decision.state.proposals[0];
+    forged.confidence = 0.5;
+    try std.testing.expectError(error.ResolverCurationConflict, store.applyQueue(.{ .expected_revision = 2, .revision = 3, .proposals = &.{forged}, .retain_evidence = true }));
+    // A touched legacy row acquires a header without rewriting its body.
+    _ = memory.rows.remove(try store.proposalHeaderPath(proposal_value.id));
+    var legacy_head = try store.queueHead();
+    legacy_head.bytes = original_bytes;
+    try TestMemory.put(&memory, a, try store.keyPath("queue/head"), try encode(a, legacy_head));
+    try std.testing.expectEqual(c.ProposalState.open, (try store.proposalHeader(proposal_value.id)).?.state);
+    try store.applyQueue(.{ .expected_revision = 2, .revision = 3, .proposals = decision.state.proposals, .retain_evidence = true });
+    try std.testing.expect(original_body.ptr == memory.rows.get(body_path).?.ptr);
+    try std.testing.expectEqual(c.ProposalState.rejected, (try store.proposal(proposal_value.id)).?.state);
+    try std.testing.expectEqual(c.proposalCapacityBytes(.{ .proposals = &.{result} }), (try store.queueHead()).bytes);
+}
+
 test "native resolver mention policy is indexed and includes current normalized text suppression" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1086,4 +3082,1716 @@ test "native resolver mention policy is indexed and includes current normalized 
     const index = try c.Index.init(a, "", try encode(a, current.namespace.state));
     try std.testing.expectEqual(c.Reason.text, (try index.textReason(a, "Noise")).?);
     try std.testing.expect(memory.reads < 40 and memory.visited < 8);
+}
+
+test "resolver curation queue scans deduplicate repeated canonical keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan }, .prefix = "authority/" };
+    for (0..64) |i| {
+        const plan = try c.propose(a, .{}, &.{}, .{ .action = .merge, .key = "entity/root", .into = try std.fmt.allocPrint(a, "entity/other-{d}", .{i}) }, .{});
+        try store.applyQueue(.{ .expected_revision = i, .revision = i + 1, .proposals = plan.state.proposals });
+    }
+    memory.scans = 0;
+    memory.visited = 0;
+    const once = try store.proposalHeadersForKeys(&.{"entity/root"});
+    std.debug.print("QUEUE unique_key scans={d} rows={d} proposals={d}\n", .{ memory.scans, memory.visited, once.proposals.len });
+    const repeated = try a.alloc([]const u8, 1000);
+    @memset(repeated, "entity/root");
+    memory.scans = 0;
+    memory.visited = 0;
+    const amplified = try store.proposalHeadersForKeys(repeated);
+    std.debug.print("QUEUE repeated_key scans={d} rows={d} proposals={d}\n", .{ memory.scans, memory.visited, amplified.proposals.len });
+    try std.testing.expectEqual(@as(usize, 64), memory.visited);
+    try std.testing.expectEqual(@as(usize, 1), memory.scans);
+}
+test "resolver curation sparse profiles skip ten thousand unrelated heads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const Txn = struct {
+        memory: *TestMemory,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.memory.rows.get(key) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key: []const u8, raw: []const u8) !void {
+            try TestMemory.put(self.memory, self.memory.a, key, raw);
+        }
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            try TestMemory.remove(self.memory, self.memory.a, key);
+        }
+    };
+    var txn: Txn = .{ .memory = &memory };
+    const template = "entity/{{_key}}";
+    for (0..10000) |i| {
+        const definition: static_profiles.Definition = .{ .key_template = template, .suppress_json = try std.fmt.allocPrint(a, "{{\"keys\":[\"entity/unrelated-{d}\"]}}", .{i}) };
+        try static_profiles.synchronize(a, &txn, "profiles/", &.{}, &.{definition});
+    }
+    const store: Store = .{ .a = a, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan }, .prefix = "authority/" };
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1 });
+    var reader: static_profiles.Reader = .{ .a = a, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan }, .key_template = template, .root = "profiles/" };
+    memory.visited = 0;
+    memory.scans = 0;
+    _ = try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup());
+    const profiles = try reader.values();
+    const encoded = try std.json.Stringify.valueAlloc(a, profiles, .{});
+    std.debug.print("PROFILES population=10000 returned={d} edges={d} scans={d} rows={d} payload_bytes={d}\n", .{ profiles.len, reader.visits, memory.scans, memory.visited, encoded.len });
+    try std.testing.expectEqual(@as(usize, 0), memory.visited);
+    try std.testing.expectEqual(@as(usize, 1), profiles.len);
+    try std.testing.expect(encoded.len < 256);
+    var invalid: @import("resolver_namespace.zig").Namespace = .{ .key_template = template, .merges = &.{.{ .key = "entity/from", .target = "entity/seed" }}, .state = .{ .suppress = .{ .keys = &.{"entity/seed"} } } };
+    try std.testing.expectError(error.SuppressedResolverRedirectTarget, validateProfiles(a, invalid, profiles));
+    const relevant: static_profiles.Definition = .{ .key_template = template, .suppress_json = "{\"keys\":[\"entity/seed\"]}" };
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{}, &.{relevant});
+    // Shared declarations count as one profile. Retiring one reference must
+    // retain its negative rule and must not remove the empty-overlay witness.
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{}, &.{relevant});
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{relevant}, &.{});
+    reader = .{ .a = a, .backend = store.backend, .key_template = template, .root = "profiles/" };
+    _ = try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup());
+    const incident = try reader.values();
+    try std.testing.expectEqual(@as(usize, 2), incident.len);
+    invalid.state = .{};
+    try std.testing.expectError(error.SuppressedResolverRedirectTarget, validateProfiles(a, invalid, incident));
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{relevant}, &.{});
+    reader = .{ .a = a, .backend = store.backend, .key_template = template, .root = "profiles/" };
+    _ = try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup());
+    try validateProfiles(a, invalid, try reader.values());
+}
+
+test "resolver curation query policy bounds fan in and composes static overrides and text rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    var aliases: [10000]resolver.KeyAlias = undefined;
+    for (&aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/a{d}", .{i}), .target = "entity/hub" };
+    const namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &aliases, .state = .{ .suppress = .{ .keys = &.{"entity/hub"}, .texts = &.{"noise"} }, .removed_aliases = &.{"entity/restored"} } };
+    try store.apply(try difference(a, .{ .key_template = template }, namespace));
+    memory.reads = 0;
+    memory.visited = 0;
+    memory.scans = 0;
+    const point = (try store.mentionPolicy(template, "entity/hub", "Noise", &.{})).?;
+    try std.testing.expectEqual(@as(usize, 0), point.namespace.merges.len);
+    try std.testing.expect(memory.reads < 12 and memory.scans == 0);
+    memory.reads = 0;
+    memory.visited = 0;
+    memory.scans = 0;
+    const current = (try store.queryPolicy(template, &.{ "entity/static", "entity/restored" }, &.{ "Noise", "NOISE" }, &.{ .{ .key = "entity/static", .target = "entity/a42" }, .{ .key = "entity/restored", .target = "entity/a43" } }, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.merges.len);
+    try std.testing.expectEqualStrings("entity/a42", current.namespace.merges[0].key);
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.state.suppress.texts.len);
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.state.removed_aliases.len);
+    try std.testing.expect(memory.reads < 32 and memory.scans == 0 and memory.visited == 0);
+    std.debug.print("query policy 10k incoming aliases: gets={d} scans={d} rows={d}\n", .{ memory.reads, memory.scans, memory.visited });
+}
+
+test "resolver curation query policy retains pins through incoming and static alias composition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    const namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = "entity/alias", .target = "entity/hub" }}, .state = .{ .distinct = &.{.{ .from = "entity/alias", .to = "entity/other" }} } };
+    try store.apply(try difference(a, .{ .key_template = template }, namespace));
+    const current = (try store.queryPolicy(template, &.{ "entity/hub", "entity/candidate" }, &.{}, &.{.{ .key = "entity/other", .target = "entity/candidate" }}, true)).?;
+    const redirects = try c.RedirectIndex.init(a, &.{ .{ .key = "entity/alias", .target = "entity/hub" }, .{ .key = "entity/other", .target = "entity/candidate" } });
+    var index = try c.Index.init(a, "", try encode(a, current.namespace.state));
+    try index.bindRedirects(a, redirects);
+    try std.testing.expect(try index.pinnedDistinct(a, "entity/hub", "entity/candidate"));
+}
+
+test "native resolver authority static pin joins skip ten thousand unrelated configured aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = &.{.{ .from = "entity/unrelated-a", .to = "entity/unrelated-b" }} } };
+    try store.apply(try difference(a, .{ .key_template = template }, namespace));
+    const aliases = try a.alloc(resolver.KeyAlias, 10002);
+    for (aliases[0..10000], 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/noise-{d}", .{i}), .target = "entity/noise-hub" };
+    aliases[10000] = .{ .key = "entity/static", .target = "entity/middle" };
+    aliases[10001] = .{ .key = "entity/middle", .target = "entity/hub" };
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    const empty = (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, aliases, true)).?;
+    try std.testing.expectEqual(@as(usize, 0), empty.namespace.state.distinct.len);
+    try std.testing.expect(memory.reads < 32 and memory.scans <= 8 and memory.visited <= 4);
+    std.debug.print("STATIC PIN JOIN aliases=10002 gets={d} seeks={d} rows={d}\n", .{ memory.reads, memory.scans, memory.visited });
+    // A native pin branch may enter a configured chain before reaching the
+    // requested canonical key. Overrides and removed static edges stay live.
+    var next = namespace;
+    next.revision += 1;
+    next.merges = &.{.{ .key = "entity/pinned", .target = "entity/static" }};
+    next.state.distinct = &.{.{ .from = "entity/pinned", .to = "entity/candidate" }};
+    try store.apply(try difference(a, namespace, next));
+    namespace = next;
+    const incident = (try store.queryPolicy(template, &.{ "entity/hub", "entity/candidate" }, &.{}, aliases, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), incident.namespace.state.distinct.len);
+    next.revision += 1;
+    next.merges = &.{ .{ .key = "entity/pinned", .target = "entity/static" }, .{ .key = "entity/middle", .target = "entity/other" } };
+    try store.apply(try difference(a, namespace, next));
+    namespace = next;
+    try std.testing.expectEqual(@as(usize, 0), (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, aliases, true)).?.namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 1), (try store.queryPolicy(template, &.{"entity/other"}, &.{}, aliases, true)).?.namespace.state.distinct.len);
+    next.revision += 1;
+    next.state.removed_aliases = &.{"entity/static"};
+    try store.apply(try difference(a, namespace, next));
+    try std.testing.expectEqual(@as(usize, 0), (try store.queryPolicy(template, &.{"entity/other"}, &.{}, aliases, true)).?.namespace.state.distinct.len);
+}
+
+test "native resolver authority prepared canonical pins bound dense unrelated queries and fence mutations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "prepared/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    const aliases = try a.alloc(resolver.KeyAlias, 1000);
+    const pairs = try a.alloc(c.Pair, 1000);
+    for (aliases, pairs, 0..) |*alias, *pair, i| {
+        alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/prepared-{d}", .{i}), .target = "entity/unrelated-root" };
+        pair.* = .{ .from = alias.key, .to = try std.fmt.allocPrint(a, "entity/other-{d}", .{i}) };
+    }
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = pairs, .suppress = .{ .texts = &.{"blocked"} } } };
+    try store.adoptNamespace(namespace);
+    var loader: Store.InlineQueryProfile = .{ .aliases = aliases };
+    const profile: Store.QueryProfile = .{ .id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a), .ptr = &loader, .load = Store.InlineQueryProfile.load, .estimated_bytes = loader.estimate() };
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    const prepared = (try store.prepareQuery(template, profile, true)).?;
+    defer prepared.release();
+    try std.testing.expect(memory.scans <= 12);
+    try std.testing.expectEqual(@as(usize, 1000), memory.visited);
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    for (0..100) |_| {
+        const empty = try store.queryPrepared(prepared, &.{"entity/seed"}, &.{}, true);
+        try std.testing.expect(empty.namespace.merges.len == 0 and empty.namespace.state.distinct.len == 0);
+    }
+    try std.testing.expectEqual(@as(usize, 400), memory.reads);
+    try std.testing.expect(memory.scans == 0 and memory.visited == 0);
+    std.debug.print("PREPARED PINS aliases=1000 pins=1000 pages=100 gets={d} scans=0 rows=0\n", .{memory.reads});
+    const incident = try store.queryPrepared(prepared, &.{"entity/other-17"}, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 1), incident.namespace.state.distinct.len);
+    memory.reads = 0;
+    memory.scans = 0;
+    const text = (try store.queryPolicy(template, &.{}, &.{"BLOCKED"}, aliases, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), text.namespace.state.suppress.texts.len);
+    try std.testing.expectEqual(@as(usize, 2), memory.reads);
+    try std.testing.expectEqual(@as(usize, 0), memory.scans);
+    // Text-only edits retain graph identity but still fence old full heads.
+    var churn_rows: usize = 0;
+    var churn_scans: usize = 0;
+    for (0..10) |i| {
+        var edited = namespace;
+        edited.revision += 1;
+        edited.state.suppress.texts = &.{try std.fmt.allocPrint(a, "noise text {d}", .{i})};
+        try store.apply(try difference(a, namespace, edited));
+        namespace = edited;
+        memory.visited = 0;
+        memory.scans = 0;
+        const current = (try store.prepareQuery(template, profile, true)).?;
+        defer current.release();
+        try std.testing.expect(current.lease.?.context == prepared.lease.?.context);
+        _ = try store.queryPrepared(current, &.{"entity/seed"}, &.{}, true);
+        churn_rows += memory.visited;
+        churn_scans += memory.scans;
+        try std.testing.expectError(error.ResolverCurationConflict, store.queryPrepared(prepared, &.{"entity/seed"}, &.{}, true));
+    }
+    try std.testing.expectEqual(@as(usize, 0), churn_rows);
+    try std.testing.expectEqual(@as(usize, 0), churn_scans);
+    std.debug.print("TEXT EDIT CHURN edits=10 unrelated_pins=1000 rows={d} scans={d}\n", .{ churn_rows, churn_scans });
+    var next = namespace;
+    next.revision += 1;
+    next.merges = &.{.{ .key = aliases[17].key, .target = "entity/new-root" }};
+    try store.apply(try difference(a, namespace, next));
+    namespace = next;
+    try std.testing.expectError(error.ResolverCurationConflict, store.queryPrepared(prepared, &.{"entity/seed"}, &.{}, true));
+    const moved = (try store.prepareQuery(template, profile, true)).?;
+    defer moved.release();
+    try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(moved, &.{"entity/new-root"}, &.{}, true)).namespace.state.distinct.len);
+    next.revision += 1;
+    next.merges = &.{};
+    next.state.removed_aliases = &.{aliases[17].key};
+    try store.apply(try difference(a, namespace, next));
+    namespace = next;
+    const removed = (try store.prepareQuery(template, profile, true)).?;
+    defer removed.release();
+    try std.testing.expectEqual(@as(usize, 0), (try store.queryPrepared(removed, &.{"entity/new-root"}, &.{}, true)).namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(removed, &.{aliases[17].key}, &.{}, true)).namespace.state.distinct.len);
+    next.revision += 1;
+    next.state.suppress.keys = &.{"entity/other-17"};
+    try store.apply(try difference(a, namespace, next));
+    try std.testing.expectError(error.ResolverCurationConflict, store.queryPrepared(removed, &.{"entity/other-17"}, &.{}, true));
+    const suppressed = (try store.prepareQuery(template, profile, true)).?;
+    defer suppressed.release();
+    try std.testing.expectEqualStrings("entity/other-17", (try store.queryPrepared(suppressed, &.{"entity/other-17"}, &.{}, true)).namespace.state.suppress.keys[0]);
+    // Released zero-fingerprint heads do not qualify shared composed entries.
+    var head = (try store.head(template)).?;
+    head.fingerprint = @splat(0);
+    try store.backend.put(store.backend.ptr, a, try store.headPath(template), try encode(a, head));
+    const legacy = (try store.prepareQuery(template, profile, true)).?;
+    defer legacy.release();
+    const another = (try store.prepareQuery(template, profile, true)).?;
+    defer another.release();
+    try std.testing.expect(legacy.indexed and another.indexed);
+    try std.testing.expect(!legacy.lease.?.context.composed and !another.lease.?.context.composed);
+}
+
+test "resolver curation query policy unions bounded batches with a head lineage fence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h: Head = .{ .key_template = "entity/{{_key}}", .revision = 7, .min_text_chars = 2, .fingerprint = @splat(1) };
+    const part: Snapshot = .{ .configured_suppression = .{ .keys = &.{"entity/configured"}, .texts = &.{"configured noise"}, .min_text_chars = 4 }, .head = h, .namespace = .{ .key_template = h.key_template, .revision = 7, .merges = &.{.{ .key = "entity/a", .target = "entity/b" }}, .state = .{ .suppress = .{ .texts = &.{"noise"} } } } };
+    const joined = try unionQueryPolicies(a, &.{ part, part });
+    try std.testing.expectEqual(@as(usize, 1), joined.namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 1), joined.namespace.state.suppress.texts.len);
+    try std.testing.expectEqual(@as(u32, 2), joined.namespace.state.suppress.min_text_chars);
+    try std.testing.expectEqual(@as(usize, 1), joined.configured_suppression.?.keys.len);
+    try std.testing.expectEqualStrings("configured noise", joined.configured_suppression.?.texts[0]);
+    try std.testing.expectEqual(@as(u32, 4), joined.configured_suppression.?.min_text_chars);
+    var legacy = part;
+    legacy.configured_suppression = null;
+    try std.testing.expectError(error.ResolverCurationConflict, unionQueryPolicies(a, &.{ part, legacy }));
+    var divergent = part;
+    divergent.head.fingerprint = @splat(2);
+    try std.testing.expectError(error.ResolverCurationConflict, unionQueryPolicies(a, &.{ part, divergent }));
+}
+
+test "resolver curation query policy wide native page union attaches without a query wide node cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "wide-attachment/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_entity.text}}";
+    const aliases = try a.alloc(resolver.KeyAlias, 9000);
+    const seeds = try a.alloc([]const u8, aliases.len);
+    for (aliases, seeds, 0..) |*edge, *seed, i| {
+        edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/a-{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/b-{d}", .{i}) };
+        seed.* = edge.key;
+    }
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1 });
+    var loader: Store.InlineQueryProfile = .{ .aliases = aliases };
+    const id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a);
+    const prepared = (try store.prepareQuery(template, .{ .id = id, .ptr = &loader, .load = Store.InlineQueryProfile.load, .estimated_bytes = loader.estimate() }, false)).?;
+    defer prepared.release();
+    var joined: QueryPolicyUnion = .{};
+    var offset: usize = 0;
+    var pages: usize = 0;
+    while (offset < seeds.len) {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        var page_store = store;
+        page_store.a = scratch.allocator();
+        const end = @min(offset + 1024, seeds.len);
+        try joined.add(a, scratch.allocator(), try page_store.queryPrepared(prepared, seeds[offset..end], &.{}, false));
+        offset = end;
+        pages += 1;
+    }
+    const snapshot = try joined.finish();
+    var target = try resolver.Resolver.initFromParts(a, "entities", template, .{}, false, "");
+    defer target.deinit();
+    try target.installQueryPolicy(a, id, aliases, "", snapshot.namespace.merges, try encode(a, snapshot.namespace.state), seeds);
+    for (aliases) |edge| try std.testing.expectEqualStrings(edge.target, target.alias_index.?.canonical(edge.key));
+    try std.testing.expectEqual(@as(usize, 9), pages);
+    std.debug.print("NATIVE PAGE ATTACHMENT seeds=9000 pages=9 canonical_results=9000\n", .{});
+}
+
+test "resolver curation query policy unrelated pins never expand a large reverse component" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    var aliases: [10000]resolver.KeyAlias = undefined;
+    for (&aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/a{d}", .{i}), .target = "entity/hub" };
+    var state: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &aliases, .state = .{ .distinct = &.{.{ .from = "entity/unrelated-a", .to = "entity/unrelated-b" }} } };
+    try store.apply(try difference(a, .{ .key_template = template }, state));
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    const sparse = (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, &.{}, true)).?;
+    try std.testing.expectEqual(@as(usize, 0), sparse.namespace.merges.len);
+    try std.testing.expect(memory.reads < 16 and memory.scans == 0 and memory.visited == 0);
+    std.debug.print("PIN INDEX 10k incoming unrelated: gets={d} scans={d} rows={d}\n", .{ memory.reads, memory.scans, memory.visited });
+    const previous = state;
+    state.revision = 2;
+    state.state.distinct = &.{.{ .from = "entity/a42", .to = "entity/other" }};
+    try store.apply(try difference(a, previous, state));
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    const incident = (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, &.{}, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), incident.namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 1), incident.namespace.state.distinct.len);
+    try std.testing.expect(memory.visited < 8 and memory.reads < 40);
+    const next = state;
+    state.revision = 3;
+    const changed = try a.dupe(resolver.KeyAlias, &aliases);
+    changed[42].target = "entity/final";
+    state.merges = changed;
+    try store.apply(try difference(a, next, state));
+    const old = (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, &.{}, true)).?;
+    const moved = (try store.queryPolicy(template, &.{"entity/final"}, &.{}, &.{}, true)).?;
+    try std.testing.expectEqual(@as(usize, 0), old.namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 1), moved.namespace.state.distinct.len);
+    const last = state;
+    state.revision = 4;
+    state.state.distinct = &.{};
+    try store.apply(try difference(a, last, state));
+    try std.testing.expectEqual(@as(u64, 0), try store.pinCount(template, "entity/final"));
+    try std.testing.expectEqual(@as(u64, 0), try store.pinCount(template, "entity/a42"));
+}
+
+test "resolver curation pin index backfills legacy namespaces before publishing readiness" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    try store.apply(try difference(a, .{ .key_template = template }, .{ .key_template = template, .revision = 1, .merges = &.{ .{ .key = "entity/a", .target = "entity/b" }, .{ .key = "entity/b", .target = "entity/c" } }, .state = .{ .distinct = &.{.{ .from = "entity/a", .to = "entity/other" }} } }));
+    var derived: std.ArrayList([]const u8) = .empty;
+    var rows = memory.rows.iterator();
+    while (rows.next()) |row| {
+        try validatePortableRow(a, row.key_ptr.*, row.value_ptr.*);
+        if (std.mem.startsWith(u8, row.key_ptr.*[lite_prefix.len..], "pin-")) try derived.append(a, row.key_ptr.*);
+    }
+    try std.testing.expect(derived.items.len > 3);
+    for (derived.items) |key| _ = memory.rows.remove(key);
+    try std.testing.expect(memory.rows.get(try store.pinReadyPath(template)) == null);
+    try store.ensurePinIndex(template);
+    try std.testing.expectEqual(@as(u64, 1), try store.pinCount(template, "entity/c"));
+    const result = (try store.queryPolicy(template, &.{"entity/c"}, &.{}, &.{}, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), result.namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 2), result.namespace.merges.len);
+    const writes = memory.writes;
+    try store.ensurePinIndex(template);
+    try std.testing.expectEqual(writes, memory.writes);
+}
+
+test "resolver curation pin index preserves rotated paths static overlays and tombstones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "{{_key}}";
+    const statics: []const resolver.KeyAlias = &.{ .{ .key = "a", .target = "s" }, .{ .key = "c", .target = "t" }, .{ .key = "y", .target = "q" } };
+    const stages: []const policy.Namespace = &.{
+        .{ .key_template = template, .revision = 1, .merges = &.{ .{ .key = "a", .target = "b" }, .{ .key = "b", .target = "c" }, .{ .key = "x", .target = "y" } }, .state = .{ .distinct = &.{.{ .from = "a", .to = "x" }} } },
+        .{ .key_template = template, .revision = 2, .merges = &.{ .{ .key = "b", .target = "a" }, .{ .key = "x", .target = "y" } }, .state = .{ .distinct = &.{ .{ .from = "a", .to = "x" }, .{ .from = "b", .to = "z" } } } },
+        .{ .key_template = template, .revision = 3, .merges = &.{ .{ .key = "b", .target = "a" }, .{ .key = "x", .target = "y" } }, .state = .{ .distinct = &.{ .{ .from = "a", .to = "x" }, .{ .from = "b", .to = "z" } }, .removed_aliases = &.{"a"} } },
+    };
+    const Build = struct {
+        fn index(alloc: A, scope: Snapshot, static: []const resolver.KeyAlias) !c.Index {
+            var negatives = try c.Index.init(alloc, "", try encode(alloc, scope.namespace.state));
+            var edges: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+            for (static) |alias| if (!negatives.removed_aliases.contains(alias.key)) try edges.put(alloc, alias.key, alias.target);
+            for (scope.namespace.merges) |alias| try edges.put(alloc, alias.key, alias.target);
+            const all = try alloc.alloc(resolver.KeyAlias, edges.count());
+            for (edges.keys(), edges.values(), all) |key, target, *alias| alias.* = .{ .key = key, .target = target };
+            try negatives.bindRedirects(alloc, try c.RedirectIndex.init(alloc, all));
+            return negatives;
+        }
+    };
+    var before: policy.Namespace = .{ .key_template = template };
+    for (stages) |state| {
+        try store.apply(try difference(a, before, state));
+        before = state;
+        for ([_][]const u8{ "a", "b", "s", "t", "x", "q", "z" }) |from| for ([_][]const u8{ "a", "b", "s", "t", "x", "q", "z" }) |to| {
+            const scoped = (try store.queryPolicy(template, &.{ from, to }, &.{}, statics, true)).?;
+            const full = (try store.exportNamespace(template)).?;
+            const actual = try Build.index(a, scoped, statics);
+            const expected = try Build.index(a, full, statics);
+            try std.testing.expectEqual(try expected.pinnedDistinct(a, from, to), try actual.pinnedDistinct(a, from, to));
+        };
+    }
+}
+
+test "resolver curation pin batch propagation is linear across overlapping and rotated paths" {
+    for ([_]usize{ 100, 200, 400, 1600 }) |n| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var memory: TestMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+        const pairs = try a.alloc(c.Pair, n);
+        const ids = try a.alloc([]const u8, n);
+        for (ids, pairs, 0..) |*id, *pair, i| {
+            id.* = try std.fmt.allocPrint(a, "node-{d:0>5}", .{i});
+            pair.* = .{ .from = id.*, .to = try std.fmt.allocPrint(a, "other-{d:0>5}", .{i}) };
+        }
+        var before: policy.Namespace = .{ .key_template = "{{_key}}", .revision = 1, .state = .{ .distinct = pairs } };
+        try store.adoptNamespace(before);
+        const aliases = try a.alloc(resolver.KeyAlias, n - 1);
+        for (aliases, 0..) |*alias, j| {
+            const i = n - 2 - j;
+            alias.* = .{ .key = ids[i], .target = ids[i + 1] };
+        }
+        var after = before;
+        after.revision += 1;
+        after.merges = aliases;
+        memory.reads = 0;
+        memory.writes = 0;
+        try store.apply(try difference(a, before, after));
+        const reads = memory.reads;
+        const writes = memory.writes;
+        for (ids, 0..) |id, i| try std.testing.expectEqual(@as(u64, @intCast(i + 1)), try store.pinCount(before.key_template, id));
+        try std.testing.expect(reads < n * 32 and writes < n * 16);
+        std.debug.print("PIN BATCH n={d} reads={d} writes={d} arena={d}\n", .{ n, reads, writes, arena.queryCapacity() });
+        before = after;
+        const rotated = try a.alloc(resolver.KeyAlias, n - 1);
+        for (rotated, 1..) |*alias, i| alias.* = .{ .key = ids[i], .target = ids[i - 1] };
+        after.revision += 1;
+        after.merges = rotated;
+        try store.apply(try difference(a, before, after));
+        for (ids, 0..) |id, i| try std.testing.expectEqual(@as(u64, @intCast(n - i)), try store.pinCount(before.key_template, id));
+        before = after;
+        after.revision += 1;
+        after.merges = &.{};
+        try store.apply(try difference(a, before, after));
+        for (ids) |id| try std.testing.expectEqual(@as(u64, 1), try store.pinCount(before.key_template, id));
+    }
+}
+
+test "native resolver authority ownership radix seeks history and resumes revision fenced backfill" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    // Released queues have only the historical hashed-key directory.
+    try store.backend.put(&memory, a, try store.keyPath("queue/head"), try encode(a, QueueHead{ .revision = 7, .count = 1000 }));
+    const keys = try a.alloc([]const u8, 1000);
+    for (keys, 0..) |*key, i| {
+        key.* = try std.fmt.allocPrint(a, "entity/{d}/claim-{d}.fact", .{ i % 10, i });
+        try store.backend.put(&memory, a, try store.keyPath(try std.fmt.allocPrint(a, "queue/owned/{s}", .{try hash(a, key.*)})), try encode(a, key.*));
+    }
+    try std.testing.expect(!try store.ownershipIndexed());
+    try std.testing.expect(try store.ownsKeyTemplate("entity/0/{{_key}}.fact"));
+    var turns: usize = 0;
+    while (true) {
+        turns += 1;
+        if (try store.advanceOwnershipIndex(37)) break;
+        if (turns == 1) {
+            // A new writer adds a key behind the hashed backfill cursor. The
+            // same transaction updates both the radix indexes and queue cut.
+            const request: c.ProposalRequest = .{ .action = .suppress, .key = "before/new" };
+            const proposed = try c.propose(a, .{}, &.{}, request, .{});
+            try store.applyQueue(.{ .expected_revision = 7, .revision = 8, .proposals = proposed.state.proposals });
+        }
+    }
+    try std.testing.expect(turns <= 28);
+    try std.testing.expect(try store.ownershipIndexed());
+    try std.testing.expect(try store.ownsKeyTemplate("before/{{_key}}"));
+    const visited = memory.visited;
+    for (0..1000) |i| try std.testing.expect(!try store.ownsKeyTemplate(try std.fmt.allocPrint(a, "unrelated-{d}/{{{{_key}}}}", .{i})));
+    try std.testing.expectEqual(visited, memory.visited);
+    const templates = [_][]const u8{ "{{_key}}", "entity/{{_key}}", "entity/0/{{_key}}.fact", "{{_key}}.fact", "entity/{{_key}}.no", "{{_key}}/new", "entity/9/claim-999.fact", "entity/9/claim-998.fact", "before/{{_key}}.fact" };
+    for (templates) |template| {
+        var expected = policy.keyInNamespace(template, "before/new");
+        for (keys) |key| expected = expected or policy.keyInNamespace(template, key);
+        try std.testing.expectEqual(expected, try store.ownsKeyTemplate(template));
+    }
+    // An older writer cannot accidentally certify a stale derived index.
+    try store.backend.put(&memory, a, try store.keyPath("queue/head"), try encode(a, QueueHead{ .revision = 9, .count = 1002 }));
+    try store.backend.put(&memory, a, try store.keyPath(try std.fmt.allocPrint(a, "queue/owned/{s}", .{try hash(a, "late/old-writer")})), try encode(a, "late/old-writer"));
+    try std.testing.expect(!try store.ownershipIndexed());
+    try std.testing.expect(try store.ownsKeyTemplate("late/{{_key}}"));
+    while (!try store.advanceOwnershipIndex(128)) {}
+    try std.testing.expect(try store.ownsKeyTemplate("late/{{_key}}"));
+    // Compressed labels accept long keys without producing long physical keys
+    // or one trie row for every byte of their common prefix.
+    const long = try a.alloc(u8, 8192);
+    @memset(long, 'a');
+    const index = try store.ownershipIndex("forward");
+    const writes = memory.writes;
+    try store.indexOwnedKey(long);
+    try store.indexOwnedKey(long);
+    try std.testing.expect(memory.writes - writes < 32);
+    try std.testing.expect(try index.prefix(try Store.Ownership.encodedKey(a, long[0..8000], false)) != null);
+    try store.indexOwnedKey("café/東京.fact");
+    try std.testing.expect(try store.ownsKeyTemplate("café/{{_key}}.fact"));
+    try std.testing.expect(try store.ownsKeyTemplate("{{_key}}東京.fact"));
+    var rows = memory.rows.iterator();
+    while (rows.next()) |row| {
+        try std.testing.expect(row.key_ptr.len < 512);
+        if (std.mem.indexOf(u8, row.key_ptr.*, "queue/ownership") != null) try validatePortableRow(a, row.key_ptr.*, row.value_ptr.*);
+    }
+    std.debug.print("OWNERSHIP history=1000 absent_templates=1000 unrelated_rows=0 backfill_turns={d}\n", .{turns});
+}
+
+test "native resolver authority indexed query fallback follows only relevant components and preserves gates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "indexed-query/", .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    const template = "entity/{{_key}}";
+    const aliases: []const resolver.KeyAlias = &.{ .{ .key = "entity/static", .target = "entity/middle" }, .{ .key = "entity/middle", .target = "entity/root" }, .{ .key = "entity/removed", .target = "entity/root" } };
+    const pairs = try a.alloc(c.Pair, 4001);
+    for (pairs[0..4000], 0..) |*pair, i| pair.* = .{ .from = try std.fmt.allocPrint(a, "entity/unrelated-pinned-{d}", .{i}), .to = try std.fmt.allocPrint(a, "entity/unrelated-other-{d}", .{i}) };
+    pairs[4000] = .{ .from = "entity/native", .to = "entity/candidate" };
+    const namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{ .{ .key = "entity/native", .target = "entity/static" }, .{ .key = "entity/middle", .target = "entity/moved" } }, .state = .{ .distinct = pairs, .removed_aliases = &.{"entity/removed"}, .suppress = .{ .keys = &.{ "entity/moved", "entity/cascaded" }, .entries = &.{.{ .key = "entity/cascaded", .origin = .{ .origin = .cascade, .cascade_from = "entity/absent" } }}, .texts = &.{"blocked"} } } };
+    try store.adoptNamespace(namespace);
+    var inline_profile: Store.InlineQueryProfile = .{ .aliases = aliases };
+    const prepared = (try store.prepareQuery(template, .{ .id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a), .ptr = &inline_profile, .load = Store.InlineQueryProfile.load, .estimated_bytes = inline_profile.estimate() }, true)).?;
+    defer prepared.release();
+    try std.testing.expect(prepared.indexed);
+    try std.testing.expect(!prepared.lease.?.context.composed);
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    memory.distinct_rows = 0;
+    const empty = try store.queryPrepared(prepared, &.{"entity/absent"}, &.{"blocked"}, true);
+    try std.testing.expectEqual(@as(usize, 0), empty.namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 0), memory.distinct_rows);
+    try std.testing.expect(memory.visited < 16 and memory.reads < 64 and memory.scans < 20);
+    std.debug.print("INDEXED QUERY FALLBACK unrelated_pins=4000 gets={d} scans={d} rows={d}\n", .{ memory.reads, memory.scans, memory.visited });
+    const current = try store.queryPrepared(prepared, &.{ "entity/moved", "entity/candidate", "entity/removed" }, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.state.removed_aliases.len);
+    var effective: std.ArrayList(resolver.KeyAlias) = .empty;
+    for (aliases) |alias| if (!std.mem.eql(u8, alias.key, "entity/middle") and !std.mem.eql(u8, alias.key, "entity/removed")) try effective.append(a, alias);
+    try effective.appendSlice(a, current.namespace.merges);
+    const redirects = try c.RedirectIndex.init(a, effective.items);
+    var index = try c.Index.init(a, "", try encode(a, current.namespace.state));
+    try index.bindRedirects(a, redirects);
+    try std.testing.expect(try index.pinnedDistinct(a, "entity/moved", "entity/candidate"));
+    try std.testing.expect(index.keySuppressed("entity/moved"));
+    memory.visited = 0;
+    const rendering = try store.queryPrepared(prepared, &.{"entity/native"}, &.{}, false);
+    try std.testing.expectEqual(@as(usize, 0), rendering.namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 0), memory.visited);
+    var without_pins = namespace;
+    without_pins.revision += 1;
+    without_pins.state.distinct = &.{};
+    try store.apply(try difference(a, namespace, without_pins));
+    const no_pins = (try store.prepareQuery(template, .{ .id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a), .ptr = &inline_profile, .load = Store.InlineQueryProfile.load, .estimated_bytes = std.math.maxInt(usize) }, true)).?;
+    defer no_pins.release();
+    memory.scans = 0;
+    _ = try store.queryPrepared(no_pins, &.{"entity/native"}, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 0), memory.scans);
+}
+
+test "native resolver authority stale derived graph stamps cannot hide older writer mutations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "older-writer/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = "entity/a", .target = "entity/old" }}, .state = .{ .distinct = &.{.{ .from = "entity/a", .to = "entity/other" }} } };
+    try store.adoptNamespace(namespace);
+    const aliases: []const resolver.KeyAlias = &.{.{ .key = "entity/unused-static", .target = "entity/unused-root" }};
+    var inline_profile: Store.InlineQueryProfile = .{ .aliases = aliases };
+    const profile: Store.QueryProfile = .{ .id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a), .ptr = &inline_profile, .load = Store.InlineQueryProfile.load, .estimated_bytes = inline_profile.estimate() };
+    const before = (try store.prepareQuery(template, profile, true)).?;
+    defer before.release();
+    const saved = (try store.backend.get(store.backend.ptr, a, try store.queryGraphPath(template))).?;
+    var next = namespace;
+    next.revision += 1;
+    next.merges = &.{.{ .key = "entity/a", .target = "entity/new" }};
+    try store.apply(try difference(a, namespace, next));
+    namespace = next;
+    // Simulate an older writer retaining an optional derived stamp it does not
+    // know how to maintain. Its complete head still changes atomically.
+    try store.backend.put(store.backend.ptr, a, try store.queryGraphPath(template), saved);
+    const prepared = (try store.prepareQuery(template, profile, true)).?;
+    defer prepared.release();
+    try std.testing.expectError(error.ResolverCurationConflict, store.queryPrepared(before, &.{"entity/new"}, &.{}, true));
+    const current = try store.queryPrepared(prepared, &.{"entity/new"}, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.state.distinct.len);
+    try std.testing.expectEqualStrings("entity/new", current.namespace.merges[0].target);
+    try store.backend.remove(store.backend.ptr, a, try store.queryGraphPath(template));
+    const missing = (try store.prepareQuery(template, profile, true)).?;
+    defer missing.release();
+    try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(missing, &.{"entity/new"}, &.{}, true)).namespace.state.distinct.len);
+}
+
+test "native resolver authority pin directed fallback skips high degree unpinned alias components" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "pin-directed/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = &.{.{ .from = "entity/unrelated-a", .to = "entity/unrelated-b" }} } };
+    try store.adoptNamespace(namespace);
+    const aliases = try a.alloc(resolver.KeyAlias, 17000);
+    for (aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/branch-{d}", .{i}), .target = "entity/root" };
+    var profile: Store.InlineQueryProfile = .{ .aliases = aliases };
+    const id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a);
+    const fallback = (try store.prepareQuery(template, .{ .id = id, .ptr = &profile, .load = Store.InlineQueryProfile.load, .estimated_bytes = std.math.maxInt(usize) }, true)).?;
+    defer fallback.release();
+    memory.reads = 0;
+    memory.scans = 0;
+    const empty = try store.queryPrepared(fallback, &.{"entity/root"}, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 0), empty.namespace.state.distinct.len);
+    try std.testing.expect(memory.reads < 32 and memory.scans < 16);
+    std.debug.print("PIN DIRECTED FALLBACK aliases=17000 gets={d} scans={d} pairs=0\n", .{ memory.reads, memory.scans });
+    const Txn = struct {
+        memory: *TestMemory,
+        pub fn get(self: *@This(), key_: []const u8) ![]const u8 {
+            return self.memory.rows.get(key_) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key_: []const u8, value: []const u8) !void {
+            return TestMemory.put(self.memory, self.memory.a, key_, value);
+        }
+        pub fn delete(self: *@This(), key_: []const u8) !void {
+            return TestMemory.remove(self.memory, self.memory.a, key_);
+        }
+    };
+    var txn: Txn = .{ .memory = &memory };
+    try static_profiles.synchronize(a, &txn, "profile-index/", &.{}, &.{.{ .key_template = template, .aliases = aliases }});
+    var indexed: static_profiles.QueryReader = .{ .backend = store.backend, .root = "profile-index/", .profile = id, .indexed = try static_profiles.queryNodesReady(a, &txn, "profile-index/", id) };
+    const Indexed = struct {
+        fn noLoad(_: *anyopaque, _: A) ![]const resolver.KeyAlias {
+            return error.OutOfMemory;
+        }
+        fn same(a_: A, left: Snapshot, right: Snapshot) !void {
+            const left_rows = try flatten(a_, left.namespace);
+            const right_rows = try flatten(a_, right.namespace);
+            try std.testing.expectEqual(left_rows.len, right_rows.len);
+            const joined = try unionNamespaces(a_, left.namespace, right.namespace);
+            try std.testing.expectEqual(left_rows.len, (try flatten(a_, joined)).len);
+        }
+    };
+    const remote_profile: Store.QueryProfile = .{ .id = id, .ptr = &profile, .load = Indexed.noLoad, .estimated_bytes = std.math.maxInt(usize), .lookup = indexed.lookup() };
+    const remote = (try store.prepareQuery(template, remote_profile, true)).?;
+    defer remote.release();
+    try std.testing.expect(remote.lease == null);
+    try Indexed.same(a, empty, try store.queryPrepared(remote, &.{"entity/root"}, &.{}, true));
+    // Loading graph aliases does not retain the profile's unrelated text policy.
+    const large_policy = try a.alloc(u8, 2 * 1024 * 1024);
+    @memset(large_policy, ' ');
+    large_policy[0] = '{';
+    large_policy[1] = '}';
+    const bounded_definition: static_profiles.Definition = .{ .key_template = template, .aliases = &.{.{ .key = "entity/bounded", .target = "entity/root" }}, .suppress_json = large_policy };
+    const bounded_id = try bounded_definition.identity(a);
+    try static_profiles.synchronize(a, &txn, "bounded-profile/", &.{}, &.{bounded_definition});
+    var buffer: [64 * 1024]u8 = undefined;
+    var bounded: std.heap.FixedBufferAllocator = .init(&buffer);
+    const loaded = try static_profiles.queryAliases(bounded.allocator(), &txn, "bounded-profile/", bounded_id, template);
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("entity/bounded", loaded[0].key);
+    std.debug.print("QUERY ALIASES unrelated_policy_bytes=2097152 scratch_bytes={d}\n", .{bounded.end_index});
+    var next = namespace;
+    next.revision += 1;
+    next.merges = &.{ .{ .key = aliases[5000].key, .target = "entity/moved" }, .{ .key = "entity/native", .target = aliases[14567].key } };
+    next.state.removed_aliases = &.{aliases[100].key};
+    next.state.distinct = &.{ .{ .from = aliases[5000].key, .to = "entity/other-moved" }, .{ .from = aliases[14567].key, .to = "entity/other-root" }, .{ .from = "entity/native", .to = "entity/other-native" }, .{ .from = aliases[100].key, .to = "entity/other-removed" } };
+    try store.apply(try difference(a, namespace, next));
+    namespace = next;
+    const current = (try store.prepareQuery(template, .{ .id = id, .ptr = &profile, .load = Store.InlineQueryProfile.load, .estimated_bytes = std.math.maxInt(usize) }, true)).?;
+    defer current.release();
+    const selected = try store.queryPrepared(current, &.{"entity/root"}, &.{}, true);
+    const remote_current = (try store.prepareQuery(template, remote_profile, true)).?;
+    defer remote_current.release();
+    try Indexed.same(a, selected, try store.queryPrepared(remote_current, &.{"entity/root"}, &.{}, true));
+    const moved = try store.queryPrepared(remote_current, &.{"entity/moved"}, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 1), moved.namespace.state.distinct.len);
+    try std.testing.expectEqualStrings("entity/other-moved", moved.namespace.state.distinct[0].to);
+    const restored = try store.queryPrepared(remote_current, &.{aliases[100].key}, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 1), restored.namespace.state.distinct.len);
+    try std.testing.expectEqualStrings("entity/other-removed", restored.namespace.state.distinct[0].to);
+    try std.testing.expectEqual(@as(usize, 2), selected.namespace.state.distinct.len);
+    for (selected.namespace.state.distinct) |pair| try std.testing.expect(std.mem.eql(u8, pair.to, "entity/other-root") or std.mem.eql(u8, pair.to, "entity/other-native"));
+    // A missing legacy pin directory also preserves result semantics. It
+    // streams only distinct records until an authorized writer adopts it.
+    try store.backend.remove(store.backend.ptr, a, try store.pinReadyPath(template));
+    const legacy = try store.queryPrepared(current, &.{"entity/root"}, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 2), legacy.namespace.state.distinct.len);
+}
+
+test "native resolver authority shares five thousand profile aliases across graph versions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "shared-base-regression/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    const aliases = try a.alloc(resolver.KeyAlias, 5000);
+    for (aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/shared-base-{d}", .{i}), .target = "entity/base-root" };
+    const Tracker = struct {
+        aliases: []const resolver.KeyAlias,
+        loads: usize = 0,
+        fn load(ptr: *anyopaque, alloc: A) ![]const resolver.KeyAlias {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.loads += 1;
+            var inline_profile: Store.InlineQueryProfile = .{ .aliases = self.aliases };
+            return Store.InlineQueryProfile.load(&inline_profile, alloc);
+        }
+    };
+    var tracker: Tracker = .{ .aliases = aliases };
+    const profile: Store.QueryProfile = .{ .id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a), .ptr = &tracker, .load = Tracker.load, .estimated_bytes = (Store.InlineQueryProfile{ .aliases = aliases }).estimate() };
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = &.{.{ .from = "entity/outside-a", .to = "entity/outside-b" }} } };
+    try store.adoptNamespace(namespace);
+    var bytes: usize = 0;
+    var first_nodes: ?[*]const query_context.QueryNode = null;
+    for (0..10) |i| {
+        if (i != 0) {
+            var next = namespace;
+            next.revision += 1;
+            const changed = try a.alloc(resolver.KeyAlias, 1);
+            changed[0] = .{ .key = "entity/native-outside", .target = try std.fmt.allocPrint(a, "entity/outside-{d}", .{i}) };
+            next.merges = changed;
+            try store.apply(try difference(a, namespace, next));
+            namespace = next;
+        }
+        const prepared = (try store.prepareQuery(template, profile, true)).?;
+        defer prepared.release();
+        const context = prepared.lease.?.context;
+        if (first_nodes) |ptr| try std.testing.expect(ptr == context.nodes.nodes.ptr) else first_nodes = context.nodes.nodes.ptr;
+        bytes += context.arena.queryCapacity();
+        _ = try store.queryPrepared(prepared, &.{"entity/base-root"}, &.{}, true);
+    }
+    try std.testing.expectEqual(@as(usize, 1), tracker.loads);
+    try std.testing.expect(bytes < 1024 * 1024);
+    std.debug.print("SHARED PROFILE aliases=5000 versions=10 loads={d} overlay_arena_bytes={d}\n", .{ tracker.loads, bytes });
+}
+
+test "native resolver authority root directed fallback and reusable routing fence graph changes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]usize{ 100, 1000 }) |count| {
+        var memory: TestMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = try std.fmt.allocPrint(a, "routing-regression-{d}/", .{count}), .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+        const template = "entity/{{_key}}";
+        const aliases = try a.alloc(resolver.KeyAlias, count);
+        const natives = try a.alloc(resolver.KeyAlias, count);
+        for (aliases, natives, 0..) |*alias, *native, i| {
+            alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/routing-branch-{d}", .{i}), .target = "entity/static-root" };
+            native.* = .{ .key = alias.key, .target = "entity/curated-root" };
+        }
+        var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = natives, .state = .{ .distinct = &.{ .{ .from = "entity/pin-a", .to = "entity/pin-b" }, .{ .from = "entity/unconnected", .to = "entity/own-pin" } } } };
+        try store.adoptNamespace(namespace);
+        var inline_profile: Store.InlineQueryProfile = .{ .aliases = aliases };
+        const profile: Store.QueryProfile = .{ .id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a), .ptr = &inline_profile, .load = Store.InlineQueryProfile.load, .estimated_bytes = std.math.maxInt(usize) };
+        const prepared = (try store.prepareQuery(template, profile, true)).?;
+        defer prepared.release();
+        memory.reads = 0;
+        memory.scans = 0;
+        const own = try store.queryPrepared(prepared, &.{"entity/unconnected"}, &.{}, true);
+        try std.testing.expectEqual(@as(usize, 1), own.namespace.state.distinct.len);
+        try std.testing.expect(memory.reads < 40 and memory.scans < 16);
+        std.debug.print("ROOT DIRECTED edits={d} gets={d} seeks={d} own_pairs=1\n", .{ count, memory.reads, memory.scans });
+        _ = try store.queryPrepared(prepared, &.{"entity/curated-root"}, &.{}, true);
+        memory.reads = 0;
+        memory.scans = 0;
+        _ = try store.queryPrepared(prepared, &.{"entity/curated-root"}, &.{}, true);
+        try std.testing.expect(memory.reads < 40 and memory.scans < 20);
+        std.debug.print("WARM ROUTING edits={d} gets={d} seeks={d}\n", .{ count, memory.reads, memory.scans });
+        const routing_before = prepared.routing_id;
+        const saved = (try store.backend.get(store.backend.ptr, a, try store.routingPath(template))).?;
+        var next = namespace;
+        next.revision += 1;
+        next.state.distinct = &.{.{ .from = aliases[0].key, .to = "entity/new-pin" }};
+        try store.apply(try difference(a, namespace, next));
+        namespace = next;
+        const pinned = (try store.prepareQuery(template, profile, true)).?;
+        defer pinned.release();
+        try std.testing.expectEqualSlices(u8, &routing_before, &pinned.routing_id);
+        try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(pinned, &.{"entity/curated-root"}, &.{}, true)).namespace.state.distinct.len);
+        next = namespace;
+        next.revision += 1;
+        const changed = try a.dupe(resolver.KeyAlias, natives);
+        changed[0].target = "entity/moved-root";
+        next.merges = changed;
+        try store.apply(try difference(a, namespace, next));
+        const moved = (try store.prepareQuery(template, profile, true)).?;
+        defer moved.release();
+        try std.testing.expect(!std.mem.eql(u8, &routing_before, &moved.routing_id));
+        try std.testing.expectEqual(@as(usize, 0), (try store.queryPrepared(moved, &.{"entity/curated-root"}, &.{}, true)).namespace.state.distinct.len);
+        try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(moved, &.{"entity/moved-root"}, &.{}, true)).namespace.state.distinct.len);
+        try store.backend.put(store.backend.ptr, a, try store.routingPath(template), saved);
+        const stale = (try store.prepareQuery(template, profile, true)).?;
+        defer stale.release();
+        try std.testing.expectEqualSlices(u8, &stale.stamp.fingerprint, &stale.routing_id);
+        try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(stale, &.{"entity/moved-root"}, &.{}, true)).namespace.state.distinct.len);
+    }
+}
+
+test "native resolver authority indexed admission avoids profile loads under leased base pressure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Pressure = struct {
+        fn load(_: *anyopaque, alloc: A) !query_context.Graph {
+            const bytes = try alloc.alloc(u8, 28 * 1024 * 1024);
+            @memset(bytes, 'x');
+            return .{ .shared_profile = true, .routes = try alloc.dupe(query_context.Route, &.{.{ .root = bytes, .component = "pressure" }}) };
+        }
+        fn noLoad(ptr: *anyopaque, _: A) ![]const resolver.KeyAlias {
+            const calls: *usize = @ptrCast(@alignCast(ptr));
+            calls.* += 1;
+            return error.OutOfMemory;
+        }
+    };
+    var calls: usize = 0;
+    const pressure = try query_context.acquire(@splat(210), true, .{ .ptr = &calls, .load = Pressure.load });
+    defer pressure.release();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "base-admission/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1, .state = .{ .distinct = &.{.{ .from = "entity/pin", .to = "entity/other" }} } });
+    var reader: static_profiles.QueryReader = .{ .backend = store.backend, .root = "unused-projection/", .profile = "unloaded", .indexed = true };
+    for (0..3) |_| {
+        const prepared = (try store.prepareQuery(template, .{ .id = "admission-unloaded", .ptr = &calls, .load = Pressure.noLoad, .estimated_bytes = 8 * 1024 * 1024, .lookup = reader.lookup() }, true)).?;
+        defer prepared.release();
+        try std.testing.expect(prepared.indexed and prepared.lease == null);
+        try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(prepared, &.{"entity/pin"}, &.{}, true)).namespace.state.distinct.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    std.debug.print("BASE ADMISSION pages=3 profile_loads=0 leased_bytes={d}\n", .{pressure.context.arena.queryCapacity()});
+}
+
+test "native resolver authority effective root pin membership skips dense split components and fences edits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]usize{ 100, 1000 }) |count| {
+        var memory: OrderedPinMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = try std.fmt.allocPrint(a, "dense-split-{d}/", .{count}), .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+        const template = "entity/{{_key}}";
+        const aliases = try a.alloc(resolver.KeyAlias, count);
+        const pairs = try a.alloc(c.Pair, count);
+        for (aliases, pairs, 0..) |*alias, *pair, i| {
+            alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/pin-branch-{d}", .{i}), .target = "entity/static-root" };
+            pair.* = .{ .from = alias.key, .to = try std.fmt.allocPrint(a, "entity/other-{d}", .{i}) };
+        }
+        var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = aliases[0].key, .target = "entity/moved-root" }}, .state = .{ .distinct = pairs } };
+        try store.adoptNamespace(namespace);
+        var inline_profile: Store.InlineQueryProfile = .{ .aliases = aliases };
+        const profile: Store.QueryProfile = .{ .id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a), .ptr = &inline_profile, .load = Store.InlineQueryProfile.load, .estimated_bytes = std.math.maxInt(usize) };
+        const prepared = (try store.prepareQuery(template, profile, true)).?;
+        defer prepared.release();
+        _ = try store.queryPrepared(prepared, &.{"entity/moved-root"}, &.{}, true);
+        memory.reads = 0;
+        memory.scans = 0;
+        const warm = try store.queryPrepared(prepared, &.{"entity/moved-root"}, &.{}, true);
+        try std.testing.expectEqual(@as(usize, 1), warm.namespace.state.distinct.len);
+        try std.testing.expect(memory.reads < 64 and memory.scans < 16);
+        std.debug.print("DENSE PIN MEMBERSHIP pins={d} gets={d} seeks={d} pairs=1\n", .{ count, memory.reads, memory.scans });
+        // A denied cache admission must not retain discarded pin postings.
+        {
+            var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer request.deinit();
+            var current = store;
+            current.a = request.allocator();
+            var uncached = prepared;
+            uncached.profile_id = "";
+            const streamed = try current.queryPrepared(uncached, &.{"entity/moved-root"}, &.{}, true);
+            try std.testing.expectEqual(@as(usize, 1), streamed.namespace.state.distinct.len);
+            try std.testing.expect(request.queryCapacity() < 128 * 1024);
+        }
+        var next = namespace;
+        next.revision += 1;
+        next.state.suppress.texts = &.{"unrelated text"};
+        try store.apply(try difference(a, namespace, next));
+        namespace = next;
+        const text_edit = (try store.prepareQuery(template, profile, true)).?;
+        defer text_edit.release();
+        try std.testing.expectEqualSlices(u8, &prepared.graph_id, &text_edit.graph_id);
+        memory.reads = 0;
+        _ = try store.queryPrepared(text_edit, &.{"entity/moved-root"}, &.{}, true);
+        try std.testing.expect(memory.reads < 64);
+        next = namespace;
+        next.revision += 1;
+        next.state.distinct = pairs[1..];
+        try store.apply(try difference(a, namespace, next));
+        namespace = next;
+        const removed = (try store.prepareQuery(template, profile, true)).?;
+        defer removed.release();
+        try std.testing.expect(!std.mem.eql(u8, &prepared.graph_id, &removed.graph_id));
+        try std.testing.expectEqualSlices(u8, &prepared.routing_id, &removed.routing_id);
+        try std.testing.expectEqual(@as(usize, 0), (try store.queryPrepared(removed, &.{"entity/moved-root"}, &.{}, true)).namespace.state.distinct.len);
+        next = namespace;
+        next.revision += 1;
+        next.merges = &.{.{ .key = aliases[1].key, .target = "entity/moved-root" }};
+        try store.apply(try difference(a, namespace, next));
+        const redirected = (try store.prepareQuery(template, profile, true)).?;
+        defer redirected.release();
+        try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(redirected, &.{"entity/moved-root"}, &.{}, true)).namespace.state.distinct.len);
+        try std.testing.expectError(error.ResolverCurationConflict, store.queryPrepared(prepared, &.{"entity/moved-root"}, &.{}, true));
+    }
+}
+
+test "resolver curation query execution projection preserves gates through cached and indexed paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "execution-policy/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    const aliases: []const resolver.KeyAlias = &.{ .{ .key = "entity/a", .target = "entity/b" }, .{ .key = "entity/b", .target = "entity/root" }, .{ .key = "entity/removed", .target = "entity/root" }, .{ .key = "entity/pinned", .target = "entity/root" } };
+    const namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = "entity/b", .target = "entity/native" }}, .state = .{ .distinct = &.{.{ .from = "entity/pinned", .to = "entity/other" }}, .removed_aliases = &.{"entity/removed"}, .suppress = .{ .keys = &.{"entity/native"}, .texts = &.{"noise"} } } };
+    try store.apply(try difference(a, .{ .key_template = template }, namespace));
+    var loader: Store.InlineQueryProfile = .{ .aliases = aliases };
+    const id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a);
+    for ([_]usize{ loader.estimate(), std.math.maxInt(usize) }) |estimate| {
+        const prepared = (try store.prepareQuery(template, .{ .id = id, .ptr = &loader, .load = Store.InlineQueryProfile.load, .estimated_bytes = estimate }, true)).?;
+        defer prepared.release();
+        const seeds: []const []const u8 = &.{ "entity/a", "entity/removed", "entity/root" };
+        const part = try store.queryExecutionPrepared(prepared, seeds, &.{"Noise"}, true);
+        try std.testing.expect(part.complete_aliases);
+        const joined = try unionQueryPolicies(a, &.{ part, part });
+        var projected = try resolver.Resolver.initFromParts(a, "entities", template, .{}, false, "");
+        defer projected.deinit();
+        try projected.installQueryProjection(a, id, "{\"keys\":[\"entity/configured-negative\"]}", joined.namespace.merges, try encode(a, joined.namespace.state), seeds);
+        try std.testing.expectEqualStrings("entity/native", projected.alias_index.?.canonical("entity/a"));
+        try std.testing.expectEqualStrings("entity/removed", projected.alias_index.?.canonical("entity/removed"));
+        try std.testing.expect(projected.curation_index.keySuppressed("entity/native"));
+        try std.testing.expect(projected.curation_index.keySuppressed("entity/configured-negative"));
+        try std.testing.expect(try projected.curation_index.pinnedDistinct(a, "entity/root", "entity/other"));
+        try std.testing.expectEqual(c.Reason.text, (try projected.curation_index.textReason(a, "Noise")).?);
+        try std.testing.expectEqual(@as(usize, 0), projected.query_policy_lease.?.aliases().len);
+        var legacy = part;
+        legacy.complete_aliases = false;
+        try std.testing.expectError(error.ResolverCurationConflict, unionQueryPolicies(a, &.{ part, legacy }));
+    }
+}
+
+test "resolver curation query execution uses ready nodes without loading oversized profiles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "oversized-execution/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1 });
+    const Ready = struct {
+        calls: usize = 0,
+        fn load(_: *anyopaque, _: A) ![]const resolver.KeyAlias {
+            return error.UnexpectedFullProfileRead;
+        }
+        fn expand(ptr: *anyopaque, alloc: A, id: []const u8, forward_only: bool, _: EdgeMask) ![]const resolver.KeyAlias {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(forward_only);
+            return if (std.mem.eql(u8, id, "entity/a")) alloc.dupe(resolver.KeyAlias, &.{.{ .key = "entity/a", .target = "entity/root" }}) else &.{};
+        }
+        fn seek(_: *anyopaque, _: A, _: []const u8, _: ?[]const u8) !?query_context.QueryNode {
+            return error.UnexpectedPinDiscovery;
+        }
+    };
+    var ready: Ready = .{};
+    const prepared = (try store.prepareQuery(template, .{ .id = "oversized-profile", .ptr = &ready, .load = Ready.load, .estimated_bytes = 100000 * 4096, .lookup = .{ .ptr = &ready, .expand = Ready.expand, .seek_node = Ready.seek } }, false)).?;
+    defer prepared.release();
+    try std.testing.expect(prepared.indexed and prepared.lease == null);
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        var page_store = store;
+        page_store.a = scratch.allocator();
+        const snapshot = try page_store.queryExecutionPrepared(prepared, &.{"entity/a"}, &.{}, false);
+        var target = try resolver.Resolver.initFromParts(scratch.allocator(), "entities", template, .{}, false, "");
+        defer target.deinit();
+        try target.installQueryProjection(scratch.allocator(), prepared.profile_id, "", snapshot.namespace.merges, try encode(scratch.allocator(), snapshot.namespace.state), &.{"entity/a"});
+        try std.testing.expectEqualStrings("entity/root", target.alias_index.?.canonical("entity/a"));
+        try std.testing.expectEqual(@as(usize, 0), target.query_policy_lease.?.aliases().len);
+        try std.testing.expect(scratch.queryCapacity() < 32 * 1024);
+    }
+    try std.testing.expectEqual(@as(usize, 20), ready.calls);
+    std.debug.print("OVERSIZED PROJECTION phases=10 full_profile_loads=0 point_expansions=20\n", .{});
+}
+
+test "resolver curation ready query indexes bound alternating profiles independently of graph cache residency" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "working-set/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1 });
+    const Txn = struct {
+        memory: *TestMemory,
+        pub fn get(self: *@This(), key_: []const u8) ![]const u8 {
+            return self.memory.rows.get(key_) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key_: []const u8, raw: []const u8) !void {
+            return TestMemory.put(self.memory, self.memory.a, key_, raw);
+        }
+        pub fn delete(self: *@This(), key_: []const u8) !void {
+            return TestMemory.remove(self.memory, self.memory.a, key_);
+        }
+    };
+    var txn: Txn = .{ .memory = &memory };
+    const Profile = struct {
+        id: []const u8,
+        aliases: []const resolver.KeyAlias,
+        loads: usize = 0,
+        fn load(ptr: *anyopaque, _: A) ![]const resolver.KeyAlias {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.loads += 1;
+            return error.UnexpectedFullProfileLoad;
+        }
+    };
+    var profiles: [5]Profile = undefined;
+    var readers: [5]static_profiles.QueryReader = undefined;
+    for (&profiles, &readers, 0..) |*profile, *reader, i| {
+        const aliases = try a.alloc(resolver.KeyAlias, 5000);
+        for (aliases, 0..) |*edge, j| edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/working-{d}-{d}", .{ i, j }), .target = try std.fmt.allocPrint(a, "entity/working-root-{d}", .{i}) };
+        const definition: static_profiles.Definition = .{ .key_template = template, .aliases = aliases };
+        profile.* = .{ .id = try definition.identity(a), .aliases = aliases };
+        try static_profiles.synchronize(a, &txn, "working-profiles/", &.{}, &.{definition});
+        reader.* = .{ .backend = store.backend, .root = "working-profiles/", .profile = profile.id, .indexed = try static_profiles.queryNodesReady(a, &txn, "working-profiles/", profile.id) };
+    }
+    const builds = test_query_base_loads.load(.monotonic);
+    var max_arena: usize = 0;
+    for (0..3) |phase| for (&profiles, &readers) |*profile, *reader| {
+        var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer request.deinit();
+        var current = store;
+        current.a = request.allocator();
+        const inline_profile: Store.InlineQueryProfile = .{ .aliases = profile.aliases };
+        const input: Store.QueryProfile = if (phase == 2)
+            .{ .id = profile.id, .lookup = reader.lookup() }
+        else
+            .{ .id = profile.id, .ptr = profile, .load = Profile.load, .estimated_bytes = if (phase == 0) 0 else inline_profile.estimate(), .lookup = reader.lookup() };
+        const prepared = (try current.prepareQuery(template, input, false)).?;
+        defer prepared.release();
+        try std.testing.expect(prepared.indexed and prepared.lease == null);
+        const visited = memory.visited;
+        const scans = memory.scans;
+        const snapshot = try current.queryExecutionPrepared(prepared, &.{ profile.aliases[0].key, "entity/absent" }, &.{}, false);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.namespace.merges.len);
+        try std.testing.expectEqualStrings(profile.aliases[0].target, snapshot.namespace.merges[0].target);
+        try std.testing.expect(memory.visited - visited <= 2);
+        try std.testing.expect(memory.scans - scans <= 4);
+        max_arena = @max(max_arena, request.queryCapacity());
+        try std.testing.expect(request.queryCapacity() < 128 * 1024);
+        try std.testing.expectEqual(@as(usize, 0), profile.loads);
+    };
+    try std.testing.expectEqual(builds, test_query_base_loads.load(.monotonic));
+    // Current native head is still required even when no graph is compiled.
+    const prior = (try store.exportNamespace(template)).?.namespace;
+    const stale = (try store.prepareQuery(template, .{ .id = profiles[0].id, .lookup = readers[0].lookup() }, false)).?;
+    defer stale.release();
+    var next = prior;
+    next.revision += 1;
+    next.merges = &.{.{ .key = profiles[0].aliases[0].key, .target = "entity/moved" }};
+    try store.apply(try difference(a, prior, next));
+    try std.testing.expectError(error.ResolverCurationConflict, store.queryExecutionPrepared(stale, &.{profiles[0].aliases[0].key}, &.{}, false));
+    const fresh = (try store.prepareQuery(template, .{ .id = profiles[0].id, .lookup = readers[0].lookup() }, false)).?;
+    defer fresh.release();
+    const moved = try store.queryExecutionPrepared(fresh, &.{profiles[0].aliases[0].key}, &.{}, false);
+    try std.testing.expectEqualStrings("entity/moved", moved.namespace.merges[0].target);
+    try std.testing.expectEqual(builds, test_query_base_loads.load(.monotonic));
+    std.debug.print("NATIVE QUERY WORKING SET profiles=5 aliases_per_profile=5000 passes=3 full_profile_loads=0 graph_leases=0 max_request_arena={d} visited_rows_per_query<=2 head_changes=fenced\n", .{max_arena});
+}
+
+test "resolver curation pin join excludes ten thousand unrelated overrides cold warm and without cache" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "pin-join-large/", .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    const aliases = try a.alloc(resolver.KeyAlias, 10000);
+    const natives = try a.alloc(resolver.KeyAlias, aliases.len);
+    for (aliases, natives, 0..) |*alias, *edge, i| {
+        alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/join-{d}", .{i}), .target = "entity/static-root" };
+        edge.* = .{ .key = alias.key, .target = "entity/curated-root" };
+    }
+    var namespace: policy.Namespace = .{ .key_template = "entity/{{_key}}", .revision = 1, .merges = natives, .state = .{ .distinct = &.{.{ .from = aliases[0].key, .to = "entity/other" }} } };
+    try store.adoptNamespace(namespace);
+    const Ready = struct {
+        nodes: query_context.NodeIndex,
+        fn node(ptr: *anyopaque, _: A, id: []const u8) !?query_context.QueryNode {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.nodes.by_key.get(id);
+        }
+        fn seek(ptr: *anyopaque, _: A, digest: []const u8, scope: ?[]const u8) !?query_context.QueryNode {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.nodes.seek(digest, scope);
+        }
+        fn expand(_: *anyopaque, _: A, id: []const u8, _: bool, _: EdgeMask) ![]const resolver.KeyAlias {
+            // Every configured edge is masked by a native override.
+            if (std.mem.startsWith(u8, id, "entity/join-")) return error.UnexpectedConfiguredExpansion;
+            return &.{};
+        }
+    };
+    var ready: Ready = .{ .nodes = try query_context.NodeIndex.init(a, aliases) };
+    const profile: Store.QueryProfile = .{ .id = try (static_profiles.Definition{ .key_template = namespace.key_template, .aliases = aliases }).identity(a), .lookup = .{ .ptr = &ready, .node = Ready.node, .seek_node = Ready.seek, .expand = Ready.expand } };
+    var max_reads: usize = 0;
+    var max_scans: usize = 0;
+    var max_arena: usize = 0;
+    for (0..4) |phase| {
+        if (phase == 3) {
+            var next = namespace;
+            next.revision += 1;
+            const moved = try a.dupe(resolver.KeyAlias, namespace.merges);
+            moved[1].target = "entity/unrelated-root";
+            next.merges = moved;
+            try store.apply(try difference(a, namespace, next));
+            namespace = next;
+        }
+        var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer request.deinit();
+        var current = store;
+        current.a = request.allocator();
+        var prepared = (try current.prepareQuery(namespace.key_template, profile, true)).?;
+        defer prepared.release();
+        if (phase == 2) prepared.profile_id = ""; // The exact cache-admission fallback.
+        memory.reads = 0;
+        memory.scans = 0;
+        const result = try current.queryExecutionPrepared(prepared, &.{"entity/curated-root"}, &.{}, true);
+        try std.testing.expectEqual(@as(usize, 1), result.namespace.state.distinct.len);
+        try std.testing.expectEqualStrings(aliases[0].key, result.namespace.state.distinct[0].from);
+        max_reads = @max(max_reads, memory.reads);
+        max_scans = @max(max_scans, memory.scans);
+        max_arena = @max(max_arena, request.queryCapacity());
+        try std.testing.expect(memory.reads < 64 and memory.scans < 20);
+        try std.testing.expect(request.queryCapacity() < 128 * 1024);
+    }
+    std.debug.print("SPARSE PIN JOIN overrides=10000 phases=4 max_gets={d} max_scans={d} max_request_arena={d} pairs=1\n", .{ max_reads, max_scans, max_arena });
+}
+
+test "resolver curation sparse pin join matches full composition through alternating native and configured paths" {
+    var rng = std.Random.DefaultPrng.init(718235);
+    const random = rng.random();
+    for (0..32) |trial| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var memory: TestMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = "pin-join-reference/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+        var names: [32][]const u8 = undefined;
+        for (&names, 0..) |*name, i| name.* = try std.fmt.allocPrint(a, "entity/trial-{d}-{d}", .{ trial, i });
+        var aliases: [24]resolver.KeyAlias = undefined;
+        var natives: std.ArrayList(resolver.KeyAlias) = .empty;
+        var removed: std.ArrayList([]const u8) = .empty;
+        var effective: std.ArrayList(resolver.KeyAlias) = .empty;
+        for (&aliases, 0..) |*alias, i| {
+            alias.* = .{ .key = names[i], .target = names[random.intRangeAtMost(usize, i + 1, 31)] };
+            switch (random.uintLessThan(u8, 4)) {
+                0 => {
+                    const edge: resolver.KeyAlias = .{ .key = names[i], .target = names[random.intRangeAtMost(usize, i + 1, 31)] };
+                    try natives.append(a, edge);
+                    try effective.append(a, edge);
+                },
+                1 => try removed.append(a, names[i]),
+                else => try effective.append(a, alias.*),
+            }
+        }
+        var pairs: [6]c.Pair = undefined;
+        for (&pairs, 0..) |*pair, i| pair.* = .{ .from = names[i], .to = names[i + 24] };
+        const namespace: policy.Namespace = .{ .key_template = "entity/{{_key}}", .revision = 1, .merges = natives.items, .state = .{ .distinct = &pairs, .removed_aliases = removed.items } };
+        try store.adoptNamespace(namespace);
+        var inline_profile: Store.InlineQueryProfile = .{ .aliases = &aliases };
+        const prepared = (try store.prepareQuery(namespace.key_template, .{ .id = try (static_profiles.Definition{ .key_template = namespace.key_template, .aliases = &aliases }).identity(a), .ptr = &inline_profile, .load = Store.InlineQueryProfile.load, .estimated_bytes = std.math.maxInt(usize) }, true)).?;
+        defer prepared.release();
+        if (trial % 2 == 1) {
+            var local: Store.StaticQueryLookup = .{ .context = prepared.lease.?.context };
+            const lookup: AliasLookup = .{ .ptr = &local, .expand = Store.StaticQueryLookup.expand, .node = Store.StaticQueryLookup.node, .seek_node = Store.StaticQueryLookup.seekNode };
+            var turns: usize = 0;
+            while (!try store.advanceQueryPins(namespace.key_template, prepared.profile_id, lookup, 8)) : (turns += 1) try std.testing.expect(turns < 64);
+        }
+        const reference = try c.RedirectIndex.init(a, effective.items);
+        for (names) |seed| {
+            var expected: std.StringHashMapUnmanaged(void) = .empty;
+            for (pairs) |pair| if (std.mem.eql(u8, reference.canonical(seed), reference.canonical(pair.from)) or std.mem.eql(u8, reference.canonical(seed), reference.canonical(pair.to))) try expected.put(a, try c.pairKey(a, pair.from, pair.to), {});
+            // Exercise the exact uncached path as well as the immutable projection.
+            var input = prepared;
+            if (trial % 2 == 0) input.profile_id = "";
+            const result = try store.queryExecutionPrepared(input, &.{seed}, &.{}, true);
+            try std.testing.expectEqual(expected.count(), result.namespace.state.distinct.len);
+            for (result.namespace.state.distinct) |pair| try std.testing.expect(expected.contains(try c.pairKey(a, pair.from, pair.to)));
+        }
+    }
+}
+
+// Ordered fixture cursor: mutation and page costs stay logarithmic while the
+// regression counts every native/profile storage call and retained row.
+const OrderedPinMemory = struct {
+    const Tree = std.Treap([]const u8, struct {
+        fn order(left: []const u8, right: []const u8) std.math.Order {
+            return std.mem.order(u8, left, right);
+        }
+    }.order);
+    a: A,
+    rows: std.StringHashMapUnmanaged([]const u8) = .empty,
+    tree: Tree = .{},
+    reads: usize = 0,
+    scans: usize = 0,
+    writes: usize = 0,
+    visited: usize = 0,
+    distinct_rows: usize = 0,
+    fn get(ptr: *anyopaque, a: A, key: []const u8) !?[]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.reads += 1;
+        return if (self.rows.get(key)) |value| try a.dupe(u8, value) else null;
+    }
+    fn put(ptr: *anyopaque, _: A, key: []const u8, value: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.writes += 1;
+        const entry = try self.rows.getOrPut(self.a, key);
+        if (!entry.found_existing) entry.key_ptr.* = try self.a.dupe(u8, key);
+        entry.value_ptr.* = try self.a.dupe(u8, value);
+        var ordered = self.tree.getEntryFor(entry.key_ptr.*);
+        if (ordered.node == null) ordered.set(try self.a.create(Tree.Node));
+    }
+    fn remove(ptr: *anyopaque, _: A, key: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.writes += 1;
+        var entry = self.tree.getEntryFor(key);
+        entry.set(null);
+        _ = self.rows.remove(key);
+    }
+    fn scan(ptr: *anyopaque, a: A, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.scans += 1;
+        const lower = after orelse prefix;
+        var current = self.tree.root;
+        var first: ?*Tree.Node = null;
+        while (current) |node| {
+            const order = std.mem.order(u8, node.key, lower);
+            if (order == .lt or (after != null and order == .eq)) current = node.children[1] else {
+                first = node;
+                current = node.children[0];
+            }
+        }
+        var rows: std.ArrayList(Row) = .empty;
+        var item = first;
+        while (item) |node| : (item = node.next()) {
+            if (!std.mem.startsWith(u8, node.key, prefix)) break;
+            if (rows.items.len == limit) return .{ .rows = rows.items, .next = rows.items[rows.items.len - 1].key };
+            try rows.append(a, .{ .key = try a.dupe(u8, node.key), .value = try a.dupe(u8, self.rows.get(node.key).?) });
+            self.visited += 1;
+            if (std.mem.endsWith(u8, prefix, "/distinct/")) self.distinct_rows += 1;
+        }
+        return .{ .rows = rows.items };
+    }
+};
+
+test "resolver curation root pin projections bound six thousand independent components and fence owner generations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    const aliases = try a.alloc(resolver.KeyAlias, 6000);
+    const pairs = try a.alloc(c.Pair, aliases.len);
+    const pad = try a.alloc(u8, 128);
+    @memset(pad, 'x');
+    for (aliases, pairs, 0..) |*alias, *pair, i| {
+        alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/pin-{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/root-{d}-{s}", .{ i, pad }) };
+        pair.* = .{ .from = alias.key, .to = try std.fmt.allocPrint(a, "entity/other-{d}", .{i}) };
+    }
+    const template = "entity/{{_key}}";
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = pairs } };
+    try store.adoptNamespace(namespace);
+    const Txn = struct {
+        memory: *OrderedPinMemory,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.memory.rows.get(key) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            return OrderedPinMemory.put(self.memory, self.memory.a, key, value);
+        }
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            return OrderedPinMemory.remove(self.memory, self.memory.a, key);
+        }
+    };
+    var txn: Txn = .{ .memory = &memory };
+    const definition: static_profiles.Definition = .{ .key_template = template, .aliases = aliases };
+    const id = try definition.identity(a);
+    try static_profiles.synchronize(a, &txn, "pin-profiles/", &.{}, &.{definition});
+    var reader: static_profiles.QueryReader = .{ .backend = store.backend, .root = "pin-profiles/", .profile = id, .indexed = true };
+    const profile: Store.QueryProfile = .{ .id = id, .lookup = reader.lookup() };
+    var max_scans: usize = 0;
+    var max_arena: usize = 0;
+    var total_turns: usize = 0;
+    var bootstrap_turns: usize = 0;
+    while (!try store.advanceQueryPins(template, id, reader.lookup(), 128)) : (bootstrap_turns += 1) try std.testing.expect(bootstrap_turns < 256);
+    for (0..4) |phase| {
+        if (phase != 0) {
+            var next = namespace;
+            next.revision += 1;
+            next.merges = if (phase == 1) &.{.{ .key = "entity/unrelated", .target = "entity/unrelated-root" }} else if (phase == 2) &.{ .{ .key = "entity/unrelated", .target = "entity/unrelated-root" }, .{ .key = aliases[0].key, .target = "entity/moved" } } else &.{};
+            try store.apply(try difference(a, namespace, next));
+            namespace = next;
+            if (phase != 3) {
+                try std.testing.expect(!try store.queryPinsIndexed(template, id));
+                const prepared = (try store.prepareQuery(template, profile, true)).?;
+                defer prepared.release();
+                var roots: std.StringHashMapUnmanaged(void) = .empty;
+                try roots.put(a, aliases[0].target, {});
+                var starts: std.StringHashMapUnmanaged(void) = .empty;
+                try std.testing.expectEqual(phase == 1, try store.projectedQueryPins(prepared, roots, reader.lookup(), &starts));
+                var turns: usize = 0;
+                while (true) : (turns += 1) {
+                    var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+                    defer request.deinit();
+                    var owner = store;
+                    owner.a = request.allocator();
+                    const writes = memory.writes;
+                    const complete = try owner.advanceQueryPins(template, id, reader.lookup(), 128);
+                    try std.testing.expect(memory.writes - writes <= 129);
+                    try std.testing.expect(turns < 1024);
+                    total_turns += 1;
+                    if (complete) break;
+                }
+                try std.testing.expect(try store.queryPinsIndexed(template, id));
+                const projection_root = try store.pinProjectionRoot(template, id);
+                const state_path = try std.mem.concat(a, u8, &.{ projection_root, "state" });
+                try validatePortableRow(a, state_path, memory.rows.get(state_path).?);
+                const canonical_root = if (phase == 2) "entity/moved" else aliases[0].target;
+                const member_path = try std.fmt.allocPrint(a, "{s}member/{s}/{s}", .{ projection_root, try hash(a, canonical_root), try hash(a, aliases[0].key) });
+                try validatePortableRow(a, member_path, memory.rows.get(member_path).?);
+            }
+        }
+        for (0..3) |_| {
+            var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer request.deinit();
+            var current = store;
+            current.a = request.allocator();
+            const prepared = (try current.prepareQuery(template, profile, true)).?;
+            defer prepared.release();
+            const scans = memory.scans;
+            const seed = if (phase == 2) "entity/moved" else aliases[0].target;
+            const result = try current.queryExecutionPrepared(prepared, &.{seed}, &.{}, true);
+            try std.testing.expectEqual(@as(usize, 1), result.namespace.state.distinct.len);
+            try std.testing.expect(memory.scans - scans < 24);
+            try std.testing.expect(request.queryCapacity() < 128 * 1024);
+            max_scans = @max(max_scans, memory.scans - scans);
+            max_arena = @max(max_arena, request.queryCapacity());
+            if (phase == 2) try std.testing.expectEqual(@as(usize, 0), (try current.queryExecutionPrepared(prepared, &.{aliases[0].target}, &.{}, true)).namespace.state.distinct.len);
+        }
+    }
+    const replacement: static_profiles.Definition = .{ .key_template = template, .aliases = aliases, .suppress_json = "{\"keys\":[\"entity/retired-profile-negative\"]}" };
+    try static_profiles.synchronize(a, &txn, "pin-profiles/", &.{definition}, &.{replacement});
+    var replacement_reader: static_profiles.QueryReader = .{ .backend = store.backend, .root = "pin-profiles/", .profile = try replacement.identity(a), .indexed = true };
+    var gc_turns: usize = 0;
+    while (true) : (gc_turns += 1) {
+        var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer request.deinit();
+        var owner = store;
+        owner.a = request.allocator();
+        const writes = memory.writes;
+        const done = try owner.advanceQueryPins(template, replacement_reader.profile, replacement_reader.lookup(), 128);
+        try std.testing.expect(memory.writes - writes <= 129);
+        try std.testing.expect(gc_turns < 256);
+        if (done) break;
+    }
+    const retired_prefix = try store.pinProjectionRoot(template, id);
+    try std.testing.expectEqual(@as(usize, 0), (try store.backend.scan(store.backend.ptr, a, retired_prefix, null, 1)).rows.len);
+    try std.testing.expect(try store.queryPinsCleanupCurrent(template, replacement_reader.lookup()));
+    var rows = memory.rows.iterator();
+    while (rows.next()) |row| if (std.mem.startsWith(u8, row.key_ptr.*, lite_prefix ++ "query-pins-v1/") or std.mem.startsWith(u8, row.key_ptr.*, lite_prefix ++ "query-pins-gc-v1/")) try validatePortableRow(a, row.key_ptr.*, row.value_ptr.*);
+    std.debug.print("ROOT PIN PROJECTION components=6000 phases=4 reads_per_phase=3 max_scans={d} max_request_arena={d} owner_turns={d} writes_per_turn<=129 generations=fenced\n", .{ max_scans, max_arena, total_turns });
+}
+
+test "resolver curation static root membership excludes dense unrelated pins on repeated reads" {
+    for ([_]usize{ 1000, 6000 }) |count| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var memory: OrderedPinMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+        const aliases = try a.alloc(resolver.KeyAlias, count * 2);
+        const pairs = try a.alloc(c.Pair, count);
+        for (pairs, 0..) |*pair, i| {
+            aliases[i] = .{ .key = try std.fmt.allocPrint(a, "entity/pinned-{d}", .{i}), .target = "entity/pinned-root" };
+            aliases[count + i] = .{ .key = try std.fmt.allocPrint(a, "entity/unpinned-{d}", .{i}), .target = "entity/unpinned-root" };
+            pair.* = .{ .from = aliases[i].key, .to = try std.fmt.allocPrint(a, "entity/other-{d}", .{i}) };
+        }
+        const template = "entity/{{_key}}";
+        const initial: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = pairs } };
+        try store.adoptNamespace(initial);
+        const Txn = struct {
+            memory: *OrderedPinMemory,
+            pub fn get(self: *@This(), k: []const u8) ![]const u8 {
+                return self.memory.rows.get(k) orelse error.NotFound;
+            }
+            pub fn put(self: *@This(), k: []const u8, v: []const u8) !void {
+                return OrderedPinMemory.put(self.memory, self.memory.a, k, v);
+            }
+            pub fn delete(self: *@This(), k: []const u8) !void {
+                return OrderedPinMemory.remove(self.memory, self.memory.a, k);
+            }
+        };
+        var txn: Txn = .{ .memory = &memory };
+        const definition: static_profiles.Definition = .{ .key_template = template, .aliases = aliases };
+        const id = try definition.identity(a);
+        try static_profiles.synchronize(a, &txn, "static-root-profile/", &.{}, &.{definition});
+        var reader: static_profiles.QueryReader = .{ .backend = store.backend, .root = "static-root-profile/", .profile = id, .indexed = true };
+        try std.testing.expect(!try store.queryPinsIndexed(template, id));
+        var turns: usize = 0;
+        while (true) : (turns += 1) {
+            var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer request.deinit();
+            var owner = store;
+            owner.a = request.allocator();
+            const writes = memory.writes;
+            const done = try owner.advanceQueryPins(template, id, reader.lookup(), 128);
+            try std.testing.expect(memory.writes - writes <= 129);
+            try std.testing.expect(turns < (pairs.len * 3 + 123) / 124 + 8);
+            if (done) break;
+        }
+        var max_scans: usize = 0;
+        for (0..3) |_| {
+            var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer request.deinit();
+            var current = store;
+            current.a = request.allocator();
+            const prepared = (try current.prepareQuery(template, .{ .id = id, .lookup = reader.lookup() }, true)).?;
+            defer prepared.release();
+            const before = memory.scans;
+            const result = try current.queryExecutionPrepared(prepared, &.{"entity/unpinned-root"}, &.{}, true);
+            max_scans = @max(max_scans, memory.scans - before);
+            try std.testing.expect(memory.scans - before <= 12);
+            try std.testing.expect(request.queryCapacity() < 128 * 1024);
+            try std.testing.expectEqual(@as(usize, 0), result.namespace.state.distinct.len);
+        }
+        // A new native pin immediately invalidates static readiness, too.
+        var next = initial;
+        next.revision += 1;
+        const extended = try a.alloc(c.Pair, pairs.len + 1);
+        @memcpy(extended[0..pairs.len], pairs);
+        extended[pairs.len] = .{ .from = "entity/unpinned-root", .to = "entity/new-other" };
+        next.state.distinct = extended;
+        try store.apply(try difference(a, initial, next));
+        try std.testing.expect(!try store.queryPinsIndexed(template, id));
+        const before_edit_writes = memory.writes;
+        const before_edit_scans = memory.scans;
+        var edit_turns: usize = 0;
+        while (true) : (edit_turns += 1) {
+            var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer request.deinit();
+            var owner = store;
+            owner.a = request.allocator();
+            const done = try owner.advanceQueryPins(template, id, reader.lookup(), 128);
+            try std.testing.expect(edit_turns < 3);
+            if (done) break;
+        }
+        try std.testing.expect(memory.writes - before_edit_writes <= 32);
+        try std.testing.expect(memory.scans - before_edit_scans <= 32);
+        std.debug.print("INCREMENTAL PIN unrelated_pins={d} owner_turns={d} writes={d} scans={d}\n", .{ count, edit_turns + 1, memory.writes - before_edit_writes, memory.scans - before_edit_scans });
+        const prepared = (try store.prepareQuery(template, .{ .id = id, .lookup = reader.lookup() }, true)).?;
+        defer prepared.release();
+        try std.testing.expectEqual(@as(usize, 1), (try store.queryExecutionPrepared(prepared, &.{"entity/unpinned-root"}, &.{}, true)).namespace.state.distinct.len);
+        var reverted = next;
+        reverted.revision += 1;
+        reverted.state.distinct = pairs;
+        try store.apply(try difference(a, next, reverted));
+        const before_remove = memory.writes;
+        try std.testing.expect(try store.advanceQueryPins(template, id, reader.lookup(), 128));
+        try std.testing.expect(memory.writes - before_remove <= 32);
+        const removed = (try store.prepareQuery(template, .{ .id = id, .lookup = reader.lookup() }, true)).?;
+        defer removed.release();
+        try std.testing.expectEqual(@as(usize, 0), (try store.queryExecutionPrepared(removed, &.{"entity/unpinned-root"}, &.{}, true)).namespace.state.distinct.len);
+        std.debug.print("STATIC ROOT MEMBERSHIP unrelated_pins={d} repeated_reads=3 max_scans={d} owner_turns={d} invalidation=fenced\n", .{ count, max_scans, turns + 1 });
+    }
+}
+
+test "resolver curation owner resumes and compresses sixteen thousand configured hops with bounded work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    const template = "entity/{{_key}}";
+    const initial: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = "entity/unrelated", .target = "entity/elsewhere" }}, .state = .{ .distinct = &.{ .{ .from = "entity/link-0", .to = "entity/other" }, .{ .from = "entity/link-4000", .to = "entity/other" } } } };
+    try store.adoptNamespace(initial);
+    // Faithful indexed fixture for a long immutable configured chain. Scalar
+    // nodes carry its canonical root; expand returns only the next edge.
+    const Lookup = struct {
+        calls: usize = 0,
+        fn node(_: *anyopaque, _: A, id: []const u8) !?query_context.QueryNode {
+            return if (std.mem.startsWith(u8, id, "entity/link-")) .{ .key = id, .canonical = "entity/link-16000" } else null;
+        }
+        fn seek(_: *anyopaque, _: A, _: []const u8, _: ?[]const u8) !?query_context.QueryNode {
+            return .{ .key = "entity/link-0", .canonical = "entity/link-16000" };
+        }
+        fn expand(ptr: *anyopaque, alloc: A, id: []const u8, _: bool, _: EdgeMask) ![]const resolver.KeyAlias {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (!std.mem.startsWith(u8, id, "entity/link-")) return &.{};
+            const n = try std.fmt.parseInt(usize, id[12..], 10);
+            if (n == 16000) return &.{};
+            const edges = try alloc.alloc(resolver.KeyAlias, 1);
+            edges[0] = .{ .key = id, .target = try std.fmt.allocPrint(alloc, "entity/link-{d}", .{n + 1}) };
+            return edges;
+        }
+    };
+    var fixture: Lookup = .{};
+    const lookup: AliasLookup = .{ .ptr = &fixture, .node = Lookup.node, .seek_node = Lookup.seek, .expand = Lookup.expand };
+    const id = try hash(a, "owner-long-configured-path");
+    var turns: usize = 0;
+    var max_hops: usize = 0;
+    var max_arena: usize = 0;
+    const state_path = try std.mem.concat(a, u8, &.{ try store.pinProjectionRoot(template, id), "state" });
+    while (true) : (turns += 1) {
+        var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer request.deinit();
+        var owner = store;
+        owner.a = request.allocator();
+        if (turns == 50) {
+            var next = initial;
+            next.revision += 1;
+            next.merges = &.{.{ .key = "entity/unrelated", .target = "entity/changed" }};
+            try store.apply(try difference(a, initial, next));
+            // A paused walk cannot publish into a replacement graph cut.
+            try std.testing.expect(!try store.queryPinsIndexed(template, id));
+        }
+        const before = fixture.calls;
+        const writes = memory.writes;
+        const done = try owner.advanceQueryPins(template, id, lookup, 128);
+        max_hops = @max(max_hops, fixture.calls - before);
+        max_arena = @max(max_arena, request.queryCapacity());
+        try std.testing.expect(fixture.calls - before <= 128);
+        try std.testing.expect(memory.writes - writes <= 129);
+        try std.testing.expect(request.queryCapacity() < 512 * 1024);
+        if (memory.rows.get(state_path)) |raw| try validatePortableRow(a, state_path, raw) else try std.testing.expect(turns == 0);
+        try std.testing.expect(turns < 600);
+        if (done) break;
+        try std.testing.expect(!try store.queryPinsIndexed(template, id));
+    }
+    // Apart from the deliberately abandoned first 50 turns, the two long
+    // converging boundaries traverse and compress the chain only once.
+    try std.testing.expect(fixture.calls < 40000);
+    try std.testing.expect(try store.queryPinsIndexed(template, id));
+    const member = try std.fmt.allocPrint(a, "{s}member/{s}/{s}", .{ try store.pinProjectionRoot(template, id), try hash(a, "entity/link-16000"), try hash(a, "entity/link-0") });
+    try std.testing.expect(memory.rows.contains(member));
+    // All converging boundaries can now use durable, graph-fenced shortcuts.
+    const shortcut = try std.fmt.allocPrint(a, "{s}path/{s}", .{ try store.pinProjectionRoot(template, id), try hash(a, "entity/link-4000") });
+    try validatePortableRow(a, shortcut, memory.rows.get(shortcut).?);
+    try std.testing.expectEqualStrings("entity/link-16000", (try parse(Store.PinPath, a, memory.rows.get(shortcut).?)).root);
+    const before_ready = fixture.calls;
+    try std.testing.expect(try store.advanceQueryPins(template, id, lookup, 128));
+    try std.testing.expectEqual(before_ready, fixture.calls);
+    std.debug.print("RESUMABLE PIN PATH configured_hops=16000 owner_turns={d} max_hops_per_turn={d} max_request_arena={d} writes_per_turn<=129 durable_shortcuts=16000\n", .{ turns + 1, max_hops, max_arena });
+}
+
+test "resolver curation incremental repairs coalesce routing edits and journal gaps match full composition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    var names: [32][]const u8 = undefined;
+    for (&names, 0..) |*name, i| name.* = try std.fmt.allocPrint(a, "entity/incremental-{d}", .{i});
+    var aliases: [24]resolver.KeyAlias = undefined;
+    for (&aliases, 0..) |*edge, i| edge.* = .{ .key = names[i], .target = names[24 + i % 8] };
+    const Reader = struct {
+        nodes: query_context.NodeIndex,
+        edges: []const resolver.KeyAlias,
+        fn node(ptr: *anyopaque, _: A, id: []const u8) !?query_context.QueryNode {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.nodes.by_key.get(id);
+        }
+        fn seek(ptr: *anyopaque, _: A, digest: []const u8, root: ?[]const u8) !?query_context.QueryNode {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.nodes.seek(digest, root);
+        }
+        fn expand(ptr: *anyopaque, alloc: A, id: []const u8, _: bool, _: EdgeMask) ![]const resolver.KeyAlias {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (self.edges) |edge| if (std.mem.eql(u8, edge.key, id)) {
+                const result = try alloc.alloc(resolver.KeyAlias, 1);
+                result[0] = edge;
+                return result;
+            };
+            return &.{};
+        }
+    };
+    var reader: Reader = .{ .nodes = try query_context.NodeIndex.init(a, &aliases), .edges = &aliases };
+    const lookup: AliasLookup = .{ .ptr = &reader, .node = Reader.node, .seek_node = Reader.seek, .expand = Reader.expand };
+    const template = "entity/{{_key}}";
+    const id = try (static_profiles.Definition{ .key_template = template, .aliases = &aliases }).identity(a);
+    var pairs: [6]c.Pair = undefined;
+    for (&pairs, 0..) |*pair, i| pair.* = .{ .from = names[i], .to = names[24 + i] };
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = &pairs } };
+    try store.adoptNamespace(namespace);
+    while (!try store.advanceQueryPins(template, id, lookup, 128)) {}
+    var native: [24]?resolver.KeyAlias = @splat(null);
+    var removed: [24]bool = @splat(false);
+    var rng = std.Random.DefaultPrng.init(98144);
+    const random = rng.random();
+    for (0..48) |step| {
+        const slot = random.uintLessThan(usize, 24);
+        native[slot] = if (step % 3 == 0) .{ .key = names[slot], .target = names[random.intRangeAtMost(usize, slot + 1, 31)] } else null;
+        removed[slot] = step % 3 == 1;
+        var merges: std.ArrayList(resolver.KeyAlias) = .empty;
+        var removed_keys: std.ArrayList([]const u8) = .empty;
+        var effective: std.ArrayList(resolver.KeyAlias) = .empty;
+        for (native, removed, aliases) |edge, absent, base| {
+            if (edge) |value| try merges.append(a, value) else if (absent) try removed_keys.append(a, base.key);
+            if (edge) |value| try effective.append(a, value) else if (!absent) try effective.append(a, base);
+        }
+        var next = namespace;
+        next.revision += 1;
+        next.merges = merges.items;
+        next.state.removed_aliases = removed_keys.items;
+        try store.apply(try difference(a, namespace, next));
+        namespace = next;
+        _ = try store.advanceQueryPins(template, id, lookup, 8);
+        // Every partial owner cut, including newly coalesced edits, must return
+        // exactly the current policy. Indexed unaffected roots and fallback
+        // affected roots share an independent full-composition reference.
+        const reference = try c.RedirectIndex.init(a, effective.items);
+        const prepared = (try store.prepareQuery(template, .{ .id = id, .lookup = lookup }, true)).?;
+        defer prepared.release();
+        for (names) |seed| {
+            var expected: std.StringHashMapUnmanaged(void) = .empty;
+            for (pairs) |pair| if (std.mem.eql(u8, reference.canonical(seed), reference.canonical(pair.from)) or std.mem.eql(u8, reference.canonical(seed), reference.canonical(pair.to))) try expected.put(a, try c.pairKey(a, pair.from, pair.to), {});
+            const result = try store.queryExecutionPrepared(prepared, &.{seed}, &.{}, true);
+            try std.testing.expectEqual(expected.count(), result.namespace.state.distinct.len);
+            for (result.namespace.state.distinct) |pair| try std.testing.expect(expected.contains(try c.pairKey(a, pair.from, pair.to)));
+        }
+    }
+    var turns: usize = 0;
+    while (!try store.advanceQueryPins(template, id, lookup, 128)) : (turns += 1) try std.testing.expect(turns < 128);
+    try std.testing.expect(try store.queryPinsIndexed(template, id));
+    // The bounded journal cannot grow forever. An owner missing its retained
+    // history safely rebuilds once, rather than trusting incomplete deltas.
+    for (0..260) |step| {
+        var next = namespace;
+        next.revision += 1;
+        const edges = try a.alloc(resolver.KeyAlias, namespace.merges.len + 1);
+        @memcpy(edges[0..namespace.merges.len], namespace.merges);
+        edges[namespace.merges.len] = .{ .key = "entity/journal-gap", .target = if (step % 2 == 0) "entity/gap-a" else "entity/gap-b" };
+        // Replace the previous unrelated edge, retaining all tested policy.
+        next.merges = if (step == 0) edges else blk: {
+            edges[namespace.merges.len - 1] = edges[namespace.merges.len];
+            break :blk edges[0..namespace.merges.len];
+        };
+        try store.apply(try difference(a, namespace, next));
+        namespace = next;
+    }
+    turns = 0;
+    while (!try store.advanceQueryPins(template, id, lookup, 128)) : (turns += 1) try std.testing.expect(turns < 128);
+    try std.testing.expect(try store.queryPinsIndexed(template, id));
+    const events = try store.backend.scan(store.backend.ptr, a, try std.mem.concat(a, u8, &.{ try store.pinEditRoot(template), "slot/" }), null, 512);
+    try std.testing.expectEqual(@as(usize, 256), events.rows.len);
+    for (events.rows) |row| try validatePortableRow(a, row.key, row.value);
+    const long_ids = try a.alloc([]const u8, 128);
+    const padding = try a.alloc(u8, 1024);
+    @memset(padding, 'x');
+    for (long_ids, 0..) |*value, i| value.* = try std.fmt.allocPrint(a, "entity/large-{d}-{s}", .{ i, padding });
+    const head = try store.pinEditHead(template, @splat(0));
+    try store.appendPinEdit(template, head.graph, @splat(9), long_ids, &.{});
+    const oversized_key = try store.pinEditSlot(template, head.sequence + 1);
+    const oversized_raw = memory.rows.get(oversized_key).?;
+    try std.testing.expect(oversized_raw.len < 64 * 1024);
+    try std.testing.expect((try parse(Store.PinEdit, a, oversized_raw)).rebuild);
+    try validatePortableRow(a, oversized_key, oversized_raw);
+    std.debug.print("INCREMENTAL COMPOSITION edits=48 seed_checks=1536 journal_slots=256 gap_recovery=ready\n", .{});
 }

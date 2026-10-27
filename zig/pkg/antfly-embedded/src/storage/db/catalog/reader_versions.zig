@@ -25,13 +25,13 @@ pub const namespace_curation_reader_version: u32 = 9;
 pub const curation_provenance_reader_version: u32 = 10;
 pub const scoped_curation_reader_version: u32 = 11;
 /// Required preparation retains exact participant and route bindings.
-pub const prepared_transaction_reader_version: u32 = 17;
+pub const prepared_transaction_reader_version: u32 = 24;
 /// Per-transaction replay retention claims and atomic inventory adjustment.
-pub const replay_credit_reader_version: u32 = 18;
+pub const replay_credit_reader_version: u32 = 25;
 /// Accepted seals retain bound read observations and their backlog accounting.
-pub const read_observations_reader_version: u32 = 19;
-pub const read_ranges_reader_version: u32 = 20;
-pub const prepared_read_guards_reader_version: u32 = 21;
+pub const read_observations_reader_version: u32 = 26;
+pub const read_ranges_reader_version: u32 = 27;
+pub const prepared_read_guards_reader_version: u32 = 28;
 pub const supported_reader_version: u32 = prepared_read_guards_reader_version;
 pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
 pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";

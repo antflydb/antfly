@@ -33,7 +33,8 @@ const antfly_image = @import("antfly_image");
 // Version 41 introduced CUDA cache credits surviving cache/host teardown.
 // Version 40 introduced the parented/supervised host cache allocator contract.
 // Worker Create.bridge_version also fences older executables before startup.
-pub const abi_version: u32 = 45;
+pub const abi_version: u32 = 46;
+pub const DocumentStoreView = @import("antfly_runtime_abi").document_abi.View;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -203,8 +204,10 @@ pub const ProviderOperation = enum(c_int) {
     rerank_documents = 22,
     /// Raw JSON routes preserve the HTTP status and body contract while using
     /// the provider request context and private-worker CPU grant transport.
-    generate_json = 23,
-    decide_json = 24,
+    generate_json = 25,
+    decide_json = 26,
+    document_read = 23,
+    document_extract = 24,
 };
 
 pub const ProviderBinaryPayload = extern struct {
@@ -328,6 +331,7 @@ pub const ProviderInvokeContext = extern struct {
     /// Private worker-protocol CPU demand. Zero means no delegated grant.
     /// The parent keeps ownership; process-local callbacks never enter IPC.
     admitted_cpu_slots: u32 = 0,
+    document_store: DocumentStoreView = .{},
 };
 
 pub const RouteManifestEntry = extern struct {
@@ -362,6 +366,7 @@ pub const HttpHandleContext = extern struct {
     runnable: ?*const runnable_abi.Borrowed = null,
     /// A worker receives only scalar CPU demand, never parent callbacks.
     admitted_cpu_slots: u32 = 0,
+    document_store: DocumentStoreView = .{},
 };
 
 pub const Capability = struct {

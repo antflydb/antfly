@@ -3613,6 +3613,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/entities/{key}/progress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List a bounded page of entity consumer replay progress
+         * @description Pages enumerate resolver consumers at one catalog cut. Each page reads current native namespace heads and verifies them again after observing replay. A changed catalog or binding invalidates the cursor. Applied describes an individual consumer, not consumers on other pages.
+         */
+        get: operations["listEntityResolverProgress"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/entities/{key}:merge": {
         parameters: {
             query?: never;
@@ -3998,6 +4021,31 @@ export interface paths {
         };
         /** list entity resolver state */
         get: operations["namespaceListEntityResolverState"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/progress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List a bounded page of entity consumer replay progress
+         * @description Pages enumerate resolver consumers at one catalog cut. Each page reads current native namespace heads and verifies them again after observing replay. A changed catalog or binding invalidates the cursor. Applied describes an individual consumer, not consumers on other pages.
+         */
+        get: operations["namespaceListEntityResolverProgress"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4665,6 +4713,46 @@ export interface paths {
          * @description Permanently deletes the specified API key. Subsequent requests using this key will be rejected.
          */
         delete: operations["deleteApiKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/read/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a durable document task over a duplex persistence channel
+         * @description Internal versioned peer protocol. The caller retains storage and lease authority. This single-use exchange must never be buffered, replayed, retried or redirected by intermediaries. X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+         */
+        post: operations["executeReadDocumentRemote"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/extract/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a durable document task over a duplex persistence channel
+         * @description Internal versioned peer protocol. The caller retains storage and lease authority. This single-use exchange must never be buffered, replayed, retried or redirected by intermediaries. X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+         */
+        post: operations["executeExtractDocumentRemote"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -5598,6 +5686,260 @@ export interface paths {
         put?: never;
         /** Synthesize speech using a named text-to-speech configuration */
         post: operations["synthesizeSpeech"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/read/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit a durable read job
+         * @description Unified Antfly API only. Persists the request before returning. Jobs continue after the submitting client disconnects. Sources and accepted stages are immutable snapshots; ambiguous calls remain charged on retry. Retention is absolute and is not extended by polling or resuming.
+         */
+        post: operations["createReadDocumentJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/read/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        /** Get principal-scoped document job status */
+        get: operations["getReadDocumentJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/read/jobs/{job_id}/result": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Atomic final response
+         * @description Atomic final response; unavailable until the whole job succeeds
+         */
+        get: operations["resultReadDocumentJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/read/jobs/{job_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+         * @description Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+         */
+        get: operations["eventsReadDocumentJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/read/jobs/{job_id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Requeue an interrupted job without resetting its budget or retention
+         * @description Requeue an interrupted job without resetting its budget or retention
+         */
+        post: operations["resumeReadDocumentJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/read/jobs/{job_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Fence the current attempt and cancel the job
+         * @description Fence the current attempt and cancel the job
+         */
+        post: operations["cancelReadDocumentJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/extract/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit a durable extract job
+         * @description Unified Antfly API only. Persists the request before returning. Jobs continue after the submitting client disconnects. Sources and accepted stages are immutable snapshots; ambiguous calls remain charged on retry. Retention is absolute and is not extended by polling or resuming.
+         */
+        post: operations["createExtractDocumentJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/extract/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        /** Get principal-scoped document job status */
+        get: operations["getExtractDocumentJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/extract/jobs/{job_id}/result": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Atomic final response
+         * @description Atomic final response; unavailable until the whole job succeeds
+         */
+        get: operations["resultExtractDocumentJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/extract/jobs/{job_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+         * @description Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+         */
+        get: operations["eventsExtractDocumentJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/extract/jobs/{job_id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Requeue an interrupted job without resetting its budget or retention
+         * @description Requeue an interrupted job without resetting its budget or retention
+         */
+        post: operations["resumeExtractDocumentJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/extract/jobs/{job_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Fence the current attempt and cancel the job
+         * @description Fence the current attempt and cancel the job
+         */
+        post: operations["cancelExtractDocumentJob"];
         delete?: never;
         options?: never;
         head?: never;
@@ -7613,7 +7955,7 @@ export interface components {
          * @description The embedding provider to use.
          * @enum {string}
          */
-        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "antfly";
+        EmbedderProvider: "cloudflare" | "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "antfly";
         /**
          * @description A unified configuration for an embedding provider.
          *
@@ -7752,7 +8094,7 @@ export interface components {
          *       "model": "text-embedding-3-small"
          *     }
          */
-        EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+        EmbedderConfig: (components["schemas"]["CloudflareEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
             /** @description This named embedder produces sparse index/value vectors. */
             sparse?: boolean;
             rate_limit?: components["schemas"]["RateLimitConfig"];
@@ -7807,7 +8149,7 @@ export interface components {
          *     canonical provider configurations; it does not define a second provider
          *     namespace.
          */
-        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
+        IndexEmbedderConfig: components["schemas"]["CloudflareEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /**
          * @description Overall health status of the cluster
          * @enum {string}
@@ -14768,7 +15110,7 @@ export interface components {
          * @description The reranking provider to use.
          * @enum {string}
          */
-        RerankerProvider: "antfly" | "cohere" | "vertex";
+        RerankerProvider: "cloudflare" | "antfly" | "cohere" | "vertex";
         /**
          * @description Objective used to rank graph paths:
          *     - min_hops: Minimize the number of edges.
@@ -14777,6 +15119,26 @@ export interface components {
          * @enum {string}
          */
         GraphPathObjective: "min_hops" | "min_weight_sum" | "max_weight_product";
+        /** @description Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/baai/bge-base-en-v1.5 */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+            /** @description Expected fixed model output dimension; the adapter validates returned vectors and never requests unsupported resizing. */
+            dimensions?: number;
+            /** @description Alias of dimensions. */
+            dimension?: number;
+        };
         /**
          * @description Advanced retrieval-role overrides. Antfly assigns canonical task intent
          *     automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
@@ -15498,6 +15860,28 @@ export interface components {
             outputs?: components["schemas"]["ChunkOutputs"];
             policy?: components["schemas"]["MediaChunkPolicy"];
         };
+        /** @description Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareGeneratorConfig: {
+            /** @enum {string} */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/meta/llama-3.3-70b-instruct-fp8-fast */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+            max_tokens?: number;
+            /** Format: float */
+            temperature?: number;
+            /** Format: float */
+            top_p?: number;
+            /** Format: float */
+            frequency_penalty?: number;
+            /** Format: float */
+            presence_penalty?: number;
+        };
         /** @description Configuration for the Google generative AI provider (Gemini). */
         GoogleGeneratorConfig: {
             /** @enum {string} */
@@ -15810,7 +16194,7 @@ export interface components {
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "bedrock" | "anthropic" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
+        GeneratorProvider: "cloudflare" | "gemini" | "vertex" | "bedrock" | "anthropic" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -15820,7 +16204,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["CloudflareGeneratorConfig"] | components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
             /**
              * Format: int64
              * @description Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
@@ -15930,7 +16314,14 @@ export interface components {
         };
         ExtractionStructureField: string | ({
             /** @enum {string} */
-            type?: "str" | "string" | "list" | "array";
+            type?: "str" | "string" | "list" | "array" | "text" | "number" | "date" | "estimate";
+            /** @description Decimal precision for compatible hosted number fields. */
+            decimals?: number;
+            unit?: string;
+            /** @description Minimum of a hosted estimate distribution. */
+            min?: number;
+            max?: number;
+            step?: number;
             enum?: string[];
             /** @enum {string} */
             dtype?: "str" | "list";
@@ -16455,7 +16846,7 @@ export interface components {
          * @description The STT provider to use.
          * @enum {string}
          */
-        STTProvider: "openai" | "vertex" | "antfly" | "apple";
+        STTProvider: "cloudflare" | "openai" | "vertex" | "antfly" | "apple";
         /**
          * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
          *
@@ -16552,7 +16943,7 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}. A named-embedder similarity decider also requires embedders={name: frozen EmbedderConfig}; the dependency travels with the specification for deterministic replay instead of resolving mutable node configuration. Credentials use secret references or environment defaults. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
             producer?: components["schemas"]["EnrichmentProducerConfig"];
             /**
              * @deprecated
@@ -16910,7 +17301,7 @@ export interface components {
         };
         DeciderConfig: {
             /** @enum {string} */
-            provider?: "antfly" | "jev" | "openai";
+            provider?: "antfly" | "jev" | "openai" | "cloudflare";
             /**
              * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
              * @default typed
@@ -16923,11 +17314,17 @@ export interface components {
             output?: components["schemas"]["ConstrainedOutput"];
             probabilities?: components["schemas"]["ConstrainedProbabilities"];
             batch?: components["schemas"]["ConstrainedGenerationBatch"];
-            /** @description Required for Antfly and OpenAI; Jev defaults to jev-latest. */
+            /** @description Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash. */
             model?: string;
+            /** @description Required with the cloudflare provider; Workers AI account identifier. */
+            account_id?: string;
+            /** @description Optional Cloudflare AI Gateway identifier. */
+            gateway_id?: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity. */
             model_identity?: string;
-            /** @description EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities. */
+            /** @description Named dense embedder for provider-neutral embedding_similarity routing. Specify matching embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes use explicit thresholds and estimated token admission. */
+            embedder?: string;
+            /** @description Geometry and acceptance defaults for embedding_similarity decisions. Named embedders require dimensions matching their configured dense output. Direct Antfly model routes support EmbeddingGemma 2 dimensions and fitted calibrations. Acceptance is serialized onto each question and can be overridden per question. Raw cosine similarities never represent probabilities. */
             embedding_options?: {
                 /** @description Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities. */
                 calibration_id?: string;
@@ -16937,10 +17334,10 @@ export interface components {
                  */
                 task_type?: "CLUSTERING" | "CLASSIFICATION";
                 /**
+                 * @description Must match the named embedder's configured dimensions. Without embedder, the direct EmbeddingGemma 2 route accepts only 768, 512, 256 or 128.
                  * @default 768
-                 * @enum {integer}
                  */
-                dimensions?: 768 | 512 | 256 | 128;
+                dimensions?: number;
                 min_similarity?: number;
                 min_margin?: number;
             };
@@ -17435,7 +17832,7 @@ export interface components {
          */
         TableStorageMode: "document" | "relational";
         ExternalLakeCredentialRef: {
-            /** @description Name of a configured external_io connection with lake_read capability. */
+            /** @description Name of a configured external_io connection with lake.read capability. */
             ref: string;
             /** @description Allowed object prefix relative to the configured bucket or filesystem root. */
             scope?: string;
@@ -17649,11 +18046,11 @@ export interface components {
              */
             sortable?: boolean;
             /**
-             * @description Missing/null sort policy. The current production policy rejects missing or null native sort values.
+             * @description Missing/null sort policy. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending and last descending, with JSON null cursor components. Nullable native layouts require a complete producer proof.
              * @default missing_rejected
              * @enum {string}
              */
-            missing_null_policy?: "missing_rejected";
+            missing_null_policy?: "missing_rejected" | "nulls_ordered";
         };
         /** @description Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected. */
         DocumentFieldMapping: {
@@ -17684,11 +18081,11 @@ export interface components {
              */
             sortable?: boolean;
             /**
-             * @description Missing/null sort policy. The current production policy rejects missing or null native sort values.
+             * @description Missing/null sort policy. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending and last descending, with JSON null cursor components. Nullable native layouts require a complete producer proof.
              * @default missing_rejected
              * @enum {string}
              */
-            missing_null_policy?: "missing_rejected";
+            missing_null_policy?: "missing_rejected" | "nulls_ordered";
             /** @description Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield. */
             fields?: {
                 [key: string]: components["schemas"]["DocumentSubfieldMapping"];
@@ -17779,13 +18176,15 @@ export interface components {
              */
             sortable?: boolean;
             /**
-             * @description Missing/null sort policy for this mapped field. The current production
-             *     policy rejects missing or null native sort values so sorted cursors
-             *     remain replayable JSON scalar tuples.
+             * @description Missing/null sort policy for this mapped field. The default missing_rejected
+             *     rejects missing or null native sort values. Opt in to nulls_ordered
+             *     to sort missing/null values first ascending and last descending,
+             *     with JSON null in replayable sort cursor tuples. Native sorting
+             *     requires a complete producer proof for nullable physical layouts.
              * @default missing_rejected
              * @enum {string}
              */
-            missing_null_policy?: "missing_rejected";
+            missing_null_policy?: "missing_rejected" | "nulls_ordered";
         };
         /**
          * @description A rule for mapping dynamically detected fields. Templates are checked in order
@@ -20682,6 +21081,19 @@ export interface components {
              */
             rank_constant?: number;
         };
+        /** @description Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareRerankerConfig: {
+            /** @enum {string} */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/baai/bge-reranker-base */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+        };
         /**
          * @description Configuration for the Antfly inference reranking provider.
          * @example {
@@ -20771,6 +21183,8 @@ export interface components {
          *     }
          */
         RerankerConfig: {
+            account_id?: string;
+            gateway_id?: string;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["RerankerProvider"];
             /** @description Field name to extract from documents for reranking. */
@@ -20786,7 +21200,7 @@ export interface components {
              * @description Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
              */
             top_n?: number;
-        } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        } & (components["schemas"]["CloudflareRerankerConfig"] | components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores. */
         GraphMetricQuery: {
             /** @description Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges. */
@@ -22085,15 +22499,35 @@ export interface components {
             table?: string;
             wait?: components["schemas"]["ResolverWait"];
         };
+        EntityNamespaceOutcome: {
+            key_template: string;
+            /** Format: uint64 */
+            revision: number;
+            changed: boolean;
+            absorbed: {
+                key: string;
+                /** @enum {string} */
+                disposition: "release" | "suppress";
+            }[];
+        };
         EntityCurationResult: {
             entity_table: string;
             key: string;
             complete: boolean;
             /**
-             * @description Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
+             * @description Entity corrections commit atomically across matching namespaces on the destination table; replay is asynchronous. Other atomicity values identify the scope guaranteed by the responding adapter.
              * @enum {string}
              */
             atomicity: "namespace" | "source_table" | "resolver";
+            /** @description True only when replay completion was observed for all consumers, or no consumers exist. Admission without wait is conservative. */
+            applied?: boolean;
+            /**
+             * Format: uri-reference
+             * @description Native HTTP mutations return this progress resource relative to the request URI. Follow its bounded pages for individual consumer proofs.
+             */
+            progress_url?: string;
+            /** @description Native mutation outcomes, stored once per namespace. Consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries. */
+            namespaces?: components["schemas"]["EntityNamespaceOutcome"][];
             results: {
                 source_table: string;
                 resolver: string;
@@ -22104,6 +22538,10 @@ export interface components {
                 };
                 /** Format: uint64 */
                 revision?: number;
+                /**
+                 * @deprecated
+                 * @description Legacy per-consumer outcomes; native mutations return namespaces instead.
+                 */
                 absorbed?: {
                     key: string;
                     /** @enum {string} */
@@ -22119,6 +22557,24 @@ export interface components {
                 distinct?: components["schemas"]["ResolverDistinctPair"][];
                 configured_suppressed?: boolean;
                 runtime_suppressed?: boolean;
+            }[];
+        };
+        EntityConsumerProgressPage: {
+            entity_table: string;
+            key: string;
+            /** Format: uint64 */
+            catalog_revision: number;
+            /** @description True when enumeration has no further pages; it does not certify replay completion. */
+            complete: boolean;
+            next_cursor?: string | null;
+            results: {
+                source_table: string;
+                resolver: string;
+                key_template: string;
+                /** Format: uint64 */
+                revision: number;
+                applied: boolean;
+                progress: components["schemas"]["ResolverReplayProgress"];
             }[];
         };
         EntityMergeRequest: {
@@ -22218,6 +22674,12 @@ export interface components {
             /** @enum {string} */
             atomicity?: "namespace" | "resolver";
             applied?: boolean;
+            /**
+             * Format: uri-reference
+             * @description Relative native consumer-progress resource; resolve against the decision request URI.
+             */
+            progress_url?: string;
+            namespaces?: components["schemas"]["EntityNamespaceOutcome"][];
             results?: {
                 [key: string]: unknown;
             }[];
@@ -22673,12 +23135,20 @@ export interface components {
             /** @description Rewritten texts for this input, one per beam. */
             texts: string[];
         };
+        /** @description Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference. */
         InferenceReadRequest: {
             /**
              * @description Name of reader model from models_dir/readers/
              * @example microsoft/trocr-base-printed
              */
             model: string;
+            /**
+             * @description Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
+             * @default false
+             */
+            retain_artifact?: boolean;
+            /** @description Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order. */
+            documents?: components["schemas"]["DocumentSource"][];
             /**
              * @description Images to read text from. Supports:
              *     - Data URIs: `data:image/png;base64,...`
@@ -22689,7 +23159,7 @@ export interface components {
              *       }
              *     ]
              */
-            images: components["schemas"]["InferenceImageURL"][];
+            images?: components["schemas"]["InferenceImageURL"][];
             /**
              * @description Optional task prompt for document understanding models.
              *     - TrOCR: Not used (pure OCR)
@@ -22709,16 +23179,80 @@ export interface components {
             max_tokens?: number;
         };
         InferenceTextRegion: {
+            /** @description Region identity within its parent; nested regions use qualified paths. */
+            id?: number;
+            /**
+             * @description Default provenance of this region; nested region origins override it.
+             * @enum {string}
+             */
+            origin?: "native" | "transcription" | "interpretation" | "derived" | "estimated";
+            /**
+             * Format: int64
+             * @description Start UTF-8 byte offset in the containing page text; null when unmapped.
+             */
+            text_start?: number | null;
+            /**
+             * Format: int64
+             * @description Exclusive end UTF-8 byte offset in the containing page text.
+             */
+            text_end?: number | null;
+            /** @description Accepted subregions in the same source coordinate space and page text offsets. */
+            children?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Tables owned by this region, including cells and provenance. */
+            tables?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Structured output owned by this region. */
+            fields?: {
+                [key: string]: unknown;
+            } | null;
             /** @description Recognized text within the region */
             text: string;
-            /** @description Bounding box [x1, y1, x2, y2] in pixel coordinates */
-            bbox: number[];
+            /** @description Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests. Null when source geometry cannot be established, including unsupported vertical PDF writing. */
+            bbox: number[] | null;
             /** @description Recognition confidence score (0-1) */
             confidence?: number;
             /** @description Semantic label from layout analysis (e.g., text, title, table) */
             label?: string;
         };
         InferenceReadResult: {
+            /** @description Original document source ID. */
+            source_id?: string;
+            /** @description One-based original page or slide number. */
+            number?: number;
+            /** @enum {string} */
+            kind?: "page" | "slide" | "image";
+            /** @description Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved. */
+            inherited_parts?: {
+                [key: string]: unknown;
+            }[];
+            native_text?: string;
+            /** @description Speaker notes, separate from slide text. */
+            notes?: string;
+            /** @enum {string} */
+            status?: "complete" | "unresolved" | "truncated";
+            /**
+             * @description Default provenance for page text; mapped region origins override it.
+             * @enum {string}
+             */
+            origin?: "native" | "transcription" | "interpretation" | "derived" | "estimated";
+            /** @description Coordinate space of regions; PDF points, slide EMUs or image pixels. */
+            coordinate_space?: string;
+            /** @description Projective source transform. */
+            transform?: {
+                [key: string]: unknown;
+            };
+            /** @description Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI. */
+            raster_to_source?: {
+                [key: string]: unknown;
+            } | null;
+            /** @description Tables and cells in source coordinates with provenance. */
+            tables?: {
+                [key: string]: unknown;
+            }[];
+            findings?: string[];
             /**
              * @description Extracted text from the image
              * @example Invoice Total: $123.45
@@ -22736,7 +23270,7 @@ export interface components {
              */
             fields?: {
                 [key: string]: string;
-            };
+            } | null;
             /**
              * @description Individual text regions with bounding boxes and recognized text.
              *     Populated by multi-stage OCR models (Surya, PaddleOCR).
@@ -22751,6 +23285,14 @@ export interface components {
             object: "list";
             /** @description Read result objects, one per input image. */
             data: components["schemas"]["InferenceReadObject"][];
+            /** @description Versioned reading metadata containing status, source fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention handle. */
+            document?: {
+                [key: string]: unknown;
+            };
+            /** @description Bounded progress and audit events. These contain model names and source IDs, never credentials. */
+            events?: {
+                [key: string]: unknown;
+            }[];
             /** @description Name of model used for reading */
             model: string;
             usage?: components["schemas"]["InferenceGenerateUsage"];
@@ -23777,6 +24319,18 @@ export interface components {
             completion_tokens: number;
             /** @description Total tokens used (prompt + completion) */
             total_tokens: number;
+            /** @description Cumulative logical child invocations for a document run. */
+            model_calls?: number;
+            /** @description Physical child operation invocations, separate from logical composite calls. */
+            physical_model_calls?: number;
+            /** @description Cumulative rendered or decoded pixels charged by document work. */
+            rendered_pixels?: number;
+            /** @description Cumulative document text bytes charged before envelope serialization. */
+            output_bytes?: number;
+            /** @description Selected pages completed successfully. */
+            completed_pages?: number;
+            /** @description Selected pages visited, including unresolved work. */
+            visited_pages?: number;
             /** @description Prompt tokens served from inference-native prefix KV cache */
             cached_prompt_tokens?: number;
         };
@@ -24301,6 +24855,31 @@ export interface components {
             prompt_tokens: number;
             /** @description Total tokens used */
             total_tokens: number;
+        };
+        /** @description Durable document execution on the unified Antfly API. Requires configured durable job storage and local inference orchestration. The request uses the ordinary read or extract schema. Credentials must use server connections, environment variables, or secret references. */
+        InferenceDocumentJobRequest: {
+            request: {
+                [key: string]: unknown;
+            };
+            /** @default 86400 */
+            retention_seconds?: number;
+        };
+        InferenceDocumentJob: {
+            id: string;
+            /** @enum {string} */
+            operation: "read" | "extract";
+            /** @enum {string} */
+            state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            /** Format: int64 */
+            attempt: number;
+            /** Format: int64 */
+            sequence: number;
+            /** Format: int64 */
+            expires_at_ms: number;
+            usage: {
+                [key: string]: unknown;
+            };
+            error?: string;
         };
         InferenceSynthesisRequest: {
             /** @description Canonical synthesizers/name target or qualified connection model. */
@@ -29008,6 +29587,28 @@ export interface components {
          * @enum {integer}
          */
         ExtractionSchemaVersion: 1 | 2;
+        DocumentSource: {
+            /** @description Image-only perspective correction. Four clockwise corners in original image-edge pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original source coordinates. */
+            quadrilateral?: number[][];
+            /** @description Unique source identity within the request. Separate sources are never implicitly merged. */
+            id: string;
+            /** @description Inline data URI or location allowed by the deployment content security policy. */
+            url: string;
+            /** @enum {string} */
+            media_type: "application/pdf" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "image/png" | "image/jpeg" | "image/webp";
+            /** @description Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. */
+            pages?: number[];
+            /**
+             * @description Include slide speaker notes as separate evidence, never silently as visible slide text.
+             * @default false
+             */
+            include_notes?: boolean;
+            /**
+             * @description Include hidden slides.
+             * @default false
+             */
+            include_hidden?: boolean;
+        };
         ExtractionToken: {
             text: string;
             box?: number[];
@@ -29024,11 +29625,15 @@ export interface components {
             /** @description Version 2 only. Replaces the complete shared options; omitted fields use runtime defaults. */
             options?: components["schemas"]["ExtractionOptions"];
         };
-        /** @description Atomic extraction request. Every input is validated before inference; failures return no partial data. */
+        /** @description Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data. */
         ExtractionRequest: {
             model: string;
             schema_version?: components["schemas"]["ExtractionSchemaVersion"];
-            inputs: components["schemas"]["ExtractionInput"][];
+            /** @description Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process. */
+            read_artifact?: string;
+            /** @description Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping. */
+            documents?: components["schemas"]["DocumentSource"][];
+            inputs?: components["schemas"]["ExtractionInput"][];
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
@@ -36769,6 +37374,56 @@ export interface operations {
             };
         };
     };
+    listEntityResolverProgress: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityConsumerProgressPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     mergeEntity: {
         parameters: {
             query?: never;
@@ -37854,6 +38509,58 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListEntityResolverProgress: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityConsumerProgressPage"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -39849,6 +40556,98 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    executeReadDocumentRemote: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Document-Model": string;
+                /** @description Remaining physical model token ceiling for this attempt, independently enforced and measured by the executor. */
+                "X-Antfly-Document-Token-Budget": number;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Duplex framed checkpoint RPC and one terminal task response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    executeExtractDocumentRemote: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Document-Model": string;
+                /** @description Remaining physical model token ceiling for this attempt, independently enforced and measured by the executor. */
+                "X-Antfly-Document-Token-Budget": number;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Duplex framed checkpoint RPC and one terminal task response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -41895,6 +42694,494 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    createReadDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceDocumentJobRequest"];
+            };
+        };
+        responses: {
+            /** @description Durable job accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDocumentJob"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    getReadDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job status without source bytes or internal artifact references */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDocumentJob"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    resultReadDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Atomic final response; unavailable until the whole job succeeds */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    eventsReadDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    resumeReadDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Requeue an interrupted job without resetting its budget or retention */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDocumentJob"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    cancelReadDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Fence the current attempt and cancel the job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDocumentJob"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    createExtractDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceDocumentJobRequest"];
+            };
+        };
+        responses: {
+            /** @description Durable job accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDocumentJob"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    getExtractDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job status without source bytes or internal artifact references */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDocumentJob"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    resultExtractDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Atomic final response; unavailable until the whole job succeeds */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    eventsExtractDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    resumeExtractDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Requeue an interrupted job without resetting its budget or retention */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDocumentJob"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    cancelExtractDocumentJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Fence the current attempt and cancel the job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDocumentJob"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
             };
             /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {

@@ -4343,7 +4343,7 @@ fn openApiSortValueIsCursorReplayable(value: std.json.Value) bool {
         .float => |v| std.math.isFinite(v),
         .number_string => |text| openApiSortNumberStringIsCursorReplayable(text),
         .bool, .integer, .string => true,
-        .null => false,
+        .null => true,
         .array, .object => false,
     };
 }
@@ -13608,13 +13608,14 @@ fn consumerTests() type {
                 .sort_values = null_sort_values,
             };
             db_mod.resetLastSortRejectionDiagnostic();
-            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+            // The wire boundary validates replayable scalar shape; mapped
+            // admission has already enforced the field's explicit null policy.
+            var null_response = try encodeQueryResponses(alloc, "docs", .{
                 .order_by = &order_by,
-            }, .{}, null_sort));
-            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqualStrings("created_at", diagnostic.field);
-            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+            }, .{}, null_sort);
+            defer null_response.deinit(alloc);
+            try std.testing.expect(std.mem.indexOf(u8, null_response.json, "\"_sort\":[null,\"doc:a\"]") != null);
+            try std.testing.expect(db_mod.peekLastSortRejectionDiagnostic() == null);
 
             var non_finite = db_mod.types.SearchResult{
                 .alloc = alloc,
@@ -18014,17 +18015,16 @@ fn consumerTests() type {
             const alloc = std.testing.allocator;
 
             db_mod.resetLastSortRejectionDiagnostic();
-            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+            var nullable = try parseQueryRequest(alloc, null, "docs",
                 \\{
                 \\  "full_text_search": {"match":"raft","field":"body"},
                 \\  "order_by": [{"field":"created_at","desc":true}],
                 \\  "search_after": [null, "doc-9"]
                 \\}
-            ));
-            var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqualStrings("created_at", diagnostic.field);
-            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+            );
+            defer nullable.deinit(alloc);
+            try std.testing.expect(nullable.req.search_after[0] == .null);
+            try std.testing.expect(db_mod.peekLastSortRejectionDiagnostic() == null);
 
             try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
                 \\{
@@ -18042,7 +18042,7 @@ fn consumerTests() type {
                 \\  "search_after": ["high", "doc-9"]
                 \\}
             ));
-            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
             try std.testing.expectEqualStrings("_score", diagnostic.field);
             try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
             try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);

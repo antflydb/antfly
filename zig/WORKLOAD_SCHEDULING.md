@@ -17,9 +17,10 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The branch includes main through `d8344ac981` (#1303), integrated by `40bf358747`.
+The branch integrates main through `a507489e93` (#1330). The October 27 merge
+retains the bounded maintenance worker and main's newer document/resolver paths.
 
-Private native ABI 150 and kernel-owner ABI 210 fence the current manager,
+Private native ABI 151 and kernel-owner ABI 211 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
 retirement, allocator-host acquisition, publication-resource and registered source-ancestry and yieldable physical output retirement and registered writer-root contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;

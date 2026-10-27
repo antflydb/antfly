@@ -22,7 +22,7 @@ pub const version: u32 = 16;
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
 pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8 };
-pub const Operation = enum { initialize, configure, provider, http, reserve, retain, transfer, release, prompt_cache, tokenizer_cache, transient_host };
+pub const Operation = enum { initialize, configure, provider, http, reserve, retain, transfer, release, prompt_cache, tokenizer_cache, transient_host, document_store };
 pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = "" };
 pub const Event = struct {
     /// Absolute process-monotonic ceiling projected before the child callback.
@@ -177,6 +177,7 @@ pub const AttachmentRef = struct {
     page_number: ?u32,
 };
 pub const Provider = struct {
+    document_store: ?[16]u8 = null,
     operation: c_int,
     deadline_ns: ?u64,
     numeric: bool,
@@ -333,6 +334,7 @@ pub const ProviderOutput = struct {
 };
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Http = struct {
+    document_store: ?[16]u8 = null,
     streaming_body: bool = false,
     route: []const u8,
     method: http.HttpMethod,
@@ -510,6 +512,7 @@ test "inference worker HTTP requires valid scalar demand for acknowledged phases
     try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
 }
 
+pub const DocumentStoreRequest = struct { capability: [16]u8, metadata: []const u8 };
 test "native checkpoint worker streaming stays limited to exact POST resume routes" {
     inline for (.{ bridge.ai_api_prefix, bridge.public_api_prefix }) |prefix| {
         try std.testing.expect(nativeCheckpointResume(.post, prefix ++ "/generate/context/resume"));

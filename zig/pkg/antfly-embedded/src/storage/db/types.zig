@@ -2021,6 +2021,10 @@ pub const SearchRequest = struct {
     /// Strict score pruning only: equal scores retain their global tie chance.
     /// Never populated from public JSON or forwarded to count-only execution.
     minimum_competitive_score: ?f32 = null,
+    /// Borrowed coordinator winners in this request's sort domain. Native
+    /// ordered producers prune strictly worse primary tuples, retaining public
+    /// identity ties and exact bitmap totals. Never accepted from public JSON.
+    competitive_sort_boundary: []const std.json.Value = &.{},
     lake_read: ?struct {
         visibility: enum { accepted, published } = .accepted,
         through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
@@ -2255,6 +2259,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
     "minimum_competitive_score",
+    "competitive_sort_boundary",
     "text_navigation_plan",
     "text_pattern_programs",
     "text_pattern_membership",
@@ -3566,6 +3571,22 @@ pub const ReplayStageStats = struct {
     blocked: bool = false,
     blocked_reason: []const u8 = "",
     error_count: u64 = 0,
+};
+
+/// Selective replay proof; no unrelated index or maintenance health is read.
+pub const ResolverReplayObservation = struct {
+    backfill_pending: bool = false,
+    empty: bool = false,
+    resolution: ReplayStageStats = .{},
+    promotion: ReplayStageStats = .{},
+    pub fn applied(self: @This(), promote: bool) bool {
+        const curation = @import("resolver_curation.zig");
+        return !self.backfill_pending and curation.stageApplied(self.resolution, self.empty) and (!promote or curation.stageApplied(self.promotion, self.empty));
+    }
+    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        a.free(self.resolution.blocked_reason);
+        a.free(self.promotion.blocked_reason);
+    }
 };
 
 pub const ResolverReplayDiagnostic = struct {

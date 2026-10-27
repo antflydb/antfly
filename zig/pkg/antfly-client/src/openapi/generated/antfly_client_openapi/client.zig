@@ -237,6 +237,11 @@ pub const LookupNamespaceTableDocumentParams = struct {
     consistency: ?[]const u8 = null,
 };
 
+pub const NamespaceListEntityResolverProgressParams = struct {
+    limit: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
 pub const NamespaceUnmergeResolverKeyParams = struct {
     pin_distinct: ?[]const u8 = null,
 };
@@ -431,6 +436,11 @@ pub const ListDocumentArtifactManifestsParams = struct {
 pub const GetDocumentArtifactManifestParams = struct {
     /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
     detail: ?[]const u8 = null,
+};
+
+pub const ListEntityResolverProgressParams = struct {
+    limit: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
 };
 
 pub const GetLakeCommitOutcomeParams = struct {
@@ -705,6 +715,89 @@ pub const Client = struct {
         return ApiResponse(types.ExtractionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Execute a durable document task over a duplex persistence channel
+    /// POST /ai/v1/extract/execute
+    pub fn executeExtractDocumentRemote(self: *@This(), body: []const u8, x_antfly_document_model: []const u8, x_antfly_document_token_budget: []const u8) !RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/execute", .{self.base_url});
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "Content-Type", "application/octet-stream" });
+        try request_headers.append(self.allocator, .{ "X-Antfly-Document-Model", x_antfly_document_model });
+        try request_headers.append(self.allocator, .{ "X-Antfly-Document-Token-Budget", x_antfly_document_token_budget });
+        var resp = try self.http.post(url, .{ .body = body, .headers = request_headers.items });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Submit a durable extract job
+    /// POST /ai/v1/extract/jobs
+    pub fn createExtractDocumentJob(self: *@This(), body: types.InferenceDocumentJobRequest) !ApiResponse(types.InferenceDocumentJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get principal-scoped document job status
+    /// GET /ai/v1/extract/jobs/{job_id}
+    pub fn getExtractDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Fence the current attempt and cancel the job
+    /// POST /ai/v1/extract/jobs/{job_id}/cancel
+    pub fn cancelExtractDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}/cancel", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+    /// GET /ai/v1/extract/jobs/{job_id}/events
+    pub fn eventsExtractDocumentJob(self: *@This(), job_id: []const u8) !RawResponse {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}/events", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Atomic final response
+    /// GET /ai/v1/extract/jobs/{job_id}/result
+    pub fn resultExtractDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}/result", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Requeue an interrupted job without resetting its budget or retention
+    /// POST /ai/v1/extract/jobs/{job_id}/resume
+    pub fn resumeExtractDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}/resume", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
     /// Generate text using LLM (OpenAI-compatible)
     /// POST /ai/v1/generate
     pub fn generateContent(self: *@This(), body: types.InferenceGenerateRequest) !RawResponse {
@@ -818,6 +911,89 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceReadResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a durable document task over a duplex persistence channel
+    /// POST /ai/v1/read/execute
+    pub fn executeReadDocumentRemote(self: *@This(), body: []const u8, x_antfly_document_model: []const u8, x_antfly_document_token_budget: []const u8) !RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/execute", .{self.base_url});
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "Content-Type", "application/octet-stream" });
+        try request_headers.append(self.allocator, .{ "X-Antfly-Document-Model", x_antfly_document_model });
+        try request_headers.append(self.allocator, .{ "X-Antfly-Document-Token-Budget", x_antfly_document_token_budget });
+        var resp = try self.http.post(url, .{ .body = body, .headers = request_headers.items });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Submit a durable read job
+    /// POST /ai/v1/read/jobs
+    pub fn createReadDocumentJob(self: *@This(), body: types.InferenceDocumentJobRequest) !ApiResponse(types.InferenceDocumentJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get principal-scoped document job status
+    /// GET /ai/v1/read/jobs/{job_id}
+    pub fn getReadDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Fence the current attempt and cancel the job
+    /// POST /ai/v1/read/jobs/{job_id}/cancel
+    pub fn cancelReadDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}/cancel", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+    /// GET /ai/v1/read/jobs/{job_id}/events
+    pub fn eventsReadDocumentJob(self: *@This(), job_id: []const u8) !RawResponse {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}/events", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Atomic final response
+    /// GET /ai/v1/read/jobs/{job_id}/result
+    pub fn resultReadDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}/result", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Requeue an interrupted job without resetting its budget or retention
+    /// POST /ai/v1/read/jobs/{job_id}/resume
+    pub fn resumeReadDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}/resume", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
     }
 
     /// Rerank documents by relevance
@@ -2236,6 +2412,47 @@ pub const Client = struct {
         }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// List a bounded page of entity consumer replay progress
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/progress
+    pub fn namespaceListEntityResolverProgress(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: NamespaceListEntityResolverProgressParams) !ApiResponse(types.EntityConsumerProgressPage) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/entities/{s}/progress", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.EntityConsumerProgressPage).fromResponse(self.allocator, &resp);
     }
 
     /// list entity resolver state
@@ -3837,6 +4054,43 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List a bounded page of entity consumer replay progress
+    /// GET /db/v1/tables/{tableName}/entities/{key}/progress
+    pub fn listEntityResolverProgress(self: *@This(), table_name: []const u8, key: []const u8, params: ListEntityResolverProgressParams) !ApiResponse(types.EntityConsumerProgressPage) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/entities/{s}/progress", .{ self.base_url, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.EntityConsumerProgressPage).fromResponse(self.allocator, &resp);
     }
 
     /// list entity resolver state

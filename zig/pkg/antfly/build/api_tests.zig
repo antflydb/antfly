@@ -1193,7 +1193,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     inference_http_deadline_run.addArg("--require-no-skips");
     b.step("antfly-inference-http-deadline-test", "Verify inference HTTP native clock conversion and borrowed lifetime intersection")
         .dependOn(&inference_http_deadline_run.step);
-    const inference_phase_filters = [_][]const u8{ "runnable execution local provider", "runnable execution worker budget", "native checkpoint worker upload", "inference worker checkpoint upload" };
+    const inference_phase_filters = [_][]const u8{ "runnable execution local provider", "runnable execution worker budget", "native checkpoint worker upload", "inference worker checkpoint upload", "inference worker document capabilities" };
     const inference_phase_tests = b.addTest(.{
         .name = "inference-parent-phase-tests",
         .root_module = antfly_imports.inference_host,
@@ -4041,6 +4041,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")
         .dependOn(&b.addRunArtifact(controlled_service_lock_tests).step);
 
+    const metadata_codec_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata_codec_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, metadata_codec_root, true, true);
+    metadata_codec_root.addImport("antfly_source_root", metadata_codec_root);
+    const metadata_codec_tests = b.addTest(.{
+        .name = "metadata-wire-codec-tests",
+        .root_module = metadata_codec_root,
+        .filters = &.{"metadata raft apply store transition codec keeps published secrets distinct from restore staging"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const metadata_codec_run = b.addRunArtifact(metadata_codec_tests);
+    metadata_codec_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-wire-codec-test", "Verify published wire tags remain distinct from pooling extensions")
+        .dependOn(&metadata_codec_run.step);
     const maintenance_selection_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/maintenance_selection_test_root.zig"),
         .target = target,

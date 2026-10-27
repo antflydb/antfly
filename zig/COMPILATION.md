@@ -208,6 +208,46 @@ warm builds, then verifies these source changes:
 This expensive check runs with `zig-full / build-cache`. The lightweight
 configuration fixtures remain useful for option and generator dependencies.
 
+The native Linux audit has a separate scheduling envelope from production
+builds. [Run 40380791678](https://github.com/antflydb/antfly/actions/runs/40380791678)
+completed its cold build in 1,364.871 seconds (1,637.813 CPU seconds), with a
+7,656,402,944-byte peak summed process RSS. The preceding run timed out at
+1,800 seconds with a similar 7.47 GB peak. Both used the immutable Nix
+`3swwykg6la02jblm03z3s4fxhiqdmpsm-zig-0.17.0` compiler, linked to glibc.
+
+For that exact compiler on native x86_64 Linux, the audit tool explicitly
+selects baseline GNU Debug, stripped symbols, CPU inference, and Debug inference
+dependencies. Its overlay caps larger reservations at **9 GiB per compile**,
+retains smaller authored claims, and keeps the **20 GiB** aggregate admission
+budget and **two-job** limit. The cap is over 25% above the largest sampled
+whole-build process RSS. Two large claims leave **2 GiB** for ready auxiliary
+work, whose reservation can precede its actual execution. They also fit the
+host-aware fallback budget (80% of a 24 GiB pod).
+
+[Run 40395513767](https://github.com/antflydb/antfly/actions/runs/40395513767)
+qualified the compiler/profile selection and diagnostics but timed out at
+1,800 seconds. Its previous 10 GiB caps still spent most samples on one
+compiler; the final API archive completed just before the timeout, and the
+source-owner fixture had only started. Peak summed process RSS was
+7,477,886,976 bytes; sampled anonymous memory peaked at 6,827,483,136 bytes,
+file cache at 8,177,479,680 bytes, and total cgroup memory at 14.01 GiB.
+This was active compilation, not an OOM. The tighter 9 GiB envelope retains
+measured headroom while reserving space for auxiliary work; its paired timing
+and memory qualification is pending CI. It affects only the audit's transitive
+compilation graph, not production reservations. Other compiler derivations
+retain existing claims until measured. No runner capacity or timeout was
+increased.
+
+Audit reports retain periodic active-process CPU time, state, RSS, artifact
+name and source root (including Zig response files). A timeout captures this
+snapshot before killing the tree, because `wait4` cannot recover its child CPU
+accounting afterward. Full compiler command lines are not retained in these
+process snapshots. The successful job's cgroup peak was 21.07 GiB; cgroup
+usage also includes cached output pages and is not interchangeable with summed
+process RSS. Reports now sample anonymous, file, dirty-file, inactive-file,
+and kernel memory separately every 30 seconds so paired qualification can
+verify actual pressure within the unchanged 24 GiB pod limit.
+
 A matched native Darwin Debug experiment compared the test ownership split
 (`c50cc4b0c`) with its parent (`60ff56514`), before the subsequent main merge.
 It compiled four consumer families, their physical partitions, three owner
@@ -1796,3 +1836,51 @@ to that kernel high-water observation. Other profiles retain their authored
 reservations. The consumer and API storage-authority claims sum to 28.375 GiB
 and still fit the unchanged 28.8 GiB aggregate budget. The independently
 qualified CAPI physical partition retains its larger 17 GiB floor.
+
+### ARM64 Linux release API admission after document jobs
+
+Release run `40426894698` (source `9ace47d363`, the pinned glibc-linked Nix
+Zig 0.17.0, Linux x86-64 host, baseline ARM64 targets, stripped ReleaseFast)
+exceeded the API archive's 12 GiB scheduling reservation on both targets:
+
+| Target | Reported peak bytes | Reservation |
+| --- | ---: | ---: |
+| aarch64-linux-gnu.2.28 | 14,346,383,360 | 15 GiB |
+| aarch64-linux-musl | 13,929,717,760 | 15 GiB |
+
+The 15 GiB claim retains at least 10% headroom over both exact measurements.
+Together with the existing 4 GiB enrichment claim it still fits a 20 GiB
+compiler budget. Release builds retain their host/cgroup-aware aggregate budget. It applies only to the measured API configuration;
+native x86, Debug, unstripped, sanitized, Darwin and other runtime claims are
+unchanged. This avoids a full expensive API retry without serializing the
+entire build or increasing the runner's memory budget. The run also exposed
+missing compiled metadata job-state projections; those compilation errors are
+separate from memory admission.
+
+### Native Linux Debug auth admission (2026-10-27)
+
+Main run [40586926751](https://github.com/antflydb/antfly/actions/runs/40586926751)
+used Nix's glibc-linked Zig 0.17.0 on native x86_64 GNU Debug. Read-only
+2-second `/proc` sampling retained the compiler's `VmHWM` through completion:
+
+| Compilation owner | Observed high-water bytes | Old claim | New claim |
+|---|---:|---:|---:|
+| `api-auth-tests` | 15,804,899,328 | 7 GiB | 17 GiB |
+| `antfly-inference-core` | 9,540,190,208 | 12 GiB | unchanged |
+
+The auth object and inference compiler overlapped because their declared claims
+summed to 19 GiB under the 20 GiB admission budget. The 24 GiB pod's cgroup peak
+reached 25,769,779,200 bytes. Auth's new floor rounds its observed high-water
+mark plus 10% up to a whole GiB. The runner and aggregate budget are unchanged:
+auth can still overlap 3 GiB of smaller work, while its unsafe overlap with the
+12 GiB inference compiler is excluded. Other owners and optimization/target
+profiles retain their claims. This is an admission correction, not a reduction
+in the compiler's own memory use.
+
+The preceding main unit runner in run
+[40566906276](https://github.com/antflydb/antfly/actions/runs/40566906276)
+reported lost communication. GKE's retained pod deletion status identifies an
+`OOMKilled` termination (exit 137) at 19:41:11 UTC against the same 24 GiB
+container limit; this was not merely a GitHub runner connectivity failure.
+Sampling the next run identifies the auth underclaim directly, rather than
+attributing a vanished runner to a test assertion or increasing runner size.

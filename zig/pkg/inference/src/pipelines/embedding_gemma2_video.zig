@@ -5152,6 +5152,9 @@ test "embeddinggemma2 video ordered cohort publishes headers before waiting for 
     borrowed.packets = &packets;
     borrowed.track.timescale = 1;
     const configuration = Configuration{ .sampling = .{ .timestamps = .{ .end_ns = 12 * std.time.ns_per_s, .step_ns = std.time.ns_per_s, .max_frames = 12 } } };
+    var first_wake: std.Io.Event = .unset;
+    var second_wake: std.Io.Event = .unset;
+    var independent_wake: std.Io.Event = .unset;
     const first = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, configuration);
     var second: ?*Prefetch = null;
     defer {
@@ -5165,27 +5168,32 @@ test "embeddinggemma2 video ordered cohort publishes headers before waiting for 
         first.deinit();
         if (second) |producer| producer.deinit();
     }
-    var polls: usize = 0;
-    while (first.published.load(.acquire) < 9 and polls < 1000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    try std.testing.expect(first.published.load(.acquire) >= 9);
+    const Ready = struct {
+        fn wait(producer: *Prefetch, wake: *std.Io.Event, count: usize) !void {
+            producer.wake.store(wake, .release);
+            while (true) {
+                wake.reset();
+                if (producer.published.load(.acquire) >= count) return;
+                try std.testing.expect(!producer.finished.isSet());
+                try wake.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+            }
+        }
+    };
+    // Readiness is signaled by publication, rather than a scheduler-dependent
+    // polling deadline. Wake storage outlives every joined producer.
+    try Ready.wait(first, &first_wake, 9);
     var next = configuration;
     next.predecessor = first;
     second = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, next);
     var header: [1]Prefetch.Job = undefined;
-    polls = 0;
-    var count: usize = 0;
-    while (count == 0 and polls < 1000) : (polls += 1) {
-        count = try second.?.header_queue.getUncancelable(std.testing.io, &header, 0);
-        if (count == 0) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    }
+    try Ready.wait(second.?, &second_wake, 1);
+    const count = try second.?.header_queue.getUncancelable(std.testing.io, &header, 0);
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(usize, 12), header[0].header.len);
     // An independent decoder does not inherit the full first row's dependency.
     const independent = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, configuration);
     defer independent.deinit();
-    polls = 0;
-    while (independent.published.load(.acquire) < 2 and polls < 1000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    try std.testing.expect(independent.published.load(.acquire) >= 2);
+    try Ready.wait(independent, &independent_wake, 2);
     try std.testing.expectEqual(@as(usize, 1), second.?.published.load(.acquire));
 }
 

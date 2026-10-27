@@ -4,6 +4,39 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Main integration for production pooling (2026-10-27)
+
+The integration target is `a507489e93` (#1330), with the bounded maintenance
+worker milestone retained. Merge resolutions preserve deadline/cancellation
+controls together with original scan execution waits and checked callback error
+translation. Inference lock polling retains the original CPU wait boundary;
+asset producers borrow main's stable provider runtime and retain request-local
+runnable authority. Shared embedding, generation and asset clients again enforce
+the pooling branch's 20-active/5-per-endpoint bounds after main's client refactor.
+A saturation test uses the actual shared clients, refuses an extra endpoint at
+capacity and admits it after release. Python typed lookup/OCC and mutation
+outcomes retain bounded transport and post-admission encoding.
+
+Published main wire values are preserved. Resolver pin readers remain version
+23; branch preparation/replay/read feature epochs move to 24–28. Main's document
+job tag 79 and resolver tag 80 remain unchanged; the branch-only remote journal
+command moves to tag 81 and topology capability 63, above main's capability 62.
+Document inference operations retain IDs 23/24; branch JSON operations use 25/26.
+The merged private contracts are native 151, storage owner 211, control API 62,
+failure ABI 68 and inference bridge 46. Public/durable main encodings are not
+renumbered. Branch-only unpublished feature epochs are intentionally distinct.
+
+Native allocator proof windows retain main's optional read coalescing. Admitted
+reads keep their existing bounded IO path and original control; optional cache
+reuse cannot bypass admission. Ordered lake scans retain execution binding and
+main's physical-direction/public-tie handling and complete filter proof; native
+text scoring retains main's exact selected-page proof.
+
+This milestone integrates current main into the production paths already enabled
+on this branch. Funded opening, normal retained flush/compaction adoption,
+complete operator/distributed ownership and broader default-policy proof remain
+open. Full qualification remains waived; focused production checks are required.
+
 ## Bounded production table selection (2026-10-26)
 
 The production storage-owner selector now limits each candidate-selection

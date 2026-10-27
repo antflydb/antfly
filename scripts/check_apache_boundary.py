@@ -62,6 +62,7 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_media": ("zig/lib/media/src/mod.zig",),
     "antfly_video": ("zig/lib/video/src/mod.zig",),
     "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),
@@ -154,10 +155,17 @@ SOURCE_MODULES = {
     "antfly_decision_evidence": ("zig/lib/decisions/evidence.zig",),
     "antfly_source_evidence": ("zig/lib/source_evidence/root.zig",),
     "antfly_decisions": ("zig/lib/decisions/root.zig",),
+    "antfly_cloudflare": ("zig/lib/cloudflare/root.zig",),
+    "antfly_cloudflare_config": ("zig/lib/cloudflare/routing.zig",),
+    "cloudflare_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig",
+    ),
     "antfly_structured": ("zig/lib/structured/root.zig",),
     "antfly_decision_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
     ),
+    "antfly_documents": ("zig/lib/documents/src/root.zig",),
+    "antfly_document_runs": ("zig/lib/readers/src/document_runs.zig",),
     "antfly_embeddings_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/root.zig",
     ),
@@ -241,6 +249,7 @@ SOURCE_MODULES = {
     "antfly_query_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_query_openapi/root.zig",
     ),
+    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),

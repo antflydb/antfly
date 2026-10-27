@@ -27,8 +27,10 @@ import argparse
 from collections import deque
 import json
 import os
+import platform
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -133,11 +135,17 @@ def control_catalog_contents() -> str:
         return False
 
     output = []
+    names = set()
     for line in (local / "source_catalog.zig").read_text().splitlines(keepends=True):
         declaration = re.fullmatch(
-            r'pub const \w+ = @import\("([^"\n]+\.zig)"\);\n?', line
+            r'pub const (?P<name>\w+) = @import\("(?P<path>[^"\n]+\.zig)"\);\n?', line
         )
-        if declaration and requires_physical((local / declaration[1]).resolve()):
+        if declaration:
+            name = declaration["name"]
+            if name in names:
+                raise ValueError(f"duplicate source catalog entry: {name}")
+            names.add(name)
+        if declaration and requires_physical((local / declaration["path"]).resolve()):
             continue
         output.append(line)
     output.insert(
@@ -167,6 +175,136 @@ def tree_rss(snapshot: str, root_pid: int) -> tuple[int, int]:
     return sum(sizes), max(sizes, default=0)
 
 
+def process_diagnostics(
+    snapshot: str, root_pid: int, cwd: Path | None = None
+) -> list[dict]:
+    """Attribute stalled work without retaining enormous compiler command lines."""
+    processes = {}
+    for line in snapshot.splitlines():
+        fields = line.split(None, 6)
+        if len(fields) != 7:
+            continue
+        pid, parent, rss, elapsed, cpu, state, command = fields
+        try:
+            processes[int(pid)] = (
+                int(parent),
+                int(rss) * 1024,
+                elapsed,
+                cpu,
+                state,
+                command,
+            )
+        except ValueError:
+            continue
+    descendants = {root_pid}
+    while True:
+        added = {pid for pid, row in processes.items() if row[0] in descendants}
+        if added <= descendants:
+            break
+        descendants |= added
+    result = []
+    for pid in sorted(descendants & processes.keys()):
+        parent, rss, elapsed, cpu, state, command = processes[pid]
+        try:
+            arguments = shlex.split(command)
+        except ValueError:
+            arguments = command.split()
+        expanded = []
+        for argument in arguments:
+            if (
+                cwd is not None
+                and argument.startswith("@")
+                and Path(arguments[0]).name == "zig"
+            ):
+                response = cwd / argument[1:]
+                try:
+                    if response.stat().st_size <= 4 * 1024 * 1024:
+                        expanded.extend(shlex.split(response.read_text()))
+                        continue
+                except (OSError, UnicodeError, ValueError):
+                    pass
+            expanded.append(argument)
+        artifact = None
+        if "--name" in expanded:
+            index = expanded.index("--name") + 1
+            if index < len(expanded):
+                artifact = expanded[index]
+        source = next(
+            (arg[len("-Mroot=") :] for arg in expanded if arg.startswith("-Mroot=")),
+            None,
+        )
+        result.append(
+            {
+                "pid": pid,
+                "parent_pid": parent,
+                "rss_bytes": rss,
+                "elapsed": elapsed,
+                "cpu_time": cpu,
+                "state": state,
+                "executable": Path(command.split()[0]).name,
+                "artifact": artifact,
+                "source_root": source,
+            }
+        )
+    return result
+
+
+def active_build_processes(root_pid: int, cwd: Path) -> list[dict]:
+    try:
+        snapshot = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid=,rss=,etime=,time=,state=,args="],
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return process_diagnostics(snapshot, root_pid, cwd)
+
+
+# Immutable Nix compiler from native run 40380791678 (glibc-linked Zig 0.17.0).
+# Its complete stripped Debug audit peaked at 7,656,402,944 bytes for the whole
+# process tree. The audit-only 9 GiB cap retains >25% above that sampled peak
+# and leaves 2 GiB for auxiliary claims inside the existing 20 GiB budget.
+# A different derivation must be measured before opting into this profile.
+QUALIFIED_AUDIT_COMPILER = Path(
+    "/nix/store/3swwykg6la02jblm03z3s4fxhiqdmpsm-zig-0.17.0/bin/zig"
+)
+
+
+def qualified_audit_memory(zig: str, jobs: int = 2) -> bool:
+    if jobs != 2 or sys.platform != "linux" or platform.machine() != "x86_64":
+        return False
+    executable = shutil.which(zig)
+    return (
+        executable is not None
+        and Path(executable).resolve() == QUALIFIED_AUDIT_COMPILER
+    )
+
+
+def cgroup_memory_stat() -> dict[str, int]:
+    """Separate anonymous compiler memory from reclaimable cached file pages."""
+    if sys.platform != "linux":
+        return {}
+    try:
+        fields = dict(
+            line.split()
+            for line in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines()
+        )
+        return {
+            key: int(fields[key])
+            for key in (
+                "anon",
+                "file",
+                "file_mapped",
+                "file_dirty",
+                "inactive_file",
+                "kernel",
+            )
+            if key in fields
+        }
+    except (OSError, ValueError):
+        return {}
+
+
 def bounded_build_command(zig: str, arguments: list[str]) -> list[str]:
     return [
         sys.executable,
@@ -184,11 +322,44 @@ def write_report(path: Path, records: list[dict]) -> None:
     temporary.replace(path)
 
 
+class CompilerWatchdog:
+    """Bound each compiler and idle orchestration, independent of graph size."""
+
+    def __init__(self, seconds: float, started: float):
+        self.seconds = seconds
+        self.last_work = started
+        self.first_seen: dict[int, float] = {}
+
+    def expired(self, now: float, processes: list[dict]) -> bool:
+        compilers = [p for p in processes if p.get("executable") == "zig"]
+        live = {p["pid"] for p in compilers}
+        self.first_seen = {
+            pid: start for pid, start in self.first_seen.items() if pid in live
+        }
+        if compilers:
+            self.last_work = now
+        for process in compilers:
+            started = self.first_seen.setdefault(process["pid"], now)
+            elapsed = process.get("elapsed", "")
+            try:
+                days, _, clock = elapsed.rpartition("-")
+                seconds = 0
+                for component in clock.split(":"):
+                    seconds = seconds * 60 + int(component)
+                seconds += int(days or 0) * 86400
+            except ValueError:
+                seconds = now - started
+            if seconds >= self.seconds:
+                return True
+        return not compilers and now - self.last_work >= self.seconds
+
+
 def measured_build(
     command: list[str],
     cwd: Path,
     *,
     timeout_seconds: float = 1800,
+    compiler_timeout_seconds: float | None = None,
     progress=None,
     env=None,
 ) -> tuple[int, str, dict]:
@@ -197,7 +368,15 @@ def measured_build(
     peak_tree = peak_process = samples = 0
     min_disk_free = shutil.disk_usage(cwd).free
     timed_out = False
+    active_processes = []
+    cgroup = {}
+    peak_anon = peak_file = None
     last_report = started
+    watchdog = (
+        CompilerWatchdog(compiler_timeout_seconds, started)
+        if compiler_timeout_seconds is not None
+        else None
+    )
     with tempfile.TemporaryFile(mode="w+") as output:
         process = subprocess.Popen(
             command,
@@ -217,6 +396,9 @@ def measured_build(
                 now = time.monotonic()
                 if not timed_out and now - started > timeout_seconds:
                     timed_out = True
+                    # Capture before killing: wait4 cannot recover compiler CPU
+                    # clocks or the active artifact after its parent is killed.
+                    active_processes = active_build_processes(process.pid, cwd)
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -231,7 +413,26 @@ def measured_build(
                 min_disk_free = min(min_disk_free, shutil.disk_usage(cwd).free)
                 samples += 1
                 if now - last_report >= 30:
+                    cgroup = cgroup_memory_stat()
+                    if "anon" in cgroup:
+                        peak_anon = max(peak_anon or 0, cgroup["anon"])
+                    if "file" in cgroup:
+                        peak_file = max(peak_file or 0, cgroup["file"])
+                    if not timed_out:
+                        active_processes = active_build_processes(process.pid, cwd)
+                        if watchdog is not None and watchdog.expired(
+                            now, active_processes
+                        ):
+                            timed_out = True
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
                     current = {
+                        "active_processes": active_processes,
+                        "cgroup_memory_stat": cgroup,
+                        "peak_sampled_cgroup_anon_bytes": peak_anon,
+                        "peak_sampled_cgroup_file_bytes": peak_file,
                         "wall_seconds": round(now - started, 3),
                         "peak_build_tree_rss_bytes": peak_tree,
                         "peak_process_rss_bytes": peak_process,
@@ -258,12 +459,19 @@ def measured_build(
                 "wall_seconds": round(time.monotonic() - started, 3),
                 "cpu_seconds": round(usage.ru_utime + usage.ru_stime, 3),
                 "cpu_accounting_complete": not timed_out,
+                "active_processes": active_processes,
+                "cgroup_memory_stat": cgroup,
+                "peak_sampled_cgroup_anon_bytes": peak_anon,
+                "peak_sampled_cgroup_file_bytes": peak_file,
+                "cgroup_sample_interval_seconds": 30,
                 "peak_build_tree_rss_bytes": peak_tree,
                 "peak_process_rss_bytes": peak_process,
                 "rss_samples": samples,
                 "rss_sample_interval_seconds": 0.25,
                 "min_disk_free_bytes": min(min_disk_free, shutil.disk_usage(cwd).free),
                 "timed_out": timed_out,
+                "build_timeout_seconds": timeout_seconds,
+                "compiler_timeout_seconds": compiler_timeout_seconds,
             },
         )
 
@@ -345,6 +553,7 @@ def main() -> None:
             )
         return
     records = []
+    measured_memory = qualified_audit_memory(args.zig, args.jobs)
     if args.jobs <= 0:
         parser.error("--jobs must be positive")
 
@@ -460,9 +669,23 @@ def main() -> None:
                 "--cache-dir",
                 str(local_cache),
             ]
+            if measured_memory:
+                # Keep every qualified axis explicit; other compiler/profile
+                # combinations retain the production reservations unchanged.
+                arguments.extend(
+                    [
+                        "-Dnative-linux-ownership-memory=true",
+                        "-Dcpu=baseline",
+                        "-Dcuda=false",
+                        "-Dinference-optimize=debug",
+                    ]
+                )
             command = bounded_build_command(args.zig, arguments)
             record = {
                 "case": label,
+                "memory_profile": "nix-glibc-0.17-stripped-debug"
+                if measured_memory
+                else "production",
                 "status": "running",
                 "command": command,
                 "disk_free_before_bytes": shutil.disk_usage(work).free,
@@ -480,6 +703,13 @@ def main() -> None:
                     root / "zig",
                     progress=progress,
                     env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(global_cache)},
+                    # The cold graph has several independent archives and
+                    # owner/consumer executables. A newly started compiler is
+                    # not stalled because earlier units consumed 30 minutes.
+                    # Keep the original bound per compiler/idle period, plus
+                    # an absolute one-hour bound for the complete cold graph.
+                    timeout_seconds=3600 if label.endswith("cold") else 1800,
+                    compiler_timeout_seconds=1800,
                 )
             except BaseException as err:
                 record.update(status="interrupted", error=type(err).__name__)
@@ -503,7 +733,7 @@ def main() -> None:
             if returncode:
                 if measurements["timed_out"]:
                     print(
-                        f"{label}: production compilation exceeded 30 minutes",
+                        f"{label}: production compilation exceeded its build or compiler deadline",
                         flush=True,
                     )
                 # Zig's failed compiler command can span hundreds of KB.

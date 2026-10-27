@@ -44,6 +44,7 @@ pub const ObjectStorageLocation = types.ObjectStorageLocation;
 pub const PgwireConfig = types.PgwireConfig;
 pub const QueryAdmissionConfig = types.QueryAdmissionConfig;
 pub const QueryAdmissionWaiting = types.QueryAdmissionWaiting;
+pub const RewriterConfig = types.RewriterConfig;
 pub const RunnableSchedulingConfig = types.RunnableSchedulingConfig;
 pub const RuntimeTaskBinding = types.RuntimeTaskBinding;
 pub const S3ExternalIoConfig = types.S3ExternalIoConfig;

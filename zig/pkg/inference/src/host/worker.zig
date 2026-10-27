@@ -20,6 +20,7 @@ const rpc = @import("antfly_inference_worker_rpc");
 pub const wire = @import("antfly_inference_worker_wire");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
+const document_abi = @import("antfly_runtime_abi").document_abi;
 const host = @import("host.zig");
 const platform = @import("antfly_platform");
 const worker_lifetime = @import("worker_lifetime.zig");
@@ -193,7 +194,10 @@ pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeCont
         .phase_handoff = context.runnable != null,
     };
     try ForwardControl.check(&control);
-    const input = try wire.ProviderInput.init(arena.allocator(), context);
+    const document_key = try client.registerDocumentStore(context.document_store);
+    defer if (document_key) |key| client.unregisterDocumentStore(key);
+    var input = try wire.ProviderInput.init(arena.allocator(), context);
+    input.options.document_store = document_key;
     const data = try std.json.Stringify.valueAlloc(arena.allocator(), input.options, .{});
     const response = client.invokePayload(.provider, data, .{ .body_segments = input.body.segments }, control.view()) catch |err| {
         // A canceled or disconnected child can stop while parked. Reacquire
@@ -323,7 +327,10 @@ fn invokeHttpOwned(client: *Client, route: []const u8, context: *const bridge.Ht
     const params = try alloc.alloc(wire.Header, context.request.params_len);
     const source_params = if (context.request.params_ptr) |ptr| ptr[0..context.request.params_len] else &.{};
     for (source_params, params) |param, *out| out.* = .{ .name = param.name.slice(), .value = param.value.slice() };
+    const document_key = try client.registerDocumentStore(context.document_store);
+    defer if (document_key) |key| client.unregisterDocumentStore(key);
     const data = try std.json.Stringify.valueAlloc(alloc, wire.Http{
+        .document_store = document_key,
         .route = route,
         .method = context.request.method,
         .path = context.request.path.slice(),
@@ -393,6 +400,37 @@ pub const Client = struct {
     worker_baseline: u64 = 0,
     configuration_allocator: ?std.mem.Allocator = null,
     bootstrap_allocator: ?std.mem.Allocator = null,
+    document_mutex: std.Io.Mutex = .init,
+    document_bindings: std.AutoHashMapUnmanaged([16]u8, bridge.DocumentStoreView) = .empty,
+
+    fn registerDocumentStore(self: *Client, view: bridge.DocumentStoreView) !?[16]u8 {
+        if (view.context == null) return null;
+        try view.retain();
+        errdefer view.release();
+        self.document_mutex.lockUncancelable(self.io);
+        defer self.document_mutex.unlock(self.io);
+        if (self.document_bindings.count() >= 128) return error.ResourceLimitExceeded;
+        var key: [16]u8 = undefined;
+        while (true) {
+            try self.io.randomSecure(&key);
+            if (!self.document_bindings.contains(key)) break;
+        }
+        try self.document_bindings.put(self.alloc, key, view);
+        return key;
+    }
+    fn unregisterDocumentStore(self: *Client, key: [16]u8) void {
+        self.document_mutex.lockUncancelable(self.io);
+        const entry = self.document_bindings.fetchRemove(key);
+        self.document_mutex.unlock(self.io);
+        if (entry) |removed| removed.value.release();
+    }
+    fn borrowDocumentStore(self: *Client, key: [16]u8) !bridge.DocumentStoreView {
+        self.document_mutex.lockUncancelable(self.io);
+        defer self.document_mutex.unlock(self.io);
+        const view = self.document_bindings.get(key) orelse return error.DocumentRunLeaseLost;
+        try view.retain();
+        return view;
+    }
 
     pub fn create(alloc: std.mem.Allocator, io: std.Io, context: *const bridge.CreateContext) !*Client {
         const parent = context.bootstrap_memory_parent orelse return error.ResourceOwnerNotConfigured;
@@ -472,6 +510,8 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         std.debug.assert(self.active == 0);
+        std.debug.assert(self.document_bindings.count() == 0);
+        self.document_bindings.deinit(self.alloc);
         if (self.worker) |worker| worker.destroy();
         const configuration_allocator = self.configuration_allocator orelse self.bootstrap_allocator orelse self.alloc;
         configuration_allocator.free(self.create_json);
@@ -542,7 +582,7 @@ pub const Client = struct {
                 .input = child.stdout.?,
                 .output = child.stdin.?,
                 .context = worker,
-                .handler = Worker.rejectRequest,
+                .handler = Worker.documentRequest,
                 .resource_handler = Worker.resourceRequest,
                 .on_closed = Worker.closed,
                 .next_id = 1,
@@ -828,8 +868,19 @@ const Worker = struct {
         }
     }
 
-    fn rejectRequest(_: *anyopaque, _: *rpc.Request) !rpc.OwnedPayload {
-        return error.UnsupportedOperation;
+    fn documentRequest(raw: *anyopaque, request: *rpc.Request) !rpc.OwnedPayload {
+        const self: *Worker = @ptrCast(@alignCast(raw));
+        var arena = std.heap.ArenaAllocator.init(self.owner.alloc);
+        defer arena.deinit();
+        const envelope = try requestEnvelope(arena.allocator(), request);
+        if (envelope.operation != .document_store) return error.UnsupportedOperation;
+        const incoming = try std.json.parseFromSliceLeaky(wire.DocumentStoreRequest, arena.allocator(), envelope.options, .{});
+        const view = self.owner.borrowDocumentStore(incoming.capability) catch |err| return reply(&self.endpoint, bridge.statusFromError(err), "", "");
+        defer view.release();
+        var result: document_abi.Response = .{};
+        const status = view.invoke.?(view.context.?, .init(incoming.metadata), .init(envelope.data), &result);
+        defer view.destroy(result);
+        return reply(&self.endpoint, status, result.metadata.slice(), result.body.slice());
     }
 
     fn resourceRequest(raw: *anyopaque, bytes: []const u8) !rpc.ResourceReply {
@@ -1069,6 +1120,8 @@ const Child = struct {
                     if (source.attachment_index >= payloads.len) return error.InvalidInput;
                     ref.* = .{ .attachment_index = source.attachment_index, .item_index = source.item_index, .item_id = .init(source.item_id), .source_fingerprint = .init(source.source_fingerprint), .page_number = source.page_number orelse 0, .has_page_number = @intFromBool(source.page_number != null) };
                 }
+                const documents = if (provider.document_store) |key| try ForwardDocuments.create(self, key) else null;
+                defer if (documents) |binding| binding.view().release();
                 var response_handle: ?*anyopaque = null;
                 var response: bridge.String = undefined;
                 var numeric: bridge.NumericResult = .{};
@@ -1096,6 +1149,7 @@ const Child = struct {
                     .attachment_refs_len = refs.len,
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
                     .progress = .{ .context = request, .update_progress = progress },
+                    .document_store = if (documents) |binding| binding.view() else .{},
                 });
                 // A backend may catch a lock/resume error. It must never turn
                 // a denied physical grant into a successful published result.
@@ -1137,6 +1191,8 @@ const Child = struct {
                     .params_len = params.len,
                     .body = .init(body),
                 };
+                const documents = if (incoming.document_store) |key| try ForwardDocuments.create(self, key) else null;
+                defer if (documents) |binding| binding.view().release();
                 var response_handle: ?*anyopaque = null;
                 var response: http.HttpResponseView = undefined;
                 defer if (response_handle) |handle| host.linkedInferenceDestroyHttpResponse(handle);
@@ -1150,6 +1206,7 @@ const Child = struct {
                     .abi_version = bridge.abi_version,
                     .route_handle = route_handle,
                     .request = &view,
+                    .document_store = if (documents) |binding| binding.view() else .{},
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
                     .body_source = if (incoming.stream_body) .{ .context = &streamed_body, .read = NativeHttpBody.read, .read_controlled = NativeHttpBody.readControlled, .streaming = 1 } else if (incoming.streaming_body) .{ .context = request, .streaming = 1, .read = readBody, .read_controlled = readBodyControlled, .read_all = readAllBody } else .{},
                     .stream = .{ .context = request, .start = streamStart, .write = streamWrite, .close = streamClose, .start_controlled = streamStartControlled, .write_controlled = streamWriteControlled, .close_controlled = streamCloseControlled },
@@ -1497,7 +1554,7 @@ test "inference worker retains reservations until reaped cleanup and owns partia
     var worker: Worker = .{
         .owner = &client,
         .child = undefined,
-        .endpoint = .{ .alloc = alloc, .io = std.testing.io, .input = undefined, .output = undefined, .context = undefined, .handler = Worker.rejectRequest, .resource_handler = Worker.resourceRequest, .on_closed = Worker.closed, .next_id = 1 },
+        .endpoint = .{ .alloc = alloc, .io = std.testing.io, .input = undefined, .output = undefined, .context = undefined, .handler = Worker.documentRequest, .resource_handler = Worker.resourceRequest, .on_closed = Worker.closed, .next_id = 1 },
     };
     worker.metadata_budget = try Worker.createMetadataBudget(alloc, client.budget.?);
     defer worker.metadata_budget.?.releaseOwner();
@@ -3046,4 +3103,97 @@ test "inference worker checkpoint upload feeds incremental HTTP reads and recove
     try std.testing.expectEqual(@as(u64, 100123), std.mem.readInt(u64, recovery.view().body[0..8], .little));
     try std.testing.expect(!fixture.parent.closed.load(.acquire));
     try std.testing.expect(!fixture.child.closed.load(.acquire));
+}
+
+/// No borrowed root-request pointer enters this retained forwarding context.
+/// Structured inference work drains before the root call returns; cancellation
+/// may invalidate its parent capability while an already-borrowed call finishes.
+const ForwardDocuments = struct {
+    child: *Child,
+    key: [16]u8,
+    references: std.atomic.Value(usize) = .init(1),
+    fn create(child: *Child, key: [16]u8) !*ForwardDocuments {
+        const self = try child.alloc.create(ForwardDocuments);
+        self.* = .{ .child = child, .key = key };
+        return self;
+    }
+    fn view(self: *ForwardDocuments) bridge.DocumentStoreView {
+        return .{ .context = self, .retain_context = retain, .release_context = release, .invoke = invoke, .destroy_response = destroyResponse };
+    }
+    fn retain(raw: *anyopaque) callconv(.c) u8 {
+        const self: *ForwardDocuments = @ptrCast(@alignCast(raw));
+        _ = self.references.fetchAdd(1, .monotonic);
+        return 1;
+    }
+    fn release(raw: *anyopaque) callconv(.c) void {
+        const self: *ForwardDocuments = @ptrCast(@alignCast(raw));
+        if (self.references.fetchSub(1, .acq_rel) == 1) self.child.alloc.destroy(self);
+    }
+    const Response = struct { payload: rpc.OwnedPayload, parsed: std.json.Parsed(wire.Reply) };
+    fn invoke(raw: *anyopaque, metadata: http.Bytes, body: http.Bytes, out: *document_abi.Response) callconv(.c) bridge.Status {
+        const self: *ForwardDocuments = @ptrCast(@alignCast(raw));
+        out.* = .{};
+        self.call(metadata.slice(), body.slice(), out) catch |err| return bridge.statusFromErrorWithFallback(err, error.InferenceWorkerUnavailable);
+        return .ok;
+    }
+    fn call(self: *ForwardDocuments, metadata: []const u8, body: []const u8, out: *document_abi.Response) !void {
+        const a = self.child.alloc;
+        const options = try std.json.Stringify.valueAlloc(a, wire.DocumentStoreRequest{ .capability = self.key, .metadata = metadata }, .{});
+        defer a.free(options);
+        const payload = try callSegments(&self.child.endpoint, .document_store, options, .{ .body = body }, .{});
+        errdefer payload.deinit();
+        var parsed = try std.json.parseFromSlice(wire.Reply, a, payload.view().metadata, .{});
+        errdefer parsed.deinit();
+        const response = try a.create(Response);
+        response.* = .{ .payload = payload, .parsed = parsed };
+        _ = retain(self);
+        out.* = .{ .handle = response, .metadata = .init(parsed.value.options), .body = .init(payload.view().body) };
+    }
+    fn destroyResponse(raw: *anyopaque, handle: *anyopaque) callconv(.c) void {
+        const self: *ForwardDocuments = @ptrCast(@alignCast(raw));
+        const response: *Response = @ptrCast(@alignCast(handle));
+        response.parsed.deinit();
+        response.payload.deinit();
+        self.child.alloc.destroy(response);
+        release(raw);
+    }
+};
+
+test "inference worker document capabilities revoke new borrows while preserving in-flight ownership" {
+    const Owner = struct {
+        references: usize = 1,
+        fn retain(raw: *anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return 1;
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn invoke(_: *anyopaque, metadata: http.Bytes, body: http.Bytes, out: *document_abi.Response) callconv(.c) bridge.Status {
+            out.* = .{ .metadata = metadata, .body = body };
+            return .ok;
+        }
+        fn destroy(_: *anyopaque, _: *anyopaque) callconv(.c) void {}
+    };
+    var owner = Owner{};
+    var client = Client{ .alloc = std.testing.allocator, .io = std.testing.io, .create_json = undefined, .environment = undefined };
+    defer client.document_bindings.deinit(std.testing.allocator);
+    const view: bridge.DocumentStoreView = .{ .context = &owner, .retain_context = Owner.retain, .release_context = Owner.release, .invoke = Owner.invoke, .destroy_response = Owner.destroy };
+    const token = (try client.registerDocumentStore(view)).?;
+    const active = try client.borrowDocumentStore(token);
+    try std.testing.expectEqual(@as(usize, 3), owner.references);
+    client.unregisterDocumentStore(token);
+    try std.testing.expectError(error.DocumentRunLeaseLost, client.borrowDocumentStore(token));
+    try std.testing.expectEqual(@as(usize, 2), owner.references);
+    var response: document_abi.Response = .{};
+    const status = active.invoke.?(active.context.?, .init("metadata"), .init("raw checkpoint bytes"), &response);
+    try std.testing.expect(status.isOk());
+    try std.testing.expectEqualStrings("raw checkpoint bytes", response.body.slice());
+    active.destroy(response);
+    active.release();
+    try std.testing.expectEqual(@as(usize, 1), owner.references);
+    Owner.release(&owner);
+    try std.testing.expectEqual(@as(usize, 0), owner.references);
 }

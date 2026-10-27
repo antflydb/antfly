@@ -17,7 +17,7 @@
 //! Keep this module free of storage, inference, and control-runtime imports.
 
 // Fence merged logical-query layouts and failure/guard contracts.
-pub const abi_version: u32 = 67;
+pub const abi_version: u32 = 68;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -813,6 +813,9 @@ pub const Status = enum(u32) {
     value_verification_requires_scan = 835,
     value_verification_limit_exceeded = 836,
     graph_start_identity_required = 837,
+    unsupported_exact_sort = 838,
+    invalid_document_checkpoint = 839,
+    too_many_active_jobs = 840,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

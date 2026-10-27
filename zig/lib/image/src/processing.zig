@@ -734,6 +734,63 @@ fn clipPillowAccumulator(value: i64, precision_bits: u6) u8 {
     return @intCast(std.math.clamp(value >> precision_bits, 0, 255));
 }
 
+// Bound all partial sums, including negative lobes, before narrowing to SIMD.
+fn pillowWeightsFitI32(weights: []const i32, precision_bits: u6) bool {
+    if (precision_bits == 0 or precision_bits >= 32) return false;
+    var magnitude: u64 = @as(u64, 1) << (precision_bits - 1);
+    for (weights) |weight| {
+        const term = @as(u64, @intCast(@abs(@as(i64, weight)))) * 255;
+        magnitude = std.math.add(u64, magnitude, term) catch return false;
+        if (magnitude > std.math.maxInt(i32)) return false;
+    }
+    return true;
+}
+
+fn pillowHorizontal(img: ImageU8, axis: BicubicAxis, horizontal: []u8, target_width: usize, comptime allow_simd: bool) !void {
+    var vector_safe = allow_simd;
+    if (allow_simd) for (0..target_width) |x| {
+        if (!pillowWeightsFitI32(axis.weights[axis.offsets[x]..axis.offsets[x + 1]], axis.precision_bits)) {
+            vector_safe = false;
+            break;
+        }
+    };
+    for (0..img.height) |source_y| {
+        try @import("work_control.zig").check();
+        for (0..target_width) |target_x| {
+            const start = axis.starts[target_x];
+            const begin = axis.offsets[target_x];
+            const end = axis.offsets[target_x + 1];
+            if (vector_safe) {
+                const row = img.data[source_y * img.row_stride_bytes ..][0 .. @as(usize, img.width) * img.channels()];
+                var accum: @Vector(4, i32) = @splat(@as(i32, 1) << @intCast(axis.precision_bits - 1));
+                for (axis.weights[begin..end], 0..) |weight, offset| {
+                    const source = (start + offset) * img.channels();
+                    // Packed RGB has only three bytes at the last pixel.
+                    // Never read row padding to fill the discarded fourth lane.
+                    const bytes: @Vector(4, u8) = if (row.len - source >= 4)
+                        row[source..][0..4].*
+                    else
+                        .{ row[source], row[source + 1], row[source + 2], 0 };
+                    accum += @as(@Vector(4, i32), @intCast(bytes)) * @as(@Vector(4, i32), @splat(weight));
+                }
+                const clipped = @min(
+                    @max(accum >> @as(@Vector(4, u5), @splat(@intCast(axis.precision_bits))), @as(@Vector(4, i32), @splat(0))),
+                    @as(@Vector(4, i32), @splat(255)),
+                );
+                inline for (0..3) |channel| horizontal[(source_y * target_width + target_x) * 3 + channel] = @intCast(clipped[channel]);
+                continue;
+            }
+            for (0..3) |channel| {
+                var value: i64 = @as(i64, 1) << (axis.precision_bits - 1);
+                for (axis.weights[begin..end], 0..) |weight, offset| {
+                    value += @as(i64, @intFromFloat(pixelAt(img, @intCast(start + offset), @intCast(source_y), channel))) * weight;
+                }
+                horizontal[(source_y * target_width + target_x) * 3 + channel] = clipPillowAccumulator(value, axis.precision_bits);
+            }
+        }
+    }
+}
+
 /// Pillow resizes 8-bit images in two passes, materializing an 8-bit
 /// horizontal intermediate before the vertical pass. Preserving that
 /// quantization boundary is required for Transformers pixel parity.
@@ -759,21 +816,7 @@ fn preprocessDecodedRectPillowBicubic(
         return error.InvalidImageDimensions;
     const horizontal = try allocator.alloc(u8, horizontal_len);
     defer allocator.free(horizontal);
-    for (0..img.height) |source_y| {
-        try @import("work_control.zig").check();
-        for (0..target_width) |target_x| {
-            const start = horizontal_axis.starts[target_x];
-            const begin = horizontal_axis.offsets[target_x];
-            const end = horizontal_axis.offsets[target_x + 1];
-            for (0..3) |channel| {
-                var value: i64 = @as(i64, 1) << (horizontal_axis.precision_bits - 1);
-                for (horizontal_axis.weights[begin..end], 0..) |weight, offset| {
-                    value += @as(i64, @intFromFloat(pixelAt(img, @intCast(start + offset), @intCast(source_y), channel))) * weight;
-                }
-                horizontal[(source_y * target_width + target_x) * 3 + channel] = clipPillowAccumulator(value, horizontal_axis.precision_bits);
-            }
-        }
-    }
+    try pillowHorizontal(img, horizontal_axis, horizontal, target_width, true);
 
     const row_bytes = target_width * 3;
     const Vec = @Vector(8, i32);
@@ -1150,4 +1193,53 @@ test "torchvision bicubic upsampling preserves padded RGBA pixels and allocation
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "Pillow horizontal SIMD matches wide scalar for packed and padded RGB RGBA" {
+    const a = std.testing.allocator;
+    for ([_]PixelFormat{ .rgb8, .rgba8 }) |format| {
+        for ([_]usize{ 1, 2, 3, 5, 8, 13, 17 }) |width| {
+            for ([_]usize{ 1, 2, 4, 7, 23 }) |target| {
+                for ([_]bool{ false, true }) |torchvision| {
+                    const channels: usize = @backingInt(format);
+                    const stride = width * channels + 5;
+                    // No padding follows the final row.
+                    const pixels = try a.alloc(u8, stride * 2 + width * channels);
+                    defer a.free(pixels);
+                    for (pixels, 0..) |*value, i| value.* = @intCast((i * 53 + i / 7 * 91) % 256);
+                    const image = ImageU8{ .data = pixels, .width = @intCast(width), .height = 3, .format = format, .row_stride_bytes = stride };
+                    try image.validate();
+                    var axis = try buildPillowBicubicAxis(a, width, target, torchvision);
+                    defer axis.deinit();
+                    const scalar = try a.alloc(u8, target * 3 * 3);
+                    defer a.free(scalar);
+                    const vector = try a.alloc(u8, scalar.len);
+                    defer a.free(vector);
+                    try pillowHorizontal(image, axis, scalar, target, false);
+                    try pillowHorizontal(image, axis, vector, target, true);
+                    try std.testing.expectEqualSlices(u8, scalar, vector);
+                }
+            }
+        }
+    }
+}
+
+test "Pillow horizontal unsafe coefficients retain wide scalar accumulation" {
+    var weights = [_]i32{ std.math.maxInt(i32), -std.math.maxInt(i32) };
+    try std.testing.expect(!pillowWeightsFitI32(&weights, 22));
+    try std.testing.expect(!pillowWeightsFitI32(&.{1}, 0));
+    try std.testing.expect(!pillowWeightsFitI32(&.{1}, 32));
+    const boundary = (std.math.maxInt(i32) - (@as(i32, 1) << 21)) / 255;
+    try std.testing.expect(pillowWeightsFitI32(&.{boundary}, 22));
+    try std.testing.expect(!pillowWeightsFitI32(&.{boundary + 1}, 22));
+    var starts = [_]usize{0};
+    var offsets = [_]usize{ 0, 2 };
+    const axis = BicubicAxis{ .allocator = std.testing.allocator, .starts = &starts, .offsets = &offsets, .weights = &weights, .precision_bits = 22 };
+    const image = ImageU8{ .data = &.{ 0, 255, 1, 255, 0, 2 }, .width = 2, .height = 1, .format = .rgb8, .row_stride_bytes = 6 };
+    var scalar: [3]u8 = undefined;
+    var vector: [3]u8 = undefined;
+    try pillowHorizontal(image, axis, &scalar, 1, false);
+    try pillowHorizontal(image, axis, &vector, 1, true);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0 }, &scalar);
+    try std.testing.expectEqualSlices(u8, &scalar, &vector);
 }

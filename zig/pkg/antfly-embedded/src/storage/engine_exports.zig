@@ -1510,6 +1510,10 @@ fn consumeResolverMetadataDrop(self: *DB, alloc: std.mem.Allocator, identity: @i
     return .{ .value = self.consumeResolverMetadataDrop(alloc, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn resolverReplayObservation(self: *DB, alloc: std.mem.Allocator) engine.Outcome(@import("db/types.zig").ResolverReplayObservation) {
+    return .{ .value = self.resolverReplayObservation(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn pendingWorkStats(self: *DB) engine.Outcome(@import("db/core.zig").PendingWorkStats) {
     return .{ .value = self.pendingWorkStats() };
 }
