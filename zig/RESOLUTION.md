@@ -2777,7 +2777,9 @@ Read-side validity uses one retained lineage anchor. Tiny edit bursts use one
 ordered invalidation page and exact dependency reads. Strategy selection also
 bounds the roots-by-edits cross product: beyond 128 combinations (except one/two
 edits, which stay linear in roots), a complete small page supplies digests to the
-same summary proof without reopening journal slots. Larger bursts use compact
+same summary proof without reopening journal slots. Empty root summaries return
+before allocating or clearing a counter buffer, avoiding 128 MiB of scratch
+clearing for a 1,024-root absent batch. Larger bursts use compact
 full SHA-256 digests from the same 256-event journal and a deletable counting
 summary per requested root. Four digest-derived positions use four-bit counters
 in nonempty 1-KiB pages (128 KiB maximum per root), with exact sparse overflow

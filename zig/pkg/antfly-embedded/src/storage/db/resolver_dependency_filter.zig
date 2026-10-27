@@ -79,17 +79,18 @@ pub const Index = struct {
             if (std.mem.allEqual(u8, &bytes, 0)) try self.backend.remove(self.backend.ptr, self.a, owned_key) else try self.backend.put(self.backend.ptr, self.a, owned_key, try self.a.dupe(u8, &bytes));
         }
     }
-    /// One bounded range read loads only nonempty pages. The caller reuses the
-    /// same output and page scratch for every requested root.
-    pub fn load(self: Index, a: A, root_digest: []const u8, output: []u8) !bool {
-        std.debug.assert(output.len == byte_count);
-        @memset(output, 0);
+    /// One bounded range read loads only nonempty pages. Empty summaries need
+    /// no counter allocation or clearing; the caller reuses its root scratch.
+    pub fn load(self: Index, a: A, root_digest: []const u8) !?[]u8 {
         const prefix = try std.fmt.allocPrint(a, "{s}dep-count/{s}/", .{ self.root, root_digest });
         const page = try self.backend.scan(self.backend.ptr, a, prefix, null, page_count);
         if (page.rows.len > page_count) return error.InvalidCatalogRecord;
         if (page.next) |next| {
             if ((try self.backend.scan(self.backend.ptr, a, prefix, next, 1)).rows.len != 0) return error.InvalidCatalogRecord;
         }
+        if (page.rows.len == 0) return null;
+        const output = try a.alloc(u8, byte_count);
+        @memset(output, 0);
         for (page.rows) |row| {
             const suffix = row.key[prefix.len..];
             if (suffix.len != 2 or row.value.len != page_bytes) return error.InvalidCatalogRecord;
@@ -97,6 +98,6 @@ pub const Index = struct {
             if (number >= page_count) return error.InvalidCatalogRecord;
             @memcpy(output[number * page_bytes ..][0..page_bytes], row.value);
         }
-        return page.rows.len != 0;
+        return output;
     }
 };

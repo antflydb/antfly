@@ -1865,8 +1865,7 @@ pub const Store = struct {
             @import("antfly_hash").Sha256.hash(id.*, &own_digest, .{});
             const own_hash = std.fmt.bytesToHex(own_digest, .lower);
             if (try self.backend.get(self.backend.ptr, r, try std.fmt.allocPrint(r, "{s}invalid-key/{s}", .{ try temporary.pinEditRoot(prepared.template), own_hash }))) |value| if (try parse(u64, r, value) > sequence) return false;
-            const counters = try r.alloc(u8, dependency_filter.byte_count);
-            if (!try self.pinFilter(root).load(r, root_hash, counters)) continue;
+            const counters = (try self.pinFilter(root).load(r, root_hash)) orelse continue;
             var offset: usize = 0;
             while (offset < changed_bytes) : (offset += 32) {
                 const digest: *const [32]u8 = @ptrCast(scratch.bytes[offset..][0..32]);
@@ -5844,7 +5843,6 @@ test "resolver curation dependency counters delete collisions and overflow exact
     var digest: [32]u8 = @splat(0);
     for (0..4) |i| std.mem.writeInt(u32, digest[i * 4 ..][0..4], @intCast(i * 4096), .little);
     const root = try hash(a, "root");
-    const bytes = try a.alloc(u8, dependency_filter.byte_count);
     for (0..24) |_| {
         const before = memory.writes;
         try index.update(root, &digest, true);
@@ -5854,14 +5852,16 @@ test "resolver curation dependency counters delete collisions and overflow exact
     // Callers always resolve a hit through exact SHA-256 dependency postings.
     var collision = digest;
     collision[31] = 1;
-    try std.testing.expect(try index.load(a, root, bytes));
+    const bytes = (try index.load(a, root)).?;
     try std.testing.expect(dependency_filter.contains(bytes, &collision));
     for (0..23) |_| try index.update(root, &digest, false);
-    try std.testing.expect(try index.load(a, root, bytes));
-    try std.testing.expect(dependency_filter.contains(bytes, &digest));
+    const remaining = (try index.load(a, root)).?;
+    try std.testing.expect(dependency_filter.contains(remaining, &digest));
     try index.update(root, &digest, false);
-    try std.testing.expect(!try index.load(a, root, bytes));
-    try std.testing.expect(!dependency_filter.contains(bytes, &digest));
+    // An empty root must load with far less than one full counter buffer.
+    var empty_bytes: [4096]u8 = undefined;
+    var empty_frame: std.heap.FixedBufferAllocator = .init(&empty_bytes);
+    try std.testing.expect(try index.load(empty_frame.allocator(), root) == null);
     try std.testing.expectEqual(@as(usize, 0), memory.rows.count());
     // All four positions may coincide: every reference is still balanced.
     @memset(&digest, 0);
