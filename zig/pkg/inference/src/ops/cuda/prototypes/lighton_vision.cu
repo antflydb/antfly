@@ -95,3 +95,37 @@ extern "C" __global__ void lighton_vision_qkv_rope_bf16(
     v[dst] = lighton_bf16_rne(packed[src + 2 * width]);
     v[dst + half] = lighton_bf16_rne(packed[src + 2 * width + half]);
 }
+
+// Learned positions use align-corners interpolation in merge-major order.
+// Explicit operations preserve the host reference's F32 rounding boundaries.
+extern "C" __global__ void lighton_vision_learned_positions_f32(
+    float* out, const float* input, const void* table,
+    unsigned grid_x, unsigned grid_y, unsigned merge, unsigned side,
+    unsigned dim, unsigned table_bf16) {
+    const unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= grid_x * grid_y * dim) return;
+    const unsigned row = index / dim, h = index % dim;
+    const unsigned inner = row % (merge * merge), group = row / (merge * merge);
+    const unsigned x = (group % (grid_x / merge)) * merge + inner % merge;
+    const unsigned y = (group / (grid_x / merge)) * merge + inner / merge;
+    const float fx = grid_x <= 1 || side <= 1 ? 0.f :
+        __fdiv_rn(__fmul_rn(float(x), float(side - 1)), float(grid_x - 1));
+    const float fy = grid_y <= 1 || side <= 1 ? 0.f :
+        __fdiv_rn(__fmul_rn(float(y), float(side - 1)), float(grid_y - 1));
+    const unsigned x0 = unsigned(floorf(fx)), y0 = unsigned(floorf(fy));
+    const unsigned x1 = min(x0 + 1, side - 1), y1 = min(y0 + 1, side - 1);
+    const float wx = __fsub_rn(fx, float(x0)), wy = __fsub_rn(fy, float(y0));
+    const unsigned ids[4] = {
+        (y0 * side + x0) * dim + h, (y0 * side + x1) * dim + h,
+        (y1 * side + x0) * dim + h, (y1 * side + x1) * dim + h
+    };
+    float values[4];
+    #pragma unroll
+    for (unsigned i = 0; i < 4; ++i) values[i] = table_bf16 ?
+        __uint_as_float(unsigned(static_cast<const unsigned short*>(table)[ids[i]]) << 16) :
+        static_cast<const float*>(table)[ids[i]];
+    const float top = __fadd_rn(__fmul_rn(values[0], __fsub_rn(1.f, wx)), __fmul_rn(values[1], wx));
+    const float bottom = __fadd_rn(__fmul_rn(values[2], __fsub_rn(1.f, wx)), __fmul_rn(values[3], wx));
+    const float position = __fadd_rn(__fmul_rn(top, __fsub_rn(1.f, wy)), __fmul_rn(bottom, wy));
+    out[index] = __fadd_rn(input[index], position);
+}

@@ -2754,6 +2754,35 @@ pub const CudaCompute = struct {
         return try lightOnFfnBf16Down(self, .{ .separate = .{ .gate = gate, .up = up } }, weights[2], rows, hidden, intermediate, input);
     }
 
+    /// Interpolate the resident learned-position table directly into patch
+    /// embeddings. F32 output and merge-major align-corners geometry match
+    /// the host projector; no table download or per-image offset upload.
+    pub fn lightOnVisionPositions(cb: *const ops.ComputeBackend, input_ct: CT, table_ct: CT, grid_x: usize, grid_y: usize, merge: usize, side: usize, dim: usize) !?CT {
+        if (cb.kind() != .cuda) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.capability_profile != .lightonocr3 or self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
+            self.lazy_host_store != null or self.resident_training_cache or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            (dim != 768 and dim != 1024) or merge != 2 or side != 48 or
+            grid_x < 2 or grid_y < 2 or grid_x % merge != 0 or grid_y % merge != 0 or
+            grid_x > 16384 or grid_y > 16384 or grid_x > 16384 / grid_y) return null;
+        const input = tensorFromCt(input_ct);
+        const table = tensorFromCt(table_ct);
+        if (input.strict_resident_training or table.strict_resident_training or table.quant_type != null or
+            (table.dtype != .f32 and table.dtype != .bf16)) return null;
+        try ensureF32(input);
+        const count = try checkedMul(try checkedMul(grid_x, grid_y), dim);
+        try ensureCount(input, count);
+        try ensureCount(table, try checkedMul(try checkedMul(side, side), dim));
+        if (table.shape.len != 2 or table.shape[0] != @as(i64, @intCast(side * side)) or table.shape[1] != @as(i64, @intCast(dim)) or
+            input.buffer.len < count * 4 or table.buffer.len < table.elem_count * table.dtype.byteSize()) return error.InvalidTensorShape;
+        try self.lighton_vision_fused.init(&self.ctx);
+        const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(grid_x * grid_y), @intCast(dim) })).?;
+        errdefer cb.free(output);
+        try self.lighton_vision_fused.learnedPositions(&self.ctx, .{ tensorFromCt(output).buffer.ptr, input.buffer.ptr, table.buffer.ptr }, @intCast(grid_x), @intCast(grid_y), @intCast(merge), @intCast(side), @intCast(dim), table.dtype == .bf16);
+        return output;
+    }
+
     pub fn lightOnVisionMlp(cb: *const ops.ComputeBackend, input_ct: CT, weights: [6]CT, rows: usize, dim: usize, hidden: usize, eps: f32) !?CT {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -4772,6 +4801,8 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_norm_weight_cache_hits={d} cuda_norm_weight_cache_misses={d}\n", .{ self.lighton_norm_weight_cache_hits, self.lighton_norm_weight_cache_misses });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_vision_qkv_calls={d}\n", .{self.lighton_vision_fused.qkv_calls});
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_vision_position_calls={d}\n", .{self.lighton_vision_fused.position_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_ffn_bf16_input_calls={d} cuda_ffn_separate_calls={d} cuda_ffn_block_calls={d}\n", .{ self.lighton_activation.calls, self.lighton_activation.separate_calls, self.lighton_activation.norm_calls });
         if (self.temp_scan_profile.enabled) {

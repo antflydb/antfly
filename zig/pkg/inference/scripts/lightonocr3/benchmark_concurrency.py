@@ -1516,6 +1516,10 @@ def run(args, model, label, mode, concurrency, output):
         result["ocr_pinned_input_wraps"] = sum(int(w) for _, w in pinned_inputs)
         if args.require_ocr_pinned_inputs and not result["ocr_pinned_input_uploads"]:
             result["status"] = "missing_ocr_pinned_inputs"
+        result["cuda_vision_position_calls"] = sum(
+            int(n)
+            for n in re.findall(r"LIGHTONOCR3 cuda_vision_position_calls=(\d+)", text)
+        )
         metadata = re.findall(
             r"OCR_CUDA pinned_metadata_uploads=(\d+) mrope_cache_hits=(\d+) mrope_cache_uploads=(\d+)",
             text,
