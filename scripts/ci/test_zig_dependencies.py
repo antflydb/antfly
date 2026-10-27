@@ -32,7 +32,7 @@ spec.loader.exec_module(deps)
 
 
 class DependencyTests(unittest.TestCase):
-    def test_release_builders_prefetch_with_the_actual_archive_cache(self):
+    def test_release_qualification_prefetches_with_the_actual_archive_cache(self):
         root = Path(__file__).resolve().parents[2]
 
         def job(workflow, name):
@@ -42,11 +42,6 @@ class DependencyTests(unittest.TestCase):
             return match.group(1)
 
         for workflow, name, policy_ref in (
-            (
-                "antfly-artifact-build.yml",
-                "build-zig-runtime-archives",
-                "inputs.build_controller_commit",
-            ),
             ("qualify-release-archives.yml", "archives", "github.workflow_sha"),
         ):
             with self.subTest(workflow=workflow):
@@ -71,6 +66,7 @@ class DependencyTests(unittest.TestCase):
                 self.assertLess(prepare, build)
                 self.assertIn("ref: ${{ " + policy_ref + " }}", body[policy:prepare])
                 self.assertIn("persist-credentials: false", body[policy:prepare])
+                self.assertIn("mirror-only: 'true'", body[prepare:build])
 
         # GitHub refuses OIDC in a nested reusable workflow unless each caller
         # explicitly delegates it. Admission retains its read-only permissions.

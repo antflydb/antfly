@@ -130,6 +130,8 @@ jobs:
 
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+        with:
+          mirror-only: 'true'
 
       - name: Build source-declared runtime archives
         env:
