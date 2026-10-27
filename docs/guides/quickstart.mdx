@@ -1,18 +1,19 @@
 ---
 title: Quickstart
-description: Create a Lite database, search your first documents, and bring a copy to Cloud
+description: Search 10,000 Wikipedia articles in a Lite database, then bring a snapshot to Cloud
 prerequisites:
   - "Bash and curl"
 difficulty: beginner
-estimatedTime: "10 min, plus installation and optional Cloud setup"
+estimatedTime: "15 min, plus installation and optional Cloud setup"
 tags: [getting-started, setup, quickstart, lite]
 sidebar: getting-started
 order: 2
 ---
 
-Start with three documents in a local `.aflite` database and find one by keyword.
-Then, optionally, upload a snapshot to Antfly Cloud and run the same query there.
-The first query needs no model download or Cloud account.
+Load 10,000 Wikipedia articles into a local `.aflite` database and search them by
+keyword. Then upload a snapshot to Antfly Cloud and repeat the query there. You
+can stop after the local search; it needs no model download or Cloud account.
+Semantic search, image search, reranking, and RAG are optional follow-ons.
 
 **Prefer to start hosted?** Follow [Get started with Antfly Cloud Lite](/docs/cloud/getting-started).
 It uses the same documents and HTTP requests. Lite is the default Cloud offering;
@@ -80,64 +81,52 @@ This creates a table named `default`. Every table includes a full-text index.
 The helper accepts a JSON filename and an API path. It also supports the scoped
 API key you will use if you move this database to Cloud.
 
-## Write three documents
+## Load Wikipedia
 
-Save and send a small batch:
+Download the sample dataset, then load it into the `default` table:
 
 ```bash
-cat > batch.json <<'JSON'
-{
-  "inserts": {
-    "quickstart-database": {
-      "title": "Portable database",
-      "body": "Antfly snapshots preserve database edits and document identifiers.",
-      "revision": 1,
-      "category": "database"
-    },
-    "quickstart-garden": {
-      "title": "Garden notes",
-      "body": "Flowers and trees grow in a sunny garden.",
-      "revision": 1,
-      "category": "garden"
-    },
-    "quickstart-bread": {
-      "title": "Bread recipe",
-      "body": "Bread uses flour water yeast and salt.",
-      "revision": 1,
-      "category": "food"
-    }
-  },
-  "sync_level": "full_index"
-}
-JSON
-antfly_request batch.json tables/default/batch
+curl --fail --location --output wiki-articles.jsonl \
+  https://cdn.antfly.io/datasets/wiki-articles-10k-v001.json
+ANTFLY_URL="${ANTFLY_ENDPOINT%/db/v1}" antfly load \
+  --table default --file wiki-articles.jsonl \
+  --id-field title --sync-level full_text
 ```
 
-Expect `"inserted": 3`. `full_index` waits for the batch's index work, so the next
-query can find these documents. Use a fresh database: batch writes replace
-documents with the same IDs.
+The download is about 12 MB: one JSON document per line, with `title`, `body`,
+and `url` fields. Some articles also include a thumbnail URL. This step indexes
+text only; it does not download images or models.
 
-## Search
+Wait for the load to complete successfully with 10,000 documents. Titles become
+stable document IDs, and `full_text` waits for keyword-search visibility. The
+CLI batches the writes for you. Use a fresh database: loading again replaces
+articles with the same IDs.
 
-Find the document about snapshots:
+`ANTFLY_URL` is the server base URL; the HTTP helper's `ANTFLY_ENDPOINT` includes
+`/db/v1`. The expression above keeps both pointed at the same local server.
+
+## Search by keyword
+
+Find articles that mention Korea and return their titles and source links:
 
 ```bash
 cat > query.json <<'JSON'
 {
-  "full_text_search": {"match": "snapshots", "field": "body"},
-  "filter_query": {
-    "ids": ["quickstart-database", "quickstart-garden", "quickstart-bread"]
-  },
-  "limit": 3
+  "full_text_search": {"query": "body:\"Korea\""},
+  "fields": ["title", "url"],
+  "limit": 5
 }
 JSON
 antfly_request query.json tables/default/query
 ```
 
-In `responses[0].hits.hits`, expect a hit with `_id` equal to
-`quickstart-database`, title `Portable database`,
-and `revision` equal to `1`. You now have a working Lite database and an HTTP API
-that the [SDKs](/docs/sdks) can use.
+Look in `responses[0].hits.hits` for matching articles. Each hit has an `_id`
+(the article title) and `_source.title` and `_source.url` fields. Keep the result
+so you can compare it with the Cloud copy. Try changing `Korea` to another word
+or phrase from the dataset, then rerun the request.
+
+This is full-text search: it matches indexed words, without embeddings or an
+inference service. The [SDKs](/docs/sdks) use the same HTTP API.
 
 ## Move this database to Cloud
 
@@ -170,8 +159,9 @@ printf '\n'
 antfly_request query.json tables/default/query
 ```
 
-Expect the same document ID and fields. Do not repeat the table creation or
-batch: the snapshot already contains them. Your HTTP requests stay the same;
+Expect the same article IDs, titles, and URLs. Do not repeat the table creation
+or dataset load: the snapshot already contains all 10,000 articles and their
+full-text index. Your HTTP requests stay the same;
 the endpoint and authentication change. An application using an embedded Lite
 binding needs an HTTP client or adapter to connect to Cloud.
 
@@ -185,6 +175,18 @@ dependencies need separate configuration and compatibility checks.
 
 To take a copy back, follow [Export and serve locally](/docs/cloud/getting-started#take-the-database-back-to-your-laptop).
 That path uses the Lite-backed HTTP server to reopen Cloud table namespaces.
+
+## Optional: add semantic search and local AI
+
+[Search Wikipedia with local AI](/docs/guides/wikipedia-search) uses this same
+10,000-article dataset to add embeddings, semantic and image search, reranking,
+and RAG. That guide sets up a separate local instance with its own model and
+memory requirements; you can reuse the downloaded `wiki-articles.jsonl` file.
+None of that model setup is required for the keyword search or snapshot above.
+
+Before moving an enriched database to Cloud, qualify its exact models and index
+configuration in the destination. The local AI guide's 8 GiB inference budget
+is not a managed Lite capacity or model-compatibility guarantee.
 
 ## Troubleshooting and cleanup
 
@@ -208,13 +210,8 @@ file does not delete the managed database or stop its billing.
 
 ## Next steps
 
-- [Search Wikipedia with local AI](/docs/guides/wikipedia-search): a separate,
-  larger local exercise covering semantic search, images, reranking, and RAG.
+- [Search Wikipedia with local AI](/docs/guides/wikipedia-search): optional model setup
+  and richer searches over the same dataset.
 - [Antfly Lite](/docs/guides/lite): embedded applications, file formats, and portability.
 - [Cloud Lite](/docs/cloud/getting-started): hosted creation, scoped keys, import, and export.
 - [SDKs](/docs/sdks): connect your application through the same HTTP API.
-
-Semantic search needs a configured embedding index and its exact compatible
-model. Qualify that dependency in the destination before moving an enriched
-database to Cloud; the larger local AI exercise is not a managed Lite capacity
-or model-compatibility guarantee.
