@@ -1099,7 +1099,8 @@ pub const PixelMeter = struct {
     }
 };
 
-const TestStore = @import("document_test_store.zig").Store;
+pub const testing = if (@import("builtin").is_test) @import("document_test_store.zig") else struct {};
+const TestStore = testing.Store;
 
 test "document durable checkpoints fence stale attempts and retain crash reservations" {
     const a = std.testing.allocator;
