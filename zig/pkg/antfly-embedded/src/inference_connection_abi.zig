@@ -23,7 +23,7 @@ const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
 const memory_abi = @import("runtime_memory_abi");
 
-pub const abi_version: u32 = 5;
+pub const abi_version: u32 = 6;
 pub const Status = error_abi.Status;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
@@ -97,6 +97,7 @@ pub const InvokeContext = extern struct {
     query: http_abi.OptionalBytes = .{},
     content_type: http_abi.OptionalBytes = .{},
     body_source: http_abi.RequestBodySource = .{},
+    document_store: @import("antfly_runtime_abi").document_abi.View = .{},
 };
 
 pub const Target = extern struct {

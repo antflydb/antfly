@@ -43,6 +43,7 @@ pub const ObjectStorageLanes = types.ObjectStorageLanes;
 pub const ObjectStorageLocation = types.ObjectStorageLocation;
 pub const PgwireConfig = types.PgwireConfig;
 pub const QueryAdmissionConfig = types.QueryAdmissionConfig;
+pub const RewriterConfig = types.RewriterConfig;
 pub const RuntimeTaskBinding = types.RuntimeTaskBinding;
 pub const S3ExternalIoConfig = types.S3ExternalIoConfig;
 pub const SecretSourceConfig = types.SecretSourceConfig;

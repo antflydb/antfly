@@ -313,8 +313,10 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
     profiles = [s["profile"]["sort"] for s in report["samples"]]
     assert all(
         p["index_sort_coverage"] == "covered_with_bounds"
-        or (p["candidate_source"] == "ordered_lake_index"
-            and p["selection_reason"] == "bounded_ordered_lake_index")
+        or (
+            p["candidate_source"] == "ordered_lake_index"
+            and p["selection_reason"] == "bounded_ordered_lake_index"
+        )
         for p in profiles
     ), profiles
     assert all(0 < p["ordered_scanned_count"] < row_count for p in profiles), profiles
@@ -330,20 +332,25 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
             assert all(
                 p["ordered_scanned_count"] <= limit + 2 for p in dense_profiles
             ), dense_profiles
-            assert all(
-                p["candidate_count"] <= limit + 1 for p in dense_profiles
-            ), dense_profiles
+            assert all(p["candidate_count"] <= limit + 1 for p in dense_profiles), (
+                dense_profiles
+            )
         membership = [
-            line for line in (output / "server.log").read_text().splitlines()
+            line
+            for line in (output / "server.log").read_text().splitlines()
             if "antfly_bench_metadata_membership " in line
         ]
         metadata_samples = [
-            sample for sample in report["samples"]
-            if (sample["case"] == "filtered_identity"
-                or sample["case"].startswith("dense_metadata_"))
+            sample
+            for sample in report["samples"]
+            if (
+                sample["case"] == "filtered_identity"
+                or sample["case"].startswith("dense_metadata_")
+            )
             # A publication-bound whole-filter witness avoids re-evaluating
             # metadata membership in the global ordered coordinator.
-            and sample["profile"]["sort"]["selection_reason"] != "bounded_ordered_lake_index"
+            and sample["profile"]["sort"]["selection_reason"]
+            != "bounded_ordered_lake_index"
         ]
         assert len(membership) == len(metadata_samples), membership
         for sample, line in zip(metadata_samples, membership, strict=True):
@@ -657,7 +664,9 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
     )
 
 
-def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monkeypatch):
+def test_small_archive_uses_metadata_order_and_native_range_seeks(
+    tmp_path, monkeypatch
+):
     """A single admission window must retain bounded seeks for a small page."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -670,8 +679,14 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
     ids = list(range(0, count, 2)) + list(range(1, count, 2))
     archive = tmp_path / "archive.parquet"
     pq.write_table(
-        pa.table({"id": ids, "revision": [0] * count,
-                  "bucket": [i // 64 for i in ids], "body": ["quasar"] * count}),
+        pa.table(
+            {
+                "id": ids,
+                "revision": [0] * count,
+                "bucket": [i // 64 for i in ids],
+                "body": ["quasar"] * count,
+            }
+        ),
         archive,
         row_group_size=128,
     )
@@ -706,7 +721,10 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
                 ],
                 "relational_indexes": [
                     {"name": "metadata", "keys": [{"column": "id"}]},
-                    {"name": "bucket_key", "keys": [{"column": "bucket"}, {"column": "id"}]},
+                    {
+                        "name": "bucket_key",
+                        "keys": [{"column": "bucket"}, {"column": "id"}],
+                    },
                 ],
             },
             "indexes": {"text": {"type": "full_text", "store_source": True}},
@@ -717,47 +735,55 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
         for selection in ("dense", "tail", "reverse"):
             descending = selection == "reverse"
             first = (
-                count // 2 - 1 if descending
-                else count // 2 if selection == "tail"
+                count // 2 - 1
+                if descending
+                else count // 2
+                if selection == "tail"
                 else 0
             )
             expected = list(
-                range(first, first - 20, -1) if descending
-                else range(first, first + 20)
+                range(first, first - 20, -1) if descending else range(first, first + 20)
             )
             fields = ("revision", "id") if native else ("id",)
-            plan["cases"].append({
-                "name": f"{'native' if native else 'metadata'}_{selection}",
-                "identity_field": "id",
-                "expected_ids": expected,
-                "request": {
-                    "full_text_search": {"match": "quasar", "field": "body"},
-                    "full_text_index": "text",
-                    "filter_query": {
-                        "range": {"path": "/id", "lte" if descending else "gte": first}
+            plan["cases"].append(
+                {
+                    "name": f"{'native' if native else 'metadata'}_{selection}",
+                    "identity_field": "id",
+                    "expected_ids": expected,
+                    "request": {
+                        "full_text_search": {"match": "quasar", "field": "body"},
+                        "full_text_index": "text",
+                        "filter_query": {
+                            "range": {
+                                "path": "/id",
+                                "lte" if descending else "gte": first,
+                            }
+                        },
+                        "fields": ["id"],
+                        "limit": 20,
+                        "profile": True,
+                        "order_by": [
+                            {"field": name, "desc": descending} for name in fields
+                        ],
                     },
-                    "fields": ["id"],
-                    "limit": 20,
-                    "profile": True,
-                    "order_by": [
-                        {"field": name, "desc": descending} for name in fields
-                    ],
-                },
-            })
-    plan["cases"].append({
-        "name": "exact_count",
-        "identity_field": "id",
-        "expected_ids": [],
-        "request": {
-            "full_text_search": {"match": "quasar", "field": "body"},
-            "full_text_index": "text",
-            "filter_query": {"range": {"path": "/id", "gte": count // 2}},
-            "order_by": [{"field": "id"}],
-            "fields": ["id"],
-            "limit": 0,
-            "profile": True,
-        },
-    })
+                }
+            )
+    plan["cases"].append(
+        {
+            "name": "exact_count",
+            "identity_field": "id",
+            "expected_ids": [],
+            "request": {
+                "full_text_search": {"match": "quasar", "field": "body"},
+                "full_text_index": "text",
+                "filter_query": {"range": {"path": "/id", "gte": count // 2}},
+                "order_by": [{"field": "id"}],
+                "fields": ["id"],
+                "limit": 0,
+                "profile": True,
+            },
+        }
+    )
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan))
     output = tmp_path / "qualification"
@@ -768,12 +794,18 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
                 sys.executable,
                 str(root / "tools" / "benchmark_lake_archive.py"),
                 "run",
-                "--binary", str(binary),
-                "--output-dir", str(output),
-                "--plan", str(plan_path),
-                "--parquet", str(archive),
-                "--samples", "1",
-                "--timeout", "120",
+                "--binary",
+                str(binary),
+                "--output-dir",
+                str(output),
+                "--plan",
+                str(plan_path),
+                "--parquet",
+                str(archive),
+                "--samples",
+                "1",
+                "--timeout",
+                "120",
             ],
             stdout=stream,
             stderr=subprocess.STDOUT,
@@ -789,7 +821,8 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
     # Only the two explicit exact-count samples may convert complete metadata
     # membership. Ordered pages must reuse their cursor's full filter proof.
     membership = [
-        line for line in (output / "server.log").read_text().splitlines()
+        line
+        for line in (output / "server.log").read_text().splitlines()
         if "antfly_bench_metadata_membership " in line
     ]
     assert sum("materialized=true" in line for line in membership) <= 2, membership
@@ -828,7 +861,10 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
     config.write_text(json.dumps(configuration))
     monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY", "1")
     with bench.managed_server(
-        harness.StandaloneAntflyServer, binary, config, cursor_output,
+        harness.StandaloneAntflyServer,
+        binary,
+        config,
+        cursor_output,
         api_root=harness.ANTFLY_PUBLIC_API_ROOT,
     ) as server:
         client = bench.Client(server, 120)
@@ -836,23 +872,43 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
             client.call("POST", f"/tables/{bench.TABLE}", plan["definition"])
             client.ready(bench.readiness_indexes(plan))
             for descending in (False, True):
-                request = dict(plan["cases"][0]["request"],
-                               order_by=[{"field": "id", "desc": descending}])
+                request = dict(
+                    plan["cases"][0]["request"],
+                    order_by=[{"field": "id", "desc": descending}],
+                )
                 ordered = list(range(count - 1, -1, -1) if descending else range(count))
                 first = client.query({"request": request})
-                second = client.query({"request": dict(
-                    request, search_after=first["hits"]["hits"][-1]["_sort"],
-                    remote_snapshot=first["remote_snapshot"],
-                )})
-                before = client.query({"request": dict(
-                    request, search_before=second["hits"]["hits"][0]["_sort"],
-                    remote_snapshot=second["remote_snapshot"],
-                )})
-                for response, expected in ((first, ordered[:20]),
-                                           (second, ordered[20:40]),
-                                           (before, ordered[:20])):
-                    bench.verify_case({"name": "cursor", "identity_field": "id",
-                                       "expected_ids": expected}, response)
+                second = client.query(
+                    {
+                        "request": dict(
+                            request,
+                            search_after=first["hits"]["hits"][-1]["_sort"],
+                            remote_snapshot=first["remote_snapshot"],
+                        )
+                    }
+                )
+                before = client.query(
+                    {
+                        "request": dict(
+                            request,
+                            search_before=second["hits"]["hits"][0]["_sort"],
+                            remote_snapshot=second["remote_snapshot"],
+                        )
+                    }
+                )
+                for response, expected in (
+                    (first, ordered[:20]),
+                    (second, ordered[20:40]),
+                    (before, ordered[:20]),
+                ):
+                    bench.verify_case(
+                        {
+                            "name": "cursor",
+                            "identity_field": "id",
+                            "expected_ids": expected,
+                        },
+                        response,
+                    )
                     profile = response["profile"]["sort"]
                     assert profile["candidate_source"] == "ordered_lake_index", profile
                     # Keep the inclusive cursor row and one lookahead until
@@ -862,39 +918,67 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
             # tie order. The global coordinator must consume all 64 rows in the
             # winning primary group before retaining its best twenty IDs.
             for descending in (False, True):
-                reference = client.query({"request": dict(
-                        plan["cases"][0]["request"], limit=128,
-                        order_by=[{"field": "id", "desc": descending}],
-                    )})
-                first_group = sorted(reference["hits"]["hits"][:64], key=lambda hit: hit["_id"])
+                reference = client.query(
+                    {
+                        "request": dict(
+                            plan["cases"][0]["request"],
+                            limit=128,
+                            order_by=[{"field": "id", "desc": descending}],
+                        )
+                    }
+                )
+                first_group = sorted(
+                    reference["hits"]["hits"][:64], key=lambda hit: hit["_id"]
+                )
                 bucket_request = dict(
                     plan["cases"][0]["request"],
                     order_by=[{"field": "bucket", "desc": descending}],
                     filter_query={"range": {"path": "/bucket", "gte": 0}},
                 )
                 bucket = client.query({"request": bucket_request})
-                bucket_after = client.query({"request": dict(
-                    bucket_request, search_after=bucket["hits"]["hits"][-1]["_sort"],
-                    remote_snapshot=bucket["remote_snapshot"],
-                )})
-                bucket_before = client.query({"request": dict(
-                    bucket_request, search_before=bucket_after["hits"]["hits"][0]["_sort"],
-                    remote_snapshot=bucket_after["remote_snapshot"],
-                )})
-                for response, expected in ((bucket, first_group[:20]),
-                                           (bucket_after, first_group[20:40]),
-                                           (bucket_before, first_group[:20])):
-                    assert [hit["_source"]["id"] for hit in response["hits"]["hits"]] == [hit["_source"]["id"] for hit in expected]
+                bucket_after = client.query(
+                    {
+                        "request": dict(
+                            bucket_request,
+                            search_after=bucket["hits"]["hits"][-1]["_sort"],
+                            remote_snapshot=bucket["remote_snapshot"],
+                        )
+                    }
+                )
+                bucket_before = client.query(
+                    {
+                        "request": dict(
+                            bucket_request,
+                            search_before=bucket_after["hits"]["hits"][0]["_sort"],
+                            remote_snapshot=bucket_after["remote_snapshot"],
+                        )
+                    }
+                )
+                for response, expected in (
+                    (bucket, first_group[:20]),
+                    (bucket_after, first_group[20:40]),
+                    (bucket_before, first_group[:20]),
+                ):
+                    assert [
+                        hit["_source"]["id"] for hit in response["hits"]["hits"]
+                    ] == [hit["_source"]["id"] for hit in expected]
                     profile = response["profile"]["sort"]
-                    assert profile["selection_reason"] == "bounded_ordered_lake_index", profile
+                    assert (
+                        profile["selection_reason"] == "bounded_ordered_lake_index"
+                    ), profile
                     assert profile["ordered_scanned_count"] <= 128, profile
             assert "materialized=true" not in server.log_path.read_text()
             # This row predicate is not enforced by the id index. Removing it
             # with the proved id range would incorrectly return twenty rows.
-            request = dict(plan["cases"][0]["request"], filter_query={"conjuncts": [
-                {"range": {"id": {"gte": 0, "lt": 20}}},
-                {"range": {"path": "/revision", "gte": 1}},
-            ]})
+            request = dict(
+                plan["cases"][0]["request"],
+                filter_query={
+                    "conjuncts": [
+                        {"range": {"id": {"gte": 0, "lt": 20}}},
+                        {"range": {"path": "/revision", "gte": 1}},
+                    ]
+                },
+            )
             residual = client.query({"request": request})
             bench.verify_case({"name": "residual", "expected_ids": []}, residual)
         finally:
