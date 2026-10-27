@@ -493,6 +493,13 @@ pub const Program = struct {
         return result;
     }
 
+    pub fn directOutputColumn(self: *const Program) ?u32 {
+        return switch (self.instructions[self.root].operation) {
+            .column => |ordinal| ordinal,
+            else => null,
+        };
+    }
+
     pub fn evaluateOutput(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Output {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
         const result = try context.runOutput(self.root, 0);
@@ -3233,13 +3240,13 @@ const Evaluator = struct {
                 if (depth >= self.limits.depth) return self.workOwner().limit();
                 if (try loader.read(loader.context, self.alloc, ordinal)) |raw| {
                     try self.workOwner().charge(1);
-                    try @import("raw_json_budget.zig").validate(self.alloc, raw, .{
+                    const normalized = try @import("raw_json_budget.zig").normalize(self.alloc, raw, .{
                         .wire_bytes = self.limits.output_bytes,
                         .depth = self.limits.depth,
                         .checkpoint = self.limits.checkpoint,
                         .checkpoint_context = self.limits.checkpoint_context,
                     }, self.workOwner());
-                    return .{ .raw = raw };
+                    return .{ .raw = normalized };
                 }
             },
             .case_when => |case| {

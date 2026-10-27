@@ -78,3 +78,23 @@ pub fn validate(a: std.mem.Allocator, raw: []const u8, limits: Limits, work: *Wo
         }
     }
 }
+
+/// Normalize while charging the same logical nodes as the typed VM. Borrow
+/// unchanged extents and retain only changed canonical bytes in the row arena.
+pub fn normalize(a: std.mem.Allocator, raw: []const u8, limits: Limits, work: *Work) ![]const u8 {
+    if (raw.len > limits.wire_bytes) return work.limit();
+    const Context = struct {
+        work: *Work,
+        limits: Limits,
+        fn value(ptr: ?*anyopaque, _: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try self.work.charge(1);
+        }
+        fn poll(ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.limits.checkpoint) |checkpoint| try checkpoint(self.limits.checkpoint_context);
+        }
+    };
+    var context: Context = .{ .work = work, .limits = limits };
+    return @import("../common/canonical_json.zig").normalize(a, raw, limits.wire_bytes, .{ .depth = limits.depth, .preserve_strings = true, .context = &context, .value = Context.value, .checkpoint = Context.poll });
+}

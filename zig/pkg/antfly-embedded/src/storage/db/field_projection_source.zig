@@ -56,6 +56,10 @@ pub const Row = struct {
     raw_sources: std.StringHashMapUnmanaged([]const u8) = .empty,
     raw_operands: std.StringHashMapUnmanaged([]const u8) = .empty,
     full_view: ?OperandPlans.View = null,
+    scope: ?@import("../backend_erased.zig").ReadScope = null,
+    prefetched: ?[]const u8 = null,
+    prefetched_view: ?OperandPlans.View = null,
+    prefetched_root: ?V = null,
     values: std.StringHashMapUnmanaged(V) = .empty,
     identities: std.StringHashMapUnmanaged(sql.Datum) = .empty,
     metadata_hits: usize = 0,
@@ -64,19 +68,35 @@ pub const Row = struct {
     full_bytes: ?[]const u8 = null,
     full_root: ?V = null,
     pub fn source(self: *Row) projection.Source {
-        return .{ .context = self, .read = read, .read_raw = readRaw };
+        return .{ .context = self, .read = read, .read_raw = readRaw, .prefetch = prefetch };
+    }
+    pub fn deinit(self: *Row) void {
+        if (self.scope) |*scope| scope.close();
+        self.scope = null;
+    }
+    fn prefetchedPath(self: *Row, path: []const u8) bool {
+        const bytes = self.raw_sources.get(path) orelse return false;
+        const cached = self.prefetched orelse return false;
+        return bytes.ptr == cached.ptr and bytes.len == cached.len;
+    }
+    fn prefetch(raw: *anyopaque, paths: []const []const u8) !void {
+        const self: *Row = @ptrCast(@alignCast(raw));
+        if (self.full_bytes != null) return;
+        const bytes = try self.load(paths);
+        if (self.full_bytes != null) return;
+        self.prefetched = bytes;
+        for (paths) |path| try self.raw_sources.put(self.a, path, bytes);
     }
     fn load(self: *Row, roots: []const []const u8) ![]const u8 {
         try @import("query/search_exec.zig").checkSearchRequestDeadline(self.req);
         if (self.full_bytes) |bytes| return bytes;
-        var scope = try (self.txn orelse return error.DocumentNotFound).openReadScope(self.a);
-        defer scope.close();
+        if (self.scope == null) self.scope = try (self.txn orelse return error.DocumentNotFound).openReadScope(self.a);
         var authority = self.authority.source;
         const selective = roots.len != 0 and roots.len <= 64 and for (roots) |path| {
             if (!projection.validPath(path)) break false;
         } else true;
         if (!selective) authority.directory = null;
-        const rows = try logical.loadPrepared(self.a, self.a, &scope, &.{self.physical}, &.{self.id}, if (selective) roots else &.{}, &.{authority});
+        const rows = try logical.loadPrepared(self.a, self.a, &self.scope.?, &.{self.physical}, &.{self.id}, if (selective) roots else &.{}, &.{authority});
         self.value_reads += 1;
         const bytes = rows[0].bytes orelse return error.DocumentNotFound;
         if (!rows[0].projected) self.full_bytes = bytes;
@@ -88,7 +108,7 @@ pub const Row = struct {
         if (self.raw_operands.get(path)) |value| return value;
         // A prior operator may already have materialized this source. Reuse
         // that value rather than building a second index for small/mixed rows.
-        if (self.full_root != null or self.values.contains(path)) return null;
+        if (self.full_root != null or self.values.contains(path) or (self.prefetched_root != null and self.prefetchedPath(path))) return null;
         const operands = self.operands orelse return null;
         const operand = operands.paths.get(path) orelse return null;
         if (std.mem.eql(u8, path, "_id")) return null;
@@ -105,6 +125,13 @@ pub const Row = struct {
                 self.full_view = prepared;
             }
             break :full &self.full_view.?;
+        } else if (self.prefetchedPath(path)) prefetched: {
+            if (self.prefetched_view == null) {
+                var prepared = OperandPlans.View.init(self.a, self.prefetched.?);
+                try prepared.prepareProjectionWithOptions(operands.selector, .all, .object_only, .{ .defer_fanout = true });
+                self.prefetched_view = prepared;
+            }
+            break :prefetched &self.prefetched_view.?;
         } else projected: {
             try partial.prepareProjectionWithOptions(operand.selector, .all, .object_only, .{ .defer_fanout = true });
             break :projected &partial;
@@ -149,13 +176,13 @@ pub const Row = struct {
                 return if (kind == .missing) sql.Datum.json(.{ .bool = true }) else .{};
             }
         };
-        const root = self.full_root orelse self.values.get(path) orelse loaded: {
+        const root = self.full_root orelse self.values.get(path) orelse (if (self.prefetchedPath(path)) self.prefetched_root else null) orelse loaded: {
             const bytes = self.raw_sources.get(path) orelse try self.load(&.{path});
             // The authenticated range loader preserves opaque array positions.
             // Parse that immutable row view directly: re-masking compacts array
             // indexes, and copying/encoding it adds work proportional to payload.
             const value = try @import("antfly-json").parseFromSliceLeaky(V, self.a, bytes, .{ .allocate = .alloc_if_needed });
-            if (self.full_bytes != null) self.full_root = value else try self.values.put(self.a, path, value);
+            if (self.full_bytes != null) self.full_root = value else if (self.prefetchedPath(path)) self.prefetched_root = value else try self.values.put(self.a, path, value);
             break :loaded value;
         };
         var source_value: projection.JsonSource = .{ .id = self.id, .root = root };

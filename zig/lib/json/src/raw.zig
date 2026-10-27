@@ -42,6 +42,10 @@ const RootKind = enum {
 fn Raw(comptime root_kind: RootKind) type {
     return struct {
         bytes: []const u8,
+        // Explicit producer-only receipt for immutable, already validated bytes.
+        // Parsing never accepts receipts from JSON. Ordinary constructors keep
+        // validation on every emission, including callers with mutable buffers.
+        immutable: ?struct { bytes: []const u8, members_end: ?usize } = null,
 
         const Self = @This();
 
@@ -84,10 +88,27 @@ fn Raw(comptime root_kind: RootKind) type {
             return result;
         }
 
+        /// The producer must have validated the complete immutable extent.
+        /// members_end optionally emits an object's leading members plus `}`;
+        /// it must be a producer-known member boundary, never caller metadata.
+        pub fn fromImmutableValidated(bytes: []const u8, members_end: ?usize) Self {
+            std.debug.assert(members_end == null or (root_kind == .object and members_end.? <= bytes.len));
+            return .{ .bytes = bytes, .immutable = .{ .bytes = bytes, .members_end = members_end } };
+        }
+
         pub fn jsonStringify(self: Self, jw: anytype) !void {
             // std.json's custom stringify hook can only surface WriteFailed.
             // Call validate() when a caller needs to distinguish malformed raw
             // input before serialization.
+            if (self.immutable) |proof| if (proof.bytes.ptr == self.bytes.ptr and proof.bytes.len == self.bytes.len) {
+                try jw.beginWriteRaw();
+                if (proof.members_end) |end| {
+                    try jw.writer.writeAll(self.bytes[0..end]);
+                    try jw.writer.writeByte('}');
+                } else try jw.writer.writeAll(self.bytes);
+                jw.endWriteRaw();
+                return;
+            };
             self.validate() catch return error.WriteFailed;
             try jw.beginWriteRaw();
             try jw.writer.writeAll(self.bytes);
@@ -277,4 +298,21 @@ test "raw JSON nesting is bounded during parsing and final validation" {
     @memset(over_limit[max_raw_nesting + 2 ..], ']');
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(RawValue, alloc, over_limit, .{}));
     try std.testing.expectError(error.InvalidRawJson, (RawValue{ .bytes = over_limit }).validate());
+}
+
+test "immutable producer object prefixes stay extent-bound and are never wire metadata" {
+    const a = std.testing.allocator;
+    const bytes = "{\"n\":1,\"private\":true}";
+    const raw = RawObject.fromImmutableValidated(bytes, "{\"n\":1".len);
+    const output = try std.json.Stringify.valueAlloc(a, raw, .{});
+    defer a.free(output);
+    try std.testing.expectEqualStrings("{\"n\":1}", output);
+    var replaced = raw;
+    replaced.bytes = "not json";
+    var buffer: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try std.testing.expectError(error.WriteFailed, std.json.Stringify.value(replaced, .{}, &writer));
+    var parsed = try std.json.parseFromSlice(RawObject, a, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.immutable == null);
 }

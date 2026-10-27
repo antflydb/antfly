@@ -9061,10 +9061,12 @@ fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, r
                 if (hit.computed_json) |computed| {
                     const bytes = if (slot.output_allocator != null) moved: {
                         document.computed_json = null;
+                        document.computed_receipt = null;
                         break :moved computed;
                     } else try alloc.dupe(u8, computed);
                     if (selected.computed_json) |prior| alloc.free(prior);
                     selected.computed_json = bytes;
+                    selected.computed_receipt = if (hit.computed_receipt) |receipt| receipt.afterCopy(computed, bytes) else null;
                 }
                 // Hydration may already have normalized and masked this row.
                 // Rebind the producer receipt to the transferred/copied bytes.

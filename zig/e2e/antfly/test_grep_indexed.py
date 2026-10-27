@@ -3060,3 +3060,63 @@ def test_select_many_native_json_outputs(stateful_api, padding, num_shards):
     hit = response.json()["responses"][0]["hits"]["hits"][0]
     assert hit["_computed"] == values, hit
     assert hit.get("_source", {}) == {}, hit
+
+
+@pytest.mark.parametrize("padding", [0, 32768])
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_numeric_outputs_are_independent_of_materialization_order(
+    stateful_api, padding, num_shards
+):
+    from decimal import Decimal
+
+    table = "select_numeric_order_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    # Submit literal numeric spellings, without Python float coercion.
+    document = (
+        '{"n":1e-400,"nested":{"a":[1.234567890123456789,1e-400]},"padding":'
+        + json.dumps("x" * padding)
+        + "}"
+    )
+    inserted = requests.post(
+        stateful_api.url + f"/tables/{table}/batch",
+        data='{"inserts":{"a":' + document + '},"sync_level":"full_index"}',
+        headers={"Content-Type": "application/json"},
+        timeout=60,
+    )
+    assert inserted.status_code == 201, inserted.text
+    for field in ("n", "nested"):
+        direct = {"field": field}
+        typed = {
+            "call": "jsonb_extract_path",
+            "args": [
+                {"call": "jsonb_build_object", "args": [{"literal": "v"}, direct]},
+                {"literal": "v"},
+            ],
+        }
+        outputs = None
+        for selected in (
+            {"direct": direct, "typed": typed},
+            {"typed": typed, "direct": direct},
+        ):
+            selected["alias"] = {"ref": "direct"}
+            selected["branch"] = {
+                "case": [{"when": {"literal": True}, "then": {"field": field}}],
+                "else": {"literal": None},
+            }
+            response = requests.post(
+                stateful_api.url + f"/tables/{table}/query",
+                json={"query": {"match_all": {}}, "fields": [], "select": selected},
+                timeout=60,
+            )
+            assert response.status_code == 200, response.text
+            hit = response.json(parse_float=Decimal)["responses"][0]["hits"]["hits"][0]
+            values = hit["_computed"]
+            assert (
+                values["direct"]
+                == values["typed"]
+                == values["alias"]
+                == values["branch"]
+            ), hit
+            if outputs is not None:
+                assert values == outputs
+            outputs = values

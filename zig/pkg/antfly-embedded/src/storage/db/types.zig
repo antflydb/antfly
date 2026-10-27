@@ -2691,6 +2691,7 @@ pub const SearchHit = struct {
     /// Owned internal selection proof; absent on ordinary/public results.
     document_authority: ?*const @import("query/document_authority.zig").Authority = null,
     computed_json: ?[]u8 = null,
+    computed_receipt: ?@import("../../api/field_projection.zig").Receipt = null,
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
     /// table. This is not serialized as part of the public search-hit shape.
@@ -2747,6 +2748,9 @@ pub const SearchHit = struct {
             cloned.document_authority = owned;
         }
         cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
+        if (self.computed_receipt) |receipt| if (self.computed_json) |previous| {
+            if (cloned.computed_json) |bytes| cloned.computed_receipt = receipt.afterCopy(previous, bytes);
+        };
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;

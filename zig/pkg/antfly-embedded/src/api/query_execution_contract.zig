@@ -4952,6 +4952,7 @@ const RemoteSearchParser = struct {
         hit.stored_data = stored;
         stored = null;
         hit.computed_json = computed;
+        hit.computed_receipt = null;
         computed = null;
         return hit;
     }

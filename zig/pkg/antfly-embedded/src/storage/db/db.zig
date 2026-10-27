@@ -41757,6 +41757,7 @@ pub const DB = struct {
                 defer row_arena.deinit();
                 const a = row_arena.allocator();
                 var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &txn, .physical = keys[i], .id = hit.id, .authority = authorities.rows[i], .req = req, .public_plan = &public_plan, .operands = &operands };
+                defer row.deinit();
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
                 const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, protocol.requestLimits(&req));
                 errdefer alloc.free(encoded);
@@ -41766,6 +41767,7 @@ pub const DB = struct {
                 hit.clearSource(alloc);
                 if (hit.computed_json) |bytes| alloc.free(bytes);
                 hit.computed_json = encoded;
+                hit.computed_receipt = if (previous == null) plan.receipt(encoded) else null;
                 hit.stored_data = source;
                 hit.finalized_source = .{ .bytes = source };
                 if (authorities.rows[i].repair) self.document_authority_backfill_requested.store(true, .release);
@@ -41902,12 +41904,14 @@ pub const DB = struct {
             var projected: ?types.LookupResult = if (scalar_plan) |plan| lazy: {
                 const a = projection_scratch.allocator();
                 var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &read.?, .physical = store_key, .id = hit.id, .req = req, .authority = scalar_authorities.rows[index % 64], .full_bytes = raw_primary, .public_plan = if (scalar_public_plan) |*public| public else null, .operands = if (scalar_operands) |*operands| operands else null };
+                defer row.deinit();
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
                 const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, scalar.requestLimits(&req));
                 errdefer alloc.free(encoded);
                 const source = try row.base(body_allocator);
                 if (hit.computed_json) |bytes| alloc.free(bytes);
                 hit.computed_json = encoded;
+                hit.computed_receipt = if (previous == null) plan.receipt(encoded) else null;
                 if (row.metadata_hits != 0) scalar_metadata_rows += 1 else scalar_fallback_rows += 1;
                 if (row.certificate_hits != 0) scalar_certificate_rows += 1;
                 if (scalar_authorities.rows[index % 64].repair) self.document_authority_backfill_requested.store(true, .release);

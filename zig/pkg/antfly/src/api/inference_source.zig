@@ -28,6 +28,17 @@ pub const Port = struct {
     lookup_many: ?*const fn (*anyopaque, A, []const Reference) anyerror![]const []const u8 = null,
 };
 const Selected = struct { part: *V, reference: Reference };
+// Guard data before typed cloning or fixed-depth encoders. Recursion is bounded
+// before entry; strings/base64 are scalar nodes and are not walked bytewise.
+fn validateDepth(value: V, depth: usize) anyerror!void {
+    if (depth >= 240) return error.InferenceRequestTooLarge;
+    switch (value) {
+        .array => |array| for (array.items) |child| try validateDepth(child, depth + 1),
+        .object => |object| for (object.values()) |child| try validateDepth(child, depth + 1),
+        else => {},
+    }
+}
+
 fn collect(a: A, value: V, selected: *std.ArrayList(Selected)) !void {
     if (value != .array) return;
     for (value.array.items) |message| {
@@ -45,6 +56,7 @@ fn collect(a: A, value: V, selected: *std.ArrayList(Selected)) !void {
                 const key = entry.key_ptr.*;
                 if (!std.mem.eql(u8, key, "type") and !std.mem.eql(u8, key, "source") and !std.mem.eql(u8, key, "detail")) return error.InvalidInferenceSource;
             }
+            try validateDepth(source, 0);
             const reference = std.json.parseFromValueLeaky(Reference, a, source, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceSource;
             try reference.validate();
             if (selected.items.len == 128) return error.InferenceRequestTooLarge;
@@ -64,12 +76,18 @@ pub fn resolve(a: A, request: V, port: ?Port) !void {
     }
     if (request.object.get("messages")) |messages| try collect(a, messages, &selected);
     if (selected.items.len == 0) return;
+    try validateDepth(request, 0);
     const authorized = port orelse return error.InferenceSourceUnsupported;
     var bytes: usize = 0;
     for (selected.items) |item| {
         bytes = std.math.add(usize, bytes, std.base64.standard.Encoder.calcSize(item.reference.byte_length) + 256) catch return error.InferenceRequestTooLarge;
         if (bytes > 16 * 1024 * 1024) return error.InferenceRequestTooLarge;
     }
+    // Count the compact request once, before replacing locators with images.
+    var original: std.Io.Writer.Discarding = .init(&.{});
+    try std.json.Stringify.value(request, .{}, &original.writer);
+    var expanded: usize = std.math.cast(usize, original.fullCount()) orelse return error.InferenceRequestTooLarge;
+    if (expanded > 16 * 1024 * 1024) return error.InferenceRequestTooLarge;
     // Validate all reference shapes and aggregate limits before reading any row.
     // Each unique source is fetched once; only this request shares its authority.
     var unique: std.StringHashMapUnmanaged(usize) = .empty;
@@ -102,29 +120,48 @@ pub fn resolve(a: A, request: V, port: ?Port) !void {
         break :sequential output;
     };
     if (urls.len != references.items.len) return error.InferenceSourceMismatch;
-    // Verify the complete batch before rewriting any evidence in the request.
-    for (references.items, urls) |reference, url| try verify(a, reference, url);
+    // Decode/inspect a distinct payload once per request. Matching references
+    // still independently check digest, MIME, byte count and their pixel limit.
+    var verified: std.StringHashMapUnmanaged(Verified) = .empty;
+    defer verified.deinit(a);
+    for (references.items, urls) |reference, url| {
+        const info = verified.get(url) orelse checked: {
+            const info = try verifyInfo(a, reference, url);
+            try verified.put(a, url, info);
+            break :checked info;
+        };
+        if (info.bytes != reference.byte_length or !std.mem.eql(u8, &info.digest, reference.sha256) or !std.mem.eql(u8, info.mime, reference.mime_type)) return error.InferenceSourceMismatch;
+        if (info.pixels > reference.max_pixels) return error.InferenceRequestTooLarge;
+    }
+    // Base64 data URLs have JSON-safe ASCII spellings, proven by verification.
+    // Replace exactly the serialized source value and the three extra key bytes;
+    // do not walk expanded image bytes through a second counting encoder.
+    for (selected.items, slots) |item, slot| {
+        var counter: std.Io.Writer.Discarding = .init(&.{});
+        try std.json.Stringify.value(item.part.object.get("source").?, .{}, &counter.writer);
+        const previous = std.math.cast(usize, counter.fullCount()) orelse return error.InferenceRequestTooLarge;
+        expanded = std.math.add(usize, expanded - previous, urls[slot].len + 5) catch return error.InferenceRequestTooLarge;
+        if (expanded > 16 * 1024 * 1024) return error.InferenceRequestTooLarge;
+    }
     for (selected.items, slots) |item, slot| {
         _ = item.part.object.swapRemove("source");
         try item.part.object.put(a, "image_url", .{ .string = urls[slot] });
     }
-    // Existing inline requests retain the same expanded transport limit. This
-    // counting sink retains no image-sized body; only cold materialization pays
-    // the encoder walk, while identity-only cache hits never enter this path.
-    var buffer: [256]u8 = undefined;
-    var counter: std.Io.Writer.Discarding = .init(&buffer);
-    try std.json.Stringify.value(request, .{}, &counter.writer);
-    if (counter.fullCount() > 16 * 1024 * 1024) return error.InferenceRequestTooLarge;
 }
+const Verified = struct { bytes: usize, digest: [64]u8, mime: []const u8, pixels: u64 };
 fn verify(a: A, reference: Reference, url: []const u8) !void {
+    _ = try verifyInfo(a, reference, url);
+}
+fn verifyInfo(a: A, reference: Reference, url: []const u8) !Verified {
     const prefix = try std.fmt.allocPrint(a, "data:{s};base64,", .{reference.mime_type});
     defer a.free(prefix);
     if (!std.mem.startsWith(u8, url, prefix)) return error.InferenceSourceMismatch;
     const encoded = url[prefix.len..];
     const length = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InferenceSourceMismatch;
     if (length != reference.byte_length) return error.InferenceSourceMismatch;
-    const bytes = try a.alloc(u8, length);
-    defer a.free(bytes);
+    const scratch = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(a);
+    const bytes = try scratch.alloc(u8, length);
+    defer scratch.free(bytes);
     std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InferenceSourceMismatch;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -132,7 +169,9 @@ fn verify(a: A, reference: Reference, url: []const u8) !void {
     const mime = images.inferenceMimeEssenceForFormat(images.detectFormat(bytes)) orelse return error.InferenceSourceMismatch;
     if (!std.mem.eql(u8, mime, reference.mime_type)) return error.InferenceSourceMismatch;
     const info = try images.inspectEncoded(bytes);
-    if (try info.pixels() > reference.max_pixels) return error.InferenceRequestTooLarge;
+    const pixels = try info.pixels();
+    if (pixels > reference.max_pixels) return error.InferenceRequestTooLarge;
+    return .{ .bytes = length, .digest = std.fmt.bytesToHex(digest, .lower), .mime = mime, .pixels = pixels };
 }
 
 test "httpx inference gateway source references validate all locators before authorized materialization" {
@@ -192,6 +231,30 @@ test "httpx inference gateway source references validate all locators before aut
     wrong = reference;
     wrong.field = "assets.*";
     try std.testing.expectError(error.InvalidInferenceSource, wrong.validate());
+    // One URL with different claims must not inherit another reference's proof.
+    const inconsistent = try std.json.parseFromSliceLeaky(V, temp, body, .{});
+    const inconsistent_parts = inconsistent.object.get("inputs").?.array.items[0].object.get("input").?.array.items[0].object.get("content").?.array.items;
+    try inconsistent_parts[1].object.getPtr("source").?.object.put(temp, "sha256", .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" });
+    try std.testing.expectError(error.InferenceSourceMismatch, resolve(temp, inconsistent, port));
+    for (inconsistent_parts) |part| try std.testing.expect(part.object.contains("source") and !part.object.contains("image_url"));
+    var oversized = try std.json.parseFromSliceLeaky(V, temp, body, .{});
+    const padding = try temp.alloc(u8, 16 * 1024 * 1024);
+    @memset(padding, 'p');
+    try oversized.object.put(temp, "padding", .{ .string = padding });
+    fake.calls = 0;
+    try std.testing.expectError(error.InferenceRequestTooLarge, resolve(temp, oversized, port));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    const deep = try std.json.parseFromSliceLeaky(V, temp, body, .{});
+    var tree: V = .null;
+    for (0..300) |_| {
+        var object: std.json.ObjectMap = .empty;
+        try object.put(temp, "nested", tree);
+        tree = .{ .object = object };
+    }
+    const deep_parts = deep.object.get("inputs").?.array.items[0].object.get("input").?.array.items[0].object.get("content").?.array.items;
+    try deep_parts[0].object.getPtr("source").?.object.put(temp, "filter_query", tree);
+    try std.testing.expectError(error.InferenceRequestTooLarge, resolve(temp, deep, port));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 /// Only actual absence becomes 404. Preserve retryable table failures through

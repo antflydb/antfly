@@ -199,6 +199,7 @@ pub const Source = struct {
     context: *anyopaque,
     read: *const fn (*anyopaque, A, []const u8, sql.ColumnRead) anyerror!sql.Datum,
     read_raw: ?*const fn (*anyopaque, A, []const u8) anyerror!?[]const u8 = null,
+    prefetch: ?*const fn (*anyopaque, []const []const u8) anyerror!void = null,
 };
 const Dependency = union(enum) { field: []const u8, binding: usize };
 const Binding = struct { name: []const u8, expression: V, state: enum { unseen, visiting, ready } = .unseen, program: ?sql.Program = null, dependencies: []const Dependency = &.{}, height: usize = 0 };
@@ -207,6 +208,27 @@ pub const BorrowedPlan = struct {
     plan: *const Plan,
     pub fn get(self: BorrowedPlan, encoded: []const u8) ?*const Plan {
         return if (self.encoded.ptr == encoded.ptr and self.encoded.len == encoded.len) self.plan else null;
+    }
+};
+/// Native-producer evidence, never a wire field or an authorization grant.
+/// Replacing bytes or changing the program invalidates it. An exact owned
+/// copy may rebind locally; transport must validate before establishing one.
+pub const Receipt = struct {
+    bytes: []const u8,
+    fingerprint: [64]u8,
+    members_end: usize,
+    pub fn matches(self: @This(), bytes: []const u8, fingerprint: [64]u8) bool {
+        return self.bytes.ptr == bytes.ptr and self.bytes.len == bytes.len and std.mem.eql(u8, &self.fingerprint, &fingerprint);
+    }
+    /// Caller has just copied the complete immutable extent into owned bytes.
+    pub fn afterCopy(self: @This(), previous: []const u8, bytes: []const u8) ?Receipt {
+        if (!self.matches(previous, self.fingerprint) or previous.len != bytes.len) return null;
+        var copied = self;
+        copied.bytes = bytes;
+        return copied;
+    }
+    pub fn output(self: @This(), transport: bool) @import("antfly-json").RawObject {
+        return @import("antfly-json").RawObject.fromImmutableValidated(self.bytes, if (transport) null else self.members_end);
     }
 };
 pub const Plan = struct {
@@ -305,6 +327,19 @@ pub const Plan = struct {
         self.evaluation_order = order.items;
         return self;
     }
+    /// Caller has strictly validated output members and the plan fingerprint.
+    /// Nonstandard worker marker placement retains the general wire fallback.
+    pub fn receiptForValidated(self: *const Plan, bytes: []const u8) ?Receipt {
+        const prefix = if (self.bindings.len == 0) "\"" ++ marker ++ "\":\"" else ",\"" ++ marker ++ "\":\"";
+        if (bytes.len < prefix.len + 64 + 3) return null;
+        const end = bytes.len - prefix.len - 64 - 2;
+        if (!std.mem.startsWith(u8, bytes[end..], prefix) or !std.mem.eql(u8, bytes[end + prefix.len ..][0..64], &self.fingerprint) or !std.mem.endsWith(u8, bytes, "\"}")) return null;
+        return .{ .bytes = bytes, .fingerprint = self.fingerprint, .members_end = end };
+    }
+    /// Only for fresh, complete native evaluateEncoded output.
+    pub fn receipt(self: *const Plan, bytes: []const u8) Receipt {
+        return self.receiptForValidated(bytes).?;
+    }
     pub fn deinit(self: *Plan) void {
         for (self.bindings) |*binding| if (binding.program) |*program| program.deinit();
         const backing = self.arena.child_allocator;
@@ -383,15 +418,33 @@ pub const Plan = struct {
         const expected = if (self.bindings.len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(self.bindings.len)) - 1;
         if (observer.has_marker and (!observer.matched or observer.seen != expected)) return error.InvalidQueryResponse;
         if (!observer.has_marker) return null;
-        if (transport) return .{ .bytes = bytes };
+        if (transport) return @import("antfly-json").RawObject.fromImmutableValidated(bytes, null);
         try observer.writer.writer.writeByte('}');
-        return .{ .bytes = try a.dupe(u8, observer.writer.written()) };
+        return @import("antfly-json").RawObject.fromImmutableValidated(try a.dupe(u8, observer.writer.written()), null);
     }
     /// Native delivery keeps borrowed JSON through pure output expressions;
     /// aliases materialize once only when a consuming operator requires Datum.
     pub fn evaluateEncoded(self: *const Plan, a: A, output: A, source: Source, previous: ?V, limits: sql.EvalLimits) ![]u8 {
         if (previous != null) return std.json.Stringify.valueAlloc(output, try self.evaluate(a, source, previous, limits), .{});
         if (limits.checkpoint) |poll| try poll(limits.checkpoint_context);
+        if (source.prefetch) |prefetch| {
+            var paths: [64][]const u8 = undefined;
+            var count: usize = 0;
+            for (self.bindings) |binding| if (binding.program.?.directOutputColumn()) |ordinal| {
+                if (binding.dependencies[ordinal] == .field) {
+                    const path = binding.dependencies[ordinal].field;
+                    if (std.mem.eql(u8, path, "_id")) continue;
+                    const present = for (paths[0..count]) |other| {
+                        if (std.mem.eql(u8, other, path)) break true;
+                    } else false;
+                    if (!present) {
+                        paths[count] = path;
+                        count += 1;
+                    }
+                }
+            };
+            if (count > 1) try prefetch(source.context, paths[0..count]);
+        }
         const values = try a.alloc(?sql.Datum, self.bindings.len);
         @memset(values, null);
         const raw_values = try a.alloc(?[]const u8, self.bindings.len);
@@ -861,4 +914,47 @@ test "api query contract literal and parameter depth bounded before stringify" {
     var params: std.json.ObjectMap = .empty;
     try params.put(a, "unused", value);
     try std.testing.expectError(error.DecisionLimitExceeded, Plan.init(a, .{ .fields = &.{}, .params = .{ .object = params } }));
+}
+
+test "api query contract producer receipts omit only the private suffix and retire on replacement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, a, "[{\"name\":\"n\",\"expression\":{\"field\":\"n\"}}]", .{});
+    var plan = try Plan.init(a, .{ .fields = fields });
+    defer plan.deinit();
+    var source: JsonSource = .{ .id = "a", .root = try std.json.parseFromSliceLeaky(V, a, "{\"n\":5}", .{}) };
+    const bytes = try plan.evaluateEncoded(a, a, source.source(), null, .{});
+    const receipt = plan.receipt(bytes);
+    try std.testing.expect(receipt.matches(bytes, plan.fingerprint));
+    try std.testing.expect(!receipt.matches(try a.dupe(u8, bytes), plan.fingerprint));
+    try std.testing.expectEqualStrings("{\"n\":5}", try std.json.Stringify.valueAlloc(a, receipt.output(false), .{}));
+    try std.testing.expectEqualStrings(bytes, try std.json.Stringify.valueAlloc(a, receipt.output(true), .{}));
+}
+test "api query contract batches unconditional fields without speculative CASE reads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, a,
+        \\[ {"name":"a","expression":{"field":"a"}}, {"name":"b","expression":{"field":"b"}},
+        \\  {"name":"conditional","expression":{"case":[{"when":{"literal":false},"then":{"field":"secret"}}],"else":{"literal":null}}} ]
+    , .{});
+    var plan = try Plan.init(a, .{ .fields = fields });
+    defer plan.deinit();
+    const Mock = struct {
+        batches: usize = 0,
+        fn prefetch(ptr: *anyopaque, paths: []const []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batches += 1;
+            try std.testing.expectEqual(@as(usize, 2), paths.len);
+            for (paths) |path| try std.testing.expect(!std.mem.eql(u8, path, "secret"));
+        }
+        fn read(_: *anyopaque, _: A, path: []const u8, _: sql.ColumnRead) !sql.Datum {
+            if (std.mem.eql(u8, path, "secret")) return error.SpeculativeRead;
+            return sql.Datum.json(.{ .integer = 1 });
+        }
+    };
+    var mock: Mock = .{};
+    _ = try plan.evaluateEncoded(a, a, .{ .context = &mock, .read = Mock.read, .prefetch = Mock.prefetch }, null, .{});
+    try std.testing.expectEqual(@as(usize, 1), mock.batches);
 }

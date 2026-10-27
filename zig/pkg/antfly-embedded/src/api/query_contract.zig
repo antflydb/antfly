@@ -65,6 +65,9 @@ pub fn fieldProjectionStorageEligible(req: db_mod.types.SearchRequest) bool {
 /// replace the revision-bound document authorization checked by the caller.
 pub fn finalizeHydratedProjectionSources(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hits: []db_mod.types.SearchHit) !void {
     if (!field_projection.hydrationEligible(req)) return;
+    if (req.field_projection_plan) |shared| if (shared.get(req.field_projection_json)) |plan| {
+        return finalizeCompletedProjectionSources(a, req, hits, plan);
+    };
     var plan = try field_projection.decode(a, req.field_projection_json);
     defer plan.deinit();
     try finalizeCompletedProjectionSources(a, req, hits, &plan);
@@ -76,8 +79,9 @@ fn finalizeCompletedProjectionSources(a: std.mem.Allocator, req: db_mod.types.Se
         if (hasFinalizedPublicSource(hit.*)) continue;
         if (hit.source_value != null or hit.column_source != null) continue;
         const stored = hit.stored_data orelse continue;
-        if (hit.computed_json) |bytes| if (try plan.wireOutput(a, bytes, true) != null) {
+        if (hit.computed_json) |bytes| if ((if (hit.computed_receipt) |receipt| receipt.matches(bytes, plan.fingerprint) else false) or try plan.wireOutput(a, bytes, true) != null) {
             hit.finalized_source = .{ .bytes = stored };
+            hit.computed_receipt = plan.receiptForValidated(bytes);
         };
     }
 }
@@ -3980,7 +3984,10 @@ fn hasFinalizedPublicSource(hit: db_mod.types.SearchHit) bool {
     return hit.finalized_source != null and hit.finalized_source.?.matches(hit.stored_data orelse return false) and hit.source_value == null and hit.column_source == null;
 }
 fn preparedComputedOutput(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !?ant_json.RawObject {
-    return if (projection) |plan| (if (hit.computed_json) |bytes| try plan.wireOutput(a, bytes, req.field_projection_transport) else null) else null;
+    const plan = projection orelse return null;
+    const bytes = hit.computed_json orelse return null;
+    if (hit.computed_receipt) |receipt| if (receipt.matches(bytes, plan.fingerprint)) return receipt.output(req.field_projection_transport);
+    return plan.wireOutput(a, bytes, req.field_projection_transport);
 }
 fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: *db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !metadata_openapi.QueryHit {
     const ready = try preparedComputedOutput(a, req, hit.*, projection);

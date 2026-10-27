@@ -63,31 +63,26 @@ pub fn validatedScalarDigest(a: std.mem.Allocator, raw: []const u8) !?[32]u8 {
         hash.final(&digest);
         return digest;
     }
-    // Composite certificates are optional. Bound canonicalization before DOM
-    // allocation and std.json's fixed-depth writer; quoted brackets are data.
-    var depth: usize = 0;
-    var quoted = false;
-    var escaped = false;
-    for (value) |byte| {
-        if (quoted) {
-            if (escaped) escaped = false else if (byte == '\\') escaped = true else if (byte == '"') quoted = false;
-        } else switch (byte) {
-            '"' => quoted = true,
-            '[', '{' => {
-                depth += 1;
-                if (depth > 128) return null;
-            },
-            ']', '}' => {
-                if (depth == 0) return null;
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
-    var parsed = std.json.parseFromSlice(V, a, value, .{}) catch |err| {
+    // Sources are strictly validated before publication. Stream the identical
+    // typed canonical encoding, including escaped keys/strings and numbers.
+    // No payload-sized DOM is needed. Unsupported depth remains optional.
+    var out: HashWriter = .{};
+    out.hash.update(domain);
+    @import("canonical_json.zig").write(a, value, &out.writer, .{ .depth = 128 }) catch |err| {
         if (err == error.OutOfMemory) return err;
         return null;
     };
-    defer parsed.deinit();
-    return try digestValue(parsed.value);
+    try out.writer.flush();
+    var digest: [32]u8 = undefined;
+    out.hash.final(&digest);
+    return digest;
+}
+
+test "logical value conditional streaming canonical digests retain the typed ABI" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{\"n\":1e-400,\"items\":[1.234567890123456789,18446744073709551615,null]}", "[\"line\\nquote\\\"\",{\"k\\uD83D\\uDE80\":\"\\uD83D\\uDE80\"}]", "{\"null\":null,\"bool\":true,\"negative\":-0.0}" }) |raw| {
+        var parsed = try std.json.parseFromSlice(V, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(try digestValue(parsed.value), (try validatedScalarDigest(a, raw)).?);
+    }
 }
