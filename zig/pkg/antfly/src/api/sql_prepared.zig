@@ -32,7 +32,7 @@ const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
-    kind: enum { table, view, sequence, function } = .table,
+    kind: enum { table, view, sequence, function, procedure } = .table,
     sequence_incarnation: ?[16]u8 = null,
     routine_incarnation: ?[16]u8 = null,
     routine_signature: ?[]const u8 = null,
@@ -62,12 +62,12 @@ pub const Binding = struct {
     }
 
     pub fn fromRoutine(a: std.mem.Allocator, target: @import("antfly_local_sources").system_catalog_domain.Target, record: @import("antfly_local_sources").sql_catalog.routines.records.Record, incarnation: [16]u8, revision: u64) !Binding {
-        return .{ .kind = .function, .database = target.database, .namespace = target.namespace, .name = target.table, .physical_name = "", .id = record.id, .schema_version = record.generation, .revision = revision, .routine_incarnation = incarnation, .routine_signature = try record.definition.signatureAlloc(a) };
+        return .{ .kind = if (record.kind == .procedure) .procedure else .function, .database = target.database, .namespace = target.namespace, .name = target.table, .physical_name = "", .id = record.id, .schema_version = record.generation, .revision = revision, .routine_incarnation = incarnation, .routine_signature = try record.definition.signatureAlloc(a) };
     }
     pub fn verifyRoutine(bindings: []const Binding, current: Binding) !void {
-        if (current.kind != .function or current.routine_incarnation == null or current.routine_signature == null) return error.InvalidSqlBackendResponse;
+        if ((current.kind != .function and current.kind != .procedure) or current.routine_incarnation == null or current.routine_signature == null) return error.InvalidSqlBackendResponse;
         for (bindings) |entry| {
-            if (entry.kind != .function or entry.id != current.id) continue;
+            if (entry.kind != current.kind or entry.id != current.id) continue;
             if (entry.schema_version != current.schema_version or !std.meta.eql(entry.routine_incarnation, current.routine_incarnation) or entry.routine_signature == null or !std.mem.eql(u8, entry.routine_signature.?, current.routine_signature.?)) return error.CatalogGenerationChanged;
             return;
         }

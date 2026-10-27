@@ -97,7 +97,11 @@ pub const Request = struct {
 };
 
 /// Fixed-size storage survives error unwinding and per-statement arenas.
+pub const notices = @import("antfly_local_sources").sql_catalog.notices;
+pub const Notice = notices.Notice;
 pub const Diagnostic = struct {
+    notice_allocator: ?std.mem.Allocator = null,
+    notices_buffer: ?*notices.Buffer = null,
     code: ?[5]u8 = null,
     message: [256]u8 = undefined,
     message_len: u16 = 0,
@@ -106,6 +110,20 @@ pub const Diagnostic = struct {
     /// Authoritative session state after a statement failure (for example a
     /// COMMIT conflict ends the transaction, unlike an ordinary failed query).
     transaction_status: ?TransactionStatus = null,
+
+    pub fn clearNotices(self: *Diagnostic) void {
+        if (self.notices_buffer) |buffer| self.notice_allocator.?.destroy(buffer);
+        self.notices_buffer = null;
+    }
+    pub fn emitNotice(raw: *anyopaque, notice: notices.Notice) !void {
+        const self: *Diagnostic = @ptrCast(@alignCast(raw));
+        const a = self.notice_allocator orelse return error.InvalidSqlBackendResponse;
+        if (self.notices_buffer == null) {
+            self.notices_buffer = try a.create(notices.Buffer);
+            self.notices_buffer.?.* = .{};
+        }
+        try self.notices_buffer.?.append(notice);
+    }
 
     pub fn set(self: *Diagnostic, code: []const u8, message: []const u8, transaction_id: ?[32]u8, retryable: ?bool) void {
         std.debug.assert(code.len == 5);
@@ -148,6 +166,7 @@ pub const Result = struct {
     /// cells directly; scroll/hold stores clone only at their ownership edge.
     cells: ?Cells = null,
     rows_affected: u64 = 0,
+    notices: []const Notice = &.{},
     command_tag: []const u8,
     session_id: ?[]const u8 = null,
     continuation: ?[]const u8 = null,

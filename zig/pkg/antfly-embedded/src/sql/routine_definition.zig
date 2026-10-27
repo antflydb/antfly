@@ -20,6 +20,7 @@ const ast = @import("ast.zig");
 const scalar = @import("scalar.zig");
 pub const records = @import("../system_catalog/routines.zig");
 pub const bindings = @import("routine_bindings.zig");
+pub const procedures = @import("procedure.zig");
 pub const preparation_bytes = @import("resource_limits.zig").preparation_bytes;
 const A = std.mem.Allocator;
 
@@ -71,13 +72,14 @@ pub fn runtimeType(declared: records.Type) scalar.Type {
 pub fn definition(a: A, intent: ast.RoutineDefinition, owner: @import("../system_catalog/owners.zig").Owner) !records.Definition {
     const arguments = try a.alloc(records.Argument, intent.arguments.len);
     for (intent.arguments, arguments) |arg, *out| out.* = .{ .name = if (arg.name) |name| try a.dupe(u8, name) else null, .type = try storageType(arg.type) };
-    const result: records.Definition = .{ .arguments = arguments, .result = try storageType(intent.result), .body = try a.dupe(u8, intent.body), .strict = intent.strict, .volatility = std.meta.stringToEnum(records.Volatility, @tagName(intent.volatility)).?, .owner = owner };
+    const result: records.Definition = .{ .arguments = arguments, .result = if (intent.result) |result| try storageType(result) else null, .language = std.meta.stringToEnum(@FieldType(records.Definition, "language"), @tagName(intent.language)).?, .body = try a.dupe(u8, intent.body), .strict = intent.strict, .volatility = std.meta.stringToEnum(records.Volatility, @tagName(intent.volatility)).?, .owner = owner };
     try result.validate();
     return result;
 }
 
 pub fn prepare(a: A, record: records.Record, resolver: ?@import("routine_bindings.zig").Resolver, settings: ?*const @import("setting_catalog.zig").View) !*const @import("routine_bindings.zig").Resolved {
     try record.validate();
+    if (record.kind != .function) return error.SqlWrongObjectType;
     var parsed = try @import("compiler.zig").compile(a, record.definition.body, .{ .max_bytes = records.max_body_bytes });
     defer parsed.deinit();
     if (parsed.statement != .select) return error.SqlInvalidFunctionDefinition;
@@ -96,7 +98,7 @@ pub fn prepare(a: A, record: records.Record, resolver: ?@import("routine_binding
     // Keep unnamed argument ordinals in the row frame, but never invent an
     // arg1/arg2 identifier: PostgreSQL exposes only $n for unnamed SQL inputs.
     const expression = body.columns[0].expression orelse &ast.Scalar{ .column = body.columns[0].field };
-    const result = runtimeType(record.definition.result);
+    const result = runtimeType(record.definition.result orelse return error.SqlWrongObjectType);
     const cast: ast.Scalar = .{ .cast = .{ .operand = expression, .type = result.kind.?, .element_type = result.element_type, .temporal_kind = result.temporal_kind, .coercion = .function } };
     const program = try a.create(scalar.Program);
     program.* = try scalar.bindTypedExpectedWithSettings(a, &cast, columns, descriptors, result, .{ .routines = resolver }, settings);
@@ -173,4 +175,15 @@ test "SQL routine numeric row execution requires no allocator or catalog work af
         try std.testing.expectEqual(@as(i64, @intCast(row + 1)), result.value.integer);
     }
     try std.testing.expectEqual(prepared_lookups, owner.lookups);
+}
+
+/// Native publication validates syntax before writing catalog state. Procedural
+/// SQL expression binding is deliberately deferred to its statement-owned CALL
+/// plan, matching PostgreSQL's first-execution PL/pgSQL resolution boundary.
+pub fn validateBody(a: A, record: records.Record) !void {
+    try record.validate();
+    switch (record.kind) {
+        .function => _ = try prepare(a, record, null, null),
+        .procedure => _ = try @import("procedure.zig").compileBody(a, record),
+    }
 }

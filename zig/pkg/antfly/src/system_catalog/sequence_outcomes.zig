@@ -63,6 +63,7 @@ pub const Rejection = enum {
     SqlDuplicateFunction,
     SqlFunctionReturnTypeChanged,
     SqlUndefinedFunction,
+    SqlUndefinedProcedure,
     SqlInvalidFunctionDefinition,
     SqlUndefinedParameter,
     SqlProgramLimitExceeded,

@@ -6056,6 +6056,16 @@ pub const AntflyApiHandler = struct {
         connection_owned: ?@import("sql_connections.zig").Owned = null,
         connection_session_hex: [32]u8 = undefined,
         statement_start_ns: u64 = 0,
+        notice_buffer: ?*@import("antfly_local_sources").sql_catalog.notices.Buffer = null,
+        fn emitNotice(raw: *anyopaque, notice: @import("antfly_local_sources").sql_catalog.notices.Notice) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const a = self.prepared_response_budget.allocator();
+            if (self.notice_buffer == null) {
+                self.notice_buffer = try a.create(@import("antfly_local_sources").sql_catalog.notices.Buffer);
+                self.notice_buffer.?.* = .{};
+            }
+            try self.notice_buffer.?.append(notice);
+        }
 
         fn deliverRead(raw: *anyopaque, alloc: std.mem.Allocator, stream: *@import("antfly_local_sources").sql_read_stream.Stream) anyerror!sql_runtime.Result {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -6156,6 +6166,8 @@ pub const AntflyApiHandler = struct {
         }
 
         fn run(self: *@This()) void {
+            self.adapter.notice_sink = .{ .ptr = self, .emit = emitNotice };
+            defer self.adapter.releaseExecutionOwners();
             // Wake on the executor that owns the request waiter, not the
             // backend executor running this worker.
             defer self.done.set(self.completion_io);
@@ -6354,7 +6366,7 @@ pub const AntflyApiHandler = struct {
             }
             self.is_write = switch (compiled.statement) {
                 .select, .explain, .copy_to, .copy_from => false,
-                .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => true,
+                .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => true,
             };
             var execution = self.adapter.server.acquireSqlExecution(self.is_write) catch |err| {
                 self.failure = err;
@@ -6390,6 +6402,16 @@ pub const AntflyApiHandler = struct {
     }
 
     const CatalogReceiptBuffers = struct { id: [20]u8 = undefined, generation: [20]u8 = undefined, revision: [20]u8 = undefined };
+
+    fn noticeWire(a: std.mem.Allocator, optional: ?*const @import("antfly_local_sources").sql_catalog.notices.Buffer) !?[]const sql_wire.SQLNotice {
+        const buffer = optional orelse return null;
+        const output = try a.alloc(sql_wire.SQLNotice, buffer.count);
+        for (output, 0..) |*notice, ordinal| {
+            const value = buffer.get(ordinal);
+            notice.* = .{ .code = value.code, .message = value.message };
+        }
+        return output;
+    }
 
     fn catalogReceiptWire(value: @import("antfly_local_sources").sql_catalog.CatalogOperationReceipt, buffers: *CatalogReceiptBuffers) sql_wire.SQLCatalogOperationReceipt {
         return .{
@@ -6610,7 +6632,7 @@ pub const AntflyApiHandler = struct {
             };
             defer compiled.deinit();
             return switch (compiled.statement) {
-                .select, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl => ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" }),
+                .select, .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl => ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" }),
                 else => ctx.status(501).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "SQL statement is not supported by this endpoint" }),
             };
         };
@@ -6631,6 +6653,7 @@ pub const AntflyApiHandler = struct {
             .cache = self.api_server.sqlPlanCache(),
             .preparation = &preparation,
         };
+        defer if (job.notice_buffer) |buffer| job.prepared_response_budget.allocator().destroy(buffer);
         var future = runtime_io.concurrent(SQLJob.run, .{&job}) catch
             return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
         // Borrowed request/identity storage remains alive until the worker has
@@ -6641,12 +6664,15 @@ pub const AntflyApiHandler = struct {
         job.done.waitUncancelable(ctx.io);
         @import("protected_future.zig").wait(runtime_io, &future);
         if (job.failure) |err| {
+            const captured_notices = try noticeWire(ctx.allocator, job.notice_buffer);
+            defer if (captured_notices) |notices| ctx.allocator.free(notices);
             const diagnostic = sql_execution.diagnostic(err);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
             if (std.mem.eql(u8, diagnostic.code, "53300")) try ctx.setHeader("Retry-After", "1");
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
                 .code = sql_execution.sqlState(err),
                 .message = if (job.compile_diagnostic_valid) job.diagnostic.message else sql_execution.diagnosticMessage(err, &job.diagnostic_message_buffer),
+                .notices = captured_notices,
                 .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null,
                 .retryable = diagnostic.retryable,
                 .position = if (job.compile_diagnostic_valid and mode != .execute) sql_execution.characterPosition(statement, job.diagnostic.start) else null,
@@ -6686,7 +6712,10 @@ pub const AntflyApiHandler = struct {
             } else null,
         };
         var catalog_receipt_buffers: CatalogReceiptBuffers = .{};
+        const captured_notices = try noticeWire(ctx.allocator, job.notice_buffer);
+        defer if (captured_notices) |notices| ctx.allocator.free(notices);
         const output: sql_wire.SQLResponse = .{
+            .notices = captured_notices,
             .columns = columns,
             .rows = result.output.rows,
             .sql_nulls = result.output.sql_nulls,

@@ -78,7 +78,7 @@ fn observeAs(ctx: *fixture.Context, statement: []const u8, expected: Output, rea
 
 // Lose the ACK only after the real Raft mutation returns, then make the
 // producer's first read-only observation unavailable. Never retry the mutation.
-fn lostAck(ctx: *fixture.Context) !void {
+pub fn lostAck(ctx: *fixture.Context, procedure: bool) !void {
     const http = @import("http_server.zig");
     const Call = @import("../system_catalog/server_call.zig").Call;
     const Context = local.api_operation.RequestContext;
@@ -112,7 +112,10 @@ fn lostAck(ctx: *fixture.Context) !void {
     const padding = try ctx.alloc.alloc(u8, 12000);
     defer ctx.alloc.free(padding);
     @memset(padding, 'x');
-    const text = try std.fmt.allocPrint(ctx.alloc, "CREATE FUNCTION lost_ack(text) RETURNS text LANGUAGE sql AS $$SELECT lower($1) /*{s}*/$$", .{padding});
+    const text = if (procedure)
+        try std.fmt.allocPrint(ctx.alloc, "CREATE PROCEDURE lost_ack_procedure(text) LANGUAGE plpgsql AS $$BEGIN NULL; /*{s}*/ END$$", .{padding})
+    else
+        try std.fmt.allocPrint(ctx.alloc, "CREATE FUNCTION lost_ack(text) RETURNS text LANGUAGE sql AS $$SELECT lower($1) /*{s}*/$$", .{padding});
     defer ctx.alloc.free(text);
     var parsed = try local.sql_compiler.compile(ctx.alloc, text, .{});
     defer parsed.deinit();
@@ -120,10 +123,11 @@ fn lostAck(ctx: *fixture.Context) !void {
     const receipt = outcome.catalog_receipt orelse return error.MissingRoutineReceipt;
     defer receipt.deinit(ctx.alloc);
     try std.testing.expectEqual(.unknown, receipt.state);
+    try std.testing.expectEqual(if (procedure) local.sql_catalog.CatalogOperationReceipt.Kind.procedure else .function, receipt.kind);
     try std.testing.expect(receipt.recovery_token.len < 2048);
     try std.testing.expectEqual(@as(usize, 1), probe.mutations);
     // Publication of unrelated functions cannot replace this exact receipt.
-    try command(ctx, "CREATE FUNCTION unrelated_ack() RETURNS text LANGUAGE sql AS $$SELECT 'ok'$$");
+    try command(ctx, "CREATE OR REPLACE FUNCTION unrelated_ack() RETURNS text LANGUAGE sql AS $$SELECT 'ok'$$");
     probe.hidden = false;
     const recovered = try @import("sql_catalog_recovery.zig").recover(&gateway, null, .{}, ctx.alloc, receipt.recovery_token);
     defer recovered.deinit(ctx.alloc);
@@ -147,7 +151,7 @@ const Campaign = struct {
     }
     pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
         try self.credentials.activateWithCatalog(ctx, true);
-        try lostAck(ctx);
+        try lostAck(ctx, false);
         for (self.reference.entries) |entry| {
             if (entry.sqlstate) |code| {
                 try rejected(ctx, entry.sql, code);
@@ -163,6 +167,8 @@ const Campaign = struct {
             }
         }
         for (self.reference.probes) |probe| try rejected(ctx, probe.sql, probe.sqlstate);
+        try command(ctx, "CREATE FUNCTION owned_text() RETURNS text LANGUAGE sql AS $$SELECT 'ready'$$");
+        try observe(ctx, "SELECT owned_text() AS value,NULL::text AS absent", self.reference.entries[0].output.?);
         // Function and relation names occupy different catalog namespaces.
         try command(ctx, "CREATE TABLE normalize_status(id INTEGER PRIMARY KEY,status TEXT)");
         const serving = try fixture.waitServingSchema(ctx, "normalize_status", 0);
@@ -185,6 +191,7 @@ const Campaign = struct {
         try observe(ctx, self.reference.entries[0].query.?, self.reference.replaced);
     }
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try observe(ctx, "SELECT owned_text() AS value,NULL::text AS absent", self.reference.entries[0].output.?);
         _ = try fixture.waitServingSchema(ctx, "normalize_status", 0);
         try observe(ctx, self.reference.entries[0].query.?, self.reference.replaced);
         for (self.reference.entries[1..]) |entry| if (entry.query) |query| try observe(ctx, query, entry.output.?);

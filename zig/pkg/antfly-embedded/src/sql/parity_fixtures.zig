@@ -178,3 +178,5 @@ pub const temporal_domain_reference = @embedFile("fixtures/sql_temporal_domain_r
 pub const table_placement_reference = @embedFile("fixtures/sql_table_placement_reference.json");
 
 pub const routine_reference = @embedFile("fixtures/sql_routine_reference.json");
+
+pub const procedure_reference = @embedFile("fixtures/sql_procedure_reference.json");

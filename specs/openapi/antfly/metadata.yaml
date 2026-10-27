@@ -1730,6 +1730,18 @@ components:
         cause the statement to be replayed. Pending or repair outcomes require
         visibility convergence or operator action rather than another write.
       enum: [committed, committed_pending, committed_repair_required, committed_graph_metric_materialization_rejected]
+    SQLNotice:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          minLength: 5
+          maxLength: 5
+        message:
+          type: string
+          description: Nonfatal statement notice; prior notices remain visible if a later instruction fails.
     SQLResponse:
       type: object
       additionalProperties: false
@@ -1742,6 +1754,11 @@ components:
         Array-typed columns contain SQLArrayValue envelopes, with their element
         descriptor in the corresponding SQLColumn. They are not JSON columns.
       properties:
+        notices:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/SQLNotice'
         columns:
           type: array
           items:
@@ -1895,7 +1912,7 @@ components:
           minimum: 0
     SQLCatalogObjectKind:
       type: string
-      enum: [sequence, function]
+      enum: [sequence, function, procedure]
       description: Native catalog resource kind; never a synthetic physical table.
     SQLCatalogOperationKind:
       type: string
@@ -1961,6 +1978,11 @@ components:
       additionalProperties: false
       required: [code, message]
       properties:
+        notices:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/SQLNotice'
         code:
           type: string
           minLength: 5

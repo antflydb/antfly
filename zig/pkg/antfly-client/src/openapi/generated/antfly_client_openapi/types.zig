@@ -51029,11 +51029,13 @@ pub const SQLBuiltinType = enum {
 pub const SQLCatalogObjectKind = enum {
     sequence,
     function,
+    procedure,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .sequence => "sequence",
             .function => "function",
+            .procedure => "procedure",
         };
         try jw.write(s);
     }
@@ -51046,6 +51048,7 @@ pub const SQLCatalogObjectKind = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "sequence", .sequence },
             .{ "function", .function },
+            .{ "procedure", .procedure },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -51456,6 +51459,7 @@ pub const SQLDDLReceiptState = enum {
 };
 
 pub const SQLDiagnostic = struct {
+    notices: ?[]const SQLNotice = null,
     /// Five-character SQLSTATE error code.
     code: []const u8,
     /// Human-readable diagnostic with no sensitive parameter values.
@@ -51472,6 +51476,7 @@ pub const SQLDiagnostic = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "notices", "notices", true },
         .{ "code", "code", false },
         .{ "message", "message", false },
         .{ "column_name", "column_name", true },
@@ -51491,6 +51496,10 @@ pub const SQLDiagnostic = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.notices) |value| {
+            try jw.objectField("notices");
+            try jw.write(value);
+        }
         try jw.objectField("code");
         try jw.write(self.code);
         try jw.objectField("message");
@@ -51549,6 +51558,12 @@ pub const SQLMutationOutcome = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const SQLNotice = struct {
+    code: []const u8,
+    /// Nonfatal statement notice; prior notices remain visible if a later instruction fails.
+    message: []const u8,
 };
 
 /// PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC.
@@ -51824,6 +51839,7 @@ pub const SQLRequest = struct {
 
 /// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON. Array-typed columns contain SQLArrayValue envelopes, with their element descriptor in the corresponding SQLColumn. They are not JSON columns.
 pub const SQLResponse = struct {
+    notices: ?[]const SQLNotice = null,
     columns: []const SQLColumn,
     rows: []const []const std.json.Value,
     /// Number of rows affected by a mutation, or zero for a read-only statement.
@@ -51843,6 +51859,7 @@ pub const SQLResponse = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "notices", "notices", true },
         .{ "columns", "columns", false },
         .{ "rows", "rows", false },
         .{ "rows_affected", "rows_affected", false },
@@ -51866,6 +51883,10 @@ pub const SQLResponse = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.notices) |value| {
+            try jw.objectField("notices");
+            try jw.write(value);
+        }
         try jw.objectField("columns");
         try jw.write(self.columns);
         try jw.objectField("rows");

@@ -99,6 +99,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .role => "CREATE ROLE",
                 .sequence => "CREATE SEQUENCE",
                 .function => "CREATE FUNCTION",
+                .procedure => "CREATE PROCEDURE",
                 .table => unreachable,
             },
             .drop => switch (ddl.kind) {
@@ -110,6 +111,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .role => "DROP ROLE",
                 .sequence => "DROP SEQUENCE",
                 .function => "DROP FUNCTION",
+                .procedure => "DROP PROCEDURE",
                 .table => unreachable,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
@@ -122,6 +124,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .role => "ALTER ROLE",
                 .sequence => "ALTER SEQUENCE",
                 .function => "ALTER FUNCTION",
+                .procedure => "ALTER PROCEDURE",
             },
         },
     }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt, .catalog_receipt = outcome.catalog_receipt };

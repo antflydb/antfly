@@ -70,11 +70,13 @@ pub fn mutateSqlRoutine(svc: anytype, alloc: std.mem.Allocator, context: operati
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const command = routines.command(request);
-    const preview = store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command) catch |err| {
-        const rejected = routines.Outcome.fromError(err) orelse return err;
-        return std.json.Stringify.valueAlloc(alloc, rejected, .{});
-    };
-    alloc.free(preview);
+    if (store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command)) |preview| {
+        alloc.free(preview);
+    } else |err| {
+        // Accepted semantic failures need the same retained nonce outcome as
+        // success. Only invalid envelopes/capability/IO failures stop admission.
+        if (routines.Outcome.fromError(err) == null) return err;
+    }
     const observation = try routines.observation(alloc, request);
     const previous = try store.sqlRoutineOutcome(alloc, svc.metadata_group_id, observation);
     defer alloc.free(previous);

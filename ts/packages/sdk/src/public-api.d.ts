@@ -7296,6 +7296,11 @@ export interface components {
          * @enum {string}
          */
         SQLMutationOutcome: "committed" | "committed_pending" | "committed_repair_required" | "committed_graph_metric_materialization_rejected";
+        SQLNotice: {
+            code: string;
+            /** @description Nonfatal statement notice; prior notices remain visible if a later instruction fails. */
+            message: string;
+        };
         /**
          * @description Ordinal result rows with corresponding logical column metadata. SQL NULL
          *     is JSON null; sql_nulls distinguishes it from a JSON column containing
@@ -7305,6 +7310,7 @@ export interface components {
          *     descriptor in the corresponding SQLColumn. They are not JSON columns.
          */
         SQLResponse: {
+            notices?: components["schemas"]["SQLNotice"][];
             columns: components["schemas"]["SQLColumn"][];
             rows: unknown[][];
             /**
@@ -7394,7 +7400,7 @@ export interface components {
          * @description Native catalog resource kind; never a synthetic physical table.
          * @enum {string}
          */
-        SQLCatalogObjectKind: "sequence" | "function";
+        SQLCatalogObjectKind: "sequence" | "function" | "procedure";
         /** @enum {string} */
         SQLCatalogOperationKind: "create" | "alter" | "rename" | "drop";
         /**
@@ -7431,6 +7437,7 @@ export interface components {
             recovery_token: string;
         };
         SQLDiagnostic: {
+            notices?: components["schemas"]["SQLNotice"][];
             /** @description Five-character SQLSTATE error code. */
             code: string;
             /** @description Human-readable diagnostic with no sensitive parameter values. */

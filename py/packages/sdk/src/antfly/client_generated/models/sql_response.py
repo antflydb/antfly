@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.sql_catalog_operation_receipt import SQLCatalogOperationReceipt
     from ..models.sql_column import SQLColumn
+    from ..models.sql_notice import SQLNotice
     from ..models.sqlddl_receipt import SQLDDLReceipt
 
 
@@ -32,6 +33,7 @@ class SQLResponse:
             rows (list[list[Any]]):
             rows_affected (int): Number of rows affected by a mutation, or zero for a read-only statement.
             command_tag (str): SQL command completion tag.
+            notices (list[SQLNotice] | Unset):
             sql_nulls (list[list[bool]] | Unset): Null flags aligned exactly with rows and their columns. True denotes
                 SQL NULL; false denotes a value, including the JSON literal null.
                 When omitted, null cells have the legacy SQL NULL interpretation.
@@ -71,6 +73,7 @@ class SQLResponse:
     rows: list[list[Any]]
     rows_affected: int
     command_tag: str
+    notices: list[SQLNotice] | Unset = UNSET
     sql_nulls: list[list[bool]] | Unset = UNSET
     mutation_outcome: SQLMutationOutcome | Unset = UNSET
     ddl_receipt: SQLDDLReceipt | Unset = UNSET
@@ -94,6 +97,13 @@ class SQLResponse:
         rows_affected = self.rows_affected
 
         command_tag = self.command_tag
+
+        notices: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.notices, Unset):
+            notices = []
+            for notices_item_data in self.notices:
+                notices_item = notices_item_data.to_dict()
+                notices.append(notices_item)
 
         sql_nulls: list[list[bool]] | Unset = UNSET
         if not isinstance(self.sql_nulls, Unset):
@@ -133,6 +143,8 @@ class SQLResponse:
                 "command_tag": command_tag,
             }
         )
+        if notices is not UNSET:
+            field_dict["notices"] = notices
         if sql_nulls is not UNSET:
             field_dict["sql_nulls"] = sql_nulls
         if mutation_outcome is not UNSET:
@@ -154,6 +166,7 @@ class SQLResponse:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.sql_catalog_operation_receipt import SQLCatalogOperationReceipt
         from ..models.sql_column import SQLColumn
+        from ..models.sql_notice import SQLNotice
         from ..models.sqlddl_receipt import SQLDDLReceipt
 
         d = dict(src_dict)
@@ -174,6 +187,15 @@ class SQLResponse:
         rows_affected = d.pop("rows_affected")
 
         command_tag = d.pop("command_tag")
+
+        _notices = d.pop("notices", UNSET)
+        notices: list[SQLNotice] | Unset = UNSET
+        if _notices is not UNSET:
+            notices = []
+            for notices_item_data in _notices:
+                notices_item = SQLNotice.from_dict(notices_item_data)
+
+                notices.append(notices_item)
 
         _sql_nulls = d.pop("sql_nulls", UNSET)
         sql_nulls: list[list[bool]] | Unset = UNSET
@@ -221,6 +243,7 @@ class SQLResponse:
             rows=rows,
             rows_affected=rows_affected,
             command_tag=command_tag,
+            notices=notices,
             sql_nulls=sql_nulls,
             mutation_outcome=mutation_outcome,
             ddl_receipt=ddl_receipt,

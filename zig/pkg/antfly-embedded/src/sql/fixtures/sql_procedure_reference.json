@@ -1,0 +1,234 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 procedural routines and notices",
+  "entries": [
+    {
+      "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS $$BEGIN NULL; END$$",
+      "command_tag": "CREATE PROCEDURE",
+      "notices": [],
+      "id": "sql-0414",
+      "source_entry_sha256": "8960e9eb50b9dd7cb0e702dd7311ba88b7a06f525bea7380c745da7732a6e4a6"
+    },
+    {
+      "sql": "CREATE PROCEDURE rotate_usage_notice() LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'rotate'; END$$",
+      "command_tag": "CREATE PROCEDURE",
+      "notices": [],
+      "id": "sql-0415",
+      "source_entry_sha256": "deeeadf4ba1776869a26d624cf8ebc608e87024bbf9f29efc3e3d3b41a2f0718"
+    },
+    {
+      "sql": "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$",
+      "command_tag": "CREATE PROCEDURE",
+      "notices": [],
+      "id": "sql-0416",
+      "source_entry_sha256": "56672552cee7f625f71b6b269a2c5677ea2aeb97660b71b75d60672742327458"
+    },
+    {
+      "sql": "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$",
+      "command_tag": "CREATE PROCEDURE",
+      "notices": [],
+      "id": "sql-0418",
+      "source_entry_sha256": "115917fa5ed881ddf7593d98d3d12a792f5ae5ee9a6839f2b1144eba3689b16b"
+    },
+    {
+      "sql": "CALL rotate_usage()",
+      "command_tag": "CALL",
+      "notices": [],
+      "id": "sql-0417",
+      "source_entry_sha256": "3c523185dc0beaab77ef66f813615c56c57b5e46fd1287a3808ce533f725a8bc"
+    }
+  ],
+  "calls": [
+    {
+      "sql": "CALL rotate_usage_notice()",
+      "command_tag": "CALL",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "rotate"
+        }
+      ]
+    },
+    {
+      "sql": "CALL rotate_usage_perform()",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "CALL rotate_usage_perform_arg()",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION rotate_usage_now() RETURNS integer LANGUAGE sql AS $$SELECT 1/0$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CALL rotate_usage_perform()",
+      "sqlstate": "22012",
+      "notices": []
+    },
+    {
+      "sql": "CREATE OR REPLACE FUNCTION rotate_usage_now() RETURNS integer LANGUAGE sql AS $$SELECT 1$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION rotate_usage_now(integer) RETURNS integer LANGUAGE sql AS $$SELECT 10/$1$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CALL rotate_usage_perform()",
+      "command_tag": "CALL",
+      "notices": []
+    },
+    {
+      "sql": "CALL rotate_usage_perform_arg()",
+      "command_tag": "CALL",
+      "notices": []
+    },
+    {
+      "sql": "CREATE PROCEDURE notice_failure() LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'before failure'; PERFORM 1/0; END$$",
+      "command_tag": "CREATE PROCEDURE",
+      "notices": []
+    },
+    {
+      "sql": "CALL notice_failure()",
+      "sqlstate": "22012",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "before failure"
+        }
+      ]
+    },
+    {
+      "sql": "CREATE PROCEDURE return_early() LANGUAGE plpgsql AS $$BEGIN RETURN; PERFORM nonexistent_helper(); END$$",
+      "command_tag": "CREATE PROCEDURE",
+      "notices": []
+    },
+    {
+      "sql": "CALL return_early()",
+      "command_tag": "CALL",
+      "notices": []
+    },
+    {
+      "sql": "CREATE PROCEDURE typed_check(v numeric) LANGUAGE plpgsql AS $$BEGIN PERFORM 1/(CASE WHEN v+$1=14.50 THEN 1 ELSE 0 END); END$$",
+      "command_tag": "CREATE PROCEDURE",
+      "notices": []
+    },
+    {
+      "sql": "CALL typed_check(7.25)",
+      "command_tag": "CALL",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION rotate_usage() RETURNS integer LANGUAGE sql AS $$SELECT 1$$",
+      "sqlstate": "42723",
+      "notices": []
+    },
+    {
+      "sql": "CREATE OR REPLACE FUNCTION rotate_usage() RETURNS integer LANGUAGE sql AS $$SELECT 1$$",
+      "sqlstate": "42809",
+      "notices": []
+    },
+    {
+      "sql": "SELECT rotate_usage()",
+      "sqlstate": "42809",
+      "notices": []
+    },
+    {
+      "sql": "CALL rotate_usage_now()",
+      "sqlstate": "42809",
+      "notices": []
+    }
+  ],
+  "cold": [
+    {
+      "sql": "CALL rotate_usage()",
+      "command_tag": "CALL",
+      "notices": []
+    },
+    {
+      "sql": "CALL rotate_usage_notice()",
+      "command_tag": "CALL",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "rotate"
+        }
+      ]
+    },
+    {
+      "sql": "CALL rotate_usage_perform()",
+      "command_tag": "CALL",
+      "notices": []
+    },
+    {
+      "sql": "CALL rotate_usage_perform_arg()",
+      "command_tag": "CALL",
+      "notices": []
+    },
+    {
+      "sql": "CALL return_early()",
+      "command_tag": "CALL",
+      "notices": []
+    },
+    {
+      "sql": "CALL typed_check(7.25)",
+      "command_tag": "CALL",
+      "notices": []
+    },
+    {
+      "sql": "CALL notice_failure()",
+      "sqlstate": "22012",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "before failure"
+        }
+      ]
+    }
+  ],
+  "teardown": [
+    {
+      "sql": "DROP PROCEDURE rotate_usage()",
+      "command_tag": "DROP PROCEDURE",
+      "notices": [],
+      "id": "sql-0419"
+    },
+    {
+      "sql": "CALL rotate_usage()",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "CREATE PROCEDURE rotate_usage(text) LANGUAGE plpgsql AS $$BEGIN NULL; END$$",
+      "command_tag": "CREATE PROCEDURE",
+      "notices": []
+    },
+    {
+      "sql": "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE",
+      "command_tag": "DROP PROCEDURE",
+      "notices": [],
+      "id": "sql-0420"
+    },
+    {
+      "sql": "CALL rotate_usage('missing')",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE",
+      "command_tag": "DROP PROCEDURE",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "procedure rotate_usage(text) does not exist, skipping"
+        }
+      ]
+    }
+  ]
+}

@@ -27,13 +27,14 @@ const common = @import("sql_catalog_recovery.zig");
 const A = std.mem.Allocator;
 
 pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl: ast.CatalogDdl) !catalog.DdlOutcome {
-    if (ddl.kind != .function or (ddl.action != .create and ddl.action != .drop)) return error.UnsupportedSqlExecution;
+    if ((ddl.kind != .function and ddl.kind != .procedure) or (ddl.action != .create and ddl.action != .drop)) return error.UnsupportedSqlExecution;
     if (root.active_transaction != null or !root.server.source.vtable.supports_sql_routines) return error.UnsupportedSqlExecution;
     try root.context.ensureActive();
     var region: std.heap.ArenaAllocator = .init(allocators.scratch);
     defer region.deinit();
     const a = region.allocator();
     const creating = ddl.action == .create;
+    const routine_kind: routines.records.Kind = if (ddl.kind == .procedure) .procedure else .function;
     const scope = try calls.targets(root, a, ddl.name);
     const declared = if (creating) try catalog.routines.definition(a, ddl.routine orelse return error.InvalidSqlSyntax, try @import("sql_view_ddl.zig").currentOwner(root.identity.*, root.server.cfg.auth_enabled)) else null;
     const signature = if (declared) |definition| try definition.signatureAlloc(a) else if (ddl.routine_signature) |types| signature: {
@@ -51,8 +52,14 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
         };
     } else if (cut.found) |found| chosen = found.scope;
     const index = chosen orelse {
-        if (!creating and ddl.conditional) return .{};
-        if (!creating) return error.SqlUndefinedFunction;
+        if (!creating and ddl.conditional) {
+            if (root.notice_sink) |sink| {
+                const message = try std.fmt.allocPrint(a, "{s} {s}({s}) does not exist, skipping", .{ if (routine_kind == .procedure) @as([]const u8, "procedure") else "function", ddl.name.table, signature orelse "" });
+                try sink.emit(sink.ptr, .{ .message = message });
+            }
+            return .{};
+        }
+        if (!creating) return if (routine_kind == .procedure) error.SqlUndefinedProcedure else error.SqlUndefinedFunction;
         return if (cut.scopes[0].database_exists) error.NamespaceNotFound else error.DatabaseNotFound;
     };
     const target = cut.scopes[index].target;
@@ -61,18 +68,19 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
     const expected: ?routines.Identity = if (prior) |record| .{ .id = record.id, .generation = record.generation } else null;
     if (declared) |definition| {
         if (prior != null and !ddl.routine.?.replace) return error.SqlDuplicateFunction;
+        if (prior) |before| if (before.kind != routine_kind) return error.SqlWrongObjectType;
         if (prior) |before| {
             if (!std.meta.eql(before.definition.result, definition.result)) return error.SqlFunctionReturnTypeChanged;
             for (before.definition.arguments, definition.arguments) |old, new| if (old.name) |name| {
                 if (new.name == null or !std.mem.eql(u8, name, new.name.?)) return error.SqlFunctionReturnTypeChanged;
             };
         }
-        _ = try catalog.routines.prepare(a, .{ .id = if (prior) |record| record.id else cut.next_id, .generation = if (prior) |record| record.generation else 1, .definition = definition }, null, null);
+        try catalog.routines.validateBody(a, .{ .kind = routine_kind, .id = if (prior) |record| record.id else cut.next_id, .generation = if (prior) |record| record.generation else 1, .definition = definition });
     }
     const io = root.server.embedding_provider_runtime.io;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
-    const request: routines.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head }, .target = target, .namespace_id = cut.scopes[index].namespace_id.?, .incarnation = cut.incarnation, .operation = if (declared) |definition| .{ .publish = .{ .definition = definition, .replace = ddl.routine.?.replace, .expected = expected } } else .{ .drop = .{ .signature = signature orelse try prior.?.definition.signatureAlloc(a), .expected = expected, .if_exists = ddl.conditional, .cascade = ddl.cascade } } };
+    const request: routines.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head }, .target = target, .namespace_id = cut.scopes[index].namespace_id.?, .incarnation = cut.incarnation, .operation = if (declared) |definition| .{ .publish = .{ .kind = routine_kind, .definition = definition, .replace = ddl.routine.?.replace, .expected = expected } } else .{ .drop = .{ .kind = routine_kind, .signature = signature orelse try prior.?.definition.signatureAlloc(a), .expected = expected, .if_exists = ddl.conditional, .cascade = ddl.cascade } } };
     try request.validate();
     const observation = try routines.observation(a, request);
     var receipt = try recovery.newReceipt(allocators.result, a, observation, cut.revision);

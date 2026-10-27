@@ -1040,7 +1040,7 @@ const Job = struct {
         const compiled = &effective;
         const write = self.kind == .execute and switch (compiled.statement) {
             .select, .explain, .copy_to, .copy_from => false,
-            .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => true,
+            .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => true,
         };
         const server = self.adapter.server;
         var admission = try server.acquireSqlExecution(write);
@@ -1071,6 +1071,10 @@ const Job = struct {
             .setting_overlay_source = .connection,
             .expected_setting_epoch = self.request.setting_epoch,
         };
+        defer native_adapter.releaseExecutionOwners();
+        if (self.request.diagnostics) |diagnostic| {
+            if (diagnostic.notice_allocator != null) native_adapter.notice_sink = .{ .ptr = diagnostic, .emit = wire.Diagnostic.emitNotice };
+        }
         var captured_bindings: std.ArrayList(@import("sql_prepared.zig").Binding) = .empty;
         if (self.kind == .describe) native_adapter.collect_prepared_bindings = &captured_bindings else native_adapter.prepared_bindings = try viewBindings(self.alloc, self.request.binding_guard);
         // describe/execute capture a single settings view. The adapter's
@@ -1177,6 +1181,7 @@ const Job = struct {
             .rows = result.output.rows,
             .sql_nulls = result.output.sql_nulls,
             .rows_affected = result.output.rows_affected,
+            .notices = if (self.request.diagnostics) |diagnostic| if (diagnostic.notice_allocator != null) &.{} else result.output.notices else result.output.notices,
             .command_tag = try commandTag(self.alloc, result.output.command_tag, result.output.completion_rows orelse result.output.rowCount(), result.output.rows_affected),
             .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
                 inline else => |kind| @field(wire.MutationOutcome, @tagName(kind)),
@@ -1774,7 +1779,7 @@ fn viewBindings(a: std.mem.Allocator, guard: ?[]const u8) !?[]const @import("sql
     for (bindings) |binding| {
         if (binding.id == 0 or binding.database.len == 0 or binding.namespace.len == 0 or binding.name.len == 0) return error.CatalogGenerationChanged;
         if (binding.kind == .view and (binding.schema_version == 0 or binding.definition_digest == null)) return error.CatalogGenerationChanged;
-        if (binding.kind == .function and (binding.schema_version == 0 or binding.routine_incarnation == null or std.mem.allEqual(u8, &binding.routine_incarnation.?, 0) or binding.routine_signature == null)) return error.CatalogGenerationChanged;
+        if ((binding.kind == .function or binding.kind == .procedure) and (binding.schema_version == 0 or binding.routine_incarnation == null or std.mem.allEqual(u8, &binding.routine_incarnation.?, 0) or binding.routine_signature == null)) return error.CatalogGenerationChanged;
         if (binding.kind == .sequence) {
             const identity: @import("antfly_local_sources").sql_sequence_session.Identity = .{ .id = binding.id, .incarnation = binding.sequence_incarnation orelse return error.CatalogGenerationChanged };
             identity.validate() catch return error.CatalogGenerationChanged;

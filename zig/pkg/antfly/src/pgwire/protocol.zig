@@ -173,6 +173,7 @@ pub const Session = struct {
     copy_sync_received: bool = false,
 
     pub fn deinit(self: *Session) void {
+        self.diagnostic.clearNotices();
         if (self.hooks) |hooks| hooks.unregister(hooks.context, self);
         // Retained readers may still reference the authenticated credential.
         // Close them before disconnecting/releasing that credential.
@@ -234,7 +235,8 @@ pub const Session = struct {
             if (self.skip_until_sync and tag != 'S') continue;
             const timeout = self.statement_timeout orelse self.limits.statement_timeout_ms;
             self.setDeadline(if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms));
-            self.diagnostic = .{};
+            self.diagnostic.clearNotices();
+            self.diagnostic = .{ .notice_allocator = self.alloc };
             self.mutation_ack_pending = false;
             self.dispatch(tag, payload) catch |err| {
                 if (err == error.Canceled) return err;
@@ -2284,12 +2286,14 @@ pub const Session = struct {
     }
 
     pub fn sendError(self: *Session, code: []const u8, message_text: []const u8) !void {
+        try self.flushNotices();
         const payload = try std.mem.concat(self.alloc, u8, &.{ "SERROR\x00C", code, "\x00M", message_text, "\x00\x00" });
         defer self.alloc.free(payload);
         try self.message('E', payload);
     }
 
     fn sendDiagnostic(self: *Session, tag: u8, diagnostic: backend.Diagnostic, outcome: ?backend.MutationOutcome) !void {
+        if (tag == 'E') try self.flushNotices();
         var bytes = std.Io.Writer.Allocating.init(self.alloc);
         defer bytes.deinit();
         try bytes.writer.writeAll(if (tag == 'N') "SNOTICE\x00C" else "SERROR\x00C");
@@ -2306,7 +2310,23 @@ pub const Session = struct {
         try self.message(tag, bytes.written());
     }
 
+    fn flushNotices(self: *Session) !void {
+        const buffer = self.diagnostic.notices_buffer orelse return;
+        while (buffer.sent < buffer.count) : (buffer.sent += 1) try self.sendNotice(buffer.get(buffer.sent));
+    }
+    fn sendNotice(self: *Session, notice: backend.Notice) !void {
+        var bytes: std.Io.Writer.Allocating = .init(self.alloc);
+        defer bytes.deinit();
+        try bytes.writer.writeAll("SNOTICE\x00C");
+        try bytes.writer.writeAll(notice.code);
+        try bytes.writer.writeAll("\x00M");
+        try bytes.writer.writeAll(notice.message);
+        try bytes.writer.writeAll("\x00\x00");
+        try self.message('N', bytes.written());
+    }
     fn complete(self: *Session, result: backend.Result) !void {
+        try self.flushNotices();
+        for (result.notices) |notice| try self.sendNotice(notice);
         if (result.ddl_receipt_json != null and result.catalog_receipt_json != null) return error.InvalidResult;
         if (result.catalog_receipt_json orelse result.ddl_receipt_json) |receipt| {
             var bytes = std.Io.Writer.Allocating.init(self.alloc);

@@ -58,12 +58,16 @@ pub fn targets(root: *execution.Adapter, a: A, input: local.sql_ast.Name) ![]con
 
 pub const Owner = struct {
     const Identity = struct { id: u64, generation: u32 };
+    control: A,
+    lease: local.sql_runtime.Result.ExecutionLease,
     root: *execution.Adapter,
     memory: local.sql_runtime.MemoryOwner,
     budget: local.sql_memory_budget,
     arena: std.heap.ArenaAllocator,
     names: std.StringHashMapUnmanaged(*const native.bindings.Resolved) = .empty,
     bodies: std.AutoHashMapUnmanaged(Identity, *const native.bindings.Resolved) = .empty,
+    procedure_names: std.StringHashMapUnmanaged(*native.procedures.Resolved) = .empty,
+    settings: ?local.sql_setting_catalog.View = null,
     depth: usize = 0,
 
     pub fn create(root: *execution.Adapter) !*Owner {
@@ -72,12 +76,16 @@ pub const Owner = struct {
         errdefer control.destroy(self);
         const memory = try @import("sql_memory_owner.zig").create(control, control, root.server.shared_resource_manager orelse &root.server.local_resource_manager);
         errdefer memory.deinit();
-        self.* = .{ .root = root, .memory = memory, .budget = .{ .backing = memory.allocator, .limit = native.preparation_bytes, .pressure = memory.pressure }, .arena = undefined };
+        self.* = .{ .control = control, .lease = .{ .ptr = self, .release = release }, .root = root, .memory = memory, .budget = .{ .backing = memory.allocator, .limit = native.preparation_bytes, .pressure = memory.pressure }, .arena = undefined };
         self.arena = .init(self.budget.allocator());
         return self;
     }
+    pub fn release(raw: *anyopaque) void {
+        (@as(*Owner, @ptrCast(@alignCast(raw)))).deinit();
+    }
     pub fn deinit(self: *Owner) void {
-        const control = self.root.server.alloc;
+        const control = self.control;
+        if (self.settings) |*settings| settings.deinit();
         self.arena.deinit();
         self.memory.deinit();
         control.destroy(self);
@@ -87,19 +95,14 @@ pub const Owner = struct {
     }
     fn resolve(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.bindings.Argument) anyerror!*const native.bindings.Resolved {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        return self.lookup(name, arguments) catch |err| {
+        return self.lookup(name, arguments, false) catch |err| {
             if (err == error.OutOfMemory and self.budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
             return self.memory.mapError(err);
         };
     }
-    fn lookup(self: *Owner, name: []const u8, arguments: []const native.bindings.Argument) !*const native.bindings.Resolved {
+    fn capture(self: *Owner, name: []const u8, arguments: []const native.bindings.Argument, routine_kind: routines.records.Kind, dynamic: bool) !routines.records.Record {
         const a = self.arena.allocator();
-        try self.root.context.ensureActive();
-        const key = try std.json.Stringify.valueAlloc(a, .{ .name = name, .arguments = arguments }, .{});
-        if (self.names.get(key)) |ready| return ready;
-        if (self.depth >= 32 or self.names.count() >= 512) return error.SqlProgramLimitExceeded;
-        self.depth += 1;
-        defer self.depth -= 1;
+        const binding_kind: @FieldType(@import("sql_prepared.zig").Binding, "kind") = if (routine_kind == .procedure) .procedure else .function;
         var parts = std.mem.splitScalar(u8, name, 0);
         const first = parts.next() orelse return error.SqlUndefinedFunction;
         const second = parts.next();
@@ -112,30 +115,31 @@ pub const Owner = struct {
             if (argument.type.kind) |kind| input.type = try native.storageType(.{ .kind = kind, .element_type = argument.type.element_type, .temporal_kind = argument.type.temporal_kind });
         }
         var pinned: ?@import("sql_prepared.zig").Binding = null;
-        if (self.root.prepared_bindings) |manifests| {
+        if (!dynamic) if (self.root.prepared_bindings) |manifests| {
             var candidates: std.ArrayList(routines.records.Header) = .empty;
             for (manifests) |manifest| {
-                if (manifest.kind != .function or !std.mem.eql(u8, manifest.name, reference.table) or !std.mem.eql(u8, manifest.database, reference.database orelse self.root.database)) continue;
+                if (manifest.kind != binding_kind or !std.mem.eql(u8, manifest.name, reference.table) or !std.mem.eql(u8, manifest.database, reference.database orelse self.root.database)) continue;
                 if (reference.namespace) |namespace| if (!std.mem.eql(u8, manifest.namespace, namespace)) continue;
                 try candidates.append(a, .{ .id = manifest.id, .signature = manifest.routine_signature orelse return error.CatalogGenerationChanged });
             }
             const selected = (try routines.records.choose(a, candidates.items, inputs)) orelse return error.CatalogGenerationChanged;
-            for (manifests) |manifest| if (manifest.kind == .function and manifest.id == selected.id) {
+            for (manifests) |manifest| if (manifest.kind == binding_kind and manifest.id == selected.id) {
                 pinned = manifest;
                 break;
             };
-        }
+        };
         const scope = try targets(self.root, a, if (pinned) |manifest| .{ .database = manifest.database, .namespace = manifest.namespace, .table = manifest.name } else reference);
         const cut = try snapshot(self.root, a, .{ .targets = scope, .signature = if (pinned) |manifest| manifest.routine_signature else null, .arguments = if (pinned != null) null else inputs, .expected_revision = self.root.revision });
-        const found = cut.found orelse return error.SqlUndefinedFunction;
+        const found = cut.found orelse return if (routine_kind == .procedure) error.SqlUndefinedProcedure else error.SqlUndefinedFunction;
+        if (found.record.kind != routine_kind) return error.SqlWrongObjectType;
         self.root.revision = cut.revision;
         if (self.root.server.cfg.auth_enabled and found.record.definition.owner == .auth_disabled) return error.Forbidden;
         const Binding = @import("sql_prepared.zig").Binding;
         const manifest = try Binding.fromRoutine(a, cut.scopes[found.scope].target, found.record, cut.incarnation, cut.revision);
-        if (self.root.prepared_bindings) |bindings| try Binding.verifyRoutine(bindings, manifest);
-        if (self.root.collect_prepared_bindings) |bindings| {
+        if (!dynamic) if (self.root.prepared_bindings) |bindings| try Binding.verifyRoutine(bindings, manifest);
+        if (!dynamic) if (self.root.collect_prepared_bindings) |bindings| {
             const exists = for (bindings.items) |entry| {
-                if (entry.kind != .function or entry.id != manifest.id) continue;
+                if (entry.kind != binding_kind or entry.id != manifest.id) continue;
                 try Binding.verifyRoutine(&.{entry}, manifest);
                 break true;
             } else false;
@@ -143,13 +147,54 @@ pub const Owner = struct {
                 if (bindings.items.len >= 64) return error.SqlProgramLimitExceeded;
                 try bindings.append(a, manifest);
             }
-        }
-        const identity: Identity = .{ .id = found.record.id, .generation = found.record.generation };
+        };
+        return found.record;
+    }
+    fn dynamicResolve(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.bindings.Argument) anyerror!*const native.bindings.Resolved {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        return self.lookup(name, arguments, true) catch |err| {
+            if (err == error.OutOfMemory and self.budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
+            return self.memory.mapError(err);
+        };
+    }
+    fn resolveProcedure(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.bindings.Argument) anyerror!*native.procedures.Resolved {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        return self.lookupProcedure(name, arguments) catch |err| {
+            if (err == error.OutOfMemory and self.budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
+            return self.memory.mapError(err);
+        };
+    }
+    fn lookupProcedure(self: *Owner, name: []const u8, arguments: []const native.bindings.Argument) !*native.procedures.Resolved {
+        const a = self.arena.allocator();
+        try self.root.context.ensureActive();
+        const key = try std.json.Stringify.valueAlloc(a, .{ .name = name, .arguments = arguments }, .{});
+        if (self.procedure_names.get(key)) |ready| return ready;
+        if (self.procedure_names.count() >= 128) return error.SqlProgramLimitExceeded;
+        const record = try self.capture(name, arguments, .procedure, false);
+        if (self.settings == null) if (self.root.settingCapture()) |capture_settings| {
+            self.settings = try local.sql_setting_catalog.View.capture(a, capture_settings.owner, capture_settings.scope, capture_settings.overlay);
+            try self.settings.?.pinSqlUser(capture_settings.sql_user);
+        };
+        const backend = self.root.backend();
+        const ready = try native.procedures.prepare(a, record, .{ .ptr = self, .resolve = dynamicResolve }, backend.sequence_resolver, if (self.settings) |*settings| settings else null);
+        try self.procedure_names.put(a, key, ready);
+        return ready;
+    }
+    fn lookup(self: *Owner, name: []const u8, arguments: []const native.bindings.Argument, dynamic: bool) !*const native.bindings.Resolved {
+        const a = self.arena.allocator();
+        try self.root.context.ensureActive();
+        const key = try std.json.Stringify.valueAlloc(a, .{ .name = name, .arguments = arguments, .dynamic = dynamic }, .{});
+        if (self.names.get(key)) |ready| return ready;
+        if (self.depth >= 32 or self.names.count() >= 512) return error.SqlProgramLimitExceeded;
+        self.depth += 1;
+        defer self.depth -= 1;
+        const record = try self.capture(name, arguments, .function, dynamic);
+        const identity: Identity = .{ .id = record.id, .generation = record.generation };
         if (self.bodies.get(identity)) |ready| {
             try self.names.put(a, key, ready);
             return ready;
         }
-        const ready = try native.prepare(a, found.record, self.resolver(), null);
+        const ready = try native.prepare(a, record, self.resolver(), null);
         try self.bodies.put(a, identity, ready);
         try self.names.put(a, key, ready);
         return ready;
@@ -161,4 +206,10 @@ pub fn bind(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.b
     if (root.routine_owner == null) root.routine_owner = try Owner.create(root);
     const owner = root.routine_owner.?;
     return Owner.resolve(owner, owner.arena.allocator(), name, arguments);
+}
+
+pub fn bindProcedure(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.bindings.Argument) !*native.procedures.Resolved {
+    const root: *execution.Adapter = @ptrCast(@alignCast(raw));
+    if (root.routine_owner == null) root.routine_owner = try Owner.create(root);
+    return Owner.resolveProcedure(root.routine_owner.?, undefined, name, arguments);
 }

@@ -37063,6 +37063,7 @@ pub const RaftApplyStore = struct {
             .publish => |value| {
                 if (prior) |old| {
                     if (!value.replace) return error.SqlDuplicateFunction;
+                    if (old.kind != value.kind) return error.SqlWrongObjectType;
                     const expected = value.expected orelse return error.CatalogGenerationChanged;
                     if (expected.id != old.id or expected.generation != old.generation) return error.CatalogGenerationChanged;
                     if (!std.meta.eql(old.definition.result, value.definition.result)) return error.SqlFunctionReturnTypeChanged;
@@ -37072,10 +37073,10 @@ pub const RaftApplyStore = struct {
                     var definition = value.definition;
                     // Replacing a definition never transfers the catalog owner.
                     definition.owner = old.definition.owner;
-                    next = .{ .id = old.id, .generation = std.math.add(u32, old.generation, 1) catch return error.CatalogGenerationExhausted, .definition = definition };
+                    next = .{ .kind = value.kind, .id = old.id, .generation = std.math.add(u32, old.generation, 1) catch return error.CatalogGenerationExhausted, .definition = definition };
                 } else {
                     if (value.expected != null) return error.CatalogGenerationChanged;
-                    next = .{ .id = meta.next_id, .generation = 1, .definition = value.definition };
+                    next = .{ .kind = value.kind, .id = meta.next_id, .generation = 1, .definition = value.definition };
                     next_id = std.math.add(u64, meta.next_id, 1) catch return error.CatalogRevisionExhausted;
                 }
                 // SQL body validation is deterministic native preparation, never
@@ -37083,18 +37084,19 @@ pub const RaftApplyStore = struct {
                 var workspace: @import("antfly_local_sources").sql_memory_budget = .{ .backing = self.alloc, .limit = sql_routines.native.preparation_bytes };
                 var prepared: std.heap.ArenaAllocator = .init(workspace.allocator());
                 defer prepared.deinit();
-                _ = sql_routines.native.prepare(prepared.allocator(), next.?, null, null) catch |err| {
+                sql_routines.native.validateBody(prepared.allocator(), next.?) catch |err| {
                     if (err == error.OutOfMemory and workspace.exhausted) return error.SqlProgramLimitExceeded;
                     return err;
                 };
             },
             .drop => |value| {
                 if (prior) |old| {
+                    if (old.kind != value.kind) return error.SqlWrongObjectType;
                     const expected = value.expected orelse return error.CatalogGenerationChanged;
                     if (expected.id != old.id or expected.generation != old.generation) return error.CatalogGenerationChanged;
                 } else {
                     if (value.expected != null) return error.CatalogGenerationChanged;
-                    if (!value.if_exists) return error.SqlUndefinedFunction;
+                    if (!value.if_exists) return if (value.kind == .procedure) error.SqlUndefinedProcedure else error.SqlUndefinedFunction;
                     return .{ .revision = meta.revision, .identity = null, .removed = 0 };
                 }
             },
@@ -59371,12 +59373,23 @@ test "SQL routine catalog overloads replacements and bounded outcomes survive na
             const body_rejection = try T.apply(&store, temporary, bad_body);
             try std.testing.expectEqual(.UnknownColumn, body_rejection.rejected);
             try std.testing.expectEqualDeep(body_rejection, try T.apply(&store, temporary, bad_body));
+            var procedure = first;
+            procedure.target.table = "p";
+            procedure.admission = .{ .nonce = @splat(6), .head = (try T.snapshot(&store, temporary, .{ .scalar = .text })).head };
+            procedure.operation = .{ .publish = .{ .kind = .procedure, .definition = .{ .arguments = &.{}, .result = null, .language = .plpgsql, .body = "BEGIN NULL; END", .owner = .auth_disabled } } };
+            const created_procedure = try T.apply(&store, temporary, procedure);
+            try std.testing.expect(created_procedure.success.identity != null);
+            try std.testing.expectEqualDeep(created_procedure, try T.apply(&store, temporary, procedure));
         } else {
             const selected = try T.snapshot(&store, temporary, .{ .scalar = .text });
             try std.testing.expectEqual(identity.id, selected.found.?.record.id);
             try std.testing.expectEqual(@as(u32, 2), selected.found.?.record.generation);
             try std.testing.expectEqualStrings("SELECT upper($1)", selected.found.?.record.definition.body);
-            try std.testing.expectEqual(@as(u64, 5), selected.head);
+            try std.testing.expectEqual(@as(u64, 6), selected.head);
+            const procedure_json = try store.sqlRoutineSnapshot(temporary, group, .{ .targets = &.{.{ .table = "p" }}, .arguments = &.{} }, .{});
+            const procedure_cut = try std.json.parseFromSliceLeaky(sql_routines.Snapshot, temporary, procedure_json, .{});
+            try std.testing.expectEqual(.procedure, procedure_cut.found.?.record.kind);
+            try std.testing.expect(procedure_cut.found.?.record.definition.result == null);
             try std.testing.expectEqualDeep(identity.id, (try T.apply(&store, temporary, first)).success.identity.?.id);
             try std.testing.expectEqual(@as(usize, 0), (try store.listTables(temporary, group)).len);
         }

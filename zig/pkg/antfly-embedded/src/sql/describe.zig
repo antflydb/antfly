@@ -113,6 +113,7 @@ pub fn scanOrder(a: std.mem.Allocator, binding: BoundStatement, statement: ast.S
 pub const BoundStatement = struct {
     copy_filter: ?bound_scalars.Bound = null,
     parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
+    procedure: ?@import("procedure.zig").Call = null,
     parameter_descriptors: []const @import("scalar.zig").Type = &.{},
     joined_mutation: ?*const @import("joined_mutation.zig").Bound = null,
     merge_mutation: ?*const @import("merge_mutation.zig").Candidates = null,
@@ -397,7 +398,7 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
         return bindInternal(allocator, read.binding_backend, &read.compiled, explicit_parameter_types);
     }
     var statement_backend = backend;
-    if (statement_backend.parameter_invocation == null and (compiled.parameter_count != 0 or (compiled.uses_sequences and backend.sequence_resolver != null) or backend.routine_resolver != null)) {
+    if (statement_backend.parameter_invocation == null and (compiled.parameter_count != 0 or (compiled.uses_sequences and backend.sequence_resolver != null) or backend.routine_resolver != null or backend.procedure_resolver != null)) {
         const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(allocator, compiled.parameter_count);
         invocation.sequence_resolver = backend.sequence_resolver;
         invocation.routine_resolver = backend.routine_resolver;
@@ -420,6 +421,13 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
 }
 
 fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_input: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+    if (compiled_input.statement == .call) {
+        const parameters = try allocator.alloc(?ast.ColumnType, compiled_input.parameter_count);
+        @memset(parameters, null);
+        @memcpy(parameters[0..explicit_parameter_types.len], explicit_parameter_types);
+        const call = try @import("procedure.zig").bind(allocator, backend, backend.parameter_invocation, compiled_input.statement.call, parameters);
+        return .{ .action = .read, .table = null, .columns = &.{}, .parameter_types = parameters, .json_literals = .empty, .procedure = call };
+    }
     // Normalize only this owned binding. Cached compiler syntax is immutable
     // and a later schema generation must derive its own ordered target list.
     var insertion_compiled = compiled_input.*;

@@ -83,6 +83,7 @@ pub const Output = struct {
     mutation_outcome: ?catalog.MutationOutcome = null,
     ddl_receipt: ?catalog.DdlReceipt = null,
     catalog_receipt: ?catalog.CatalogOperationReceipt = null,
+    notices: []const @import("procedure.zig").Notice = &.{},
 
     pub fn rowCount(self: Output) usize {
         return if (self.native_rows) |rows| rows.len else self.rows.len;
@@ -92,7 +93,7 @@ pub const Output = struct {
     /// representation. Keep the public result envelope explicit at every ABI.
     pub fn jsonStringify(self: Output, writer: anytype) !void {
         if (self.native_rows != null) return error.WriteFailed;
-        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt, .catalog_receipt = self.catalog_receipt });
+        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt, .catalog_receipt = self.catalog_receipt, .notices = self.notices });
     }
 };
 /// An execution-scoped allocator whose control state outlives returned rows or
@@ -118,7 +119,8 @@ pub const Result = struct {
     state: *State,
     output: Output,
 
-    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig"), clock_values: ?catalog.Clock.Frame, owner: ?MemoryOwner };
+    pub const ExecutionLease = struct { ptr: *anyopaque, release: *const fn (*anyopaque) void, next: ?*ExecutionLease = null };
+    const State = struct { retained: ?*ExecutionLease = null, budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig"), clock_values: ?catalog.Clock.Frame, owner: ?MemoryOwner };
 
     /// Includes retained result arena capacity and transient native page data.
     pub fn peakMemoryBytes(self: Result) usize {
@@ -135,18 +137,30 @@ pub const Result = struct {
     pub fn deinit(self: *Result) void {
         const backing = self.state.budget.backing;
         const owner = self.state.owner;
+        const retained_leases = self.state.retained;
         self.state.regex_execution.deinit();
         self.state.arena.deinit();
         std.debug.assert(self.state.budget.live == 0);
+        var lease = retained_leases;
+        while (lease) |current| {
+            lease = current.next;
+            current.release(current.ptr);
+        }
         backing.destroy(self.state);
         if (owner) |retained| retained.deinit();
         self.* = undefined;
+    }
+
+    pub fn retainExecution(self: *Result, lease: *ExecutionLease) void {
+        lease.next = self.state.retained;
+        self.state.retained = lease;
     }
 
     pub fn empty(alloc: std.mem.Allocator, command_tag: []const u8) !Result {
         const state = try alloc.create(State);
         state.clock_values = null;
         state.owner = null;
+        state.retained = null;
         state.budget = .{ .backing = alloc, .limit = (Limits{}).retained_bytes };
         state.regex_execution = .init(state.budget.allocator(), 16 * 1024 * 1024);
         state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
@@ -205,6 +219,7 @@ fn executeInner(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     errdefer alloc.destroy(state);
     state.clock_values = if (statement_backend.statement_clock) |view| try catalog.Clock.Frame.init(view) else null;
     state.owner = null;
+    state.retained = null;
     state.budget = .{ .backing = alloc, .limit = memory, .pressure = if (owner) |retained| retained.pressure else null };
     state.regex_execution = .init(state.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
     statement_backend.regex_execution = &state.regex_execution;
@@ -657,6 +672,7 @@ pub const Context = struct {
         if (context.binding.merge_mutation) |merge| return @import("merge_mutation.zig").execute(context, merge.*);
         return switch (input) {
             .select => |statement| try context.selectOutput(statement),
+            .call => try @import("procedure.zig").execute(context, context.binding.procedure orelse return error.InvalidSqlBackendResponse),
             .insert => |input_insert| blk: {
                 var statement = input_insert;
                 if (context.binding.normalized_insert_columns) |names| {
@@ -8347,3 +8363,28 @@ const PopulationPreparation = struct {
         self.source = null;
     }
 };
+
+test "SQL result execution leases retain nested preparation owners until all borrowed output is released" {
+    const Owner = struct {
+        released: *usize,
+        payload: []u8,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.testing.allocator.free(self.payload);
+            self.released.* += 1;
+        }
+    };
+    var released: usize = 0;
+    var first: Owner = .{ .released = &released, .payload = try std.testing.allocator.dupe(u8, "first") };
+    var second: Owner = .{ .released = &released, .payload = try std.testing.allocator.dupe(u8, "second") };
+    var first_lease: Result.ExecutionLease = .{ .ptr = &first, .release = Owner.release };
+    var second_lease: Result.ExecutionLease = .{ .ptr = &second, .release = Owner.release };
+    var result = try Result.empty(std.testing.allocator, "CALL");
+    result.retainExecution(&first_lease);
+    result.retainExecution(&second_lease);
+    try std.testing.expectEqual(@as(usize, 0), released);
+    try std.testing.expectEqualStrings("first", first.payload);
+    try std.testing.expectEqualStrings("second", second.payload);
+    result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), released);
+}

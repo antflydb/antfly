@@ -33,7 +33,7 @@ pub fn authorize(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdent
 
 fn encode(a: A, scratch: A, request: routines.OutcomeRequest, revision: u64) ![]u8 {
     try request.validate();
-    const bytes = try std.json.Stringify.valueAlloc(scratch, Token{ .request = request, .observed_revision = revision }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(scratch, Token{ .kind = std.meta.stringToEnum(common.Receipt.Kind, @tagName(request.kind)).?, .request = request, .observed_revision = revision }, .{});
     defer scratch.free(bytes);
     const size = base64.Encoder.calcSize(bytes.len);
     if (size > common.max_token_bytes) return error.InvalidSqlRecoveryToken;
@@ -48,7 +48,7 @@ fn withToken(a: A, request: routines.OutcomeRequest, token: []const u8) !common.
     errdefer a.free(namespace);
     const name = try a.dupe(u8, request.target.table);
     const diagnostic = local.sql_errors.describe(error.SqlMutationOutcomeUnknown);
-    return .{ .kind = .function, .operation = std.meta.stringToEnum(common.Receipt.Operation, @tagName(request.operation)).?, .database = database, .namespace = namespace, .name = name, .recovery_token = token, .diagnostic = .{ .code = diagnostic.code, .message = diagnostic.message, .retryable = diagnostic.retryable orelse false } };
+    return .{ .kind = std.meta.stringToEnum(common.Receipt.Kind, @tagName(request.kind)).?, .operation = std.meta.stringToEnum(common.Receipt.Operation, @tagName(request.operation)).?, .database = database, .namespace = namespace, .name = name, .recovery_token = token, .diagnostic = .{ .code = diagnostic.code, .message = diagnostic.message, .retryable = diagnostic.retryable orelse false } };
 }
 pub fn newReceipt(a: A, scratch: A, request: routines.OutcomeRequest, revision: u64) !common.Receipt {
     const token = try encode(a, scratch, request, revision);
@@ -85,9 +85,10 @@ pub fn recoverIfCallable(server: *http.ApiHttpServer, identity: ?http.Authentica
     base64.Decoder.decode(bytes, encoded) catch return error.InvalidSqlRecoveryToken;
     const header = std.json.parseFromSliceLeaky(struct { version: u8, kind: common.Receipt.Kind }, scratch, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidSqlRecoveryToken;
     if (header.version == 1 and header.kind == .sequence) return null;
-    if (header.version != 2 or header.kind != .function) return error.InvalidSqlRecoveryToken;
+    if (header.version != 2 or (header.kind != .function and header.kind != .procedure)) return error.InvalidSqlRecoveryToken;
     const token = std.json.parseFromSliceLeaky(Token, scratch, bytes, .{ .allocate = .alloc_always }) catch return error.InvalidSqlRecoveryToken;
     try token.request.validate();
+    if (!std.mem.eql(u8, @tagName(token.kind), @tagName(token.request.kind))) return error.InvalidSqlRecoveryToken;
     try context.ensureActive();
     try authorize(server, identity, scratch, token.request.target);
     const owned = try a.dupe(u8, encoded);

@@ -67,8 +67,8 @@ pub const Mutation = struct {
     namespace_id: u64,
     incarnation: [16]u8,
     operation: union(enum) {
-        publish: struct { definition: records.Definition, replace: bool = false, expected: ?Identity = null },
-        drop: struct { signature: []const u8, expected: ?Identity, if_exists: bool = false, cascade: bool = false },
+        publish: struct { kind: records.Kind = .function, definition: records.Definition, replace: bool = false, expected: ?Identity = null },
+        drop: struct { kind: records.Kind = .function, signature: []const u8, expected: ?Identity, if_exists: bool = false, cascade: bool = false },
     },
     pub fn validate(self: @This()) !void {
         try self.admission.validate();
@@ -76,7 +76,7 @@ pub const Mutation = struct {
         if (self.namespace_id == 0 or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidCatalogMutation;
         switch (self.operation) {
             .publish => |value| {
-                try value.definition.validate();
+                try (records.Record{ .kind = value.kind, .id = 1, .generation = 1, .definition = value.definition }).validate();
                 if (value.expected) |expected| try expected.validate();
                 if (!value.replace and value.expected != null) return error.InvalidCatalogMutation;
             },
@@ -88,6 +88,7 @@ pub const Mutation = struct {
     }
 };
 pub const OutcomeRequest = struct {
+    kind: records.Kind = .function,
     admission: outcomes.Admission,
     target: domain.Target,
     namespace_id: u64,
@@ -121,7 +122,10 @@ pub fn boundDigest(a: std.mem.Allocator, request: OutcomeRequest) ![32]u8 {
     return hash.finalResult();
 }
 pub fn observation(a: std.mem.Allocator, request: Mutation) !OutcomeRequest {
-    return .{ .admission = request.admission, .target = request.target, .namespace_id = request.namespace_id, .incarnation = request.incarnation, .digest = try digest(a, request), .operation = switch (request.operation) {
+    return .{ .kind = switch (request.operation) {
+        .publish => |value| value.kind,
+        .drop => |value| value.kind,
+    }, .admission = request.admission, .target = request.target, .namespace_id = request.namespace_id, .incarnation = request.incarnation, .digest = try digest(a, request), .operation = switch (request.operation) {
         .publish => |value| if (value.replace) .alter else .create,
         .drop => .drop,
     } };

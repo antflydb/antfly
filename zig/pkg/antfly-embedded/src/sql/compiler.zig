@@ -17,6 +17,7 @@ const std = @import("std");
 test {
     _ = @import("relation_population.zig");
     _ = @import("routine_definition.zig");
+    _ = @import("procedure.zig");
 }
 const sql_parser = @import("sql_parser");
 const lexer = sql_parser.lexer;
@@ -3303,7 +3304,7 @@ const Parser = struct {
     /// Definition admission is deliberately separate from routine activation.
     /// Validate the supported declaration grammar to its end before reporting
     /// a missing body. Never publish a definition or execute a valid prefix.
-    fn routineDrop(self: *Parser) Error!ast.CatalogDdl {
+    fn routineDrop(self: *Parser, procedure: bool) Error!ast.CatalogDdl {
         const conditional = self.keyword(.@"if");
         if (conditional) try self.expectKeyword(.exists);
         const name_value = try self.name();
@@ -3322,7 +3323,7 @@ const Parser = struct {
         }
         const cascade = self.ddlWord("CASCADE");
         if (!cascade) _ = self.ddlWord("RESTRICT");
-        return .{ .kind = .function, .action = .drop, .name = name_value, .routine_signature = signature, .conditional = conditional, .cascade = cascade };
+        return .{ .kind = if (procedure) .procedure else .function, .action = .drop, .name = name_value, .routine_signature = signature, .conditional = conditional, .cascade = cascade };
     }
 
     fn routineAdmission(self: *Parser, procedure: bool, replace: bool) Error!ast.Statement {
@@ -3361,7 +3362,7 @@ const Parser = struct {
         var body: ?[]const u8 = null;
         var strict = false;
         var volatility: @FieldType(ast.RoutineDefinition, "volatility") = .@"volatile";
-        var supported = !procedure and result != null;
+        var supported = procedure or result != null;
         var seen: u16 = 0;
         while (self.pos < self.tokens.len and !self.peek(.semicolon)) {
             var option: u4 = undefined;
@@ -3448,8 +3449,8 @@ const Parser = struct {
         if (language) |name_| if (std.mem.eql(u8, name_, "plpgsql") or std.mem.eql(u8, name_, "sql")) {
             if (body == null) return self.fail(error.SqlInvalidFunctionDefinition, "no function body specified");
         };
-        if (supported and language != null and std.mem.eql(u8, language.?, "sql") and body != null)
-            return .{ .catalog_ddl = .{ .kind = .function, .action = .create, .name = name_value, .routine = .{ .arguments = try arguments.toOwnedSlice(self.alloc), .result = result.?, .body = body.?, .replace = replace, .strict = strict, .volatility = volatility } } };
+        if (supported and language != null and body != null and (std.mem.eql(u8, language.?, "sql") or (procedure and std.mem.eql(u8, language.?, "plpgsql"))))
+            return .{ .catalog_ddl = .{ .kind = if (procedure) .procedure else .function, .action = .create, .name = name_value, .routine = .{ .arguments = try arguments.toOwnedSlice(self.alloc), .result = result, .language = if (std.mem.eql(u8, language.?, "sql")) .sql else .plpgsql, .body = body.?, .replace = replace, .strict = strict, .volatility = volatility } } };
         return self.fail(error.UnsupportedSqlShape, "routine language or execution options are not supported");
     }
 
@@ -3790,6 +3791,20 @@ const Parser = struct {
     }
 
     fn statement(self: *Parser) Error!ast.Statement {
+        if (self.ddlWord("CALL")) {
+            const name_value = try self.name();
+            try self.expect(.lparen);
+            var arguments: std.ArrayList(*const ast.Scalar) = .empty;
+            if (!self.take(.rparen)) while (true) {
+                if (arguments.items.len >= 100) return error.SqlLimitExceeded;
+                const argument = try self.scalar(0, 0);
+                try self.checkScalarDepth(argument, 0);
+                try arguments.append(self.alloc, argument);
+                if (self.take(.rparen)) break;
+                try self.expect(.comma);
+            };
+            return .{ .call = .{ .name = name_value, .arguments = try arguments.toOwnedSlice(self.alloc) } };
+        }
         try self.node();
         if (self.ddlWord("COPY")) return self.copyTo();
         if (self.keyword(.explain)) {
@@ -4028,7 +4043,8 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
-            if (self.ddlWord("FUNCTION")) return .{ .catalog_ddl = try self.routineDrop() };
+            if (self.ddlWord("FUNCTION")) return .{ .catalog_ddl = try self.routineDrop(false) };
+            if (self.ddlWord("PROCEDURE")) return .{ .catalog_ddl = try self.routineDrop(true) };
             if (self.keyword(.materialized)) {
                 if (!self.ddlWord("VIEW")) return self.fail(error.InvalidSqlSyntax, "MATERIALIZED requires VIEW");
                 var ddl = try self.viewDdl(.drop, false);
@@ -5561,7 +5577,7 @@ test "SQL routine original declarations retain typed signatures names bodies and
         if (std.mem.eql(u8, id, "sql-0404")) try std.testing.expectEqualStrings("status_text", definition.arguments[0].name.?);
         if (std.mem.eql(u8, id, "sql-0401")) {
             try std.testing.expectEqual(@as(usize, 3), definition.arguments.len);
-            try std.testing.expectEqual(.numeric, definition.result.element_type.?);
+            try std.testing.expectEqual(.numeric, definition.result.?.element_type.?);
         }
     }
     var replacement = try compile(a, "CREATE OR REPLACE FUNCTION public.f(x bigint) RETURNS bigint LANGUAGE sql STRICT AS $$SELECT x+x$$", .{});

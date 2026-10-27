@@ -402,7 +402,7 @@ pub const RelationPopulation = struct {
 };
 
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function },
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -438,7 +438,8 @@ pub const RoutineDefinition = struct {
     };
     pub const Argument = struct { name: ?[]const u8 = null, type: Type };
     arguments: []const Argument,
-    result: Type,
+    result: ?Type = null,
+    language: enum { sql, plpgsql } = .sql,
     body: []const u8,
     replace: bool = false,
     strict: bool = false,
@@ -639,6 +640,7 @@ pub const Statement = union(enum) {
     release_savepoint: []const u8,
     set_constraints: struct { names: []const []const u8, deferred: bool },
     set_transaction: @import("session.zig").Characteristics,
+    call: struct { name: Name, arguments: []const *const Scalar },
 };
 
 /// Only target postimages need a reserved write stamp. DELETE retains its

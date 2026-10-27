@@ -238,6 +238,7 @@ pub const Adapter = struct {
     sequence_state: ?@import("antfly_local_sources").sql_sequence_session.Borrowed = null,
     sequence_owner: ?*@import("sql_sequence_execution.zig").Owner = null,
     routine_owner: ?*@import("sql_routine_execution.zig").Owner = null,
+    notice_sink: ?catalog.notices.Sink = null,
     /// Pgwire retains the original durable owner scope independently of its
     /// mutable, freshly authorized lookup namespace. HTTP leaves this null.
     session_namespace: ?[]const u8 = null,
@@ -306,6 +307,10 @@ pub const Adapter = struct {
         };
         errdefer result.deinit();
         try @import("sql_sequence_execution.zig").flush(self);
+        if (self.routine_owner) |owner| {
+            result.retainExecution(&owner.lease);
+            self.routine_owner = null;
+        }
         return result;
     }
 
@@ -546,7 +551,7 @@ pub const Adapter = struct {
         };
         if (session.transaction_id != null) {
             const transaction = (session.statement(switch (compiled.statement) {
-                .select, .explain => false,
+                .select, .explain, .call => false,
                 else => true,
             }) catch |zig017_err| {
                 zig017_return_error = zig017_err;
@@ -599,7 +604,7 @@ pub const Adapter = struct {
                     }
                 }
                 _ = (session.statement(switch (compiled.statement) {
-                    .select, .explain => false,
+                    .select, .explain, .call => false,
                     else => true,
                 }) catch |zig017_err| {
                     zig017_return_error = zig017_err;
@@ -795,7 +800,7 @@ pub const Adapter = struct {
         const bindings = self.prepared_bindings orelse return input;
         var result: ?ast.Name = null;
         for (bindings) |binding| {
-            if (binding.kind == .sequence or binding.kind == .function or !std.mem.eql(u8, binding.name, input.table) or !std.mem.eql(u8, binding.database, self.database)) continue;
+            if (binding.kind == .sequence or binding.kind == .function or binding.kind == .procedure or !std.mem.eql(u8, binding.name, input.table) or !std.mem.eql(u8, binding.database, self.database)) continue;
             if (result) |prior| if (!std.mem.eql(u8, prior.namespace.?, binding.namespace)) return error.CatalogGenerationChanged;
             result = .{ .database = binding.database, .namespace = binding.namespace, .table = input.table };
         }
@@ -806,7 +811,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .copy_filter = self.copy_filter, .routine_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bind } else null, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+        return .{ .copy_filter = self.copy_filter, .notice_sink = self.notice_sink, .procedure_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bindProcedure } else null, .routine_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bind } else null, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -869,7 +874,7 @@ pub const Adapter = struct {
         // Catalog jobs are not transaction participants yet. Never commit
         // their namespace change independently of an explicit SQL transaction.
         if (input == .populate and self.active_transaction != null) return error.UnsupportedSqlExecution;
-        if (input == .catalog_ddl and input.catalog_ddl.kind == .function)
+        if (input == .catalog_ddl and (input.catalog_ddl.kind == .function or input.catalog_ddl.kind == .procedure))
             return @import("sql_routine_ddl.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .populate and input.populate.intent.operation == .refresh_materialized_view)
             return @import("sql_population.zig").executeRefresh(self, allocators, input.populate);

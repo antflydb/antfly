@@ -3730,11 +3730,11 @@ const LocalStandaloneMetadata = struct {
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                 if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
                 const command = routines.command(request);
-                const preview = store.prepareSystemCatalogResult(alloc, group_ids.main_metadata_group_id, command) catch |err| {
-                    const rejected = routines.Outcome.fromError(err) orelse return err;
-                    return std.json.Stringify.valueAlloc(alloc, rejected, .{});
-                };
-                alloc.free(preview);
+                if (store.prepareSystemCatalogResult(alloc, group_ids.main_metadata_group_id, command)) |preview| {
+                    alloc.free(preview);
+                } else |err| {
+                    if (routines.Outcome.fromError(err) == null) return err;
+                }
                 const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
                 defer alloc.free(bytes);
                 if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;

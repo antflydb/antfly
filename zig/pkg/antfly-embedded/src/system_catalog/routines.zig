@@ -30,9 +30,11 @@ pub const Type = struct {
 };
 pub const Argument = struct { name: ?[]const u8 = null, type: Type };
 pub const Volatility = enum { immutable, stable, @"volatile" };
+pub const Kind = enum { function, procedure };
 pub const Definition = struct {
     arguments: []const Argument,
-    result: Type,
+    result: ?Type = null,
+    language: enum { sql, plpgsql } = .sql,
     body: []const u8,
     strict: bool = false,
     volatility: Volatility = .@"volatile",
@@ -40,7 +42,7 @@ pub const Definition = struct {
     pub fn validate(self: Definition) !void {
         if (self.arguments.len > max_arguments or self.body.len == 0 or self.body.len > max_body_bytes or
             !std.unicode.utf8ValidateSlice(self.body) or std.mem.indexOfScalar(u8, self.body, 0) != null) return error.InvalidSqlRoutineRecord;
-        try self.result.validate();
+        if (self.result) |result| try result.validate();
         // There are at most 100 names; validation needs no heap or global state.
         for (self.arguments, 0..) |argument, i| {
             try argument.type.validate();
@@ -69,14 +71,18 @@ pub const Definition = struct {
     }
 };
 pub const Record = struct {
-    version: u16 = 1,
-    kind: enum { function, procedure } = .function,
+    version: u16 = 2,
+    kind: Kind = .function,
     id: u64,
     generation: u32,
     definition: Definition,
     pub fn validate(self: Record) !void {
-        if (self.version != 1 or self.kind != .function or self.id == 0 or self.generation == 0) return error.InvalidSqlRoutineRecord;
+        if (self.version != 2 or self.id == 0 or self.generation == 0) return error.InvalidSqlRoutineRecord;
         try self.definition.validate();
+        switch (self.kind) {
+            .function => if (self.definition.result == null or self.definition.language != .sql) return error.InvalidSqlRoutineRecord,
+            .procedure => if (self.definition.result != null or self.definition.strict or self.definition.volatility != .@"volatile") return error.InvalidSqlRoutineRecord,
+        }
     }
     pub fn encode(self: Record, a: std.mem.Allocator) ![]u8 {
         try self.validate();

@@ -18,6 +18,7 @@ const protocol = @import("protocol.zig");
 const backend = @import("backend.zig");
 
 const Mock = struct {
+    procedure_notice_failure: bool = false,
     describes: usize = 0,
     catalog_rebind: bool = false,
     cached_shape_change: bool = false,
@@ -263,6 +264,12 @@ const Mock = struct {
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
+        if (self.procedure_notice_failure) {
+            const diagnostic = request.diagnostics orelse return error.InvalidSqlBackendResponse;
+            try backend.Diagnostic.emitNotice(diagnostic, .{ .message = "before failure" });
+            diagnostic.set("22012", "division by zero", null, null);
+            return error.SqlDivisionByZero;
+        }
         if (self.array_parameters) for (request.parameters) |parameter| try retainedAllocator(parameter, alloc);
         if (self.result_override) |result| {
             self.result_override_executions += 1;
@@ -3385,4 +3392,20 @@ test "pgwire COPY prepared predicate arguments remain separate from imported row
     try std.testing.expectEqual(@as(i64, 23), mock.copy_sum);
     try std.testing.expectEqual(@as(usize, 2), mock.copy_committed);
     try std.testing.expectEqual(@as(usize, 1), mock.copy_batches);
+}
+
+test "pgwire procedure notices survive failing statement arenas and precede the error frame" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "CALL fail()\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .procedure_notice_failure = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expect(std.mem.endsWith(u8, observed, "NEZ"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "SNOTICE\x00C00000\x00Mbefore failure\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "C22012\x00") != null);
 }
