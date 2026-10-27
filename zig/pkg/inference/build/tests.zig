@@ -345,6 +345,7 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
         .filters = &.{"GLiNER25 fuzz"},
     });
     tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
+    tests.root_module.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
     tests.root_module.addImport("build_options", ctx.graph.build_options_mod);
     tests.root_module.addImport("antfly_platform", platform);
     tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
