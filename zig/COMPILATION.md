@@ -1804,3 +1804,23 @@ to that kernel high-water observation. Other profiles retain their authored
 reservations. The consumer and API storage-authority claims sum to 28.375 GiB
 and still fit the unchanged 28.8 GiB aggregate budget. The independently
 qualified CAPI physical partition retains its larger 17 GiB floor.
+
+### ARM64 Linux release API admission after document jobs
+
+Release run `40426894698` (source `9ace47d363`, the pinned glibc-linked Nix
+Zig 0.17.0, Linux x86-64 host, baseline ARM64 targets, stripped ReleaseFast)
+exceeded the API archive's 12 GiB scheduling reservation on both targets:
+
+| Target | Reported peak bytes | Reservation |
+| --- | ---: | ---: |
+| aarch64-linux-gnu.2.28 | 14,346,383,360 | 15 GiB |
+| aarch64-linux-musl | 13,929,717,760 | 15 GiB |
+
+The 15 GiB claim retains at least 10% headroom over both exact measurements.
+Together with the existing 4 GiB enrichment claim it still fits a 20 GiB
+compiler budget. Release builds retain their host/cgroup-aware aggregate budget. It applies only to the measured API configuration;
+native x86, Debug, unstripped, sanitized, Darwin and other runtime claims are
+unchanged. This avoids a full expensive API retry without serializing the
+entire build or increasing the runner's memory budget. The run also exposed
+missing compiled metadata job-state projections; those compilation errors are
+separate from memory admission.

@@ -270,6 +270,17 @@ pub const RaftApplyStore = struct {
         _ = try self.projection(bool, .{ .kind = .migrate_standalone_restore_jobs, .key = .fromSlice(encoded.written()) });
     }
 
+    pub fn getJobOwnerCount(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner: []const u8) !u64 {
+        return self.projectionWithAllocator(u64, alloc, .{ .kind = .job_owner_count, .group_id = group_id, .key = .fromSlice(owner) });
+    }
+
+    pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .job_state, .group_id = group_id, .key = .fromSlice(key) });
+    }
+    pub fn scanJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8) ![]u8 {
+        return self.projectionWithAllocator([]u8, alloc, .{ .kind = .job_state_scan, .group_id = group_id, .key = .fromSlice(after orelse ""), .arg1 = @intFromBool(after != null) });
+    }
+
     pub fn getBackupCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .backup_cohort, .group_id = group_id, .arg0 = job_id });
     }
@@ -965,22 +976,6 @@ pub const RaftApplyStore = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&response);
         if (response.len == 0) return null;
         return try alloc.dupe(u8, response.slice());
-    }
-
-    pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
-        return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .job_state_value, .group_id = group_id, .key = .fromSlice(key) });
-    }
-
-    pub fn scanJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8) ![]u8 {
-        var response: abi.OwnedBytes = .{};
-        try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &.{ .kind = .job_state_page, .group_id = group_id, .key = .fromSlice(after orelse "") }, &response));
-        defer abi.antfly_storage_owner_buffer_destroy(&response);
-        // The kernel owns encoding the bounded Page envelope exactly once.
-        return try alloc.dupe(u8, response.slice());
-    }
-
-    pub fn getJobOwnerCount(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner: []const u8) !u64 {
-        return try self.projectionWithAllocator(u64, alloc, .{ .kind = .job_owner_count, .group_id = group_id, .key = .fromSlice(owner) });
     }
 
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {

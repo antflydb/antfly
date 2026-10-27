@@ -14,6 +14,7 @@
 // limitations under the License.
 
 //! Checked document formats and native display compilation, independent of inference.
+const builtin = @import("builtin");
 pub const types = @import("types.zig");
 pub const ooxml = @import("ooxml.zig");
 pub const slides = @import("slides.zig");
@@ -22,7 +23,6 @@ pub const drawingml_theme = @import("drawingml_theme.zig");
 pub const drawingml_text = @import("drawingml_text.zig");
 pub const drawingml_chart = @import("drawingml_chart.zig");
 pub const output = @import("output.zig");
-const builtin = @import("builtin");
 pub const fixtures = if (builtin.is_test) @import("fixtures.zig") else struct {};
 
 test {

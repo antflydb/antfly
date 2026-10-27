@@ -1769,6 +1769,21 @@ pub fn metadataApplyStoreProjection(
             handle.store.migrateStandaloneRestoreJobs(rows.value) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
+        .job_owner_count => blk: {
+            const count = handle.store.getJobOwnerCount(alloc, request.group_id, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, count);
+        },
+        .job_state => blk: {
+            const value = handle.store.getJobState(alloc, request.group_id, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .job_state_scan => blk: {
+            if (request.arg1 > 1) break :blk .invalid_argument;
+            const value = handle.store.scanJobState(alloc, request.group_id, if (request.arg1 == 0) null else request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .backup_cohort => blk: {
             const value = handle.store.getBackupCohort(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
@@ -2381,24 +2396,6 @@ pub fn metadataApplyStoreProjection(
             // Empty means absent; a persisted collection always has a header.
             out_json.* = if (value) |bytes| .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) } else .{};
             break :blk .ok;
-        },
-        .job_state_value => blk: {
-            const value = handle.store.getJobState(alloc, request.group_id, request.key.slice()) catch |err|
-                break :blk storageOwnerStatusFromError(err);
-            defer if (value) |bytes| alloc.free(bytes);
-            break :blk metadataProjectionJson(alloc, out_json, value);
-        },
-        .job_state_page => blk: {
-            const cursor = request.key.slice();
-            const value = handle.store.scanJobState(alloc, request.group_id, if (cursor.len == 0) null else cursor) catch |err|
-                break :blk storageOwnerStatusFromError(err);
-            out_json.* = .{ .ptr = value.ptr, .len = @intCast(value.len) };
-            break :blk .ok;
-        },
-        .job_owner_count => blk: {
-            const value = handle.store.getJobOwnerCount(alloc, request.group_id, request.key.slice()) catch |err|
-                break :blk storageOwnerStatusFromError(err);
-            break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .restore_job_value => blk: {
             const value = handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice()) catch |err|
