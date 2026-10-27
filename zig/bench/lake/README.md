@@ -778,3 +778,63 @@ exact integers above 2^53 and explicit whole-source reconstruction. Main
 facade. The additional release-only merge preserves the frozen executable hash.
 Benchmark tooling, formatting/lint, syntax, license, Apache boundary and diff
 checks also pass.
+
+
+### Source batching and indexed chunk navigation
+
+The [source-batch observation](native-source-batches-and-chunk-navigation-v1-observation.json)
+qualifies the wider-projection regression and the native source refinements.
+On the same 1,024-row Parquet fixture, adding a fifth small integer field to a
+24-hit page adds only 264 response bytes. The previous row-major hydration loop
+reopened its four cached columns for each row. The new loop processes a requested
+column across at most 64 ordinal-sorted winners before moving to the next column,
+preserving public rank and key validation with the same four-cursor capacity.
+
+| Case | Reviewed warm median | Final warm median |
+|---|---:|---:|
+| Four projected fields | 52.35 ms | 17.23 ms |
+| Five projected fields | 93.25 ms | 17.63 ms |
+| Boolean metadata order, anti-correlated forward | 27.46 ms | 21.07 ms |
+| Boolean metadata order, anti-correlated reverse | 26.35 ms | 20.92 ms |
+| Boolean metadata order, aligned forward | 26.61 ms | 20.91 ms |
+| Small projection, 1 MiB unrequested payload per row | 33.93 ms | 30.90 ms |
+| Same projection with physical source delivery | 29.83 ms | 26.49 ms |
+| Wide-key ordered control | 545.97 ms | 517.79 ms |
+| Native-order control, forward | 22.77 ms | 20.17 ms |
+| Native-order control, reverse | 22.72 ms | 20.50 ms |
+
+Projection variants have five alternating warm samples after both variants are
+primed. Other case/cache modes have three samples. All 58 paired pages preserve
+complete hit objects exactly, including scores, with identical candidate and
+ordered-reference counts. Definitions, inputs, configuration and requests match
+within every pair. The physical-source control intentionally changes
+`store_source` and therefore pack layout. Earlier review repetition measured
+55.52/84.02 ms for four/five fields; the retained original run above measured
+52.35/93.25 ms. This remains a local Debug observation on a shared machine, with
+E2E activity overlapping candidate measurements; it does not establish causal
+latency, empty-cache, cloud or archive-scale throughput.
+
+Recipe v4 source-column directories carry authenticated chunk row ranges. A
+cold lookup into 32 sparse one-row chunks decodes only the selected chunk, and a
+sparse gap performs no additional decode. Reusable cursors validate record offsets
+once per chunk and use binary value lookup; append and sorted compaction share
+them. Legacy formats, byte bounds, oversized values, malformed row ranges and
+exhaustive allocation failures retain independent coverage.
+
+Native text input now carries typed source without a temporary JSON body. Exact,
+allocation-free AJV1 sizing shares encoder tags and preserves byte admission and
+segment splitting. Tests retain a 256 KiB source payload while asserting no
+stored JSON input and adequate source-size accounting. Highlight preparation
+plans explicit/static source dependencies once, retains aliases, falls back
+conservatively for unknown mappings, and reuses covered projected values. These
+work reductions have structural qualification; no isolated ingestion RSS or
+highlight latency gain is claimed.
+
+The production build succeeds with Zig 0.17.0 and main `ef25cb9405` merged.
+All 260 targeted native/owner checks and nine stored-column checks pass, with one
+declared benchmark skip and no leaks. All 35 selected real Parquet/Iceberg E2Es
+pass without skips. The new independent Parquet case crosses 64-row batch and
+chunk boundaries with five projected fields, nullable exact integers above 2^53,
+forward/backward cursor pages and hidden highlights before/after restart, while
+the original Parquet object is unavailable. Benchmark tooling, formatting/lint,
+syntax, license, Apache boundary and whitespace checks pass.
