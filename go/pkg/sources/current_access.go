@@ -74,13 +74,13 @@ func (c *CollaborationConnector) AuthorizeInventory(ctx context.Context, r Reque
 	started := time.Now()
 	for {
 		err := c.authorizeInventoryOnce(ctx, r, inventory)
-		var api *ProviderHTTPError
-		if !errors.As(err, &api) || api.Status != 429 {
+		if !IsRateLimited(err) {
 			return err
 		}
 		delay := time.Minute
-		if !api.RetryAt.IsZero() {
-			delay = time.Until(api.RetryAt)
+		var cooldown interface{ AntflyRetryAfter() time.Time }
+		if errors.As(err, &cooldown) && !cooldown.AntflyRetryAfter().IsZero() {
+			delay = time.Until(cooldown.AntflyRetryAfter())
 			if delay < 0 {
 				delay = 0
 			}

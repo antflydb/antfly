@@ -487,13 +487,26 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		digest := sha256.Sum256(raw)
 		revision = hex.EncodeToString(digest[:])
 	}
-	state.Published = state.Pending
 	if c, ok := connector.(*CollaborationConnector); ok {
-		if err := c.ValidateInventory(ctx, request, *state.Pending); err != nil {
+		ttl := s.PermissionTTLSeconds
+		if ttl == 0 {
+			ttl = 900
+		}
+		checkedAt := time.Now()
+		auditCtx, cancel := context.WithTimeout(ctx, time.Duration(ttl)*time.Second)
+		err := c.ValidateInventory(auditCtx, request, *state.Pending)
+		cancel()
+		if err != nil {
 			return 0, "", err
 		}
-		state.StartedAt = time.Now().Unix()
+		if time.Since(checkedAt) >= time.Duration(ttl)*time.Second {
+			return 0, "", fmt.Errorf("%w: source permission audit exceeded lease duration", context.DeadlineExceeded)
+		}
+		// Every scope in this audit shares its earliest possible check time.
+		// Slow audits must never extend the advertised maximum access age.
+		state.StartedAt = checkedAt.Unix()
 	}
+	state.Published = state.Pending
 	state.Pending = nil
 	state.AcquisitionID = ""
 	state.RecordFormat = 2

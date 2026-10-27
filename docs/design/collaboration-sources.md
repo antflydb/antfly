@@ -372,3 +372,20 @@ pinned inventory and private normalized content; canonical content hashes avoid
 rewriting unchanged records. Early redelivery consumes no attempt and performs no
 provider check. Permanent denial records a terminal source-permissions phase and
 cannot publish a fresh searchable lease.
+
+
+Standalone publication anchors its permission lease to the beginning of the final
+audit and bounds that audit with the source TTL. It rejects checks that reach or
+exceed the budget, preserving the pinned acquisition for a later fresh audit. No
+new publication or lease is committed on timeout.
+
+Google acquisition shares a bounded error parser across Gmail/Calendar requests,
+Drive metadata, media and native exports, including Calendar attachments. It keeps
+HTTP status, a safe reason code and numeric/HTTP-date Retry-After deadlines, never
+provider messages or raw bodies. Only documented transient rate-limit reasons can
+reclassify an HTTP 403; mixed permission/quota errors and unknown reasons remain
+permanent. Error parsing reads at most 64 KiB plus an overflow byte. Legacy Google
+errors and collaboration errors share retryability, cooldown and rate-limit
+contracts, so bounded audit waits and hosted acquisition progress apply equally.
+See [Gmail error handling](https://developers.google.com/workspace/gmail/api/guides/handle-errors)
+and [Calendar error handling](https://developers.google.com/workspace/calendar/api/guides/errors).

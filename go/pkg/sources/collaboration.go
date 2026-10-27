@@ -107,7 +107,10 @@ func (e *ProviderHTTPError) Error() string {
 	return fmt.Sprintf("%s source returned HTTP %d (%s)", e.Provider, e.Status, e.Code)
 }
 func (e *ProviderHTTPError) AntflyRetryAfter() time.Time { return e.RetryAt }
-func (e *ProviderHTTPError) Retryable() bool             { return e.Status == 429 || e.Status >= 500 }
+func (e *ProviderHTTPError) RateLimited() bool {
+	return e.Status == 429 || (e.Provider == ProviderGoogleWorkspace && e.Status == 403 && googleRateLimitReason(e.Code))
+}
+func (e *ProviderHTTPError) Retryable() bool { return e.RateLimited() || e.Status >= 500 }
 
 func (c *CollaborationConnector) Provider() string { return c.ProviderName }
 
@@ -269,9 +272,11 @@ func (c *CollaborationConnector) get(ctx context.Context, resource, path string,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		e := &ProviderHTTPError{Provider: c.ProviderName, Status: resp.StatusCode}
-		e.RetryAt = providerRetryAt(resp.Header.Get("Retry-After"), time.Now())
-		return e
+		if resource == "gmail" || resource == "calendar" {
+			api := googleResponseError(resp)
+			return &ProviderHTTPError{Provider: c.ProviderName, Status: api.Status, Code: api.Reason, RetryAt: api.RetryAt}
+		}
+		return &ProviderHTTPError{Provider: c.ProviderName, Status: resp.StatusCode, RetryAt: providerRetryAt(resp.Header.Get("Retry-After"), time.Now())}
 	}
 	b, err := readBounded(resp.Body)
 	if err != nil {

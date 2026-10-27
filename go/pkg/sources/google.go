@@ -102,11 +102,6 @@ func googleFileID(s string) bool {
 	return true
 }
 
-type GoogleHTTPError struct{ Status int }
-
-func (e *GoogleHTTPError) Error() string {
-	return fmt.Sprintf("Google source returned HTTP %d", e.Status)
-}
 func (c *GoogleConnector) get(ctx context.Context, client *http.Client, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base()+path, nil)
 	if err != nil {
@@ -118,7 +113,7 @@ func (c *GoogleConnector) get(ctx context.Context, client *http.Client, path str
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return &GoogleHTTPError{resp.StatusCode}
+		return googleResponseError(resp)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20+1))
 	if err != nil {
@@ -382,7 +377,7 @@ func (c *GoogleConnector) read(ctx context.Context, client *http.Client, r Reque
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, &GoogleHTTPError{resp.StatusCode}
+		return nil, googleResponseError(resp)
 	}
 	if c.ProviderName == ProviderGCS && resp.Header.Get("X-Goog-Generation") != o.Revision {
 		return nil, &RevisionChangedError{Expected: o.Revision, Actual: resp.Header.Get("X-Goog-Generation")}
@@ -509,7 +504,7 @@ func (*GoogleConnector) RuntimeAccess(context.Context, Request) (string, error) 
 func (*GoogleConnector) IsRetryable(err error) bool {
 	var e *GoogleHTTPError
 	if errors.As(err, &e) {
-		return e.Status == 429 || e.Status >= 500
+		return e.Retryable()
 	}
 	return false
 }

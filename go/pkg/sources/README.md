@@ -244,3 +244,17 @@ sharing remain bound, and resumed reads recheck current account/service access.
 Old checkpoints adopt this identity when their complete old configuration still
 matches. If that proof is unavailable after an earlier configuration change, use
 an explicit restart to select fresh content.
+
+
+Standalone collaboration leases begin at the start of the final permission audit.
+The audit receives the configured TTL as its deadline; an expired audit keeps its
+pinned inventory for retry and leaves the source stale. A slow check cannot mint
+a new full lease after its earliest scope checks have aged out.
+
+Google API errors retain a bounded reason code and provider `Retry-After` deadline.
+Documented `rateLimitExceeded` and `userRateLimitExceeded` responses are retryable
+on HTTP 403 as well as 429. Permission, domain-policy, usage-cap and unknown 403
+errors remain permanent. The same classification applies to Gmail, Calendar and
+legacy Drive/GCS acquisition, including Calendar-linked Drive downloads/exports.
+`IsRateLimited` recognizes wrapped errors for audit waits and progress accounting;
+provider messages and response bodies never enter persisted error diagnostics.
