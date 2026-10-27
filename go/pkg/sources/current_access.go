@@ -112,20 +112,22 @@ func (c *CollaborationConnector) authorizeInventoryOnce(ctx context.Context, r R
 		return err
 	}
 	if c.ProviderName == ProviderGoogleWorkspace && config.Resource == "drive" {
-		var folder struct {
-			ID           string `json:"id"`
-			Capabilities struct {
-				CanListChildren bool `json:"canListChildren"`
-			} `json:"capabilities"`
-		}
-		if err := c.drive().get(ctx, c.HTTPClient, "/files/"+url.PathEscape(config.FolderID)+"?fields=id,capabilities(canListChildren)&supportsAllDrives=true", &folder); err != nil {
+		if err := c.checkedAuthority("drive-folder/"+config.FolderID, func() error {
+			var folder struct {
+				ID           string `json:"id"`
+				Capabilities struct {
+					CanListChildren bool `json:"canListChildren"`
+				} `json:"capabilities"`
+			}
+			if err := c.drive().get(ctx, c.HTTPClient, "/files/"+url.PathEscape(config.FolderID)+"?fields=id,capabilities(canListChildren)&supportsAllDrives=true", &folder); err != nil {
+				return err
+			}
+			if folder.ID == "" || !folder.Capabilities.CanListChildren {
+				return fmt.Errorf("%w: Drive folder listing access revoked", ErrInvalidInput)
+			}
+			return nil
+		}); err != nil {
 			return err
-		}
-		if folder.ID == "" || !folder.Capabilities.CanListChildren {
-			return fmt.Errorf("%w: Drive folder listing access revoked", ErrInvalidInput)
-		}
-		if c.scopeChecks == nil {
-			c.scopeChecks = map[string]time.Time{}
 		}
 		for _, item := range inventory.Objects {
 			id := configString(item.Metadata, "file_id")
@@ -171,22 +173,32 @@ func (c *CollaborationConnector) authorizeInventoryOnce(ctx context.Context, r R
 		}
 	case ProviderGoogleWorkspace:
 		if config.Resource == "gmail" {
-			if _, err := c.gmailAccount(ctx); err != nil {
+			if err := c.checkedAuthority("gmail-account", func() error { _, err := c.gmailAccount(ctx); return err }); err != nil {
 				return err
 			}
 			for _, label := range config.LabelIDs {
-				var value any
-				if err := c.get(ctx, "gmail", "/labels/"+url.PathEscape(label), &value); err != nil {
+				if err := c.checkedAuthority("gmail-label/"+label, func() error { var value any; return c.get(ctx, "gmail", "/labels/"+url.PathEscape(label), &value) }); err != nil {
 					return err
 				}
 			}
 		} else {
 			for _, id := range config.CalendarIDs {
-				if _, err := c.calendarID(ctx, id); err != nil {
+				if err := c.checkedAuthority("calendar-selection/"+id, func() error { _, err := c.calendarID(ctx, id); return err }); err != nil {
 					return err
 				}
 			}
 		}
 	}
+	return nil
+}
+
+func (c *CollaborationConnector) checkedAuthority(key string, check func() error) error {
+	if time.Since(c.scopeChecks[key]) <= c.accessCheckWindow() {
+		return nil
+	}
+	if err := check(); err != nil {
+		return err
+	}
+	c.scopeChecks[key] = time.Now()
 	return nil
 }

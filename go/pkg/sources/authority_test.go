@@ -243,3 +243,30 @@ func TestPermissionAuditRetainsSuccessfulScopeProofsAcrossRateLimit(t *testing.T
 	require.Equal(t, map[string]int{"C1": 1, "C2": 2}, calls)
 	require.Zero(t, c.accessAuditWindow)
 }
+
+func TestWorkspacePermissionAuditResumesLabelChecksAfterRateLimit(t *testing.T) {
+	calls := map[string]int{}
+	c := &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, Services: []string{"gmail"}, GmailBase: "https://fixture.test"}
+	c.HTTPClient = fixtureClient(t, func(r *http.Request) (int, any) {
+		calls[r.URL.Path]++
+		if strings.HasSuffix(r.URL.Path, "/profile") {
+			return 200, map[string]any{"emailAddress": "alice@example.com"}
+		}
+		if strings.HasSuffix(r.URL.Path, "/labels/L2") && calls[r.URL.Path] == 1 {
+			return 429, nil
+		}
+		require.Contains(t, r.URL.Path, "/labels/")
+		return 200, map[string]any{"id": r.URL.Path}
+	})
+	waits := 0
+	c.accessWait = func(context.Context, time.Duration) error { waits++; return nil }
+	require.NoError(t, c.AuthorizeInventory(t.Context(), Request{Mode: ImportModeSource, Config: SourceConfig(`{"resource":"gmail","label_ids":["L1","L2"]}`)}, Inventory{}))
+	require.Equal(t, 1, waits)
+	for path, n := range calls {
+		if strings.HasSuffix(path, "L2") {
+			require.Equal(t, 2, n)
+		} else {
+			require.Equal(t, 1, n)
+		}
+	}
+}
