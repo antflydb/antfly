@@ -237,6 +237,7 @@ pub const Plan = struct {
     required_fields: std.StringHashMapUnmanaged(void) = .empty,
     bindings: []Binding = &.{},
     evaluation_order: []const usize = &.{},
+    unconditional_fields: []const []const u8 = &.{},
     parameters: std.ArrayList(V) = .empty,
     hints: std.ArrayList(?ast.ColumnType) = .empty,
     params: V = .null,
@@ -325,6 +326,18 @@ pub const Plan = struct {
             if (before == remaining) return error.CyclicFunctionBinding;
         }
         self.evaluation_order = order.items;
+        // Eligibility and deduplication are immutable program facts. Prepare
+        // once per request, never once per row or selected output.
+        var unconditional: std.ArrayList([]const u8) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (self.bindings) |binding| if (binding.program.?.directOutputColumn()) |ordinal| {
+            if (binding.dependencies[ordinal] == .field) {
+                const path = binding.dependencies[ordinal].field;
+                if (std.mem.eql(u8, path, "_id")) continue;
+                if (!(try seen.getOrPut(a, path)).found_existing) try unconditional.append(a, path);
+            }
+        };
+        self.unconditional_fields = unconditional.items;
         return self;
     }
     /// Caller has strictly validated output members and the plan fingerprint.
@@ -427,24 +440,7 @@ pub const Plan = struct {
     pub fn evaluateEncoded(self: *const Plan, a: A, output: A, source: Source, previous: ?V, limits: sql.EvalLimits) ![]u8 {
         if (previous != null) return std.json.Stringify.valueAlloc(output, try self.evaluate(a, source, previous, limits), .{});
         if (limits.checkpoint) |poll| try poll(limits.checkpoint_context);
-        if (source.prefetch) |prefetch| {
-            var paths: [64][]const u8 = undefined;
-            var count: usize = 0;
-            for (self.bindings) |binding| if (binding.program.?.directOutputColumn()) |ordinal| {
-                if (binding.dependencies[ordinal] == .field) {
-                    const path = binding.dependencies[ordinal].field;
-                    if (std.mem.eql(u8, path, "_id")) continue;
-                    const present = for (paths[0..count]) |other| {
-                        if (std.mem.eql(u8, other, path)) break true;
-                    } else false;
-                    if (!present) {
-                        paths[count] = path;
-                        count += 1;
-                    }
-                }
-            };
-            if (count > 1) try prefetch(source.context, paths[0..count]);
-        }
+        if (self.unconditional_fields.len > 1) if (source.prefetch) |prefetch| try prefetch(source.context, self.unconditional_fields);
         const values = try a.alloc(?sql.Datum, self.bindings.len);
         @memset(values, null);
         const raw_values = try a.alloc(?[]const u8, self.bindings.len);
