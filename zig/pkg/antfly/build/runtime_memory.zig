@@ -133,6 +133,22 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         };
         return gib * 1024 * 1024 * 1024;
     }
+    if (unit == .api_kernel and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
+        target.os.tag == .linux and target.cpu.arch == .aarch64 and
+        (target.abi == .gnu or target.abi == .musl) and
+        target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
+        profile.optimize == .fast and profile.strip and !profile.sanitize_thread)
+    {
+        // Run 40426894698, glibc-linked Zig 0.17.0: ARM64 GNU/musl
+        // API archives peaked at 14,346,383,360/13,929,717,760 bytes.
+        // 15 GiB covers the larger peak plus 10% while still admitting
+        // the 4 GiB enrichment owner within a 20 GiB scheduler budget.
+        // Do not transfer these cross-target measurements to native x86,
+        // Debug, sanitizers or other runtime units.
+        return 15 * 1024 * 1024 * 1024;
+    }
     return switch (unit) {
         // Claims conservatively cover clean production ReleaseFast
         // peaks measured for both aarch64-linux-musl and explicit
@@ -537,10 +553,20 @@ test "Linux release API reservations cover ARM64 GNU and musl peaks within the r
         const target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = abi });
         const profile: CompileMemoryProfile = .{ .host = host, .target = target, .optimize = .fast, .strip = true, .cpu_inference = abi == .musl };
         const claim = runtimeCompileMaxRss(.api_kernel, profile);
-        const peak: usize = if (abi == .gnu) 10_983_571_456 else 10_788_933_632;
-        try std.testing.expectEqual(12 * gib, claim);
-        try std.testing.expect(claim >= peak + peak / 6);
+        const peak: usize = if (abi == .gnu) 14_346_383_360 else 13_929_717_760;
+        try std.testing.expectEqual(15 * gib, claim);
+        try std.testing.expect(claim >= peak + peak / 10);
         try std.testing.expect(claim + runtimeCompileMaxRss(.enrichment_compute, profile) <= 20 * gib);
+        var unmeasured = profile;
+        unmeasured.optimize = .debug;
+        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
+        unmeasured = profile;
+        unmeasured.strip = false;
+        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
+        unmeasured = profile;
+        unmeasured.sanitize_thread = true;
+        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
+        try std.testing.expectEqual(20 * gib, runtimeCompileMaxRss(.storage_kernel, profile));
     }
 }
 
