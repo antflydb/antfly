@@ -518,6 +518,18 @@ test('ambiguous metadata deadlines retain native reservations and recover the la
  assert.equal(pool.reservedBytes,0);assert.equal(await store.transaction(tx=>tx.get('value')),2,'fresh native recovery must authenticate the late commit');assert.equal(created,2);assert.equal(pool.reservedBytes,0);
 });
 
+test('late storage resource failures remain observable after native deadlines',{timeout:5000},async()=>{
+ const{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs'),{resourceFailureCode}=await import('../performance.mjs');
+ let release,entered;const held=new Promise(r=>release=r),started=new Promise(r=>entered=r),events=[],counters={},failure=Error('out of memory: SQLITE_NOMEM secret-must-not-be-logged');
+ const io=instrumentTransport(async()=>{entered();await held;throw failure;},counters,{onResourceFailure:sample=>events.push(sample)}),host=await instantiateHost(module,io),operation=host.request({op:'coordinate',bucket:'database',prefix:'antfly',namespace:'late-resource',working_set_bytes:4*1024*1024,coordinate:{action:'begin',owner:Array(16).fill(1)}},{deadlineMs:Date.now()+25});
+ const expired=assert.rejects(operation,/DeadlineExceeded/);await started;
+ try{await expired;assert.ok(host.draining());assert.deepEqual(events,[]);assert.equal(counters.resource_failures,undefined);}finally{release();await expired;await host.draining();}
+ assert.equal(counters.resource_failures,1);assert.deepEqual(events,[{event:'antfly.resource_failure',failure_code:'SQLITE_NOMEM',op:'get'}]);assert.ok(!JSON.stringify(events).includes('secret'));
+ for(const message of['OutOfMemory','MemoryLimitExceeded','memory limit exceeded','CPULimitExceeded','CPU time limit exceeded'])assert.ok(resourceFailureCode(Error(message)));
+ for(const message of['DeadlineExceeded','ObjectIoBudgetExceeded','key missing'])assert.equal(resourceFailureCode(Error(message)),null);
+ const same=Error('CPULimitExceeded private'),observed=instrumentTransport(async()=>{throw same;},{},{onResourceFailure:()=>{throw Error('observer failed');}});await assert.rejects(observed({op:'get'}),error=>error===same);
+});
+
 test('native inline read views avoid metadata pages across logical storage identities and preserve migration barriers',async()=>{
  const{NativeReadViews}=await import('../native-read-views.mjs'),{openAuthority}=await import('../coordinator-authority.mjs'),{inlineReadSet}=await import('../read-view.mjs'),{MIGRATION}=await import('../r2-coordinator-migration.mjs'),{RequestPool}=await import('../request-pool.mjs'),{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs');
  const small=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-observe.wasm',import.meta.url))),bucket=new Bucket(),namespace='logical-capsule',storage='distinct-storage-capsule',keys=await metadataKeys(namespace),now=Date.now(),env={DATABASE:bucket,ANTFLY_INCARNATION:namespace,COORDINATOR_STORAGE_ID:storage,COORDINATOR_BACKEND:'r2'};

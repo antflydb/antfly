@@ -18,6 +18,24 @@ test('streaming metrics discard HTTP credentials bodies and arbitrary text befor
  const secret='Bearer do-not-persist',event={outcome:'exception',event:{request:{headers:{authorization:secret},url:secret}},exceptions:[{name:'Error',message:'unexpected '+secret}],logs:[{timestamp:42,message:[secret,JSON.stringify({event:'antfly.operation',op:'lookup',elapsed_ms:5,body:secret,token:secret,unknown:secret,physical:{calls:2,headers:{authorization:secret},name:'do-not-persist',event:'do-not-persist'},failure_code:'Error: WorkLeaseLost '+secret})]}]};
  const safe=sanitizeTailEvent(event);assert.ok(!JSON.stringify(safe).includes('do-not-persist'));const value=JSON.parse(safe.logs[0].message[0]);assert.equal(value.elapsed_ms,5);assert.equal(value.physical.calls,2);assert.equal(value.failure_code,'WorkLeaseLost');assert.equal(safe.exceptions[0].message,'RedactedError');assert.equal(value.token,undefined);
 });
+test('sanitized tails retain late resource codes without raw error text',()=>{
+ const safe=sanitizeTailEvent({outcome:'ok',logs:[{timestamp:1,message:[JSON.stringify({event:'antfly.resource_failure',op:'get',failure_code:'SQLITE_NOMEM secret-must-not-persist',error:'CPU time limit exceeded secret-must-not-persist'})]}]});
+ const value=JSON.parse(safe.logs[0].message[0]);assert.equal(value.event,'antfly.resource_failure');assert.equal(value.failure_code,'SQLITE_NOMEM');assert.ok(!JSON.stringify(safe).includes('secret-must-not-persist'));
+ const legacy=sanitizeTailEvent({outcome:'ok',logs:[{message:['Antfly object operation failed','get','Error: out of memory: SQLITE_NOMEM secret-must-not-persist']}]});assert.equal(JSON.parse(legacy.logs[0].message[0]).failure_code,'SQLITE_NOMEM');assert.ok(!JSON.stringify(legacy).includes('secret-must-not-persist'));
+});
 test('tail framing bounds buffers and handles fragmented quoted objects',()=>{
  const out=[],parse=tailFrames(v=>out.push(v),{maxBytes:256});parse('CLI banner\n'+JSON.stringify({event:{body:'x'.repeat(512)}}));const raw=JSON.stringify({outcome:'ok',logs:[{timestamp:1,message:[JSON.stringify({event:'antfly.trace',scope:'http',elapsed_ms:5})]}]});for(let i=0;i<raw.length;i+=3)parse(raw.slice(i,i+3));assert.equal(out.length,1);assert.equal(out[0].outcome,'ok');assert.equal(JSON.parse(out[0].logs[0].message[0]).scope,'http');
+});
+
+test('live diagnostic coverage rejects a late resource failure after a successful HTTP outcome',async()=>{
+ const{DiagnosticCoverage}=await import('../qualification/live-diagnostics.mjs'),coverage=new DiagnosticCoverage([{id:'baseline'},{id:'candidate'}]);
+ for(const run of['baseline','candidate'])for(const role of['app','writer','reader','builder'])coverage.connected(run,role);
+ assert.equal(coverage.report().passed,true);coverage.observe('candidate','writer',sanitizeTailEvent({outcome:'ok',logs:[{message:[JSON.stringify({event:'antfly.resource_failure',op:'put',failure_code:'SQLITE_NOMEM'})]}]}));
+ assert.equal(coverage.report().passed,false);assert.throws(()=>coverage.assertClean(),/LiveResourceDiagnosticsFailed/);assert.equal(coverage.report().streams.find(s=>s.run==='candidate'&&s.role==='writer').resource_failures,1);
+});
+test('live diagnostic coverage preserves connection gaps and requires all eight roles',async()=>{
+ const{DiagnosticCoverage}=await import('../qualification/live-diagnostics.mjs'),coverage=new DiagnosticCoverage([{id:'baseline'},{id:'candidate'}]);
+ assert.equal(coverage.report().passed,false);for(const run of['baseline','candidate'])for(const role of['app','writer','reader','builder'])coverage.connected(run,role);
+ assert.equal(coverage.report().passed,true);coverage.lost('baseline','reader');coverage.connected('baseline','reader');assert.equal(coverage.report().passed,false);
+ const cpu=new DiagnosticCoverage([{id:'baseline'},{id:'candidate'}]);for(const run of['baseline','candidate'])for(const role of['app','writer','reader','builder'])cpu.connected(run,role);cpu.observe('candidate','builder',{outcome:'exceededCpu'});assert.equal(cpu.report().passed,false);
 });

@@ -1761,3 +1761,19 @@ work to one tenant and 64 documents on both sides under the original thirty-minu
 setup budget. Native binaries changed, so ANN, capacity evidence, sealed profiles
 and live trials must be refreshed. No reserved cold epoch has been used; the gate
 remains unpassed at this checkpoint.
+
+
+The capsule binaries pass the refreshed 50,000-document capacity run: all nine
+stages pass, including cold point/vector/sparse reads, updates, deletion and
+compaction. Peak linear memory is 27,525,120 bytes and peak working allocation is
+11,788,282 bytes, within the existing module budgets. The 1,000-document reindex
+run passes all ten stages. Both frozen ANN corpora pass all six comparison
+points with unchanged recall, equal/fewer physical GETs and fewer bytes read.
+These are local scale results; they do not supply live soak or recovery coverage.
+
+Late physical memory/CPU failures now have fixed-code settlement diagnostics.
+The updated qualification harness captures and checks all eight live service
+streams, rejecting gaps and resource failures before recovery. The implementation
+passes 239 Node tests and 18 persisted Worker tests. A separate read-only live
+probe connected all eight streams and closed its exact temporary sessions.
+The first capsule live comparison is still a diagnostic, not a gate pass.

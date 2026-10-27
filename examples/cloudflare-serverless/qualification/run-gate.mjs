@@ -18,6 +18,7 @@ import{resolve}from'node:path';
 import{spawn}from'node:child_process';
 import{fileURLToPath}from'node:url';
 import{GateClient,resumeSeedExecution}from'./gate-client.mjs';
+import{startLiveDiagnostics}from'./live-diagnostics.mjs';
 import{evaluateTrial,evaluateWarmPrerequisites}from'./gate-policy.mjs';
 import{validatedEvidence}from'./validated-evidence.mjs';
 import{runOfferedWorkload}from'./offered-workload.mjs';
@@ -31,8 +32,9 @@ for(const side of[baseline,candidate])assertUnusedRecovery(side.run);
 const executionId=crypto.randomUUID();baseline.executionId=executionId;candidate.executionId=executionId;
 const resumePath=process.argv.find(v=>v.startsWith('--resume-setup='))?.slice(15);
 const resumedSeedExecutionId=resumePath?resumeSeedExecution(JSON.parse(await readFile(resumePath)),baseline.run,candidate.run):null;
-let offered=0,fatal,workload,evidenceSummary={};
-const report=()=>({schema:1,execution_id:executionId,resumed_seed_execution_id:resumedSeedExecutionId,trial,documents,offered_period_ms:period,soak_ms:offered,workload,...evidenceSummary,baseline:baseline.report(),candidate:candidate.report(),fatal,limitations:['Fresh physical actors do not prove complete platform isolate eviction.','Live R2 attempts and sampled memory are not billing or absolute memory peaks.']});
+let offered=0,fatal,workload,diagnostics,diagnosticReport,evidenceSummary={};
+for(const signal of['SIGTERM','SIGINT'])process.once(signal,()=>{baseline.stop(Error('QualificationInterrupted'));candidate.stop(Error('QualificationInterrupted'));});
+const report=()=>({schema:1,execution_id:executionId,resumed_seed_execution_id:resumedSeedExecutionId,trial,documents,offered_period_ms:period,soak_ms:offered,workload,diagnostics:diagnosticReport??diagnostics?.report(),...evidenceSummary,baseline:baseline.report(),candidate:candidate.report(),fatal,limitations:['Fresh physical actors do not prove complete platform isolate eviction.','Live R2 attempts and sampled memory are not billing or absolute memory peaks.']});
 async function save(){const data=report();data.evaluation=evaluateTrial(data);await writeFile(output+'.tmp',JSON.stringify(data,null,2));await rename(output+'.tmp',output);}
 async function markPhase(phase){
  for(const side of[baseline,candidate]){
@@ -46,6 +48,7 @@ async function markPhase(phase){
 async function lifecycle(action,id){await new Promise((resolve,reject)=>{const child=spawn(process.execPath,[fileURLToPath(new URL('./gate-lifecycle.mjs',import.meta.url)),path,action,id],{stdio:'inherit'});child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(Error(action+' failed')));});}
 try{
  for(const side of[baseline,candidate])if(side.run.paused)await lifecycle('resume',side.run.id);
+ diagnostics=await startLiveDiagnostics([baseline.run,candidate.run],executionId,gate.dir);
  await markPhase('setup');
  console.log('seeding',trial);await runPairedPhase([baseline,candidate],side=>side.seed(documents,{executionId:resumedSeedExecutionId??executionId}));console.log('seeded',trial);
  await markPhase('workload');
@@ -54,6 +57,7 @@ try{
  if(seconds>=3600||process.argv.includes('--cold')){
   let evidence;try{evidence=JSON.parse(await readFile(resolve(gate.dir,'evidence.json')));}catch{}
   evidenceSummary=await validatedEvidence(evidence,report(),baseline.run,candidate.run);
+  diagnostics.assertClean();
   const prerequisites=evaluateWarmPrerequisites(report());
   if(!prerequisites.passed)throw Error('cold actors preserved; warm prerequisites failed: '+prerequisites.failures.join('; '));
   candidate.run.cold_execution_id=executionId;await writeFile(resolve(candidate.run.dir,'run.json'),JSON.stringify(candidate.run,null,2));
@@ -62,4 +66,5 @@ try{
   await candidate.verify(documents);
  }
 }catch(error){fatal=String(error);console.error('gate trial failed',trial,fatal);}
+if(diagnostics)try{diagnosticReport=await diagnostics.finish();if(!diagnosticReport.passed)fatal??='LiveResourceDiagnosticsFailed';}catch{fatal??='LiveResourceDiagnosticFinalizationFailed';}
 await save();await writeFile(resolve(gate.dir,'trial-'+trial+'-'+executionId+'.json'),JSON.stringify(report(),null,2));console.log('saved',output,JSON.stringify(evaluateTrial(report())));if(fatal)process.exitCode=1;

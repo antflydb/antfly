@@ -15,7 +15,7 @@
 
 import{test}from'node:test';
 import assert from'node:assert/strict';
-import{evaluateTrial,evaluateGate}from'../qualification/gate-policy.mjs';
+import{evaluateTrial,evaluateGate,evaluateWarmPrerequisites}from'../qualification/gate-policy.mjs';
 import{GateClient,resumeSeedExecution}from'../qualification/gate-client.mjs';
 test('WAL format activation probes the actual full writer and compact reader',async()=>{
  const{verifyWalTailReaders}=await import('../qualification/wal-compatibility.mjs'),{readFile}=await import('node:fs/promises');
@@ -46,7 +46,7 @@ function report(){
  const execution_id=crypto.randomUUID(),version='01234567-0123-4567-89ab-0123456789ab',samples=[...Array.from({length:1000},()=>({phase:'read',ms:100,version,attempts:1})),...Array.from({length:300},()=>({phase:'write',ms:500,version,attempts:1}))];
  const side={execution_id,version,samples,errors:[],resource_errors:[],verification:{bodies:2052,receipts:8,passed:true},converged:true,lag:["a","b","c","d"].flatMap(tenant=>Array.from({length:60},(_,minute)=>({minute,tenant,lag:0}))),queue:Array.from({length:60},(_,minute)=>({minute,backlog_count:0,oldest_ms:0,dead_letter_count:0})),cold:Array.from({length:100},(_,epoch)=>({epoch:epoch+1,ms:1000,version,count:'512',attempts:1}))};
  const point={samples:10,baseline_recall:.9,candidate_recall:.9,baseline_gets:100,candidate_gets:100,baseline_bytes:1000,candidate_bytes:1000},points=[8,32,"all"].map(probes=>({...point,probes}));
- return{schema:1,execution_id,trial:1,documents:512,soak_ms:3600000,offered_period_ms:30000,workload:{period_ms:30000,rounds:120,requested_ms:3600000,started_at:1,offered_end_at:3600001},baseline:structuredClone(side),candidate:side,faults:{passed:true,artifact_sha256:'a'.repeat(64)},ann:{datasets:[{kind:"synthetic",documents:10000,points},{kind:"model-embeddings",documents:1000,fixture_sha256:"b".repeat(64),points}],samples:10,exact_control:true,baseline_recall:.9,candidate_recall:.9,baseline_gets:100,candidate_gets:100,baseline_bytes:1000,candidate_bytes:1000}};
+ return{schema:1,execution_id,diagnostics:{passed:true,streams:['baseline','candidate'].flatMap(run=>['app','writer','reader','builder'].map(role=>({run,role,connected:true,gap:false,resource_failures:0})))},trial:1,documents:512,soak_ms:3600000,offered_period_ms:30000,workload:{period_ms:30000,rounds:120,requested_ms:3600000,started_at:1,offered_end_at:3600001},baseline:{...structuredClone(side),run:'baseline'},candidate:{...side,run:'candidate'},faults:{passed:true,artifact_sha256:'a'.repeat(64)},ann:{datasets:[{kind:"synthetic",documents:10000,points},{kind:"model-embeddings",documents:1000,fixture_sha256:"b".repeat(64),points}],samples:10,exact_control:true,baseline_recall:.9,candidate_recall:.9,baseline_gets:100,candidate_gets:100,baseline_bytes:1000,candidate_bytes:1000}};
 }
 test('gate requires three independent complete trials',()=>{const a=report();assert.equal(evaluateTrial(a).passed,true);assert.equal(evaluateGate([a]).passed,false);const b=report(),c=report();b.trial=2;c.trial=3;assert.equal(evaluateGate([a,b,c]).passed,true);assert.equal(evaluateGate([a,a,a]).passed,false);});
 test('fresh corpus retries preserve resource parameters and old recovery markers',async()=>{
@@ -261,4 +261,8 @@ test('stopped qualification clients cancel active transport and never start anot
  const pending=client.call('a',{op:'status'},'seed');await entered;client.stop(Error('PeerPhaseCancelled'));await assert.rejects(pending,/PeerPhaseCancelled/);await assert.rejects(client.call('a',{op:'status'},'seed'),/PeerPhaseCancelled/);assert.equal(calls,1);assert.equal(client.samples.length,0);assert.ok(!JSON.stringify(client.errors).includes('do-not-log'));
  let retries=0,backoff;backoff=new GateClient({id:'test',origin:'https://stopped.invalid',version:'v'},'test',{fetch:async()=>{retries++;queueMicrotask(()=>backoff.stop(Error('PeerPhaseCancelled')));return Response.json({error:'CoordinatorRecovering'},{status:503});}});
  await assert.rejects(backoff.call('a',{op:'status'},'seed'),/PeerPhaseCancelled/);assert.equal(retries,1);assert.equal(backoff.errors[0].attempts,1);
+});
+
+test('gate rejects missing gapped duplicate or resource-failed live diagnostics',()=>{
+ for(const change of[r=>delete r.diagnostics,r=>r.diagnostics.streams.pop(),r=>r.diagnostics.streams[0].gap=true,r=>r.diagnostics.streams[0].resource_failures=1,r=>r.diagnostics.streams[0]=r.diagnostics.streams[1]]){const r=report();change(r);assert.equal(evaluateWarmPrerequisites(r).passed,false);assert.equal(evaluateTrial(r).passed,false);}
 });

@@ -1164,3 +1164,27 @@ cover staged activation, eviction, both collectors, checkpointed reindex,
 receipt replay and recovery after platform storage erasure. This removes
 metadata page fetches from the covered read path; end-to-end live latency and
 the full acceptance gate remain separate requirements.
+
+## Resource failures after a deadline
+
+Physical R2 instrumentation recognizes fixed memory/CPU resource codes and emits
+`antfly.resource_failure` at settlement, independently of the native request's
+completion. It retains no arbitrary binding error text, key, tenant or credential.
+The original exception still propagates; diagnostic callbacks cannot replace it.
+A held-I/O regression returns `DeadlineExceeded` first, then injects
+`SQLITE_NOMEM` and verifies the later failure remains counted and observable.
+HTTP qualification also recognizes CPU and memory variants on recovered retries.
+
+Qualification now owns eight bounded tail sessions, one per service on both
+sides. It uses the same trace-v1 API as the pinned Wrangler, with no sampling
+filter, a 1 MiB frame limit, ping/pong health checks and fixed scope validation.
+Session URLs and account credentials stay in memory. Only the existing sanitized
+numeric/code representation reaches private local journals. Connection loss,
+malformed/oversize frames, journal errors and observed memory/CPU failures make
+the diagnostic population fail. Reconnection cannot erase a coverage gap.
+
+The warm preflight checks all eight streams before consuming recovery actors.
+Finalization closes and deletes only its own temporary tail sessions and hashes
+the completed sanitized journals. The final gate also rejects diagnostic failure.
+This covers observed late errors; it is not an assertion about unreported
+provider events, complete platform isolate eviction or absolute memory peaks.

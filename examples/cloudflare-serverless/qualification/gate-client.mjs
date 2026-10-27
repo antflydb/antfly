@@ -14,6 +14,7 @@
 // limitations under the License.
 
 import{Agent}from'undici';
+import{resourceFailureCode}from'../performance.mjs';
 import{assertGateRun}from'./gate-scope.mjs';
 import{verifySealedRun}from'./gate-provenance.mjs';
 import {readFile} from 'node:fs/promises';
@@ -49,7 +50,7 @@ export class GateClient {
    this.abortController.signal.throwIfAborted();
    let response,body;try{transportAttempts++;response=await this.fetch(new URL(path,this.run.origin),{method:'POST',headers:{Authorization:'Bearer '+this.token,'Content-Type':'application/json','X-Antfly-Tenant':tenant,'X-Antfly-Physical-Epoch':String(epoch)},body:JSON.stringify(input),signal:AbortSignal.any([this.abortController.signal,AbortSignal.timeout(Math.max(1,Math.min(35000,scheduled+60000-Date.now())))])});
    body=await response.text();}catch(error){lastTransportError=error;if(!this.abortController.signal.aborted&&phase!=="cold"&&idempotent&&networkFailure(error)){await new Promise(r=>setTimeout(r,250));continue;}throw error;}let value;try{value=JSON.parse(body);}catch{throw Error('non-JSON response: '+response.status);}
-   last=value;if(/OutOfMemory|SQLITE_NOMEM|MemoryLimitExceeded/.test(value.error??''))this.resourceErrors.push({phase,error:value.error});
+   last=value;if(resourceFailureCode(value.error))this.resourceErrors.push({phase,error:value.error});
    if(phase!=="cold"&&(response.status===503||response.status===409&&(/WorkLeaseLost|WalCommitContended|PublicationConflict|PreconditionFailed/.test(value.error??'')||idempotent&&value.error===constructorReset))){await new Promise(r=>setTimeout(r,250));continue;}
    if(!response.ok)throw Error('HTTP '+response.status+': '+(value.error??'unknown'));
    const version=response.headers.get('X-Antfly-Version');if(version!==this.run.version)throw Error('mixed version: '+version);

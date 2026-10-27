@@ -24,6 +24,8 @@ function assessTrial(report,includeCold){
  const failures=[],check=(ok,reason)=>{if(!ok)failures.push(reason);};
  const candidate=report.candidate,baseline=report.baseline;
  check(!report.fatal,"trial failed before completion");
+ const diagnosticStreams=report.diagnostics?.streams??[],expectedStreams=[report.baseline?.run,report.candidate?.run].flatMap(run=>['app','writer','reader','builder'].map(role=>run+'/'+role));
+ check(report.diagnostics?.passed===true&&diagnosticStreams.length===8&&new Set(diagnosticStreams.map(s=>s.run+'/'+s.role)).size===8&&diagnosticStreams.every(s=>expectedStreams.includes(s.run+'/'+s.role)&&s.connected&&!s.gap&&s.resource_failures===0),"live resource diagnostics missing or failed");
  check(report.documents===512,"declared soak corpus missing or changed");
  check(report.schema===1&&candidate&&baseline,"versioned paired report missing");
  if(!candidate||!baseline)return{passed:false,failures};

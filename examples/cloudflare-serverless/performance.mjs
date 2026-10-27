@@ -16,7 +16,16 @@
 // Physical transport counters sit below immutable caches; logical WASM I/O
 // remains separate. Observers cannot affect a committed operation.
 const transportActivity=new WeakMap();
-export function instrumentTransport(transport,counters={}){
+export function resourceFailureCode(error){
+ const value=String(error??'');
+ if(/\bSQLITE_NOMEM\b/.test(value))return 'SQLITE_NOMEM';
+ if(/\bOutOfMemory\b|out of memory/i.test(value))return 'OutOfMemory';
+ if(/\bMemoryLimitExceeded\b|memory limit|exceeded memory/i.test(value))return 'MemoryLimitExceeded';
+ if(/\bCPULimitExceeded\b|CPU.*limit|exceeded CPU/i.test(value))return 'CPULimitExceeded';
+ return null;
+}
+const reportResourceFailure=sample=>console.error(JSON.stringify(sample));
+export function instrumentTransport(transport,counters={},{onResourceFailure=reportResourceFailure}={}){
  let activity=transportActivity.get(counters);if(!activity){activity={active:0,waveStarted:0};transportActivity.set(counters,activity);}
  return async(request,body)=>{
   if(request.op==="bucket_exists")return transport(request,body);
@@ -26,7 +35,16 @@ export function instrumentTransport(transport,counters={}){
   if(activity.active++===0){activity.waveStarted=started;counters.io_waves=(counters.io_waves??0)+1;}
   counters.concurrency_peak=Math.max(counters.concurrency_peak??0,activity.active);
   counters.bytes_written=(counters.bytes_written??0)+(body?.byteLength??0);
-  try{const result=await transport(request,body);counters.bytes_read=(counters.bytes_read??0)+(result.body?.byteLength??0);return result;}finally{const ended=performance.now();counters.wait_ms=(counters.wait_ms??0)+ended-started;if(--activity.active===0)counters.wait_union_ms=(counters.wait_union_ms??0)+ended-activity.waveStarted;}
+  try{const result=await transport(request,body);counters.bytes_read=(counters.bytes_read??0)+(result.body?.byteLength??0);return result;}catch(error){
+   const failure_code=resourceFailureCode(error);
+   if(failure_code){
+    counters.resource_failures=(counters.resource_failures??0)+1;
+    // This callback stays with physical I/O after a native caller times out.
+    // Emit only fixed codes, never the binding's arbitrary error message.
+    try{onResourceFailure({event:'antfly.resource_failure',failure_code,op:['get','put','head','list','delete','delete_many'].includes(request.op)?request.op:'coordinate'});}catch{}
+   }
+   throw error;
+  }finally{const ended=performance.now();counters.wait_ms=(counters.wait_ms??0)+ended-started;if(--activity.active===0)counters.wait_union_ms=(counters.wait_union_ms??0)+ended-activity.waveStarted;}
  };
 }
 

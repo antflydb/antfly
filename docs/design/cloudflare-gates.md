@@ -89,6 +89,7 @@ cannot turn measured writes into receipt replays.
 | Stability | Last ten backlog samples no more than four above the p95 of minutes 15–24, with a floor of four |
 | ANN | Both corpora below: equal/better recall with no additional mean physical GETs or bytes at 8/32/full effort |
 | Failure tests | Content-addressed passing native, Node and persisted Worker test logs |
+| Resource diagnostics | Eight continuously connected service streams, no observed memory/CPU failures |
 
 Setup uses one tenant at a time and waits for publication after each 64-document
 seed batch. Both sides use the same preparation policy and a single thirty-minute
@@ -449,3 +450,12 @@ Store completed logs and benchmark reports under the worktree's ignored
 system-directory logs may disappear between sessions; a missing artifact
 invalidates its evidence manifest. Preserve such manifests as historical failed
 evidence and regenerate current evidence from available, verified artifacts.
+
+
+Each new runner also captures eight sanitized live diagnostic streams. Missing
+roles, connection gaps and memory/CPU failures reject warm preflight and final
+qualification even when an HTTP retry succeeds. Completed journals are hashed
+locally; session URLs and credentials are never saved. The [performance
+design](cloudflare-performance.md#resource-failures-after-a-deadline) describes
+limits and late-settlement coverage. Historical reports without these diagnostics
+remain preserved and cannot qualify under the updated evaluator.
