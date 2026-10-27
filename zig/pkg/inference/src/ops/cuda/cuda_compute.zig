@@ -4798,7 +4798,8 @@ pub const CudaCompute = struct {
             std.debug.print("FLORENCE2 cuda_bart_ffn_calls={d}\n", .{self.florence_bart_ffn_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_vision_mlp_calls={d}\n", .{self.lighton_vision_fused.calls});
-        std.debug.print("LIGHTONOCR3 cuda_vision_bias_epilogue_calls={d}\n", .{self.lighton_vision_bias_epilogue_calls});
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_vision_bias_epilogue_calls={d}\n", .{self.lighton_vision_bias_epilogue_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_norm_weight_cache_hits={d} cuda_norm_weight_cache_misses={d}\n", .{ self.lighton_norm_weight_cache_hits, self.lighton_norm_weight_cache_misses });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
