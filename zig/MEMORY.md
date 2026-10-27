@@ -2638,3 +2638,14 @@ independent of cache residency or size estimates. Returned paths and incident
 pins remain bounded and head-fenced. Legacy source loading is confined to missing
 native readiness or explicit bulk use without a complete lookup; front-door
 queries cannot repeatedly rebuild whole alias profiles under cache pressure.
+
+Identity curation collects affected belief groups once per canonical subject,
+predicate, scope, environment, task, visibility and private owner. It deduplicates
+that group identity before scanning member claims, including when dependency
+pages repeat the same subject/object references across aliases. Suppression does
+not exclude a group from rebuilding, and private owners remain separate. The
+206-claim regression covers 412 dependency entries and seven canonical groups:
+14 raw group scans (two identity members per group), followed by the existing
+atomic belief rebuild and reconciliation. Collection no longer performs one
+whole-group traversal for every dependency. Pairwise belief reconciliation retains
+its existing semantics and work limits.

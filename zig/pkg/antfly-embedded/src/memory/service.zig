@@ -3110,7 +3110,8 @@ const Run = struct {
         }
         return records.items;
     }
-    fn rebuildIdentityGroups(self: *Run, names: *std.StringHashMapUnmanaged(void)) !void {
+    fn collectIdentityGroups(self: *Run, names: *std.StringHashMapUnmanaged(void)) !std.StringHashMapUnmanaged(t.StoredAssertion) {
+        var groups: ResourceSet = .empty;
         var affected: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty;
         var iterator = names.keyIterator();
         while (iterator.next()) |name| {
@@ -3122,7 +3123,11 @@ const Run = struct {
                     const entry = try parse(struct { child: []const u8, branch: []const u8 = "" }, self.a, row.json);
                     const seed = (try self.assertion(entry.child)) orelse continue;
                     if (!names.contains(seed.assertion.subject) and !(self.objectTyped(seed.assertion.predicate) and names.contains(seed.assertion.value))) continue;
-                    for (try self.canonicalGroup(seed.assertion, seed.owner)) |record| {
+                    var canonical_claim = seed.assertion;
+                    canonical_claim.subject = (try self.forwardIdentity(seed.assertion.subject)).canonical;
+                    const group = try groupPrefix(self.a, canonical_claim, seed.owner);
+                    if ((try groups.getOrPut(self.a, group)).found_existing) continue;
+                    for (try self.canonicalGroup(canonical_claim, seed.owner)) |record| {
                         try affected.put(self.a, record.assertion.id, record);
                         if (affected.count() > t.max_items) return error.MemoryWorkLimit;
                     }
@@ -3131,6 +3136,10 @@ const Run = struct {
                 if (cursor == null) break;
             }
         }
+        return affected;
+    }
+    fn rebuildIdentityGroups(self: *Run, names: *std.StringHashMapUnmanaged(void)) !void {
+        var affected = try self.collectIdentityGroups(names);
         try self.rebuildBeliefs(&affected);
     }
     fn rebuildBeliefs(self: *Run, affected: *std.StringHashMapUnmanaged(t.StoredAssertion)) !void {
@@ -7908,4 +7917,50 @@ test "memory performance supersession byte caps allocate one bounded page and pr
     try std.testing.expectError(error.Canceled, run.renderSupersessionCandidates(page, storage.len));
     try std.testing.expectEqual(@as(usize, 0), fixed.end_index);
     std.debug.print("SUPERSESSION BYTE CAP candidates=64 max_bytes=262144 kept=2 output_bytes={d} allocated_bytes={d} discarded_page_buffers=0\n", .{ bytes, bytes });
+}
+
+test "memory performance identity rebuild discovers each canonical group once across dependency pages" {
+    const Counts = struct {
+        groups: usize = 0,
+        dependencies: usize = 0,
+        fn scan(ptr: *anyopaque, _: A, prefix: []const u8, _: ?[]const u8, _: u32) !Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.startsWith(u8, prefix, "group/")) self.groups += 1;
+            if (std.mem.startsWith(u8, prefix, "dependency/identity/")) self.dependencies += 1;
+            return .{ .rows = &.{} };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var counts: Counts = .{};
+    var run = performanceTestRun(a);
+    run.service.backend.ptr = &counts;
+    run.service.backend.scan = Counts.scan;
+    try run.put("entity-policy", EntityPolicy{ .redirects = &.{.{ .key = "alias", .target = "subject" }}, .state = .{ .suppress = .{ .keys = &.{"subject"} } } });
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    try names.put(a, "alias", {});
+    try names.put(a, "subject", {});
+    for (0..206) |i| {
+        const id = try std.fmt.allocPrint(a, "claim-{d}", .{i});
+        var record: t.StoredAssertion = .{ .assertion = .{ .id = id, .subject = if (i % 2 == 0) "alias" else "subject", .predicate = "fact", .value = "value", .statement = "Claim", .evidence = &.{}, .visibility = .team }, .owner = if (i % 2 == 0) "alice" else "bob", .recorded_from = 1, .revision = 1, .config_generation = 1 };
+        switch (i) {
+            200 => record.assertion.scope = "other-scope",
+            201 => record.assertion.environment = "other-environment",
+            202 => record.assertion.task = "other-task",
+            203, 204 => record.assertion.visibility = .private,
+            205 => record.assertion.predicate = "other-predicate",
+            else => {},
+        }
+        try run.put(try key(a, "assertion", id), record);
+        try run.put(try groupKey(a, record.assertion, record.owner), .{ .id = id });
+        // Both dependency lists mention every claim, as happens when an
+        // identity is used as both a subject and an object during curation.
+        for ([_][]const u8{ "alias", "subject" }) |name| try run.put(try dependencyKey(a, "identity", name, id), .{ .child = id });
+    }
+    const affected = try run.collectIdentityGroups(&names);
+    try std.testing.expectEqual(@as(usize, 206), affected.count());
+    try std.testing.expectEqual(@as(usize, 4), counts.dependencies);
+    try std.testing.expectEqual(@as(usize, 14), counts.groups); // Seven groups × two raw identities.
+    std.debug.print("IDENTITY GROUP DISCOVERY dependencies=412 groups=7 raw_group_scans={d} retained_claims={d}\n", .{ counts.groups, affected.count() });
 }

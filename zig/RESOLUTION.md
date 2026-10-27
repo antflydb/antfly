@@ -2700,3 +2700,29 @@ version 59. The shared snapshot registry retains document job bodies, owner quot
 counts and due-order scheduling entries together. A replay/snapshot-install test
 checks that a queued job remains discoverable and counts against its owner after
 restoration, without leaking into another metadata group.
+
+Distinct discovery no longer builds a namespace-wide map of native override
+routes. The durable native `pin-count` postings already identify every point
+where a pin-bearing native path can enter a configured profile path. An ordered
+intersection with that profile's native query-node index produces precisely the
+boundaries worth canonicalizing. The same join handles alternating configured
+and native edges, removed configured aliases and native-only pin branches.
+Ordinary native overrides with zero pin weight do not participate.
+
+An optional immutable projection maps effective roots to those pin-bearing
+boundaries. Its identity includes the immutable profile and native graph
+fingerprint; redirect, removed-alias and distinct edits fence it immediately,
+while text-only edits can reuse it. A bounded, separately owned path memo keeps
+converging paths shared without retaining per-posting cursor scratch. Cache
+admission failure executes the identical sparse-index join in reusable scratch,
+retaining only matching boundaries in the request. Work on a cold or uncached
+projection follows sparse pin postings and their forward paths, rather than all
+native overrides or all profile aliases. A large number of pin-bearing boundaries
+can still require a correspondingly large join; cache capacity affects latency,
+not the result or unselected-row retention.
+
+The 10,000-override regression checks cold, warm, uncached and changed-graph
+execution with an actual incident distinct pair. An independent full-composition
+reference checks 1,024 seed queries over randomized acyclic graphs, including
+alternating native/configured paths and removed aliases. No durable key or wire
+change is required: both routed and embedded adapters use this shared reader.
