@@ -1133,6 +1133,7 @@ const LocalStandaloneMetadata = struct {
                 .supports_query_definitions = true,
                 .supports_sql_views = durable,
                 .supports_sql_sequences = durable,
+                .supports_sql_routines = durable,
                 .supports_resolver_catalog_read = true,
                 .supports_resolver_authority = true,
                 .supports_object_tables = true,
@@ -2974,6 +2975,26 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            .sql_snapshot_cohort => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlSnapshotCohort(alloc, group_ids.main_metadata_group_id, request.database);
+            },
+            .sql_column_sequence_handoffs => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.prepareColumnSequenceHandoffs(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .query_population_prepare => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                _ = try self.ensureNativeOwnerBindingLocked();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                const protocol = @import("../metadata/topology_protocol.zig");
+                const required = if (request.expected_view != null) protocol.sql_materialized_refresh_version else if (request.materialized_view) protocol.sql_materialized_view_version else protocol.sql_population_version;
+                const activation = (try store.topologyActivation(group_ids.main_metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
+                if (activation.version < required) return error.TableTopologyProtocolUpgradeRequired;
+                return store.prepareRelationCreateJsonWithContext(alloc, group_ids.main_metadata_group_id, request, .query_population, context);
+            },
             .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate, .relational_index_begin => unreachable,
             .relational_index_status => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -3691,6 +3712,36 @@ const LocalStandaloneMetadata = struct {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                 return std.json.Stringify.valueAlloc(alloc, try store.sqlSequenceAdmissionHead(group_ids.main_metadata_group_id), .{});
+            },
+            .sql_routine_snapshot => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlRoutineSnapshot(alloc, group_ids.main_metadata_group_id, request, context);
+            },
+            .sql_routine_outcome => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlRoutineOutcome(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .sql_routine_mutate => |request| {
+                const routines = @import("../system_catalog/routines.zig");
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const command = routines.command(request);
+                const preview = store.prepareSystemCatalogResult(alloc, group_ids.main_metadata_group_id, command) catch |err| {
+                    const rejected = routines.Outcome.fromError(err) orelse return err;
+                    return std.json.Stringify.valueAlloc(alloc, rejected, .{});
+                };
+                alloc.free(preview);
+                const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_system_catalog = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+                self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                return store.sqlRoutineOutcome(alloc, group_ids.main_metadata_group_id, try routines.observation(alloc, request)) catch error.MetadataMutationOutcomeUnknown;
             },
             .sql_sequence_snapshot => |request| {
                 if (!context.setting_admin) return error.Forbidden;

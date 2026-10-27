@@ -3543,6 +3543,56 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-routine-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-routine-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-routine-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-routine-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-routine-kernel-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL routine",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-routine-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_routine_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_routine_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -9897,43 +9947,219 @@
     },
     {
       "id": "sql-0397",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged SQL-language declaration publishes a typed overload in the native catalog and executes its positional/named scalar body through the shared VM. The mounted PostgreSQL witness checks exact command tags, result domains, complete values and SQL NULLs; native/public tests cover replacement guards, overloads, UPDATE, existing row filters, read-only lost-ACK recovery and cold owners. No synthetic relation or row-loop catalog callback is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL routine original declarations retain typed signatures names bodies and volatility",
+          "gate": "sql-routine-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0398",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged SQL-language declaration publishes a typed overload in the native catalog and executes its positional/named scalar body through the shared VM. The mounted PostgreSQL witness checks exact command tags, result domains, complete values and SQL NULLs; native/public tests cover replacement guards, overloads, UPDATE, existing row filters, read-only lost-ACK recovery and cold owners. No synthetic relation or row-loop catalog callback is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL routine original declarations retain typed signatures names bodies and volatility",
+          "gate": "sql-routine-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0399",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged SQL-language declaration publishes a typed overload in the native catalog and executes its positional/named scalar body through the shared VM. The mounted PostgreSQL witness checks exact command tags, result domains, complete values and SQL NULLs; native/public tests cover replacement guards, overloads, UPDATE, existing row filters, read-only lost-ACK recovery and cold owners. No synthetic relation or row-loop catalog callback is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL routine original declarations retain typed signatures names bodies and volatility",
+          "gate": "sql-routine-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0400",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged SQL-language declaration publishes a typed overload in the native catalog and executes its positional/named scalar body through the shared VM. The mounted PostgreSQL witness checks exact command tags, result domains, complete values and SQL NULLs; native/public tests cover replacement guards, overloads, UPDATE, existing row filters, read-only lost-ACK recovery and cold owners. No synthetic relation or row-loop catalog callback is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL routine original declarations retain typed signatures names bodies and volatility",
+          "gate": "sql-routine-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0401",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged SQL-language declaration publishes a typed overload in the native catalog and executes its positional/named scalar body through the shared VM. The mounted PostgreSQL witness checks exact command tags, result domains, complete values and SQL NULLs; native/public tests cover replacement guards, overloads, UPDATE, existing row filters, read-only lost-ACK recovery and cold owners. No synthetic relation or row-loop catalog callback is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL routine original declarations retain typed signatures names bodies and volatility",
+          "gate": "sql-routine-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0402",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged SQL-language declaration publishes a typed overload in the native catalog and executes its positional/named scalar body through the shared VM. The mounted PostgreSQL witness checks exact command tags, result domains, complete values and SQL NULLs; native/public tests cover replacement guards, overloads, UPDATE, existing row filters, read-only lost-ACK recovery and cold owners. No synthetic relation or row-loop catalog callback is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL routine original declarations retain typed signatures names bodies and volatility",
+          "gate": "sql-routine-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0403",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original references arg1 despite declaring an unnamed numeric argument. Independent PostgreSQL and mounted native SQL reject it with 42703 before publication; calls remain undefined before and after cold restart. This closes the original invalid-body contract, not activation of an invented argument alias or working shift_amount function.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL routine original declarations retain typed signatures names bodies and volatility",
+          "gate": "sql-routine-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0404",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged SQL-language declaration publishes a typed overload in the native catalog and executes its positional/named scalar body through the shared VM. The mounted PostgreSQL witness checks exact command tags, result domains, complete values and SQL NULLs; native/public tests cover replacement guards, overloads, UPDATE, existing row filters, read-only lost-ACK recovery and cold owners. No synthetic relation or row-loop catalog callback is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL routine original declarations retain typed signatures names bodies and volatility",
+          "gate": "sql-routine-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+          "gate": "sql-routine-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0405",

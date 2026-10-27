@@ -29,7 +29,7 @@ const A = std.mem.Allocator;
 
 const namespaceUsage = @import("sql_catalog_auth.zig").namespaceUsage;
 
-fn owner(identity: ?http.AuthenticatedIdentity, auth_enabled: bool) !definitions.Owner {
+pub fn currentOwner(identity: ?http.AuthenticatedIdentity, auth_enabled: bool) !definitions.Owner {
     const actor = identity orelse return if (auth_enabled) error.Forbidden else .auth_disabled;
     if (actor.is_internal_service) return error.RowPolicyAuthenticationRequired;
     const manager = actor.live_user_manager orelse return error.RowPolicyAuthenticationRequired;
@@ -126,7 +126,7 @@ pub fn preparePopulation(server: *http.ApiHttpServer, identity: ?http.Authentica
         settings = try sources.sql_setting_catalog.View.capture(a, capture.owner, capture.scope, capture.overlay);
         try settings.?.pinSqlUser(capture.sql_user);
     }
-    return definitions.preparePopulation(a, .{ .ptr = &loader, .resolve = Loader.resolve, .checkpoint = Loader.checkpoint }, intent, .{ .owner = try owner(identity, server.cfg.auth_enabled), .settings = if (settings) |*value| value else null });
+    return definitions.preparePopulation(a, .{ .ptr = &loader, .resolve = Loader.resolve, .checkpoint = Loader.checkpoint }, intent, .{ .owner = try currentOwner(identity, server.cfg.auth_enabled), .settings = if (settings) |*value| value else null });
 }
 
 pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: ast.CatalogDdl, path: ?*const Path) !catalog.DdlOutcome {
@@ -178,7 +178,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
                 settings = try sources.sql_setting_catalog.View.capture(a, capture.owner, capture.scope, capture.overlay);
                 try settings.?.pinSqlUser(capture.sql_user);
             }
-            var definition = try definitions.prepareDdl(a, .{ .ptr = &loader, .resolve = Loader.resolve, .checkpoint = Loader.checkpoint }, ddl, .{ .owner = try owner(identity, server.cfg.auth_enabled), .settings = if (settings) |*value| value else null });
+            var definition = try definitions.prepareDdl(a, .{ .ptr = &loader, .resolve = Loader.resolve, .checkpoint = Loader.checkpoint }, ddl, .{ .owner = try currentOwner(identity, server.cfg.auth_enabled), .settings = if (settings) |*value| value else null });
             defer definition.deinit();
             // The command owner borrows definition until serialization below.
             // Its owned JSON survives the preparation's arena teardown.

@@ -12,7 +12,8 @@ Original plan fingerprints, endpoint behavior, authorization, diagnostics and
 deliberate rejections must be distinguished. Blocking dispositions describe
 missing case-by-case evidence, not missing implementations.
 
-The SQL design is in [SQL extraction](extraction.md); regex qualification is in
+The SQL design is in [SQL extraction](extraction.md); native callable ownership
+and recovery are in [SQL routines](routines.md). Regex qualification is in
 [the regex parity design](regex-parity.md). Batch-by-batch campaign narratives,
 per-case evidence prose and component measurements are in
 [history](history/parity-inventory-batches.md).

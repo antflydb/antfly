@@ -60,6 +60,18 @@ pub const Rejection = enum {
     SequenceGeneratorLimitExceeded,
     SequenceValueOutOfRange,
     CatalogGenerationExhausted,
+    SqlDuplicateFunction,
+    SqlFunctionReturnTypeChanged,
+    SqlUndefinedFunction,
+    SqlInvalidFunctionDefinition,
+    SqlUndefinedParameter,
+    SqlProgramLimitExceeded,
+    InvalidSqlSyntax,
+    UnsupportedSqlShape,
+    UnknownColumn,
+    SqlTypeMismatch,
+    SqlAssignmentTypeMismatch,
+    CatalogRevisionExhausted,
 };
 pub const Outcome = union(enum) {
     success: Result,

@@ -86,6 +86,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&sql_column_identity_run.step);
     b.step("antfly-metadata-sql-view-catalog-test", "Verify view record identity, replacement and source binding contracts alongside durable source attributes")
         .dependOn(&sql_column_identity_run.step);
+    const sql_routine_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "SQL routine catalog", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_routine_run = addFilteredTestRunArtifact(b, sql_routine_tests);
+    sql_routine_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sql-routine-test", "Verify callable overloads, native publication and bounded catalog outcome recovery").dependOn(&sql_routine_run.step);
     const online_merge_driver_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "metadata.online_merge_driver.", "metadata module compiles" },

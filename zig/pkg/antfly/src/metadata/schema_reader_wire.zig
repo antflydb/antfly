@@ -17,6 +17,10 @@
 //! FK and restore envelopes. Schema/row strings are validated but never copied.
 const std = @import("std");
 
+pub fn requiresSqlRoutine(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_routine");
+}
+
 pub fn requiresMaterializedRefresh(bytes: []const u8) bool {
     return requiresMarker(bytes, "refresh_identity");
 }
@@ -300,4 +304,9 @@ test "relational integrity restore staging refresh decoder marker ignores source
         try std.testing.expect(!requiresMaterializedRefresh(bytes));
     for ([_][]const u8{ "{\"materialized_view\":{\"refresh_identity\":{}}}", "{\"refresh_ident\\u0069ty\":{}}", "{" }) |bytes|
         try std.testing.expect(requiresMaterializedRefresh(bytes));
+}
+
+test "SQL routine catalog decoder marker ignores quoted bodies and requires explicit callable publication" {
+    for ([_][]const u8{ "{}", "{\"source_json\":\"sql_routine\"}", "{\"sql_routine\":null}" }) |bytes| try std.testing.expect(!requiresSqlRoutine(bytes));
+    for ([_][]const u8{ "{\"sql_routine\":{}}", "{\"sql_rout\\u0069ne\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlRoutine(bytes));
 }

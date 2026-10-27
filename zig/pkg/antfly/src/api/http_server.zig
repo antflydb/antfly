@@ -2027,6 +2027,7 @@ pub const StatusSource = struct {
         /// Requires complete native admission AND portable allocator-state
         /// transport. Kept false by production constructors until qualified.
         supports_sql_sequences: bool = false,
+        supports_sql_routines: bool = false,
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
         supports_resolver_catalog_read: bool = false,
@@ -2794,6 +2795,7 @@ pub const StatusSource = struct {
             .supports_query_definitions = true,
             .supports_sql_views = true,
             .supports_sql_sequences = true,
+            .supports_sql_routines = true,
             .supports_object_tables = true,
             .supports_resolver_catalog_read = true,
             .supports_resolver_authority = true,
@@ -28567,6 +28569,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         if (route.kind == .table and route.name == null and isReadMethod(method)) return null;
         const resource_type: usermgr.ResourceType = switch (route.kind) {
             .query_source, .view, .sequence => .table,
+            .routine => .namespace,
             .database => .database,
             .namespace => .namespace,
             .table => .table,

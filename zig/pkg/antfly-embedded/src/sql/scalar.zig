@@ -340,6 +340,7 @@ pub fn assignmentSourceIdentity(kind: ast.ColumnType, element: ?arrays.ElementTy
     };
 }
 pub const BindLimits = struct {
+    routines: ?@import("routine_bindings.zig").Resolver = null,
     nodes: usize = 8192,
     depth: usize = 64,
     parameters: usize = 1024,
@@ -506,9 +507,10 @@ pub const Function = enum {
     setval,
     date_bin,
     @"$current_date",
+    @"$routine",
     pub fn volatility(self: Function) Volatility {
         return switch (self) {
-            .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid, .uuidv7, .nextval, .currval, .lastval, .setval => .@"volatile",
+            .@"$routine", .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid, .uuidv7, .nextval, .currval, .lastval, .setval => .@"volatile",
             .now, .transaction_timestamp, .@"$current_timestamp", .@"$current_date", .@"$current_user", .current_setting, .date_part, .extract, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
             else => .immutable,
         };
@@ -872,6 +874,45 @@ fn regexFunction(function: Function) ?regex_functions.Function {
     };
 }
 
+pub const FunctionCall = struct {
+    function: Function,
+    args: []const u32,
+    setting_identity: ?setting_catalog.Identity = null,
+    routine: ?*const @import("routine_bindings.zig").Resolved = null,
+    const Symbol = struct { id: u64, generation: u32 };
+    const Wire = struct {
+        function: Function,
+        args: []const u32,
+        setting_identity: ?setting_catalog.Identity = null,
+        routine: ?Symbol = null,
+        pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+            return std.mem.eql(u8, field, "routine") and self.routine == null;
+        }
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            if (self.routine == null) return writer.write(.{ .function = self.function, .args = self.args, .setting_identity = self.setting_identity });
+            return writer.write(.{ .function = self.function, .args = self.args, .setting_identity = self.setting_identity, .routine = self.routine });
+        }
+    };
+    pub fn nativeJsonProjection(self: @This()) Wire {
+        return .{ .function = self.function, .args = self.args, .setting_identity = self.setting_identity, .routine = if (self.routine) |value| .{ .id = value.id, .generation = value.generation } else null };
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        return writer.write(self.nativeJsonProjection());
+    }
+    pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!@This() {
+        const wire = try std.json.innerParse(Wire, a, source, options);
+        // Symbolic call graphs require a catalog-owned binding directory.
+        // Ordinary native schema programs cannot deserialize process pointers.
+        if (wire.routine != null or wire.function == .@"$routine") return error.UnexpectedToken;
+        return .{ .function = wire.function, .args = wire.args, .setting_identity = wire.setting_identity };
+    }
+    pub fn jsonParseFromValue(a: Allocator, value: Json, options: std.json.ParseOptions) std.json.ParseFromValueError!@This() {
+        const wire = try std.json.innerParseFromValue(Wire, a, value, options);
+        if (wire.routine != null or wire.function == .@"$routine") return error.UnexpectedToken;
+        return .{ .function = wire.function, .args = wire.args, .setting_identity = wire.setting_identity };
+    }
+};
+
 pub const Instruction = struct {
     type: Type,
     input_function: bool = false,
@@ -881,7 +922,7 @@ pub const Instruction = struct {
         parameter: u32,
         unary: struct { op: ast.Scalar.Unary, operand: u32 },
         binary: struct { op: ast.Scalar.Binary, left: u32, right: u32 },
-        call: struct { function: Function, args: []const u32, setting_identity: ?setting_catalog.Identity = null },
+        call: FunctionCall,
         cast: struct { operand: u32, type: ast.ColumnType, temporal_kind: ?@import("temporal_value.zig").Kind = null, element_type: ?arrays.ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null },
         case_when: struct { branches: []const Branch, otherwise: ?u32 },
         in_list: struct { operand: u32, values: []const u32, negated: bool },
@@ -1232,7 +1273,7 @@ pub fn inferOutput(alloc: Allocator, expression: *const ast.Scalar, columns: []c
 pub fn inferOutputWithInvocation(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameters: []const ?ast.ColumnType, invocation: ?*@import("parameter_binding.zig").Invocation) !Type {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = .{}, .allow_unresolved = true, .typed_parameters = invocation != null };
+    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = .{ .invocation = invocation }, .allow_unresolved = true, .typed_parameters = invocation != null };
     if (parameters.len > binder.parameters.len) return error.SqlProgramLimitExceeded;
     for (parameters, binder.parameters[0..parameters.len]) |kind, *descriptor| descriptor.* = .{ .kind = kind };
     if (invocation) |owner| {
@@ -2936,6 +2977,7 @@ fn arity(function: Function, count: usize) !void {
         return;
     }
     const valid = switch (function) {
+        .@"$routine" => false,
         .numrange, .daterange, .tsrange, .tstzrange, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => unreachable,
         .lastval => count == 0,
         .nextval, .currval => count == 1,
@@ -3184,7 +3226,9 @@ const Binder = struct {
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);
                     break :blk .{ .kind = .integer, .nullable = false };
                 }
-                const function = try functionId(call.name);
+                const function = functionId(call.name) catch {
+                    break :blk (try self.resolveRoutine(call.name, call.args, depth + 1)).output;
+                };
                 try arity(function, call.args.len);
                 if (@import("sequence_effects.zig").function(@tagName(function)) != null) {
                     for (call.args, 0..) |arg, ordinal| {
@@ -3668,6 +3712,23 @@ const Binder = struct {
         return self.compileArrayContext(expression, expected, null, depth);
     }
 
+    fn resolveRoutine(self: *Binder, name: []const u8, args: []const *const ast.Scalar, depth: usize) !*const @import("routine_bindings.zig").Resolved {
+        const routines = @import("routine_bindings.zig");
+        const resolver = self.limits.routines orelse (if (self.limits.invocation) |invocation| invocation.routine_resolver else null) orelse return error.UnsupportedSqlShape;
+        if (args.len > routines.max_arguments or depth > self.limits.depth) return error.SqlProgramLimitExceeded;
+        var inputs: [routines.max_arguments]routines.Argument = undefined;
+        for (args, inputs[0..args.len]) |arg, *input| {
+            input.* = .{ .type = try self.infer(arg, depth + 1), .unknown_literal = arg.* == .literal and (arg.literal == .string or arg.literal == .null) };
+            // PostgreSQL gives unsuffixed integer constants the narrowest int4
+            // or int8 domain that holds their value. Rows retain their declared
+            // domain; only an actual literal participates in this defaulting.
+            if (arg.* == .literal and arg.literal == .integer) input.type.element_type = if (std.math.cast(i32, arg.literal.integer) != null) .int32 else .int64;
+        }
+        const bound = try resolver.resolve(resolver.ptr, self.alloc, name, inputs[0..args.len]);
+        if (bound.id == 0 or bound.generation == 0 or bound.arguments.len != args.len or bound.output.kind == null) return error.InvalidSqlProgram;
+        return bound;
+    }
+
     fn arrayChildren(self: *const Binder, args: []const *const ast.Scalar) bool {
         for (args) |arg| if (self.inferred.get(arg)) |kind| {
             if (kind.kind == .array) return true;
@@ -3852,7 +3913,16 @@ const Binder = struct {
                     self.parameter_count = validator.parameter_count;
                     break :blk .{ .literal = .{ .integer = 1 } };
                 }
-                const function = try functionId(call.name);
+                const function = functionId(call.name) catch {
+                    const routine = try self.resolveRoutine(call.name, call.args, depth + 1);
+                    const args = try self.alloc.alloc(u32, call.args.len);
+                    for (call.args, args, routine.arguments) |arg, *out, target| {
+                        const cast = try self.alloc.create(ast.Scalar);
+                        cast.* = .{ .cast = .{ .operand = arg, .type = target.kind orelse return error.InvalidSqlProgram, .element_type = target.element_type, .temporal_kind = target.temporal_kind, .coercion = .function } };
+                        out.* = try self.compileTypedContext(cast, target.kind, target.element_type, target.temporal_kind, depth + 1);
+                    }
+                    break :blk .{ .call = .{ .function = .@"$routine", .args = args, .routine = routine } };
+                };
                 if (@import("sequence_effects.zig").function(@tagName(function)) != null) {
                     try arity(function, call.args.len);
                     const args = try self.alloc.alloc(u32, call.args.len);
@@ -4712,6 +4782,44 @@ const Evaluator = struct {
                 break :blk if (unknown) .{} else Datum.json(.{ .bool = list.negated });
             },
             .call => |call| blk: {
+                if (call.routine) |routine| {
+                    if (call.function != .@"$routine" or call.args.len > @import("routine_bindings.zig").max_arguments) return error.InvalidSqlProgram;
+                    if (routine.strict) for (call.args) |arg| if (self.literalNull(arg)) break :blk .{};
+                    var local_arguments: [8]Datum = undefined;
+                    const arguments = if (call.args.len <= local_arguments.len) local_arguments[0..call.args.len] else wide: {
+                        try self.charge(call.args.len * @sizeOf(Datum));
+                        break :wide try self.alloc.alloc(Datum, call.args.len);
+                    };
+                    defer if (call.args.len > local_arguments.len) self.alloc.free(arguments);
+                    var null_argument = false;
+                    for (call.args, arguments) |arg, *value| {
+                        value.* = try self.runDatum(arg, depth + 1);
+                        null_argument = null_argument or value.sql_null;
+                    }
+                    if (routine.strict and null_argument) break :blk .{};
+                    var callee = self.*;
+                    callee.program = routine.program;
+                    callee.cells = arguments;
+                    callee.parameters = &.{};
+                    callee.typed_parameters = arguments;
+                    callee.folded_values = null;
+                    callee.parameter_lookup = .{};
+                    callee.limits.effect_work = self.workOwner();
+                    callee.work_owner = null;
+                    // The complete scalar invocation is cached at this caller's
+                    // instruction identity. Child instruction ordinals must not
+                    // alias another program's suspended-effect cache.
+                    callee.limits.volatile_values = null;
+                    callee.limits.sequence_values = null;
+                    callee.limits.decision_values = null;
+                    defer {
+                        self.bytes = callee.bytes;
+                        self.input_bytes = callee.input_bytes;
+                        self.pattern_steps = callee.pattern_steps;
+                    }
+                    break :blk try callee.runDatum(routine.program.root, depth + 1);
+                }
+                if (call.function == .@"$routine") return error.InvalidSqlProgram;
                 if (@import("sequence_effects.zig").function(@tagName(call.function))) |sequence_function| {
                     if (self.limits.sequence_values) |values| if (values[index]) |value| break :blk value;
                     // PostgreSQL simplifies strict calls with a constant NULL
@@ -9250,4 +9358,38 @@ test "SQL mutation temporal frames preserve every precise parameter identity" {
     var explicit = try Frame.prepare(a, &.{.{ .kind = .datetime, .temporal_kind = .timestamp_tz }}, &.{.sql_null}, .{});
     defer explicit.deinit();
     _ = try legacy.bindParameters(&explicit);
+}
+
+test "SQL routine bound calls evaluate arguments once share work budgets and avoid row catalog callbacks" {
+    const a = std.testing.allocator;
+    var body = try @import("compiler.zig").compileScalar(a, "$1 = $1", .{});
+    defer body.deinit();
+    var program = try bindTypedExpectedWithSettings(a, body.expression, &.{}, &.{.{ .kind = .uuid, .element_type = .uuid }}, .{ .kind = .boolean }, .{}, null);
+    defer program.deinit();
+    var routine: @import("routine_bindings.zig").Resolved = .{ .id = 7, .generation = 1, .arguments = &.{.{ .kind = .uuid, .element_type = .uuid }}, .output = .{ .kind = .boolean, .element_type = .boolean }, .program = &program };
+    const Owner = struct {
+        routine: *@import("routine_bindings.zig").Resolved,
+        lookups: usize = 0,
+        fn resolve(raw: *anyopaque, _: Allocator, name: []const u8, args: []const @import("routine_bindings.zig").Argument) !*const @import("routine_bindings.zig").Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.lookups += 1;
+            if (!std.mem.eql(u8, name, "same_id") or args.len != 1 or args[0].type.kind != .uuid) return error.SqlUndefinedFunction;
+            return self.routine;
+        }
+    };
+    var owner: Owner = .{ .routine = &routine };
+    var call = try @import("compiler.zig").compileScalar(a, "same_id(gen_random_uuid())", .{});
+    defer call.deinit();
+    var caller = try bind(a, call.expression, &.{}, &.{}, .{ .routines = .{ .ptr = &owner, .resolve = Owner.resolve } });
+    defer caller.deinit();
+    const prepared_lookups = owner.lookups;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    for (0..64) |_| {
+        const result = try caller.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = std.testing.io });
+        try std.testing.expect(result.value.bool);
+    }
+    try std.testing.expectEqual(prepared_lookups, owner.lookups);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, caller.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = std.testing.io, .steps = 1 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, caller.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = std.testing.io, .depth = 1 }));
 }

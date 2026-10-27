@@ -942,6 +942,12 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     if (input == .populate) return @import("sql_population.zig").execute(server, identity, context, database, namespace, allocators, input.populate, path);
     const alloc = allocators.result;
     try context.ensureActive();
+    if (input == .catalog_ddl and input.catalog_ddl.kind == .function) {
+        var actor = identity;
+        var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &actor, .context = context, .database = database, .namespace = namespace, .ddl_search_path = path };
+        defer adapter.releaseExecutionOwners();
+        return @import("sql_routine_ddl.zig").execute(&adapter, allocators, input.catalog_ddl);
+    }
     if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .sequence)
         return @import("sql_sequence_ddl.zig").execute(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
@@ -965,7 +971,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     try target.validate();
     const kind: domain.Kind = switch (input) {
         .catalog_ddl => |ddl| switch (ddl.kind) {
-            .index, .view, .role, .sequence => unreachable,
+            .index, .view, .role, .sequence, .function => unreachable,
             inline else => |tag| @field(domain.Kind, @tagName(tag)),
         },
         .policy_ddl, .populate => unreachable,
@@ -977,6 +983,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     // Check logical scope before any catalog lookup, including IF EXISTS.
     const permission_kind: @import("../usermgr/mod.zig").ResourceType = switch (kind) {
         .query_source, .view, .sequence => .table,
+        .routine => .namespace,
         inline else => |tag| @field(@import("../usermgr/mod.zig").ResourceType, @tagName(tag)),
     };
     const table_path_mutation = kind == .table and path != null and name.namespace == null and name.database == null and
@@ -1125,13 +1132,13 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .database => error.SqlDuplicateDatabase,
             .namespace => error.SqlDuplicateNamespace,
             .tablespace => error.SqlDuplicateTablespace,
-            .table, .query_source, .view, .sequence => err,
+            .table, .query_source, .view, .sequence, .routine => err,
         };
         if (err == error.CatalogNotFound) return switch (kind) {
             .database => error.DatabaseNotFound,
             .namespace => error.NamespaceNotFound,
             .tablespace => error.TablespaceNotFound,
-            .table, .query_source, .view, .sequence => err,
+            .table, .query_source, .view, .sequence, .routine => err,
         };
         return err;
     };

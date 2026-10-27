@@ -741,10 +741,10 @@ const Builder = struct {
     }
 
     fn inferType(self: *Builder, expression: *const ast.Scalar, expected: ?scalar.Type, assignment: bool) !bool {
-        if (self.typedExpected(expected)) return scalar.inferTypedParametersExpected(self.alloc, expression, self.columns, self.parameters, expected, .{ .assignment = assignment });
+        if (self.typedExpected(expected)) return scalar.inferTypedParametersExpected(self.alloc, expression, self.columns, self.parameters, expected, .{ .assignment = assignment, .invocation = self.invocation });
         var coarse: [1024]?ast.ColumnType = undefined;
         for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
-        const changed = try scalar.inferParameters(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment });
+        const changed = try scalar.inferParameters(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment, .invocation = self.invocation });
         for (self.parameters, coarse[0..self.parameters.len]) |*descriptor, kind| descriptor.* = .{ .kind = kind };
         return changed;
     }

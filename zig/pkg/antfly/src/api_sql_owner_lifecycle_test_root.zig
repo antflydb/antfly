@@ -52,6 +52,7 @@ test {
     _ = @import("api/sql_cursor_lifecycle_integration_test.zig");
     _ = @import("api/sql_copy_input_integration_test.zig");
     _ = @import("api/sql_view_domain_integration_test.zig");
+    _ = @import("api/sql_routine_lifecycle_integration_test.zig");
     _ = @import("api/sql_collection_integration_test.zig");
     _ = @import("system_catalog/views.zig");
     _ = @import("api/sql_document_mutation_lifecycle_integration_test.zig");

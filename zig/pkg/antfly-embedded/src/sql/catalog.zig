@@ -1324,6 +1324,8 @@ pub const PopulationPreparation = struct {
     release: *const fn (*anyopaque) void,
 };
 
+pub const routines = @import("routine_definition.zig");
+
 pub const Ddl = union(enum) {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         // Request-owned producer callbacks cannot become stored catalog data.
@@ -1371,7 +1373,7 @@ pub const DdlReceipt = struct {
 /// Native catalog operations have no physical table/schema receipt. Identity
 /// integers stay native here and stringify as exact decimal strings on wire.
 pub const CatalogOperationReceipt = struct {
-    pub const Kind = enum { sequence };
+    pub const Kind = enum { sequence, function };
     pub const Operation = enum { create, alter, rename, drop };
     pub const State = enum { committed, rejected, unknown };
     pub const Diagnostic = struct { code: []const u8, message: []const u8, retryable: bool };
@@ -1559,6 +1561,7 @@ pub const Backend = struct {
     supports_expression_access_hints: bool = false,
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
+    routine_resolver: ?@import("routine_bindings.zig").Resolver = null,
     sequence_resolver: ?@import("sequence_effects.zig").Resolver = null,
     sequence_provider: ?@import("sequence_effects.zig").Provider = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,

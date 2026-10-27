@@ -98,6 +98,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .view => "CREATE VIEW",
                 .role => "CREATE ROLE",
                 .sequence => "CREATE SEQUENCE",
+                .function => "CREATE FUNCTION",
                 .table => unreachable,
             },
             .drop => switch (ddl.kind) {
@@ -108,6 +109,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .view => if (ddl.materialized) "DROP MATERIALIZED VIEW" else "DROP VIEW",
                 .role => "DROP ROLE",
                 .sequence => "DROP SEQUENCE",
+                .function => "DROP FUNCTION",
                 .table => unreachable,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
@@ -119,6 +121,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .view => "ALTER VIEW",
                 .role => "ALTER ROLE",
                 .sequence => "ALTER SEQUENCE",
+                .function => "ALTER FUNCTION",
             },
         },
     }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt, .catalog_receipt = outcome.catalog_receipt };

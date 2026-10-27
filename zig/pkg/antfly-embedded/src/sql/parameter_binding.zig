@@ -25,6 +25,7 @@ const frames = @import("parameter_frame.zig");
 const A = std.mem.Allocator;
 
 pub const Invocation = struct {
+    routine_resolver: ?@import("routine_bindings.zig").Resolver = null,
     sequence_resolver: ?@import("sequence_effects.zig").Resolver = null,
     allocator: A,
     descriptors: []scalar.Type,
@@ -83,6 +84,7 @@ pub const Invocation = struct {
         if (self.phase != .binding) return error.InvalidSqlParameters;
         try self.mergeCoarse(coarse);
         var local_limits = limits;
+        local_limits.routines = local_limits.routines orelse self.routine_resolver;
         local_limits.invocation = null;
         const changed = try scalar.inferTypedParametersExpected(a, expression, columns, self.descriptors, expected, local_limits);
         for (coarse, self.descriptors[0..coarse.len]) |*kind, descriptor| kind.* = descriptor.kind;

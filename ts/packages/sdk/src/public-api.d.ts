@@ -7394,7 +7394,7 @@ export interface components {
          * @description Native catalog resource kind; never a synthetic physical table.
          * @enum {string}
          */
-        SQLCatalogObjectKind: "sequence";
+        SQLCatalogObjectKind: "sequence" | "function";
         /** @enum {string} */
         SQLCatalogOperationKind: "create" | "alter" | "rename" | "drop";
         /**

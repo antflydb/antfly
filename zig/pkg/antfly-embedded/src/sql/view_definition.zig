@@ -33,8 +33,8 @@ pub const max_columns = 1024;
 
 /// Populated by trusted identity admission, never by SQL text or a client
 /// definition payload. Names are display/lookup hints, not reusable authority.
-pub const Principal = struct { name: []const u8, instance_id: [16]u8 };
-pub const Owner = union(enum) { auth_disabled, user: Principal, role: Principal };
+pub const Principal = @import("../system_catalog/owners.zig").Principal;
+pub const Owner = @import("../system_catalog/owners.zig").Owner;
 pub const Security = enum { owner, invoker };
 pub const SourceKind = enum(u8) { table = 1, view = 2 };
 pub const Output = struct {

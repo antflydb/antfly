@@ -1,0 +1,84 @@
+# Native SQL routines
+
+Scalar SQL-language functions are catalog objects, separate from relation names.
+A function is identified by namespace, name and canonical input-type signature;
+the result type is not part of overload identity. CREATE allocates an immutable
+catalog ID. CREATE OR REPLACE retains that ID and owner and advances the
+function generation. Changing a result type or an existing argument name is
+rejected before publication. DROP resolves a particular signature and fences
+against its admitted ID and generation.
+
+The declaration parser retains typed positional/named inputs, result domain,
+SQL body, strictness and volatility. Unnamed inputs expose `$n`, never invented
+`arg1` names. PostgreSQL is the behavioral oracle, including declarations that
+must fail body analysis. Unknown literals participate in category/preferred-type
+overload resolution; typed values retain their input domains. Exact NUMERIC
+arguments and results do not pass through floating point.
+
+## Execution ownership
+
+A statement owner captures authorized namespace lookup and a catalog revision,
+uses covering signature entries to select an overload, and loads only the
+selected definition. The owner prepares immutable typed body programs and
+caches them by ID/generation. Repeated calls share those programs. Metadata
+reads, parsing and overload selection never occur in the row loop.
+
+The scalar VM evaluates actual arguments once and enters the body with an owned
+argument frame. The caller and callee share work, cancellation, depth and byte
+budgets. Small argument frames use stack storage. Strict calls preserve NULL
+semantics. A 10,000-row Debug regression executes an integer successor function
+with a zero-byte execution allocator and asserts no catalog callbacks after
+binding. This is an allocation/callback invariant, not a throughput claim.
+
+Prepared manifests retain function signature, ID, generation and cluster
+incarnation. Execution reauthorizes the captured namespace and verifies the
+manifest at a fresh statement cut. A search-path edit cannot retarget the call;
+a replaced definition or reused name requires a new binding.
+
+## Durable publication and recovery
+
+Distributed and standalone publication share the native catalog transaction and
+bounded catalog outcome journal already used by sequence DDL. A nonce binds the
+full declaration digest and immutable namespace/cluster identities. Native apply
+validates and prepares the body before writing catalog/index changes. Its
+preparation allocator is bounded. Deterministic definition failures are retained
+rejections; allocator/storage failures abort the transaction.
+
+Decoder floor 105 activates callable publication. Linked control reaches the
+same concrete native owner through catalog projection interfaces, preserving
+request deadlines and cancellation. Routine records have no physical table,
+placement or storage binding. Parent schema/database emptiness checks include
+routines, so parent deletion cannot orphan them. Cold reads validate canonical
+signatures through the ordinary catalog indexes.
+
+The producer reserves a recovery receipt before submitting a mutation. An
+ambiguous reply triggers read-only observation of that exact operation, never a
+second submission or inference from an object's current name. Versioned recovery
+tokens contain a compact scoped nonce/digest, not function bodies or authority.
+Native journal digests commit the observation scope as well as the full request
+hash, preventing a token's namespace/name from being edited independently. Every
+observation rechecks live namespace administration.
+
+## Qualification and remaining activation
+
+The mounted campaign executes original cases sql-0397 through sql-0404 unchanged
+against real HTTP, native metadata Raft and native data owners. It compares
+PostgreSQL command tags, result domains, complete row images, SQL NULL flags and
+negative SQLSTATEs. It covers replacement, overloads, UPDATE, row filters,
+unauthorized DROP, exact lost-ACK recovery, and cold owner restart. The independent
+PostgreSQL fixture is reproducible with `generate_sql_routine_reference.py`.
+
+This does not activate procedures, triggers, set-returning functions, multi-query
+or table-reading bodies, recursive/composed user routines, external effects in
+bodies, function-local settings, SECURITY DEFINER, or user-defined argument types.
+Those need catalog dependency/authority and retained execution contracts. Stored
+views and schema expressions still reject user-function calls before publication;
+DROP must not claim to manage dependencies that were never durably recorded.
+PARALLEL, COST and ROWS options remain explicitly unsupported until their catalog
+and planner semantics are retained. The original invalid `shift_amount(numeric)`
+body references an undeclared `arg1` and correctly fails with PostgreSQL's 42703;
+its rejection does not imply that a callable shift function exists.
+
+Further activation should extend this same catalog, VM and outcome path, with
+PostgreSQL differential witnesses and native fault tests. It must not introduce
+another routine interpreter, coordinator or receipt journal.

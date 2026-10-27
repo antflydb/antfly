@@ -36,6 +36,6 @@ pub const Broker = struct {
         return result;
     }
     pub fn deinit(self: *Broker) void {
-        if (self.initialized) self.adapter.releaseSequenceExecution();
+        if (self.initialized) self.adapter.releaseExecutionOwners();
     }
 };

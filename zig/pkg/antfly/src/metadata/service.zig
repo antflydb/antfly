@@ -3647,6 +3647,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlRoutine(command.apply_system_catalog)) return metadata_topology_protocol.sql_routine_version;
     const refresh = switch (command) {
         .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresMaterializedRefresh(bytes),
         .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresMaterializedRefresh(request.plan_json),
@@ -4160,6 +4161,10 @@ pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const 
         try ensureMaterializedViewCapabilityWithContext(service, context)
     else if (@import("schema_reader_wire.zig").requiresPopulation(bytes))
         try ensureQueryPopulationCapabilityWithContext(service, context);
+}
+
+pub fn ensureSqlRoutineCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_routine_version);
 }
 
 pub fn ensureMaterializedRefreshCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {

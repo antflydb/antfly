@@ -815,7 +815,7 @@ const OwnedRead = struct {
     fn close(raw: *anyopaque) void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
         detach(raw);
-        self.native_adapter.releaseSequenceExecution();
+        self.native_adapter.releaseExecutionOwners();
         self.identity.?.deinit(self.adapter.server.alloc);
         if (self.session_id) |id| self.adapter.server.alloc.free(id);
         self.arena.deinit();
@@ -1774,6 +1774,7 @@ fn viewBindings(a: std.mem.Allocator, guard: ?[]const u8) !?[]const @import("sql
     for (bindings) |binding| {
         if (binding.id == 0 or binding.database.len == 0 or binding.namespace.len == 0 or binding.name.len == 0) return error.CatalogGenerationChanged;
         if (binding.kind == .view and (binding.schema_version == 0 or binding.definition_digest == null)) return error.CatalogGenerationChanged;
+        if (binding.kind == .function and (binding.schema_version == 0 or binding.routine_incarnation == null or std.mem.allEqual(u8, &binding.routine_incarnation.?, 0) or binding.routine_signature == null)) return error.CatalogGenerationChanged;
         if (binding.kind == .sequence) {
             const identity: @import("antfly_local_sources").sql_sequence_session.Identity = .{ .id = binding.id, .incarnation = binding.sequence_incarnation orelse return error.CatalogGenerationChanged };
             identity.validate() catch return error.CatalogGenerationChanged;

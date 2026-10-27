@@ -16,6 +16,7 @@
 const std = @import("std");
 test {
     _ = @import("relation_population.zig");
+    _ = @import("routine_definition.zig");
 }
 const sql_parser = @import("sql_parser");
 const lexer = sql_parser.lexer;
@@ -245,7 +246,6 @@ test "SQL routine declaration admission consumes grammar before missing-body dia
     for ([_][]const u8{
         "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$",
         "CREATE FUNCTION f() RETURNS trigger LANGUAGE unknown_language",
-        "CREATE FUNCTION f(arg text) RETURNS text LANGUAGE sql AS $$SELECT arg$$",
         "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql SUPPORT missing_support",
     }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(a, sql, .{}));
 }
@@ -3303,18 +3303,65 @@ const Parser = struct {
     /// Definition admission is deliberately separate from routine activation.
     /// Validate the supported declaration grammar to its end before reporting
     /// a missing body. Never publish a definition or execute a valid prefix.
-    fn routineAdmission(self: *Parser, procedure: bool) Error!ast.Statement {
-        _ = try self.name();
+    fn routineDrop(self: *Parser) Error!ast.CatalogDdl {
+        const conditional = self.keyword(.@"if");
+        if (conditional) try self.expectKeyword(.exists);
+        const name_value = try self.name();
+        var signature: ?[]const ast.RoutineDefinition.Type = null;
+        if (self.take(.lparen)) {
+            var types: std.ArrayList(ast.RoutineDefinition.Type) = .empty;
+            if (!self.take(.rparen)) while (true) {
+                if (types.items.len >= 100) return self.fail(error.SqlLimitExceeded, "function signature exceeds argument limit");
+                const declared = try self.castType();
+                if (declared.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "function signature modifiers require declaration notices");
+                try types.append(self.alloc, .{ .kind = declared.type, .element_type = declared.element_type, .temporal_kind = declared.temporal_kind });
+                if (self.take(.rparen)) break;
+                try self.expect(.comma);
+            };
+            signature = try types.toOwnedSlice(self.alloc);
+        }
+        const cascade = self.ddlWord("CASCADE");
+        if (!cascade) _ = self.ddlWord("RESTRICT");
+        return .{ .kind = .function, .action = .drop, .name = name_value, .routine_signature = signature, .conditional = conditional, .cascade = cascade };
+    }
+
+    fn routineAdmission(self: *Parser, procedure: bool, replace: bool) Error!ast.Statement {
+        const name_value = try self.name();
         try self.expect(.lparen);
-        // Parameterized routine activation requires catalog-bound signatures.
-        // Do not guess type resolution from the spelling of an argument.
-        if (!self.take(.rparen)) return self.fail(error.UnsupportedSqlShape, "catalog-bound routine signatures are not supported");
+        var arguments: std.ArrayList(ast.RoutineDefinition.Argument) = .empty;
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        if (!self.take(.rparen)) while (true) {
+            if (arguments.items.len >= 100) return self.fail(error.SqlLimitExceeded, "functions cannot have more than 100 arguments");
+            const start = self.pos;
+            const diagnostic = self.diagnostic.*;
+            var arg_name: ?[]const u8 = null;
+            const declared = self.castType() catch |err| named: {
+                if (err != error.UnsupportedSqlShape) return err;
+                self.pos = start;
+                self.diagnostic.* = diagnostic;
+                arg_name = try self.identifier();
+                break :named try self.castType();
+            };
+            if (declared.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "routine type modifiers require declaration notices");
+            if (arg_name) |argument_name| if ((try names.getOrPut(self.alloc, argument_name)).found_existing) return self.fail(error.InvalidSqlSyntax, "duplicate function parameter name");
+            try arguments.append(self.alloc, .{ .name = arg_name, .type = .{ .kind = declared.type, .element_type = declared.element_type, .temporal_kind = declared.temporal_kind } });
+            if (self.take(.rparen)) break;
+            try self.expect(.comma);
+        };
+        var result: ?ast.RoutineDefinition.Type = null;
         if (!procedure) {
             if (!self.ddlWord("RETURNS")) return self.fail(error.InvalidSqlSyntax, "a function requires RETURNS");
-            if (!self.ddlWord("TRIGGER") and !self.ddlWord("VOID")) return self.fail(error.UnsupportedSqlShape, "catalog-bound routine return types are not supported");
+            if (!self.ddlWord("TRIGGER") and !self.ddlWord("VOID")) {
+                const declared = try self.castType();
+                if (declared.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "routine type modifiers require declaration notices");
+                result = .{ .kind = declared.type, .element_type = declared.element_type, .temporal_kind = declared.temporal_kind };
+            }
         }
         var language: ?[]const u8 = null;
-        var body = false;
+        var body: ?[]const u8 = null;
+        var strict = false;
+        var volatility: @FieldType(ast.RoutineDefinition, "volatility") = .@"volatile";
+        var supported = !procedure and result != null;
         var seen: u16 = 0;
         while (self.pos < self.tokens.len and !self.peek(.semicolon)) {
             var option: u4 = undefined;
@@ -3323,19 +3370,28 @@ const Parser = struct {
                 language = try self.identifier();
             } else if (self.ddlWord("AS")) {
                 option = 1;
-                try self.expect(.string);
-                if (self.take(.comma)) try self.expect(.string);
-                body = true;
+                if (!self.peek(.string)) return self.fail(error.InvalidSqlSyntax, "AS requires a function body");
+                body = self.tokens[self.pos].text;
+                self.pos += 1;
+                if (self.take(.comma)) {
+                    try self.expect(.string);
+                    supported = false;
+                }
             } else if (self.ddlWord("IMMUTABLE") or self.ddlWord("STABLE") or self.ddlWord("VOLATILE")) {
                 option = 2;
+                const word = self.tokens[self.pos - 1].text;
+                volatility = if (std.ascii.eqlIgnoreCase(word, "IMMUTABLE")) .immutable else if (std.ascii.eqlIgnoreCase(word, "STABLE")) .stable else .@"volatile";
             } else if (self.ddlWord("EXTERNAL") or self.ddlWord("SECURITY")) {
                 option = 3;
                 if (std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "EXTERNAL")) {
                     if (!self.ddlWord("SECURITY")) return self.fail(error.InvalidSqlSyntax, "EXTERNAL requires SECURITY");
                 }
-                if (!self.ddlWord("DEFINER") and !self.ddlWord("INVOKER")) return self.fail(error.InvalidSqlSyntax, "SECURITY requires DEFINER or INVOKER");
+                if (self.ddlWord("DEFINER")) {
+                    supported = false;
+                } else if (!self.ddlWord("INVOKER")) return self.fail(error.InvalidSqlSyntax, "SECURITY requires DEFINER or INVOKER");
             } else if (self.ddlWord("STRICT") or self.ddlWord("CALLED") or self.ddlWord("RETURNS")) {
                 option = 4;
+                strict = !std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "CALLED");
                 if (std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "CALLED")) {
                     if (!self.ddlWord("ON")) return self.fail(error.InvalidSqlSyntax, "CALLED requires ON NULL INPUT");
                     if (!self.ddlWord("NULL") or !self.ddlWord("INPUT")) return self.fail(error.InvalidSqlSyntax, "CALLED requires ON NULL INPUT");
@@ -3343,26 +3399,32 @@ const Parser = struct {
                     if (!self.ddlWord("NULL") or !self.ddlWord("ON") or !self.ddlWord("NULL") or !self.ddlWord("INPUT")) return self.fail(error.InvalidSqlSyntax, "RETURNS requires NULL ON NULL INPUT");
                 }
             } else if (self.ddlWord("PARALLEL")) {
+                supported = false;
                 option = 5;
                 if (!self.ddlWord("SAFE") and !self.ddlWord("RESTRICTED") and !self.ddlWord("UNSAFE")) return self.fail(error.InvalidSqlSyntax, "invalid PARALLEL option");
             } else if (self.ddlWord("COST") or self.ddlWord("ROWS")) {
+                supported = false;
                 option = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "COST")) 6 else 7;
                 try self.expect(.number);
             } else if (self.ddlWord("WINDOW")) {
                 option = 8;
+                supported = false;
             } else if (self.ddlWord("LEAKPROOF") or self.ddlWord("NOT")) {
                 option = 9;
+                supported = false;
                 if (self.tokens[self.pos - 1].isKeyword(.not) and !self.ddlWord("LEAKPROOF")) return self.fail(error.InvalidSqlSyntax, "NOT requires LEAKPROOF");
             } else if (self.ddlWord("SUPPORT")) {
                 return self.fail(error.UnsupportedSqlShape, "SUPPORT requires catalog-bound routine lookup");
             } else if (self.ddlWord("TRANSFORM")) {
                 option = 11;
+                supported = false;
                 while (true) {
                     if (!self.ddlWord("FOR") or !self.ddlWord("TYPE")) return self.fail(error.InvalidSqlSyntax, "each TRANSFORM entry requires FOR TYPE");
                     _ = try self.name();
                     if (!self.take(.comma)) break;
                 }
             } else if (self.ddlWord("SET")) {
+                supported = false;
                 _ = try self.name();
                 if (self.ddlWord("FROM")) {
                     if (!self.ddlWord("CURRENT")) return self.fail(error.InvalidSqlSyntax, "SET FROM requires CURRENT");
@@ -3384,9 +3446,11 @@ const Parser = struct {
         // Language lookup and validation must precede body validation. Only a
         // built-in supported language can produce this definitive diagnostic.
         if (language) |name_| if (std.mem.eql(u8, name_, "plpgsql") or std.mem.eql(u8, name_, "sql")) {
-            if (!body) return self.fail(error.SqlInvalidFunctionDefinition, "no function body specified");
+            if (body == null) return self.fail(error.SqlInvalidFunctionDefinition, "no function body specified");
         };
-        return self.fail(error.UnsupportedSqlShape, "routine catalog activation is not supported");
+        if (supported and language != null and std.mem.eql(u8, language.?, "sql") and body != null)
+            return .{ .catalog_ddl = .{ .kind = .function, .action = .create, .name = name_value, .routine = .{ .arguments = try arguments.toOwnedSlice(self.alloc), .result = result.?, .body = body.?, .replace = replace, .strict = strict, .volatility = volatility } } };
+        return self.fail(error.UnsupportedSqlShape, "routine language or execution options are not supported");
     }
 
     const UniqueColumnList = struct { columns: []const []const u8, without_overlaps_column: ?[]const u8 = null };
@@ -3932,13 +3996,13 @@ const Parser = struct {
                 if (!self.ddlWord("REPLACE")) return self.fail(error.InvalidSqlSyntax, "CREATE OR requires REPLACE");
                 if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.table) or self.tokens[self.pos].isKeyword(.materialized)))
                     return self.fail(error.InvalidSqlSyntax, "PostgreSQL does not permit CREATE OR REPLACE TABLE or MATERIALIZED VIEW");
-                if (self.ddlWord("FUNCTION")) return self.routineAdmission(false);
-                if (self.ddlWord("PROCEDURE")) return self.routineAdmission(true);
+                if (self.ddlWord("FUNCTION")) return self.routineAdmission(false, true);
+                if (self.ddlWord("PROCEDURE")) return self.routineAdmission(true, true);
                 if (!self.ddlWord("VIEW")) return self.fail(error.UnsupportedSqlShape, "this CREATE OR REPLACE object is not supported");
                 return .{ .catalog_ddl = try self.viewDdl(.create, true) };
             }
-            if (self.ddlWord("FUNCTION")) return self.routineAdmission(false);
-            if (self.ddlWord("PROCEDURE")) return self.routineAdmission(true);
+            if (self.ddlWord("FUNCTION")) return self.routineAdmission(false, false);
+            if (self.ddlWord("PROCEDURE")) return self.routineAdmission(true, false);
             if (self.ddlWord("SEQUENCE")) return .{ .catalog_ddl = try self.sequenceDdl(.create) };
             if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.create, false) };
             if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.create) };
@@ -3964,6 +4028,7 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("FUNCTION")) return .{ .catalog_ddl = try self.routineDrop() };
             if (self.keyword(.materialized)) {
                 if (!self.ddlWord("VIEW")) return self.fail(error.InvalidSqlSyntax, "MATERIALIZED requires VIEW");
                 var ddl = try self.viewDdl(.drop, false);
@@ -5477,4 +5542,32 @@ test "SQL relation population producer parsing isolates nested INTO and preserve
     var materialized = try compile(a, "CREATE MATERIALIZED VIEW dst(a,b) AS SELECT 1,2 WITH NO DATA", .{});
     defer materialized.deinit();
     try std.testing.expectEqualStrings("SELECT 1,2", materialized.statement.catalog_ddl.population.?.query_sql.?);
+}
+
+test "SQL routine original declarations retain typed signatures names bodies and volatility" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0397", "sql-0398", "sql-0399", "sql-0400", "sql-0401", "sql-0402", "sql-0403", "sql-0404" }) |id| {
+        const entry = try corpus.get(id);
+        var compiled = try compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(.function, compiled.statement.catalog_ddl.kind);
+        const definition = compiled.statement.catalog_ddl.routine.?;
+        try std.testing.expect(definition.arguments.len > 0);
+        try std.testing.expect(std.mem.startsWith(u8, definition.body, "SELECT "));
+        try std.testing.expectEqual(@as(u32, 0), compiled.parameter_count);
+        if (std.mem.eql(u8, id, "sql-0397")) try std.testing.expectEqual(.immutable, definition.volatility);
+        if (std.mem.eql(u8, id, "sql-0404")) try std.testing.expectEqualStrings("status_text", definition.arguments[0].name.?);
+        if (std.mem.eql(u8, id, "sql-0401")) {
+            try std.testing.expectEqual(@as(usize, 3), definition.arguments.len);
+            try std.testing.expectEqual(.numeric, definition.result.element_type.?);
+        }
+    }
+    var replacement = try compile(a, "CREATE OR REPLACE FUNCTION public.f(x bigint) RETURNS bigint LANGUAGE sql STRICT AS $$SELECT x+x$$", .{});
+    defer replacement.deinit();
+    const definition = replacement.statement.catalog_ddl.routine.?;
+    try std.testing.expect(definition.replace and definition.strict);
+    try std.testing.expectEqualStrings("public", replacement.statement.catalog_ddl.name.namespace.?);
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, "CREATE FUNCTION f(x bigint) RETURNS bigint LANGUAGE sql SECURITY DEFINER AS $$SELECT x$$", .{}));
 }

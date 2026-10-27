@@ -13371,10 +13371,12 @@ pub const SQLArrayValue = struct {
 /// Native catalog resource kind; never a synthetic physical table.
 pub const SQLCatalogObjectKind = enum {
     sequence,
+    function,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .sequence => "sequence",
+            .function => "function",
         };
         try jw.write(s);
     }
@@ -13386,6 +13388,7 @@ pub const SQLCatalogObjectKind = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "sequence", .sequence },
+            .{ "function", .function },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

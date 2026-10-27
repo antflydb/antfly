@@ -402,7 +402,7 @@ pub const RelationPopulation = struct {
 };
 
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index, view, role, sequence },
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -425,6 +425,24 @@ pub const CatalogDdl = struct {
     sequence_targets: []const Name = &.{},
     population: ?RelationPopulation = null,
     materialized: bool = false,
+    routine: ?RoutineDefinition = null,
+    routine_signature: ?[]const RoutineDefinition.Type = null,
+};
+/// A typed SQL declaration, owned by the compiled request. Durable publication
+/// supplies catalog/owner identities independently of this syntax tree.
+pub const RoutineDefinition = struct {
+    pub const Type = struct {
+        kind: ColumnType,
+        element_type: ?@import("array_value.zig").ElementType = null,
+        temporal_kind: ?@import("temporal_value.zig").Kind = null,
+    };
+    pub const Argument = struct { name: ?[]const u8 = null, type: Type };
+    arguments: []const Argument,
+    result: Type,
+    body: []const u8,
+    replace: bool = false,
+    strict: bool = false,
+    volatility: enum { immutable, stable, @"volatile" } = .@"volatile",
 };
 /// Compiler-owned view intent. The parsed query is reused for semantic
 /// preparation; retained text is for durable definition/rebinding, not execution.

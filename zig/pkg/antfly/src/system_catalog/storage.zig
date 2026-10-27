@@ -563,7 +563,54 @@ const SettingDatabaseReader = struct {
 
 pub fn nameKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) ![]u8 {
     try domain.validateResourceName(kind, name);
-    return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:{s}:{d}:{s}", .{ group_id, @tagName(kind), parent, name });
+    const base = try std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:{s}:{d}:{s}", .{ group_id, @tagName(kind), parent, name });
+    if (kind != .routine) return base;
+    defer alloc.free(base);
+    return std.fmt.allocPrint(alloc, "{s}\x00", .{base});
+}
+
+/// A callable's logical name and input signature form one catalog key. Other
+/// object encodings remain unchanged. NUL cannot occur in either component.
+fn resourceNameKeyAlloc(a: std.mem.Allocator, group: u64, resource: domain.Resource) ![]u8 {
+    const key = try nameKeyAlloc(a, group, resource.kind, resource.parent_id, resource.name);
+    if (resource.kind != .routine) return key;
+    defer a.free(key);
+    return std.fmt.allocPrint(a, "{s}{s}", .{ key, resource.signature orelse return error.InvalidCatalogRecord });
+}
+
+pub fn findFunction(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, namespace: u64, name: []const u8, signature: []const u8) !?std.json.Parsed(domain.Resource) {
+    const key = try resourceNameKeyAlloc(a, group, .{ .kind = .routine, .id = 1, .parent_id = namespace, .name = name, .signature = signature });
+    defer a.free(key);
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (raw.len != 8) return error.InvalidCatalogRecord;
+    var record = (try getById(a, txn, group, .routine, std.mem.readInt(u64, raw[0..8], .little))) orelse return error.InvalidCatalogRecord;
+    errdefer record.deinit();
+    if (record.value.parent_id != namespace or !std.mem.eql(u8, record.value.name, name) or !std.mem.eql(u8, record.value.signature orelse return error.InvalidCatalogRecord, signature)) return error.InvalidCatalogRecord;
+    return record;
+}
+
+/// Bounded name-index discovery; no unrelated functions, relations or bodies
+/// enter overload resolution. The caller owns the transaction's snapshot.
+pub const CallableHeader = domain.RoutineHeader;
+pub fn functionOverloads(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, namespace: u64, name: []const u8) ![]const CallableHeader {
+    const prefix = try nameKeyAlloc(a, group, .routine, namespace, name);
+    defer a.free(prefix);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var records: std.ArrayList(CallableHeader) = .empty;
+    var row = try cursor.seekAtOrAfter(prefix);
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        if (records.items.len >= 100) return error.SqlProgramLimitExceeded;
+        if (item.value.len != 8) return error.InvalidCatalogRecord;
+        const id = std.mem.readInt(u64, item.value[0..8], .little);
+        if (id == 0) return error.InvalidCatalogRecord;
+        try records.append(a, .{ .id = id, .signature = try a.dupe(u8, item.key[prefix.len..]) });
+    }
+    return records.toOwnedSlice(a);
 }
 
 pub fn readMeta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !Meta {
@@ -778,7 +825,7 @@ pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
     }
     for (rows) |row| try txn.delete(row.key);
     for (state.value.resources) |resource| {
-        const key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
+        const key = try resourceNameKeyAlloc(alloc, group_id, resource);
         defer alloc.free(key);
         var id: [8]u8 = undefined;
         std.mem.writeInt(u64, &id, resource.id, .little);
@@ -825,7 +872,10 @@ fn tablespaceUseKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource)
 // Covering parent rows keep list reads sequential. These values are derived,
 // written atomically with the primary record, and rebuilt on index migration.
 fn childKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource) ![]u8 {
-    return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:{s}", .{ group_id, @tagName(r.kind), r.parent_id, r.name });
+    const base = try std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:{s}", .{ group_id, @tagName(r.kind), r.parent_id, r.name });
+    if (r.kind != .routine) return base;
+    defer alloc.free(base);
+    return std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ base, r.signature orelse return error.InvalidCatalogRecord });
 }
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
     const child_key = try childKey(alloc, group_id, r);
@@ -881,7 +931,7 @@ pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
         var old = old_value;
         defer old.deinit();
         try removeReferences(alloc, txn, group_id, old.value);
-        const old_name_key = try nameKeyAlloc(alloc, group_id, old.value.kind, old.value.parent_id, old.value.name);
+        const old_name_key = try resourceNameKeyAlloc(alloc, group_id, old.value);
         defer alloc.free(old_name_key);
         txn.delete(old_name_key) catch |err| switch (err) {
             error.NotFound => {},
@@ -890,7 +940,7 @@ pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
     }
     const record_key = try recordKeyAlloc(alloc, group_id, resource.kind, resource.id);
     defer alloc.free(record_key);
-    const name_key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
+    const name_key = try resourceNameKeyAlloc(alloc, group_id, resource);
     defer alloc.free(name_key);
     const json = try std.json.Stringify.valueAlloc(alloc, resource, .{});
     defer alloc.free(json);
@@ -905,7 +955,7 @@ pub fn removeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, gro
     try removeReferences(alloc, txn, group_id, resource);
     const record_key = try recordKeyAlloc(alloc, group_id, resource.kind, resource.id);
     defer alloc.free(record_key);
-    const name_key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
+    const name_key = try resourceNameKeyAlloc(alloc, group_id, resource);
     defer alloc.free(name_key);
     txn.delete(record_key) catch |err| switch (err) {
         error.NotFound => {},

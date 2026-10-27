@@ -24,8 +24,9 @@ pub const default_database_id: u64 = 1;
 pub const default_namespace_id: u64 = 2;
 pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
+pub const RoutineHeader = @import("routines.zig").Header;
 pub const ServiceOwner = @import("../common/service_ownership.zig").Owner;
-pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence };
+pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence, routine };
 
 pub fn namespaceRelation(kind: Kind) bool {
     return kind == .table or kind == .view or kind == .sequence;
@@ -134,6 +135,7 @@ pub const PlacementPolicy = struct {
 
 pub const Resource = struct {
     native_service: ?ServiceOwner = null,
+    signature: ?[]const u8 = null,
     kind: Kind,
     id: u64,
     parent_id: u64 = 0,
@@ -149,7 +151,7 @@ pub const Resource = struct {
     description: ?[]const u8 = null,
 
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
+        return (std.mem.eql(u8, field, "signature") and self.signature == null) or (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
     }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
@@ -301,7 +303,7 @@ pub const State = struct {
     policy_publications: []const @import("policies.zig").Publication = &.{},
 
     pub fn find(self: @This(), kind: Kind, parent_id: u64, name: []const u8) ?Resource {
-        for (self.resources) |r| if (r.kind == kind and r.parent_id == parent_id and std.mem.eql(u8, r.name, name)) return r;
+        for (self.resources) |r| if (r.kind == kind and r.parent_id == parent_id and std.mem.eql(u8, r.name, name) and (r.signature == null or r.signature.?.len == 0)) return r;
         if (kind == .database and parent_id == 0 and std.mem.eql(u8, name, default_database_name)) return default_database;
         if (kind == .namespace and parent_id == default_database_id and std.mem.eql(u8, name, default_namespace_name)) return default_namespace;
         return null;
@@ -335,16 +337,18 @@ pub fn hasPhysicalStorageBinding(resource: Resource) bool {
 /// Borrowed indexes over one immutable state. Rebuild before publication; keys
 /// borrow state strings and must be destroyed before their owner.
 pub const StateIndex = struct {
-    const Name = struct { kind: Kind, parent: u64, name: []const u8 };
+    const Name = struct { kind: Kind, parent: u64, name: []const u8, signature: []const u8 = "" };
     const NameContext = struct {
         pub fn hash(_: @This(), key: Name) u64 {
             var h = std.hash.Wyhash.init(@backingInt(key.kind));
             h.update(std.mem.asBytes(&key.parent));
             h.update(key.name);
+            h.update("\x00");
+            h.update(key.signature);
             return h.final();
         }
         pub fn eql(_: @This(), a: Name, b: Name) bool {
-            return a.kind == b.kind and a.parent == b.parent and std.mem.eql(u8, a.name, b.name);
+            return a.kind == b.kind and a.parent == b.parent and std.mem.eql(u8, a.name, b.name) and std.mem.eql(u8, a.signature, b.signature);
         }
     };
     const Id = struct { kind: Kind, id: u64 };
@@ -362,6 +366,15 @@ pub const StateIndex = struct {
         try self.names.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         try self.ids.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         for (state.resources) |r| {
+            if ((r.kind == .routine) != (r.signature != null)) return error.InvalidCatalogRecord;
+            if (r.kind == .routine) {
+                if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
+                const record = try @import("routines.zig").Record.decode(alloc, r.source_json);
+                defer record.deinit();
+                const signature = try record.value.definition.signatureAlloc(alloc);
+                defer alloc.free(signature);
+                if (record.value.id != r.id or !std.mem.eql(u8, signature, r.signature.?)) return error.InvalidCatalogRecord;
+            }
             try validateDescription(r.description);
             if (r.description) |value| if (value.len == 0) return error.InvalidCatalogRecord;
             if (namespaceRelation(r.kind)) inline for (.{ Kind.table, Kind.view, Kind.sequence }) |kind| {
@@ -373,7 +386,7 @@ pub const StateIndex = struct {
                 if (descriptor.id != r.id) return error.InvalidCatalogRecord;
                 try validateTableName(r.name);
             }
-            const name = try self.names.getOrPut(alloc, .{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
+            const name = try self.names.getOrPut(alloc, .{ .kind = r.kind, .parent = r.parent_id, .name = r.name, .signature = r.signature orelse "" });
             if (name.found_existing) return error.InvalidCatalogRecord;
             name.value_ptr.* = r;
             const id = try self.ids.getOrPut(alloc, .{ .kind = r.kind, .id = r.id });
@@ -390,7 +403,7 @@ pub const StateIndex = struct {
                 count.value_ptr.* += 1;
             }
         }
-        for (state.resources) |r| if (r.kind == .sequence) {
+        for (state.resources) |r| if (r.kind == .sequence or r.kind == .routine) {
             if (self.byId(.namespace, r.parent_id) == null) return error.InvalidCatalogRecord;
         };
         if (!self.ids.contains(.{ .kind = .database, .id = default_database_id })) try self.appendChild(alloc, default_database);
@@ -432,7 +445,7 @@ pub const StateIndex = struct {
         }
     }
     fn remove(self: *StateIndex, r: Resource) void {
-        _ = self.names.remove(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
+        _ = self.names.remove(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name, .signature = r.signature orelse "" });
         _ = self.ids.remove(.{ .kind = r.kind, .id = r.id });
         if (hasPhysicalStorageBinding(r)) _ = self.storage_names.remove(r.storage_name);
         if (r.tablespace_id != 0) {
@@ -449,7 +462,7 @@ pub const StateIndex = struct {
         }
     }
     fn insert(self: *StateIndex, r: Resource) void {
-        self.names.putAssumeCapacity(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name }, r);
+        self.names.putAssumeCapacity(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name, .signature = r.signature orelse "" }, r);
         self.ids.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, r);
         if (hasPhysicalStorageBinding(r)) self.storage_names.putAssumeCapacity(r.storage_name, r);
         if (r.tablespace_id != 0) {
@@ -687,6 +700,8 @@ pub const MutableState = struct {
 
 pub fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
     var r = source;
+    r.signature = if (source.signature) |signature| try alloc.dupe(u8, signature) else null;
+    errdefer if (r.signature) |signature| alloc.free(signature);
     r.name = try alloc.dupe(u8, source.name);
     errdefer alloc.free(r.name);
     r.storage_name = try alloc.dupe(u8, source.storage_name);
@@ -701,6 +716,7 @@ pub fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
     return r;
 }
 fn freeResource(alloc: std.mem.Allocator, r: Resource) void {
+    if (r.signature) |signature| alloc.free(signature);
     alloc.free(r.name);
     alloc.free(r.storage_name);
     alloc.free(r.location_json);
@@ -748,6 +764,7 @@ pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, requ
 pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool) !Delta {
     // View definitions require attribute/dependency admission. Generic resource
     // mutation must never publish an opaque caller-provided view payload.
+    if (request.kind == .routine) return error.CatalogRoutineAdmissionRequired;
     if (request.kind == .view) return error.CatalogViewAdmissionRequired;
     if (request.kind == .sequence) return error.CatalogSequenceAdmissionRequired;
     if (request.action == .alter) return error.InvalidCatalogMutation;
@@ -774,7 +791,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     const parent_id: u64 = switch (request.kind) {
         .database, .tablespace, .query_source => 0,
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
-        .table, .view, .sequence => (try reader.namespaceFor(request.database, request.namespace)).id,
+        .table, .view, .sequence, .routine => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
     var found = try reader.lookup(request.kind, parent_id, request.name);
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
@@ -848,17 +865,19 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                                 if ((try reader.children(.table, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 if ((try reader.children(.view, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 if ((try reader.children(.sequence, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
+                                if ((try reader.children(.routine, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 try removes.append(alloc, namespace);
                             }
                         },
                         .namespace => {
                             if ((try reader.children(.table, existing.id, 1)).len != 0 or
                                 (try reader.children(.view, existing.id, 1)).len != 0 or
-                                (try reader.children(.sequence, existing.id, 1)).len != 0) return error.NamespaceNotEmpty;
+                                (try reader.children(.sequence, existing.id, 1)).len != 0 or
+                                (try reader.children(.routine, existing.id, 1)).len != 0) return error.NamespaceNotEmpty;
                         },
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
                         .query_source => {},
-                        .view, .sequence => unreachable,
+                        .view, .sequence, .routine => unreachable,
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
@@ -1614,7 +1633,7 @@ pub fn validateTableName(name: []const u8) !void {
 }
 
 pub fn validateResourceName(kind: Kind, name: []const u8) !void {
-    if (namespaceRelation(kind)) return validateTableName(name);
+    if (namespaceRelation(kind) or kind == .routine) return validateTableName(name);
     return validateName(name);
 }
 

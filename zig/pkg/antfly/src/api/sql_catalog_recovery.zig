@@ -51,7 +51,7 @@ pub fn decode(a: A, encoded: []const u8) !Token {
         error.OutOfMemory => return err,
         else => return error.InvalidSqlRecoveryToken,
     };
-    if (result.version != 1) return error.InvalidSqlRecoveryToken;
+    if (result.version != 1 or result.kind != .sequence) return error.InvalidSqlRecoveryToken;
     result.request.validate() catch return error.InvalidSqlRecoveryToken;
     return result;
 }
@@ -137,6 +137,7 @@ pub fn observe(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
 pub fn recover(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, a: A, encoded: []const u8) !Receipt {
     try context.ensureActive();
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
+    if (try @import("sql_routine_recovery.zig").recoverIfCallable(server, identity, context, a, encoded)) |receipt| return receipt;
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const temporary = scratch.allocator();

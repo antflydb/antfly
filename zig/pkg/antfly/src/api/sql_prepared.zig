@@ -32,8 +32,10 @@ const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
-    kind: enum { table, view, sequence } = .table,
+    kind: enum { table, view, sequence, function } = .table,
     sequence_incarnation: ?[16]u8 = null,
+    routine_incarnation: ?[16]u8 = null,
+    routine_signature: ?[]const u8 = null,
     definition_digest: ?[32]u8 = null,
     database: []const u8,
     namespace: []const u8,
@@ -54,6 +56,19 @@ pub const Binding = struct {
             if (entry.kind != .table) continue;
             if (!std.mem.eql(u8, entry.database, current.database) or !std.mem.eql(u8, entry.namespace, current.namespace) or !std.mem.eql(u8, entry.name, current.name)) continue;
             if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
+
+    pub fn fromRoutine(a: std.mem.Allocator, target: @import("antfly_local_sources").system_catalog_domain.Target, record: @import("antfly_local_sources").sql_catalog.routines.records.Record, incarnation: [16]u8, revision: u64) !Binding {
+        return .{ .kind = .function, .database = target.database, .namespace = target.namespace, .name = target.table, .physical_name = "", .id = record.id, .schema_version = record.generation, .revision = revision, .routine_incarnation = incarnation, .routine_signature = try record.definition.signatureAlloc(a) };
+    }
+    pub fn verifyRoutine(bindings: []const Binding, current: Binding) !void {
+        if (current.kind != .function or current.routine_incarnation == null or current.routine_signature == null) return error.InvalidSqlBackendResponse;
+        for (bindings) |entry| {
+            if (entry.kind != .function or entry.id != current.id) continue;
+            if (entry.schema_version != current.schema_version or !std.meta.eql(entry.routine_incarnation, current.routine_incarnation) or entry.routine_signature == null or !std.mem.eql(u8, entry.routine_signature.?, current.routine_signature.?)) return error.CatalogGenerationChanged;
             return;
         }
         return error.CatalogGenerationChanged;
@@ -477,4 +492,19 @@ test "SQL prepared resource survives native store restart and transaction cleanu
     var reopened = try transactions.OpenedSessionStore.open(alloc, directory.path());
     defer reopened.deinit();
     try std.testing.expectError(error.SqlPreparedNotFound, load(reopened.durableStore(), alloc, &resource.id, "alice", 7, 3));
+}
+
+test "SQL prepared routine manifests reject replaced generations signatures and cluster incarnations" {
+    const first: Binding = .{ .kind = .function, .database = "default", .namespace = "public", .name = "f", .physical_name = "", .id = 7, .schema_version = 1, .revision = 2, .routine_signature = "text", .routine_incarnation = @splat(1) };
+    var current = first;
+    current.revision = 90;
+    try Binding.verifyRoutine(&.{first}, current);
+    current.schema_version = 2;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyRoutine(&.{first}, current));
+    current = first;
+    current.routine_signature = "int32";
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyRoutine(&.{first}, current));
+    current = first;
+    current.routine_incarnation = @splat(2);
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyRoutine(&.{first}, current));
 }

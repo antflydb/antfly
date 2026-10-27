@@ -17,6 +17,7 @@ const hot_standby_write_gate_adapter = @import("../../storage/hot_standby/write_
 const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
 const std = @import("std");
 const sql_views = @import("../../system_catalog/views.zig");
+const sql_routines = @import("../../system_catalog/routines.zig");
 const sql_sequences = @import("../../system_catalog/sequence_catalog.zig");
 const store_report_baseline = @import("../store_report_baseline.zig");
 const secret_store = @import("../secret_store.zig");
@@ -24364,7 +24365,7 @@ pub const RaftApplyStore = struct {
         const sources = @import("antfly_local_sources");
         if (command.version != 3 or command.column_sequences.len == 0 or command.column_sequences.len > 256 or
             command.mutation.kind != .table or command.mutation.action != .create or command.sql_sequence != null or
-            command.sql_view != null or command.placement_update != null) return error.InvalidCatalogMutation;
+            command.sql_view != null or command.sql_routine != null or command.placement_update != null) return error.InvalidCatalogMutation;
         const topology = command.topology orelse return error.InvalidCatalogMutation;
         if (topology != .create or topology.create.table.table_id != command.mutation.table_id) return error.InvalidCatalogMutation;
         _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_column_sequences_version);
@@ -24469,7 +24470,8 @@ pub const RaftApplyStore = struct {
     pub fn prepareSystemCatalogResult(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: SystemCatalogCommand) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
-        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null)) return error.InvalidCatalogMutation;
+        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null or command.sql_routine != null)) return error.InvalidCatalogMutation;
+        if (command.sql_routine != null) return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlRoutineCatalogTxn(&txn, group_id, command), .{});
         if (command.sql_sequence != null) return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlSequenceCatalogTxn(&txn, group_id, command), .{});
         if (command.sql_view != null) return std.json.Stringify.valueAlloc(alloc, try self.applySqlViewLifecycleTxn(&txn, group_id, command, false), .{});
         if (command.mutation.action == .comment) _ = try self.requireTopologyActivationTxn(&txn, group_id, topology_protocol.sql_resource_comments_version);
@@ -24892,6 +24894,13 @@ pub const RaftApplyStore = struct {
         var parsed = try std.json.parseFromSlice(SystemCatalogCommand, self.alloc, bytes, .{});
         defer parsed.deinit();
         const command = parsed.value;
+        if (command.sql_routine != null) {
+            self.applySqlRoutineOutcomeTxn(txn, group_id, command) catch |err| switch (err) {
+                error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.SequenceAdmissionExpired, error.SequenceAdmissionConflict, error.CatalogRevisionExhausted => return,
+                else => return err,
+            };
+            return;
+        }
         if (command.sql_sequence != null) {
             self.applySqlSequenceOutcomeTxn(txn, group_id, command) catch |err| switch (err) {
                 error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.SequenceAdmissionExpired, error.SequenceAdmissionConflict, error.CatalogRevisionExhausted => return,
@@ -24900,7 +24909,7 @@ pub const RaftApplyStore = struct {
             return;
         }
         if (command.version != 1 and command.version != 2 and command.version != 3) return error.InvalidCatalogMutation;
-        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null)) return error.InvalidCatalogMutation;
+        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null or command.sql_routine != null)) return error.InvalidCatalogMutation;
         if (command.mutation.action == .comment) {
             _ = self.requireTopologyActivationTxn(txn, group_id, topology_protocol.sql_resource_comments_version) catch |err| switch (err) {
                 error.TableTopologyProtocolUpgradeRequired => return,
@@ -30109,7 +30118,7 @@ pub const RaftApplyStore = struct {
 
     /// Read from the same pinned transaction as the source rows. An absent
     /// cluster identity cannot authorize a durable reconciliation generation.
-    fn relationSourceEpochTxn(txn: anytype, group_id: u64) !relation_reconciliation.Epoch {
+    fn catalogIncarnationTxn(txn: anytype, group_id: u64) ![16]u8 {
         var buf: [160]u8 = undefined;
         const bytes = txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)) catch |err| {
             if (err == error.NotFound) return error.InvalidMetadataIncarnation;
@@ -30118,6 +30127,11 @@ pub const RaftApplyStore = struct {
         const record = try decodeMetadataIncarnationRecord(bytes);
         var incarnation: [16]u8 = undefined;
         _ = std.fmt.hexToBytes(&incarnation, &record.incarnation) catch return error.InvalidMetadataIncarnation;
+        return incarnation;
+    }
+
+    fn relationSourceEpochTxn(txn: anytype, group_id: u64) !relation_reconciliation.Epoch {
+        const incarnation = try catalogIncarnationTxn(txn, group_id);
         const revision = try relation_reconciliation.readSourceRevision(txn, group_id);
         if (revision == 0) return error.CatalogSourceUntracked;
         return .{ .incarnation = incarnation, .revision = revision };
@@ -36958,6 +36972,190 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(alloc, result, .{});
     }
 
+    pub fn sqlRoutineSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: sql_routines.SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        var region: std.heap.ArenaAllocator = .init(alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        try request.validate();
+        try context.ensureActive();
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        if (request.expected_revision) |revision| if (revision != meta.revision) return error.CatalogGenerationChanged;
+        const incarnation = try catalogIncarnationTxn(&txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        const scopes = try a.alloc(sql_routines.Snapshot.Scope, request.targets.len);
+        var candidates: std.ArrayList(system_catalog_storage.CallableHeader) = .empty;
+        var owners: std.ArrayList(usize) = .empty;
+        var signatures: std.StringHashMapUnmanaged(void) = .empty;
+        for (request.targets, scopes, 0..) |target, *scope, ordinal| {
+            try context.ensureActive();
+            scope.* = .{ .target = target, .namespace_id = null, .database_exists = false };
+            const db = (try view.lookup(.database, 0, target.database)) orelse continue;
+            scope.database_exists = true;
+            const namespace = (try view.lookup(.namespace, db.id, target.namespace)) orelse continue;
+            scope.namespace_id = namespace.id;
+            if (request.signature) |signature| {
+                const found = (try system_catalog_storage.findFunction(a, &txn, group, namespace.id, target.table, signature)) orelse continue;
+                if ((try signatures.getOrPut(a, signature)).found_existing) continue;
+                try candidates.append(a, .{ .id = found.value.id, .signature = signature });
+                try owners.append(a, ordinal);
+            } else {
+                for (try system_catalog_storage.functionOverloads(a, &txn, group, namespace.id, target.table)) |header| {
+                    if ((try signatures.getOrPut(a, header.signature)).found_existing) continue;
+                    try candidates.append(a, header);
+                    try owners.append(a, ordinal);
+                }
+            }
+        }
+        const selected = if (request.arguments) |arguments| try sql_routines.records.choose(a, candidates.items, arguments) else selected: {
+            if (candidates.items.len > 1) return error.SqlAmbiguousFunction;
+            break :selected if (candidates.items.len == 1) candidates.items[0] else null;
+        };
+        var found: ?sql_routines.Snapshot.Found = null;
+        if (selected) |header| {
+            const resource = (try system_catalog_storage.getById(a, &txn, group, .routine, header.id)) orelse return error.InvalidCatalogRecord;
+            const record = try sql_routines.records.Record.decode(a, resource.value.source_json);
+            const signature = try record.value.definition.signatureAlloc(a);
+            if (record.value.id != header.id or !std.mem.eql(u8, resource.value.signature orelse return error.InvalidCatalogRecord, signature) or !std.mem.eql(u8, signature, header.signature)) return error.InvalidCatalogRecord;
+            for (candidates.items, owners.items) |candidate, owner| if (candidate.id == header.id) {
+                if (resource.value.parent_id != scopes[owner].namespace_id or !std.mem.eql(u8, resource.value.name, scopes[owner].target.table)) return error.InvalidCatalogRecord;
+                found = .{ .scope = owner, .record = record.value };
+                break;
+            };
+        }
+        const outcomes: sql_routines.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        const result: sql_routines.Snapshot = .{ .revision = meta.revision, .next_id = meta.next_id, .head = try outcomes.head(a), .incarnation = incarnation, .scopes = scopes, .found = found };
+        try result.validate(request);
+        return std.json.Stringify.valueAlloc(alloc, result, .{});
+    }
+
+    fn validateSqlRoutineCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
+        const request = command.sql_routine orelse return error.InvalidCatalogMutation;
+        try request.validate();
+        if (command.version != 4 or command.expected_revision != 0 or command.sql_view != null or command.sql_sequence != null or command.column_sequences.len != 0 or
+            command.topology != null or command.placement_update != null or command.constraint_name_admission != null or command.mutation.kind != .routine or
+            command.mutation.action != (if (request.operation == .publish) system_catalog.Action.create else .drop) or
+            !std.mem.eql(u8, command.mutation.database, request.target.database) or !std.mem.eql(u8, command.mutation.namespace, request.target.namespace) or !std.mem.eql(u8, command.mutation.name, request.target.table) or
+            command.mutation.new_name != null or command.mutation.tablespace != null or command.mutation.native_service != null or command.mutation.description != null or
+            command.mutation.table_id != 0 or command.mutation.storage_name.len != 0 or !std.mem.eql(u8, command.mutation.source_json, "null") or !std.mem.eql(u8, command.mutation.location_json, "null")) return error.InvalidCatalogMutation;
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_routine_version);
+        if (!std.mem.eql(u8, &try catalogIncarnationTxn(txn, group), &request.incarnation)) return error.CatalogGenerationChanged;
+    }
+
+    fn applySqlRoutineCatalogTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: sql_routines.Mutation, apply: bool) !sql_routines.Result {
+        var region: std.heap.ArenaAllocator = .init(self.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const meta = try system_catalog_storage.readMeta(a, txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
+        const namespace = try view.namespaceFor(request.target.database, request.target.namespace);
+        if (namespace.id != request.namespace_id) return error.CatalogGenerationChanged;
+        const signature = switch (request.operation) {
+            .publish => |value| try value.definition.signatureAlloc(a),
+            .drop => |value| value.signature,
+        };
+        const previous = try system_catalog_storage.findFunction(a, txn, group, namespace.id, request.target.table, signature);
+        const prior = if (previous) |resource| (try sql_routines.records.Record.decode(a, resource.value.source_json)).value else null;
+        var next: ?sql_routines.records.Record = null;
+        var next_id = meta.next_id;
+        switch (request.operation) {
+            .publish => |value| {
+                if (prior) |old| {
+                    if (!value.replace) return error.SqlDuplicateFunction;
+                    const expected = value.expected orelse return error.CatalogGenerationChanged;
+                    if (expected.id != old.id or expected.generation != old.generation) return error.CatalogGenerationChanged;
+                    if (!std.meta.eql(old.definition.result, value.definition.result)) return error.SqlFunctionReturnTypeChanged;
+                    for (old.definition.arguments, value.definition.arguments) |before, after| if (before.name) |name| {
+                        if (after.name == null or !std.mem.eql(u8, name, after.name.?)) return error.SqlFunctionReturnTypeChanged;
+                    };
+                    var definition = value.definition;
+                    // Replacing a definition never transfers the catalog owner.
+                    definition.owner = old.definition.owner;
+                    next = .{ .id = old.id, .generation = std.math.add(u32, old.generation, 1) catch return error.CatalogGenerationExhausted, .definition = definition };
+                } else {
+                    if (value.expected != null) return error.CatalogGenerationChanged;
+                    next = .{ .id = meta.next_id, .generation = 1, .definition = value.definition };
+                    next_id = std.math.add(u64, meta.next_id, 1) catch return error.CatalogRevisionExhausted;
+                }
+                // SQL body validation is deterministic native preparation, never
+                // a stored execution callback or an evaluation of the body.
+                var workspace: @import("antfly_local_sources").sql_memory_budget = .{ .backing = self.alloc, .limit = sql_routines.native.preparation_bytes };
+                var prepared: std.heap.ArenaAllocator = .init(workspace.allocator());
+                defer prepared.deinit();
+                _ = sql_routines.native.prepare(prepared.allocator(), next.?, null, null) catch |err| {
+                    if (err == error.OutOfMemory and workspace.exhausted) return error.SqlProgramLimitExceeded;
+                    return err;
+                };
+            },
+            .drop => |value| {
+                if (prior) |old| {
+                    const expected = value.expected orelse return error.CatalogGenerationChanged;
+                    if (expected.id != old.id or expected.generation != old.generation) return error.CatalogGenerationChanged;
+                } else {
+                    if (value.expected != null) return error.CatalogGenerationChanged;
+                    if (!value.if_exists) return error.SqlUndefinedFunction;
+                    return .{ .revision = meta.revision, .identity = null, .removed = 0 };
+                }
+            },
+        }
+        const revision = std.math.add(u64, meta.revision, 1) catch return error.CatalogRevisionExhausted;
+        const result: sql_routines.Result = .{ .revision = revision, .identity = if (next) |value| .{ .id = value.id, .generation = value.generation } else null, .removed = @intFromBool(next == null) };
+        if (!apply) return result;
+        var upserts: [1]system_catalog.Resource = undefined;
+        if (next) |value| upserts[0] = .{ .kind = .routine, .id = value.id, .parent_id = namespace.id, .name = request.target.table, .signature = signature, .source_json = try value.encode(a) };
+        var removes: [1]system_catalog.Resource = undefined;
+        if (next == null) removes[0] = previous.?.value;
+        const delta: system_catalog.Delta = .{ .upserts = if (next != null) &upserts else &.{}, .removes = if (next == null) &removes else &.{}, .next_id = next_id };
+        const bytes = try std.json.Stringify.valueAlloc(a, sql_routines.command(request), .{});
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        try system_catalog_storage.applyDelta(a, txn, group, delta, meta, hash);
+        return result;
+    }
+
+    fn prepareSqlRoutineCatalogTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !sql_routines.Result {
+        try self.validateSqlRoutineCommandTxn(txn, group, command);
+        const request = command.sql_routine.?;
+        const outcomes: sql_routines.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group = group, .incarnation = request.incarnation };
+        return switch (try outcomes.prepare(self.alloc, request.admission, try sql_routines.boundDigest(self.alloc, try sql_routines.observation(self.alloc, request)))) {
+            .replay => |outcome| outcome.result(),
+            .append => self.applySqlRoutineCatalogTxn(txn, group, request, false),
+        };
+    }
+
+    fn applySqlRoutineOutcomeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
+        try self.validateSqlRoutineCommandTxn(txn, group, command);
+        const request = command.sql_routine.?;
+        const outcomes: sql_routines.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group = group, .incarnation = request.incarnation };
+        const digest = try sql_routines.boundDigest(self.alloc, try sql_routines.observation(self.alloc, request));
+        switch (try outcomes.prepare(self.alloc, request.admission, digest)) {
+            .replay => return,
+            .append => |ordinal| {
+                const result = self.applySqlRoutineCatalogTxn(txn, group, request, true);
+                const outcome: sql_routines.Outcome = if (result) |value| .{ .success = value } else |err| sql_routines.Outcome.fromError(err) orelse return err;
+                try outcomes.append(self.alloc, ordinal, request.admission, digest, outcome);
+            },
+        }
+    }
+
+    pub fn sqlRoutineOutcome(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: sql_routines.OutcomeRequest) ![]u8 {
+        try request.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const incarnation = try catalogIncarnationTxn(&txn, group);
+        if (!std.mem.eql(u8, &incarnation, &request.incarnation)) return a.dupe(u8, "null");
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        const namespace = view.namespaceFor(request.target.database, request.target.namespace) catch |err| switch (err) {
+            error.DatabaseNotFound, error.NamespaceNotFound => return a.dupe(u8, "null"),
+            else => return err,
+        };
+        if (namespace.id != request.namespace_id) return a.dupe(u8, "null");
+        const outcomes: sql_routines.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        return std.json.Stringify.valueAlloc(a, try outcomes.lookup(a, request.admission, try sql_routines.boundDigest(a, request)), .{});
+    }
+
     fn validateSqlSequenceCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
         const request = command.sql_sequence orelse return error.InvalidCatalogMutation;
         try request.validate();
@@ -36967,7 +37165,7 @@ pub const RaftApplyStore = struct {
             .rename => .rename,
             .drop => .drop,
         };
-        if (command.version != 3 or command.expected_revision != 0 or command.sql_view != null or command.column_sequences.len != 0 or
+        if (command.version != 3 or command.expected_revision != 0 or command.sql_view != null or command.sql_routine != null or command.column_sequences.len != 0 or
             command.topology != null or command.placement_update != null or command.constraint_name_admission != null or
             command.mutation.kind != .sequence or command.mutation.action != expected_action or
             command.mutation.table_id != 0 or command.mutation.storage_name.len != 0 or command.mutation.new_name != null or
@@ -45061,7 +45259,7 @@ fn verifySqlSequenceCut(backing: std.mem.Allocator, group: u64, reader: anytype,
     const incarnation = try decodeMetadataIncarnationRecord(try reader.get(try metadataIncarnationKeyForGroup(&buffer, group)));
     if (!std.meta.eql(activation.incarnation, incarnation.incarnation)) return error.InvalidSequenceState;
     if (meta.sequence_outcome_head == null) return error.InvalidSequenceOutcome;
-    const outcomes: sql_sequences.outcomes.Store(Reader) = .{ .txn = reader, .group = group, .incarnation = (try RaftApplyStore.relationSourceEpochTxn(reader, group)).incarnation };
+    const outcomes: sql_sequences.outcomes.Store(Reader) = .{ .txn = reader, .group = group, .incarnation = try RaftApplyStore.catalogIncarnationTxn(reader, group) };
     try outcomes.validateCut(a);
     var definitions_present = false;
     try rows.reset();
@@ -59091,4 +59289,96 @@ test "SQL view catalog materialized hidden generation atomically publishes empty
     defer missing.deinit(a);
     try std.testing.expect(missing.sql_sources[0] == null);
     try verifyRelationRecoveryForTest(&store, a, group);
+}
+
+test "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/routines", .{tmp.sub_path});
+    defer a.free(root);
+    const group: u64 = group_ids.main_metadata_group_id;
+    const T = struct {
+        fn snapshot(store: *RaftApplyStore, allocator: std.mem.Allocator, argument: sql_routines.records.Type) !sql_routines.Snapshot {
+            const bytes = try store.sqlRoutineSnapshot(allocator, group, .{ .targets = &.{.{ .table = "f" }}, .arguments = &.{.{ .type = argument }} }, .{});
+            return std.json.parseFromSliceLeaky(sql_routines.Snapshot, allocator, bytes, .{});
+        }
+        fn apply(store: *RaftApplyStore, allocator: std.mem.Allocator, request: sql_routines.Mutation) !sql_routines.Outcome {
+            const command = sql_routines.command(request);
+            const json = try std.json.Stringify.valueAlloc(allocator, command, .{});
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = json });
+            const bytes = try store.sqlRoutineOutcome(allocator, group, try sql_routines.observation(allocator, request));
+            return (try std.json.parseFromSliceLeaky(?sql_routines.Outcome, allocator, bytes, .{})) orelse error.TestExpectedRoutineOutcome;
+        }
+    };
+    var first: sql_routines.Mutation = undefined;
+    var identity: sql_routines.Identity = undefined;
+    for (0..2) |pass| {
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        const temporary = region.allocator();
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        if (pass == 0) {
+            const incarnation = "01010101010101010101010101010101".*;
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+            const activation = try std.json.Stringify.valueAlloc(temporary, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+            const initial = try T.snapshot(&store, temporary, .{ .scalar = .text });
+            try std.testing.expect(initial.found == null);
+            first = .{ .admission = .{ .nonce = @splat(1), .head = initial.head }, .target = .{ .table = "f" }, .namespace_id = 2, .incarnation = initial.incarnation, .operation = .{ .publish = .{ .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .text } }}, .result = .{ .scalar = .text }, .body = "SELECT lower($1)", .owner = .auth_disabled } } } };
+            const created = try T.apply(&store, temporary, first);
+            identity = created.success.identity.?;
+            var wrong_target = try sql_routines.observation(temporary, first);
+            wrong_target.target.table = "another_function";
+            try std.testing.expectError(error.SequenceAdmissionConflict, store.sqlRoutineOutcome(temporary, group, wrong_target));
+
+            try std.testing.expectEqual(@as(u64, 1), identity.generation);
+            var second = first;
+            second.admission = .{ .nonce = @splat(2), .head = (try T.snapshot(&store, temporary, .{ .scalar = .text })).head };
+            second.operation.publish.definition.arguments = &.{.{ .type = .{ .scalar = .numeric } }};
+            second.operation.publish.definition.result = .{ .scalar = .numeric };
+            second.operation.publish.definition.body = "SELECT $1+$1";
+            const other = try T.apply(&store, temporary, second);
+            try std.testing.expect(other.success.identity.?.id != identity.id);
+            const replay = try T.apply(&store, temporary, first);
+            try std.testing.expectEqualDeep(created, replay);
+            const selected = try T.snapshot(&store, temporary, .{ .scalar = .text });
+            try std.testing.expectEqual(identity.id, selected.found.?.record.id);
+            try std.testing.expectEqual(@as(u64, 2), selected.head);
+            const numeric = try T.snapshot(&store, temporary, .{ .scalar = .numeric });
+            try std.testing.expectEqual(other.success.identity.?.id, numeric.found.?.record.id);
+            var replacement = first;
+            replacement.admission = .{ .nonce = @splat(3), .head = selected.head };
+            replacement.operation.publish.replace = true;
+            replacement.operation.publish.expected = identity;
+            replacement.operation.publish.definition.body = "SELECT upper($1)";
+            const changed = try T.apply(&store, temporary, replacement);
+            try std.testing.expectEqual(identity.id, changed.success.identity.?.id);
+            identity = changed.success.identity.?;
+            try std.testing.expectEqual(@as(u64, 2), identity.generation);
+            var invalid = replacement;
+            invalid.admission = .{ .nonce = @splat(4), .head = (try T.snapshot(&store, temporary, .{ .scalar = .text })).head };
+            invalid.operation.publish.expected = identity;
+            invalid.operation.publish.definition.result = .{ .scalar = .numeric };
+            const rejected = try T.apply(&store, temporary, invalid);
+            try std.testing.expectEqual(.SqlFunctionReturnTypeChanged, rejected.rejected);
+            try std.testing.expectEqualDeep(rejected, try T.apply(&store, temporary, invalid));
+            var bad_body = replacement;
+            bad_body.admission = .{ .nonce = @splat(5), .head = (try T.snapshot(&store, temporary, .{ .scalar = .text })).head };
+            bad_body.operation.publish.expected = identity;
+            bad_body.operation.publish.definition.body = "SELECT nonexistent_argument";
+            const body_rejection = try T.apply(&store, temporary, bad_body);
+            try std.testing.expectEqual(.UnknownColumn, body_rejection.rejected);
+            try std.testing.expectEqualDeep(body_rejection, try T.apply(&store, temporary, bad_body));
+        } else {
+            const selected = try T.snapshot(&store, temporary, .{ .scalar = .text });
+            try std.testing.expectEqual(identity.id, selected.found.?.record.id);
+            try std.testing.expectEqual(@as(u32, 2), selected.found.?.record.generation);
+            try std.testing.expectEqualStrings("SELECT upper($1)", selected.found.?.record.definition.body);
+            try std.testing.expectEqual(@as(u64, 5), selected.head);
+            try std.testing.expectEqualDeep(identity.id, (try T.apply(&store, temporary, first)).success.identity.?.id);
+            try std.testing.expectEqual(@as(usize, 0), (try store.listTables(temporary, group)).len);
+        }
+    }
 }
