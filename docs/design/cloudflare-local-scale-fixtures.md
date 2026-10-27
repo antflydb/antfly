@@ -40,3 +40,10 @@ native peak-memory/I/O counters, routing shape and all thirty recall samples.
 Its evidence is `file-fixture-equivalence.json` in the ignored gate directory.
 It does not qualify deployed latency, CPU, total isolate memory or diagnostic
 coverage. The live gate and original failed runs remain unchanged.
+
+The refreshed 50,000-document file-backed run passes all nine stages with the
+same existing native budgets. Its native linear-memory peak is 27,525,120 bytes,
+working-set peak is 11,788,282 bytes, and its backing file grows to
+21,526,325,594 bytes before successful cleanup. There is no completed host-memory
+sample for this replacement run; payload ownership and successful completion
+must not be represented as a measured total-Worker-memory result.

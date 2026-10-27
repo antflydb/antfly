@@ -1337,3 +1337,30 @@ The regression holds the old tail, proves the new tail starts before releasing
 it, verifies the read has not returned early, then checks the new value and lack
 of writer ownership. Existing coverage also checks negative-probe freshness and
 owner replacement. This is a tested overlap improvement, not a live gate pass.
+
+## Post-main diagnostic read costs
+
+The post-merge candidate-3 diagnostic recorded in
+[qualification](cloudflare-qualification.md#post-main-merge-durable-maintenance-and-persisted-diagnostics)
+still fails coverage and contains an unreplayed unkeyed maintenance disconnect.
+It is not a successful SLO run. Its 72 completed lookup traces can nevertheless
+locate observed waiting without discarding either failure.
+
+After deduplicating the two tail sockets, the traces report metadata admission
+at 399 ms median / 916 ms p95, native lookup at 325 / 801 ms, and HTTP handler
+time at 779 / 1,350 ms. Client read p95 is 1,810 ms. The per-stage percentiles
+must not be added or treated as paired samples. Reported kernel queue p95 is
+four milliseconds. Native lookup working-set p95 is 61,955 bytes; its reported
+elapsed time is predominantly awaited I/O. These clocks do not measure CPU use.
+The 64 lookups with physical misses report two GET waves at median and three
+at p95, after metadata admission. This points further measurement toward fresh
+proof and data-fetch dependency depth, rather than an allocator-cap increase.
+
+A read-only bucket audit confirms both pair-3 buckets are in `WNAM`; candidate
+actor hints are `wnam`. This rules out an observed bucket-region mismatch as
+the explanation. Actor hints do not establish the public app Worker's location
+or guarantee physical colocation. No placement or resource profile was changed.
+Cloudflare documents [bucket location hints](https://developers.cloudflare.com/r2/reference/data-location/)
+as creation-time best effort and [Worker placement](https://developers.cloudflare.com/workers/configuration/placement/)
+as a separate setting. Any future placement comparison needs declared profiles
+and fresh evidence, not an inferred improvement from a setting name.

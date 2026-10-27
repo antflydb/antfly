@@ -6,9 +6,10 @@ capacity or complete native feature parity.
 
 The current candidate uses Antfly-native transactional coordination in R2;
 SQLite below describes the initial deployment and migration history. The latest
-local evidence passes 660 native tests (six skipped), 250 Node tests, 18 persisted
-Worker tests, the 50,000-document capacity fixture, the 1,000-document reindex
-fixture and both frozen ANN comparisons. The three-pair live gate remains
+local evidence passes 660 native tests (six skipped), 259 Node tests, 20 persisted
+Worker tests, the 16,384-row metadata fixture, the 1,000-document reindex
+fixture and both frozen ANN comparisons. Earlier 50,000-document passes and the
+post-main-merge fixture refresh are distinguished below. The three-pair live gate remains
 unpassed. The approved control is `c44896ac8c` with its original native modules.
 Live trials are paused after reproducing shared provider tail resets. The next
 diagnostic backend needs the account permission described in the
@@ -1844,3 +1845,65 @@ independent of arrivals and records diagnostic disconnect causes. These changes
 pass 245 Node regressions; live latency and longer diagnostic capture still need
 qualification. The approved control remains `c44896ac8c`, including its original
 native modules. The gate remains unpassed.
+
+## Post-main merge, durable maintenance and persisted diagnostics
+
+The branch merges `origin/main` at `ca4339f030a66c4e842e62462cb69137dd089d39`
+without conflicts and rebuilds its native WASM. The new full-module SHA-256 is
+`c3355e5ba9dd578d0eb92e95e8798084cc8e958fd4c28f95b43c8d6eee8b926c`.
+The native suite passes 660 tests with six skips and no failures/leaks after
+enabling local networking for the five listener tests that initially fail with
+sandbox `EPERM`. Node passes 259 tests and actual-workerd passes twenty.
+The 16,384-row metadata scale/reopen/collection fixture, 1,000-document reindex
+and all six frozen ANN recall/GET/byte comparisons also pass.
+
+[Compaction receipts](cloudflare-compaction-receipts.md) now commit an operation's
+outcome with its HEAD and native lease release. Local fault tests cover actual
+publication with an injected lost metadata-commit acknowledgement, reopen,
+stale-owner rejection and exact replay. Ticketed R2 Queue redelivery recovers
+the receipt after an injected ticket-completion failure. The frozen corrected
+control and strict driver's unkeyed compaction retry policy remain unchanged.
+
+The [persisted diagnostic collector](cloudflare-persisted-diagnostics.md) now
+has bounded pagination, query/ingestion sampling checks, before/after counts,
+two separated snapshots and independent sixteen-artifact verification. It is
+not connected to the gate evaluator and always reports `qualification: false`.
+Its live schema/delivery checks remain blocked by the absent observability token.
+
+Candidate 3 is deployed at `2151adfdf1227e292890e85b186779243cce3e95` over its
+existing diagnostic corpus, preserving the approved baseline bundles. A new
+three-minute diagnostic (`acdae850-2a02-475c-85d2-e8f461316aa2`) fails after about
+190 seconds: candidate tenant C has one real, unkeyed compaction connection
+reset (`ECONNRESET`, twenty milliseconds, one attempt), and both baseline-reader
+tail sockets lose their shared session with code `1006`. Subsequent interrupted
+requests and round annotations are coverage-abort consequences. Zero resource
+signals are observed before the gap; this does not establish coverage afterward.
+All eight journals independently verify and every owned tail session is deleted.
+Both stacks return to paused state; all 300 reserved cold epochs remain unused.
+
+The incomplete candidate sample contains 72 reads at 1,810 ms p95 and twenty
+completed writes at 6,418 ms p95; four writes are interrupted at the gap. The
+baseline has sixty completed reads at 6,690 ms p95 and twenty completed writes
+at 7,152 ms p95. These partial populations establish no gate result. There is
+no exact post-run verification after the coverage abort.
+
+A separate paused-candidate API probe discards one successful keyed compaction
+response locally, queries its durable status, and replays the same operation.
+It recovers `complete` and the exact original no-op result (manifest version
+51, six artifacts), with one expected injected transport error and no observed
+HTTP resource errors. It uses no cold epochs and is not qualification evidence.
+
+The post-merge in-memory 50,000-document fixture is incomplete after host exit
+137; its logs and a 22.6-GB host-footprint sample are preserved. It must not be
+substituted for the earlier complete report. The new
+[file-backed local fixture](cloudflare-local-scale-fixtures.md) avoids retaining
+the emulated R2 payloads in host RAM, with exact model-corpus equivalence checks.
+Its refreshed 50,000-document run completes all nine stages, including cold
+text/vector/sparse reads, point updates, deletion and compaction. Peak native
+linear memory is 27,525,120 bytes and working set is 11,788,282 bytes, with at
+most 871 operations and 28,867,885 transferred bytes per request, inside the
+unchanged budgets. The fixture appends 21,526,325,594 bytes to its local backing
+file and removes it on completion. This is local native capacity evidence,
+not a total-isolate-memory or live latency result. The refreshed evidence
+manifest binds 22 artifacts to the new native module; the prior manifest and
+all original report files remain preserved.
