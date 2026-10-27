@@ -1722,6 +1722,17 @@ mutation/visitor paths; those allocations belong to the operation, not a shared
 cached page. No sort components, public-ID ties, authentication or range bounds
 are discarded.
 
+Read-only rank, batched point/lower-bound lookup, membership, range cardinality
+and sorted-range zipper probes use the same compact page leases. Each request
+bound is checked against the common prefix once per reached page before suffix
+comparisons. Zipper frames refresh those bound views whenever their shared range
+producer advances, including advancement inside a recursive child. Cross-page
+separator checks still compare complete logical keys. Batched lookups own only
+the keys and values they return; rank/count/membership probes allocate no key
+buffers on a warm decoded cache. An unbounded count authenticates the root before
+using its record count. Navigation I/O admission reserves encoded bytes and
+compact descriptors, without reserving a complete expanded-key buffer per page.
+
 Sorted publication and incremental mutation packing use compressed occupancy
 when a store opts into key prefixes. The shared prefix is one indivisible
 page overhead; the soft target bounds the unshared payload. The original

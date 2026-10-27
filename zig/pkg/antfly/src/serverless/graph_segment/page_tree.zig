@@ -421,6 +421,34 @@ pub const NavigationPage = struct {
     pub fn key(self: NavigationPage, index: usize) KeyView {
         return .{ .prefix = self.prefix, .suffix = self.entries[index].key };
     }
+    /// Compare a request key against this page's suffixes after checking the
+    /// common prefix once. The returned view borrows both page and request.
+    pub fn probeKey(self: NavigationPage, bytes: []const u8) KeyView {
+        return self.probeView(KeyView.from(bytes));
+    }
+    fn probeView(self: NavigationPage, probe: KeyView) KeyView {
+        if (self.prefix.len == 0 or (probe.prefix.ptr == self.prefix.ptr and probe.prefix.len == self.prefix.len)) return probe;
+        // Descendant pages may extend an ancestor's prefix. Rebase the view
+        // without concatenating it; a shorter or different prefix keeps the
+        // original two-piece bound and its ordinary complete-key comparison.
+        if (self.prefix.len >= probe.prefix.len and std.mem.startsWith(u8, self.prefix, probe.prefix)) {
+            const rest = self.prefix[probe.prefix.len..];
+            if (std.mem.startsWith(u8, probe.suffix, rest)) return .{ .prefix = self.prefix, .suffix = probe.suffix[rest.len..] };
+        }
+        return probe;
+    }
+    fn lowerBound(self: NavigationPage, bytes: []const u8) usize {
+        return self.lowerBoundView(self.probeKey(bytes));
+    }
+    fn lowerBoundView(self: NavigationPage, probe: KeyView) usize {
+        var lo: usize = 0;
+        var hi = self.entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.key(mid).order(probe) == .lt) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
     pub fn retainedBytes(self: NavigationPage) usize {
         return self.bytes.len + self.entries.len * @sizeOf(DecodedEntry) + self.child_refs.len * @sizeOf(Ref);
     }
@@ -554,14 +582,16 @@ pub fn rankOf(alloc: Allocator, store: Store, root: Ref, key: []const u8) !u64 {
     var ref = root;
     var rank: u64 = 0;
     while (true) {
-        var page = try readPage(alloc, store, ref);
+        var page = try readNavigationPage(alloc, store, ref);
         defer page.deinit(alloc);
-        var position: usize = 0;
-        while (position + 1 < page.entries.len and !less(key, page.entries[position + 1].key)) : (position += 1) {}
+        const probe = page.probeKey(key);
+        const next = page.lowerBoundView(probe);
+        const exact = next < page.entries.len and page.key(next).order(probe) == .eq;
         if (ref.height == 0) {
-            if (!std.mem.eql(u8, page.entries[position].key, key)) return error.InvalidGraphPage;
-            return std.math.add(u64, rank, position);
+            if (!exact) return error.InvalidGraphPage;
+            return std.math.add(u64, rank, next);
         }
+        const position = if (exact) next else next -| 1;
         for (page.entries[0..position]) |entry| rank = try std.math.add(u64, rank, entry.child.?.records);
         ref = page.entries[position].child.?.*;
     }
@@ -580,11 +610,12 @@ pub const BatchEntry = struct {
         a.free(self.value);
     }
 };
-/// Encoded prefixes can expand while decoding. Admission includes the bounded
-/// full-key buffer and entry descriptors rather than assuming a 2x wire ratio.
+/// Navigation retains encoded prefixes, entry descriptors and child refs.
+/// Reserve those allocations plus allocator headroom; complete result keys
+/// belong to the consumer, rather than every page's speculative I/O task.
 pub fn readWorkspace(ref: Ref) usize {
     const entries: usize = @intCast(@min(ref.records, ref.bytes / @as(u32, if (ref.height == 0) 8 else 69)));
-    return @as(usize, ref.bytes) + max_page_bytes + entries * (@sizeOf(DecodedEntry) + if (ref.height == 0) @as(usize, 0) else @sizeOf(Ref)) + 64 * 1024;
+    return @as(usize, ref.bytes) + entries * (@sizeOf(DecodedEntry) + if (ref.height == 0) @as(usize, 0) else @sizeOf(Ref)) + 64 * 1024;
 }
 /// Exact point reads share each routing page and fetch independent children in
 /// bounded waves. Results own their bytes and preserve duplicate/input order.
@@ -607,13 +638,18 @@ fn lookupBatch(a: Allocator, store: Store, root: ?Ref, keys: []const []const u8,
     if (root) |ref| if (keys.len != 0) {
         var positions: [max_lookup_batch]usize = undefined;
         sortedPositions(keys, positions[0..keys.len]);
-        var page = try readPage(a, store, ref);
+        var page = try readNavigationPage(a, store, ref);
         defer page.deinit(a);
         try batchPage(a, store, page, keys, positions[0..keys.len], result, 0, lower, true);
         if (lower) for (result, keys) |*entry, key| if (entry.* == null) {
             var cursor = try Cursor.init(a, store, ref, key, null);
             defer cursor.deinit();
-            if (try cursor.next()) |record| entry.* = try ownBatchEntry(a, record.key, record.value, try rankOf(a, store, ref, record.key), true);
+            if (try cursor.nextView()) |record| {
+                var owned = try ownBatchEntry(a, record.key, record.value, 0, true);
+                errdefer owned.deinit(a);
+                owned.rank = try rankOf(a, store, ref, owned.key);
+                entry.* = owned;
+            }
         };
     };
     return result;
@@ -626,44 +662,32 @@ fn sortedPositions(keys: []const []const u8, positions: []usize) void {
         }
     }.compare);
 }
-fn ownBatchEntry(a: Allocator, key: []const u8, value: []const u8, rank: u64, copy: bool) !BatchEntry {
+fn ownBatchEntry(a: Allocator, key: KeyView, value: []const u8, rank: u64, copy: bool) !BatchEntry {
     if (!copy) return .{ .key = "", .value = "", .rank = rank };
-    const owned = try a.dupe(u8, key);
+    const owned = try key.dupe(a);
     errdefer a.free(owned);
     return .{ .key = owned, .value = try a.dupe(u8, value), .rank = rank };
 }
-fn readPageWave(a: Allocator, store: Store, refs: []const Ref, pages: []Page) !void {
-    if (store.read_many) |batch| {
-        if (refs.len != pages.len or refs.len > max_read_batch) return error.InvalidGraphPage;
-        var compact: [max_read_batch]NavigationPage = undefined;
-        try batch.read(batch.ptr, a, refs, compact[0..refs.len]);
-        var consumed: usize = 0;
-        var expanded: usize = 0;
-        defer for (compact[consumed..refs.len]) |*page| page.deinit(a);
-        errdefer for (pages[0..expanded]) |*page| page.deinit(a);
-        for (compact[0..refs.len], pages) |page, *out| {
-            consumed += 1;
-            out.* = try page.materialize(a);
-            expanded += 1;
-        }
-        return;
-    }
+fn readNavigationWave(a: Allocator, store: Store, refs: []const Ref, pages: []NavigationPage) !void {
+    if (refs.len != pages.len or refs.len > max_read_batch) return error.InvalidGraphPage;
+    if (store.read_many) |batch| return batch.read(batch.ptr, a, refs, pages);
     var initialized: usize = 0;
     errdefer for (pages[0..initialized]) |*page| page.deinit(a);
     for (refs, pages) |ref, *page| {
-        page.* = try readPage(a, store, ref);
+        page.* = try readNavigationPage(a, store, ref);
         initialized += 1;
     }
 }
-fn batchPage(a: Allocator, store: Store, page: Page, keys: []const []const u8, positions: []const usize, result: []?BatchEntry, base: u64, lower: bool, copy: bool) anyerror!void {
+fn batchPage(a: Allocator, store: Store, page: NavigationPage, keys: []const []const u8, positions: []const usize, result: []?BatchEntry, base: u64, lower: bool, copy: bool) anyerror!void {
     try store.check(store.ptr);
     if (page.ref.height == 0) {
         var at: usize = 0;
         for (positions) |position| {
-            while (at < page.entries.len and less(page.entries[at].key, keys[position])) at += 1;
-            if (at == page.entries.len or (!lower and !std.mem.eql(u8, page.entries[at].key, keys[position]))) continue;
+            const probe = page.probeKey(keys[position]);
+            while (at < page.entries.len and page.key(at).order(probe) == .lt) at += 1;
+            if (at == page.entries.len or (!lower and page.key(at).order(probe) != .eq)) continue;
             const entry = page.entries[at];
-            result[position] = try ownBatchEntry(a, entry.key, entry.value, try std.math.add(u64, base, at), copy);
+            result[position] = try ownBatchEntry(a, page.key(at), entry.value, try std.math.add(u64, base, at), copy);
         }
         return;
     }
@@ -673,11 +697,15 @@ fn batchPage(a: Allocator, store: Store, page: Page, keys: []const []const u8, p
     var next: usize = 0;
     var rank = base;
     var index: usize = 0;
+    var probe = if (positions.len != 0) page.probeKey(keys[positions[0]]) else KeyView.from("");
     while (index < page.entries.len) {
         var count: usize = 0;
         while (index < page.entries.len and count < children.len) : (index += 1) {
             const first = next;
-            while (next < positions.len and (index + 1 == page.entries.len or less(keys[positions[next]], page.entries[index + 1].key))) next += 1;
+            while (next < positions.len and (index + 1 == page.entries.len or probe.order(page.key(index + 1)) == .lt)) {
+                next += 1;
+                if (next < positions.len) probe = page.probeKey(keys[positions[next]]);
+            }
             const child = page.entries[index].child.?.*;
             if (first != next) {
                 children[count] = .{ .entry = index, .begin = first, .end = next, .rank = rank };
@@ -687,12 +715,12 @@ fn batchPage(a: Allocator, store: Store, page: Page, keys: []const []const u8, p
             rank = try std.math.add(u64, rank, child.records);
         }
         if (count == 0) continue;
-        var pages: [max_read_batch]Page = undefined;
-        try readPageWave(a, store, refs[0..count], pages[0..count]);
+        var pages: [max_read_batch]NavigationPage = undefined;
+        try readNavigationWave(a, store, refs[0..count], pages[0..count]);
         defer for (pages[0..count]) |*owned| owned.deinit(a);
         for (children[0..count], pages[0..count], refs[0..count]) |child, decoded, ref| {
-            if (!decoded.ref.eql(ref) or !std.mem.eql(u8, decoded.entries[0].key, page.entries[child.entry].key)) return error.InvalidGraphPage;
-            if (child.entry + 1 < page.entries.len and !less(decoded.entries[decoded.entries.len - 1].key, page.entries[child.entry + 1].key)) return error.InvalidGraphPage;
+            if (!decoded.ref.eql(ref) or decoded.key(0).order(page.key(child.entry)) != .eq) return error.InvalidGraphPage;
+            if (child.entry + 1 < page.entries.len and !keyLess(decoded.key(decoded.entries.len - 1), page.key(child.entry + 1))) return error.InvalidGraphPage;
             try batchPage(a, store, decoded, keys, positions[child.begin..child.end], result, child.rank, lower, copy);
         }
     }
@@ -704,7 +732,7 @@ pub fn ranksOf(a: Allocator, store: Store, root: Ref, keys: []const []const u8, 
     var results: [256]?BatchEntry = @splat(null);
     sortedPositions(keys, positions[0..keys.len]);
     if (keys.len == 0) return;
-    var page = try readPage(a, store, root);
+    var page = try readNavigationPage(a, store, root);
     defer page.deinit(a);
     try batchPage(a, store, page, keys, positions[0..keys.len], results[0..keys.len], 0, false, false);
     for (results[0..keys.len], ranks) |entry, *rank| rank.* = (entry orelse return error.InvalidGraphPage).rank;
@@ -1641,25 +1669,30 @@ pub fn containsMany(alloc: Allocator, store: Store, root: ?Ref, keys: []const []
     @memset(found, false);
     if (root) |ref| if (keys.len != 0) try containsPage(alloc, store, ref, keys, found, null, null);
 }
-fn containsPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8, found: []bool, first: ?[]const u8, end: ?[]const u8) !void {
-    var page = try load(alloc, store, ref);
+fn containsPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8, found: []bool, first: ?KeyView, end: ?KeyView) !void {
+    var page = try readNavigationPage(alloc, store, ref);
     defer page.deinit(alloc);
-    if (first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
-    if (end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+    if (first) |key| if (key.order(page.key(0)) != .eq) return error.InvalidGraphPage;
+    if (end) |key| if (!keyLess(page.key(page.entries.len - 1), key)) return error.InvalidGraphPage;
     var position: usize = 0;
     if (ref.height == 0) {
         for (keys, found) |key, *present| {
-            while (position < page.entries.len and less(page.entries[position].key, key)) position += 1;
-            present.* = position < page.entries.len and std.mem.eql(u8, page.entries[position].key, key);
+            const probe = page.probeKey(key);
+            while (position < page.entries.len and page.key(position).order(probe) == .lt) position += 1;
+            present.* = position < page.entries.len and page.key(position).order(probe) == .eq;
         }
         return;
     }
-    while (position < keys.len and less(keys[position], page.entries[0].key)) position += 1;
+    while (position < keys.len and page.probeKey(keys[position]).order(page.key(0)) == .lt) position += 1;
+    var probe = if (position < keys.len) page.probeKey(keys[position]) else KeyView.from("");
     for (page.entries, 0..) |entry, index| {
-        const upper = if (index + 1 < page.entries.len) page.entries[index + 1].key else end;
+        const upper = if (index + 1 < page.entries.len) page.key(index + 1) else end;
         const begin = position;
-        while (position < keys.len and (upper == null or less(keys[position], upper.?))) position += 1;
-        if (position != begin) try containsPage(alloc, store, entry.child.?.*, keys[begin..position], found[begin..position], entry.key, upper);
+        while (position < keys.len and (upper == null or keyLess(probe, upper.?))) {
+            position += 1;
+            if (position < keys.len) probe = page.probeKey(keys[position]);
+        }
+        if (position != begin) try containsPage(alloc, store, entry.child.?.*, keys[begin..position], found[begin..position], page.key(index), upper);
         if (position == keys.len) break;
     }
 }
@@ -1969,14 +2002,7 @@ pub const Cursor = struct {
             errdefer page.deinit(self.alloc);
             if (expected_first) |key| if (key.order(page.key(0)) != .eq) return error.InvalidGraphPage;
             if (expected_end) |key| if (!keyLess(page.key(page.entries.len - 1), key)) return error.InvalidGraphPage;
-            var lo: usize = 0;
-            var hi = page.entries.len;
-            if (upper) |bound| {
-                while (lo < hi) {
-                    const mid = lo + (hi - lo) / 2;
-                    if (keyLess(page.key(mid), bound)) lo = mid + 1 else hi = mid;
-                }
-            } else lo = hi;
+            const lo = if (upper) |bound| page.lowerBound(bound) else page.entries.len;
             if (ref.height == 0 or lo == 0) {
                 self.frames[self.depth] = .{ .page = page, .next = lo, .end = expected_end };
                 self.depth += 1;
@@ -2069,18 +2095,13 @@ pub const Cursor = struct {
             errdefer page.deinit(self.alloc);
             if (expected_first) |key| if (key.order(page.key(0)) != .eq) return error.InvalidGraphPage;
             if (expected_end) |key| if (!keyLess(page.key(page.entries.len - 1), key)) return error.InvalidGraphPage;
-            var lo: usize = 0;
-            var hi = page.entries.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                if (keyLess(page.key(mid), lower)) lo = mid + 1 else hi = mid;
-            }
+            const lo = page.lowerBound(lower);
             if (ref.height == 0) {
                 self.frames[self.depth] = .{ .page = page, .next = lo, .end = expected_end };
                 self.depth += 1;
                 return;
             }
-            const index = if (lo < page.entries.len and page.key(lo).order(KeyView.from(lower)) == .eq) lo else lo -| 1;
+            const index = if (lo < page.entries.len and page.key(lo).order(page.probeKey(lower)) == .eq) lo else lo -| 1;
             self.frames[self.depth] = .{ .page = page, .next = index + 1, .end = expected_end };
             self.depth += 1;
             ref = page.entries[index].child.?.*;
@@ -2105,17 +2126,12 @@ pub const Cursor = struct {
                 self.depth -= 1;
                 continue;
             };
-            var lo: usize = 0;
-            var hi = frame.page.entries.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                if (keyLess(frame.page.key(mid), lower)) lo = mid + 1 else hi = mid;
-            }
+            const lo = frame.page.lowerBound(lower);
             if (frame.page.ref.height == 0) {
                 frame.next = @max(frame.next, lo);
                 return;
             }
-            const index = @max(frame.next, if (lo < frame.page.entries.len and frame.page.key(lo).order(KeyView.from(lower)) == .eq) lo else lo -| 1);
+            const index = @max(frame.next, if (lo < frame.page.entries.len and frame.page.key(lo).order(frame.page.probeKey(lower)) == .eq) lo else lo -| 1);
             if (index == frame.page.entries.len) {
                 frame.page.deinit(self.alloc);
                 self.depth -= 1;
@@ -2190,26 +2206,32 @@ pub const Cursor = struct {
 pub fn countRange(alloc: Allocator, store: Store, root: ?Ref, lower: []const u8, upper: ?[]const u8) !u64 {
     try store.check(store.ptr);
     if (upper) |bound| if (!less(lower, bound)) return 0;
-    return countInner(alloc, store, root orelse return 0, lower, upper, null, null);
+    return countInner(alloc, store, root orelse return 0, .from(lower), if (upper) |bound| .from(bound) else null, null, null);
 }
 
-fn countInner(alloc: Allocator, store: Store, ref: Ref, lower: []const u8, upper: ?[]const u8, first: ?[]const u8, end: ?[]const u8) anyerror!u64 {
-    if (end) |key| if (!less(lower, key)) return 0;
+fn countInner(alloc: Allocator, store: Store, ref: Ref, lower: KeyView, upper: ?KeyView, first: ?KeyView, end: ?KeyView) anyerror!u64 {
+    if (end) |key| if (!keyLess(lower, key)) return 0;
     if (first) |key| {
-        if (upper) |bound| if (!less(key, bound)) return 0;
-        if (!less(key, lower) and (upper == null or (end != null and !less(upper.?, end.?)))) return ref.records;
+        if (upper) |bound| if (!keyLess(key, bound)) return 0;
+        if (!keyLess(key, lower) and (upper == null or (end != null and !keyLess(upper.?, end.?)))) return ref.records;
     }
-    var page = try load(alloc, store, ref);
+    var page = try readNavigationPage(alloc, store, ref);
     defer page.deinit(alloc);
-    if (first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
-    if (end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+    if (first) |key| if (key.order(page.key(0)) != .eq) return error.InvalidGraphPage;
+    if (end) |key| if (!keyLess(page.key(page.entries.len - 1), key)) return error.InvalidGraphPage;
+    const low = page.probeView(lower);
+    const high = if (upper) |bound| page.probeView(bound) else null;
+    // Counts are authoritative only after normal page authentication. An
+    // unbounded range can then consume the root count without visiting keys.
+    if (high == null and !keyLess(page.key(0), low)) return ref.records;
     var count: u64 = 0;
     for (page.entries, 0..) |entry, i| {
-        if (upper) |bound| if (!less(entry.key, bound)) break;
+        const key = page.key(i);
+        if (high) |bound| if (!keyLess(key, bound)) break;
         if (entry.child) |child_ptr| {
             const child = child_ptr.*;
-            count = try std.math.add(u64, count, try countInner(alloc, store, child, lower, upper, entry.key, if (i + 1 < page.entries.len) page.entries[i + 1].key else end));
-        } else if (!less(entry.key, lower)) count += 1;
+            count = try std.math.add(u64, count, try countInner(alloc, store, child, low, high, key, if (i + 1 < page.entries.len) page.key(i + 1) else end));
+        } else if (!keyLess(key, low)) count += 1;
     }
     return count;
 }
@@ -2227,36 +2249,47 @@ pub fn countSortedRanges(alloc: Allocator, store: Store, root: ?Ref, source: any
         source: @TypeOf(source),
         range: ?Range = null,
         counts: RangeCounts = .{},
+        generation: u64 = 0,
         fn advance(self: *@This()) !bool {
             try self.store.check(self.store.ptr);
             self.range = try self.source.next();
+            self.generation +|= 1;
             if (self.range) |range| {
                 if (range.upper) |upper| if (!less(range.lower, upper)) return error.InvalidGraphPage;
                 self.counts.ranges +|= 1;
             }
             return self.source.admit(self.counts);
         }
-        fn visit(self: *@This(), ref: Ref, first: ?[]const u8, end: ?[]const u8) anyerror!bool {
+        fn visit(self: *@This(), ref: Ref, first: ?KeyView, end: ?KeyView) anyerror!bool {
             if (self.range == null) return true;
-            var page = try load(self.a, self.store, ref);
+            var page = try readNavigationPage(self.a, self.store, ref);
             defer page.deinit(self.a);
             self.counts.pages +|= 1;
             if (!try self.source.admit(self.counts)) return false;
-            if (first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
-            if (end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+            if (first) |key| if (key.order(page.key(0)) != .eq) return error.InvalidGraphPage;
+            if (end) |key| if (!keyLess(page.key(page.entries.len - 1), key)) return error.InvalidGraphPage;
+            var generation: u64 = 0;
+            var low: KeyView = undefined;
+            var high: ?KeyView = null;
             for (page.entries, 0..) |entry, i| {
+                const key = page.key(i);
                 while (self.range) |range| {
-                    if (range.upper == null or less(entry.key, range.upper.?)) break;
+                    if (generation != self.generation) {
+                        low = page.probeKey(range.lower);
+                        high = if (range.upper) |bound| page.probeKey(bound) else null;
+                        generation = self.generation;
+                    }
+                    if (high == null or keyLess(key, high.?)) break;
                     if (!try self.advance()) return false;
                 }
-                const range = self.range orelse return true;
-                const child_end = if (i + 1 < page.entries.len) page.entries[i + 1].key else end;
+                if (self.range == null) return true;
+                const child_end = if (i + 1 < page.entries.len) page.key(i + 1) else end;
                 if (entry.child) |child_ptr| {
                     const child = child_ptr.*;
-                    if (child_end) |bound| if (!less(range.lower, bound)) continue;
-                    const covered = !less(entry.key, range.lower) and (range.upper == null or (child_end != null and !less(range.upper.?, child_end.?)));
-                    if (covered) self.counts.records +|= child.records else if (!try self.visit(child, entry.key, child_end)) return false;
-                } else if (!less(entry.key, range.lower)) self.counts.records +|= 1;
+                    if (child_end) |bound| if (!keyLess(low, bound)) continue;
+                    const covered = !keyLess(key, low) and (high == null or (child_end != null and !keyLess(high.?, child_end.?)));
+                    if (covered) self.counts.records +|= child.records else if (!try self.visit(child, key, child_end)) return false;
+                } else if (!keyLess(key, low)) self.counts.records +|= 1;
                 if (!try self.source.admit(self.counts)) return false;
             }
             return true;
@@ -4241,4 +4274,161 @@ test "external lake metadata navigation compressed occupancy repair preserves ex
     }
     try std.testing.expect((try cursor.nextView()) == null);
     try std.testing.expectEqual(@as(u64, count), original.records);
+}
+
+test "serverless graph compact metadata probes keep warm ranks counts and membership allocation free" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    var store = memory.store();
+    store.prefix_keys = true;
+    const width = 4096;
+    const keys = try a.alloc([width]u8, 64);
+    defer a.free(keys);
+    var builder: SortedBuilder = .{ .alloc = a, .store = store, .target_bytes = 256 };
+    defer builder.deinit();
+    for (keys, 0..) |*key, i| {
+        @memset(key, 'w');
+        std.mem.writeInt(u32, key[width - 4 ..], @intCast(2 * i + 2), .big);
+        try builder.add(key, "v");
+    }
+    const root = (try builder.finish()).?;
+    try std.testing.expect(root.height > 0);
+    var cache: Cache = .{ .alloc = a, .underlying = store, .decoded = true, .max_bytes = 16 * 1024 * 1024 };
+    defer cache.deinit();
+    {
+        var cursor = try Cursor.init(a, cache.store(), root, "", null);
+        defer cursor.deinit();
+        var seen: usize = 0;
+        while (try cursor.nextView()) |_| seen += 1;
+        try std.testing.expectEqual(keys.len, seen);
+    }
+    var navigation = try readNavigationPage(a, cache.store(), root);
+    try std.testing.expect(navigation.retainedBytes() <= readWorkspace(root));
+    try std.testing.expect(readWorkspace(root) < max_page_bytes);
+    navigation.deinit(a);
+    const reads = memory.reads;
+    var reject_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const no_alloc = reject_allocations.allocator();
+    for (keys, 0..) |*key, i| try std.testing.expectEqual(@as(u64, @intCast(i)), try rankOf(no_alloc, cache.store(), root, key));
+    const input = [_][]const u8{ &keys[63], &keys[0], &keys[31], &keys[31], &keys[32] };
+    var ranks: [input.len]u64 = undefined;
+    try ranksOf(no_alloc, cache.store(), root, &input, &ranks);
+    try std.testing.expectEqualSlices(u64, &.{ 63, 0, 31, 31, 32 }, &ranks);
+    try std.testing.expectError(error.InvalidGraphPage, rankOf(no_alloc, cache.store(), root, "missing"));
+    try std.testing.expectEqual(@as(u64, 64), try countRange(no_alloc, cache.store(), root, "", null));
+    try std.testing.expectEqual(@as(u64, 0), try countRange(no_alloc, cache.store(), root, "a", "b"));
+    try std.testing.expectEqual(@as(u64, 0), try countRange(no_alloc, cache.store(), root, "z", null));
+    try std.testing.expectEqual(@as(u64, 0), try countRange(no_alloc, cache.store(), root, &keys[11], &keys[11]));
+    try std.testing.expectEqual(@as(u64, 45), try countRange(no_alloc, cache.store(), root, &keys[7], &keys[52]));
+    var found: [4]bool = undefined;
+    try containsMany(no_alloc, cache.store(), root, &.{ "a", &keys[1], &keys[63], "z" }, &found);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true, false }, &found);
+    // The producer reuses its bounds on every advance. Recursive pages must
+    // refresh their normalized views after a child advances that producer.
+    const Ranges = struct {
+        at: u32 = 0,
+        lower: [width]u8 = @splat('w'),
+        upper: [width]u8 = @splat('w'),
+        limit: u64 = 64,
+        pub fn next(self: *@This()) !?Range {
+            if (self.at == 32) return null;
+            std.mem.writeInt(u32, self.lower[width - 4 ..], self.at * 4 + 2, .big);
+            std.mem.writeInt(u32, self.upper[width - 4 ..], self.at * 4 + 4, .big);
+            self.at += 1;
+            return .{ .lower = &self.lower, .upper = &self.upper };
+        }
+        pub fn admit(self: *@This(), counts: RangeCounts) !bool {
+            return counts.records <= self.limit;
+        }
+    };
+    var ranges: Ranges = .{};
+    const counted = (try countSortedRanges(no_alloc, cache.store(), root, &ranges)).?;
+    try std.testing.expectEqual(@as(u64, 32), counted.records);
+    var bounded: Ranges = .{ .limit = 1 };
+    try std.testing.expect((try countSortedRanges(no_alloc, cache.store(), root, &bounded)) == null);
+    try std.testing.expectEqual(reads, memory.reads);
+    try std.testing.expectEqual(@as(usize, 0), reject_allocations.allocations);
+    memory.canceled = true;
+    try std.testing.expectError(error.Canceled, rankOf(no_alloc, cache.store(), root, &keys[0]));
+    try std.testing.expectError(error.Canceled, countRange(no_alloc, cache.store(), root, "", null));
+    try std.testing.expectError(error.Canceled, ranksOf(no_alloc, cache.store(), root, &input, &ranks));
+    memory.canceled = false;
+    cache.underlying.domain[0] = 1;
+    try std.testing.expectError(error.GraphPageDomainMismatch, countRange(no_alloc, cache.store(), root, "", null));
+}
+
+test "serverless graph compact batched probes own only returned keys and preserve compressed gaps" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    var store = memory.store();
+    store.prefix_keys = true;
+    const width = 512;
+    var builder: SortedBuilder = .{ .alloc = a, .store = store, .target_bytes = 256 };
+    defer builder.deinit();
+    var key: [width]u8 = @splat('x');
+    for (0..64) |i| {
+        std.mem.writeInt(u32, key[width - 4 ..], @intCast(2 * i + 2), .big);
+        try builder.add(&key, "v");
+    }
+    const root = (try builder.finish()).?;
+    var cache: Cache = .{ .alloc = a, .underlying = store, .decoded = true, .max_bytes = 16 * 1024 * 1024 };
+    defer cache.deinit();
+    {
+        var cursor = try Cursor.init(a, cache.store(), root, "", null);
+        defer cursor.deinit();
+        while (try cursor.nextView()) |_| {}
+    }
+    const probes = [_]u32{ 128, 17, 2, 17, 16, 129, 0, 63, 64, 65, 126 };
+    var keys: [probes.len][width]u8 = @splat(@splat('x'));
+    var pointers: [probes.len][]const u8 = undefined;
+    for (&keys, &pointers, probes) |*bytes, *pointer, ordinal| {
+        std.mem.writeInt(u32, bytes[width - 4 ..], ordinal, .big);
+        pointer.* = bytes;
+    }
+    const Check = struct {
+        fn run(alloc: Allocator, backing: Store, ref: Ref, input: []const []const u8, ordinals: []const u32, lower: bool) !void {
+            const values = try lookupBatch(alloc, backing, ref, input, lower);
+            defer {
+                for (values) |entry| if (entry) |value| value.deinit(alloc);
+                alloc.free(values);
+            }
+            for (values, ordinals) |entry, ordinal| {
+                const expected = if (lower and ordinal < 2) 2 else if (lower and ordinal % 2 != 0) ordinal + 1 else ordinal;
+                if (expected > 128 or expected < 2 or expected % 2 != 0) {
+                    try std.testing.expect(entry == null);
+                } else {
+                    try std.testing.expectEqual(expected, std.mem.readInt(u32, entry.?.key[width - 4 ..][0..4], .big));
+                    try std.testing.expectEqual(@as(u64, expected / 2 - 1), entry.?.rank);
+                    try std.testing.expectEqualStrings("v", entry.?.value);
+                }
+            }
+        }
+    };
+    const reads = memory.reads;
+    for ([_]bool{ false, true }) |lower| {
+        var measured = std.testing.FailingAllocator.init(a, .{});
+        try Check.run(measured.allocator(), cache.store(), root, &pointers, &probes, lower);
+        // Returned BatchEntry descriptors plus one complete key and value per
+        // match are the only allocations; no reached page is expanded.
+        try std.testing.expect(measured.allocated_bytes <= probes.len * (@sizeOf(?BatchEntry) + width + 1));
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+        try std.testing.checkAllAllocationFailures(a, Check.run, .{ cache.store(), root, &pointers, &probes, lower });
+    }
+    try std.testing.expectEqual(reads, memory.reads);
+}
+
+test "serverless graph compact probe rebasing preserves shorter differing and extended prefixes" {
+    const key = "abcdefghijk";
+    const candidate = "abcdefghijz";
+    for (0..key.len + 1) |split| {
+        const view: KeyView = .{ .prefix = key[0..split], .suffix = key[split..] };
+        for (0..candidate.len + 1) |prefix_len| {
+            const page: NavigationPage = .{ .bytes = "", .entries = &.{}, .ref = undefined, .prefix = candidate[0..prefix_len] };
+            const normalized = page.probeView(view);
+            try std.testing.expectEqual(.eq, normalized.order(.from(key)));
+            try std.testing.expectEqual(std.mem.order(u8, key, candidate), normalized.order(.from(candidate)));
+        }
+    }
 }

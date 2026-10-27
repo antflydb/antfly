@@ -1365,6 +1365,45 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
                         == "bounded_ordered_lake_index"
                     )
                     assert actual["profile"]["sort"]["ordered_scanned_count"] <= 129
+                    # Long predicate bounds exercise compact range counts and
+                    # reverse membership probes, in addition to a wide unused
+                    # sort suffix. Both primary directions preserve public ties.
+                    filtered = dict(
+                        request,
+                        filter_query={
+                            "conjuncts": [
+                                {"range": {"path": "/bucket", "gte": 0, "lte": 0}},
+                                {
+                                    "range": {
+                                        "path": "/wide",
+                                        "gte": data["wide"][32],
+                                        "lt": data["wide"][64],
+                                    }
+                                },
+                            ]
+                        },
+                    )
+                    reference = client.query(
+                        {"request": dict(filtered, order_by=[{"field": "_id"}])}
+                    )
+                    assert len(reference["hits"]["hits"]) == 32
+                    for descending in (False, True):
+                        selected = client.query(
+                            {
+                                "request": dict(
+                                    filtered,
+                                    order_by=[{"field": "bucket", "desc": descending}],
+                                )
+                            }
+                        )
+                        assert selected["hits"]["total"] == reference["hits"]["total"]
+                        assert [
+                            {key: value for key, value in hit.items() if key != "_sort"}
+                            for hit in selected["hits"]["hits"]
+                        ] == [
+                            {key: value for key, value in hit.items() if key != "_sort"}
+                            for hit in reference["hits"]["hits"]
+                        ]
                 else:
                     for term, descending, wanted in (
                         ("pulsar", False, list(range(8128, 8148))),

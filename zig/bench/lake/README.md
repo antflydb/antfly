@@ -892,3 +892,53 @@ page/graph checks pass, with one declared benchmark skip and zero failures or
 leaks. All 35 selected real Parquet/Iceberg E2Es pass without skips. Benchmark
 tooling's 18 tests, formatting, license, Apache boundary (2,542 source files) and
 whitespace checks pass. Latest fetched main `ef25cb9405` is already merged.
+
+### Compact rank, count and membership probes
+
+Read-only metadata probes now retain compact navigation leases through rank,
+point/lower-bound batches, membership, range counts and sorted-range zippers.
+Seek bounds share a page's prefix after one prefix check. Recursive range counts
+retain normalized bounds while their ancestor leases remain live, and zipper
+frames refresh bounds after their range producer advances. Batched results own
+only returned complete keys/values; mutation and visitor interfaces stay intact.
+Navigation I/O admission no longer reserves an unused expanded-key buffer.
+
+The production-code kernel comparison uses 64 keys of 131,000 bytes, a fully
+warmed decoded cache and three alternating before/after samples in Zig 0.17.0
+Debug. Rank/count kernels run 256 operations per sample; batches run 32 operations
+with eight requested keys. All answers match, every allocation is released, and
+all measured loops make zero additional backing-store reads.
+
+| Kernel | Reviewed median per operation | Final median per operation |
+|---|---:|---:|
+| Exact rank | 4.29 ms | 1.95 ms |
+| Unbounded count | 26.0 us | 1.2 us |
+| Bounded count | 19.04 ms | 7.30 ms |
+| Eight exact ranks | 35.64 ms | 24.12 ms |
+| Eight owned point lookups | 39.65 ms | 28.32 ms |
+| Eight membership probes | 33.34 ms | 21.81 ms |
+
+Warm rank/count/membership probes allocate zero key buffers. Rank removes
+2,227,952 temporary allocated bytes per operation; bounded count removes
+3,276,400 bytes. Eight point lookups reduce allocated bytes from 9,567,032 to
+1,048,392, retaining the required owned result keys and values.
+
+The earlier native-order restart slowdown did not reproduce with the same frozen
+executables. In the repeat, original/reviewed forward restart medians were
+127.24/109.09 ms and reverse medians were 129.02/103.30 ms. The earlier contrary
+observation remains above. Three sequential samples on a shared Debug host do
+not establish a causal startup regression or improvement; no startup policy was
+changed on that evidence. Restarts retain OS/persistent caches and readiness
+warming. Kernel improvements are distinct from whole-query gains.
+
+To repeat the kernel comparison from this worktree:
+
+```sh
+mkdir -p .benchmark-results/lake/compact-metadata-probes
+git show 3b1675bd94:zig/pkg/antfly/src/serverless/graph_segment/page_tree.zig > .benchmark-results/lake/compact-metadata-probes/before.zig
+~/bin/zig test -lc --cache-dir zig/.zig-cache --global-cache-dir zig/.zig-cache/global \
+  --test-filter compact_metadata_production_comparison --dep before --dep after \
+  -Mroot=zig/bench/lake/compact_metadata_probe.zig \
+  -Mbefore=.benchmark-results/lake/compact-metadata-probes/before.zig \
+  -Mafter=zig/pkg/antfly/src/serverless/graph_segment/page_tree.zig
+```
