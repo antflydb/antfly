@@ -1364,3 +1364,30 @@ Cloudflare documents [bucket location hints](https://developers.cloudflare.com/r
 as creation-time best effort and [Worker placement](https://developers.cloudflare.com/workers/configuration/placement/)
 as a separate setting. Any future placement comparison needs declared profiles
 and fresh evidence, not an inferred improvement from a setting name.
+
+
+## Drain obsolete proof I/O after authenticated metadata reads
+
+Starting the new checkpoint's probes early still leaves an avoidable dependency:
+the checkpoint wrapper waits for every obsolete probe before returning the
+checkpoint to native recovery. The native-backed regression now holds an old
+tail request after a newer checkpoint is available. Restoring the previous wait
+reproduces a blocked metadata read; the revised path reads the newly committed
+value before that old request is released.
+
+Warm proof transports now expose an operation-local drain. Native authentication
+and metadata-row reads proceed from the relevant checkpoint, seal and tail;
+`readOnly` drains every outstanding speculative request before releasing its
+snapshot-reader admission or returning. Error paths retain the same ownership,
+and a successful callback cannot bypass the original five-second deadline while
+waiting for final drain. No negative probe is shared across observations. The
+maximum five proof keys, four speculative reservations, transfer limits and
+native authority checks are unchanged.
+
+This overlaps metadata work with obsolete I/O; it does not remove the final I/O
+wait or start the application's lookup before admission completes. Native tests
+cover progress, failure cleanup and deadline expiry, and actual-workerd tests
+cover request-context lifetime and direct-read recovery. A 16,384-row metadata
+scale/reopen/collection run also exercises the final observer without writes.
+These establish the dependency correction; deployed latency still needs a fresh
+measurement of this runtime.

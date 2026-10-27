@@ -509,13 +509,30 @@ test('warm unowned proof reads overlap checkpoint and tail without reusing negat
 });
 
 test('advanced checkpoint probes overlap obsolete tail I/O and drain before returning',async()=>{
- const bucket=new Bucket(),raw=createR2Transport({database:bucket});let now=Date.now(),hold=false,oldKey,newKey,release,notify,returned=false;const held=new Promise(r=>release=r),newStarted=new Promise(r=>notify=r),calls=[];
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let now=Date.now(),hold=false,oldKey,newKey,release,notify,readNotify,returned=false;const dataRead=new Promise(r=>readNotify=r),held=new Promise(r=>release=r),newStarted=new Promise(r=>notify=r),calls=[];
  const writer=new R2CoordinatorStore(module,bucket,'checkpoint-proof-overlap',{clock:()=>now});await writer.transaction(tx=>tx.put('value',1));
  const observer=new R2CoordinatorStore(module,bucket,'checkpoint-proof-overlap',{clock:()=>now,transport:async(request,body)=>{calls.push(request.key);if(hold&&request.key===newKey)notify();if(hold&&request.key===oldKey)await held;return raw(request,body);}});assert.equal(await observer.readOnly(tx=>tx.get('value')),1);
  const key=state=>writer.base+'/epochs/'+Array.from(state.epoch,n=>n.toString(16).padStart(2,'0')).join('')+'/'+String(state.next).padStart(20,'0')+'.json';oldKey=key(observer.observedState);await writer.transaction(tx=>tx.put('value',2));now+=1001;await writer.checkpointHint();newKey=key(writer.state);assert.notEqual(oldKey,newKey);calls.length=0;hold=true;
- const reading=observer.readOnly(tx=>tx.get('value')).then(value=>{returned=true;return value;});
- try{assert.equal(await Promise.race([newStarted.then(()=>true),new Promise(r=>setTimeout(()=>r(false),250))]),true,'fresh checkpoint probes must not wait for the obsolete tail');assert.equal(returned,false,'unused old I/O must still drain before returning');}finally{hold=false;release();await reading;}
+ const reading=observer.readOnly(async tx=>{const value=await tx.get('value');readNotify(value);return value;}).then(value=>{returned=true;return value;});
+ try{assert.equal(await Promise.race([newStarted.then(()=>true),new Promise(r=>setTimeout(()=>r(false),250))]),true,'fresh checkpoint probes must not wait for the obsolete tail');assert.equal(await Promise.race([dataRead,new Promise(r=>setTimeout(()=>r('blocked'),250))]),2,'authenticated data reads must progress while obsolete I/O drains');assert.equal(observer.snapshotReaders,1,'admission remains reserved until all speculative I/O settles');assert.equal(returned,false,'unused old I/O must still drain before returning');}finally{hold=false;release();await reading;}
  assert.equal(await reading,2);assert.equal(calls.filter(k=>k===newKey).length,1,'reuse each primed result once without an extra GET');assert.equal(observer.acquired,false);
+});
+
+test('failed warm observations retain admission until obsolete speculative I/O settles',async()=>{
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let now=Date.now(),oldKey,hold=false,release,entered,finished=false;const held=new Promise(r=>release=r),reached=new Promise(r=>entered=r);
+ const writer=new R2CoordinatorStore(module,bucket,'checkpoint-proof-error',{clock:()=>now});await writer.transaction(tx=>tx.put('value',1));
+ const observer=new R2CoordinatorStore(module,bucket,'checkpoint-proof-error',{clock:()=>now,transport:async(request,body)=>{if(hold&&request.key===oldKey){await held;throw Error('UnusedProbeFailed');}return raw(request,body);}});
+ await observer.readOnly(tx=>tx.get('value'));oldKey=writer.base+'/epochs/'+Array.from(observer.observedState.epoch,n=>n.toString(16).padStart(2,'0')).join('')+'/'+String(observer.observedState.next).padStart(20,'0')+'.json';
+ await writer.transaction(tx=>tx.put('value',2));now+=1001;await writer.checkpointHint();hold=true;
+ const reading=observer.readOnly(async tx=>{assert.equal(await tx.get('value'),2);entered();throw Error('ObservationCallbackFailed');}).finally(()=>{finished=true;});const failed=assert.rejects(reading,/ObservationCallbackFailed/);
+ try{assert.equal(await Promise.race([reached.then(()=>true),new Promise(r=>setTimeout(()=>r(false),250))]),true);assert.equal(finished,false);assert.equal(observer.snapshotReaders,1);}finally{release();await failed;}
+ assert.equal(observer.snapshotReaders,0);hold=false;assert.equal(await observer.readOnly(tx=>tx.get('value')),2);
+});
+
+test('warm observation completion preserves its original deadline through final draining',async()=>{
+ const bucket=new Bucket();let now=Date.now();const writer=new R2CoordinatorStore(module,bucket,'proof-drain-deadline',{clock:()=>now});await writer.transaction(tx=>tx.put('value',1));
+ const observer=new R2CoordinatorStore(module,bucket,'proof-drain-deadline',{clock:()=>now});await observer.readOnly(tx=>tx.get('value'));
+ await assert.rejects(observer.readOnly(async tx=>{assert.equal(await tx.get('value'),1);now+=5000;return 1;}),/DeadlineExceeded/);assert.equal(observer.snapshotReaders,0);assert.equal(await observer.readOnly(tx=>tx.get('value')),1);
 });
 
 test('ambiguous metadata deadlines retain native reservations and recover the late durable commit', {timeout:5000},async()=>{

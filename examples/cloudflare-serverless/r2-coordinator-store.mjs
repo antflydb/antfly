@@ -177,7 +177,7 @@ export class R2CoordinatorStore {
     }catch(error){
       if(admissionBudgetExceeded||["ObjectIoBudgetExceeded","HostedWorkingSetBudgetExceeded"].includes(error?.message)){outcome="needs_admission";throw Error("ReadSnapshotNeedsAdmission");}
       throw error;
-    }finally{this.snapshotReaders--;try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}}
+    }finally{await proofTransport.drain?.();this.snapshotReaders--;const expired=outcome==="ok"&&this.clock()>=deadlineMs;if(expired)outcome="error";try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}if(expired)throw Error("DeadlineExceeded");}
   }
   commitWal(commit,{deadlineMs=Infinity,traceId}={}){
     return this.enqueue({kind:"commit_wal",commit,deadlineMs,traceId,priority:"interactive"});

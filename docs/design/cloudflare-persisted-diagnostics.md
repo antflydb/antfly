@@ -138,3 +138,70 @@ qualification remains incomplete; all reserved cold epochs remain unused.
 
 References: [Workers Query Builder](https://developers.cloudflare.com/workers/observability/query-builder/)
 and [telemetry query API](https://developers.cloudflare.com/api/resources/workers/subresources/observability/subresources/telemetry/methods/query/).
+
+
+## Physical attempts and invocation accounting
+
+The common driver now records each physical HTTP attempt, including admission
+retries and transport failures, in a bounded 20,000-entry ledger. A unique UUID
+query parameter identifies each attempt without changing the frozen control's
+source or request body. Reports retain timestamps, status, deployment UUID and a
+SHA-256 digest of the normalized response Ray ID; they retain no raw Ray IDs,
+HTTP URLs, headers, credentials or document bodies. Overflow is a sticky failure.
+The declared request-identity policy applies equally to both sides.
+
+Persisted window schema two adds hashed attempt and Ray identities, deployment
+UUID and an allowlisted invocation type. The independent reader continues to
+verify original schema-one artifacts. Accounting checks four exact role scopes,
+contiguous declared windows, deployment versions, duplicate/conflicting event
+identities, every acknowledged request and its Ray ID, and unfinished attempts.
+Counts must come from a separately scoped, unsampled platform counter with the
+same Worker and time range. Empty logs, missing counters, estimated counts and
+ambiguous transport failures cannot silently establish coverage. These checks
+remain diagnostic-only; the gate evaluator has no new acceptance path.
+
+The fresh workload command is:
+
+```sh
+node qualification/run-coverage-probe.mjs   dist/qualification/gate-mvnf29dvfe41/gate.json 3 --seconds=600
+```
+
+It requires a sealed, deployed, paused pair with unused recovery epochs, resumes
+only that pair, captures eight auxiliary live streams, drives the existing
+fixed-arrival workload, and pauses both sides in cleanup. It audits one interior
+minute twice after settlement. It explicitly does not claim whole-execution
+coverage or exact body/receipt verification. Each invocation writes a distinct
+private report directory; subsequent versions also snapshot the diagnostic
+driver sources. Live socket gaps remain recorded even when this diagnostic
+experiment continues collecting load. This behavior does not change the strict
+gate's immediate cancellation rule.
+
+Independent counter exploration uses Workers `workersInvocationsAdaptive` for
+public invocations and Durable Objects
+`durableObjectsInvocationsAdaptiveGroups` for private RPC invocations. Historical
+Worker and writer aggregates both report sampling above one. Some private-role
+rows are unsampled, but that cannot establish an exact population for all roles
+or account for Queue/cron/alarm invocations through the wrong dataset. See
+[Durable Object metrics](https://developers.cloudflare.com/durable-objects/observability/metrics-and-analytics/).
+The dedicated observability token works; more token permission does not repair
+sampled data.
+
+A durable export is the next transport candidate, not an automatic coverage
+proof. An isolated Tail Worker should sanitize before persistence, write bounded
+immutable batches to an observability-only R2 prefix/bucket, retain terminal
+outcomes after `waitUntil`, and independently verify object hashes and settled
+execution windows. Keep its storage and CPU outside the database's admission
+path; instrument the same producer roles on both sides. Never use timestamps as
+unique invocation IDs. HTTP identities can use the ledger; private/background
+identities and independent exact totals still need a verified source. Missing
+IDs, dropped batches, unknown versions, exporter failures, sampling or missing
+expected invocations must fail closed.
+
+Cloudflare documents a Tail Worker invocation after producer execution, but its
+[handler schema](https://developers.cloudflare.com/workers/runtime-apis/handlers/tail/)
+does not promise unique private-RPC identities or an at-least-once export
+contract. R2 durability only protects batches that reach R2; it cannot recover
+an invocation never delivered to the exporter. Validate those boundaries with a
+small canary and independently counted injected failures before connecting a
+new transport to gate evaluation. Keep the frozen control, original failures,
+thresholds, and all recovery epochs intact until that prerequisite succeeds.

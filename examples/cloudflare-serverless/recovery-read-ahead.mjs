@@ -31,19 +31,23 @@ export function warmRecoveryReadAhead(transport,{base,cursor,reserve=()=>{}}={})
  // Reserve the maximum four speculative keys before native admission. This
  // remains inside the existing per-observation operation and transfer bounds.
  reserve(4,4*16384);
- return async(request,body)=>{
+ const outstanding=new Set();
+ const read=async(request,body)=>{
   if(request.op!=='get')return transport(request,body);
   if(request.key===checkpoint&&!primed){
    primed=true;
-   const start=key=>{if(!pending.has(key))pending.set(key,Promise.resolve().then(()=>transport({...request,key,max_response_bytes:16384},new Uint8Array())).then(value=>({value}),error=>({error})));return pending.get(key);};
+   const start=key=>{if(!pending.has(key)){const task=Promise.resolve().then(()=>transport({...request,key,max_response_bytes:16384},new Uint8Array())).then(value=>({value}),error=>({error}));pending.set(key,task);outstanding.add(task);task.then(()=>outstanding.delete(task));}return pending.get(key);};
    const floor=start(checkpoint);for(const key of keys(prior))start(key);
    const result=await floor,fresh=state(result.value&&parse(result.value)?.state);
    if(fresh&&fresh.revision>prior.revision)for(const key of keys(fresh))start(key);
-   await Promise.all(pending.values());
   }
   if(pending.has(request.key)){const result=await pending.get(request.key);pending.delete(request.key);if(result.error)throw result.error;return result.value;}
   return transport(request,body);
  };
+ // The observation owns every speculative request, including unused results.
+ // Its caller must drain before releasing admission or reporting completion.
+ read.drain=async()=>{await Promise.all(outstanding);};
+ return read;
 }
 export function recoveryReadAhead(transport,{window=8,initialWindow=window,reserve=()=>{},cursor,followSeals=false}={}){
  if(!Number.isInteger(window)||window<1||window>16||!Number.isInteger(initialWindow)||initialWindow<1||initialWindow>window)throw new Error("InvalidRecoveryWindow");

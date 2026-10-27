@@ -19,6 +19,7 @@ import {createHash} from 'node:crypto';
 import {assertGateRun} from './gate-scope.mjs';
 import {sanitizeTailEvent} from './metrics-tail.mjs';
 import {DiagnosticCoverage} from './live-diagnostics.mjs';
+import {rayIdentity,versionIdentity,requestAttemptIdentity,invocationTypes} from './invocation-accounting.mjs';
 
 const roles = ['app', 'writer', 'reader', 'builder'];
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -67,7 +68,10 @@ export function sanitizePersistedEvent(row, worker, timeframe) {
     // field names as a CPU-limit failure.
     ...(typeof metadata.error==='string'?{exceptions:[{name:'Error',message:metadata.error}]}:{}),
   }) ?? {};
-  return {event_id_sha256: digest(metadata.id), invocation_id_sha256: digest(requestId), timestamp: row.timestamp, invocation, event};
+  return {event_id_sha256: digest(metadata.id), invocation_id_sha256: digest(requestId), timestamp: row.timestamp, invocation, event,
+    ray_id_sha256:rayIdentity(metadata.rayId),version_id:versionIdentity(context?.scriptVersion?.id),
+    attempt_id_sha256:requestAttemptIdentity(metadata.url??context?.event?.request?.url??row.source?.request?.url),
+    event_type:invocationTypes.has(context?.eventType)?context.eventType:'unknown'};
 }
 
 // Complete one small window with before/after aggregate reconciliation.
@@ -111,7 +115,7 @@ export async function collectPersistedWindow(run, role, token, timeframe, {fetch
     // conveys no sampling/delivery evidence; pagination and the final count
     // still must independently confirm an empty stored set.
     if(aggregate.value===0&&aggregate.sampleInterval===0)return 0;
-    if (aggregate.sampleInterval !== 1) fail('DiagnosticIngestionSampled');
+    if (aggregate.sampleInterval !== 1) throw Object.assign(Error('DiagnosticIngestionSampled'),{diagnostic:{sample_interval:Number.isFinite(aggregate.sampleInterval)?aggregate.sampleInterval:null,estimated_events:aggregate.value}});
     return aggregate.value;
   }
   const before = await count(), rows = [], seen = new Set(), invocations = new Set(); let offset;
@@ -136,7 +140,7 @@ export async function collectPersistedWindow(run, role, token, timeframe, {fetch
   const coverage = new DiagnosticCoverage([run]);
   for (const row of rows) coverage.observe(run.id, role, row.event);
   const observed = coverage.stream(run.id, role);
-  return {schema: 1, qualification: false, worker, role, timeframe: {...timeframe},
+  return {schema: 2, qualification: false, worker, role, timeframe: {...timeframe},
     collected_started_at,collected_finished_at:clock(),
     reconciled: true, events: rows.length, invocations: rows.filter(row => row.invocation).length,
     invocation_errors:rows.filter(row=>row.invocation&&row.event.outcome!=='ok').length,

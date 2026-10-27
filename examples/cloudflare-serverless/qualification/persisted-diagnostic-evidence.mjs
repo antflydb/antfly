@@ -20,6 +20,7 @@ import {isDeepStrictEqual} from 'node:util';
 import {assertGateRun} from './gate-scope.mjs';
 import {DiagnosticCoverage} from './live-diagnostics.mjs';
 import {sanitizeTailEvent} from './metrics-tail.mjs';
+import {versionIdentity,invocationTypes} from './invocation-accounting.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
 // This verifies local evidence integrity and repeatability, not unsampled
@@ -43,11 +44,13 @@ export async function verifyPersistedProbe(directory,runs){
    const info=await stat(artifact.path);if(!info.isFile()||info.size!==artifact.bytes||await realpath(artifact.path)!==artifact.path)return false;
    const bytes=await readFile(artifact.path);if(bytes.length!==artifact.bytes||hash(bytes)!==artifact.sha256)return false;
    const window=JSON.parse(bytes);
-   if(window.schema!==1||window.qualification!==false||window.reconciled!==true||window.worker!==scope.worker||window.role!==scope.role||!isDeepStrictEqual(window.timeframe,report.timeframe)||!Array.isArray(window.rows)||window.rows.length>20000||window.events!==window.rows.length||window.events!==artifact.events||window.invocations!==artifact.invocations||window.rows_sha256!==hash(JSON.stringify(window.rows)))return false;
+   if(![1,2].includes(window.schema)||window.qualification!==false||window.reconciled!==true||window.worker!==scope.worker||window.role!==scope.role||!isDeepStrictEqual(window.timeframe,report.timeframe)||!Array.isArray(window.rows)||window.rows.length>20000||window.events!==window.rows.length||window.events!==artifact.events||window.invocations!==artifact.invocations||window.rows_sha256!==hash(JSON.stringify(window.rows)))return false;
    if(!Number.isSafeInteger(window.collected_started_at)||!Number.isSafeInteger(window.collected_finished_at)||window.collected_started_at<to+60000||window.collected_finished_at<window.collected_started_at||window.collected_finished_at-window.collected_started_at>120000)return false;
    const seen=new Set(),invocations=new Set(),coverage=new DiagnosticCoverage([scope.run]);
    for(const row of window.rows){
-    if(Object.keys(row).sort().join(',')!=='event,event_id_sha256,invocation,invocation_id_sha256,timestamp'||!Number.isSafeInteger(row.timestamp)||row.timestamp<from||row.timestamp>to||typeof row.invocation!=='boolean'||!isDeepStrictEqual(sanitizeTailEvent(row.event)??{},row.event))return false;
+    const keys=window.schema===1?'event,event_id_sha256,invocation,invocation_id_sha256,timestamp':'attempt_id_sha256,event,event_id_sha256,event_type,invocation,invocation_id_sha256,ray_id_sha256,timestamp,version_id';
+    if(Object.keys(row).sort().join(',')!==keys||!Number.isSafeInteger(row.timestamp)||row.timestamp<from||row.timestamp>to||typeof row.invocation!=='boolean'||!isDeepStrictEqual(sanitizeTailEvent(row.event)??{},row.event))return false;
+    if(window.schema===2){for(const id of[row.ray_id_sha256,row.attempt_id_sha256])if(id!==null&&!/^[a-f0-9]{64}$/.test(id))return false;if(row.version_id!==null&&!versionIdentity(row.version_id)||!invocationTypes.has(row.event_type))return false;}
     for(const id of[row.event_id_sha256,row.invocation_id_sha256])if(!/^[a-f0-9]{64}$/.test(id))return false;
     if(seen.has(row.event_id_sha256))return false;seen.add(row.event_id_sha256);
     if(row.invocation){if(invocations.has(row.invocation_id_sha256))return false;invocations.add(row.invocation_id_sha256);}
