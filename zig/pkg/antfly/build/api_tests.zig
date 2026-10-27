@@ -2248,6 +2248,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed txn SQL search paths retain local committed savepoint and recovery state",
             "SQL durable search paths encode compact names own decoded bytes and reject invalid state",
             "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes",
+            "SQL statement read admission calls native capture once without write authority",
             "SQL drop retirement",
             "relational row query primary digest transport preserves snapshot proof and rejects missing or invalid headers",
             "httpx SQL policy observation rejects public capabilities even in legacy internal mode",
@@ -2370,7 +2371,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     timing_run.addArg("--require-no-skips");
     const named_timing_filter = "mounted SQL named FK and CHECK timing preserves schema epochs";
     const tablespace_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original tablespace names preserve bound owners deletion guards and restart", "mounted SQL table placement and name evolution follows captured search path through cold recovery", "SQL catalog name DDL pins first search path owner without fetching schema or replaying admission", "SQL catalog captured name mutations retain exact owners across forwarding", "distributed txn SQL search paths retain local committed savepoint and recovery state", "SQL durable search paths encode compact names own decoded bytes and reject invalid state" });
-    const drop_retirement_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "SQL drop retirement", "FK historical reference coverage", "mounted SQL constrained table drops", "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes", "relational row query primary digest transport preserves snapshot proof and rejects missing or invalid headers", "httpx SQL policy observation rejects public capabilities even in legacy internal mode" });
+    const drop_retirement_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "SQL statement read admission calls native capture once without write authority", "SQL drop retirement", "FK historical reference coverage", "mounted SQL constrained table drops", "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes", "relational row query primary digest transport preserves snapshot proof and rejects missing or invalid headers", "httpx SQL policy observation rejects public capabilities even in legacy internal mode" });
     drop_retirement_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-drop-retirement-test", "Verify durable SQL deletion through native constraint retirement and cold owners").dependOn(&drop_retirement_run.step);
     tablespace_run.addArg("--require-no-skips");

@@ -23770,7 +23770,15 @@ pub const RaftApplyStore = struct {
             try self.setFkGenerationTableLocksTxn(txn, group_id, plan, true);
             publication = .{ .plan = plan, .plan_digest = plan_digest, .child_identity = try plan.childIdentity(alloc), .revision = 1, .phase = .fencing_child };
         } else {
-            previous = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, existing orelse return error.GenerationPublicationNotFound, .{ .allocate = .alloc_always });
+            // A previously valid proposal can lose its CAS to another
+            // coordinator or a replayed receipt. This read-only rejection
+            // must not poison the metadata log. Errors after this guard still
+            // abort apply; no partially written transaction is swallowed.
+            const prior_bytes = existing orelse return;
+            previous = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, prior_bytes, .{ .allocate = .alloc_always });
+            const prior = previous.?.value;
+            if (prior.plan.child_before.table_id != table_id) return error.InvalidGenerationPublication;
+            if (prior.revision != command.expected_revision or !std.mem.eql(u8, &prior.plan.id, &command.plan_id)) return;
             if (source_tracked) previous_source_digest = try relationFkSourceDigest(previous.?.value, table_id);
             publication = try previous.?.value.apply(alloc, command);
             if (command.action == .publish_child) {
@@ -31039,7 +31047,10 @@ pub const RaftApplyStore = struct {
             .apply_sql_settings => |bytes| try self.applySqlSettingsTxn(txn, group_id, bytes),
             .apply_sql_policies => |bytes| try self.applySqlPoliciesTxn(txn, group_id, bytes),
             .apply_sql_policy_publication => |bytes| try self.applySqlPolicyPublicationTxn(txn, group_id, bytes),
-            .apply_fk_generation_publication => |bytes| try self.applyFkGenerationPublicationTxn(txn, group_id, bytes),
+            .apply_fk_generation_publication => |bytes| self.applyFkGenerationPublicationTxn(txn, group_id, bytes) catch |err| {
+                std.log.err("FK generation metadata apply failed group={d} err={s}", .{ group_id, @errorName(err) });
+                return err;
+            },
             .apply_schema_validation => |bytes| try self.applySchemaValidationTxn(txn, group_id, bytes),
             .begin_relational_index_publication => |bytes| try self.beginRelationalIndexPublicationTxn(txn, group_id, bytes),
             .ack_relational_index_publication => |bytes| try self.ackRelationalIndexPublicationTxn(txn, group_id, bytes),
@@ -31047,7 +31058,10 @@ pub const RaftApplyStore = struct {
             .cancel_relational_index_publication => |decision| try self.cancelRelationalIndexPublicationTxn(txn, group_id, decision),
             .accept_relational_index_delivery => |bytes| try self.acceptRelationalIndexDeliveryTxn(txn, group_id, bytes),
             .complete_relational_index_source => |bytes| try self.completeRelationalIndexSourceTxn(txn, group_id, bytes),
-            .apply_fk_initial_create => |bytes| try self.applyCommittedFkInitialCreateTxn(txn, group_id, bytes),
+            .apply_fk_initial_create => |bytes| self.applyCommittedFkInitialCreateTxn(txn, group_id, bytes) catch |err| {
+                std.log.err("initial FK metadata apply failed group={d} err={s}", .{ group_id, @errorName(err) });
+                return err;
+            },
             .apply_store_root_enrollment => |bytes| self.applyStoreRootEnrollmentTxn(txn, group_id, bytes) catch |err| switch (err) {
                 error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged, error.UnknownStore => {},
                 else => return err,

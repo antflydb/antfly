@@ -1776,8 +1776,11 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     errdefer alloc.free(observed);
     var parsed = std.json.parseFromSlice(fk_publication.Publication, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
     defer parsed.deinit();
-    if (!std.mem.eql(u8, &parsed.value.plan.id, &command.plan_id) or parsed.value.revision != command.expected_revision + 1)
-        return error.MetadataMutationOutcomeUnknown;
+    if (!parsed.value.commandObserved(command)) return error.MetadataMutationOutcomeUnknown;
+    if (command.plan) |plan| {
+        const expected_digest = plan.digest(alloc) catch return error.MetadataMutationOutcomeUnknown;
+        if (!std.mem.eql(u8, &parsed.value.plan_digest, &expected_digest)) return error.MetadataMutationOutcomeUnknown;
+    }
     return observed;
 }
 

@@ -368,6 +368,7 @@ const mappings = [_]Mapping{
     .{ .status = .integrity_action_job_required, .err = error.IntegrityActionJobRequired },
     .{ .status = .invalid_relational_rows_request, .err = error.InvalidRelationalRowsRequest },
     .{ .status = .constraint_retirement_required, .err = error.ConstraintRetirementRequired },
+    .{ .status = .table_transition_active, .err = error.TableTransitionActive },
     .{ .status = .invalid_integrity_key, .err = error.InvalidIntegrityKey },
     .{ .status = .integrity_record_too_large, .err = error.IntegrityRecordTooLarge },
     .{ .status = .invalid_range, .err = error.InvalidRange },
@@ -1159,6 +1160,13 @@ test "seed replica policy mismatch survives compiled runtime boundaries" {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    // Catalog admission must retain its definite pre-proposal lifecycle
+    // conflict across the compiled owner, rather than report an internal
+    // failure or invite replay of an allegedly ambiguous mutation.
+    const transition = failureFromError(error.TableTransitionActive, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.table_transition_active, transition.status);
+    try validateFailureEnvelope(transition.status, &transition, abi.abi_version);
+    try std.testing.expectError(error.TableTransitionActive, statusToError(transition.status));
     try std.testing.expectEqual(abi.Status.sql_invalid_power_argument, statusFromError(error.SqlInvalidPowerArgument));
     try std.testing.expectError(error.SqlInvalidPowerArgument, statusToError(.sql_invalid_power_argument));
     // Typed occupancy is a publication precondition, not an undeclared

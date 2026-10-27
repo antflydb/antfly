@@ -1625,6 +1625,50 @@ pub const Publication = struct {
         if (self.phase == .canceled and (self.child_canceled.len != self.plan.child_ranges.len or self.parent_canceled.len != parent_groups.items.len)) return error.InvalidGenerationPublication;
     }
 
+    /// A revision alone cannot distinguish competing owner ACKs. Confirm the
+    /// exact durable effect before reporting an idempotent command as applied.
+    pub fn commandObserved(self: Publication, command: Command) bool {
+        const next_revision = std.math.add(u64, command.expected_revision, 1) catch return false;
+        if (self.revision != next_revision or self.plan.child_before.table_id != command.child_table_id or
+            self.plan.catalog_coverage != command.catalog_coverage or !std.mem.eql(u8, &self.plan.id, &command.plan_id)) return false;
+        switch (command.action) {
+            .begin => return self.revision == 1,
+            .publish_child => return if (self.plan.sql_drop != null) self.phase == .published else self.phase == .installing_child,
+            .cancel => return self.phase == .canceling or self.phase == .canceled,
+            .child_fenced, .child_installed, .child_canceled => {
+                const receipt = command.source_receipt orelse return false;
+                const receipts = switch (command.action) {
+                    .child_fenced => self.child_fenced,
+                    .child_installed => self.child_installed,
+                    .child_canceled => self.child_canceled,
+                    else => unreachable,
+                };
+                return matchingReceipt(receipts, receipt.child_group_id, receipt.digest());
+            },
+            .parent_staged, .parent_activated, .parent_acknowledged, .parent_canceled => {
+                const receipt = command.parent_receipt orelse return false;
+                const receipts = switch (command.action) {
+                    .parent_staged => self.parent_staged,
+                    .parent_activated => self.parent_activated,
+                    .parent_acknowledged => if (receipt.reference_coverage_ready) self.parent_coverage_acknowledged else self.parent_acknowledged,
+                    .parent_canceled => self.parent_canceled,
+                    else => unreachable,
+                };
+                return matchingReceipt(receipts, receipt.parent_group_id, receipt.digest());
+            },
+        }
+    }
+
+    fn matchingReceipt(receipts: []const Receipt, group_id: u64, digest: Digest) bool {
+        var left: usize = 0;
+        var right = receipts.len;
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            if (receipts[mid].group_id < group_id) left = mid + 1 else right = mid;
+        }
+        return left < receipts.len and receipts[left].group_id == group_id and std.mem.eql(u8, &receipts[left].digest, &digest);
+    }
+
     pub fn apply(self: Publication, alloc: std.mem.Allocator, command: Command) !Publication {
         try command.validateShape();
         if (command.action == .begin or command.child_table_id != self.plan.child_before.table_id or
@@ -2663,4 +2707,34 @@ test "SQL drop retirement policy controls reject grants installs transfers and m
     transition.expected_generation = null;
     command.child_generations = &.{transition};
     try std.testing.expect(!command.isSqlDropControl());
+}
+
+test "SQL drop retirement command observations require exact durable owner receipts" {
+    const control = @import("../api/relational_fk_generation_publication.zig");
+    var receipt = std.mem.zeroes(control.SourceReceipt);
+    receipt.plan_id = @splat(1);
+    receipt.child_table_id = 7;
+    receipt.child_group_id = 11;
+    receipt.action = .fence;
+    receipt.applied_index = 1;
+    const stored = [_]Receipt{.{ .group_id = 11, .digest = receipt.digest() }};
+    const state: Publication = .{
+        .plan = .{ .id = @splat(1), .child_before = .{ .table_id = 7, .name = "child" }, .child_after = .{ .table_id = 7, .name = "child" }, .child_catalog_before_b64 = "", .child_ranges = &.{}, .child_fences = &.{}, .parents = &.{} },
+        .plan_digest = @splat(2),
+        .child_identity = undefined,
+        .revision = 2,
+        .phase = .staging_parents,
+        .child_fenced = &stored,
+    };
+    var command: Command = .{ .plan_id = @splat(1), .child_table_id = 7, .expected_revision = 1, .action = .child_fenced, .source_receipt = receipt };
+    try std.testing.expect(state.commandObserved(command));
+    receipt.applied_index = 2;
+    command.source_receipt = receipt;
+    try std.testing.expect(!state.commandObserved(command));
+    command.source_receipt.?.applied_index = 1;
+    command.plan_id[0] ^= 1;
+    try std.testing.expect(!state.commandObserved(command));
+    command.plan_id[0] ^= 1;
+    command.expected_revision = 2;
+    try std.testing.expect(!state.commandObserved(command));
 }

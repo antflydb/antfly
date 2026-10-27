@@ -1532,9 +1532,10 @@ test "mounted SQL constrained table drops drain outgoing and self references pre
             }
         }
         fn scoped(ctx: *fixture.Context, statement: []const u8) !@import("../raft/transport/http_common.zig").HttpResponse {
-            const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .database = "retirement_db", .namespace = "retirement_ns" }, .{});
-            defer ctx.alloc.free(body);
-            return fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.metadata_uri, "/db/v1/sql", .POST, body, 15_000);
+            var authenticated = ctx.*;
+            authenticated.headers = ctx.admin_headers;
+            authenticated.base = ctx.metadata_uri;
+            return client.executeInDatabase(&authenticated, "retirement_db", "retirement_ns", statement, .write_admission);
         }
         fn scopedReady(ctx: *fixture.Context, name: []const u8, version: u32) !fixture.ServingSchema {
             const owner = try fixture.waitServingSchemaInScope(ctx, "retirement_db", "retirement_ns", name, version);
@@ -1679,11 +1680,16 @@ test "mounted SQL constrained table drops drain outgoing and self references pre
             try scopedCommand(ctx, "ALTER SCHEMA retirement_ns RENAME TO stolen_namespace", "55006");
             try command(ctx, "ALTER DATABASE retirement_db RENAME TO stolen_database", "55006");
             const deadline = platform.time.monotonicNs() +| 45 * std.time.ns_per_s;
+            var last_phase: ?@import("../metadata/fk_generation_publication.zig").Phase = null;
+            var last_revision: u64 = 0;
+            var last_step_error: ?anyerror = null;
             while (platform.time.monotonicNs() < deadline) {
                 try ctx.checkDrivers();
                 var state = try publication(ctx, self.pending_child);
                 defer state.deinit();
                 self.pending_plan = state.value.plan.id;
+                last_phase = state.value.phase;
+                last_revision = state.value.revision;
                 try std.testing.expectEqualStrings(token, &std.fmt.bytesToHex(self.pending_plan, .lower));
                 const interrupt_phase: @import("../metadata/fk_generation_publication.zig").Phase = if (self.lost_final_reply) .publishing_child else .acknowledging_parents;
                 if (state.value.phase == interrupt_phase) {
@@ -1702,76 +1708,85 @@ test "mounted SQL constrained table drops drain outgoing and self references pre
                     return;
                 }
                 driver.forgetVolatileCursor(api);
-                driver.step(api, .none) catch |err| switch (err) {
-                    error.GenerationAdmissionPending, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.StorageReadTemporarilyUnavailable => {},
-                    else => return err,
+                driver.step(api, .repeat_metadata_mutate) catch |err| {
+                    last_step_error = err;
+                    switch (err) {
+                        error.GenerationAdmissionPending, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.StorageReadTemporarilyUnavailable => {},
+                        else => return err,
+                    }
                 };
                 try ctx.io.sleep(.fromMilliseconds(10), .awake);
             }
+            std.debug.print("SQL drop fault boundary profile={s} child={d} phase={s} revision={d} last_error={s}\n", .{ if (self.lost_final_reply) "final-reply" else "parent-ack", self.pending_child, if (last_phase) |phase| @tagName(phase) else "unobserved", last_revision, if (last_step_error) |err| @errorName(err) else "none" });
             return error.SqlDropFaultBoundaryTimeout;
         }
         pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
             try self.credentials.activateWithCatalog(ctx, true);
-            try command(ctx, "CREATE TABLE drop_parent(id BIGINT PRIMARY KEY)", null);
-            self.old_parent = (try readyTable(ctx, "drop_parent", 0)).table_id;
-            try command(ctx, "CREATE TABLE drop_child(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_parent(id),email TEXT UNIQUE)", null);
-            self.old_child = (try readyTable(ctx, "drop_child", 0)).table_id;
-            try command(ctx, "INSERT INTO drop_parent VALUES(1),(2)", null);
-            try command(ctx, "INSERT INTO drop_child VALUES(1,1,'a'),(2,2,'b')", null);
-            {
-                var reader = ctx.*;
-                reader.base = ctx.metadata_uri;
-                reader.headers = ctx.reader_headers;
-                var denied = try client.execute(&reader, "DROP TABLE drop_child", .write_admission);
-                defer denied.deinit(ctx.alloc);
-                try std.testing.expectEqual(@as(u16, 403), denied.status);
-                try std.testing.expectEqual(self.old_child, (try readyTable(ctx, "drop_child", 0)).table_id);
+            // Qualify shared semantics once. The second independent cluster
+            // isolates the 128-row final-publication fault from repeated RLS
+            // and dependency setup, while retaining both recovery profiles.
+            if (!self.lost_final_reply) {
+                try command(ctx, "CREATE TABLE drop_parent(id BIGINT PRIMARY KEY)", null);
+                self.old_parent = (try readyTable(ctx, "drop_parent", 0)).table_id;
+                try command(ctx, "CREATE TABLE drop_child(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_parent(id),email TEXT UNIQUE)", null);
+                self.old_child = (try readyTable(ctx, "drop_child", 0)).table_id;
+                try command(ctx, "INSERT INTO drop_parent VALUES(1),(2)", null);
+                try command(ctx, "INSERT INTO drop_child VALUES(1,1,'a'),(2,2,'b')", null);
+                {
+                    var reader = ctx.*;
+                    reader.base = ctx.metadata_uri;
+                    reader.headers = ctx.reader_headers;
+                    var denied = try client.execute(&reader, "DROP TABLE drop_child", .write_admission);
+                    defer denied.deinit(ctx.alloc);
+                    try std.testing.expectEqual(@as(u16, 403), denied.status);
+                    try std.testing.expectEqual(self.old_child, (try readyTable(ctx, "drop_child", 0)).table_id);
+                }
+                try reject(ctx, "DROP TABLE drop_parent");
+                try command(ctx, "CREATE VIEW drop_child_view AS SELECT id,email FROM drop_child", null);
+                try reject(ctx, "DROP TABLE drop_child");
+                // Both dependency rejections precede fencing: normal writes still work.
+                try command(ctx, "INSERT INTO drop_child VALUES(3,1,'c')", null);
+                try command(ctx, "DROP VIEW drop_child_view", null);
+                {
+                    const users = @import("../usermgr/mod.zig");
+                    const manager = ctx.metadata.server.owned_public_http_server.?.cfg.user_manager.?;
+                    const scope = try (local.system_catalog_domain.Target{ .table = "drop_child" }).resourceNameAlloc(ctx.alloc);
+                    defer ctx.alloc.free(scope);
+                    var permission = try users.Permission.initOwned(ctx.alloc, .table, scope, .admin);
+                    defer permission.deinit(ctx.alloc);
+                    var key = try manager.createApiKey("pk-rewriter", "sql-drop-child-only", &.{permission}, &.{}, null);
+                    defer key.deinit(manager.alloc);
+                    const authorization = try std.fmt.allocPrint(ctx.alloc, "ApiKey {s}", .{key.encoded});
+                    defer ctx.alloc.free(authorization);
+                    const headers = [_]@import("../raft/transport/http_common.zig").RequestHeader{.{ .name = "authorization", .value = authorization }};
+                    var child_owner = ctx.*;
+                    child_owner.admin_headers = &headers;
+                    var denied_parent = try execute(&child_owner, "DROP TABLE drop_parent", false);
+                    defer denied_parent.deinit(ctx.alloc);
+                    try std.testing.expectEqual(@as(u16, 403), denied_parent.status);
+                    try drop(&child_owner, "drop_child");
+                }
+                try count(ctx, "drop_parent", "2");
+                // Deleting a child must drain its inverse parent witnesses, so the
+                // surviving parent is immediately usable and subsequently droppable.
+                try command(ctx, "DELETE FROM drop_parent WHERE id=1", null);
+                try drop(ctx, "drop_parent");
+                try command(ctx, "CREATE TABLE drop_self(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_self(id))", null);
+                _ = try readyTable(ctx, "drop_self", 0);
+                try command(ctx, "INSERT INTO drop_self VALUES(1,NULL),(2,1)", null);
+                try drop(ctx, "drop_self");
+                try command(ctx, "CREATE TABLE mixed_parent(id BIGINT PRIMARY KEY)", null);
+                const mixed_parent = try readyTable(ctx, "mixed_parent", 0);
+                try command(ctx, "CREATE TABLE drop_mixed(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_mixed(id),external_parent BIGINT REFERENCES mixed_parent(id))", null);
+                _ = try readyTable(ctx, "drop_mixed", 0);
+                try command(ctx, "INSERT INTO mixed_parent VALUES(1)", null);
+                try command(ctx, "INSERT INTO drop_mixed VALUES(1,NULL,1),(2,1,1)", null);
+                try enablePolicy(ctx, "mixed_parent", mixed_parent.table_id, "true");
+                try drop(ctx, "drop_mixed");
+                try command(ctx, "DELETE FROM mixed_parent WHERE id=1", null);
+                try drop(ctx, "mixed_parent");
+                try policyTable(ctx);
             }
-            try reject(ctx, "DROP TABLE drop_parent");
-            try command(ctx, "CREATE VIEW drop_child_view AS SELECT id,email FROM drop_child", null);
-            try reject(ctx, "DROP TABLE drop_child");
-            // Both dependency rejections precede fencing: normal writes still work.
-            try command(ctx, "INSERT INTO drop_child VALUES(3,1,'c')", null);
-            try command(ctx, "DROP VIEW drop_child_view", null);
-            {
-                const users = @import("../usermgr/mod.zig");
-                const manager = ctx.metadata.server.owned_public_http_server.?.cfg.user_manager.?;
-                const scope = try (local.system_catalog_domain.Target{ .table = "drop_child" }).resourceNameAlloc(ctx.alloc);
-                defer ctx.alloc.free(scope);
-                var permission = try users.Permission.initOwned(ctx.alloc, .table, scope, .admin);
-                defer permission.deinit(ctx.alloc);
-                var key = try manager.createApiKey("pk-rewriter", "sql-drop-child-only", &.{permission}, &.{}, null);
-                defer key.deinit(manager.alloc);
-                const authorization = try std.fmt.allocPrint(ctx.alloc, "ApiKey {s}", .{key.encoded});
-                defer ctx.alloc.free(authorization);
-                const headers = [_]@import("../raft/transport/http_common.zig").RequestHeader{.{ .name = "authorization", .value = authorization }};
-                var child_owner = ctx.*;
-                child_owner.admin_headers = &headers;
-                var denied_parent = try execute(&child_owner, "DROP TABLE drop_parent", false);
-                defer denied_parent.deinit(ctx.alloc);
-                try std.testing.expectEqual(@as(u16, 403), denied_parent.status);
-                try drop(&child_owner, "drop_child");
-            }
-            try count(ctx, "drop_parent", "2");
-            // Deleting a child must drain its inverse parent witnesses, so the
-            // surviving parent is immediately usable and subsequently droppable.
-            try command(ctx, "DELETE FROM drop_parent WHERE id=1", null);
-            try drop(ctx, "drop_parent");
-            try command(ctx, "CREATE TABLE drop_self(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_self(id))", null);
-            _ = try readyTable(ctx, "drop_self", 0);
-            try command(ctx, "INSERT INTO drop_self VALUES(1,NULL),(2,1)", null);
-            try drop(ctx, "drop_self");
-            try command(ctx, "CREATE TABLE mixed_parent(id BIGINT PRIMARY KEY)", null);
-            const mixed_parent = try readyTable(ctx, "mixed_parent", 0);
-            try command(ctx, "CREATE TABLE drop_mixed(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_mixed(id),external_parent BIGINT REFERENCES mixed_parent(id))", null);
-            _ = try readyTable(ctx, "drop_mixed", 0);
-            try command(ctx, "INSERT INTO mixed_parent VALUES(1)", null);
-            try command(ctx, "INSERT INTO drop_mixed VALUES(1,NULL,1),(2,1,1)", null);
-            try enablePolicy(ctx, "mixed_parent", mixed_parent.table_id, "true");
-            try drop(ctx, "drop_mixed");
-            try command(ctx, "DELETE FROM mixed_parent WHERE id=1", null);
-            try drop(ctx, "mixed_parent");
-            try policyTable(ctx);
             try command(ctx, "CREATE DATABASE retirement_db", null);
             try scopedCommand(ctx, "CREATE SCHEMA retirement_ns", null);
             try scopedCommand(ctx, "CREATE TABLE recovery_parent(id BIGINT PRIMARY KEY)", null);
@@ -1797,6 +1812,9 @@ test "mounted SQL constrained table drops drain outgoing and self references pre
             // One source fence, four parent receipts and the final publication:
             // the same seven durable revisions for one or 128 real child rows.
             try std.testing.expectEqual(@as(u64, 7), recovered.value.revision);
+            // Metadata completion is durable independently of this freshly
+            // reopened data owner's serving-schema installation.
+            _ = try scopedReady(ctx, "recovery_parent", 0);
             try scopedCommand(ctx, "DELETE FROM recovery_parent WHERE id=1", null);
             try scopedCommand(ctx, "DROP TABLE recovery_parent", null);
             try scopedGone(ctx, "recovery_parent");
@@ -1804,17 +1822,19 @@ test "mounted SQL constrained table drops drain outgoing and self references pre
             // deletion intent has completed and released its lifecycle locks.
             try scopedCommand(ctx, "ALTER SCHEMA retirement_ns RENAME TO retired_namespace", null);
             try command(ctx, "ALTER DATABASE retirement_db RENAME TO retired_database", null);
-            inline for (.{ "drop_child", "drop_parent", "drop_self" }) |name| try expectAbsent(ctx, name);
-            try command(ctx, "CREATE TABLE drop_parent(id BIGINT PRIMARY KEY)", null);
-            const parent = try readyTable(ctx, "drop_parent", 0);
-            try std.testing.expect(parent.table_id != self.old_parent);
-            try command(ctx, "CREATE TABLE drop_child(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_parent(id),email TEXT UNIQUE)", null);
-            const child = try readyTable(ctx, "drop_child", 0);
-            try std.testing.expect(child.table_id != self.old_child);
-            // Old generation claims cannot collide with fresh logical name reuse.
-            try command(ctx, "INSERT INTO drop_parent VALUES(1)", null);
-            try command(ctx, "INSERT INTO drop_child VALUES(1,1,'a')", null);
-            try count(ctx, "drop_child", "1");
+            if (!self.lost_final_reply) {
+                inline for (.{ "drop_child", "drop_parent", "drop_self" }) |name| try expectAbsent(ctx, name);
+                try command(ctx, "CREATE TABLE drop_parent(id BIGINT PRIMARY KEY)", null);
+                const parent = try readyTable(ctx, "drop_parent", 0);
+                try std.testing.expect(parent.table_id != self.old_parent);
+                try command(ctx, "CREATE TABLE drop_child(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_parent(id),email TEXT UNIQUE)", null);
+                const child = try readyTable(ctx, "drop_child", 0);
+                try std.testing.expect(child.table_id != self.old_child);
+                // Old generation claims cannot collide with fresh logical name reuse.
+                try command(ctx, "INSERT INTO drop_parent VALUES(1)", null);
+                try command(ctx, "INSERT INTO drop_child VALUES(1,1,'a')", null);
+                try count(ctx, "drop_child", "1");
+            }
         }
     };
     for ([_]bool{ false, true }) |lost_final_reply|

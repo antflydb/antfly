@@ -178,6 +178,14 @@ pub fn executeIn(ctx: *fixture.Context, namespace: ?[]const u8, statement: []con
     return executeConnected(ctx, namespace, null, statement, retry);
 }
 
+/// Named scopes use the same precise nonadmission classifier and deadline as
+/// default-scope campaigns. Transport/unknown or committed outcomes never replay.
+pub fn executeInDatabase(ctx: *fixture.Context, database: []const u8, namespace: []const u8, statement: []const u8, retry: Retry) !http.HttpResponse {
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .database = database, .namespace = namespace }, .{});
+    defer ctx.alloc.free(body);
+    return executeBody(ctx, null, body, retry);
+}
+
 pub fn executeParameters(ctx: *fixture.Context, statement: []const u8, parameters: []const std.json.Value, retry: Retry) !http.HttpResponse {
     const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .parameters = parameters }, .{});
     defer ctx.alloc.free(body);

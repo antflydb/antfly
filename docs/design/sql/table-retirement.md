@@ -59,6 +59,11 @@ the materialized ordered timestamp may accompany the control. Application still
 uses the normal native transaction, source-pin and topology checks; user writes
 and unrelated topology changes retain policy enforcement.
 
+Surviving-parent mutations carry signed integrity-read authority through both
+primary reads and batched observations. Tokens and database scope remain in
+headers. The receiver requires an explicit service credential even in legacy
+internal mode, and native readers verify the signed owner and purpose.
+
 Metadata topology capability 72 and data-Raft protocol 27 fence the new control
 and lifecycle-lock kind. Private storage engine descriptor/method symbols
 advance together to version 37. Public storage-owner ABI and OpenAPI contracts
@@ -73,9 +78,24 @@ authorizes replaying the DDL. Parent completion precedes logical deletion, so a
 completed ordinary DROP leaves surviving parents usable.
 
 While the durable deletion intent owns the table, native catalog admission
-rejects renames and new view or extension dependencies. Schema, policy and
+rejects table and ancestor namespace/database renames and new view or extension
+dependencies. Ancestor checks stream active lifecycle locks and compact catalog
+bindings, rather than decoding complete publication plans. Schema, policy and
 other lifecycle changes use the shared table lock. The final native transaction
 rechecks dependencies and owner identity before deleting anything.
+
+Late publication commands which lose their plan/revision CAS are native
+metadata no-ops before any writes. Later validation and storage failures still
+abort apply. A successful response requires the exact durable owner receipt;
+a competing command advancing the same revision is insufficient. The native
+campaign deliberately repeats intermediate commands and verifies that both
+fault profiles still have seven publication revisions.
+
+A bound table whose advertised native snapshot is temporarily absent returns
+statement-read unavailability instead of falling back to stateless pages or
+claiming unsupported SQL. Cold-owner tests independently wait for serving
+schema installation. Named scopes share the existing bounded nonadmission
+retry client; unknown and committed outcomes are never replayed.
 
 Work depends on source owners and FK parent edges, not the number of user rows.
 The native campaign checks the same seven durable revisions for one and 128
@@ -104,3 +124,13 @@ Neighboring gates are `antfly-api-hosted-fk-drop-test`,
 the completed build graph; compilation, an admitted receipt or one successful
 subcase is not end-to-end qualification. The authoritative parity ledger stays
 unchanged until an original contract has sufficient executable evidence.
+
+Local qualification on 2026-10-26 used pinned Zig 0.17 Debug on macOS arm64.
+The combined retirement, hosted FK, FK schema, names/tablespace and runtime-error
+gates passed all 108 build steps and 23 tests with zero skips or leaks. The
+11-test retirement gate then passed two additional consecutive cached runs,
+including deliberate duplicate metadata commands and both cold-recovery faults.
+The merged-tree SQL suite passed 1,670 tests with four existing opt-in benchmark
+skips and no failures or leaks. The PostgreSQL oracle passed all 50 assertions;
+the Go SDK suite, inventory checker tests, license and embedded-boundary checks
+also passed. The original parity disposition counts are unchanged.

@@ -59,6 +59,7 @@ test "SQL statement read admission calls native capture once without write autho
     const Fake = struct {
         failure: anyerror,
         captures: usize = 0,
+        native_absent: bool = false,
         fn resolve(_: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .policy_publication_status) return a.dupe(u8, "null");
             try std.testing.expect(call == .resolve_many);
@@ -77,6 +78,7 @@ test "SQL statement read admission calls native capture once without write autho
             self.captures += 1;
             try std.testing.expectEqualStrings("physical", table);
             try std.testing.expectEqual(.read_index, consistency);
+            if (self.native_absent) return null;
             return self.failure;
         }
         fn guarded(raw: *anyopaque, _: std.mem.Allocator, scan_request: reads.RelationalStatementScan) !reads.RelationalStatementSnapshot.GuardedRead {
@@ -87,15 +89,16 @@ test "SQL statement read admission calls native capture once without write autho
             return self.failure;
         }
     };
-    for ([_]struct { failure: anyerror, expected: anyerror }{
+    for ([_]struct { failure: anyerror, expected: anyerror, native_absent: bool = false }{
         .{ .failure = error.GroupLeaderUnavailable, .expected = error.SqlStatementReadUnavailable },
         .{ .failure = error.ReadUnavailable, .expected = error.SqlStatementReadUnavailable },
         .{ .failure = error.TableNotFound, .expected = error.SqlStatementReadUnavailable },
+        .{ .failure = error.SqlStatementReadUnavailable, .expected = error.SqlStatementReadUnavailable, .native_absent = true },
         .{ .failure = error.InvalidSqlBackendResponse, .expected = error.InvalidSqlBackendResponse },
         .{ .failure = error.SqlMutationOutcomeUnknown, .expected = error.SqlMutationOutcomeUnknown },
         .{ .failure = error.SqlRangeTrackingRequired, .expected = error.SqlRangeTrackingRequired },
     }) |case| {
-        var fake: Fake = .{ .failure = case.failure };
+        var fake: Fake = .{ .failure = case.failure, .native_absent = case.native_absent };
         var server: http_server.ApiHttpServer = undefined;
         server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
         server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.capture, .open_relational_read = Fake.open } };
@@ -1897,7 +1900,10 @@ pub const Adapter = struct {
         const scan_request = try self.prepareScan(scratch.allocator(), table, request);
         // The provider owns all request data it retains; only page values use
         // short-lived arenas. Closing the cursor releases its snapshot first.
-        const view = (source.openRelationalRead(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return null;
+        // A native provider is advertised and the logical table is bound.
+        // Missing physical serving state is availability, never permission
+        // to fall back to pages from a different visibility cut.
+        const view = (source.openRelationalRead(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.SqlStatementReadUnavailable;
         errdefer view.deinit();
         try verifyTextPredicate(request, view);
         // Tie the acquired physical snapshot to the SQL binding, not merely
@@ -2274,6 +2280,7 @@ pub const Adapter = struct {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
         const source = self.server.table_reads orelse return error.UnsupportedSqlExecution;
+        if (source.route_fence != null or source.vtable.open_relational_read == null) return error.UnsupportedSqlExecution;
         const upper = try pointUpperBound(alloc, key);
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const policy_proof = try self.normalizationProof(alloc, table);
@@ -2292,7 +2299,7 @@ pub const Adapter = struct {
             .filter_query_json = mandatory_filter orelse "",
             .execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns,
             .cancellation = self.context.cancellation,
-        }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.UnsupportedSqlExecution;
+        }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.SqlStatementReadUnavailable;
         errdefer view.deinit();
         owner.* = .{ .adapter = self, .table = table, .view = view, .allocator = alloc };
         if (require_visible) if (mandatory_filter) |json| {
@@ -2369,6 +2376,7 @@ pub const Adapter = struct {
             // interpret the stripped native metadata a second time.
             const normalized = if (!already_prepared and !prepared_here and writes.items.len != 0 and table.storage_mode == .relational) blk: {
                 const source = self.server.table_reads orelse return error.UnsupportedSqlExecution;
+                if (source.route_fence != null or source.vtable.open_relational_read == null) return error.UnsupportedSqlExecution;
                 const scope = table.scope orelse return error.InvalidSqlBackendResponse;
                 const policy_proof = try self.normalizationProof(alloc, table);
                 const first_key = writes.items[0].key;
@@ -2382,7 +2390,7 @@ pub const Adapter = struct {
                     .row_policy_database = scope.database,
                     .execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns,
                     .cancellation = self.context.cancellation,
-                }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.UnsupportedSqlExecution;
+                }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.SqlStatementReadUnavailable;
                 defer view.deinit();
                 try self.verify(alloc, table);
                 break :blk view.normalize(alloc, writes.items) catch |err| return statementReadAdmissionError(err);

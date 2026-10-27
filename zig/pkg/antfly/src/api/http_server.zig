@@ -5715,7 +5715,7 @@ pub const ApiHttpServer = struct {
         }
     }
 
-    const FkPublicationStepFault = enum { none, before_metadata_mutate, after_metadata_mutate };
+    const FkPublicationStepFault = enum { none, before_metadata_mutate, after_metadata_mutate, repeat_metadata_mutate };
 
     fn advanceFkGenerationPublicationBackgroundOnce(self: *ApiHttpServer) !void {
         if (!self.cfg.catalog_publication_authority_available) return;
@@ -5825,6 +5825,11 @@ pub const ApiHttpServer = struct {
         if (builtin.is_test and fault == .before_metadata_mutate) return error.InjectedPublicationReplyLoss;
         const result = try self.source.systemCatalog(alloc, context, .{ .fk_generation_publication_mutate = command });
         _ = result;
+        if (builtin.is_test and fault == .repeat_metadata_mutate) {
+            // An exact late duplicate must be a native CAS no-op, preserve
+            // the original receipt/revision and leave Raft progress healthy.
+            _ = try self.source.systemCatalog(alloc, context, .{ .fk_generation_publication_mutate = command });
+        }
         if (builtin.is_test and fault == .after_metadata_mutate) return error.InjectedPublicationReplyLoss;
     }
 

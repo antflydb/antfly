@@ -96,22 +96,30 @@ fn basicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: 
     return std.fmt.allocPrint(alloc, "Basic {s}", .{encoded});
 }
 
+/// A progress failure is terminal to the campaign. Retain its origin before
+/// the asynchronous driver stores only the error identity for checkDrivers.
+fn progressFailure(lane: []const u8, err: anyerror, trace: ?*std.builtin.StackTrace) anyerror {
+    std.debug.print("mounted SQL progress lane={s} failed error={s}\n", .{ lane, @errorName(err) });
+    if (trace) |value| std.debug.dumpErrorReturnTrace(value);
+    return err;
+}
+
 fn metadataRaft(ptr: *anyopaque) !void {
     const server: *metadata_runtime.Server = @ptrCast(@alignCast(ptr));
-    try server.runRaftRoundOnly();
+    server.runRaftRoundOnly() catch |err| return progressFailure("metadataRaft/runRaftRoundOnly", err, @errorReturnTrace());
 }
 fn metadataControl(ptr: *anyopaque) !void {
     const server: *metadata_runtime.Server = @ptrCast(@alignCast(ptr));
-    try server.runControlRoundOnly();
-    try server.runCdcRound();
+    server.runControlRoundOnly() catch |err| return progressFailure("metadataControl/runControlRoundOnly", err, @errorReturnTrace());
+    server.runCdcRound() catch |err| return progressFailure("metadataControl/runCdcRound", err, @errorReturnTrace());
 }
 fn dataRaft(ptr: *anyopaque) !void {
     const server: *data_runtime.DataServer = @ptrCast(@alignCast(ptr));
-    try server.runRaftRoundOnly();
+    server.runRaftRoundOnly() catch |err| return progressFailure("dataRaft/runRaftRoundOnly", err, @errorReturnTrace());
 }
 fn dataControl(ptr: *anyopaque) !void {
     const server: *data_runtime.DataServer = @ptrCast(@alignCast(ptr));
-    try server.runControlRoundOnly();
+    server.runControlRoundOnly() catch |err| return progressFailure("dataControl/runControlRoundOnly", err, @errorReturnTrace());
 }
 
 pub fn request(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, suffix: []const u8, method: http.Method, body: ?[]const u8) !http.HttpResponse {
