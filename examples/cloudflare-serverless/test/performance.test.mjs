@@ -676,6 +676,15 @@ test("durable hint encoding bounds compact metadata and rejects corrupt or misma
  assert.equal(encodeReadHints(namespace,'8',hint),null);
 });
 
+test('durable hints retain the manifest and facts within escaped native root capacity',async()=>{
+ const{encodeReadHints,writeReadHints}=await import('../publication-read-hints.mjs'),{inlineReadSet,captureReadView}=await import('../read-view.mjs'),namespace='qualification-'+ 'n'.repeat(140),keys=await metadataKeys(namespace),manifest=`antfly/manifests/${namespace}/manifests/7.bin`,artifact=i=>'antfly/artifacts/graph/'+'a'.repeat(64)+'/'+'b'.repeat(32)+'/'+i.repeat(64),facts=new Uint8Array(576);facts.set(utf8.encode('AFDFACT3'));
+ const hint={version:'7',records:[[manifest,{etag:'manifest',body:new Uint8Array(2000)}],[artifact('c'),{etag:'facts',body:facts}],[artifact('d'),{etag:'page-a',body:new Uint8Array(768)}],[artifact('e'),{etag:'page-b',body:new Uint8Array(768)}]]},encoded=encodeReadHints(namespace,'7',hint);
+ assert.ok(encoded.records.some(([key])=>key===manifest));assert.ok(encoded.records.some(([key])=>key===artifact('c')));assert.ok(hint.records.length===4,'do not mutate caller hints');
+ const bucket=new Bucket(),writer=new R2CoordinatorStore(module,bucket,'hint-root-capacity',{inlineReadSet:inlineReadSet(namespace)}),now=Date.now();
+ await writer.transaction(tx=>{tx.put(keys.head,record('7'));tx.put(keys.wal,{etag:'wal',body:new Uint8Array(1536).fill(97),contentType:null});tx.put(keys.floor,record('0'));tx.put(keys.progress+'READ_PINS/7',record(String(BigInt(now+600000)*1000000n)));writeReadHints(tx,namespace,'7',hint);});
+ const events=[],reader=new R2CoordinatorStore(module,bucket,'hint-root-capacity',{onMetrics:e=>events.push(e)}),view=await reader.readOnly(tx=>captureReadView(tx,keys));assert.ok(view.immutable.some(([key])=>key===manifest));assert.ok(view.immutable.some(([key])=>key===artifact('c')));assert.ok(events.filter(e=>e.action==='read').every(e=>e.operations===0),'bounded hints must remain inline alongside a realistic WAL record');assert.ok(utf8.encode(writer.state.root).byteLength<=12288);assert.equal(reader.acquired,false);assert.ok(utf8.encode(JSON.stringify(JSON.stringify(encoded))).byteLength<=6144,'budget the escaped representation actually embedded in native roots');
+});
+
 
 test("actor-version ownership resumes after reconstruction and still fences different deployments",async()=>{
  const{actorOwner}=await import('../actor-owner.mjs'),actor='a'.repeat(64),version='01234567-0123-4567-89ab-0123456789ab',namespace='stable-actor',identity=await actorOwner(actor,version,namespace),bucket=new Bucket();

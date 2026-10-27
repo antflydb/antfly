@@ -18,7 +18,7 @@
 import{resourceFailureCode}from'../performance.mjs';
 const events=new Set(['antfly.resource_failure','antfly.operation','antfly.trace','antfly.actor_started','antfly.coordinator','antfly.coordinator_group','antfly.coordinator_snapshot','antfly.coordinator_snapshot_native','antfly.checkpoint_hint','antfly.checkpoint_deferred','antfly.wal_prepare','antfly.wal_group','antfly.publication_feedback','antfly.reader_metadata','antfly.app_metadata']);
 const ops=new Set(['coordinate','lookup','list','count','search','status','latest','mutate','publish','compact','reindex','enrich','gc_prepare','gc_trace','gc_wal','collect','collect_metadata']);
-const spans=new Set(['parse','dispatch','kernel_queue','wasm_instantiate','wal_prepare','wal_commit','recovery','writer_rpc','queue_delivery','point_read_capacity_promotion','native:openReadView',...['objectCall','openReadView','beginPublication','openPublication','publicationCall','finalizePublication','abortPublication'].map(v=>'rpc:'+v)]);
+const spans=new Set(['parse','dispatch','kernel_queue','wasm_instantiate','wal_prepare','wal_snapshot','durable_commit','wal_commit','recovery','writer_rpc','queue_delivery','point_read_capacity_promotion','native:openReadView',...['objectCall','openReadView','beginPublication','openPublication','publicationCall','finalizePublication','abortPublication'].map(v=>'rpc:'+v)]);
 const labels={role:new Set(['interactive','maintenance','app','writer','reader','builder']),runtime_role:new Set(['shared','app','app-reader','writer','reader','builder']),action:new Set(['begin','observe','observe_committed','read','commit','commit_wal','checkpoint','trace','retire_logs']),operation_outcome:new Set(['ok','error']),outcome:new Set(['ok','error','needs_admission']),owner_identity:new Set(['actor-version','ephemeral'])};
 const stringAllowed=(key,value)=>key==='event'?events.has(value):key==='op'?ops.has(value):key==='name'?spans.has(value):key==='scope'?['http','coordinator','outbox','wal'].includes(value)||value.startsWith('runtime:')&&ops.has(value.slice(8)):labels[key]?.has(value);
 const code=/\b(OutOfMemory|SQLITE_NOMEM|MemoryLimitExceeded|CPULimitExceeded|DeadlineExceeded|WorkLeaseLost|Canceled|CoordinatorRecovering|CoordinatorCommitBusy|ManifestReadLeaseExpired|IntegrityMismatch|ObjectIoBudgetExceeded|InvalidImmutableLog|ImmutableLogFenced|HostedWorkingSetBudgetExceeded)\b/;
@@ -34,7 +34,7 @@ function metric(value,depth=0){
   if(typeof v==='string'&&stringAllowed(key,v)){out[key]=v;continue;}
   if(['trace_id','actor_instance_id'].includes(key)&&typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v)){out[key]=v;continue;}
   if(['error','failure_code'].includes(key)){if(v!=null)out[key]=errorCode(v);continue;}
-  if(!/^[a-z_]{1,64}$/.test(key))continue;
+  if(!/^[a-z_]{1,64}$/.test(key)&&key!=='physical_r2')continue;
   const safe=metric(v,depth+1);if(safe!==undefined)out[key]=safe;
  }return out;
 }

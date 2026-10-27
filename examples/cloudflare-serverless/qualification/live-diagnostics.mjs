@@ -66,10 +66,10 @@ export async function startLiveDiagnostics(runs,executionId,dir,{authenticate=ac
   await Promise.all(sessions.map(async s=>{
    clearInterval(s.ping);clearTimeout(s.reconnectTimer);
    if(s.socket&&s.socket.readyState!==WebSocket.CLOSED)await new Promise(done=>{const timer=setTimeout(()=>{coverage.lost(s.run.id,s.role);done();},5000);s.socket.once('close',()=>{clearTimeout(timer);done();});s.socket.terminate();});
-   if(s.id)try{await api(s.run,{role:s.role,id:s.id},'DELETE');s.id=null;}catch{errors.push('TailSessionCleanupFailed');}
   }));
-  for(const journal of journals){await journal.writes;await journal.file.close();}
-  if(errors.length)throw Error(errors.join('; '));
+  for(const journal of journals){if(journal.id)try{await api(journal.run,{role:journal.role,id:journal.id},'DELETE');journal.id=null;}catch{errors.push('TailSessionCleanupFailed');}await journal.writes;await journal.file.close();}
+  await writeFile(resolve(directory,'sessions.json'),JSON.stringify(journals.map(j=>({run:j.run.id,role:j.role,id:j.id??null}))),{mode:0o600});
+  return errors;
  }
  function connect(session,url){
   if(closing)return Promise.resolve();
@@ -91,14 +91,15 @@ export async function startLiveDiagnostics(runs,executionId,dir,{authenticate=ac
  try{
   // Bounded sequential creation avoids a credential/session request burst.
   for(const run of runs)for(const role of roles){
-   const journal={writes:Promise.resolve(),path:resolve(directory,run.id+'-'+role+'.jsonl')};journal.file=await open(journal.path,'ax',0o600);journals.push(journal);
-   // Independent provider sessions overlap throughout qualification. Repair a
-   // dropped replica without losing coverage from its already connected peer.
+   const journal={run,role,writes:Promise.resolve(),path:resolve(directory,run.id+'-'+role+'.jsonl')};journal.file=await open(journal.path,'ax',0o600);journals.push(journal);
+   // The provider reuses a session ID for concurrent creates on one script.
+   // Overlapping sockets protect transport continuity, not a shared tail reset.
+   const record=await api(run,{role},'POST',{filters:[]});
+   if(typeof record.id!=='string'||!/^[a-zA-Z0-9-]{1,128}$/.test(record.id))throw Error('DiagnosticSessionInvalid');journal.id=record.id;
+   if(typeof record.url!=='string'||new URL(record.url).protocol!=='wss:')throw Error('DiagnosticSessionInvalid');
+   await writeFile(resolve(directory,'sessions.json'),JSON.stringify(journals.map(j=>({run:j.run.id,role:j.role,id:j.id}))),{mode:0o600});
    for(let replica=0;replica<2;replica++){
    const session={run,role,journal,replica};sessions.push(session);
-   const record=await api(run,{role},'POST',{filters:[]});
-   if(typeof record.id!=='string'||!/^[a-zA-Z0-9-]{1,128}$/.test(record.id))throw Error('DiagnosticSessionInvalid');session.id=record.id;
-   if(typeof record.url!=='string'||new URL(record.url).protocol!=='wss:')throw Error('DiagnosticSessionInvalid');
    await connect(session,record.url);
    }
   }
@@ -106,7 +107,7 @@ export async function startLiveDiagnostics(runs,executionId,dir,{authenticate=ac
  }catch(error){await close().catch(()=>{});throw error;}
  return{
   report:()=>coverage.report(),assertClean:()=>coverage.assertClean(),
-  async finish(){await close();const artifacts=[];for(const s of journals){const hash=createHash('sha256');let bytes=0;for await(const chunk of createReadStream(s.path)){bytes+=chunk.length;if(bytes>256*1024*1024)throw Error('DiagnosticJournalExceeded');hash.update(chunk);}artifacts.push({path:s.path,bytes,sha256:hash.digest('hex')});}const report={...coverage.report(),artifacts};await writeFile(resolve(directory,'audit.json'),JSON.stringify(report,null,2));return report;},
+  async finish(){const cleanup_errors=await close(),artifacts=[];for(const s of journals){const hash=createHash('sha256');let bytes=0;for await(const chunk of createReadStream(s.path)){bytes+=chunk.length;if(bytes>256*1024*1024)throw Error('DiagnosticJournalExceeded');hash.update(chunk);}artifacts.push({path:s.path,bytes,sha256:hash.digest('hex')});}const report={...coverage.report(),passed:coverage.report().passed&&cleanup_errors.length===0,cleanup_errors,artifacts};await writeFile(resolve(directory,'audit.json'),JSON.stringify(report,null,2));return report;},
  };
 }
 

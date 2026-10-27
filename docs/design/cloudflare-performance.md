@@ -1252,23 +1252,57 @@ repair it. Progress checkpoints fail promptly on observed diagnostic gaps.
 
 A longer idle probe reproduces an abnormal `1006` close after seven minutes,
 without a heartbeat timeout. Persisted-log API access returns `403` with the
-current account credential. Qualification therefore maintains two independently
-created provider tail sessions per logical service, repairing a disconnected
-replica against its existing session URL. At least one connection must remain
+current account credential. A transport-overlap experiment initially creates
+two tails per logical service. A follow-up live API probe proves the provider
+returns the same session ID and expiry for repeated creates, even with different
+rate-one filters. The collector now creates one provider session with two
+overlapping sockets. This can repair an individual socket, but cannot protect
+against reset of their shared provider session. At least one connection must remain
 continuously healthy. Losing both is a permanent coverage failure, even after
 repair; truncation, unsettled native I/O, journal errors and resource signals
 also remain unconditional failures. This provides overlap rather than inferring
 that a reconnect recovered missed events.
 
-There are sixteen physical sessions per pair and eight logical journals. The
+There are sixteen sockets, eight provider sessions and eight journals per pair. The
 journals retain a numeric replica index and may contain duplicate events;
 diagnostic event counts are not request or billing counts. Both replicas share
 the existing 4 MiB pending-write bound per logical stream and the final 256 MiB
 journal ceiling. Finalization stops repair timers, terminates sockets and deletes
-only the sixteen exact session IDs created by that execution. Tests exercise
+each of the eight exact session IDs once. A private manifest retains owned IDs
+for recovery after interruption; it contains no URLs or credentials. Cleanup
+failures retain completed journal hashes and make the report fail. Tests exercise
 single-replica repair, complete coverage loss, late failure retention, bounded
 sanitization, journal hashes and exact owned-session cleanup.
 
 The gate checks coverage once per second during preparation as well as the
 measured workload and recovery. A permanent gap cancels both clients and joins
 outstanding calls, rather than continuing a seed that can no longer qualify.
+
+The overlap experiment still loses both sockets for a shared session during
+live preparation. It does not qualify diagnostic coverage. See the
+[persisted diagnostic access proposal](cloudflare-persisted-diagnostics.md)
+for the next backend and its currently missing account permission.
+
+## Fit advisory hints into native roots
+
+The ten-minute paired diagnostic completes 240 reads and 80 writes per side
+without final logical errors. Candidate read/write p95 is 1,052/2,971 ms versus
+control 5,664/6,826 ms. Read latency misses the one-second target, and diagnostic
+coverage later fails during verification. This is a failed diagnostic, not a
+qualification result. Traces show some format-three roots have four exact rows
+and no read hints, adding immutable fetches to those queries.
+
+A native-backed reproduction combines a larger WAL row with four valid advisory
+hints. The previous encoding fits the general metadata value limit, but exceeds
+the root's remaining inline capacity; native recovery must fetch ordered-tree
+pages. The encoder now budgets the escaped JSON representation at 6 KiB, leaving
+room inside the existing 12 KiB root for mandatory rows and the selected pin.
+It removes older small pages before the current manifest and facts root. It
+preserves caller inputs and the existing format-one codec, and changes neither
+native modules nor authority semantics. Oversized optional values still have
+the native ordered-tree fallback.
+
+The corrected reproduction retains manifest and facts after reopening the
+metadata store, uses zero physical metadata-page reads and remains within the
+existing root budget. This addresses a reproduced capacity cliff; its effect on
+live p95 still requires a fresh deployment and qualification.

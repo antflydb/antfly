@@ -17,6 +17,9 @@
 // never replace mutable authority, generation pins or native integrity checks.
 const text=new TextDecoder();
 export const readHintBudget=8192;
+// Leave room for mandatory HEAD/WAL/floor rows and the selected read pin in
+// the existing 12 KiB native capsule. Count the escaped value embedded there.
+export const readHintEncodedBudget=6144;
 const version=value=>typeof value==="string"&&/^(0|[1-9][0-9]{0,19})$/.test(value)&&BigInt(value)<=18446744073709551615n;
 const manifestPrefix=namespace=>`antfly/manifests/${namespace}/manifests/`;
 function kind(namespace,key,body){
@@ -67,8 +70,13 @@ export class PublicationReadHints {
 // value limit. These bytes remain advisory and independently digest-checked.
 export function encodeReadHints(namespace,generation,input){
  const hints=normalizeReadHints(namespace,generation,input);if(!hints)return null;
- const stored={format:1,version:generation,records:hints.records.map(([key,record])=>[key,{etag:record.etag,contentType:record.contentType,body_base64:btoa(String.fromCharCode(...record.body))}])};
- return new TextEncoder().encode(JSON.stringify(stored)).byteLength<=16384?stored:null;
+ const selected=hints.records.map(([key,record],index)=>({key,rank:kind(namespace,key,record.body),index,value:{etag:record.etag,contentType:record.contentType,body_base64:btoa(String.fromCharCode(...record.body))}}));
+ const stored=()=>({format:1,version:generation,records:selected.map(row=>[row.key,row.value])});
+ while(selected.length&&new TextEncoder().encode(JSON.stringify(JSON.stringify(stored()))).byteLength>readHintEncodedBudget){
+  // Keep the current manifest, then its facts root, before advisory small pages.
+  const victim=[...selected].sort((a,b)=>a.rank-b.rank||a.index-b.index)[0];selected.splice(selected.indexOf(victim),1);
+ }
+ return stored();
 }
 export function decodeReadHints(namespace,generation,stored){
  if(stored?.format!==1||stored.version!==generation||!Array.isArray(stored.records)||stored.records.length>8)return null;
