@@ -680,3 +680,49 @@ declared benchmark skip; no failures or leaks), 18 benchmark-tooling tests and
 the reviewed binary and pass before and after restart on the candidate. Main
 `2f47731030` is merged, with a successful integrated production build and the full
 real-file suite. Formatting, syntax, license, Apache boundary and diff checks pass.
+
+
+### Metadata-order costing and multi-pack delivery
+
+The [delivery and costing observation](native-ordered-delivery-and-cost-v1-observation.json)
+extends the shared single-term cost rule to metadata orders different from the
+native physical order. The bucket index remains present in both builds, and the
+Parquet, configuration, queries and runner are identical. Each selective query
+now examines 64 text candidates with zero speculative metadata references; the
+reviewed forward/reverse cases visited 1,024 unrelated references. A broad-filter
+E2E also verifies the decision survives the downstream collector: it fails on the
+reviewed binary at 2,304 references and passes after the complete handoff fix.
+
+| Case | Reviewed warm median | Final warm median |
+|---|---:|---:|
+| Metadata ordering, anti-correlated forward | 298.82 ms | 20.16 ms |
+| Metadata ordering, anti-correlated reverse | 303.48 ms | 19.68 ms |
+| Metadata ordering, aligned forward | 51.02 ms | 19.61 ms |
+| Native ordering control, forward | 18.29 ms | 20.26 ms |
+| Native ordering control, reverse | 18.11 ms | 19.72 ms |
+| Wide-key ordered control | 648.80 ms | 696.82 ms |
+
+There are three samples per case and cache mode. These are sequential local
+Debug observations on a shared machine; candidate samples overlap build/E2E
+activity. They do not establish causal latency, empty-cache performance or cloud
+throughput. All 36 paired pages preserve IDs, sources, sort tuples and every
+non-score hit field. Metadata-order scores differ by at most 2.4e-7; native and
+wide-key controls match exactly. Exact and lower-bound totals remain visible per
+sample. The control timing increases are retained alongside the demonstrated
+metadata work reduction; their work bounds remain unchanged.
+
+Bitmap admission now evicts older pack states and retries while protecting the
+current prepared patterns, then remembers an admission decline for that attempt.
+Allocation-failure tests also verify that request-owned winner locators survive
+result retirement without partial publication. Final ordered and ordinary text
+pages use those locators to group covered native projection into joined waves of
+at most four packs. Native ordinals never outlive their pin; stored coverage,
+key validation and physical fallback remain enforced.
+
+An independent Parquet E2E uses 32 incompressible 1 MiB stored payloads to create
+multiple serving packs while projecting a small 24-hit page. With the original
+Parquet object unavailable, it verifies at least two native hydration batches and
+zero physical hydration calls across field/score ordering, projected/hidden
+highlight fields and restart. Counter assertions wait for the health endpoint's
+asynchronous metrics refresh. This proves the delivery path and eliminated
+physical reads, without a separate multi-pack latency or throughput claim.
