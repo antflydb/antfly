@@ -2598,6 +2598,23 @@ pub fn metadataApplyStoreProjection(
             out_json.* = if (value) |bytes| .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) } else .{};
             break :blk .ok;
         },
+        .job_state_value => blk: {
+            const value = handle.store.getJobState(alloc, request.group_id, request.key.slice()) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .job_state_page => blk: {
+            const value = handle.store.scanJobState(alloc, request.group_id, if (request.arg0 != 0) request.key.slice() else null) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .job_owner_count => blk: {
+            const value = handle.store.getJobOwnerCount(alloc, request.group_id, request.key.slice()) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .restore_job_value => blk: {
             const value = handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice()) catch |err|
                 break :blk storageOwnerStatusFromError(err);

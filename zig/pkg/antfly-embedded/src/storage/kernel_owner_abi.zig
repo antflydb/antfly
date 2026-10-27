@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 107;
+pub const abi_version: u32 = 108;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -605,6 +605,9 @@ pub const MetadataProjectionKind = enum(u32) {
     /// Raw binary schema-publication command; read-only preflight returns JSON
     /// acceptance intent. No ASVI frame is escaped into a JSON envelope.
     schema_validation_preflight = 72,
+    job_state_value = 73,
+    job_state_page = 74,
+    job_owner_count = 75,
 };
 
 pub const MetadataHABindRequest = extern struct {

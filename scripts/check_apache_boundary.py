@@ -62,6 +62,7 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_media": ("zig/lib/media/src/mod.zig",),
     "antfly_video": ("zig/lib/video/src/mod.zig",),
     "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),

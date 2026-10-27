@@ -270,6 +270,16 @@ pub const RaftApplyStore = struct {
         _ = try self.projection(bool, .{ .kind = .migrate_standalone_restore_jobs, .key = .fromSlice(encoded.written()) });
     }
 
+    pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .job_state_value, .group_id = group_id, .key = .fromSlice(key) });
+    }
+    pub fn scanJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8) ![]u8 {
+        return self.projectionWithAllocator([]u8, alloc, .{ .kind = .job_state_page, .group_id = group_id, .key = .fromSlice(after orelse ""), .arg0 = @intFromBool(after != null) });
+    }
+    pub fn getJobOwnerCount(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner: []const u8) !u64 {
+        return self.projectionWithAllocator(u64, alloc, .{ .kind = .job_owner_count, .group_id = group_id, .key = .fromSlice(owner) });
+    }
+
     pub fn getBackupCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .backup_cohort, .group_id = group_id, .arg0 = job_id });
     }
@@ -1362,3 +1372,47 @@ fn statusToError(status: abi.Status) !void {
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const store_report_update = @import("../metadata/store_report_update.zig");
 const topology_protocol = @import("../metadata/topology_protocol.zig");
+
+pub const consumer_tests = consumerTests();
+
+fn consumerTests() type {
+    const implementation_only = @hasDecl(@import("antfly_source_root"), "implementation_tests_only") and @import("antfly_source_root").implementation_tests_only;
+    if (!(@import("builtin").is_test and !implementation_only)) return struct {};
+    const Suite = struct {
+        test "native metadata job state projections preserve CAS quotas cursors and cold ownership" {
+            const a = std.testing.allocator;
+            var directory = std.testing.tmpDir(.{});
+            defer directory.cleanup();
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-job-state", .{directory.sub_path});
+            defer a.free(root);
+            const key = "documents/native-boundary";
+            const value = "{\"owner\":\"alice\",\"state\":\"queued\"}";
+            for ([_]bool{ false, true }) |cold| {
+                var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+                defer store.deinit();
+                if (!cold) {
+                    try std.testing.expect((try store.getJobState(a, 41, key)) == null);
+                    try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "", .value = value } });
+                    // A duplicate create must not replace the admitted owner or move
+                    // quota to the competing principal across the compiled boundary.
+                    try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "", .value = "{\"owner\":\"mallory\",\"state\":\"queued\"}" } });
+                }
+                const current = (try store.getJobState(a, 41, key)).?;
+                defer a.free(current);
+                try std.testing.expectEqualStrings(value, current);
+                try std.testing.expectEqual(@as(u64, 1), try store.getJobOwnerCount(a, 41, "alice"));
+                try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 41, "mallory"));
+                const bytes = try store.scanJobState(a, 41, null);
+                defer a.free(bytes);
+                var page = try std.json.parseFromSlice(@import("../metadata/job_state.zig").Page, a, bytes, .{});
+                defer page.deinit();
+                try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
+                try std.testing.expectEqualStrings(key, page.value.rows[0].key);
+                try std.testing.expectEqualStrings(value, page.value.rows[0].value);
+                try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, ""));
+                try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, "../invalid"));
+            }
+        }
+    };
+    return Suite;
+}

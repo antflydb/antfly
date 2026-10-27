@@ -369,6 +369,8 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_relational_rows_request, .err = error.InvalidRelationalRowsRequest },
     .{ .status = .constraint_retirement_required, .err = error.ConstraintRetirementRequired },
     .{ .status = .table_transition_active, .err = error.TableTransitionActive },
+    .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
+    .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .invalid_integrity_key, .err = error.InvalidIntegrityKey },
     .{ .status = .integrity_record_too_large, .err = error.IntegrityRecordTooLarge },
     .{ .status = .invalid_range, .err = error.InvalidRange },
@@ -1160,6 +1162,11 @@ test "seed replica policy mismatch survives compiled runtime boundaries" {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    for ([_]anyerror{ error.InvalidDocumentCheckpoint, error.TooManyActiveJobs }) |err| {
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 23);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(err, statusToError(failure.status));
+    }
     // Catalog admission must retain its definite pre-proposal lifecycle
     // conflict across the compiled owner, rather than report an internal
     // failure or invite replay of an allegedly ambiguous mutation.

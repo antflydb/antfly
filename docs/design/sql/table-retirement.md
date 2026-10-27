@@ -69,6 +69,14 @@ and lifecycle-lock kind. Private storage engine descriptor/method symbols
 advance together to version 37. Public storage-owner ABI and OpenAPI contracts
 are unchanged. The marker is omitted from ordinary legacy control bytes.
 
+Integration with main through `a69c0b582e` raises the metadata topology decoder
+to 73. Main's durable job-state command retains tag 79; the unreleased SQL index
+publication ACK moves to 89, and the complete index publication cohort requires
+decoder 73. Compiled boundaries require runtime callback ABI 11, storage owner
+ABI 108 and failure ABI 74. Job-state lookup, paged scanning and owner counts use
+the existing owned metadata projections, including exact checkpoint errors and
+the distinction between an absent cursor and an invalid empty cursor.
+
 ## Publication and operational behavior
 
 SQL returns `DROP TABLE` only for terminal completion. A bounded request may
@@ -126,7 +134,7 @@ subcase is not end-to-end qualification. The authoritative parity ledger stays
 unchanged until an original contract has sufficient executable evidence.
 
 Local qualification on 2026-10-26 used pinned Zig 0.17 Debug on macOS arm64.
-The combined retirement, hosted FK, FK schema, names/tablespace and runtime-error
+Before the latest main merge, the combined retirement, hosted FK, FK schema, names/tablespace and runtime-error
 gates passed all 108 build steps and 23 tests with zero skips or leaks. The
 11-test retirement gate then passed two additional consecutive cached runs,
 including deliberate duplicate metadata commands and both cold-recovery faults.
@@ -134,3 +142,11 @@ The merged-tree SQL suite passed 1,670 tests with four existing opt-in benchmark
 skips and no failures or leaks. The PostgreSQL oracle passed all 50 assertions;
 the Go SDK suite, inventory checker tests, license and embedded-boundary checks
 also passed. The original parity disposition counts are unchanged.
+
+After merging main through `a69c0b582e`, the combined Debug build passed all
+164 steps: 1,670 SQL tests, 50 runtime identity tests, 32 coordinator tests,
+12 retirement/native-owner tests, six tablespace tests, four hosted FK tests,
+one FK schema test, one column/index lifecycle test and three durable metadata
+tests. Only the four existing opt-in SQL benchmarks were skipped; no tests
+failed or leaked. The added compiled-owner test verifies stale-create CAS,
+owner quota isolation, exact cursor errors and cold reopen of durable job state.
