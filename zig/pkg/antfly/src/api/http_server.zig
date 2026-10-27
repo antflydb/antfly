@@ -58309,6 +58309,25 @@ test "system catalog graph primary qualifiers bind full target without namespace
         try std.testing.expectEqualStrings(if (primary.isDefault()) "table:primary" else "docs", nodes.get("c").?.object.get("table").?.string);
         try std.testing.expectEqualStrings("table:primary", nodes.get("d").?.object.get("table").?.string);
         try std.testing.expect(!nodes.get("e").?.object.contains("table"));
+        const selector_body = try std.json.Stringify.valueAlloc(a, .{ .graph_queries = .{
+            .walk = .{ .index = "graph", .traverse = .{ .start = .{ .identities = &[_]struct { key: []const u8, table: []const u8 }{.{ .key = "a", .table = key }} } } },
+            .path = .{ .index = "graph", .shortest_path = .{ .from = .{ .key = "a", .table = key }, .to = .{ .key = "b", .table = foreign } } },
+            .paths = .{ .index = "graph", .k_shortest_paths = .{ .from = .{ .key = "a", .table = "table:primary" }, .to = .{ .key = "b", .table = key }, .k = @as(u32, 2) } },
+        } }, .{});
+        defer a.free(selector_body);
+        var selectors = try server.bindCatalogQuery(a, .{}, key, selector_body, &identity, null);
+        defer selectors.deinit();
+        var selected = try std.json.parseFromSlice(std.json.Value, a, selectors.bound_body.?, .{});
+        defer selected.deinit();
+        const operations = selected.value.object.get("graph_queries").?.object;
+        const start = operations.get("walk").?.object.get("traverse").?.object.get("start").?.object.get("identities").?.array.items[0];
+        try std.testing.expectEqualStrings("table:primary", start.object.get("table").?.string);
+        const path = operations.get("path").?.object.get("shortest_path").?.object;
+        try std.testing.expectEqualStrings("table:primary", path.get("from").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings(foreign, path.get("to").?.object.get("table").?.string);
+        const paths = operations.get("paths").?.object.get("k_shortest_paths").?.object;
+        try std.testing.expectEqualStrings("table:primary", paths.get("from").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings("table:primary", paths.get("to").?.object.get("table").?.string);
     }
 }
 
