@@ -46,36 +46,40 @@ rare CUDA Florence receipt mismatch is not definitively root-caused.
 
 The latest DGX Spark GB10 comparison uses 256 warmup requests and two
 256-request measurements, 128 physical native slots and at most 128 active vLLM
-sequences. Every native output matches native serial bytes and the complete
-normalized vLLM content on the three fixtures. Both profiles retain F32 decode
-and recurrent state, with optional BF16 FFN/recurrent prefill; 4B also uses the
-optional F16-query/F32-output paged prefill attention.
+sequences. Native and fresh vLLM serial references are byte-identical on all
+three fixtures. Every native timed output matches native serial bytes and the
+complete normalized vLLM content. Both profiles retain F32 decode and recurrent
+state, with optional BF16 FFN/recurrent prefill and F16-query/F32-output paged
+prefill attention.
 
 | Model | Native pages/s | vLLM pages/s | Required actual execution |
 | --- | ---: | ---: | --- |
-| LightOn 0.8B | 10.4775 / 10.4189 | 14.3595 / 14.3396 | Wide four-token chains in each round |
-| LightOn 4B | 3.6663 / 3.6641 | 4.6163 / 4.6200 | Wide model-graph replay in each round |
+| LightOn 0.8B | 11.4627 / 11.5924 | 14.6135 / 14.5742 | Wide four-token chains in each round |
+| LightOn 4B | 3.7639 / 3.7325 | 4.6205 / 4.6164 | Wide four-token chains in each round |
 
 The 0.8B profile uses vision/prefix limits 16/16; 4B uses 8/16 and prefix
-chunks of 256 rows. Operator byte limits are unchanged. The 4B four-token chain
-passes output qualification but gives no meaningful throughput improvement and
-is not selected by this table. These comparisons do not establish CUDA parity
-or broad OCR accuracy. Fresh Florence and Metal whole-model qualification after
-cleanup remains outstanding.
+chunks of 256 rows. Operator byte limits are unchanged. Greedy execution reads
+back token IDs instead of vocabulary rows; 4B skips all 426 unused intermediate
+prefix heads in each round. These measurements do not establish CUDA parity
+or broad OCR accuracy. Fresh CUDA Florence throughput qualification remains
+outstanding; M5 Metal qualification is documented in the user guide.
 
-All 44 frozen build187 runtime files match commit `bfd1738430`. CUDA broad
-regression: 248 selected, 234 passed, 14 backend skips. Wide group: 84 selected,
-83 passed, one skip. Independent packet, admission, numerical and ownership
-checks pass with their original tolerances. Default-F32 whole-model checks on
-both models also preserve exact independent baseline bytes; their contended
-rates are excluded from performance conclusions.
+All 48 frozen build223 runtime files match commit `d90a4f5048`. CUDA broad
+regression: 254 selected, 240 passed, 14 backend skips. Wide group: 89 selected,
+88 passed, one skip. Independent packet, admission, numerical and ownership
+checks retain their original tolerances. Default-F32 execution on both models
+also preserves exact independent baseline bytes; those short correctness runs
+are excluded from throughput comparisons.
 
 The [latest archive manifest](followup.json) records the immutable URI, object
-generation, SHA-256 and 108 files. It retains exact frozen binaries and source,
-public scripts and fixtures, sanitized commands/settings, full native/reference
-reports, native-library artifacts and Florence regression evidence. Every member
-has a verified SHA-256; the uploaded object's size and MD5 were also checked.
-The [earlier 64-page functional bundle](followup-736f721b59.json) remains available.
+generation, SHA-256 and 77 files. It retains frozen binaries/source, public
+scripts/fixtures, sanitized commands/settings, full native/reference reports,
+native libraries and diagnostic summaries. Every member has a verified SHA-256;
+the uploaded object's size and MD5 were also checked. The separately labeled
+ReleaseSafe transport qualification includes runtime bounds checks.
+The [previous wide-cohort bundle](followup-bfd1738430.json) retains the graph
+control and Florence regression evidence; the [earlier 64-page functional
+bundle](followup-736f721b59.json) remains available.
 
 ## Reproduce
 
