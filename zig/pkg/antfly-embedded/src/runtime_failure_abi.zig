@@ -795,6 +795,8 @@ pub const Status = enum(u32) {
     value_verification_limit_exceeded = 836,
     graph_start_identity_required = 837,
     unsupported_exact_sort = 838,
+    invalid_document_checkpoint = 839,
+    too_many_active_jobs = 840,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

@@ -658,6 +658,7 @@ pub const Owner = struct {
     embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
     test_after_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
+    test_after_allocator_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *native.NativeFile) void } else void = if (h.builtin.is_test) null else {},
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
@@ -1096,6 +1097,55 @@ pub const Owner = struct {
         defer if (lease_held) lease.close();
         const foreground = try self.refresh();
         if (needsOutcomeReconciliation(foreground)) return false;
+        const foreground_file = &foreground.owned_lite_backend.?.native_docstore.?.file;
+        if (self.options.open_mode == .writer and !foreground_file.free_pages_verified) {
+            // Source-recovery, group-source and TTL control slices below can
+            // write before detached provider replay starts. Prove their free
+            // pool first, without holding the connection or path-writer gate.
+            // Pin the originating runtime: the reader borrows its allocator
+            // and optional page-cache resource manager through completion.
+            foreground.maintenance_references += 1;
+            defer {
+                if (!gate_locked) self.gate.mutex.lockUncancelable(io);
+                foreground.maintenance_references -= 1;
+                if (!gate_locked) self.gate.mutex.unlock(io);
+            }
+            const reader = try foreground_file.captureAllocatorVerificationSnapshot(&self.verification_cancel);
+            const proof_alloc = reader.allocator;
+            defer {
+                reader.close();
+                proof_alloc.destroy(reader);
+            }
+            lease.close();
+            lease_held = false;
+            self.gate.mutex.unlock(io);
+            gate_locked = false;
+            if (comptime h.builtin.is_test) if (self.test_after_allocator_capture) |hook| hook.notify(hook.ptr, reader);
+            try reader.completeAllocatorVerification();
+            self.gate.mutex.lockUncancelable(io);
+            gate_locked = true;
+            lease = try native.lockWriterPathWithIo(alloc, io, self.path);
+            lease_held = true;
+            // The originating runtime remains pinned until reader cleanup.
+            // Refreshing while pinned would unnecessarily fork that runtime
+            // and publish new lease metadata, invalidating this exact proof.
+            // Observe the current on-disk generation without opening a DB.
+            var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
+            defer probe.close();
+            if (self.current) |current| {
+                const file = &current.owned_lite_backend.?.native_docstore.?.file;
+                if (std.meta.eql(file.header, probe.header) and
+                    (try file.file.stat(file.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
+                    try file.inheritAllocatorVerification(reader);
+            }
+            // Header/inode mismatch leaves the new generation unverified.
+            // Yield and recapture, never fall back to a scan under this gate.
+            lease.close();
+            lease_held = false;
+            self.gate.mutex.unlock(io);
+            gate_locked = false;
+            return true;
+        }
         try @import("sql_commit.zig").recover(foreground);
         try @import("sql_ddl.zig").recover(foreground);
         // Catalog identities suffice for rotation and dropped-table pruning.

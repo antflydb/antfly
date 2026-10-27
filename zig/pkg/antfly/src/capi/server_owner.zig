@@ -1769,6 +1769,21 @@ pub fn metadataApplyStoreProjection(
             handle.store.migrateStandaloneRestoreJobs(rows.value) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
+        .job_owner_count => blk: {
+            const count = handle.store.getJobOwnerCount(alloc, request.group_id, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, count);
+        },
+        .job_state => blk: {
+            const value = handle.store.getJobState(alloc, request.group_id, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .job_state_scan => blk: {
+            if (request.arg1 > 1) break :blk .invalid_argument;
+            const value = handle.store.scanJobState(alloc, request.group_id, if (request.arg1 == 0) null else request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .backup_cohort => blk: {
             const value = handle.store.getBackupCohort(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
