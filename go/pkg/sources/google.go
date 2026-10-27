@@ -344,6 +344,12 @@ func (c *GoogleConnector) enumerateDrive(ctx context.Context, client *http.Clien
 	return nil
 }
 func (c *GoogleConnector) read(ctx context.Context, client *http.Client, r Request, o Item) ([]byte, error) {
+	return c.readWithin(ctx, client, r, o, maxImportSourceObjectBytes)
+}
+func (c *GoogleConnector) readWithin(ctx context.Context, client *http.Client, r Request, o Item, limit int) ([]byte, error) {
+	if limit < 0 || limit > maxImportSourceObjectBytes {
+		return nil, ErrInvalidInput
+	}
 	config, _ := decodeSourceConfig[GoogleConfig](r.Config)
 	if configString(o.Metadata, "mime_type") == "application/vnd.google-apps.spreadsheet" {
 		return nil, fmt.Errorf("%w: whole-workbook extraction is not supported; first-sheet CSV must not be presented as a complete workbook", ErrInvalidInput)
@@ -382,11 +388,11 @@ func (c *GoogleConnector) read(ctx context.Context, client *http.Client, r Reque
 	if c.ProviderName == ProviderGCS && resp.Header.Get("X-Goog-Generation") != o.Revision {
 		return nil, &RevisionChangedError{Expected: o.Revision, Actual: resp.Header.Get("X-Goog-Generation")}
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImportSourceObjectBytes+1))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > maxImportSourceObjectBytes {
+	if len(data) > limit {
 		return nil, fmt.Errorf("%w: source exceeds byte limit", ErrInvalidInput)
 	}
 	if c.ProviderName == ProviderGCS && int64(len(data)) != o.Size {

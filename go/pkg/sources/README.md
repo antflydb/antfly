@@ -264,3 +264,8 @@ archive cursors; narrowing the selection is required when the sample is exhauste
 Normal syncs retain complete archive pagination. Google OAuth refresh failures use
 the same safe retry/cooldown contract as resource errors: transient failures retry,
 invalid grants remain permanent, and token response bodies are not retained.
+
+Calendar attachment previews acquire at most eight Drive files; unsampled files
+receive no Drive reads. Attachment downloads and native exports share the remaining
+parent byte budget. Discord resource lists reuse one guild authority snapshot and
+preserve provider rate limits instead of treating them as missing access.

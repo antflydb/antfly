@@ -124,7 +124,7 @@ func TestWorkspaceDriveDownloadPreservesGoogleCooldown(t *testing.T) {
 					raw, _ := json.Marshal(map[string]any{"id": "file", "version": "1", "name": "notes.txt", "size": "5", "mimeType": mime})
 					return &http.Response{StatusCode: 200, Header: http.Header{}, Request: r, Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
 				})}
-				_, err := c.workspaceDriveFile(t.Context(), "file")
+				_, err := c.workspaceDriveFile(t.Context(), "file", maxImportSourceObjectBytes)
 				var api *GoogleHTTPError
 				require.ErrorAs(t, err, &api)
 				require.True(t, api.Retryable())
@@ -284,7 +284,7 @@ func TestDriveRefreshFailureBeforeDownloadRetainsCooldown(t *testing.T) {
 				return &http.Response{StatusCode: 200, Header: http.Header{}, Request: r, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
 			})
 			c := &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, HTTPClient: &http.Client{Transport: &oauth2.Transport{Source: source, Base: base}}}
-			_, err := c.workspaceDriveFile(t.Context(), "file")
+			_, err := c.workspaceDriveFile(t.Context(), "file", maxImportSourceObjectBytes)
 			var api *GoogleHTTPError
 			require.ErrorAs(t, err, &api)
 			require.Equal(t, 503, api.Status)
@@ -313,5 +313,34 @@ func TestGoogleJWTRefreshResponseUsesBoundedCodeOnly(t *testing.T) {
 		require.ErrorAs(t, err, &api)
 		require.Equal(t, tc.retry, api.Retryable())
 		require.NotContains(t, err.Error(), "provider-secret")
+	}
+}
+
+func TestGoogleCredentialTokenSourceSharesSafeErrorContract(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		code   string
+		retry  bool
+	}{
+		{503, "temporarily_unavailable", true}, {429, "temporarily_unavailable", true}, {400, "temporarily_unavailable", true}, {400, "invalid_grant", false},
+	} {
+		t.Run(fmt.Sprintf("%d/%s", tc.status, tc.code), func(t *testing.T) {
+			deadline := time.Now().UTC().Add(10 * time.Minute).Truncate(time.Second)
+			client := &http.Client{Transport: collaborationTransport(func(r *http.Request) (*http.Response, error) {
+				body, _ := json.Marshal(map[string]string{"error": tc.code, "error_description": "provider-secret"})
+				return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": []string{"application/json"}, "Retry-After": []string{deadline.Format(http.TimeFormat)}}, Request: r, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
+			})}
+			ctx := context.WithValue(t.Context(), oauth2.HTTPClient, client)
+			credentials, err := GoogleCredentialsForServices(ctx, ProviderGoogleWorkspace, `{"type":"authorized_user","client_id":"test","client_secret":"provider-secret","refresh_token":"provider-secret"}`, []string{"gmail"})
+			require.NoError(t, err)
+			_, err = credentials.TokenSource.Token()
+			var api *GoogleHTTPError
+			require.ErrorAs(t, err, &api)
+			require.Equal(t, tc.retry, api.Retryable())
+			require.Equal(t, deadline, api.AntflyRetryAfter())
+			require.NotContains(t, err.Error(), "provider-secret")
+			var raw *oauth2.RetrieveError
+			require.NotErrorAs(t, err, &raw)
+		})
 	}
 }

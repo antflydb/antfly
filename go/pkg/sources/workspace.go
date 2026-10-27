@@ -437,21 +437,23 @@ func (c *CollaborationConnector) calendarLoad(ctx context.Context, config Collab
 		if !driveAccess {
 			return collaborationMaterial{}, fmt.Errorf("calendar attachment extraction requires Google Workspace Drive access")
 		}
-		for _, attachment := range event.Attachments {
+		selected := event.Attachments
+		if config.preview && len(selected) > PreviewItemLimit-1 {
+			selected = selected[:PreviewItemLimit-1]
+		}
+		for _, attachment := range selected {
 			if !googleFileID(attachment.FileID) {
 				return collaborationMaterial{}, fmt.Errorf("calendar external attachments require an independently authorized source")
 			}
-			file, err := c.workspaceDriveFile(ctx, attachment.FileID)
-			if err != nil {
-				return collaborationMaterial{}, err
-			}
-			files = append(files, file)
+			// Defer Drive metadata and bytes until materialItems has applied the
+			// preview count and the remaining aggregate extraction budget.
+			files = append(files, collaborationFile{ID: attachment.FileID, Name: attachment.Title, MIME: attachment.MIME, driveFile: true})
 		}
 	}
 	return collaborationMaterial{Text: []byte(text), URL: event.HTMLLink, Title: event.Summary, Metadata: meta, Files: files}, nil
 }
 
-func (c *CollaborationConnector) workspaceDriveFile(ctx context.Context, id string) (collaborationFile, error) {
+func (c *CollaborationConnector) workspaceDriveFile(ctx context.Context, id string, limit int) (collaborationFile, error) {
 	drive := c.drive()
 	var file driveSourceFile
 	if err := drive.get(ctx, c.HTTPClient, "/files/"+url.PathEscape(id)+"?fields="+url.QueryEscape(driveSourceFields)+"&supportsAllDrives=true", &file); err != nil {
@@ -469,8 +471,11 @@ func (c *CollaborationConnector) workspaceDriveFile(ctx context.Context, id stri
 		}
 	}
 	export := googleWorkspaceTextExport(file.MIME)
+	if export == "" && file.Size != "" && size > int64(limit) {
+		return collaborationFile{}, fmt.Errorf("%w: Drive attachment exceeds remaining byte budget", ErrInvalidInput)
+	}
 	item := Item{ID: "drive://attachment/" + id, Path: file.Name, Filename: file.Name, Revision: file.Version, Size: size, Metadata: map[string]any{"file_id": id, "mime_type": file.MIME, "export_mime_type": export, "md5_checksum": file.MD5, "size_is_upper_bound": export != "" || file.Size == ""}}
-	data, err := drive.Read(ctx, Request{}, item)
+	data, err := drive.readWithin(ctx, c.HTTPClient, Request{}, item, limit)
 	if err != nil {
 		return collaborationFile{}, err
 	}

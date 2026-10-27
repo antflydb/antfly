@@ -17,6 +17,7 @@ package sources
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -86,29 +87,48 @@ func (c *CollaborationConnector) discordScope(ctx context.Context, config Collab
 			return fmt.Errorf("Discord parent guild changed")
 		}
 	}
+	authority, err := c.discordAuthority(ctx, config.GuildID)
+	if err != nil {
+		return err
+	}
+	return authority.check(channel)
+}
+
+var errDiscordAccessDenied = errors.New("Discord source access denied")
+
+type discordAuthority struct {
+	guild, botID   string
+	roles          map[string]bool
+	permissions    uint64
+	messageContent bool
+}
+
+// Guild identity, role membership and application flags are shared by every
+// channel in a resource page. Channel overwrites are evaluated locally.
+func (c *CollaborationConnector) discordAuthority(ctx context.Context, guild string) (*discordAuthority, error) {
 	var me struct {
 		ID string `json:"id"`
 	}
 	if err := c.get(ctx, ProviderDiscord, "/users/@me", &me); err != nil {
-		return err
+		return nil, err
 	}
 	if !discordID(me.ID) {
-		return fmt.Errorf("Discord bot identity missing")
+		return nil, fmt.Errorf("Discord bot identity missing")
 	}
 	var member struct {
 		Roles []string `json:"roles"`
 	}
-	if err := c.get(ctx, ProviderDiscord, "/guilds/"+config.GuildID+"/members/"+me.ID, &member); err != nil {
-		return err
+	if err := c.get(ctx, ProviderDiscord, "/guilds/"+guild+"/members/"+me.ID, &member); err != nil {
+		return nil, err
 	}
 	var roles []struct {
 		ID          string `json:"id"`
 		Permissions string `json:"permissions"`
 	}
-	if err := c.get(ctx, ProviderDiscord, "/guilds/"+config.GuildID+"/roles", &roles); err != nil {
-		return err
+	if err := c.get(ctx, ProviderDiscord, "/guilds/"+guild+"/roles", &roles); err != nil {
+		return nil, err
 	}
-	memberRoles := map[string]bool{config.GuildID: true}
+	memberRoles := map[string]bool{guild: true}
 	for _, id := range member.Roles {
 		memberRoles[id] = true
 	}
@@ -117,15 +137,27 @@ func (c *CollaborationConnector) discordScope(ctx context.Context, config Collab
 		if memberRoles[role.ID] {
 			bits, err := strconv.ParseUint(role.Permissions, 10, 64)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			permissions |= bits
 		}
 	}
+	var app struct {
+		Flags uint64 `json:"flags"`
+	}
+	if err := c.get(ctx, ProviderDiscord, "/oauth2/applications/@me", &app); err != nil {
+		return nil, err
+	}
+
+	return &discordAuthority{guild: guild, botID: me.ID, roles: memberRoles, permissions: permissions, messageContent: app.Flags&((1<<18)|(1<<19)) != 0}, nil
+}
+
+func (authority *discordAuthority) check(channel discordChannel) error {
+	permissions := authority.permissions
 	if permissions&8 == 0 {
 		var deny, allow uint64
 		for _, overwrite := range channel.Overwrites {
-			if overwrite.Type == 0 && overwrite.ID == config.GuildID {
+			if overwrite.Type == 0 && overwrite.ID == authority.guild {
 				a, err := strconv.ParseUint(overwrite.Allow, 10, 64)
 				if err != nil {
 					return err
@@ -138,7 +170,7 @@ func (c *CollaborationConnector) discordScope(ctx context.Context, config Collab
 			}
 		}
 		for _, overwrite := range channel.Overwrites {
-			if overwrite.Type == 0 && overwrite.ID != config.GuildID && memberRoles[overwrite.ID] {
+			if overwrite.Type == 0 && overwrite.ID != authority.guild && authority.roles[overwrite.ID] {
 				a, err := strconv.ParseUint(overwrite.Allow, 10, 64)
 				if err != nil {
 					return err
@@ -153,7 +185,7 @@ func (c *CollaborationConnector) discordScope(ctx context.Context, config Collab
 		}
 		permissions = (permissions &^ deny) | allow
 		for _, overwrite := range channel.Overwrites {
-			if overwrite.Type == 1 && overwrite.ID == me.ID {
+			if overwrite.Type == 1 && overwrite.ID == authority.botID {
 				a, err := strconv.ParseUint(overwrite.Allow, 10, 64)
 				if err != nil {
 					return err
@@ -166,20 +198,16 @@ func (c *CollaborationConnector) discordScope(ctx context.Context, config Collab
 			}
 		}
 		if permissions&(1<<10) == 0 || permissions&(1<<16) == 0 {
-			return fmt.Errorf("Discord source requires VIEW_CHANNEL and READ_MESSAGE_HISTORY")
+			return fmt.Errorf("%w: VIEW_CHANNEL and READ_MESSAGE_HISTORY required", errDiscordAccessDenied)
 		}
 	}
-	var app struct {
-		Flags uint64 `json:"flags"`
-	}
-	if err := c.get(ctx, ProviderDiscord, "/oauth2/applications/@me", &app); err != nil {
-		return err
-	}
-	if app.Flags&((1<<18)|(1<<19)) == 0 {
-		return fmt.Errorf("Discord source requires MESSAGE_CONTENT access")
+
+	if !authority.messageContent {
+		return fmt.Errorf("%w: MESSAGE_CONTENT required", errDiscordAccessDenied)
 	}
 	return nil
 }
+
 func discordArchivePaths(channelType int) []string {
 	paths := []string{"threads/archived/public"}
 	// Private threads exist only under guild text channels, not forums, media,

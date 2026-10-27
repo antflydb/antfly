@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
 
@@ -73,5 +74,15 @@ func GoogleCredentialsForServices(ctx context.Context, provider, secret string, 
 	if err != nil {
 		return nil, fmt.Errorf("invalid Google source credentials")
 	}
+	credentials.TokenSource = googleCredentialTokens{credentials.TokenSource}
 	return credentials, nil
+}
+
+// Normalize at the credential boundary too: callers that validate a connection
+// directly must receive the same safe retry contract as resource HTTP requests.
+type googleCredentialTokens struct{ oauth2.TokenSource }
+
+func (s googleCredentialTokens) Token() (*oauth2.Token, error) {
+	token, err := s.TokenSource.Token()
+	return token, googleRequestError(err)
 }

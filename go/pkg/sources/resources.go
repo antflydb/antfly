@@ -17,6 +17,7 @@ package sources
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -139,12 +140,27 @@ func (c *CollaborationConnector) ListResources(ctx context.Context, resource, pa
 		if err := c.get(ctx, ProviderDiscord, "/guilds/"+parent+"/channels", &channels); err != nil {
 			return page, err
 		}
+		if len(channels) > 10000 {
+			return page, ErrInventoryIncomplete
+		}
+		authority, err := c.discordAuthority(ctx, parent)
+		if err != nil {
+			return page, err
+		}
+		seen := map[string]bool{}
 		for _, channel := range channels {
-			if channel.Type == 0 || channel.Type == 5 || channel.Type == 15 || channel.Type == 16 {
-				config := CollaborationConfig{GuildID: parent, ChannelIDs: []string{channel.ID}}
-				err := c.discordScope(ctx, config, channel.ID)
-				page.Data = append(page.Data, Resource{ID: channel.ID, Name: channel.Name, ParentID: channel.ParentID, Readable: err == nil})
+			if channel.Type != 0 && channel.Type != 5 && channel.Type != 15 && channel.Type != 16 {
+				continue
 			}
+			if !discordID(channel.ID) || seen[channel.ID] || (channel.GuildID != "" && channel.GuildID != parent) {
+				return page, ErrInventoryIncomplete
+			}
+			seen[channel.ID] = true
+			err := authority.check(channel)
+			if err != nil && !errors.Is(err, errDiscordAccessDenied) {
+				return page, err
+			}
+			page.Data = append(page.Data, Resource{ID: channel.ID, Name: channel.Name, ParentID: channel.ParentID, Readable: err == nil})
 		}
 	default:
 		return page, ErrInvalidInput

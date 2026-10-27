@@ -402,3 +402,15 @@ eight containers, reuse one active-thread listing and read at most one page per
 applicable archive kind without following cursors. A truncated sample without a
 message fails explicitly rather than claiming an empty source. Full syncs retain
 complete archive pagination; private archives are queried only for text channels.
+
+Workspace credential token sources normalize OAuth failures before both validation
+and ingestion. Validation retains active credentials on transient or inconclusive
+refresh failures, and invalidates only confirmed permanent failures or invalid
+configuration. Provider bodies and descriptions are never returned as diagnostics.
+
+Calendar-linked Drive attachments are lazy acquisition references until preview
+count and aggregate byte budgets have been applied. Known file sizes are checked
+before download; native exports are read only within the remaining parent budget.
+Discord resource browsing fetches guild identity, roles and application flags once
+per page, evaluates channel overwrites locally, and propagates transient failures
+with cooldowns instead of returning unreadable channels.

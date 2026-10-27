@@ -88,6 +88,7 @@ type collaborationFile struct {
 	CanonicalURL        string
 	Revision            string
 	Data                []byte
+	driveFile           bool
 }
 type collaborationMaterial struct {
 	Text       []byte
@@ -483,6 +484,17 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 	totalBytes := len(m.Text)
 	if config.Attachments {
 		for _, file := range m.Files {
+			remaining := maxImportSourceObjectBytes - totalBytes
+			if remaining <= 0 {
+				return nil, fmt.Errorf("%w: attachment budget exhausted", ErrInvalidInput)
+			}
+			if file.driveFile {
+				var err error
+				file, err = c.workspaceDriveFile(ctx, file.ID, remaining)
+				if err != nil {
+					return nil, err
+				}
+			}
 			data := file.Data
 			if file.URL != "" {
 				var err error
@@ -490,6 +502,9 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 				if err != nil {
 					return nil, err
 				}
+			}
+			if len(data) > remaining {
+				return nil, fmt.Errorf("%w: attachment exceeds remaining byte budget", ErrInvalidInput)
 			}
 			extract := c.Extractor
 			if extract == nil {
