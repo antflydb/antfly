@@ -6824,6 +6824,18 @@ test "capi native close certifies allocator before the next process opens source
             try std.testing.expect((try file.check()).valid);
             try std.testing.expect(file.free_pages_verified);
         }
+        // Exercise the certificate with real managed SQL index sources too;
+        // opening their read leases must preserve inherited verification.
+        if (process == 0) try sqlFkRecoveryStatement(handle, "CREATE TABLE certified(n BIGINT PRIMARY KEY)");
+        var statement: [160]u8 = undefined;
+        try sqlFkRecoveryStatement(handle, try std.fmt.bufPrint(&statement, "INSERT INTO certified(_id,n) VALUES ('row-{d}',{d})", .{ process, process }));
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            try std.testing.expect(file.free_pages_verified);
+            try std.testing.expect((try file.check()).valid);
+        }
         antfly_db_close(handle);
         handle = null;
         var probe = try lite_backend.native.NativeFile.openWithIo(a, shared.handleLockIo(), path, .{ .read_only = true, .internal_reader = true });
