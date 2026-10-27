@@ -160,6 +160,8 @@ class TestRunnerSelection(unittest.TestCase):
 
     def test_execution_budget_excludes_compilation_and_bounds_a_stuck_test(self):
         for limit, expected in ((20, 124), (5000, 0)):
+            progress_dir = Path(self.temp.name) / f"watchdog-{limit}"
+            progress_dir.mkdir(exist_ok=True)
             process = subprocess.Popen(
                 [
                     str(self.binary),
@@ -171,6 +173,7 @@ class TestRunnerSelection(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env={**os.environ, "ANTFLY_TEST_LOG_DIR": str(progress_dir)},
             )
             try:
                 if expected:
@@ -179,6 +182,18 @@ class TestRunnerSelection(unittest.TestCase):
                     process.wait(timeout=7)
                     _, stderr = process.communicate(timeout=1)
                 else:
+                    path = progress_dir / f"{self.progress_prefix}-{process.pid}.log"
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if path.exists() and "START\t" in path.read_text():
+                            break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("watchdog fixture did not start")
+                    # Begin after START, when the watchdog is active. The
+                    # longer budget must survive beyond the 20 ms short case.
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        process.wait(timeout=0.1)
                     _, stderr = process.communicate(input="r", timeout=7)
                 self.assertEqual(process.returncode, expected, stderr)
                 if expected:
