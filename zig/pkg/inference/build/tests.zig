@@ -76,6 +76,7 @@ pub fn create(ctx: Context) Suite {
     // linkage stay consistent with the runtime under test.
     const readers_mod = ctx.graph.inference_mod.import_table.get("antfly_readers").?;
     tests.root_module.addImport("antfly_readers", readers_mod);
+    tests.root_module.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);

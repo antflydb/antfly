@@ -98,6 +98,7 @@ pub const Config = struct {
 };
 
 pub const Graph = struct {
+    document_runs_mod: *std.Build.Module,
     runtime_abi_mod: *std.Build.Module,
     build_info_mod: *std.Build.Module,
     build_info_object: *std.Build.Step.Compile,
@@ -283,7 +284,9 @@ pub fn create(config: Config) Graph {
     };
     const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
+    const document_runs_mod = b.modules.get("antfly_document_runs") orelse createSharedModule(config, "lib/readers/src/document_runs.zig");
     const readers_mod = b.modules.get("antfly_readers") orelse createSharedModule(config, "lib/readers/src/mod.zig");
+    readers_mod.addImport("antfly_document_runs", document_runs_mod);
     readers_mod.addImport("httpx", httpx_mod);
     readers_mod.addImport("inference_api", inference_api_mod);
     readers_mod.addImport("antfly_google", google_mod);
@@ -475,6 +478,7 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     });
+    documents_mod.addImport("antfly_hash", hash_mod);
     documents_mod.addImport("antfly_image", image_mod);
     documents_mod.addImport("antfly_pdf", pdf_mod);
     inference_mod.addImport("antfly_documents", documents_mod);
@@ -486,6 +490,7 @@ pub fn create(config: Config) Graph {
     inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     inference_mod.addImport("antfly_extracting", extracting_mod);
     inference_mod.addImport("antfly_readers", readers_mod);
+    inference_mod.addImport("antfly_document_runs", document_runs_mod);
     inference_mod.addImport("antfly_transcribing", transcribing_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
     inference_mod.link_libc = backend.link_libc;
@@ -496,6 +501,7 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
     inference_internal_mod.addImport("antfly_readers", readers_mod);
+    inference_internal_mod.addImport("antfly_document_runs", document_runs_mod);
     inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("antfly_structured", structured_mod);
     inference_internal_mod.addImport("antfly_extracting", extracting_mod);
@@ -535,6 +541,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_internal", inference_internal_mod);
 
     return .{
+        .document_runs_mod = document_runs_mod,
         .runtime_abi_mod = runtime_abi_mod,
         .build_info_mod = shared.build_info_mod,
         .build_info_object = shared.build_info_object,
