@@ -112,7 +112,7 @@ type hydrationCheckpoint struct {
 func (c *CollaborationConnector) hydrationSelection(r Request) string {
 	version := c.ExtractorVersion
 	if version == "" {
-		version = "attachment-text-v2"
+		version = "attachment-text-v3"
 	}
 	return acquisitionKey(c.ProviderName + "\x00" + workspaceSelectionKey(r) + "\x00" + version)
 }
@@ -283,7 +283,7 @@ func (c *CollaborationConnector) authorizeCurrent(ctx context.Context, config Co
 				return &RevisionChangedError{Expected: configString(item.Metadata, "etag"), Actual: event.ETag}
 			}
 			limited, known := item.Metadata["details_visible"].(bool)
-			if event.Visibility == "private" && c.calendarRoles[ref.Container] == "reader" && (!known || limited) {
+			if calendarPrivateVisibility(event.Visibility) && c.calendarRoles[ref.Container] == "reader" && (!known || limited) {
 				return fmt.Errorf("%w: private Calendar event detail access revoked", ErrInvalidInput)
 			}
 			c.scopeChecks[eventKey] = time.Now()

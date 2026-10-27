@@ -400,6 +400,10 @@ type calendarEvent struct {
 	} `json:"attachments"`
 }
 
+func calendarPrivateVisibility(visibility string) bool {
+	return visibility == "private" || visibility == "confidential"
+}
+
 func (c *CollaborationConnector) calendarLoad(ctx context.Context, config CollaborationConfig, ref collaborationRef) (collaborationMaterial, error) {
 	var event calendarEvent
 	if err := c.get(ctx, "calendar", "/calendars/"+url.PathEscape(ref.Container)+"/events/"+url.PathEscape(ref.ID), &event); err != nil {
@@ -411,7 +415,7 @@ func (c *CollaborationConnector) calendarLoad(ctx context.Context, config Collab
 	meta := map[string]any{"calendar_id": ref.Container, "etag": event.ETag, "ical_uid": event.ICalUID, "recurring_event_id": event.RecurringEventID, "start": event.Start, "end": event.End, "original_start_time": event.OriginalStartTime, "recurrence": event.Recurrence, "organizer": event.Organizer, "attendees": event.Attendees}
 	meta["status"] = event.Status
 	meta["visibility"] = event.Visibility
-	meta["details_visible"] = event.Visibility != "private" || c.calendarRoles[ref.Container] == "writer" || c.calendarRoles[ref.Container] == "owner"
+	meta["details_visible"] = !calendarPrivateVisibility(event.Visibility) || c.calendarRoles[ref.Container] == "writer" || c.calendarRoles[ref.Container] == "owner"
 	text := event.Summary + "\n" + string(htmlText([]byte(event.Description))) + "\n" + event.Location
 	if event.Status == "cancelled" {
 		text = "Canceled occurrence\n" + text

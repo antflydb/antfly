@@ -237,27 +237,31 @@ func (c *CollaborationConnector) base(resource string) string {
 	}
 }
 func (c *CollaborationConnector) get(ctx context.Context, resource, path string, out any) error {
+	_, err := c.getWithHeaders(ctx, resource, path, out)
+	return err
+}
+func (c *CollaborationConnector) getWithHeaders(ctx context.Context, resource, path string, out any) (http.Header, error) {
 	cacheKey := c.base(resource) + path
 	if c.Cache != nil && inventoryPage(path) {
 		data, found, err := c.Cache.Load(ctx, cacheKey)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if found {
-			return json.Unmarshal(data, out)
+			return nil, json.Unmarshal(data, out)
 		}
 	}
 	if c.HTTPClient == nil {
-		return fmt.Errorf("authorized HTTP client required")
+		return nil, fmt.Errorf("authorized HTTP client required")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base(resource)+path, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if c.AccessToken != nil {
 		token, err := c.AccessToken(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		scheme := "Bearer "
 		if c.ProviderName == ProviderDiscord {
@@ -270,21 +274,21 @@ func (c *CollaborationConnector) get(ctx context.Context, resource, path string,
 	resp, err := client.Do(req)
 	if err != nil {
 		if c.ProviderName == ProviderGoogleWorkspace {
-			return googleRequestError(err)
+			return nil, googleRequestError(err)
 		}
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		if resource == "gmail" || resource == "calendar" {
 			api := googleResponseError(resp)
-			return &ProviderHTTPError{Provider: c.ProviderName, Status: api.Status, Code: api.Reason, RetryAt: api.RetryAt}
+			return nil, &ProviderHTTPError{Provider: c.ProviderName, Status: api.Status, Code: api.Reason, RetryAt: api.RetryAt}
 		}
-		return &ProviderHTTPError{Provider: c.ProviderName, Status: resp.StatusCode, RetryAt: providerRetryAt(resp.Header.Get("Retry-After"), time.Now())}
+		return nil, &ProviderHTTPError{Provider: c.ProviderName, Status: resp.StatusCode, RetryAt: providerRetryAt(resp.Header.Get("Retry-After"), time.Now())}
 	}
 	b, err := readBounded(resp.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if resource == ProviderSlack {
 		var envelope struct {
@@ -292,19 +296,19 @@ func (c *CollaborationConnector) get(ctx context.Context, resource, path string,
 			Error string `json:"error"`
 		}
 		if err := json.Unmarshal(b, &envelope); err != nil {
-			return err
+			return nil, err
 		}
 		if !envelope.OK {
-			return SlackAPIError(envelope.Error, providerRetryAt(resp.Header.Get("Retry-After"), time.Now()))
+			return nil, SlackAPIError(envelope.Error, providerRetryAt(resp.Header.Get("Retry-After"), time.Now()))
 		}
 	}
 	if err := json.Unmarshal(b, out); err != nil {
-		return err
+		return nil, err
 	}
 	if c.Cache != nil && inventoryPage(path) {
-		return c.Cache.Save(ctx, cacheKey, acquisitionMetadata(resource, path, b))
+		return resp.Header, c.Cache.Save(ctx, cacheKey, acquisitionMetadata(resource, path, b))
 	}
-	return nil
+	return resp.Header, nil
 }
 
 func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inventory, error) {

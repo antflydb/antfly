@@ -119,17 +119,24 @@ func (c *CollaborationConnector) ListResources(ctx context.Context, resource, pa
 		var result struct {
 			Channels []struct {
 				ID, Name string
-				Member   bool `json:"is_member"`
+				Member   bool  `json:"is_member"`
+				Private  *bool `json:"is_private"`
 			} `json:"channels"`
 			Meta struct {
 				Next string `json:"next_cursor"`
 			} `json:"response_metadata"`
 		}
-		if err := c.get(ctx, ProviderSlack, "/conversations.list?"+q.Encode(), &result); err != nil {
+		headers, err := c.getWithHeaders(ctx, ProviderSlack, "/conversations.list?"+q.Encode(), &result)
+		if err != nil {
 			return page, err
 		}
 		for _, channel := range result.Channels {
-			page.Data = append(page.Data, Resource{ID: channel.ID, Name: channel.Name, Readable: channel.Member})
+			err := slackReadAccess(headers, channel.Private, false)
+			var api *ProviderHTTPError
+			if err != nil && !(errors.As(err, &api) && api.Status == 403) {
+				return page, err
+			}
+			page.Data = append(page.Data, Resource{ID: channel.ID, Name: channel.Name, Readable: channel.Member && err == nil})
 		}
 		page.NextCursor = result.Meta.Next
 	case ProviderDiscord:

@@ -269,3 +269,10 @@ Calendar attachment previews acquire at most eight Drive files; unsampled files
 receive no Drive reads. Attachment downloads and native exports share the remaining
 parent byte budget. Discord resource lists reuse one guild authority snapshot and
 preserve provider rate limits instead of treating them as missing access.
+
+Slack lease renewal requires live granular history grants (and files:read for
+attachments); channel membership alone is insufficient. Missing scope proofs never
+renew a lease. Slack bot tokens require include_threads:false for channel sources.
+Calendar confidential visibility is private. Extractor v3 invalidates older
+visibility metadata. Discord moderators use effective parent-channel permissions;
+ordinary private-thread readers still require explicit membership.

@@ -43,7 +43,11 @@ func fixtureClient(t *testing.T, handler func(*http.Request) (int, any)) *http.C
 		status, value := handler(r)
 		data, err := json.Marshal(value)
 		require.NoError(t, err)
-		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(data)), Request: r}, nil
+		headers := make(http.Header)
+		// Real Slack responses carry live token scopes; successful fixtures model a
+		// fully granted user token unless a scope-specific test supplies its own HTTP client.
+		headers.Set("X-OAuth-Scopes", "channels:read,groups:read,channels:history,groups:history,files:read")
+		return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(bytes.NewReader(data)), Request: r}, nil
 	})}
 }
 

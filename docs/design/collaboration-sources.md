@@ -331,8 +331,8 @@ in this pass replenishes the same bounded retry budget as initial acquisition.
 Hosted SQL checkpoints expire seven days after run creation, matching bounded
 backfill retention. Completed runs enqueue bounded cleanup; the scheduler also
 sweeps expired rows with indexed, skip-locked batches. A run past retention must
-start over. Default extraction version `attachment-text-v2` invalidates cached
-Calendar records that predate visibility metadata.
+start over. Default extraction version `attachment-text-v3` invalidates cached
+Calendar records with older privacy classifications.
 
 
 Permission renewal uses a durable recurring queue job per completed publication.
@@ -414,3 +414,17 @@ before download; native exports are read only within the remaining parent budget
 Discord resource browsing fetches guild identity, roles and application flags once
 per page, evaluates channel overwrites locally, and propagates transient failures
 with cooldowns instead of returning unreadable channels.
+
+
+Slack authority uses the live X-OAuth-Scopes header from the channel metadata
+response, verifying public/private history scopes and files:read when attachments
+are enabled. Missing or malformed scope proofs are transient and cannot renew a
+lease; confirmed grant loss denies access. Bot tokens cannot authorize user-only
+channel thread reads. Resource browsing uses the same content-grant checks.
+
+Calendar private and legacy confidential visibility share one normalization and
+reauthorization rule. Default extractor v3 invalidates older visibility metadata.
+Discord private-thread checks evaluate effective parent-channel permissions first:
+administrators and MANAGE_THREADS moderators need no membership lookup; ordinary
+readers still require explicit membership. Channel overwrites can remove moderator
+rights, and ordinary history/message-content requirements still apply.

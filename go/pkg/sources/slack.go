@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -84,6 +85,7 @@ func (c *CollaborationConnector) slackScope(ctx context.Context, config Collabor
 	}
 	var auth struct {
 		TeamID string `json:"team_id"`
+		BotID  string `json:"bot_id"`
 	}
 	if err := c.get(ctx, ProviderSlack, "/auth.test", &auth); err != nil {
 		return err
@@ -91,17 +93,67 @@ func (c *CollaborationConnector) slackScope(ctx context.Context, config Collabor
 	if auth.TeamID != config.TeamID {
 		return fmt.Errorf("Slack workspace does not match connection")
 	}
+	if auth.BotID != "" && (config.IncludeThreads == nil || *config.IncludeThreads) {
+		return &ProviderHTTPError{Provider: ProviderSlack, Status: 403, Code: "not_allowed_token_type"}
+	}
 	var info struct {
 		Channel struct {
-			ID       string `json:"id"`
-			IsMember bool   `json:"is_member"`
+			ID        string `json:"id"`
+			IsMember  bool   `json:"is_member"`
+			IsPrivate *bool  `json:"is_private"`
 		} `json:"channel"`
 	}
-	if err := c.get(ctx, ProviderSlack, "/conversations.info?channel="+url.QueryEscape(channel), &info); err != nil {
+	headers, err := c.getWithHeaders(ctx, ProviderSlack, "/conversations.info?channel="+url.QueryEscape(channel), &info)
+	if err != nil {
 		return err
 	}
 	if info.Channel.ID != channel || !info.Channel.IsMember {
 		return fmt.Errorf("Slack source requires current channel membership")
+	}
+	return slackReadAccess(headers, info.Channel.IsPrivate, config.Attachments)
+}
+
+// Live token scopes accompany the same metadata response that proves channel
+// membership. Persisted consent metadata and cached pages are not grant proofs.
+func slackReadAccess(headers http.Header, private *bool, attachments bool) error {
+	raw := strings.Join(headers.Values("X-OAuth-Scopes"), ",")
+	unavailable := func() error {
+		return &ProviderHTTPError{Provider: ProviderSlack, Status: 502, Code: "missing_scope_proof"}
+	}
+	if raw == "" || len(raw) > 16<<10 {
+		return unavailable()
+	}
+	scopes := map[string]bool{}
+	parts := strings.Split(raw, ",")
+	if len(parts) > 256 {
+		return unavailable()
+	}
+	for _, part := range parts {
+		scope := strings.TrimSpace(part)
+		if scope == "" || len(scope) > 128 {
+			return unavailable()
+		}
+		for _, r := range scope {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == ':' || r == '.' || r == '_' || r == '-') {
+				return unavailable()
+			}
+		}
+		scopes[scope] = true
+	}
+	required := []string{}
+	if private == nil || !*private {
+		required = append(required, "channels:history")
+	}
+	if private == nil || *private {
+		required = append(required, "groups:history")
+	}
+	if attachments {
+		required = append(required, "files:read")
+	}
+	for _, scope := range required {
+		if !scopes[scope] {
+			return &ProviderHTTPError{Provider: ProviderSlack, Status: 403, Code: "missing_scope"}
+		}
 	}
 	return nil
 }

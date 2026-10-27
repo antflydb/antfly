@@ -72,12 +72,8 @@ func (c *CollaborationConnector) discordScope(ctx context.Context, config Collab
 	if channel.Type != 0 && channel.Type != 5 && channel.Type != 10 && channel.Type != 11 && channel.Type != 12 && channel.Type != 15 && channel.Type != 16 {
 		return fmt.Errorf("unsupported Discord source channel type")
 	}
-	if channel.Type == 12 {
-		var member map[string]any
-		if err := c.get(ctx, ProviderDiscord, "/channels/"+id+"/thread-members/@me", &member); err != nil {
-			return err
-		}
-	}
+	privateThread := channel.Type == 12
+
 	if channel.Type == 10 || channel.Type == 11 || channel.Type == 12 {
 		channel, err = c.discordChannel(ctx, channel.ParentID)
 		if err != nil {
@@ -91,7 +87,17 @@ func (c *CollaborationConnector) discordScope(ctx context.Context, config Collab
 	if err != nil {
 		return err
 	}
-	return authority.check(channel)
+	permissions, err := authority.checkedPermissions(channel)
+	if err != nil {
+		return err
+	}
+	if privateThread && permissions&8 == 0 && permissions&(1<<34) == 0 {
+		var member map[string]any
+		if err := c.get(ctx, ProviderDiscord, "/channels/"+id+"/thread-members/@me", &member); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 var errDiscordAccessDenied = errors.New("Discord source access denied")
@@ -153,6 +159,10 @@ func (c *CollaborationConnector) discordAuthority(ctx context.Context, guild str
 }
 
 func (authority *discordAuthority) check(channel discordChannel) error {
+	_, err := authority.checkedPermissions(channel)
+	return err
+}
+func (authority *discordAuthority) checkedPermissions(channel discordChannel) (uint64, error) {
 	permissions := authority.permissions
 	if permissions&8 == 0 {
 		var deny, allow uint64
@@ -160,11 +170,11 @@ func (authority *discordAuthority) check(channel discordChannel) error {
 			if overwrite.Type == 0 && overwrite.ID == authority.guild {
 				a, err := strconv.ParseUint(overwrite.Allow, 10, 64)
 				if err != nil {
-					return err
+					return 0, err
 				}
 				d, err := strconv.ParseUint(overwrite.Deny, 10, 64)
 				if err != nil {
-					return err
+					return 0, err
 				}
 				permissions = (permissions &^ d) | a
 			}
@@ -173,11 +183,11 @@ func (authority *discordAuthority) check(channel discordChannel) error {
 			if overwrite.Type == 0 && overwrite.ID != authority.guild && authority.roles[overwrite.ID] {
 				a, err := strconv.ParseUint(overwrite.Allow, 10, 64)
 				if err != nil {
-					return err
+					return 0, err
 				}
 				d, err := strconv.ParseUint(overwrite.Deny, 10, 64)
 				if err != nil {
-					return err
+					return 0, err
 				}
 				allow |= a
 				deny |= d
@@ -188,24 +198,24 @@ func (authority *discordAuthority) check(channel discordChannel) error {
 			if overwrite.Type == 1 && overwrite.ID == authority.botID {
 				a, err := strconv.ParseUint(overwrite.Allow, 10, 64)
 				if err != nil {
-					return err
+					return 0, err
 				}
 				d, err := strconv.ParseUint(overwrite.Deny, 10, 64)
 				if err != nil {
-					return err
+					return 0, err
 				}
 				permissions = (permissions &^ d) | a
 			}
 		}
 		if permissions&(1<<10) == 0 || permissions&(1<<16) == 0 {
-			return fmt.Errorf("%w: VIEW_CHANNEL and READ_MESSAGE_HISTORY required", errDiscordAccessDenied)
+			return 0, fmt.Errorf("%w: VIEW_CHANNEL and READ_MESSAGE_HISTORY required", errDiscordAccessDenied)
 		}
 	}
 
 	if !authority.messageContent {
-		return fmt.Errorf("%w: MESSAGE_CONTENT required", errDiscordAccessDenied)
+		return 0, fmt.Errorf("%w: MESSAGE_CONTENT required", errDiscordAccessDenied)
 	}
-	return nil
+	return permissions, nil
 }
 
 func discordArchivePaths(channelType int) []string {
