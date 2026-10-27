@@ -21,6 +21,7 @@ const std = @import("std");
 pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
 pub const Column = struct {
+    defaulted: bool = false,
     name: []const u8,
     type: Type,
     temporal_kind: ?@import("antfly_local_sources").sql_temporal_value.Kind = null,

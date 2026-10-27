@@ -31,7 +31,7 @@ const Entry = struct {
     output: Result,
     faults: []const struct { name: []const u8, hex: []const u8, sqlstate: []const u8 },
 };
-const Reference = struct { create: []const u8, read: []const u8, entries: []const Entry, identity: struct { create: []const u8, copy: []const u8, hex: []const u8, output: Result }, rls_sqlstate: []const u8 };
+const Reference = struct { create: []const u8, read: []const u8, entries: []const Entry, advanced: []const Entry, removed_oids: struct { id: []const u8, sql: []const u8, sqlstate: []const u8 }, identity: struct { create: []const u8, copy: []const u8, hex: []const u8, fault_hex: []const u8, fault_sqlstate: []const u8, after_hex: []const u8, output: Result }, rls_sqlstate: []const u8 };
 const bytes = @embedFile("../pgwire/fixtures/copy_input_reference.json");
 
 fn command(ctx: *fixture.Context, sql: []const u8) !void {
@@ -69,7 +69,7 @@ const Campaign = struct {
         const payload = try a.alloc(u8, hex.len / 2);
         defer a.free(payload);
         _ = try std.fmt.hexToBytes(payload, hex);
-        const early = reader_only or (expected != null and std.mem.eql(u8, expected.?, "0A000"));
+        const early = reader_only or (expected != null and (std.mem.eql(u8, expected.?, "0A000") or std.mem.eql(u8, expected.?, "42601")));
         if (!early) {
             var offset: usize = 0;
             while (offset < payload.len) {
@@ -170,6 +170,20 @@ const Campaign = struct {
             try copy(ctx, entry, entry.hex, null, false, false, false);
             try self.capture(ctx, entry);
         }
+        for (self.reference.advanced) |entry| {
+            try command(ctx, "DELETE FROM usage_records");
+            try copy(ctx, entry, entry.hex, null, false, false, false);
+            try self.capture(ctx, entry);
+            for (entry.faults) |fault| {
+                errdefer std.debug.print("COPY advanced={s} fault={s}\n", .{ entry.id, fault.name });
+                try copy(ctx, entry, fault.hex, fault.sqlstate, false, false, false);
+                try self.unchanged(ctx);
+            }
+        }
+        const removed = self.reference.removed_oids;
+        const invalid: Entry = .{ .id = removed.id, .sql = removed.sql, .format = "csv", .hex = "", .tag = "", .output = self.reference.advanced[0].output, .faults = &.{} };
+        try copy(ctx, invalid, "", removed.sqlstate, false, false, false);
+        try self.unchanged(ctx);
         const identity = self.reference.identity;
         try command(ctx, identity.create);
         const identity_owner = try fixture.waitServingSchema(ctx, "copy_identity", 0);
@@ -180,6 +194,8 @@ const Campaign = struct {
         try command(ctx, "INSERT INTO copy_identity(status) VALUES('default')");
         identity_entry.sql = "COPY copy_identity(status) FROM STDIN";
         try copy(ctx, identity_entry, "6e6578740a", null, false, false, false);
+        try copy(ctx, identity_entry, identity.fault_hex, identity.fault_sqlstate, false, false, false);
+        try copy(ctx, identity_entry, identity.after_hex, null, false, false, false);
         try self.checkIdentity(ctx);
         try command(ctx, "CREATE TABLE copy_rls(id BIGINT PRIMARY KEY,status TEXT)");
         const rls_owner = try fixture.waitServingSchema(ctx, "copy_rls", 0);
@@ -206,14 +222,15 @@ const Campaign = struct {
         try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "usage_records");
         try self.baseline.?.verify(ctx, true);
         try self.checkIdentity(ctx);
-        const entry = self.reference.entries[self.reference.entries.len - 1];
+        const entry = self.reference.advanced[self.reference.advanced.len - 1];
         try copy(ctx, entry, entry.faults[0].hex, "23505", false, false, false);
         try self.unchanged(ctx);
     }
 };
 
 test "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners" {
-    // sql-0370, sql-0371, sql-0379: no statement rewriting or metadata-only credit.
+    // sql-0370, sql-0371, sql-0379; sql-0381 rejects the removed OIDS option.
+    // No statement rewriting or metadata-only credit.
     const a = std.testing.allocator;
     const reference = try std.json.parseFromSlice(Reference, a, bytes, .{ .ignore_unknown_fields = true });
     defer reference.deinit();
@@ -223,6 +240,8 @@ test "mounted SQL original COPY input preserves PostgreSQL atomic batches constr
         const original = try corpus.get(entry.id);
         try std.testing.expectEqualStrings(original.sql, entry.sql);
     }
+    const removed = try corpus.get(reference.value.removed_oids.id);
+    try std.testing.expectEqualStrings(removed.sql, reference.value.removed_oids.sql);
     var retained: std.heap.ArenaAllocator = .init(a);
     defer retained.deinit();
     try fixture.runWithState(Campaign, .{ .reference = reference.value, .retained = &retained });

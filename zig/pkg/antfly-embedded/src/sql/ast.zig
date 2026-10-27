@@ -461,6 +461,15 @@ pub const CopyOptions = struct {
     quote: ?u8 = null,
     escape: ?u8 = null,
     header: bool = false,
+    header_match: bool = false,
+    force_null_all: bool = false,
+    force_not_null_all: bool = false,
+    force_null_columns: []const []const u8 = &.{},
+    force_not_null_columns: []const []const u8 = &.{},
+    default_string: ?[]const u8 = null,
+    on_error: enum { stop, ignore } = .stop,
+    reject_limit: ?u64 = null,
+    log_verbosity: enum { default, verbose, silent } = .default,
     force_quote_all: bool = false,
     force_quote_columns: []const []const u8 = &.{},
 
@@ -472,6 +481,12 @@ pub const CopyOptions = struct {
         const columns = try allocator.alloc([]const u8, self.force_quote_columns.len);
         for (columns, self.force_quote_columns) |*out, column| out.* = try allocator.dupe(u8, column);
         result.force_quote_columns = columns;
+        inline for (.{ "force_null_columns", "force_not_null_columns" }) |field| {
+            const names = try allocator.alloc([]const u8, @field(self, field).len);
+            for (names, @field(self, field)) |*out, name| out.* = try allocator.dupe(u8, name);
+            @field(result, field) = names;
+        }
+        if (self.default_string) |text| result.default_string = try allocator.dupe(u8, text);
         return result;
     }
 
@@ -491,6 +506,14 @@ pub const CopyOptions = struct {
         const std = @import("std");
         if (self.format == .binary and (self.delimiter != null or self.null_string != null or self.header or self.quote != null or self.escape != null or self.force_quote_all or self.force_quote_columns.len != 0)) return error.SqlInvalidParameterValue;
         if (self.format != .csv and (self.quote != null or self.escape != null or self.force_quote_all or self.force_quote_columns.len != 0)) return error.SqlInvalidParameterValue;
+        if (self.format == .binary and (self.header_match or self.default_string != null or self.on_error != .stop)) return error.InvalidSqlSyntax;
+        if (self.format != .csv and (self.force_null_all or self.force_not_null_all or self.force_null_columns.len != 0 or self.force_not_null_columns.len != 0)) return error.UnsupportedSqlShape;
+        if (self.reject_limit) |limit| if (limit == 0 or self.on_error != .ignore) return error.SqlInvalidParameterValue;
+        if (self.default_string) |marker| {
+            if (std.mem.eql(u8, marker, self.nullBytes())) return error.UnsupportedSqlShape;
+            if (marker.len > 1024 or std.mem.indexOfAny(u8, marker, "\x00\n\r") != null or !std.unicode.utf8ValidateSlice(marker)) return error.SqlInvalidParameterValue;
+            if (std.mem.indexOfScalar(u8, marker, self.delimiterByte()) != null or (self.format == .csv and std.mem.indexOfScalar(u8, marker, self.quoteByte()) != null)) return error.SqlInvalidParameterValue;
+        }
         const delimiter = self.delimiterByte();
         if (delimiter == 0 or delimiter >= 128 or delimiter == '\n' or delimiter == '\r') return error.SqlInvalidParameterValue;
         if (self.format == .text and (delimiter == '\\' or delimiter == '.' or std.ascii.isDigit(delimiter) or std.ascii.isLower(delimiter))) return error.SqlInvalidParameterValue;

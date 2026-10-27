@@ -120,6 +120,154 @@ def reference():
                     "faults": faults,
                 }
             )
+        advanced = []
+        for codec in ["csv", "text"]:
+            db.execute("DELETE FROM usage_records")
+            separator = "," if codec == "csv" else "\t"
+            options = (
+                "FORMAT "
+                + codec
+                + ", HEADER match, DEFAULT 'n/a', ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose"
+            )
+            if codec == "csv":
+                options += ", FORCE_NULL(status), FORCE_NOT_NULL(status)"
+            sql = "COPY usage_records(id,status,amount) FROM STDIN (" + options + ")"
+            header = separator.join(["id", "status", "amount"]) + "\n"
+
+            def record(*cells):
+                return separator.join(str(cell) for cell in cells) + "\n"
+
+            data = header + "".join(record(i, "READY", "n/a") for i in range(128))
+            data += record("bad", "READY", "1") + record(
+                128, "READY", "100000000000000"
+            )
+            data += record(129, "READY", "n/a") + record(130, "", "2.345")
+            if codec == "csv":
+                data += record(131, '""', "n/a") + record(132, "READY", '"n/a"')
+            else:
+                data += record(131, "READY", "\\156/a")
+            with db.cursor() as cursor:
+                with cursor.copy(sql) as stream:
+                    stream.write(data.encode())
+                tag = cursor.statusmessage
+            expected = state()
+            prefix = header + "".join(
+                record(1000 + i, "READY", "n/a") for i in range(128)
+            )
+            faults = []
+            for name, broken, code in [
+                ("duplicate", prefix + record(0, "READY", "n/a"), "23505"),
+                ("check_not_ignored", prefix + record(1128, "blocked", "n/a"), "23514"),
+                (
+                    "default_without_default",
+                    prefix + record("n/a", "READY", "n/a"),
+                    "22P04",
+                ),
+                (
+                    "bad_header",
+                    record("status", "id", "amount") + record(2000, "READY", "n/a"),
+                    "22P04",
+                ),
+                (
+                    "early_check_before_bad_framing",
+                    header
+                    + record(2000, "blocked", "n/a")
+                    + record(2001, "READY", "n/a", "extra"),
+                    "23514",
+                ),
+                ("missing_header", "", "22P04"),
+                ("reject_limit", prefix + record("bad", "READY", "n/a") * 11, "22P02"),
+                (
+                    "framing_not_ignored",
+                    prefix + record(2000, "READY", "n/a", "extra"),
+                    "22P04",
+                ),
+            ]:
+                try:
+                    with db.transaction():
+                        with db.cursor().copy(sql) as stream:
+                            stream.write(broken.encode())
+                except psycopg.Error as error:
+                    if error.sqlstate != code:
+                        raise
+                else:
+                    raise AssertionError((codec, name, "accepted"))
+                if state() != expected:
+                    raise AssertionError((codec, name, "partial import"))
+                faults.append(
+                    {"name": name, "hex": broken.encode().hex(), "sqlstate": code}
+                )
+            advanced.append(
+                {
+                    "id": "copy-options-" + codec,
+                    "sql": sql,
+                    "format": codec,
+                    "hex": data.encode().hex(),
+                    "tag": tag,
+                    "output": expected,
+                    "faults": faults,
+                }
+            )
+        invalid = inventory["sql-0381"]
+        for invalid_id in ["sql-0381", "sql-0382"]:
+            original = inventory[invalid_id]
+            try:
+                with db.transaction():
+                    with db.cursor().copy(original["sql"]) as stream:
+                        stream.write(b"")
+            except psycopg.Error as error:
+                if error.sqlstate != "42601":
+                    raise
+            else:
+                raise AssertionError(
+                    (invalid_id, "removed PostgreSQL OIDS option admitted")
+                )
+        db.execute("CREATE TABLE copy_options(id BIGINT)")
+        option_checks = []
+        for direction, options in [
+            ("FROM", "FORMAT csv, HEADER match"),
+            ("FROM", "FORMAT text, HEADER match"),
+            ("FROM", "FORMAT binary, HEADER false"),
+            ("FROM", "FORMAT csv, FORCE_NULL *"),
+            ("FROM", "FORMAT csv, FORCE_NOT_NULL *"),
+            (
+                "FROM",
+                "FORMAT csv, ON_ERROR 'IGNORE', LOG_VERBOSITY 'SILENT', REJECT_LIMIT '10'",
+            ),
+            ("TO", "LOG_VERBOSITY silent"),
+            ("FROM", "FORMAT csv, OIDS false"),
+            ("FROM", "FORMAT binary, ON_ERROR ignore"),
+            ("FROM", "FORMAT text, FORCE_NULL(id)"),
+            ("FROM", "FORMAT csv, FORCE_QUOTE *"),
+            ("FROM", "FORMAT csv, FORCE_NULL(id,id)"),
+            ("FROM", "FORMAT csv, FORCE_NOT_NULL(id,id)"),
+            ("FROM", "FORMAT csv, REJECT_LIMIT 2"),
+            ("FROM", "FORMAT csv, ON_ERROR ignore, REJECT_LIMIT 0"),
+            ("FROM", "FORMAT csv, DEFAULT ''"),
+            ("TO", "ON_ERROR stop"),
+            ("TO", "FORMAT csv, DEFAULT 'd'"),
+            ("TO", "FORMAT csv, HEADER match"),
+            ("TO", "FORMAT csv, FORCE_NULL(id)"),
+            ("TO", "FORMAT csv, FORCE_NOT_NULL(id)"),
+        ]:
+            sql = "COPY copy_options " + direction + " STDIN (" + options + ")"
+            code = None
+            try:
+                with db.transaction():
+                    with db.cursor().copy(sql) as stream:
+                        if direction == "FROM":
+                            stream.write(
+                                b"id\n"
+                                if "HEADER match" in options
+                                else b"PGCOPY\n\xff\r\n\x00" + bytes(8) + b"\xff\xff"
+                                if "FORMAT binary" in options
+                                else b""
+                            )
+                        else:
+                            list(stream)
+            except psycopg.Error as error:
+                code = error.sqlstate
+            option_checks.append({"sql": sql, "sqlstate": code})
         identity_create = "CREATE TABLE copy_identity(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,status TEXT)"
         db.execute(identity_create)
         identity_copy = "COPY copy_identity(id,status) FROM STDIN"
@@ -128,9 +276,26 @@ def reference():
         db.execute("INSERT INTO copy_identity(status) VALUES('default')")
         with db.cursor().copy("COPY copy_identity(status) FROM STDIN") as stream:
             stream.write(b"next\n")
+        identity_fault = b"before_failure\nbad\textra\n"
+        try:
+            with db.transaction():
+                with db.cursor().copy(
+                    "COPY copy_identity(status) FROM STDIN"
+                ) as stream:
+                    stream.write(identity_fault)
+        except psycopg.Error as error:
+            if error.sqlstate != "22P04":
+                raise
+        else:
+            raise AssertionError("malformed identity COPY admitted")
+        with db.cursor().copy("COPY copy_identity(status) FROM STDIN") as stream:
+            stream.write(b"after_failure\n")
         identity = {
             "create": identity_create,
             "copy": identity_copy,
+            "fault_hex": identity_fault.hex(),
+            "fault_sqlstate": "22P04",
+            "after_hex": b"after_failure\n".hex(),
             "hex": b"42\tREADY\n".hex(),
             "output": output(
                 db.execute("SELECT id,status FROM copy_identity ORDER BY id")
@@ -161,6 +326,13 @@ def reference():
         "create": CREATE,
         "read": READ,
         "entries": entries,
+        "advanced": advanced,
+        "option_checks": option_checks,
+        "removed_oids": {
+            "id": invalid["id"],
+            "sql": invalid["sql"],
+            "sqlstate": "42601",
+        },
         "identity": identity,
         "rls_sqlstate": "0A000",
     }
@@ -176,7 +348,7 @@ def main():
         if json.loads(args.check.read_text()) != result:
             raise SystemExit("COPY input PostgreSQL witness drift")
         print(
-            "verified three original COPY input codecs and twelve atomic-failure postimages"
+            "verified three original COPY input codecs, advanced input profiles, 28 atomic-failure postimages and 21 option contracts"
         )
     elif args.output:
         args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")

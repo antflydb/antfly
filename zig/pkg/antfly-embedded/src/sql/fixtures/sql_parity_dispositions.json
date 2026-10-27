@@ -9416,18 +9416,40 @@
     },
     {
       "id": "sql-0381",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL 18 supersedes the source-era accepted OIDS false option: it rejects the exact unchanged original with 42601 before CopyInResponse. The mounted native wire campaign reproduces that diagnostic without admitting input or changing rows, versions or content digests. This is an independently verified PostgreSQL semantic supersession, not positive COPY OIDS functionality or generic unsupported-shape credit.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/pgwire/protocol_test.zig",
+          "test": "pgwire COPY input option admission matches independent PostgreSQL contracts",
+          "gate": "sql-copy-input-protocol-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0382",
       "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by UnsupportedSqlShape at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
+      "reason": "The exact pinned OIDS true original rejects with PostgreSQL 18 SQLSTATE 42601 (InvalidSqlSyntax) at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. The isolated PostgreSQL oracle independently reproduces both exact OIDS originals. No SQL prefix is executed.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
           "test": "SQL exact original rejection contracts fail before backend access",
           "gate": "sql-exact-rejection-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
+          "test": "SQL exact original rejection contracts fail before backend access",
+          "gate": "sql-copy-input-postgres"
         }
       ]
     },

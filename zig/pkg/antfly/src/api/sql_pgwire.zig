@@ -1094,7 +1094,7 @@ const Job = struct {
                 for (selected, input.compiled.statement.insert.columns) |*out, name| {
                     const column = try target.column(name);
                     if (column.generated) return error.SqlGeneratedColumnWrite;
-                    out.* = .{ .name = try self.alloc.dupe(u8, name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
+                    out.* = .{ .defaulted = column.defaulted, .name = try self.alloc.dupe(u8, name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
                 }
                 break :blk selected;
             } else null;

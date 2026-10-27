@@ -67,6 +67,7 @@ const Mock = struct {
     copy_json_nulls: usize = 0,
     copy_instant: ?i64 = null,
     copy_batches: usize = 0,
+    copy_batch_error: ?anyerror = null,
     copy_rollbacks: usize = 0,
     stream_text: ?[]const u8 = null,
     stream_cells: bool = false,
@@ -310,11 +311,12 @@ const Mock = struct {
             try std.testing.expectEqualStrings("immutable-catalog-binding", request.binding_guard.?);
             try std.testing.expect(request.parameters.len <= 128);
             try std.testing.expectEqual(request.parameters.len, request.parameter_cells.?.len);
+            self.copy_batches += 1;
+            if (self.copy_batch_error) |err| return err;
             for (request.parameter_cells.?) |cell| {
                 if (cell.sql_null) self.copy_sql_nulls += 1 else if (cell.value == .null) self.copy_json_nulls += 1 else if (cell.value == .integer) self.copy_sum += cell.value.integer;
             }
             self.copy_staged += request.parameters.len;
-            self.copy_batches += 1;
             return .{ .command_tag = "INSERT", .rows_affected = request.parameters.len, .transaction_status = .in_transaction, .session_id = request.session_id };
         }
         if (self.expected_execute_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
@@ -3271,4 +3273,86 @@ test "pgwire COPY local input failure marks an explicit transaction failed after
     try std.testing.expectEqual(@as(usize, 0), mock.copy_staged);
     try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "Z\x00\x00\x00\x05E") != null);
+}
+
+test "pgwire COPY input ignores only conversion failures with bounded rejection and notices" {
+    const a = std.testing.allocator;
+    for ([_]@import("copy_out.zig").Options{
+        .{ .on_error = .ignore },
+        .{ .on_error = .ignore, .log_verbosity = .verbose },
+        .{ .on_error = .ignore, .log_verbosity = .silent },
+        .{ .on_error = .ignore, .reject_limit = 1 },
+    }) |options| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+        for (0..128) |_| try frame(&input.writer, 'd', "1\n");
+        try frame(&input.writer, 'd', "bad\n2\n99999999999999999999999999\n3\n");
+        try frame(&input.writer, 'c', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = options };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        if (options.reject_limit != null) {
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "REJECT_LIMIT (1)") != null);
+            try std.testing.expectEqual(@as(usize, 0), mock.copy_committed);
+            try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "22P02") != null);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+            try std.testing.expectEqual(@as(usize, 130), mock.copy_committed);
+            try std.testing.expectEqual(@as(usize, 2), mock.copy_batches);
+            try std.testing.expectEqual(@as(usize, switch (options.log_verbosity) {
+                .default => 1,
+                .verbose => 3,
+                .silent => 0,
+            }), std.mem.count(u8, messages, "N"));
+        }
+    }
+}
+
+test "pgwire COPY input option admission matches independent PostgreSQL contracts" {
+    const a = std.testing.allocator;
+    const Reference = struct { option_checks: []const struct { sql: []const u8, sqlstate: ?[]const u8 } };
+    const reference = try std.json.parseFromSlice(Reference, a, @embedFile("fixtures/copy_input_reference.json"), .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    const local = @import("antfly_local_sources");
+    for (reference.value.option_checks) |check| {
+        var compiled = local.sql_compiler.compile(a, check.sql, .{}) catch |err| {
+            errdefer std.debug.print("COPY option contract sql={s} err={s}\n", .{ check.sql, @errorName(err) });
+            try std.testing.expectEqualStrings(check.sqlstate orelse return error.UnexpectedCopyOptionRejection, local.sql_errors.describe(err).code);
+            continue;
+        };
+        defer compiled.deinit();
+        if (check.sqlstate != null) {
+            std.debug.print("COPY option unexpectedly admitted sql={s}\n", .{check.sql});
+            return error.UnexpectedCopyOptionAdmission;
+        }
+    }
+}
+
+test "pgwire COPY input preserves earlier native error ordering without retrying admission" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 1, 128 }) |count| for ([_]anyerror{ error.UniqueConstraintViolation, error.SqlInvalidTextRepresentation, error.SqlMutationOutcomeUnknown }) |failure| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+        for (0..count) |_| try frame(&input.writer, 'd', "1\n");
+        try frame(&input.writer, 'd', "malformed\textra\n");
+        try frame(&input.writer, 'c', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = .{}, .copy_batch_error = failure };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.copy_batches);
+        try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_committed);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), @import("antfly_local_sources").sql_errors.describe(failure).code) != null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "22P04") == null);
+    };
 }

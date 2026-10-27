@@ -3514,10 +3514,11 @@ const Parser = struct {
         // direction; TO determines CopyOut even when the token says STDIN.
         if (!self.ddlWord("STDOUT") and !self.ddlWord("STDIN")) return self.fail(error.UnsupportedSqlShape, "server files and PROGRAM are not COPY client streams");
         var options: ast.CopyOptions = .{};
+        var on_error_seen = false;
         const with_options = self.keyword(.with);
         if (with_options and !self.peek(.lparen)) return self.fail(error.InvalidSqlSyntax, "COPY WITH requires options");
         if (self.take(.lparen)) {
-            const Option = enum { format, delimiter, null, header, quote, escape, force_quote, encoding };
+            const Option = enum { format, delimiter, null, header, quote, escape, force_quote, encoding, force_null, force_not_null, default, on_error, reject_limit, log_verbosity, oids };
             var seen: u16 = 0;
             while (true) {
                 try self.node();
@@ -3526,7 +3527,7 @@ const Parser = struct {
                 self.pos += 1;
                 const folded = try self.alloc.dupe(u8, option_token.text);
                 if (!option_token.owned) _ = std.ascii.lowerString(folded, folded);
-                const option = std.meta.stringToEnum(Option, folded) orelse return self.fail(error.UnsupportedSqlShape, "unsupported COPY output option");
+                const option = std.meta.stringToEnum(Option, folded) orelse return self.fail(error.UnsupportedSqlShape, "unsupported COPY option");
                 const mask = @as(u16, 1) << @intCast(@backingInt(option));
                 if (seen & mask != 0) return self.fail(error.SqlInvalidParameterValue, "duplicate COPY option");
                 seen |= mask;
@@ -3546,12 +3547,45 @@ const Parser = struct {
                         } else {
                             const boolean = self.tokens[self.pos].text;
                             self.pos += 1;
-                            if (std.ascii.eqlIgnoreCase(boolean, "true") or std.ascii.eqlIgnoreCase(boolean, "on") or std.mem.eql(u8, boolean, "1")) options.header = true else if (std.ascii.eqlIgnoreCase(boolean, "false") or std.ascii.eqlIgnoreCase(boolean, "off") or std.mem.eql(u8, boolean, "0")) options.header = false else return self.fail(error.SqlInvalidParameterValue, "COPY HEADER requires a boolean");
+                            if (std.ascii.eqlIgnoreCase(boolean, "match")) {
+                                options.header = true;
+                                options.header_match = true;
+                            } else if (std.ascii.eqlIgnoreCase(boolean, "true") or std.ascii.eqlIgnoreCase(boolean, "on") or std.mem.eql(u8, boolean, "1")) options.header = true else if (std.ascii.eqlIgnoreCase(boolean, "false") or std.ascii.eqlIgnoreCase(boolean, "off") or std.mem.eql(u8, boolean, "0")) options.header = false else return self.fail(error.SqlInvalidParameterValue, "COPY HEADER requires a boolean");
                         }
                     },
                     .encoding => {
                         const text = try self.copyString();
                         if (!std.ascii.eqlIgnoreCase(text, "UTF8") and !std.ascii.eqlIgnoreCase(text, "UTF-8")) return self.fail(error.UnsupportedSqlShape, "COPY encoding must be UTF8");
+                    },
+                    .oids => return self.fail(error.InvalidSqlSyntax, "option oids not recognized"),
+                    .default => options.default_string = try self.copyString(),
+                    .on_error => {
+                        const option_value = if (self.peek(.string)) try self.copyString() else try self.identifier();
+                        on_error_seen = true;
+                        options.on_error = if (std.ascii.eqlIgnoreCase(option_value, "ignore")) .ignore else if (std.ascii.eqlIgnoreCase(option_value, "stop")) .stop else return self.fail(error.SqlInvalidParameterValue, "COPY ON_ERROR requires STOP or IGNORE");
+                    },
+                    .log_verbosity => {
+                        const option_value = if (self.peek(.string)) try self.copyString() else try self.identifier();
+                        options.log_verbosity = if (std.ascii.eqlIgnoreCase(option_value, "default")) .default else if (std.ascii.eqlIgnoreCase(option_value, "verbose")) .verbose else if (std.ascii.eqlIgnoreCase(option_value, "silent")) .silent else return self.fail(error.SqlInvalidParameterValue, "invalid COPY LOG_VERBOSITY");
+                    },
+                    .reject_limit => {
+                        const option_value = try self.value();
+                        const limit = if (option_value == .integer) option_value.integer else if (option_value == .string) std.fmt.parseInt(i64, option_value.string, 10) catch return self.fail(error.SqlInvalidParameterValue, "invalid COPY REJECT_LIMIT") else return self.fail(error.SqlInvalidParameterValue, "COPY REJECT_LIMIT must be positive");
+                        if (limit <= 0) return self.fail(error.SqlInvalidParameterValue, "COPY REJECT_LIMIT must be positive");
+                        options.reject_limit = @intCast(limit);
+                    },
+                    .force_null, .force_not_null => {
+                        const all = self.take(.star);
+                        const names = if (all) &.{} else try self.ddlColumnList();
+                        var unique: std.StringHashMapUnmanaged(void) = .empty;
+                        for (names) |column_name| if ((try unique.getOrPut(self.alloc, column_name)).found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate COPY force column");
+                        if (option == .force_null) {
+                            options.force_null_all = all;
+                            options.force_null_columns = names;
+                        } else {
+                            options.force_not_null_all = all;
+                            options.force_not_null_columns = names;
+                        }
                     },
                     .force_quote => {
                         if (self.take(.star)) options.force_quote_all = true else options.force_quote_columns = try self.ddlColumnList();
@@ -3566,9 +3600,17 @@ const Parser = struct {
             }
             try self.expect(.rparen);
         }
-        options.validate() catch return self.fail(error.SqlInvalidParameterValue, "invalid COPY format options");
+        options.validate() catch |err| return self.fail(switch (err) {
+            error.InvalidSqlSyntax => error.InvalidSqlSyntax,
+            error.UnsupportedSqlShape => error.UnsupportedSqlShape,
+            else => error.SqlInvalidParameterValue,
+        }, "invalid COPY format options");
+        if (!input) {
+            if (options.header_match or options.default_string != null) return self.fail(error.UnsupportedSqlShape, "COPY input option is not allowed with COPY TO");
+            if (on_error_seen or options.force_null_all or options.force_not_null_all or options.force_null_columns.len != 0 or options.force_not_null_columns.len != 0 or options.reject_limit != null) return self.fail(error.SqlInvalidParameterValue, "COPY input option is not allowed with COPY TO");
+        }
         if (input) {
-            if (options.force_quote_all or options.force_quote_columns.len != 0) return self.fail(error.SqlInvalidParameterValue, "FORCE_QUOTE is only valid for COPY TO");
+            if (options.force_quote_all or options.force_quote_columns.len != 0) return self.fail(error.UnsupportedSqlShape, "FORCE_QUOTE is only valid for COPY TO");
             const columns = try self.alloc.alloc([]const u8, query.columns.len);
             for (columns, query.columns) |*out, projection| out.* = projection.field;
             return .{ .copy_from = .{ .table = query.table.?, .columns = columns, .options = options } };
@@ -5207,4 +5249,35 @@ test "compiler implicit INSERT budgets DEFAULT cells and rejects ragged rows" {
     try std.testing.expectEqual(@as(usize, 2), compiled.statement.insert.rows.len);
     try std.testing.expect(compiled.statement.insert.isDefault(0, 0));
     try std.testing.expect(compiled.statement.insert.isDefault(1, 0));
+}
+
+test "SQL COPY input advanced options retain owned column domains and PostgreSQL option failures" {
+    const a = std.testing.allocator;
+    var compiled = try compile(a, "COPY t(id,status,amount) FROM STDIN (FORMAT csv, HEADER match, FORCE_NULL(status), FORCE_NOT_NULL(status), DEFAULT 'n/a', ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY silent)", .{});
+    defer compiled.deinit();
+    const options = compiled.statement.copy_from.options;
+    try std.testing.expect(options.header and options.header_match);
+    try std.testing.expectEqualStrings("status", options.force_null_columns[0]);
+    try std.testing.expectEqualStrings("n/a", options.default_string.?);
+    try std.testing.expectEqual(.ignore, options.on_error);
+    try std.testing.expectEqual(@as(?u64, 10), options.reject_limit);
+    try std.testing.expectEqual(.silent, options.log_verbosity);
+    for ([_][]const u8{
+        "COPY t FROM STDIN (FORMAT csv, OIDS false)",
+        "COPY t FROM STDIN (FORMAT binary, ON_ERROR ignore)",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(a, sql, .{}));
+    for ([_][]const u8{
+        "COPY t FROM STDIN (FORMAT text, FORCE_NULL(id))",
+        "COPY t FROM STDIN (FORMAT csv, FORCE_QUOTE *)",
+        "COPY t TO STDOUT (FORMAT csv, DEFAULT 'd')",
+        "COPY t TO STDOUT (FORMAT csv, HEADER match)",
+        "COPY t FROM STDIN (FORMAT csv, DEFAULT '')",
+    }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(a, sql, .{}));
+    try std.testing.expectError(error.DuplicateSqlColumn, compile(a, "COPY t FROM STDIN (FORMAT csv, FORCE_NULL(id,id))", .{}));
+    for ([_][]const u8{
+        "COPY t TO STDOUT (ON_ERROR stop)",
+        "COPY t TO STDOUT (FORMAT csv, FORCE_NULL(id))",
+        "COPY t FROM STDIN (REJECT_LIMIT 1)",
+        "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT 0)",
+    }) |sql| try std.testing.expectError(error.SqlInvalidParameterValue, compile(a, sql, .{}));
 }

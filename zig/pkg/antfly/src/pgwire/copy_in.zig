@@ -25,6 +25,9 @@ pub const Decoder = struct {
     limit: usize,
     record: std.ArrayList(u8) = .empty,
     fields: std.ArrayList(Field) = .empty,
+    defaults: std.ArrayList(bool) = .empty,
+    force: std.ArrayList(u8) = .empty,
+    columns: []const []const u8 = &.{},
     ranges: std.ArrayList(?struct { start: usize, len: usize }) = .empty,
     quoted: bool = false,
     escaped: bool = false,
@@ -44,9 +47,30 @@ pub const Decoder = struct {
         if (width == 0 or width > std.math.maxInt(i16)) return error.ProgramLimitExceeded;
         return .{ .alloc = a, .options = options, .width = width, .limit = limit, .header = options.header };
     }
+    /// Names and masks are pinned once before CopyInResponse, never searched
+    /// per field. Caller owns the immutable names for the decoder lifetime.
+    pub fn setColumns(self: *Decoder, columns: []const []const u8) !void {
+        if (columns.len != self.width) return error.InvalidCopyData;
+        self.columns = columns;
+        try self.force.resize(self.alloc, columns.len);
+        @memset(self.force.items, @as(u8, if (self.options.force_null_all) 1 else 0) | @as(u8, if (self.options.force_not_null_all) 2 else 0));
+        inline for (.{ "force_null_columns", "force_not_null_columns" }, 0..) |field, bit| {
+            for (@field(self.options, field)) |name| {
+                var found = false;
+                for (columns, 0..) |column, i| if (std.mem.eql(u8, column, name)) {
+                    self.force.items[i] |= @as(u8, 1) << bit;
+                    found = true;
+                    break;
+                };
+                if (!found) return error.UnknownColumn;
+            }
+        }
+    }
     pub fn deinit(self: *Decoder) void {
         self.record.deinit(self.alloc);
         self.fields.deinit(self.alloc);
+        self.defaults.deinit(self.alloc);
+        self.force.deinit(self.alloc);
         self.ranges.deinit(self.alloc);
     }
     /// A returned row remains valid until the next call. Caller advances input
@@ -54,9 +78,11 @@ pub const Decoder = struct {
     pub fn next(self: *Decoder, input: *[]const u8) !?[]const Field {
         if (self.fields.items.len != 0 and self.options.format != .binary) {
             self.fields.clearRetainingCapacity();
+            self.defaults.clearRetainingCapacity();
             self.record.clearRetainingCapacity();
         } else if (self.options.format == .binary and self.binary_fields == self.width) {
             self.fields.clearRetainingCapacity();
+            self.defaults.clearRetainingCapacity();
             self.record.clearRetainingCapacity();
             self.binary_offset = 0;
             self.binary_fields = 0;
@@ -117,9 +143,7 @@ pub const Decoder = struct {
                     return null;
                 }
                 if (self.header) {
-                    self.header = false;
-                    self.fields.clearRetainingCapacity();
-                    self.record.clearRetainingCapacity();
+                    try self.consumeHeader();
                     continue;
                 }
                 return try self.parseRecord();
@@ -135,14 +159,29 @@ pub const Decoder = struct {
         }
         if (self.skip_lf and self.ending == .crlf) return error.InvalidCopyData;
         if (self.quoted and !self.quote_pending) return error.InvalidCopyData;
+        // MATCH must see an actual header, including on an empty stream.
+        if (self.header and self.options.header_match and self.record.items.len == 0) return error.InvalidCopyData;
         // A row returned by next has already been delivered.
         if (self.fields.items.len != 0 or self.record.items.len == 0) return null;
         if (self.options.format == .text and std.mem.eql(u8, self.record.items, "\\.")) return null;
         if (self.header) {
-            self.header = false;
+            try self.consumeHeader();
             return null;
         }
         return try self.parseRecord();
+    }
+    fn consumeHeader(self: *Decoder) !void {
+        if (self.options.header_match) {
+            if (self.columns.len != self.width) return error.InvalidCopyData;
+            const fields = try self.parseRecord();
+            for (fields, self.columns, 0..) |field, name, i| {
+                if ((self.defaults.items.len != 0 and self.defaults.items[i]) or field == null or !std.mem.eql(u8, field.?, name)) return error.InvalidCopyData;
+            }
+        }
+        self.header = false;
+        self.fields.clearRetainingCapacity();
+        self.defaults.clearRetainingCapacity();
+        self.record.clearRetainingCapacity();
     }
     fn append(self: *Decoder, ch: u8) !void {
         if (self.record.items.len >= self.limit) return error.ProgramLimitExceeded;
@@ -158,6 +197,7 @@ pub const Decoder = struct {
             const raw_start = read;
             const nulls = self.options.nullBytes();
             const text_null = self.options.format == .text and std.mem.startsWith(u8, self.record.items[raw_start..], nulls) and (self.record.items.len - raw_start == nulls.len or self.record.items[raw_start + nulls.len] == self.options.delimiterByte());
+            const text_default = if (self.options.default_string) |marker| self.options.format == .text and std.mem.startsWith(u8, self.record.items[raw_start..], marker) and (self.record.items.len - raw_start == marker.len or self.record.items[raw_start + marker.len] == self.options.delimiterByte()) else false;
             var in_quote = false;
             var was_quoted = false;
             while (read < self.record.items.len) {
@@ -224,10 +264,17 @@ pub const Decoder = struct {
             }
             if (in_quote) return error.InvalidCopyData;
             const bytes = self.record.items[start..write];
-            const is_null = if (self.options.format == .csv) !was_quoted and std.mem.eql(u8, bytes, self.options.nullBytes()) else text_null;
+            const index = self.fields.items.len;
+            const mask = if (!self.header and index < self.force.items.len) self.force.items[index] else @as(u8, 0);
+            const null_match = std.mem.eql(u8, bytes, self.options.nullBytes());
+            const is_null = if (self.options.format == .csv) null_match and (if (was_quoted) mask & 1 != 0 else mask & 2 == 0) else text_null;
+            // PostgreSQL compares unquoted raw input with DEFAULT, before
+            // text backslash decoding, independently of the NULL marker.
+            const is_default = if (self.options.default_string) |marker| !was_quoted and !is_null and (if (self.options.format == .csv) std.mem.eql(u8, bytes, marker) else text_default) else false;
             if (!is_null and (std.mem.indexOfScalar(u8, bytes, 0) != null or !std.unicode.utf8ValidateSlice(bytes))) return error.SqlInvalidTextEncoding;
             if (self.fields.items.len == self.width) return error.InvalidCopyData;
             try self.fields.append(self.alloc, if (is_null) null else bytes);
+            try self.defaults.append(self.alloc, is_default);
             if (read == self.record.items.len) break;
             read += 1;
         }
@@ -466,4 +513,48 @@ test "pgwire COPY input reuses bounded row storage without warm allocations" {
         const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
         std.debug.print("PGWIRE_COPY_INPUT codec={s} rows=10000 retained_bytes={d} warm_allocation_bytes=0 elapsed_ns={d}\n", .{ @tagName(options.format), baseline, elapsed });
     }
+}
+
+test "pgwire COPY input column masks default provenance and matching headers survive every split" {
+    const a = std.testing.allocator;
+    const data = "id,status,amount\n1,,n/a\n2,\"\",\"n/a\"\n";
+    for (1..data.len + 1) |chunk| {
+        var decoder = try Decoder.init(a, .{ .format = .csv, .header = true, .header_match = true, .force_null_columns = &.{"status"}, .force_not_null_columns = &.{"status"}, .default_string = "n/a" }, 3, 1024);
+        defer decoder.deinit();
+        try decoder.setColumns(&.{ "id", "status", "amount" });
+        var offset: usize = 0;
+        var rows: usize = 0;
+        while (offset < data.len) {
+            const end = @min(offset + chunk, data.len);
+            var input = data[offset..end];
+            while (try decoder.next(&input)) |row| {
+                if (rows == 0) {
+                    try std.testing.expectEqualStrings("", row[1].?);
+                    try std.testing.expect(decoder.defaults.items[2]);
+                } else {
+                    try std.testing.expect(row[1] == null);
+                    try std.testing.expectEqualStrings("n/a", row[2].?);
+                    try std.testing.expect(!decoder.defaults.items[2]);
+                }
+                rows += 1;
+            }
+            offset = end;
+        }
+        try std.testing.expect((try decoder.finish()) == null);
+        try std.testing.expectEqual(@as(usize, 2), rows);
+    }
+    var bad = try Decoder.init(a, .{ .header = true, .header_match = true }, 2, 1024);
+    defer bad.deinit();
+    try bad.setColumns(&.{ "id", "status" });
+    try std.testing.expectError(error.InvalidCopyData, bad.finish());
+    var header: []const u8 = "status\tid\n";
+    try std.testing.expectError(error.InvalidCopyData, bad.next(&header));
+    var marker_header = try Decoder.init(a, .{ .format = .csv, .header = true, .header_match = true, .default_string = "id" }, 1, 1024);
+    defer marker_header.deinit();
+    try marker_header.setColumns(&.{"id"});
+    var default_header: []const u8 = "id\n";
+    try std.testing.expectError(error.InvalidCopyData, marker_header.next(&default_header));
+    var unknown = try Decoder.init(a, .{ .format = .csv, .force_null_columns = &.{"missing"} }, 1, 1024);
+    defer unknown.deinit();
+    try std.testing.expectError(error.UnknownColumn, unknown.setColumns(&.{"id"}));
 }

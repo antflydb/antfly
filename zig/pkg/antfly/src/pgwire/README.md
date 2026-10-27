@@ -131,7 +131,9 @@ TLS itself.
 `COPY table [(columns)] FROM STDIN` accepts PostgreSQL text, CSV and binary
 payloads in simple and extended queries. Input frames may split any field,
 UTF-8 character, quoted newline or binary length word. CSV supports HEADER,
-DELIMITER, NULL, QUOTE and ESCAPE. Only UTF-8 encoding is accepted. Implicit
+DELIMITER, NULL, QUOTE and ESCAPE. Text/CSV support HEADER MATCH, DEFAULT,
+ON_ERROR IGNORE, REJECT_LIMIT and LOG_VERBOSITY; CSV also supports FORCE_NULL
+and FORCE_NOT_NULL by column or for all columns. Only UTF-8 encoding is accepted. Implicit
 column lists omit generated columns. Supplied identity values use PostgreSQL's
 COPY override semantics; omitted identity/default columns retain normal defaults.
 
@@ -153,8 +155,10 @@ authority during preparation and finalization, and closes before writer admissio
 COPY requires write permission. Tables with active row-level security reject
 COPY input with `0A000`, following PostgreSQL; use INSERT for policy-protected
 writes. Normal row filters, owner proofs and transaction checks remain active.
-WHERE, FORCE_NULL/FORCE_NOT_NULL, DEFAULT, FREEZE and error-skipping input options
-are not activated by this implementation. COPY requires the wire streaming
+ON_ERROR IGNORE skips conversion failures, including numeric-modifier overflow;
+it never skips malformed framing, missing defaults, encoding, constraint,
+authority or commit errors. Exceeding REJECT_LIMIT rolls back the whole COPY.
+WHERE and FREEZE are not activated by this implementation. COPY requires the wire streaming
 protocol; the ordinary JSON SQL endpoint cannot carry an input stream.
 
 ## COPY output

@@ -245,7 +245,7 @@ test "SQL exact original rejection contracts fail before backend access" {
     var corpus = try fixtures.Corpus.init(std.testing.allocator);
     defer corpus.deinit();
     const cases = [_]struct { id: []const u8, expected: compiler.Error }{
-        .{ .id = "sql-0382", .expected = error.UnsupportedSqlShape },
+        .{ .id = "sql-0382", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0672", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0673", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0699", .expected = error.InvalidSqlSyntax },
