@@ -747,7 +747,7 @@ fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection 
 /// Build one current namespace outside writer leases and publish all local
 /// consumers atomically. Missing/recreated destinations retract old projections
 /// immediately, independent of physical cleanup of the retired authority.
-const query_pins_owner_marker = prefix ++ "query-pins-owner-enrolled-v4";
+const query_pins_owner_marker = prefix ++ "query-pins-owner-enrolled-v5";
 fn queryPinsWorkPossible(database: *h.db_mod.DB, a: A) !bool {
     if (!database.core.index_manager.hasResolverDefinitions()) return false;
     _ = database.core.store.get(a, query_pins_owner_marker) catch |err| return if (err == error.NotFound) true else err;

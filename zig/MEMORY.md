@@ -2666,14 +2666,17 @@ Pin membership maintenance consumes bounded native edit journals. Pin edits repa
 only changed boundaries; routing edits repair affected root membership and path
 shortcuts. New edits coalesce into persistent repair queues. Unaffected roots can
 retain indexed serving under a bounded current-head proof while affected roots
-use exact fallback. A single new pair with 6,000 unrelated pins requires nine
+use exact fallback. A single new pair with 6,000 unrelated pins requires 13
 owner writes, rather than clearing and rebuilding the entire profile. The shared
 metadata/Lite contracts retain source, head, visibility and final grant fences.
 
 Resolver dependency projection follow-up: static consumers use shared projection
-format 3. Reverse-parent dependencies scope a leaf correction to its affected
+format 4. Reverse-parent dependencies scope a leaf correction to its affected
 paths, while the bounded journal maintains deduplicated key invalidations for
-unaffected-root read proofs across edit bursts. Complete configured/native graph
+unaffected-root read proofs across edit bursts. Deletable counting summaries
+with exact SHA-256 checks keep large distinct-key bursts out of request arenas.
+Durable ingestion and next-work queues preserve active repair/walk progress under
+unrelated edits; configured parent guards cover masked-edge unmerge. Complete configured/native graph
 coverage is owner-built before membership readiness; native memory identities
 without static consumers still create neither this projection nor its journal.
 See `RESOLUTION.md` for upgrade floors, bounded maintenance, and fallback rules.
