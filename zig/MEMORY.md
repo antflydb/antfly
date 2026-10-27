@@ -2631,3 +2631,10 @@ serialized copies of discarded suffixes. Existing retrieval truncation remains
 visible; an oversized seed is refused, and cancellation is checked while sizing
 and before emission. The 64-candidate, 64 KiB-statement regression fits into a
 256 KiB output allocator instead of retaining roughly 191 MB of JSON buffers.
+
+Ready native resolver projections use the same preparation policy in routed and
+embedded execution: complete node/seek lookups bypass full-profile graph builds,
+independent of cache residency or size estimates. Returned paths and incident
+pins remain bounded and head-fenced. Legacy source loading is confined to missing
+native readiness or explicit bulk use without a complete lookup; front-door
+queries cannot repeatedly rebuild whole alias profiles under cache pressure.

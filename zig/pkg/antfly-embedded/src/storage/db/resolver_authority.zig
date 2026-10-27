@@ -597,8 +597,10 @@ pub const Store = struct {
     }
     pub const QueryProfile = struct {
         id: []const u8,
-        ptr: *anyopaque,
-        load: *const fn (*anyopaque, A) anyerror![]const resolver.KeyAlias,
+        // Complete native lookups need no full-profile loader. Legacy or
+        // explicitly bulk callers supply the loader and its build estimate.
+        ptr: ?*anyopaque = null,
+        load: ?*const fn (*anyopaque, A) anyerror![]const resolver.KeyAlias = null,
         estimated_bytes: usize = std.math.maxInt(usize),
         lookup: ?AliasLookup = null,
     };
@@ -629,9 +631,9 @@ pub const Store = struct {
             if (self.lease) |lease| lease.release();
         }
     };
-    /// Static maps are content-addressed independently of mutable heads. The
-    /// composed index additionally pins exact head lineage and canonical pin
-    /// membership. Loading occurs only in the caller's read snapshot.
+    /// Published native lookups keep foreground work bounded independently of
+    /// cache residency. Full compilation is reserved for explicit bulk/legacy
+    /// profiles without a complete lookup, at the caller's pinned read cut.
     pub fn prepareQuery(self: Store, template: []const u8, profile: QueryProfile, distinct: bool) !?PreparedQuery {
         const h = (try self.head(template)) orelse return null;
         var composed = distinct;
@@ -640,7 +642,9 @@ pub const Store = struct {
         };
         const graph_state = try self.queryGraph(h);
         const static_estimate = profile.estimated_bytes *| 4;
-        const indexed = (composed and std.mem.allEqual(u8, &h.fingerprint, 0)) or static_estimate > query_context.Cache.max_bytes or (composed and graph_state.bytes *| 128 > query_context.Cache.max_bytes / 2);
+        const native_indexed = if (profile.lookup) |lookup| lookup.node != null and lookup.seek_node != null else false;
+        if (!native_indexed and profile.load == null) return error.InvalidCatalogRecord;
+        const indexed = native_indexed or (composed and std.mem.allEqual(u8, &h.fingerprint, 0)) or static_estimate > query_context.Cache.max_bytes or (composed and graph_state.bytes *| 128 > query_context.Cache.max_bytes / 2);
         var result: PreparedQuery = .{ .lease = null, .indexed = indexed, .pin_discovery = composed, .profile_id = profile.id, .routing_id = try self.routingFingerprint(h), .graph_id = graph_state.fingerprint, .stamp = .{ .revision = h.revision, .fingerprint = h.fingerprint }, .template = template, .distinct = distinct };
         if (indexed and profile.lookup != null and profile.lookup.?.seek_node != null) {
             result.lookup = profile.lookup;
@@ -651,7 +655,9 @@ pub const Store = struct {
             fn load(ptr: *anyopaque, a: A) !query_context.Graph {
                 const loader: *@This() = @ptrCast(@alignCast(ptr));
                 if (comptime @import("builtin").is_test) _ = test_query_base_loads.fetchAdd(1, .monotonic);
-                return .{ .aliases = try loader.profile.load(loader.profile.ptr, a), .shared_profile = true };
+                const callback = loader.profile.load orelse return error.InvalidCatalogRecord;
+                const ptr_ = loader.profile.ptr orelse return error.InvalidCatalogRecord;
+                return .{ .aliases = try callback(ptr_, a), .shared_profile = true };
             }
         };
         var base_loader: BaseLoader = .{ .profile = profile };
@@ -3525,4 +3531,89 @@ test "resolver curation query execution uses ready nodes without loading oversiz
     }
     try std.testing.expectEqual(@as(usize, 20), ready.calls);
     std.debug.print("OVERSIZED PROJECTION phases=10 full_profile_loads=0 point_expansions=20\n", .{});
+}
+
+test "resolver curation ready query indexes bound alternating profiles independently of graph cache residency" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "working-set/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1 });
+    const Txn = struct {
+        memory: *TestMemory,
+        pub fn get(self: *@This(), key_: []const u8) ![]const u8 {
+            return self.memory.rows.get(key_) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key_: []const u8, raw: []const u8) !void {
+            return TestMemory.put(self.memory, self.memory.a, key_, raw);
+        }
+        pub fn delete(self: *@This(), key_: []const u8) !void {
+            return TestMemory.remove(self.memory, self.memory.a, key_);
+        }
+    };
+    var txn: Txn = .{ .memory = &memory };
+    const Profile = struct {
+        id: []const u8,
+        aliases: []const resolver.KeyAlias,
+        loads: usize = 0,
+        fn load(ptr: *anyopaque, _: A) ![]const resolver.KeyAlias {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.loads += 1;
+            return error.UnexpectedFullProfileLoad;
+        }
+    };
+    var profiles: [5]Profile = undefined;
+    var readers: [5]static_profiles.QueryReader = undefined;
+    for (&profiles, &readers, 0..) |*profile, *reader, i| {
+        const aliases = try a.alloc(resolver.KeyAlias, 5000);
+        for (aliases, 0..) |*edge, j| edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/working-{d}-{d}", .{ i, j }), .target = try std.fmt.allocPrint(a, "entity/working-root-{d}", .{i}) };
+        const definition: static_profiles.Definition = .{ .key_template = template, .aliases = aliases };
+        profile.* = .{ .id = try definition.identity(a), .aliases = aliases };
+        try static_profiles.synchronize(a, &txn, "working-profiles/", &.{}, &.{definition});
+        reader.* = .{ .backend = store.backend, .root = "working-profiles/", .profile = profile.id, .indexed = try static_profiles.queryNodesReady(a, &txn, "working-profiles/", profile.id) };
+    }
+    const builds = test_query_base_loads.load(.monotonic);
+    var max_arena: usize = 0;
+    for (0..3) |phase| for (&profiles, &readers) |*profile, *reader| {
+        var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer request.deinit();
+        var current = store;
+        current.a = request.allocator();
+        const inline_profile: Store.InlineQueryProfile = .{ .aliases = profile.aliases };
+        const input: Store.QueryProfile = if (phase == 2)
+            .{ .id = profile.id, .lookup = reader.lookup() }
+        else
+            .{ .id = profile.id, .ptr = profile, .load = Profile.load, .estimated_bytes = if (phase == 0) 0 else inline_profile.estimate(), .lookup = reader.lookup() };
+        const prepared = (try current.prepareQuery(template, input, false)).?;
+        defer prepared.release();
+        try std.testing.expect(prepared.indexed and prepared.lease == null);
+        const visited = memory.visited;
+        const scans = memory.scans;
+        const snapshot = try current.queryExecutionPrepared(prepared, &.{ profile.aliases[0].key, "entity/absent" }, &.{}, false);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.namespace.merges.len);
+        try std.testing.expectEqualStrings(profile.aliases[0].target, snapshot.namespace.merges[0].target);
+        try std.testing.expect(memory.visited - visited <= 2);
+        try std.testing.expect(memory.scans - scans <= 4);
+        max_arena = @max(max_arena, request.queryCapacity());
+        try std.testing.expect(request.queryCapacity() < 128 * 1024);
+        try std.testing.expectEqual(@as(usize, 0), profile.loads);
+    };
+    try std.testing.expectEqual(builds, test_query_base_loads.load(.monotonic));
+    // Current native head is still required even when no graph is compiled.
+    const prior = (try store.exportNamespace(template)).?.namespace;
+    const stale = (try store.prepareQuery(template, .{ .id = profiles[0].id, .lookup = readers[0].lookup() }, false)).?;
+    defer stale.release();
+    var next = prior;
+    next.revision += 1;
+    next.merges = &.{.{ .key = profiles[0].aliases[0].key, .target = "entity/moved" }};
+    try store.apply(try difference(a, prior, next));
+    try std.testing.expectError(error.ResolverCurationConflict, store.queryExecutionPrepared(stale, &.{profiles[0].aliases[0].key}, &.{}, false));
+    const fresh = (try store.prepareQuery(template, .{ .id = profiles[0].id, .lookup = readers[0].lookup() }, false)).?;
+    defer fresh.release();
+    const moved = try store.queryExecutionPrepared(fresh, &.{profiles[0].aliases[0].key}, &.{}, false);
+    try std.testing.expectEqualStrings("entity/moved", moved.namespace.merges[0].target);
+    try std.testing.expectEqual(builds, test_query_base_loads.load(.monotonic));
+    std.debug.print("NATIVE QUERY WORKING SET profiles=5 aliases_per_profile=5000 passes=3 full_profile_loads=0 graph_leases=0 max_request_arena={d} visited_rows_per_query<=2 head_changes=fenced\n", .{max_arena});
 }

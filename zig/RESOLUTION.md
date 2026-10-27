@@ -2670,3 +2670,26 @@ still does. Existing indexed-projection readiness and legacy hydration remain
 independent, and this proof change needs no new durable backfill generation.
 With 1,000 sibling destinations, key render performs one destination qualification
 at admission and one at final verification; resolve retains all 1,000 checks.
+
+Published native query nodes take precedence over full-profile graph compilation
+in the shared preparation contract. A complete lookup supplies both direct node
+and ordered node-seek operations. Its prepared query retains native head, graph
+and routing stamps but leases no compiled profile graph, whether the graph cache
+is cold, warm, evicting or occupied by active callers. HTTP and Lite both admit
+that lookup without a full-body loader or a synthetic oversized build estimate.
+Ready routed reads no longer fetch an optional profile-size hint either.
+Only legacy/unready profiles, or explicit bulk callers without a complete
+lookup, supply a full-profile loader. Missing readiness therefore retains exact
+legacy results while backfill runs; restored readiness immediately returns to
+indexed execution even if a legacy compiled graph is still resident.
+
+Forward paths and incident pins still use the existing bounded indexed reader,
+request-local canonical memo and bounded native-routing cache. Native heads,
+profile enrollment, source declarations and final authorization remain independent
+live fences. This changes execution planning, not durable keys or protocol shape.
+The working-set regression publishes five profiles of 5,000 aliases, alternates
+three passes with different size estimates and absent loaders, and requires zero
+full-profile loads or compiled-graph leases. Each two-key query visits at most
+two rows and retains less than 128 KiB of arena capacity. Native head changes
+invalidate an already prepared query, and missing readiness still exercises a
+single exact legacy load before returning to the indexed path.
