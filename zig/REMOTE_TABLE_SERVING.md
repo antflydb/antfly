@@ -1629,3 +1629,41 @@ asynchronously, so isolated E2E counter assertions wait for the refreshed query
 snapshot. The real Parquet test spans multiple serving packs and verifies covered
 projection and hidden highlight fields before and after restart with the original
 Parquet object unavailable.
+
+
+### Boolean costing and independently readable stored source
+
+Optional ordered demand uses a conservative prepared text candidate ceiling,
+including required Boolean intersections and minimum-should-match unions. Required
+children take the minimum ceiling; required disjunctions sum child ceilings before
+dividing by their minimum match count. Unrestricted, unknown and phrase producers
+retain the corpus ceiling, and exclusions never increase selectivity. This ceiling
+only chooses a driver: exact counts, eligibility, scoring, authorization and cursor
+proofs continue to use their authoritative implementations. A postings choice
+survives pack routing and the downstream collector even without profiling.
+
+The stored-source recipe v3 writes the complete declared row as independently
+compressed `columnar_stored` sections using the existing typed AJV1 value codec.
+An authenticated non-JSON marker occupies each ordinary stored-body slot; it is
+not a second serialized row. Unindexed large fields remain available as source
+columns without becoming text postings. Native projection opens only the requested
+columns, validates the stored row identity, and decodes selected values under the
+request allocator. Four field cursors retain at most one decoded chunk each;
+ordinary chunks have a 64 KiB raw target, and an oversized required value owns its
+own chunk. A nested path reads its containing native JSON column. No new public
+configuration is required: `store_source` owns this representation.
+
+Whole-document consumers explicitly reconstruct JSON through the existing stored
+reader API. Highlight attachment uses projected native values too, including fields
+excluded from the response. The representation therefore preserves source and
+highlight semantics while allowing a small projection to avoid an unrelated large
+payload. Field cursors expire before their pack pin, and shared segment caches do
+not retain request-decoded source values.
+
+Both append and physically sorted compaction stream source columns through the
+same live-document and ordinal mapping as the text sections. They retain the raw
+marker rather than reconstructing full JSON rows. Delete masks, sparse field
+presence, scalar kinds and exact integers survive the rewrite. The authenticated
+recipe changes when this source representation changes, so reuse cannot claim
+column capability for a monolithic producer. Local embedded builders retain their
+existing source mode unless they explicitly select column storage.
