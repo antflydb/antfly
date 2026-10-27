@@ -731,6 +731,8 @@ def run(args, model, label, mode, concurrency, output):
                     for counter in [
                         "packed_gpu_decode_rows",
                         "packed_cpu_logit_rows",
+                        "packed_gpu_prefill_rows",
+                        "packed_skipped_prefix_heads",
                         "packed_standalone_wide_heads",
                     ]:
                         sample[counter] = sum(
