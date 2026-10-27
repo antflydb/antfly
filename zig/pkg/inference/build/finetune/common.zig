@@ -277,6 +277,7 @@ pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Ste
             // checks share an executable. A union of imports would mask missing
             // dependency declarations in standalone commands.
             module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);
+            module.addImport("antfly_document_runs", ctx.document_runs_mod);
             for (command.imports) |dependency| {
                 const name = @tagName(dependency);
                 if (!check.root_module.import_table.contains(name))
@@ -362,6 +363,7 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
 
 fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import, pjrt: ?*std.Build.Module) void {
     module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);
+    module.addImport("antfly_document_runs", ctx.document_runs_mod);
     for (imports) |import| {
         const dependency = if (import == .pjrt) (pjrt orelse continue) else ctx.moduleFor(import);
         module.addImport(@tagName(import), dependency);

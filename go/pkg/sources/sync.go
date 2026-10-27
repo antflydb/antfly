@@ -89,7 +89,7 @@ type SyncWriter struct {
 }
 
 func NewSyncWriter(client SyncClient, table, sourceID string, providerIDs []string, authoritative bool) (*SyncWriter, error) {
-	if client == nil || table == "" || !canonicalID(sourceID) || len(providerIDs) > maxImportSourceObjects {
+	if client == nil || table == "" || !canonicalID(sourceID) || len(providerIDs) > maxCollaborationSourceObjects {
 		return nil, fmt.Errorf("invalid source sync configuration")
 	}
 	w := &SyncWriter{client: client, table: table, sourceID: sourceID, bounds: recordRange(sourceID), inventory: map[string]bool{}, verified: map[string]bool{}, authoritative: authoritative}

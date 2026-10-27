@@ -993,26 +993,49 @@ func TestDecodeNumericDenseFrameRejectsForgedHeaders(t *testing.T) {
 }
 
 func TestClient_ContextCancellation(t *testing.T) {
-	// Server that delays response
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(5 * time.Second)
-		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(canceled)
+		case <-release:
+		}
 	}))
 	defer server.Close()
+	defer close(release)
 
 	inferenceClient, err := NewInferenceClient(server.URL, nil)
 	require.NoError(t, err)
 
-	// Create context with short timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	_, err = inferenceClient.Embed(ctx, "test-model", []string{"hello"})
-	require.Error(t, err)
-	// Error should be context-related
-	assert.True(t, strings.Contains(err.Error(), "context") ||
-		strings.Contains(err.Error(), "deadline") ||
-		strings.Contains(err.Error(), "cancel"))
+	result := make(chan error, 1)
+	go func() {
+		_, err := inferenceClient.Embed(ctx, "test-model", []string{"hello"})
+		result <- err
+	}()
+	// Cancel an in-flight request, rather than relying on a timed server sleep.
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("inference request did not reach the server")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("inference request ignored cancellation")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not observe request cancellation")
+	}
 }
 
 func TestClient_ServerErr(t *testing.T) {

@@ -89,6 +89,17 @@ pub const Registry = struct {
         const waiting = self.callbacks != 0;
         self.mutex.unlock(runtime);
         if (waiting) self.callbacks_done.waitUncancelable(runtime);
+        // Cached descriptors may outlive their DB wrapper. Once publication
+        // callbacks have drained, retire their weak resources immediately.
+        // Explicit readers and active uses retain their independent lifetime.
+        self.mutex.lockUncancelable(runtime);
+        defer self.mutex.unlock(runtime);
+        var it = self.first;
+        while (it) |state| : (it = state.next) state.retire();
+        it = self.first;
+        while (it) |state| : (it = state.next) {
+            if (state.resources_closed.load(.acquire)) self.releaseClosedClaimAssumeLocked(state);
+        }
     }
 
     pub fn releaseOwner(self: *Registry) void {
@@ -191,6 +202,10 @@ pub const Registry = struct {
         const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
         defer self.mutex.unlock(runtime);
+        self.releaseClosedClaimAssumeLocked(state);
+    }
+
+    fn releaseClosedClaimAssumeLocked(self: *Registry, state: *State) void {
         if (state.retired_claim == 0) return;
         var it = self.first;
         while (it) |other| : (it = other.next) {
