@@ -57,8 +57,11 @@ Use `cuda_ocr_profile.py --decode-graph` and the native harness's
 `--require-lighton-model-graph`. Graph rows follow stable sequence IDs and both
 output columns return to the scheduler's original claim order. The public
 attention verifier also checks repeated two-token replay, reset, complete KV
-contents and unused slots with the original F32 threshold. Raw follow-up logs
-and manifests remain outside the tracked source tree.
+contents and unused slots with the original F32 threshold. The
+[follow-up archive manifest](followup.json) records the immutable evidence URI,
+object generation and SHA-256. Its 80 files include the exact frozen binary,
+source, commands, six reports, reference outputs and per-file checksums; ambient
+authentication and session variables are excluded.
 
 ## Reproduce
 
