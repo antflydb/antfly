@@ -129,6 +129,9 @@ func (c *CollaborationConnector) slackPage(ctx context.Context, method string, q
 		if result.Limited {
 			return nil, fmt.Errorf("%w: Slack history is retention limited", ErrInventoryIncomplete)
 		}
+		if sample && len(result.Messages) > 1 {
+			result.Messages = result.Messages[:1]
+		}
 		for _, message := range result.Messages {
 			for _, visit := range visitors {
 				if err := visit(message); err != nil {

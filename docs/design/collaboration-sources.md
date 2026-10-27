@@ -340,10 +340,19 @@ The first job commits atomically with completion; subsequent deliveries reschedu
 at their due time. The minute sweep is a repair mechanism. Renewal timestamps stay
 anchored to the start of authority verification, including for one-minute leases.
 Workspace grant expansion preserves a separately persisted permission fingerprint;
-content replay retains its stricter full configuration hash. Live checks still
+content replay retains account, selection and processing identity while ignoring
+consent bookkeeping. Live checks still
 require the selected service, and account/selection/sharing changes cannot renew
 an older authority identity.
 
 Slack API error envelopes are classified independently of HTTP status. Transient
 or unknown failures never imply credential revocation, and the shared classifier
 preserves rate-limit deadlines for acquisition, validation and token refresh.
+
+
+Slack preview materialization uses the sampled history response directly and keeps
+at most one parent plus eight attachments in memory. It does not load or save
+acquisition checkpoints, even when the connector has durable stores configured.
+Reading the sample reuses the captured bytes after current scope checks. Attachment
+download failures preserve provider Retry-After deadlines through normal worker
+retry scheduling; numeric and HTTP-date forms share the API request parser.

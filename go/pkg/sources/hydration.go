@@ -123,7 +123,7 @@ func (c *CollaborationConnector) hydrationKey(r Request, ref collaborationRef) s
 }
 func (c *CollaborationConnector) hydrate(ctx context.Context, r Request, config CollaborationConfig, ref collaborationRef, message *slackMessage) ([]Input, error) {
 	key := c.hydrationKey(r, ref)
-	if !r.Preview && c.ContentStore != nil {
+	if (!r.Preview && c.ContentStore != nil) || (r.Preview && c.previewSelection == c.hydrationSelection(r)) {
 		if items, ok := c.hydratedItems[key]; ok {
 			return checkpointInputs(items), nil
 		}
@@ -173,6 +173,11 @@ func (c *CollaborationConnector) hydrate(ctx context.Context, r Request, config 
 			}
 			c.previewInputs[input.ID] = input
 		}
+		items := make([]Item, len(inputs))
+		for i, input := range inputs {
+			items[i] = input.Item
+		}
+		c.rememberHydration(key, items)
 		return inputs, nil
 	}
 	if c.ContentStore == nil {

@@ -316,3 +316,96 @@ func TestSlackEnvelopeClassifiesTransientAndCredentialFailures(t *testing.T) {
 	require.Equal(t, at, providerRetryAt(at.Format(http.TimeFormat), time.Now()))
 	require.WithinDuration(t, at, SlackAPIError("ratelimited", at).AntflyRetryAfter(), time.Second)
 }
+
+type previewForbiddenPersistence struct{ t *testing.T }
+
+func (p previewForbiddenPersistence) Load(context.Context, string) ([]byte, bool, error) {
+	p.t.Fatal("preview must not read acquisition storage")
+	return nil, false, nil
+}
+func (p previewForbiddenPersistence) Save(context.Context, string, []byte) error {
+	p.t.Fatal("preview must not persist acquisition storage")
+	return nil
+}
+
+type previewDownloadTransport func(*http.Request) (*http.Response, error)
+
+func (f previewDownloadTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func TestSlackPreviewReusesSampleAndAttachmentsWithoutPersistence(t *testing.T) {
+	for _, persistent := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no-store", true: "configured-store"}[persistent], func(t *testing.T) {
+			history, downloads, extractions := 0, 0, 0
+			c := &CollaborationConnector{ProviderName: ProviderSlack, APIBase: "https://fixture.test", AccessToken: func(context.Context) (string, error) { return "fixture", nil }}
+			if persistent {
+				store := previewForbiddenPersistence{t}
+				c.Cache = store
+				c.ContentStore = store
+			}
+			c.HTTPClient = fixtureClient(t, func(r *http.Request) (int, any) {
+				switch r.URL.Path {
+				case "/auth.test":
+					return 200, map[string]any{"ok": true, "team_id": "T1"}
+				case "/conversations.info":
+					return 200, map[string]any{"ok": true, "channel": map[string]any{"id": "C1", "is_member": true}}
+				case "/conversations.history":
+					history++
+					require.Equal(t, 1, history, "sample hydration/read must never fetch history again")
+					return 200, map[string]any{"ok": true, "messages": []any{
+						map[string]any{"ts": "100.000001", "text": "sample body", "files": []any{map[string]any{"id": "F1", "name": "report.txt", "mimetype": "text/plain", "url_private": "https://files.slack.com/private/report.txt"}}},
+						map[string]any{"ts": "100.000002", "text": "must not hydrate excess sample"},
+					}}
+				case "/chat.getPermalink":
+					return 200, map[string]any{"ok": true}
+				default:
+					t.Fatalf("unexpected request %s", r.URL)
+					return 500, nil
+				}
+			})
+			c.DownloadTransport = previewDownloadTransport(func(r *http.Request) (*http.Response, error) {
+				downloads++
+				return &http.Response{StatusCode: 200, Header: http.Header{}, Request: r, Body: io.NopCloser(strings.NewReader("attachment body"))}, nil
+			})
+			c.Extractor = func(_ context.Context, _ string, _ string, b []byte) ([]byte, error) { extractions++; return b, nil }
+			r := Request{Mode: ImportModeSource, SourceNamespace: "preview/test", Preview: true, Config: SourceConfig(`{"team_id":"T1","channel_ids":["C1"],"include_threads":false,"attachments":true}`)}
+			inv, err := c.Enumerate(t.Context(), r)
+			require.NoError(t, err)
+			require.Len(t, inv.Objects, 2)
+			for _, item := range inv.Objects {
+				b, err := c.Read(t.Context(), r, item)
+				require.NoError(t, err)
+				require.NotEmpty(t, b)
+			}
+			require.Equal(t, 1, history)
+			require.Equal(t, 1, downloads)
+			require.Equal(t, 1, extractions)
+		})
+	}
+}
+func TestAttachmentErrorsPreserveRetryAfter(t *testing.T) {
+	for _, provider := range []string{ProviderSlack, ProviderDiscord} {
+		for _, status := range []int{429, 503} {
+			for _, dateHeader := range []bool{false, true} {
+				header := "600"
+				expected := time.Now().UTC().Add(10 * time.Minute).Truncate(time.Second)
+				if dateHeader {
+					header = expected.Format(http.TimeFormat)
+				}
+				c := &CollaborationConnector{ProviderName: provider, AccessToken: func(context.Context) (string, error) { return "fixture", nil }, DownloadTransport: previewDownloadTransport(func(r *http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": []string{header}}, Request: r, Body: io.NopCloser(strings.NewReader(""))}, nil
+				})}
+				target := "https://files.slack.com/private/report.txt"
+				if provider == ProviderDiscord {
+					target = "https://cdn.discordapp.com/attachments/report.txt"
+				}
+				_, err := c.downloadAttachment(t.Context(), target)
+				var api *ProviderHTTPError
+				require.ErrorAs(t, err, &api)
+				require.Equal(t, status, api.Status)
+				require.True(t, api.Retryable())
+				var retry interface{ AntflyRetryAfter() time.Time }
+				require.ErrorAs(t, err, &retry)
+				require.WithinDuration(t, expected, retry.AntflyRetryAfter(), 2*time.Second)
+			}
+		}
+	}
+}

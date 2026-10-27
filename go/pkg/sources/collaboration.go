@@ -299,6 +299,13 @@ func (c *CollaborationConnector) get(ctx context.Context, resource, path string,
 }
 
 func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inventory, error) {
+	// Previews are fresh, bounded and ephemeral even when the caller configured
+	// durable acquisition storage for normal synchronization.
+	if r.Preview {
+		cache := c.Cache
+		c.Cache = nil
+		defer func() { c.Cache = cache }()
+	}
 	c.previewInputs = nil
 	c.previewSelection = c.hydrationSelection(r)
 	c.hydratedItems = nil
@@ -338,7 +345,7 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 		var capturedBytes int64
 		var capturedObjects int
 		refs, err = c.slackRefs(ctx, config, func(ref collaborationRef, message *slackMessage) error {
-			if c.ContentStore == nil {
+			if c.ContentStore == nil && !r.Preview {
 				return nil
 			}
 			inputs, captureErr := c.hydrate(ctx, r, config, ref, message)
@@ -707,7 +714,7 @@ func (c *CollaborationConnector) downloadAttachment(ctx context.Context, raw str
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return nil, &ProviderHTTPError{Provider: c.ProviderName, Status: resp.StatusCode}
+		return nil, &ProviderHTTPError{Provider: c.ProviderName, Status: resp.StatusCode, RetryAt: providerRetryAt(resp.Header.Get("Retry-After"), time.Now())}
 	}
 	return readBounded(resp.Body)
 }
