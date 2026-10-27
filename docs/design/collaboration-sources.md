@@ -449,3 +449,18 @@ the operation. Effective MANAGE_THREADS or administrator access selects the full
 private archive endpoint and timestamp cursor; ordinary readers retain joined-only
 archives and snowflake cursors. Both normal enumeration and deletion reconciliation
 use the same selection, preserving moderator-readable messages after archiving.
+
+Drive resource capabilities and OAuth scope authority are separate. Permission
+checks pin the current OAuth token, validate its bounded scope response, and use
+the same token for files.get(id,version,isAppAuthorized,capabilities(canDownload)).
+Full drive/drive.readonly scopes permit user-authorized files; drive.file also
+requires app authorization for that individual file. Metadata-only grants cannot
+renew Drive or Calendar-linked file content or authorize cached/staged reuse.
+Unknown/malformed proof is transient, while confirmed scope/file denial is
+permanent for the source. No token or raw grant strings are persisted in errors
+or acquisition state, and audits neither download bodies nor call token-info.
+
+GoogleHTTPClient carries verified requested JWT scopes for service accounts when
+the token response omits them; explicit response scopes always win. Authorized-user
+credentials always use the actual token response scopes. Hosted workers, resource
+previews, legacy Drive adapters and standalone clients use this shared client.

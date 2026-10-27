@@ -168,6 +168,7 @@ func TestCalendarRetainedContentAndPermissionOnlyAudit(t *testing.T) {
 		b, _ := json.Marshal(value)
 		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(string(b))), Request: r}, nil
 	})}
+	client = withDriveScopes(client, "https://www.googleapis.com/auth/drive.readonly")
 	connector := func() *CollaborationConnector {
 		return &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, Services: []string{"calendar", "drive"}, CalendarBase: "https://fixture.test/calendar", DriveBase: "https://fixture.test/drive", HTTPClient: client, ContentStore: store}
 	}

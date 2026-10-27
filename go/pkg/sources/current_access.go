@@ -28,26 +28,7 @@ import (
 // An empty revision authorizes a retained snapshot without requiring a content
 // refresh merely because the remote document was edited since publication.
 func (c *CollaborationConnector) checkDriveContentAccess(ctx context.Context, id, revision string) error {
-	if !googleFileID(id) {
-		return ErrInvalidInput
-	}
-	var file struct {
-		ID           string `json:"id"`
-		Version      string `json:"version"`
-		Capabilities struct {
-			CanDownload bool `json:"canDownload"`
-		} `json:"capabilities"`
-	}
-	if err := c.drive().get(ctx, c.HTTPClient, "/files/"+url.PathEscape(id)+"?fields=id,version,capabilities(canDownload)&supportsAllDrives=true", &file); err != nil {
-		return err
-	}
-	if file.ID != id || !file.Capabilities.CanDownload {
-		return fmt.Errorf("%w: Drive content download access revoked", ErrInvalidInput)
-	}
-	if revision != "" && file.Version != revision {
-		return &RevisionChangedError{Expected: revision, Actual: file.Version}
-	}
-	return nil
+	return c.drive().checkDriveContentAccess(ctx, c.HTTPClient, id, revision)
 }
 
 // AuthorizeInventory renews only authority for an already published snapshot.
@@ -114,6 +95,10 @@ func (c *CollaborationConnector) authorizeInventoryOnce(ctx context.Context, r R
 		return err
 	}
 	if c.ProviderName == ProviderGoogleWorkspace && config.Resource == "drive" {
+		client, _, err := driveContentClient(c.HTTPClient)
+		if err != nil {
+			return err
+		}
 		if err := c.checkedAuthority("drive-folder/"+config.FolderID, func() error {
 			var folder struct {
 				ID           string `json:"id"`
@@ -121,7 +106,7 @@ func (c *CollaborationConnector) authorizeInventoryOnce(ctx context.Context, r R
 					CanListChildren bool `json:"canListChildren"`
 				} `json:"capabilities"`
 			}
-			if err := c.drive().get(ctx, c.HTTPClient, "/files/"+url.PathEscape(config.FolderID)+"?fields=id,capabilities(canListChildren)&supportsAllDrives=true", &folder); err != nil {
+			if err := c.drive().get(ctx, client, "/files/"+url.PathEscape(config.FolderID)+"?fields=id,capabilities(canListChildren)&supportsAllDrives=true", &folder); err != nil {
 				return err
 			}
 			if folder.ID == "" || !folder.Capabilities.CanListChildren {

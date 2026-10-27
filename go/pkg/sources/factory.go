@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"golang.org/x/oauth2"
 	"net/http"
 	"os"
 	"time"
@@ -62,7 +61,7 @@ func EnvironmentFactory(ctx context.Context, connection Connection) (Connector, 
 		if err != nil {
 			return nil, err
 		}
-		client := oauth2.NewClient(ctx, auth.TokenSource)
+		client := GoogleHTTPClient(ctx, auth)
 		client.Timeout = 60 * time.Second
 		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		if connection.Provider == ProviderGoogleWorkspace {

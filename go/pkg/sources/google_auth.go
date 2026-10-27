@@ -74,13 +74,20 @@ func GoogleCredentialsForServices(ctx context.Context, provider, secret string, 
 	if err != nil {
 		return nil, fmt.Errorf("invalid Google source credentials")
 	}
-	credentials.TokenSource = googleCredentialTokens{credentials.TokenSource}
+	tokens := googleCredentialTokens{TokenSource: credentials.TokenSource}
+	if config.Type == "service_account" {
+		tokens.serviceAccountScopes = append([]string(nil), scopes...)
+	}
+	credentials.TokenSource = tokens
 	return credentials, nil
 }
 
 // Normalize at the credential boundary too: callers that validate a connection
 // directly must receive the same safe retry contract as resource HTTP requests.
-type googleCredentialTokens struct{ oauth2.TokenSource }
+type googleCredentialTokens struct {
+	oauth2.TokenSource
+	serviceAccountScopes []string
+}
 
 func (s googleCredentialTokens) Token() (*oauth2.Token, error) {
 	token, err := s.TokenSource.Token()

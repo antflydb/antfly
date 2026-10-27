@@ -450,7 +450,11 @@ func (c *GoogleConnector) ValidateCachedSnapshot(ctx context.Context, r Request,
 	if c.ProviderName == ProviderGCS {
 		return c.get(ctx, client, "/b/"+url.PathEscape(config.Bucket)+"/o?maxResults=1&prefix="+url.QueryEscape(config.Prefix), &response)
 	}
-	return c.get(ctx, client, "/files/"+url.PathEscape(config.FolderID)+"?fields=id&supportsAllDrives=true", &response)
+	pinned, _, err := driveContentClient(client)
+	if err != nil {
+		return err
+	}
+	return c.get(ctx, pinned, "/files/"+url.PathEscape(config.FolderID)+"?fields=id&supportsAllDrives=true", &response)
 }
 func (c *GoogleConnector) OpenSource(ctx context.Context, r Request, o Item) (io.ReadCloser, error) {
 	client, err := c.client(ctx, r)
@@ -469,16 +473,8 @@ func (c *GoogleConnector) ValidateStagedSource(ctx context.Context, r Request, o
 		return err
 	}
 	if c.ProviderName == ProviderGoogleDrive {
-		var access struct {
-			Capabilities struct {
-				CanDownload bool `json:"canDownload"`
-			} `json:"capabilities"`
-		}
-		if err := c.get(ctx, client, "/files/"+url.PathEscape(configString(o.Metadata, "file_id"))+"?fields=id,capabilities&supportsAllDrives=true", &access); err != nil {
-			return err
-		}
-		if !access.Capabilities.CanDownload {
-			return fmt.Errorf("%w: Drive content access cannot be established for cached export", ErrInvalidInput)
+		if err := c.checkDriveContentAccess(ctx, client, configString(o.Metadata, "file_id"), ""); err != nil {
+			return fmt.Errorf("Drive content access cannot be established for cached export: %w", err)
 		}
 		return nil
 	}
@@ -546,4 +542,37 @@ func (c *GoogleConnector) Read(ctx context.Context, r Request, o Item) ([]byte, 
 }
 func (c *GoogleConnector) CheckAccess(ctx context.Context, r Request, o Item) error {
 	return c.ValidateStagedSource(ctx, r, o)
+}
+
+// Resource capabilities express user permissions; OAuth scopes separately limit
+// the app. drive.file additionally requires this file to be authorized to the app.
+func (c *GoogleConnector) checkDriveContentAccess(ctx context.Context, client *http.Client, id, revision string) error {
+	if !googleFileID(id) {
+		return ErrInvalidInput
+	}
+	pinned, grant, err := driveContentClient(client)
+	if err != nil {
+		return err
+	}
+	var file struct {
+		ID            string `json:"id"`
+		Version       string `json:"version"`
+		AppAuthorized bool   `json:"isAppAuthorized"`
+		Capabilities  struct {
+			CanDownload bool `json:"canDownload"`
+		} `json:"capabilities"`
+	}
+	if err := c.get(ctx, pinned, "/files/"+url.PathEscape(id)+"?fields=id,version,isAppAuthorized,capabilities(canDownload)&supportsAllDrives=true", &file); err != nil {
+		return err
+	}
+	if file.ID != id || !file.Capabilities.CanDownload {
+		return fmt.Errorf("%w: Drive content download access revoked", ErrInvalidInput)
+	}
+	if !grant.allFiles && !file.AppAuthorized {
+		return &GoogleHTTPError{Status: 403, Reason: "file_not_authorized"}
+	}
+	if revision != "" && file.Version != revision {
+		return &RevisionChangedError{Expected: revision, Actual: file.Version}
+	}
+	return nil
 }

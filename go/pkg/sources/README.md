@@ -302,3 +302,16 @@ Calendar alias/role resolution is shared within each bounded audit and acquisiti
 phase. A 20-calendar audit makes 20 calendar metadata reads, rather than 230.
 New audits and publication checks clear proofs; long operations refresh expired
 proofs. Provider failures never become permission proofs.
+
+Drive authorization verifies the actual token's content scopes as well as the
+file's canDownload capability. A drive.file grant also requires isAppAuthorized
+on that file; metadata-only grants cannot authorize retained content. Missing or
+malformed scope proof remains retryable without renewing publication access.
+Permission metadata uses the exact token whose grant was checked, with no content
+reads or token-info requests. Scope text and tokens never enter diagnostics.
+
+Build Google clients with GoogleHTTPClient(ctx, credentials) after loading them
+through GoogleCredentialsForServices. This preserves verified service-account
+JWT scope provenance when token response scopes are omitted. Custom OAuth clients
+must expose an oauth2.Transport with actual token scope extras; opaque transports
+or authorized-user tokens without scope proof cannot authorize cached Drive data.

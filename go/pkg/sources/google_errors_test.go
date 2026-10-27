@@ -171,6 +171,7 @@ func TestWorkspaceQuotaAuditsResumeSuccessfulScopeChecks(t *testing.T) {
 					raw, _ := json.Marshal(value)
 					return &http.Response{StatusCode: 200, Header: http.Header{}, Request: r, Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
 				})}
+				c.HTTPClient = withDriveScopes(c.HTTPClient, "https://www.googleapis.com/auth/drive.readonly")
 				c.accessWait = func(context.Context, time.Duration) error { waits++; limited = false; return nil }
 				config := SourceConfig(`{"resource":"gmail","label_ids":["INBOX"],"permission_ttl_seconds":60}`)
 				inventory := Inventory{}
