@@ -25,6 +25,9 @@ pub const GraphStatement = @import("cypher_read.zig").Statement;
 pub const GraphTable = @import("cypher_read.zig").Table;
 
 pub const Fence = struct {
+    /// Opt in only when a deferred graph cut's validate operation finalizes
+    /// this fence's admission proof. Custom fences retain explicit validation.
+    graph_finalizes_validation: bool = false,
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,

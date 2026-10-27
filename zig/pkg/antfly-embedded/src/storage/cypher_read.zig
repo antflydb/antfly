@@ -17,6 +17,9 @@
 const std = @import("std");
 const callbacks = @import("../runtime_callback_abi.zig");
 pub const Input = struct {
+    /// Internal cohort capture: the first operation MUST be validate while
+    /// every owner's mutation fence remains held. Other operations fail closed.
+    defer_validation: bool = false,
     catalog_json: []const u8,
     /// Private catalog allowlist for a SQL statement referencing several graphs.
     catalogs_json: []const u8 = "",

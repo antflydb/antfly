@@ -90,7 +90,7 @@ pub const Client = struct {
             return null;
         }
         self.token = parsed.value.token orelse return error.InvalidRetainedReadResponse;
-        return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .capture_snapshot = captureSnapshot, .capture_graph = captureGraph, .release = close } };
+        return .{ .graph_finalizes_validation = true, .ptr = self, .vtable = &.{ .validate = validate, .open = open, .capture_snapshot = captureSnapshot, .capture_graph = captureGraph, .release = close } };
     }
 
     fn call(self: *Client, request: rpc.Request) !http.HttpResponse {

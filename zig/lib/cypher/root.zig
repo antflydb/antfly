@@ -41,6 +41,7 @@ pub const mutations = @import("mutations.zig");
 test {
     _ = @import("fanout_test.zig");
     _ = dependencies;
+    _ = runtime;
     _ = integer_affine;
     _ = @import("compiler_test.zig");
     _ = @import("catalog_test.zig");

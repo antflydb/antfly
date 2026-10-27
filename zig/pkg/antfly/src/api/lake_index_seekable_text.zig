@@ -2281,11 +2281,13 @@ test "external lake admitted directories evict independently of the corpus heap 
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer cache.deinit();
     cache.decoded.max_entries = 1;
-    var memory: local.sql_memory_budget = .{ .backing = a, .limit = 16 * 1024 };
+    const source_count = 12;
+    // Account for fixed reader owners as well as bounded query workspace.
+    var memory: local.sql_memory_budget = .{ .backing = a, .limit = source_count * @sizeOf(Owner) + 16 * 1024 };
     const capability: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(3), .context = .{ .io = std.testing.io } }, .context = .{ .io = std.testing.io }, .cancellation = .none };
     var first: ?Owner.DirectoryPin = null;
     defer if (first) |*pin| pin.release();
-    var sources: [12]?local.index.SegmentSource = @splat(null);
+    var sources: [source_count]?local.index.SegmentSource = @splat(null);
     defer for (&sources) |*source| if (source.*) |*owned| owned.close();
     for (&sources, 0..) |*source, i| {
         store.upload_scope = try stores.UploadScope.forPublication(@splat(@intCast(i + 1)), 1, std.testing.io);

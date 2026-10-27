@@ -4554,6 +4554,29 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     };
 
+    /// The short fence owns admission controls. Deferred snapshots retain this
+    /// capsule, never a naked borrow of those controls after fence release.
+    const GraphCaptureState = struct {
+        alloc: std.mem.Allocator,
+        references: std.atomic.Value(usize) = .init(1),
+        mutex: std.atomic.Mutex = .unlocked,
+        active: bool = true,
+        deadline_ns: ?u64,
+        fence: ?*RetainedStatementFence = null,
+        cancellation: @import("antfly_cancellation").CancellationToken,
+        fn retain(self: *@This()) void {
+            _ = self.references.fetchAdd(1, .monotonic);
+        }
+        fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) == 1) self.alloc.destroy(self);
+        }
+        fn retire(self: *@This()) void {
+            lock(&self.mutex);
+            self.active = false;
+            self.mutex.unlock();
+        }
+    };
+
     const RetainedStatementFence = struct {
         alloc: std.mem.Allocator,
         source: *ProvisionedKernelOwnerSource,
@@ -4564,6 +4587,24 @@ pub const ProvisionedKernelOwnerSource = struct {
         table: []const u8,
 
         frozen_proof: ?read_gate.ReadSafetyBarrier.FrozenProof = null,
+        graph_capture: ?*GraphCaptureState = null,
+        graph_capture_mutex: std.atomic.Mutex = .unlocked,
+
+        fn retainGraphCapture(self: *@This()) !*GraphCaptureState {
+            if (!self.graph_capture_mutex.tryLock()) return error.ReadUnavailable;
+            defer self.graph_capture_mutex.unlock();
+            if (self.graph_capture == null) {
+                // A graph read may use a different allocator and outlive the
+                // short fence's caller arena. The source outlives all reads.
+                const a = self.source.alloc;
+                const created = try a.create(GraphCaptureState);
+                created.* = .{ .alloc = a, .deadline_ns = self.route.admission_deadline_ns, .fence = self, .cancellation = self.route.admission_cancellation };
+                self.graph_capture = created;
+            }
+            const state = self.graph_capture.?;
+            state.retain();
+            return state;
+        }
 
         pub fn validate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -4580,6 +4621,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
         fn release(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.graph_capture) |state| {
+                state.retire();
+                state.release();
+            }
             self.native.deinit();
             self.owner.deinit();
             self.alloc.free(self.table);
@@ -4600,25 +4645,30 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn captureGraph(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").storage_statement_read_fence.GraphInput) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try validate(self);
+            try validateLocal(self);
             // Standalone owners have no Raft proof provider. Their native
             // mutation/replay fence still pins the cut. Replicated owners
-            // additionally validate the frozen proof in validate(). Private
+            // validate their frozen proof once at cohort finalization. Private
             // remote admission separately requires frozen-proof support.
             if (input.table_id != self.route.table_id or !std.mem.eql(u8, input.table, self.table)) return error.CatalogGenerationChanged;
+            var state: ?*GraphCaptureState = null;
+            if (input.defer_validation) state = try self.retainGraphCapture();
+            errdefer if (state) |retained_state| retained_state.release();
             const native = try self.native.captureGraph(alloc, input);
             errdefer native.deinit();
-            try validate(self);
+            try validateLocal(self);
             var owner = self.owner.cloneRead();
             errdefer owner.deinit();
             const name = try alloc.dupe(u8, self.table);
             errdefer alloc.free(name);
             const retained = try alloc.create(RoutedGraphRead);
+            errdefer alloc.destroy(retained);
             var route = self.route;
             route.admission_cancellation = .none;
             route.admission_deadline_ns = null;
             route.admission_deadline_io = null;
-            retained.* = .{ .alloc = alloc, .source = self.source, .owner = owner, .native = native, .route = route, .group = self.group, .table = name };
+            retained.* = .{ .alloc = alloc, .source = self.source, .owner = owner, .native = native, .route = route, .group = self.group, .table = name, .pending_validation = .init(input.defer_validation), .frozen_proof = self.frozen_proof, .capture_state = state };
+            if (!input.defer_validation) try validate(self);
             return .{ .ptr = retained, .vtable = &.{ .invoke = RoutedGraphRead.invoke, .release = RoutedGraphRead.close, .open_sql = RoutedGraphRead.openSql } };
         }
 
@@ -4654,16 +4704,50 @@ pub const ProvisionedKernelOwnerSource = struct {
         route: metadata_api.CatalogRouteFence,
         group: u64,
         table: []u8,
+        pending_validation: std.atomic.Value(bool) = .init(false),
+        capture_state: ?*GraphCaptureState = null,
+        frozen_proof: ?read_gate.ReadSafetyBarrier.FrozenProof = null,
         fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
+            const state = if (self.pending_validation.load(.acquire)) self.capture_state orelse return error.CypherSnapshotNotReady else null;
+            if (state) |capture| {
+                if (!capture.mutex.tryLock()) return error.ReadUnavailable;
+            }
+            defer if (state) |capture| capture.mutex.unlock();
+            var finalizing = false;
+            if (state) |capture| {
+                if (self.pending_validation.load(.acquire)) {
+                    if (!capture.active) return error.CypherSnapshotNotReady;
+                    try capture.cancellation.check();
+                    var request = try std.json.parseFromSlice(@import("cypher").rpc.Request, alloc, body, .{});
+                    defer request.deinit();
+                    if (request.value.operation != .validate) return error.CypherSnapshotNotReady;
+                    if (self.frozen_proof) |proof| {
+                        const barrier = self.source.read_safety_barrier;
+                        const validate_proof = barrier.vtable.validate_frozen orelse return error.SqlStatementSnapshotRequired;
+                        // Never wait for a Raft apply blocked by our mutation fence.
+                        try validate_proof(barrier.ptr, self.group, proof, capture.deadline_ns, capture.cancellation);
+                    }
+                    // The capsule keeps the original fence and its controls
+                    // alive through both native checks, including schema and
+                    // authority checks beyond the immutable graph view itself.
+                    try RetainedStatementFence.validateLocal(capture.fence orelse return error.CypherSnapshotNotReady);
+                    finalizing = true;
+                }
+            }
+            if (!finalizing) try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
             const result = try self.native.invoke(alloc, body);
             errdefer alloc.free(result);
-            try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
+            if (finalizing) {
+                try RetainedStatementFence.validateLocal(state.?.fence.?);
+                try state.?.cancellation.check();
+            } else try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
+            self.pending_validation.store(false, .release);
             return result;
         }
         fn openSql(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_types.ScanOptions) !table_read_source.RelationalReadView {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.pending_validation.load(.acquire)) return error.CypherSnapshotNotReady;
             if (!std.mem.eql(u8, table, self.table)) return error.Forbidden;
             try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
             var owner = self.owner.cloneRead();
@@ -4678,6 +4762,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.native.deinit();
+            if (self.capture_state) |state| state.release();
             self.owner.deinit();
             self.alloc.free(self.table);
             self.alloc.destroy(self);
@@ -4785,7 +4870,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (self.read_safety_barrier.vtable.capture_frozen) |capture_proof|
             retained.frozen_proof = try capture_proof(self.read_safety_barrier.ptr, group);
         try RetainedStatementFence.validateLocal(retained);
-        return .{ .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .open = RetainedStatementFence.open, .capture_snapshot = RetainedStatementFence.captureSnapshot, .capture_graph = RetainedStatementFence.captureGraph, .release = RetainedStatementFence.release } };
+        return .{ .graph_finalizes_validation = true, .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .open = RetainedStatementFence.open, .capture_snapshot = RetainedStatementFence.captureSnapshot, .capture_graph = RetainedStatementFence.captureGraph, .release = RetainedStatementFence.release } };
     }
 
     fn prepareRetainedScanRead(self: *ProvisionedKernelOwnerSource, group: u64, from: []const u8, to: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !void {
@@ -8077,4 +8162,64 @@ test "storage owner entity sink bridge preserves curation capability and missing
     const entries = [_]abi.EntityUpsert{.{ .table = .fromSlice("entities"), .storage_table = .fromSlice("table:7"), .key = .fromSlice("entity/retired"), .doc_json = .fromSlice("{}"), .skip_if_missing = 1 }};
     try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.upsert_batch_fn.?(hooks.entity_sink.callback_ctx, &entries, entries.len));
     try std.testing.expect(fixture.seen);
+}
+
+test "source owner deferred graph cut rejects paging and failed quorum finalization" {
+    const Fixture = struct {
+        checks: usize = 0,
+        fn validate(ptr: *anyopaque, _: u64, _: read_gate.ReadSafetyBarrier.FrozenProof, _: ?u64, _: @import("antfly_cancellation").CancellationToken) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.checks += 1;
+            return error.NotLeader;
+        }
+    };
+    var fixture: Fixture = .{};
+    var barrier = read_gate.unavailableReadSafetyBarrier();
+    var vtable = barrier.vtable.*;
+    vtable.validate_frozen = Fixture.validate;
+    barrier.ptr = &fixture;
+    barrier.vtable = &vtable;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    source.read_safety_barrier = barrier;
+    const state = try std.testing.allocator.create(ProvisionedKernelOwnerSource.GraphCaptureState);
+    state.* = .{ .alloc = std.testing.allocator, .deadline_ns = null, .cancellation = .none };
+    defer state.release();
+    var read: ProvisionedKernelOwnerSource.RoutedGraphRead = .{ .alloc = std.testing.allocator, .source = &source, .owner = undefined, .native = undefined, .route = undefined, .group = 7, .table = undefined, .pending_validation = .init(true), .capture_state = state, .frozen_proof = .{ .incarnation = 1, .term = 1, .applied_index = 1 } };
+    const Read = ProvisionedKernelOwnerSource.RoutedGraphRead;
+    try std.testing.expectError(error.CypherSnapshotNotReady, Read.invoke(&read, std.testing.allocator, "{\"operation\":\"scan\",\"graph_incarnation\":1,\"graph_revision\":1}"));
+    try std.testing.expectError(error.CypherSnapshotNotReady, Read.openSql(&read, std.testing.allocator, "docs", "", "", .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.checks);
+    try std.testing.expectError(error.NotLeader, Read.invoke(&read, std.testing.allocator, "{\"operation\":\"validate\",\"graph_incarnation\":1,\"graph_revision\":1}"));
+    try std.testing.expectEqual(@as(usize, 1), fixture.checks);
+    try std.testing.expect(read.pending_validation.load(.acquire));
+    try std.testing.expectError(error.CypherSnapshotNotReady, Read.invoke(&read, std.testing.allocator, "{\"operation\":\"get\",\"graph_incarnation\":1,\"graph_revision\":1}"));
+    state.retire();
+    try std.testing.expectError(error.CypherSnapshotNotReady, Read.invoke(&read, std.testing.allocator, "{\"operation\":\"validate\",\"graph_incarnation\":1,\"graph_revision\":1}"));
+    try std.testing.expectEqual(@as(usize, 1), fixture.checks);
+}
+
+test "source owner deferred graph cut state survives capture allocator retirement" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    source.alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const state = capture: {
+        errdefer arena.deinit();
+        const fence = try arena.allocator().create(ProvisionedKernelOwnerSource.RetainedStatementFence);
+        fence.* = undefined;
+        fence.alloc = arena.allocator();
+        fence.source = &source;
+        fence.graph_capture = null;
+        fence.graph_capture_mutex = .unlocked;
+        fence.route.admission_deadline_ns = null;
+        fence.route.admission_cancellation = .none;
+        const retained = try fence.retainGraphCapture();
+        // Retire and drop the fence's reference before releasing its arena.
+        retained.retire();
+        retained.release();
+        break :capture retained;
+    };
+    arena.deinit();
+    defer state.release();
+    try std.testing.expect(!state.active);
+    try std.testing.expectEqual(@as(usize, 1), state.references.load(.acquire));
 }

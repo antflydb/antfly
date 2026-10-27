@@ -10,6 +10,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from cypher_qualification_retry import retry_allowed
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -43,8 +45,16 @@ def main():
                     code, raw = response.status, response.read()
             except urllib.error.HTTPError as error:
                 code, raw = error.code, error.read()
-            # Fixture replay requires an explicit noncommit result. Never
-            # replay a graph write or an unknown transaction outcome.
+            # Graph mutations can restart only after explicit nonadmission.
+            # Expected failures and unknown write outcomes remain observable.
+            if (
+                code not in accepted
+                and retry_allowed(code, raw, path=path, body=body)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.2)
+                continue
+            # SQL fixture replay requires an explicit noncommit result.
             if setup and code in (409, 503):
                 failure = json.loads(raw) if raw.startswith(b"{") else {}
                 aborted = (

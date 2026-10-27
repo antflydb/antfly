@@ -50,10 +50,17 @@ pub const Writer = struct {
         const self = cast(ptr);
         try self.read.validate();
         const plans = try cypher.mutations.build(a, self.read.graph, self.overlay.?);
-        const requests = try a.alloc(contract.TableCommitRequest, plans.len);
-        for (plans, requests) |plan, *request| {
-            const guard = for (self.guards) |entry| {
-                if (std.mem.eql(u8, entry.table_name, plan.table)) break entry;
+        for (plans) |plan| {
+            if (plan.writes.items.len == 0 and plan.deletes.items.len == 0 and plan.edges.items.len == 0 and plan.removed_edges.items.len == 0) continue;
+            const captured = for (self.guards) |guard| {
+                if (std.mem.eql(u8, guard.table_name, plan.table)) break true;
+            } else false;
+            if (!captured) return error.CatalogGenerationChanged;
+        }
+        const requests = try a.alloc(contract.TableCommitRequest, self.guards.len);
+        for (self.guards, requests) |guard, *request| {
+            const plan = for (plans) |entry| {
+                if (std.mem.eql(u8, entry.table, guard.table_name)) break entry;
             } else return error.CatalogGenerationChanged;
             const writes = try a.alloc(types.TransactionWrite, plan.writes.items.len);
             for (plan.writes.items, writes) |write, *out| out.* = .{ .key = write.key, .value = write.value };

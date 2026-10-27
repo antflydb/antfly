@@ -9169,3 +9169,32 @@ def test_ordered_membership_uses_compact_continuations_beyond_eight_domains(grap
         assert [row[0]["value"] for row in result["rows"]] == expected
         assert result["stats"]["scanned_anchors"] <= 20
         assert result["stats"]["memory_bytes"] < 2 << 20
+
+
+def test_selective_writes_guard_only_captured_tables_and_preserve_other_mappings(graph_db):
+    db = graph_db
+    db.sql("CREATE TABLE unrelated (id TEXT)")
+    db.sql("INSERT INTO unrelated (_id,id) VALUES ('untouched','untouched')")
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "selective",
+            "definition": {
+                "labels": [{"name": "D", "table": "docs"}, {"name": "Other", "table": "unrelated"}],
+                "relationships": [],
+            },
+        }
+    )
+    for query, expected in [
+        ("CREATE (n:D {id:'selected',score:1}) RETURN n.score", "1"),
+        ("MATCH (n:D {id:'selected'}) SET n.score=2 RETURN n.score", "2"),
+        ("MERGE (n:D {id:'selected'}) ON MATCH SET n.score=3 RETURN n.score", "3"),
+        ("MATCH (n:D {id:'selected'}) REMOVE n.score RETURN n.id", "selected"),
+    ]:
+        result = db.cypher_json("selective", {"query": query})
+        assert result["commit"]["status"] == "committed"
+        assert result["rows"][0][0]["value"] == expected
+    assert db.sql("SELECT id FROM unrelated")["rows"] == [["untouched"]]
+    # Deletion retains the complete incident-edge/cleanup domain.
+    db.cypher_json("selective", {"query": "MATCH (n:D {id:'selected'}) DETACH DELETE n"})
+    assert db.sql("SELECT count(*) FROM docs")["rows"] == [["0"]]

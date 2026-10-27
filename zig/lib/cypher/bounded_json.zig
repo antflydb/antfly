@@ -52,8 +52,13 @@ pub fn checkSize(value: anytype, limit: usize, checkpoint: ?Checkpoint) !usize {
     return counter.count;
 }
 pub fn encode(allocator: std.mem.Allocator, value: anytype, limit: usize, checkpoint: ?Checkpoint) ![]u8 {
-    _ = try checkSize(value, limit, checkpoint);
-    return std.json.Stringify.valueAlloc(allocator, value, .{});
+    const size = try checkSize(value, limit, checkpoint);
+    const bytes = try allocator.alloc(u8, size);
+    errdefer allocator.free(bytes);
+    var writer = std.Io.Writer.fixed(bytes);
+    std.json.Stringify.value(value, .{}, &writer) catch return error.CypherResponseTooLarge;
+    if (writer.end != size) return error.CypherResponseTooLarge;
+    return bytes;
 }
 
 test "bounded graph serialization counts escaped UTF-8 bytes exactly" {

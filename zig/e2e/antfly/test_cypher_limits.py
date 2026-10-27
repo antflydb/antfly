@@ -21,9 +21,9 @@ import subprocess
 import time
 from pathlib import Path
 
+import conftest
 import pytest
 import requests
-import conftest
 
 
 @pytest.mark.parametrize(
@@ -231,12 +231,17 @@ def test_completed_graph_statements_release_cuts_and_reject_bound_redeclarations
         assert query("MATCH (n:Document) RETURN count(n)")["rows"] == [
             [{"type": "integer", "value": "2"}]
         ]
-        # The client can receive the response before the handler's deferred
-        # final-reader cleanup completes. Allow that cleanup to finish.
+        # Statement-owned generations live under each store's query-pins.
+        # Artifact inventory also retains reusable native-query-links caches
+        # across statements, including the cache created during index setup.
+        # Allow deferred final-reader cleanup to finish before checking pins.
         deadline = time.monotonic() + 5
-        while list(server.root.rglob("query-cut.json")) and time.monotonic() < deadline:
+        while (
+            list(server.root.rglob("*.query-pins/*/query-cut.json"))
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.05)
-        assert list(server.root.rglob("query-cut.json")) == []
+        assert list(server.root.rglob("*.query-pins/*/query-cut.json")) == []
         assert "Cypher statement cut cleanup failed" not in server.log_path.read_text()
     finally:
         client.close()

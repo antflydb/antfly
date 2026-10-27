@@ -127,9 +127,17 @@ pub const Statement = struct {
         statement: *Statement,
         fence: reads.StatementReadFence,
         plan: Plan,
+        read: ?port.GraphRead = null,
         fn validate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.fence.validate();
+            if (!self.fence.graph_finalizes_validation) try self.fence.validate();
+            const read = self.read orelse return error.CypherSnapshotNotReady;
+            var arena = std.heap.ArenaAllocator.init(self.statement.a);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const request = try std.json.Stringify.valueAlloc(a, cypher.rpc.Request{ .operation = .validate, .graph_incarnation = self.statement.graph.incarnation, .graph_revision = self.statement.graph.revision }, .{});
+            const response = try read.invoke(a, request);
+            a.free(response);
         }
         fn release(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -149,8 +157,9 @@ pub const Statement = struct {
             hash.update(&identity);
             var digest: [32]u8 = undefined;
             hash.final(&digest);
-            const read = try self.fence.captureGraph(a, .{ .catalog_json = statement.input.catalog_json, .catalogs_json = statement.input.catalogs_json, .table = self.plan.table.name, .table_id = self.plan.table.table_id, .schema_version = self.plan.table.schema_version, .cut_id = std.fmt.bytesToHex(digest, .lower), .expires_ms = statement.input.expires_ms, .ttl_now_ns = statement.input.ttl_now_ns, .principal_proof = self.plan.table.principal_proof, .database = self.plan.table.database, .filter_query_json = self.plan.table.filter_query_json });
+            const read = try self.fence.captureGraph(a, .{ .defer_validation = self.fence.graph_finalizes_validation, .catalog_json = statement.input.catalog_json, .catalogs_json = statement.input.catalogs_json, .table = self.plan.table.name, .table_id = self.plan.table.table_id, .schema_version = self.plan.table.schema_version, .cut_id = std.fmt.bytesToHex(digest, .lower), .expires_ms = statement.input.expires_ms, .ttl_now_ns = statement.input.ttl_now_ns, .principal_proof = self.plan.table.principal_proof, .database = self.plan.table.database, .filter_query_json = self.plan.table.filter_query_json });
             errdefer read.deinit();
+            self.read = read;
             const snapshot = try a.create(Owner);
             snapshot.* = .{ .a = a, .statement = statement, .read = read, .client = undefined };
             snapshot.client = .{ .channel = .{ .ptr = snapshot, .call = Owner.call }, .incarnation = statement.graph.incarnation, .revision = statement.graph.revision, .allowed_versions = statement.versions };

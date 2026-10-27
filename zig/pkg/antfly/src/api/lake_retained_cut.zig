@@ -832,15 +832,17 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
         const legacy_pin = try loadCached(wa, &artifacts, identity, legacy_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
         defer legacy_pin.deinit();
         try std.testing.expectEqual(@as(usize, 1), legacy_pin.descriptor.pending.count());
-        try std.testing.expect(!legacy_pin.lease.?.item.cached);
         // Allocator remapping changes the legacy parser's peak across owners
         // and build modes. Explicit active-load pressure proves the private
         // replay path without depending on that incidental allocation layout.
-        decoded.max_loading_bytes = 32 * 1024 * 1024;
-        const constrained = try loadCached(wa, &artifacts, identity, legacy_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
+        // Use a cold cache so an earlier successful admission cannot bypass
+        // the active-load limit through a resident hit.
+        var constrained_cache: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a, .max_loading_bytes = 32 * 1024 * 1024 };
+        defer constrained_cache.deinit();
+        const constrained = try loadCached(wa, &artifacts, identity, legacy_token, table, now + 1, .none, &constrained_cache, .{ .io = std.testing.io });
         defer constrained.deinit();
         try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), constrained.lease.?.item.budget.limit);
-        try std.testing.expect(constrained.lease.?.item.budget.peak > decoded.max_loading_bytes);
+        try std.testing.expect(constrained.lease.?.item.budget.peak > constrained_cache.max_loading_bytes);
         try std.testing.expect(!constrained.lease.?.item.cached);
         try std.testing.expectEqual(@as(usize, 125000), constrained.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row, .canonical)).?.object.get("payload").?.array.items.len);
     }

@@ -50,10 +50,28 @@ const Plan = struct {
             }
             return;
         }
-        // Dynamic procedure sources and writes conservatively keep all owners.
-        if (T == ast.Procedure) self.full = true;
+        // Preserve runtime logical/physical name resolution, including scoped
+        // literal targets. Unknown or dynamic targets retain runtime diagnostics.
+        if (T == ast.Procedure) {
+            if (std.mem.eql(u8, value.name, "antfly.search") and value.args.len == 2) {
+                if (searchTarget(value.args[0])) |target| {
+                    var found = false;
+                    for (self.graph.labels) |label| {
+                        const logical = std.mem.eql(u8, if (label.logical_table.len == 0) label.table else label.logical_table, target.name) and
+                            std.mem.eql(u8, label.database, target.database) and std.mem.eql(u8, label.namespace, target.namespace);
+                        if (logical or (target.physical_alias and std.mem.eql(u8, label.table, target.name))) {
+                            found = true;
+                            try self.tables.put(self.a, label.table, {});
+                        }
+                    }
+                    if (!found) self.full = true;
+                } else self.full = true;
+            } else self.full = true;
+        }
         if (T == ast.Clause) switch (value.operation) {
-            .create, .merge, .set, .remove, .delete => self.full = true,
+            // Deletion can inspect incoming edges in any source table,
+            // including DETACH cleanup and derived relationship producers.
+            .delete => self.full = true,
             else => {},
         };
         switch (@typeInfo(T)) {
@@ -72,6 +90,28 @@ const Plan = struct {
         }
     }
 };
+const SearchTarget = struct { name: []const u8, database: []const u8 = "default", namespace: []const u8 = "public", physical_alias: bool = false };
+fn searchTarget(expr: *const ast.Expr) ?SearchTarget {
+    if (expr.value == .literal and expr.value.literal == .string) return .{ .name = expr.value.literal.string, .physical_alias = true };
+    if (expr.value != .map) return null;
+    var result: SearchTarget = .{ .name = "" };
+    var seen: u8 = 0;
+    for (expr.value.map) |entry| {
+        const bit: u8 = if (std.mem.eql(u8, entry.name, "table")) 1 else if (std.mem.eql(u8, entry.name, "database")) 2 else if (std.mem.eql(u8, entry.name, "namespace")) 4 else continue;
+        if (seen & bit != 0 or entry.value.value != .literal) return null;
+        seen |= bit;
+        const literal = entry.value.value.literal;
+        if (literal == .null and bit != 1) continue;
+        if (literal != .string) return null;
+        switch (bit) {
+            1 => result.name = literal.string,
+            2 => result.database = literal.string,
+            4 => result.namespace = literal.string,
+            else => unreachable,
+        }
+    }
+    return if (seen & 1 != 0) result else null;
+}
 /// Null means unknown: capture the entire cohort. Names are physical tables.
 pub fn required(a: std.mem.Allocator, query: ast.Query, graph: catalog.Graph) !?[]const []const u8 {
     var plan: Plan = .{ .a = a, .graph = graph };
@@ -93,6 +133,14 @@ test "dependencies retain nested patterns, unions, procedures and write cohorts"
     const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{ .{ .name = "A", .table = "a" }, .{ .name = "B", .table = "b" }, .{ .name = "C", .table = "c" } }, .relationships = &.{.{ .name = "R", .index = "r", .source_label = "A", .target_label = "B", .stored_type = "r" }} };
     const Case = struct { query: []const u8, count: ?usize };
     for ([_]Case{
+        .{ .query = "MATCH(n:A) SET n.x=1 RETURN n", .count = 1 },
+        .{ .query = "MERGE(n:A {x:1}) RETURN n", .count = 1 },
+        .{ .query = "MATCH(n:A) DETACH DELETE n", .count = null },
+        .{ .query = "CALL antfly.search($table,{query:'x'}) YIELD node RETURN node", .count = null },
+        .{ .query = "CALL antfly.search({table:'a',namespace:'public'},{query:'x'}) YIELD node RETURN node", .count = 1 },
+        .{ .query = "CALL antfly.search({table:'a',database:null},{query:'x'}) YIELD node RETURN node", .count = 1 },
+        .{ .query = "CALL antfly.search({table:$table},{query:'x'}) YIELD node RETURN node", .count = null },
+        .{ .query = "CALL antfly.search('missing',{query:'x'}) YIELD node RETURN node", .count = null },
         .{ .query = "RETURN 1", .count = 0 },
         .{ .query = "MATCH(n:A) RETURN n", .count = 1 },
         .{ .query = "MATCH(n:A)-[:R]->() RETURN n", .count = null },
@@ -100,8 +148,8 @@ test "dependencies retain nested patterns, unions, procedures and write cohorts"
         .{ .query = "MATCH(n) RETURN n", .count = null },
         .{ .query = "MATCH(n:A) RETURN EXISTS { MATCH(m:C) RETURN m }", .count = 2 },
         .{ .query = "MATCH(n:A) RETURN n UNION MATCH(n:C) RETURN n", .count = 2 },
-        .{ .query = "CREATE(n:A) RETURN n", .count = null },
-        .{ .query = "CALL antfly.search('a',{query:'x'}) YIELD node RETURN node", .count = null },
+        .{ .query = "CREATE(n:A) RETURN n", .count = 1 },
+        .{ .query = "CALL antfly.search('a',{query:'x'}) YIELD node RETURN node", .count = 1 },
     }) |case| {
         var diagnostic: @import("compiler.zig").Diagnostic = .{};
         var compiled = try @import("compiler.zig").compile(a, case.query, .{}, &diagnostic);

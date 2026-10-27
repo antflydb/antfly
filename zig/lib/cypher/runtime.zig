@@ -51,6 +51,14 @@ pub const Result = struct {
     statement_byte_pool: ?*v.BytePool = null,
     pub fn jsonStringify(self: Result, writer: anytype) !void {
         try writer.beginObject();
+        try self.jsonStringifyFields(writer);
+        try writer.endObject();
+    }
+    /// Shared flat envelope; hosts append their typed durable commit receipt.
+    pub fn withCommit(self: Result, receipt: anytype) CommitResult(@TypeOf(receipt)) {
+        return .{ .result = self, .commit = receipt };
+    }
+    fn jsonStringifyFields(self: Result, writer: anytype) !void {
         try writer.objectField("wire_version");
         try writer.write(@import("wire.zig").version);
         try writer.objectField("columns");
@@ -77,7 +85,6 @@ pub const Result = struct {
         try writer.write(std.fmt.bufPrint(&revision, "{d}", .{self.graph_revision}) catch unreachable);
         try writer.objectField("complete");
         try writer.write(self.complete);
-        try writer.endObject();
     }
     pub fn deinit(self: *Result) void {
         const backing = self.budget.backing;
@@ -87,6 +94,22 @@ pub const Result = struct {
         self.* = undefined;
     }
 };
+
+/// Serialize the existing result wire fields directly, without a JSON DOM or
+/// a second owned copy of every returned graph value.
+pub fn CommitResult(comptime Receipt: type) type {
+    return struct {
+        result: Result,
+        commit: Receipt,
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            try writer.beginObject();
+            try self.result.jsonStringifyFields(writer);
+            try writer.objectField("commit");
+            try writer.write(self.commit);
+            try writer.endObject();
+        }
+    };
+}
 
 pub fn execute(backing: A, backend: backend_mod.Backend, graph: catalog.Graph, compiled: *const compiler.Compiled, parameters: []const v.Entry, limits: Limits) !Result {
     try graph.validate();
@@ -986,11 +1009,15 @@ pub const NodeCursor = struct {
         try graph.validate();
         try @import("binder.zig").validate(backing, graph, query);
         const allocator = backend_mod.reclaimingAllocator(backing);
-        const self = try allocator.create(NodeCursor);
-        errdefer allocator.destroy(self);
         const budget = try allocator.create(Budget);
         errdefer allocator.destroy(budget);
         budget.* = .{ .backing = allocator, .limit = limits.memory_bytes };
+        return openBudget(allocator, budget, backend, graph, query, parameters, limits) catch |err| return if (budget.exhausted) error.CypherMemoryBudgetExceeded else err;
+    }
+    fn openBudget(allocator: A, budget: *Budget, backend: backend_mod.Backend, graph: catalog.Graph, query: ast.Query, parameters: []const v.Entry, limits: Limits) !?*NodeCursor {
+        const projection = query.clauses[1].operation.project.value;
+        const self = try allocator.create(NodeCursor);
+        errdefer allocator.destroy(self);
         var arena = std.heap.ArenaAllocator.init(budget.allocator());
         var arena_moved = false;
         errdefer if (arena_moved) self.arena.deinit() else arena.deinit();
@@ -18174,4 +18201,47 @@ test "streaming windows cap promoted weights while sequential folds enforce tran
     try std.testing.expectError(error.CypherStateBudgetExceeded, fold.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .integer = 7 } }}, huge));
     engine.limits.intermediate_states = engine.stats.intermediate_states + 2;
     try std.testing.expectError(error.CypherStateBudgetExceeded, fold.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .integer = 7 } }}, Count.init(100)));
+}
+
+test "typed commit reply preserves the flat graph wire contract and byte limit" {
+    const a = std.testing.allocator;
+    const result: Result = .{
+        .arena = undefined,
+        .budget = undefined,
+        .columns = &.{"value"},
+        .rows = &.{ &.{.{ .string = "escaped \" newline\n 😀" }}, &.{.null}, &.{.{ .integer = std.math.maxInt(i64) }} },
+        .stages = &.{},
+        .stats = .{ .mutations = 1 },
+        .read_only = false,
+        .graph_incarnation = std.math.maxInt(u64),
+        .graph_revision = 19,
+        .complete = false,
+    };
+    const receipt = .{ .transaction_id = "0123456789abcdef", .status = "unknown", .outcome = "pending" };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var legacy = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, result, .{}), .{});
+    try legacy.object.put(scratch, "commit", try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, receipt, .{}), .{}));
+    const expected = try std.json.Stringify.valueAlloc(scratch, legacy, .{});
+    const reply = result.withCommit(receipt);
+    const encoded = try @import("bounded_json.zig").encode(a, reply, expected.len, null);
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings(expected, encoded);
+    try std.testing.expectError(error.CypherResponseTooLarge, @import("bounded_json.zig").encode(a, reply, expected.len - 1, null));
+}
+
+test "streaming graph initialization preserves configured memory-limit provenance" {
+    const Noop = struct {
+        fn bind(_: *anyopaque, _: A, _: catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var token: u8 = 0;
+    const backend: backend_mod.Backend = .{ .ptr = &token, .vtable = &.{ .bind = Noop.bind, .checkpoint = Noop.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } };
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "A", .table = "docs" }}, .relationships = &.{} };
+    var diagnostic: compiler.Diagnostic = .{};
+    var compiled = try compiler.compile(a, "MATCH(n:A) RETURN n", .{}, &diagnostic);
+    defer compiled.deinit();
+    try std.testing.expectError(error.CypherMemoryBudgetExceeded, NodeCursor.open(a, backend, graph, compiled.query, &.{}, .{ .memory_bytes = 1 }));
 }

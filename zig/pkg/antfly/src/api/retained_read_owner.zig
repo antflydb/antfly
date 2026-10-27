@@ -163,12 +163,12 @@ pub const Owner = struct {
         var borrow = try self.registry.borrow(capture_token, scope, .capture, time.monotonicNs());
         defer borrow.deinit();
         const captured: *Capture = @ptrCast(@alignCast(borrow.resource.ptr));
-        try captured.fence.validate();
+        if (!captured.fence.graph_finalizes_validation) try captured.fence.validate();
         const graph = try self.registry.alloc.create(GraphSnapshot);
         errdefer self.registry.alloc.destroy(graph);
         graph.* = .{ .alloc = self.registry.alloc, .read = try captured.fence.captureGraph(self.registry.alloc, input) };
         errdefer graph.read.deinit();
-        try captured.fence.validate();
+        if (!captured.fence.graph_finalizes_validation) try captured.fence.validate();
         try borrow.validate(time.monotonicNs());
         return self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = graph, .kind = .graph_snapshot, .close = GraphSnapshot.close, .cancellation = &graph.cancelled });
     }

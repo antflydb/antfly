@@ -321,7 +321,7 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
         lease.* = try db.acquireCypherReadAuthority(a, "", "default");
         admitted += 1;
         if (db == &handle.db and db.local_execution.row_policy_table_name == null) db.local_execution.row_policy_table_name = "default";
-        if (writes) try db.batch(.{ .activate_range_tracking = true });
+        if (writes and data.contains(db)) try db.batch(.{ .activate_range_tracking = true });
     }
     const schemas = try a.alloc(u32, owners.items.len);
     for (owners.items, schemas) |db, *version| version.* = if (db.core.schema) |schema| schema.version else 0;
@@ -362,8 +362,9 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
     try read.pin(a, data_owners.items, fences);
     defer read.unpin();
     const guard_type = @import("sql_commit.zig").GraphGuard;
-    const guards = try a.alloc(guard_type, if (writes) owners.items.len else 0);
-    for (owners.items[0..guards.len], guards, schemas[0..guards.len]) |db, *guard, version| {
+    const guards = try a.alloc(guard_type, if (writes) data_owners.items.len else 0);
+    for (data_owners.items[0..guards.len], guards) |db, *guard| {
+        const version = if (db.core.schema) |schema| schema.version else 0;
         const table = for (read.tables) |entry| {
             if (entry.db == db) break entry.name;
         } else unreachable;
@@ -379,10 +380,7 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
     var result = try cypher.runtime.execute(handle.alloc, if (writes) overlay.backend() else read.pinnedBackend(), graph, &compiled, request.parameters, request.limits);
     defer result.deinit();
     if (writes) {
-        var response = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, result, .{}), .{});
-        const receipt = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .transaction_id = std.fmt.bytesToHex(scope.transaction_id.?, .lower), .status = writer.outcome, .outcome = writer.outcome }, .{}), .{});
-        try response.object.put(a, "commit", receipt);
-        const bytes = try cypher.bounded_json.encode(std.heap.c_allocator, response, cypher.runtime.max_response_bytes, null);
+        const bytes = try cypher.bounded_json.encode(std.heap.c_allocator, result.withCommit(.{ .transaction_id = std.fmt.bytesToHex(scope.transaction_id.?, .lower), .status = writer.outcome, .outcome = writer.outcome }), cypher.runtime.max_response_bytes, null);
         out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
         return;
     }

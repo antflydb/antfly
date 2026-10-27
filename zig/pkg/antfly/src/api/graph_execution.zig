@@ -101,14 +101,14 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
         const normalized = try context.platformDeadline();
         if (writes) {
             const write_source = server.table_writes orelse return error.CypherMutationsUnavailable;
-            for (tables.items) |table| try write_source.activateRangeTracking(scratch, table.name, context);
+            for (read_tables.items) |table| try write_source.activateRangeTracking(scratch, table.name, context);
         }
         read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
         channel.read = &read.?;
         client = .{ .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint }, .incarnation = graph.incarnation, .revision = graph.revision };
         provider = client.backend();
     }
-    var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = tables.items, .release_read = AuthorityChannel.releaseRead, .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint } };
+    var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = read_tables.items, .release_read = AuthorityChannel.releaseRead, .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint } };
     errdefer if (writer.receipt) |receipt| {
         write_outcome.* = switch (receipt.status) {
             .aborted => .aborted,
@@ -126,11 +126,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     if (!writes or compiled.query.explain) try channel.validateAuthority(true);
     if (writer.receipt) |write_receipt| {
         if (write_receipt.status == .unknown) result.complete = false;
-        const encoded = try std.json.Stringify.valueAlloc(scratch, result, .{});
-        var json = try std.json.parseFromSliceLeaky(std.json.Value, scratch, encoded, .{});
-        const receipt = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, .{ .transaction_id = std.fmt.bytesToHex(writer.transaction_id.?, .lower), .status = write_receipt.status, .outcome = write_receipt.outcome }, .{}), .{});
-        try json.object.put(scratch, "commit", receipt);
-        return cypher.bounded_json.encode(a, json, cypher.runtime.max_response_bytes, null);
+        return cypher.bounded_json.encode(a, result.withCommit(.{ .transaction_id = std.fmt.bytesToHex(writer.transaction_id.?, .lower), .status = write_receipt.status, .outcome = write_receipt.outcome }), cypher.runtime.max_response_bytes, null);
     }
     const encoded = try cypher.bounded_json.encode(a, result, cypher.runtime.max_response_bytes, .{ .ptr = &channel, .call = AuthorityChannel.checkpoint });
     errdefer a.free(encoded);
@@ -148,6 +144,10 @@ pub const AuthorityChannel = struct {
     read: ?*port.GraphRead = null,
     read_owner: ?*?port.GraphRead = null,
     last_authority_check: ?u64 = null,
+    catalog_guard: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque, std.mem.Allocator) anyerror!void } = null,
+    /// SQL page operations have mandatory authoritative guards at both ends.
+    /// Internal RPCs share that boundary; long operations still refresh guards.
+    guarded_operation: bool = false,
     role_revision: ?u64 = null,
     fn releaseRead(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -162,18 +162,23 @@ pub const AuthorityChannel = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try self.validateAuthority(false);
     }
-    fn validateAuthority(self: *@This(), force: bool) !void {
+    pub fn validateAuthority(self: *@This(), force: bool) !void {
         try self.context.ensureActive();
         const now = @import("antfly_platform").time.monotonicNs();
-        if (!force) if (self.last_authority_check) |last| if (now -| last < 10 * std.time.ns_per_ms) return;
         if (self.role_revision) |revision| {
             const principal = self.identity.* orelse return error.Forbidden;
             const manager = principal.live_user_manager orelse return error.Forbidden;
             if (manager.rowPolicyRoleRevision() != revision) return error.Forbidden;
         }
+        if (!force or self.guarded_operation) if (self.last_authority_check) |last| if (now -| last < 10 * std.time.ns_per_ms) return;
         var arena = std.heap.ArenaAllocator.init(self.server.alloc);
         defer arena.deinit();
         const a = arena.allocator();
+        if (self.catalog_guard) |guard| {
+            try guard.call(guard.ptr, a);
+            self.last_authority_check = @import("antfly_platform").time.monotonicNs();
+            return;
+        }
         var checks: std.ArrayList(server_mod.GraphPermissionCheck) = .empty;
         try checks.append(a, .{ .resource_type = .graph, .resource = self.name, .permission_type = .read });
         if (self.writes) try checks.append(a, .{ .resource_type = .graph, .resource = self.name, .permission_type = .write });
@@ -186,14 +191,14 @@ pub const AuthorityChannel = struct {
             const bytes = try self.server.source.systemCatalog(a, self.context, .{ .graph_authority = .{ .name = self.name, .graph_id = self.record_id } });
             const reply = try std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").GraphAuthorityResult, a, bytes, .{});
             if (!reply.present) return error.CatalogGenerationChanged;
-            self.last_authority_check = now;
+            self.last_authority_check = @import("antfly_platform").time.monotonicNs();
             return;
         }
         const bytes = try self.server.source.systemCatalog(a, self.context, .{ .read = .{ .kind = .graph, .name = self.name } });
         const state = try std.json.parseFromSliceLeaky(domain.State, a, bytes, .{});
         const record = state.find(.graph, 0, self.name) orelse return error.CatalogGenerationChanged;
         if (record.id != self.record_id) return error.CatalogGenerationChanged;
-        self.last_authority_check = now;
+        self.last_authority_check = @import("antfly_platform").time.monotonicNs();
     }
     pub fn invoke(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -370,4 +375,31 @@ test "graph admission batches distinct tables before resolving label aliases" {
     // Every alias still checks its captured immutable table identity.
     bindings[63].table_id = 99;
     try std.testing.expectError(error.CatalogGenerationChanged, execute(std.testing.allocator, &server, &identity, .{}, "g", "{\"query\":\"RETURN 1\"}", &diagnostic, &outcome));
+}
+
+test "graph admission batches SQL operation guards from completed authority checks" {
+    const Fixture = struct {
+        completed: u64 = 0,
+        calls: usize = 0,
+        fn guard(ptr: *anyopaque, _: std.mem.Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+            self.calls += 1;
+            self.completed = @import("antfly_platform").time.monotonicNs();
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = server_mod.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    var identity: ?server_mod.AuthenticatedIdentity = null;
+    var channel: AuthorityChannel = .{ .server = &server, .identity = &identity, .context = .{}, .name = "g", .record_id = 1, .tables = &.{}, .writes = false, .catalog_guard = .{ .ptr = &fixture, .call = Fixture.guard } };
+    try channel.validateAuthority(true);
+    // Metadata latency cannot immediately expire the completed page guard.
+    try std.testing.expect(channel.last_authority_check.? >= fixture.completed);
+    channel.guarded_operation = true;
+    try channel.validateAuthority(true);
+    channel.guarded_operation = false;
+    try channel.validateAuthority(true);
+    try std.testing.expect(fixture.calls >= 2);
+    try std.testing.expect(channel.last_authority_check.? >= fixture.completed);
 }

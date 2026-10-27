@@ -3893,17 +3893,18 @@ cache instead of retaining it in the statement arena. This bounds payload
 retention independently of the number of owner pages even when parallel
 execution is unavailable or a small quota selects the sequential path.
 
-This integration merges origin/main at 9ace47d36392. Metadata protocol 45
-fences durable document job state and transaction sessions, whose independent
-branches had both used version 43. Runtime semantic-detail ABI 2 combines
+This integration merges origin/main through 031742c340741b5b4b8f2f49d2f366cbf2c5fe09.
+Metadata protocol 63 admits graph definitions and transaction sessions alongside
+main's resolver namespace and durable document-job formats. Runtime semantic-detail ABI 2 combines
 the document/inference and graph inventories while preserving their common
 prefix and testing the new extension boundary explicitly.
-The complete main inventory precedes the graph extension: all 826 semantic
-detail identifiers, 15 behavior codes and 78 metadata transition identifiers
-match origin/main. Golden tests cover the endpoint at 781, document details
+The complete main inventory precedes the graph extension. Main's semantic
+detail identifiers, behavior codes, and metadata transition identifiers retain
+their published values. Golden tests cover the endpoint at 781, document details
 at 782 through 825, and the graph extension beginning at 826.
 The metadata command frames preserve main's durable job tag 79 and assign
-transaction sessions tag 80, with an encoder/decoder regression for both.
+transaction sessions tag 81; main retains resolver advancement tag 80.
+Encoder/decoder regressions distinguish the durable frames.
 
 The same injected-five-millisecond probes now measure get-many for 8/16/64
 owners at 6/12/57 ms, versus 50/95/390 ms before. Ordered first-page startup
@@ -3919,9 +3920,9 @@ per-owner counts through the compiled kernel projection channel. Checkpoint
 and scan buffers transfer as owned opaque bytes, preserving binary values
 and avoiding a second JSON encoding. A real compiled-owner regression covers
 binary checkpoints, scheduled rows, quota transitions and invalid cursors.
-Private failure ABI 67 appends InvalidDocumentCheckpoint and TooManyActiveJobs
-as identities 903 and 904 without changing earlier status values. This keeps
-expected document-job errors
+Private failure ABI 68 preserves main's UnsupportedExactSort,
+InvalidDocumentCheckpoint and TooManyActiveJobs identities at 838 through 840,
+then appends graph identities at 841 through 904. This keeps expected document-job errors
 distinct across the kernel boundary rather than classifying them as defects.
 
 Retained-read ingress converts its clock-labelled transport deadline to the
@@ -3948,7 +3949,7 @@ checks pass, and a compiled-owner regression verifies that receipt probes
 require configured authority. The mutation campaign allows 300 seconds for
 32 checks and two independently bounded 60-second index-generation waits.
 
-Qualification passes 484 native Cypher cases, 42 runtime error ABI cases,
+The preceding fanout milestone passed 484 native Cypher cases, 42 runtime error ABI cases,
 nine private failure-identity cases, nine standalone SQL diagnostic cases,
 and 1,310 SQL cases across both partitions (24 build/run steps). All 1,156
 public Cypher/performance cases pass against the final shared library in one
@@ -3966,3 +3967,109 @@ Authenticated qualification passes all 10 selected cases across the suite
 and replicated-owner rerun. The latter completes all six campaigns, durable
 receipt reads from every metadata replica, metadata-leader loss, duplicate
 request-ID rejection across graphs, and receipt reads after node restart.
+
+
+## Cohort finalization, selective writes, and SQL graph guards
+
+Graph cut creation separates local native/route checks from quorum admission
+validation. Production routed owners opt in to deferred finalization. Each
+snapshot remains unavailable to graph operations and ordinary SQL cursors until
+its validate operation succeeds while the complete mutation-fenced cohort is
+held. This performs one frozen quorum proof per owner, replacing the remote
+path's four capture proofs plus final cohort proof. Direct capture remains
+validated before returning; custom sources retain explicit fence validation
+unless they opt in to the finalization contract.
+
+A reference-counted finalization capsule synchronizes validation with capture
+retirement. Releasing the short fence makes unfinalized cuts unusable; snapshots
+cannot dereference cancellation controls borrowed from a released capture.
+The capsule uses the source's allocator, so freeing an independent short-fence
+arena cannot invalidate a retained read or its eventual release.
+Successful finalization publishes readiness atomically. Paging keeps the
+independent route, native authority, expiry, and cancellation checks. Frozen
+proof validation retains the existing fail-fast rule when Raft apply owns its
+mutex; no validation waits for an apply blocked by the mutation fence.
+
+The shared dependency planner now recognizes literal search targets, including
+scoped table objects, and labeled CREATE, MERGE, SET, and REMOVE operations.
+Nested patterns, relationship endpoint mappings, and UNION arms contribute to
+the closure. Dynamic procedure targets, unlabeled patterns, and deletion retain
+the full cohort. Deletion includes incident relationships, incoming producers,
+and DETACH cleanup; native integrity coordination continues to expand physical
+participants where schemas require it. Unresolved literal search names retain
+runtime diagnostics through the conservative fallback.
+
+HTTP and embedded hosts keep full catalog and permission validation, but activate
+range tracking, capture owner cuts, collect conflict proofs, and submit guarded
+commit participants only for the proved execution domain. Empty mutation plans
+for uncaptured graph tables do not become participants. Read-only dependencies
+remain guarded participants even if they produce no mutation. Embedded authority
+leases and schema watches continue to cover every catalog mapping.
+
+SQL GRAPH_TABLE uses the same closure, unions dependencies across graph aliases
+and ordinary SQL tables, and explicitly opens a partial graph cut. Its binding
+retains the complete authorization/schema inventory. Graph admission batches
+unique logical tables in one metadata epoch. Page guards check graph incarnation
+through the bounded indexed authority probe and verify all logical table IDs,
+physical names, and schema/policy revision fences in one resolve-many batch per
+graph. Graph aliases share the statement's authority channel; each RPC client
+and request carries its own graph identity and revision. Custom catalog sources without
+the probe use the original authoritative catalog read.
+
+Every SQL page or optimized scalar/group/count operation has mandatory guards
+before and after execution. Internal RPCs share that operation boundary; long
+operations still refresh guards, and every checkpoint checks cancellation and
+the live role revision before considering a cached guard. This avoids graph JSON
+decoding and a separate linearizable metadata read for each table on every RPC,
+while changes during an operation prevent its output from being returned.
+
+Write replies use one shared typed flat envelope in HTTP and the embedded C API.
+The serializer writes existing result fields and the typed commit receipt
+directly, with identical wire representations. The bounded encoder counts exact
+escaped bytes, allocates the final buffer once, and serializes into that buffer.
+The precommit result-size check and receipt reservation remain before the durable
+decision. No result JSON string, generic JSON DOM, or parsed receipt is retained
+solely to attach commit metadata.
+
+An equal-output serialization probe over the actual runtime Result and shared
+commit envelope averages three runs per size. At 1,000/10,000/50,000 rows,
+legacy serialization takes 381/4,942/20,402 microseconds versus 107/1,450/5,077
+microseconds for the typed envelope. At 50,000 rows the 1,650,416-byte response
+uses 53,439,410 versus 2,475,662 arena bytes (about 95% less). The probe includes
+legacy result/receipt parsing and final encoding, asserts identical bytes, and
+excludes query execution, commit, storage, and network latency.
+
+Streaming cursor initialization also preserves graph-budget failure provenance.
+Its owning wrapper translates failures before destroying the budget, including
+failures while copying or planning the initial query. A configured graph memory
+ceiling therefore remains SQLSTATE 54000; genuine allocator exhaustion remains
+53200. The one-byte initialization regression and an allocation-failure sweep
+cover classification and partial-state cleanup.
+
+Statement cleanup qualification checks per-store `*.query-pins` generations.
+The artifact inventory's reusable `native-query-links` caches intentionally
+survive individual statements and can be created during index setup, before any
+Cypher request. Those published caches are outside the statement-cut lifecycle.
+
+The current qualification includes 486 native Cypher cases, 1,310 SQL cases,
+50 runtime error ABI cases, and nine private failure-identity cases. Debug
+qualification passes 238 local lake/SQL cases, both deferred graph owner cases,
+and five focused host cases covering SQL graph joins, joined-table privileges,
+exact schema normalization, constrained legacy replay, and admitted directory
+ownership. Allocation-failure sweeps disable address-dependent heap remapping;
+the legacy replay pressure check uses a cold cache, and directory workspace
+limits account for fixed reader structures. The Python SDK's 99 cases, generated
+Go SDK tests, and workbench build also pass.
+
+The final stripped ReleaseFast server/library build passes all 88 steps and
+the export boundary retains exactly 137 public functions with no internal
+exports. All 1,158 embedded Cypher/performance cases pass against that shared
+library; its SHA-256 remains unchanged through the final consistency build.
+All 19 distributed, authenticated search, operator-limit, and statement-cleanup
+cases pass in one complete run, including owner loss during index visibility
+and the configured one-byte memory ceiling. Authenticated storage and owner-loss
+verifiers share the bounded admission retry guard: only an explicit 503
+`write_outcome: not_started` permits mutation replay. Expected failures and
+admitted or unknown write outcomes remain observable. Its three contract tests
+pass. Qualification retains the production disk-admission floor; obsolete
+worktree build artifacts were reclaimed before the final campaign.

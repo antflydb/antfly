@@ -374,6 +374,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const graph_authority_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"system catalog graph authority probes"} });
     b.step("antfly-graph-authority-probe-test", "Verify bounded graph binding authority across catalog replacement")
         .dependOn(&b.addRunArtifact(graph_authority_tests).step);
+    const cypher_metadata_merge_filters = &.{
+        "metadata durable job state and transaction sessions retain distinct command frames",
+        "resolver curation namespace propagation snapshot registry retains document jobs and scheduling",
+        "metadata durable job state snapshot retains scheduling quotas and group isolation",
+    };
+    const cypher_metadata_merge_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = cypher_metadata_merge_filters });
+    b.step("cypher-metadata-merge-test", "Verify graph transaction frames coexist with resolver advancement and document job snapshots")
+        .dependOn(&b.addRunArtifact(cypher_metadata_merge_tests).step);
     const document_owner_simulation_tests = b.addTest(.{ .root_module = antfly_test_mod, .filters = &.{"VOPR durable document owner"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("antfly-document-owner-simulation-test", "Replay document owner failure schedules on the shared VOPR durable lane").dependOn(&addFilteredTestRunArtifact(b, document_owner_simulation_tests).step);
     const document_owner_metadata_tests = b.addTest(.{

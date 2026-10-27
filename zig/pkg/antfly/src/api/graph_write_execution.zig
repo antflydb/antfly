@@ -78,6 +78,7 @@ pub const Provider = struct {
         }
         const postimages = try cypher.mutations.build(a, self.graph, overlay);
         for (postimages) |postimage| {
+            if (postimage.writes.items.len == 0 and postimage.deletes.items.len == 0 and postimage.edges.items.len == 0 and postimage.removed_edges.items.len == 0) continue;
             const entry = try plan(plans, postimage.table);
             for (postimage.writes.items) |write| try entry.writes.append(a, .{ .key = write.key, .value = write.value });
             try entry.deletes.appendSlice(a, postimage.deletes.items);

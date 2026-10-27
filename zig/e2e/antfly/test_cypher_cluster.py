@@ -15,30 +15,33 @@
 
 """Public authenticated Cypher through real metadata/data Raft owners."""
 
-import os
 import base64
-import json
-import time
-import uuid
-import urllib.error
-import urllib.request
-import subprocess
-import sys
-from pathlib import Path
-from urllib.parse import urlsplit
-from concurrent.futures import ThreadPoolExecutor
-import threading
-import pytest
 import hashlib
 import hmac
+import json
+import os
 import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from urllib.parse import urlsplit
 
+import pytest
+import test_backup_restore
 from conftest import (
     AUTH_BOOTSTRAP_PASSWORD,
-    ready_index_status,
     internal_service_headers,
+    ready_index_status,
 )
-from test_backup_restore import three_by_three_backup_cluster  # noqa: F401
+from cypher_qualification_retry import retry_allowed
+
+three_by_three_backup_cluster = test_backup_restore.three_by_three_backup_cluster
 
 
 @pytest.fixture(autouse=True)
@@ -423,10 +426,9 @@ def test_authenticated_cypher_across_replicated_owner_nodes(
             # explicit not-started response permits replay, including when the
             # intended result is a duplicate-request rejection.
             if (
-                code == 503
-                and code not in accepted
+                code not in accepted
                 and attempt < 39
-                and json.loads(content).get("write_outcome") == "not_started"
+                and retry_allowed(code, content, path=path, body=body)
             ):
                 time.sleep(0.25)
                 continue
@@ -520,11 +522,21 @@ def test_cypher_receipt_recovers_owner_loss_during_index_visibility(
             },
             method=method,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                code, content = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            code, content = error.code, error.read()
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    code, content = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                code, content = error.code, error.read()
+            if (
+                code not in accepted
+                and retry_allowed(code, content, path=path, body=body)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.2)
+                continue
+            break
         assert code in accepted, (path, code, content.decode(), cluster.debug_logs())
         return json.loads(content) if content else None
 
@@ -582,8 +594,9 @@ def test_cypher_receipt_recovers_owner_loss_during_index_visibility(
             )
             time.sleep(0.2)
         with ThreadPoolExecutor(max_workers=1) as executor:
-            # Submit once. Owner loss must reconcile this ID, never replay the
-            # public query or generate a second ID for the same write.
+            # Admit one mutation. Only explicit nonadmission permits restart;
+            # owner loss must reconcile this ID without replaying an admitted
+            # or unknown write or generating a second ID.
             future = executor.submit(
                 call,
                 f"/graphs/{graph}/query",

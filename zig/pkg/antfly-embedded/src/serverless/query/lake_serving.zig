@@ -1495,7 +1495,11 @@ test "external lake metadata navigation full scans share frozen plans and empty 
     try std.testing.expectEqual(first.plan_lease.?.item, second.plan_lease.?.item);
     try std.testing.expect(first.canonicalOrder().?.ptr == second.canonicalOrder().?.ptr);
     try std.testing.expect(!first.hasLazyInventory());
-    try std.testing.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &cache, metadata });
+    // Heap remaps can avoid allocations depending on the address chosen by the
+    // backing allocator. Exercise the allocate/copy fallback deterministically
+    // so every failure index is reached in both shared and private plan paths.
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Fixture.checked, .{ memory.client(), &cache, metadata });
     var constrained = @import("lake_serving_cache.zig").Cache.init(a);
     defer constrained.deinit();
     constrained.decoded.max_loading_bytes = 32 * 1024 * 1024;
@@ -1505,5 +1509,5 @@ test "external lake metadata navigation full scans share frozen plans and empty 
     try std.testing.expect(private.private_snapshot != null);
     try private.ensureInventory(.{});
     try private.ownInventory();
-    try std.testing.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &constrained, metadata });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Fixture.checked, .{ memory.client(), &constrained, metadata });
 }
