@@ -2727,20 +2727,36 @@ graphs jump directly through immutable scalar canonical nodes. Curated walks
 publish graph-fenced `path/<node>` canonical shortcuts during a bounded second
 pass, so later converging boundaries reuse completed paths across owner turns.
 The cursor, shortcuts, members and readiness share one native transaction.
-Redirect, removed-alias and distinct edits immediately fence the whole generation,
-including paused walks and shortcuts. A replacement clears its old members and
-paths in bounded pages; only the final build page publishes readiness. Text-only
-edits reuse the same graph cut.
+Native graph edits append to a destination-owned, 256-slot bounded edit journal
+in the same transaction as pin propagation and the new head. Enrollment is owner-only:
+native memory identities without static consumers create no unused log. Slots are
+limited to 64 KiB, bounding the retained journal to 16 MiB per namespace. Each event captures
+changed pin-count boundaries and routing keys. Per-boundary manifests locate old
+membership directly; root-to-path indexes locate only affected canonical shortcuts.
+Owner repair seeds persistent dirty queues, expands affected roots, clears their
+paths, and repairs only queued boundaries. New edits coalesce into these queues;
+they do not discard unaffected members or restart a profile-wide clear/build pass.
+Unchanged paths and text-only edits reuse their prior work.
+
+A read-side proof checks at most 16 retained events and 128 boundary/path steps.
+It admits unaffected root postings across a newer graph cut and excludes dirty,
+old and new affected roots immediately. If that proof is too large, the journal
+has a gap, or cleanup is publishing the final repaired cut, readers use exact
+fallback. Final head, source, and authorization fences are unchanged. The owner
+publishes the repaired graph watermark only after every affected boundary and
+cleanup page completes. Full rebuilding is reserved for initial enrollment,
+legacy-format upgrade, oversized invalidations, or recovery after falling behind
+the journal's retained history. The ring cannot accumulate an unbounded log.
 A profile enrollment epoch also drives bounded retirement cleanup, so replacing
 immutable profiles does not accumulate their obsolete membership generations.
 Namespace retirement uses the existing bounded native-prefix cleanup.
 
 Metadata namespace replay advances these pages before acknowledging a source
 binding. Partial work yields to pending sibling namespaces and retains each
-namespace's source cursor and dirty state. Bootstrap v14 discovers historical
-static and curated profiles even in an idle catalog. Already-certified v12/v13 declaration,
+namespace's source cursor and dirty state. Bootstrap v15 discovers historical
+static and curated profiles even in an idle catalog. Already-certified v12/v13/v14 declaration,
 consumer and profile proofs remain usable during this backfill; pin readiness
-is a separate graph-specific watermark. Metadata topology version 61 gates the
+is a separate graph-specific watermark. Metadata topology version 62 gates the
 new durable owner work. Lite maintenance uses the same generation builder under
 its destination writer grant, retains the source work item until complete, and
 preserves ready postings on reopen. Historical Lite sources enroll their scopes
@@ -2748,7 +2764,7 @@ in the existing fair work queue; partial pin pages advance its observation curso
 without deleting the pending work. Scoped admission identities reuse cached
 profile hashes and avoid cloning unrelated alias declarations. The physical
 profile-enrollment cut is revalidated after writer admission before member or
-retirement publication. Lite reader version 22 fences the additional
+retirement publication. Lite reader version 23 fences the additional
 native records and enrollment epochs. An existing ready directory needs only
 a reader-floor update, not a wholesale rebuild; read-only files do not attempt
 that update. Source documents, native heads and final authorization keep their
@@ -2780,3 +2796,10 @@ per request). A 16,000-edge configured-chain regression checks bounded durable
 resume, invalidation during a paused walk, converging-boundary shortcut reuse,
 portable state validation and final readiness without scratch exhaustion. Lite
 owner tests exercise static materialization, curation, reopen and unmerge.
+
+The incremental single-pin regression adds one pair with 1,000 and 6,000 unrelated
+pins. Both cases complete in one owner turn with nine writes and 13 scans;
+the previous whole-profile repair needed 2,025/12,142 writes and 24/141 turns.
+A separate full-composition reference checks 1,536 seed queries during 48
+interleaved routing edits and partial owner turns. It also exercises a missed
+256-event journal window and verifies bounded recovery rather than stale readiness.

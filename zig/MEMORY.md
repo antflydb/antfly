@@ -2661,3 +2661,11 @@ excludes its previous postings. Metadata replay and Lite maintenance finish that
 work before marking the source binding applied. Existing full-path, visibility,
 head and final-grant fences remain independent. Legacy profiles keep exact
 fallback results while their owner generation is incomplete.
+
+Pin membership maintenance consumes bounded native edit journals. Pin edits repair
+only changed boundaries; routing edits repair affected root membership and path
+shortcuts. New edits coalesce into persistent repair queues. Unaffected roots can
+retain indexed serving under a bounded current-head proof while affected roots
+use exact fallback. A single new pair with 6,000 unrelated pins requires nine
+owner writes, rather than clearing and rebuilding the entire profile. The shared
+metadata/Lite contracts retain source, head, visibility and final grant fences.

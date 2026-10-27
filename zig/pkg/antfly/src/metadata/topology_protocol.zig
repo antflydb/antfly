@@ -92,11 +92,12 @@ const std = @import("std");
 /// Version 59 combines replicated document jobs with resolver advancement tag 80.
 /// Version 60 backfills and maintains root-scoped resolver pin projections.
 /// Version 61 resumes bounded pin paths and backfills static root membership.
-pub const current_version: u16 = 61;
+/// Version 62 incrementally repairs graph-fenced pin membership from edit journals.
+pub const current_version: u16 = 62;
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 61;
+pub const resolver_namespaces_version: u16 = 62;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {
