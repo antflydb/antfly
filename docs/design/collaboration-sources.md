@@ -333,3 +333,17 @@ backfill retention. Completed runs enqueue bounded cleanup; the scheduler also
 sweeps expired rows with indexed, skip-locked batches. A run past retention must
 start over. Default extraction version `attachment-text-v2` invalidates cached
 Calendar records that predate visibility metadata.
+
+
+Permission renewal uses a durable recurring queue job per completed publication.
+The first job commits atomically with completion; subsequent deliveries reschedule
+at their due time. The minute sweep is a repair mechanism. Renewal timestamps stay
+anchored to the start of authority verification, including for one-minute leases.
+Workspace grant expansion preserves a separately persisted permission fingerprint;
+content replay retains its stricter full configuration hash. Live checks still
+require the selected service, and account/selection/sharing changes cannot renew
+an older authority identity.
+
+Slack API error envelopes are classified independently of HTTP status. Transient
+or unknown failures never imply credential revocation, and the shared classifier
+preserves rate-limit deadlines for acquisition, validation and token refresh.
