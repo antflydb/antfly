@@ -1660,8 +1660,12 @@ pub fn prepareEmbeddingGemma2Audio(allocator: std.mem.Allocator, bytes: []const 
 /// Inspect only trustworthy sample-count headers. Unknown durations retain the
 /// full model envelope; admission must never infer a 30-second input limit.
 pub fn embeddingGemma2EncodedAudioSequenceBound(bytes: []const u8) !usize {
+    return embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes, .{});
+}
+
+pub fn embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes: []const u8, options: audio.DecodeOptions) !usize {
     const generic = @import("inference_audio");
-    const format = generic.detectFormat(bytes) orelse return error.UnsupportedAudioFormat;
+    const format = generic.detectFormatWithOptions(bytes, options) orelse return error.UnsupportedAudioFormat;
     const info: ?struct { samples: usize, rate: u32 } = switch (format) {
         .wav => wav: {
             const parsed = try generic.wav.parseData(bytes);
@@ -4364,7 +4368,10 @@ fn depthwiseConvWeightCt(
             const key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.depthwise.v1.{s}.{d}.{d}", .{ self.name, self.kernel_size, self.hidden });
             const cache = self.store.huggingface and !audioHostOps().resident and (self.cb.kind() == .metal or self.cb.kind() == .cuda);
             if (cache) if (try self.cb.modelConstant(key, null)) |hit| return hit;
-            if (!audioHostOps().resident) {
+            // CUDA resident checkpoint weights can be BF16, but transpose and
+            // the prepared-constant cache require F32. Use tensorF32 below to
+            // materialize and transpose these small constants once.
+            if (!audioHostOps().resident and self.cb.kind() != .cuda) {
                 if (self.store.residentWeight(self.name)) |resident| {
                     const expected = [_]i64{ @intCast(self.kernel_size), @intCast(self.hidden) };
                     if ((self.cb.tensorShapeMatches(resident, &expected) catch null) orelse false) return resident;
@@ -8012,6 +8019,60 @@ test "embeddinggemma2 audio frontend recipe builds once under concurrent prepara
     defer a.free(reference_basis);
     fillAudioDftBasis(reference_basis, 320, 512);
     try std.testing.expectEqualSlices(f32, reference_basis, second.basis);
+}
+
+fn populateBf16DepthwiseWeight(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const a = store.allocator;
+    const name = "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight";
+    const key = try a.dupe(u8, name);
+    errdefer a.free(key);
+    // BF16 values 1..6, in hidden-first checkpoint layout.
+    var tensor = try @import("../backends/tensor.zig").Tensor.initInt16(a, key, &.{ 2, 1, 3 }, &.{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 });
+    errdefer tensor.deinit();
+    tensor.dtype = .bf16;
+    try store.resident_weights.put(a, key, .{ .tensor = tensor });
+}
+
+fn checkBf16DepthwiseWeight(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    for (0..2) |iteration| {
+        // A fresh request-local store must reuse the device constant cache.
+        var weights = ProjectorWeights.initHuggingFace(&cb, a);
+        defer weights.deinit();
+        const downloads = cb.trainingRuntimeStats().d2h_bytes;
+        const hits = compute.embedding_gemma2_constant_hits;
+        const result = try depthwiseConvWeightCt(&cb, a, &weights, "a.blk.0.conv_dw.weight", 3, 2);
+        if (iteration == 0) {
+            try std.testing.expect(cb.trainingRuntimeStats().d2h_bytes > downloads);
+            try std.testing.expectEqual(hits, compute.embedding_gemma2_constant_hits);
+        } else {
+            // Check before the intentional result readback below.
+            try std.testing.expectEqual(downloads, cb.trainingRuntimeStats().d2h_bytes);
+            try std.testing.expectEqual(hits + 1, compute.embedding_gemma2_constant_hits);
+        }
+        const values = try cb.toFloat32(result, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 4, 2, 5, 3, 6 }, values);
+        try std.testing.expect((try cb.tensorShapeMatches(result, &.{ 3, 2 })).?);
+    }
+}
+
+test "embeddinggemma2 CUDA BF16 depthwise preparation widens before transpose and warm reuse" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    try populateBf16DepthwiseWeight(&store);
+    var compute = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .embedding_gemma2;
+    var it = store.resident_weights.iterator();
+    while (it.next()) |entry| {
+        try compute.insertBf16WeightFromTensor(try a.dupe(u8, entry.key_ptr.*), &entry.value_ptr.tensor);
+    }
+    try checkBf16DepthwiseWeight(compute.computeBackend(), compute.computeBackend());
 }
 
 fn populateAudioScaleCacheWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
