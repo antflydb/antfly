@@ -270,9 +270,7 @@ func (c *CollaborationConnector) get(ctx context.Context, resource, path string,
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		e := &ProviderHTTPError{Provider: c.ProviderName, Status: resp.StatusCode}
-		if seconds, err := strconv.ParseFloat(resp.Header.Get("Retry-After"), 64); err == nil && seconds >= 0 && seconds <= 86400 {
-			e.RetryAt = time.Now().Add(time.Duration(seconds * float64(time.Second)))
-		}
+		e.RetryAt = providerRetryAt(resp.Header.Get("Retry-After"), time.Now())
 		return e
 	}
 	b, err := readBounded(resp.Body)
@@ -288,7 +286,7 @@ func (c *CollaborationConnector) get(ctx context.Context, resource, path string,
 			return err
 		}
 		if !envelope.OK {
-			return &ProviderHTTPError{Provider: c.ProviderName, Status: 403, Code: envelope.Error}
+			return SlackAPIError(envelope.Error, providerRetryAt(resp.Header.Get("Retry-After"), time.Now()))
 		}
 	}
 	if err := json.Unmarshal(b, out); err != nil {
@@ -800,3 +798,36 @@ func discordID(id string) bool {
 }
 
 var _ Connector = (*CollaborationConnector)(nil)
+
+// SlackAPIError classifies Slack Web API error envelopes independently of their
+// HTTP status. Unknown failures remain retryable and never imply token revocation.
+func SlackAPIError(code string, retryAt time.Time) *ProviderHTTPError {
+	status := 502
+	switch code {
+	case "ratelimited", "rate_limited":
+		status = 429
+		if retryAt.IsZero() {
+			retryAt = time.Now().Add(time.Minute)
+		}
+	case "internal_error", "fatal_error", "service_unavailable", "request_timeout":
+		status = 503
+	case "invalid_auth", "not_authed", "token_revoked", "token_expired", "account_inactive":
+		status = 401
+	case "missing_scope", "no_permission", "restricted_action", "not_allowed_token_type", "enterprise_is_restricted":
+		status = 403
+	case "channel_not_found", "user_not_found":
+		status = 404
+	case "invalid_arguments", "invalid_arg_name", "invalid_array_arg", "invalid_charset", "invalid_form_data", "invalid_post_type", "missing_post_type":
+		status = 400
+	}
+	return &ProviderHTTPError{Provider: ProviderSlack, Status: status, Code: code, RetryAt: retryAt}
+}
+func providerRetryAt(value string, now time.Time) time.Time {
+	if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds >= 0 && seconds <= 86400 {
+		return now.Add(time.Duration(seconds * float64(time.Second)))
+	}
+	if at, err := http.ParseTime(value); err == nil && !at.Before(now) && at.Sub(now) <= 24*time.Hour {
+		return at
+	}
+	return time.Time{}
+}

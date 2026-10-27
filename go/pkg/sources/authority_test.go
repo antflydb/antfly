@@ -289,3 +289,30 @@ func TestGmailAbsenceAttachmentCheckRequestsIdentityMetadataOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"1.1"}, ids)
 }
+
+func TestSlackEnvelopeClassifiesTransientAndCredentialFailures(t *testing.T) {
+	for _, tc := range []struct {
+		code   string
+		status int
+		retry  bool
+	}{
+		{"internal_error", 503, true}, {"fatal_error", 503, true}, {"service_unavailable", 503, true}, {"unknown_future_error", 502, true}, {"ratelimited", 429, true}, {"rate_limited", 429, true},
+		{"invalid_auth", 401, false}, {"token_revoked", 401, false}, {"account_inactive", 401, false}, {"missing_scope", 403, false}, {"channel_not_found", 404, false},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			c := &CollaborationConnector{ProviderName: ProviderSlack, APIBase: "https://fixture.test", HTTPClient: fixtureClient(t, func(r *http.Request) (int, any) { return 200, map[string]any{"ok": false, "error": tc.code} })}
+			_, err := c.ConnectionIdentity(t.Context())
+			var api *ProviderHTTPError
+			require.ErrorAs(t, err, &api)
+			require.Equal(t, tc.status, api.Status)
+			require.Equal(t, tc.code, api.Code)
+			require.Equal(t, tc.retry, api.Retryable())
+			if tc.status == 429 {
+				require.True(t, api.RetryAt.After(time.Now()))
+			}
+		})
+	}
+	at := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
+	require.Equal(t, at, providerRetryAt(at.Format(http.TimeFormat), time.Now()))
+	require.WithinDuration(t, at, SlackAPIError("ratelimited", at).AntflyRetryAfter(), time.Second)
+}
