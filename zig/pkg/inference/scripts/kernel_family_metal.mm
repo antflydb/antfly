@@ -23,6 +23,13 @@ static double dispatch(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pi
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
+    for (NSDictionary *binding in test[@"bindings"]) {
+        if ([binding[@"pointer_patches"] count] == 0) continue;
+        // Declare resources reached through GPU addresses in argument records.
+        for (id buffer in buffers) if (buffer != [NSNull null])
+            [encoder useResource:buffer usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        break;
+    }
     NSUInteger i = 0;
     for (NSDictionary *binding in test[@"bindings"]) {
         NSUInteger index = [binding[@"index"] unsignedIntegerValue];
@@ -87,9 +94,26 @@ int main(int argc, char **argv) { @autoreleasepool {
             }
             id<MTLBuffer> buffer = [device newBufferWithBytes:initial.bytes length:initial.length options:MTLResourceStorageModeShared];
             require(buffer != nil, @"Buffer allocation failed"); [buffers[0] addObject:buffer];
-            id<MTLBuffer> second = [binding[@"output"] boolValue]
+            id<MTLBuffer> second = ([binding[@"output"] boolValue] || [binding[@"pointer_patches"] count] != 0)
                 ? [device newBufferWithBytes:initial.bytes length:initial.length options:MTLResourceStorageModeShared] : buffer;
             require(second != nil, @"Buffer allocation failed"); [buffers[1] addObject:second];
+        }
+        // Each image needs its own record when writable pointees differ.
+        for (NSUInteger record = 0; record < data.count; ++record) {
+            for (NSDictionary *patch in test[@"bindings"][record][@"pointer_patches"]) {
+                NSUInteger target = [patch[@"target"] unsignedIntegerValue];
+                NSUInteger offset = [patch[@"offset"] unsignedIntegerValue];
+                NSUInteger targetOffset = [patch[@"target_offset"] unsignedIntegerValue];
+                require(target < data.count && offset % sizeof(uint64_t) == 0, @"Invalid pointer patch");
+                for (int version = 0; version < 2; ++version) {
+                    id<MTLBuffer> owner = buffers[version][record], pointee = buffers[version][target];
+                    require((id)owner != [NSNull null] && (id)pointee != [NSNull null] &&
+                            offset <= owner.length && owner.length - offset >= sizeof(uint64_t) &&
+                            targetOffset <= pointee.length, @"Pointer patch exceeds buffer");
+                    const uint64_t address = pointee.gpuAddress + targetOffset;
+                    memcpy((char *)owner.contents + offset, &address, sizeof(address));
+                }
+            }
         }
         for (int version = 0; version < 2; ++version)
             dispatch(queue, pipelines[version], test, buffers[version], data, 1);

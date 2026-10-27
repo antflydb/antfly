@@ -3248,3 +3248,10 @@ The V01–V40 follow-up is recorded in [the V outcome register](unified-executio
 source reduction from checked-in generated expansion and physical repository
 size. CPU reaches the 20% maintenance-source target with Mac validation passing;
 the individual CUDA/Metal targets and CUDA device qualification remain pending.
+
+### Z native kernel-family consolidation
+
+[The Z outcome register](unified-execution-z-outcomes.md) records native
+compile-time CPU/Metal/CUDA numerical sharing and removal of stored CUDA
+attention expansions. It separates maintained-source savings from physical
+text savings and records performance and device-qualification limits.

@@ -30481,29 +30481,59 @@ inline fn q8KBlock8WeightScales(weights: [8][]const u8) F32x8 {
     };
 }
 
-inline fn dotQ8KQ8KBlock8Blocks(q8_input: []const u8, weights: [8][]const u8) [8]f32 {
-    // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock8Blocks
-    std.debug.assert(q8_input.len == 292);
-    inline for (0..8) |lane| std.debug.assert(weights[lane].len == 292);
-    const qx = q8_input[4..260];
-    const input_scale: F32x8 = @splat(readF32Le(q8_input[0..4]));
-    const weight_scales = q8KBlock8WeightScales(weights);
-    var acc: I32x8 = @splat(0);
+/// Static row/column specialization of the Q8_K integer dot. Keep the existing
+/// native dot leaves, chunk order and post-dot scale multiplication unchanged.
+inline fn q8KDotWide(comptime mr: usize, comptime nr: usize, comptime blocks: bool, inputs: [mr][]const u8, weights: if (blocks) [8][]const u8 else []const u8) [mr][nr]f32 {
+    const halves = nr / 8;
+    inline for (inputs) |input| std.debug.assert(input.len == 292);
+    if (comptime blocks) {
+        inline for (weights) |weight| std.debug.assert(weight.len == 292);
+    } else std.debug.assert(weights.len == (if (nr == 16) prepared_q8_k_panel16_block_bytes else prepared_q8_k_panel8_block_bytes));
+    var qx: [mr][]const u8 = undefined;
+    var scales: [mr]F32x8 = undefined;
+    inline for (0..mr) |r| qx[r] = inputs[r][4..260];
+    inline for (0..mr) |r| scales[r] = @splat(readF32Le(inputs[r][0..4]));
+    const weight_scales = if (blocks) [1]F32x8{q8KBlock8WeightScales(weights)} else if (nr == 16) [2]F32x8{ q8KPanel16WeightScalesLo(weights), q8KPanel16WeightScalesHi(weights) } else [1]F32x8{q8KPanel8WeightScales(weights)};
+    var acc: [mr][halves]I32x8 = @splat(@splat(@splat(0)));
     inline for (0..8) |chunk| {
         const off = chunk * 32;
-        acc += i32ArrayToVec8(dotI8I8Block8(
-            qx[off..][0..32],
-            weights[0][4 + off ..][0..32],
-            weights[1][4 + off ..][0..32],
-            weights[2][4 + off ..][0..32],
-            weights[3][4 + off ..][0..32],
-            weights[4][4 + off ..][0..32],
-            weights[5][4 + off ..][0..32],
-            weights[6][4 + off ..][0..32],
-            weights[7][4 + off ..][0..32],
-        ));
+        var dots: [halves][mr]I32x8 = undefined;
+        inline for (0..halves) |half| {
+            if (comptime blocks) {
+                const w = .{ weights[0][4 + off ..][0..32], weights[1][4 + off ..][0..32], weights[2][4 + off ..][0..32], weights[3][4 + off ..][0..32], weights[4][4 + off ..][0..32], weights[5][4 + off ..][0..32], weights[6][4 + off ..][0..32], weights[7][4 + off ..][0..32] };
+                if (comptime mr == 1) {
+                    dots[half][0] = i32ArrayToVec8(dotI8I8Block8(qx[0][off..][0..32], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]));
+                } else {
+                    const sums = if (mr == 2) dotI8I8Block8MR2RowsVec(qx[0][off..][0..32], qx[1][off..][0..32], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]) else dotI8I8Block8MR4RowsVec(qx[0][off..][0..32], qx[1][off..][0..32], qx[2][off..][0..32], qx[3][off..][0..32], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                    inline for (0..mr) |r| dots[half][r] = @field(sums, .{ "r0", "r1", "r2", "r3" }[r]);
+                }
+            } else {
+                const base = (if (nr == 16) prepared_q8_k_panel16_values_offset else prepared_q8_k_panel8_values_offset) + chunk * nr * 32 + half * 8 * 32;
+                const panel = weights[base..][0 .. 8 * 32];
+                if (comptime mr == 1) {
+                    dots[half][0] = dotI8I8Block8ContiguousVec(qx[0][off..][0..32], panel);
+                } else {
+                    const sums = if (mr == 2) dotI8I8Block8MR2RowsContiguousVec(qx[0][off..][0..32], qx[1][off..][0..32], panel) else dotI8I8Block8MR4RowsContiguousVec(qx[0][off..][0..32], qx[1][off..][0..32], qx[2][off..][0..32], qx[3][off..][0..32], panel);
+                    inline for (0..mr) |r| dots[half][r] = @field(sums, .{ "r0", "r1", "r2", "r3" }[r]);
+                }
+            }
+        }
+        inline for (0..halves) |half| inline for (0..mr) |r| {
+            acc[r][half] += dots[half][r];
+        };
     }
-    return f32x8ToArray((input_scale * weight_scales) * @as(F32x8, @floatFromInt(acc)));
+    var result: [mr][nr]f32 = undefined;
+    inline for (0..mr) |r| inline for (0..halves) |half| {
+        const value = f32x8ToArray((scales[r] * weight_scales[half]) * @as(F32x8, @floatFromInt(acc[r][half])));
+        inline for (0..8) |lane| result[r][half * 8 + lane] = value[lane];
+    };
+    return result;
+}
+
+inline fn dotQ8KQ8KBlock8Blocks(q8_input: []const u8, weights: [8][]const u8) [8]f32 {
+    // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock8Blocks
+    const result = q8KDotWide(1, 8, true, .{q8_input}, weights);
+    return result[0];
     // quant-kernel-codegen:end CPU Q8K dot dotQ8KQ8KBlock8Blocks
 }
 
@@ -30513,36 +30543,10 @@ inline fn dotQ8KQ8KBlock8MR2Blocks(
     weights: [8][]const u8,
 ) Panel8MR2Sums {
     // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock8MR2Blocks
-    std.debug.assert(q8_input0.len == 292);
-    std.debug.assert(q8_input1.len == 292);
-    inline for (0..8) |lane| std.debug.assert(weights[lane].len == 292);
-    const qx0 = q8_input0[4..260];
-    const qx1 = q8_input1[4..260];
-    const input_scale0: F32x8 = @splat(readF32Le(q8_input0[0..4]));
-    const input_scale1: F32x8 = @splat(readF32Le(q8_input1[0..4]));
-    const weight_scales = q8KBlock8WeightScales(weights);
-    var acc0: I32x8 = @splat(0);
-    var acc1: I32x8 = @splat(0);
-    inline for (0..8) |chunk| {
-        const off = chunk * 32;
-        const dots = dotI8I8Block8MR2RowsVec(
-            qx0[off..][0..32],
-            qx1[off..][0..32],
-            weights[0][4 + off ..][0..32],
-            weights[1][4 + off ..][0..32],
-            weights[2][4 + off ..][0..32],
-            weights[3][4 + off ..][0..32],
-            weights[4][4 + off ..][0..32],
-            weights[5][4 + off ..][0..32],
-            weights[6][4 + off ..][0..32],
-            weights[7][4 + off ..][0..32],
-        );
-        acc0 += dots.r0;
-        acc1 += dots.r1;
-    }
+    const result = q8KDotWide(2, 8, true, .{ q8_input0, q8_input1 }, weights);
     return .{
-        .r0 = f32x8ToArray((input_scale0 * weight_scales) * @as(F32x8, @floatFromInt(acc0))),
-        .r1 = f32x8ToArray((input_scale1 * weight_scales) * @as(F32x8, @floatFromInt(acc1))),
+        .r0 = result[0],
+        .r1 = result[1],
     };
     // quant-kernel-codegen:end CPU Q8K dot dotQ8KQ8KBlock8MR2Blocks
 }
@@ -30555,50 +30559,12 @@ inline fn dotQ8KQ8KBlock8MR4Blocks(
     weights: [8][]const u8,
 ) Panel8MR4Sums {
     // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock8MR4Blocks
-    std.debug.assert(q8_input0.len == 292);
-    std.debug.assert(q8_input1.len == 292);
-    std.debug.assert(q8_input2.len == 292);
-    std.debug.assert(q8_input3.len == 292);
-    inline for (0..8) |lane| std.debug.assert(weights[lane].len == 292);
-    const qx0 = q8_input0[4..260];
-    const qx1 = q8_input1[4..260];
-    const qx2 = q8_input2[4..260];
-    const qx3 = q8_input3[4..260];
-    const input_scale0: F32x8 = @splat(readF32Le(q8_input0[0..4]));
-    const input_scale1: F32x8 = @splat(readF32Le(q8_input1[0..4]));
-    const input_scale2: F32x8 = @splat(readF32Le(q8_input2[0..4]));
-    const input_scale3: F32x8 = @splat(readF32Le(q8_input3[0..4]));
-    const weight_scales = q8KBlock8WeightScales(weights);
-    var acc0: I32x8 = @splat(0);
-    var acc1: I32x8 = @splat(0);
-    var acc2: I32x8 = @splat(0);
-    var acc3: I32x8 = @splat(0);
-    inline for (0..8) |chunk| {
-        const off = chunk * 32;
-        const dots = dotI8I8Block8MR4RowsVec(
-            qx0[off..][0..32],
-            qx1[off..][0..32],
-            qx2[off..][0..32],
-            qx3[off..][0..32],
-            weights[0][4 + off ..][0..32],
-            weights[1][4 + off ..][0..32],
-            weights[2][4 + off ..][0..32],
-            weights[3][4 + off ..][0..32],
-            weights[4][4 + off ..][0..32],
-            weights[5][4 + off ..][0..32],
-            weights[6][4 + off ..][0..32],
-            weights[7][4 + off ..][0..32],
-        );
-        acc0 += dots.r0;
-        acc1 += dots.r1;
-        acc2 += dots.r2;
-        acc3 += dots.r3;
-    }
+    const result = q8KDotWide(4, 8, true, .{ q8_input0, q8_input1, q8_input2, q8_input3 }, weights);
     return .{
-        .r0 = f32x8ToArray((input_scale0 * weight_scales) * @as(F32x8, @floatFromInt(acc0))),
-        .r1 = f32x8ToArray((input_scale1 * weight_scales) * @as(F32x8, @floatFromInt(acc1))),
-        .r2 = f32x8ToArray((input_scale2 * weight_scales) * @as(F32x8, @floatFromInt(acc2))),
-        .r3 = f32x8ToArray((input_scale3 * weight_scales) * @as(F32x8, @floatFromInt(acc3))),
+        .r0 = result[0],
+        .r1 = result[1],
+        .r2 = result[2],
+        .r3 = result[3],
     };
     // quant-kernel-codegen:end CPU Q8K dot dotQ8KQ8KBlock8MR4Blocks
 }
@@ -30610,18 +30576,8 @@ inline fn q8KPanel8WeightScales(panel_block: []const u8) F32x8 {
 
 inline fn dotQ8KQ8KBlock8(q8_input: []const u8, panel_block: []const u8) [8]f32 {
     // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock8
-    std.debug.assert(q8_input.len == 292);
-    std.debug.assert(panel_block.len == prepared_q8_k_panel8_block_bytes);
-    const qx = q8_input[4..260];
-    const input_scale: F32x8 = @splat(readF32Le(q8_input[0..4]));
-    const weight_scales = q8KPanel8WeightScales(panel_block);
-    var acc: I32x8 = @splat(0);
-    inline for (0..8) |chunk| {
-        const off = chunk * 32;
-        const values_base = prepared_q8_k_panel8_values_offset + chunk * prepared_k_panel8_nr * 32;
-        acc += dotI8I8Block8ContiguousVec(qx[off..][0..32], panel_block[values_base..][0 .. prepared_k_panel8_nr * 32]);
-    }
-    return f32x8ToArray((input_scale * weight_scales) * @as(F32x8, @floatFromInt(acc)));
+    const result = q8KDotWide(1, 8, false, .{q8_input}, panel_block);
+    return result[0];
     // quant-kernel-codegen:end CPU Q8K dot dotQ8KQ8KBlock8
 }
 
@@ -30631,30 +30587,10 @@ inline fn dotQ8KQ8KBlock8MR2(
     panel_block: []const u8,
 ) Panel8MR2Sums {
     // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock8MR2
-    std.debug.assert(q8_input0.len == 292);
-    std.debug.assert(q8_input1.len == 292);
-    std.debug.assert(panel_block.len == prepared_q8_k_panel8_block_bytes);
-    const qx0 = q8_input0[4..260];
-    const qx1 = q8_input1[4..260];
-    const input_scale0: F32x8 = @splat(readF32Le(q8_input0[0..4]));
-    const input_scale1: F32x8 = @splat(readF32Le(q8_input1[0..4]));
-    const weight_scales = q8KPanel8WeightScales(panel_block);
-    var acc0: I32x8 = @splat(0);
-    var acc1: I32x8 = @splat(0);
-    inline for (0..8) |chunk| {
-        const off = chunk * 32;
-        const values_base = prepared_q8_k_panel8_values_offset + chunk * prepared_k_panel8_nr * 32;
-        const dots = dotI8I8Block8MR2RowsContiguousVec(
-            qx0[off..][0..32],
-            qx1[off..][0..32],
-            panel_block[values_base..][0 .. prepared_k_panel8_nr * 32],
-        );
-        acc0 += dots.r0;
-        acc1 += dots.r1;
-    }
+    const result = q8KDotWide(2, 8, false, .{ q8_input0, q8_input1 }, panel_block);
     return .{
-        .r0 = f32x8ToArray((input_scale0 * weight_scales) * @as(F32x8, @floatFromInt(acc0))),
-        .r1 = f32x8ToArray((input_scale1 * weight_scales) * @as(F32x8, @floatFromInt(acc1))),
+        .r0 = result[0],
+        .r1 = result[1],
     };
     // quant-kernel-codegen:end CPU Q8K dot dotQ8KQ8KBlock8MR2
 }
@@ -30667,44 +30603,12 @@ inline fn dotQ8KQ8KBlock8MR4(
     panel_block: []const u8,
 ) Panel8MR4Sums {
     // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock8MR4
-    std.debug.assert(q8_input0.len == 292);
-    std.debug.assert(q8_input1.len == 292);
-    std.debug.assert(q8_input2.len == 292);
-    std.debug.assert(q8_input3.len == 292);
-    std.debug.assert(panel_block.len == prepared_q8_k_panel8_block_bytes);
-    const qx0 = q8_input0[4..260];
-    const qx1 = q8_input1[4..260];
-    const qx2 = q8_input2[4..260];
-    const qx3 = q8_input3[4..260];
-    const input_scale0: F32x8 = @splat(readF32Le(q8_input0[0..4]));
-    const input_scale1: F32x8 = @splat(readF32Le(q8_input1[0..4]));
-    const input_scale2: F32x8 = @splat(readF32Le(q8_input2[0..4]));
-    const input_scale3: F32x8 = @splat(readF32Le(q8_input3[0..4]));
-    const weight_scales = q8KPanel8WeightScales(panel_block);
-    var acc0: I32x8 = @splat(0);
-    var acc1: I32x8 = @splat(0);
-    var acc2: I32x8 = @splat(0);
-    var acc3: I32x8 = @splat(0);
-    inline for (0..8) |chunk| {
-        const off = chunk * 32;
-        const values_base = prepared_q8_k_panel8_values_offset + chunk * prepared_k_panel8_nr * 32;
-        const dots = dotI8I8Block8MR4RowsContiguousVec(
-            qx0[off..][0..32],
-            qx1[off..][0..32],
-            qx2[off..][0..32],
-            qx3[off..][0..32],
-            panel_block[values_base..][0 .. prepared_k_panel8_nr * 32],
-        );
-        acc0 += dots.r0;
-        acc1 += dots.r1;
-        acc2 += dots.r2;
-        acc3 += dots.r3;
-    }
+    const result = q8KDotWide(4, 8, false, .{ q8_input0, q8_input1, q8_input2, q8_input3 }, panel_block);
     return .{
-        .r0 = f32x8ToArray((input_scale0 * weight_scales) * @as(F32x8, @floatFromInt(acc0))),
-        .r1 = f32x8ToArray((input_scale1 * weight_scales) * @as(F32x8, @floatFromInt(acc1))),
-        .r2 = f32x8ToArray((input_scale2 * weight_scales) * @as(F32x8, @floatFromInt(acc2))),
-        .r3 = f32x8ToArray((input_scale3 * weight_scales) * @as(F32x8, @floatFromInt(acc3))),
+        .r0 = result[0],
+        .r1 = result[1],
+        .r2 = result[2],
+        .r3 = result[3],
     };
     // quant-kernel-codegen:end CPU Q8K dot dotQ8KQ8KBlock8MR4
 }
@@ -30721,24 +30625,8 @@ inline fn q8KPanel16WeightScalesHi(panel_block: []const u8) F32x8 {
 
 inline fn dotQ8KQ8KBlock16(q8_input: []const u8, panel_block: []const u8) [16]f32 {
     // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock16
-    std.debug.assert(q8_input.len == 292);
-    std.debug.assert(panel_block.len == prepared_q8_k_panel16_block_bytes);
-    const qx = q8_input[4..260];
-    const input_scale: F32x8 = @splat(readF32Le(q8_input[0..4]));
-    const weight_scales_lo = q8KPanel16WeightScalesLo(panel_block);
-    const weight_scales_hi = q8KPanel16WeightScalesHi(panel_block);
-    var acc_lo: I32x8 = @splat(0);
-    var acc_hi: I32x8 = @splat(0);
-    inline for (0..8) |chunk| {
-        const off = chunk * 32;
-        const values_base = prepared_q8_k_panel16_values_offset + chunk * prepared_k_panel16_nr * 32;
-        acc_lo += dotI8I8Block8ContiguousVec(qx[off..][0..32], panel_block[values_base..][0 .. 8 * 32]);
-        acc_hi += dotI8I8Block8ContiguousVec(qx[off..][0..32], panel_block[values_base + 8 * 32 ..][0 .. 8 * 32]);
-    }
-    return panel16FromAcc(
-        (input_scale * weight_scales_lo) * @as(F32x8, @floatFromInt(acc_lo)),
-        (input_scale * weight_scales_hi) * @as(F32x8, @floatFromInt(acc_hi)),
-    );
+    const result = q8KDotWide(1, 16, false, .{q8_input}, panel_block);
+    return result[0];
     // quant-kernel-codegen:end CPU Q8K dot dotQ8KQ8KBlock16
 }
 
@@ -30748,43 +30636,11 @@ inline fn dotQ8KQ8KBlock16MR2(
     panel_block: []const u8,
 ) Panel16MR2Sums {
     // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock16MR2
-    std.debug.assert(q8_input0.len == 292);
-    std.debug.assert(q8_input1.len == 292);
-    std.debug.assert(panel_block.len == prepared_q8_k_panel16_block_bytes);
-    const qx0 = q8_input0[4..260];
-    const qx1 = q8_input1[4..260];
-    const input_scale0: F32x8 = @splat(readF32Le(q8_input0[0..4]));
-    const input_scale1: F32x8 = @splat(readF32Le(q8_input1[0..4]));
-    const weight_scales_lo = q8KPanel16WeightScalesLo(panel_block);
-    const weight_scales_hi = q8KPanel16WeightScalesHi(panel_block);
-    var acc0_lo: I32x8 = @splat(0);
-    var acc0_hi: I32x8 = @splat(0);
-    var acc1_lo: I32x8 = @splat(0);
-    var acc1_hi: I32x8 = @splat(0);
-    inline for (0..8) |chunk| {
-        const off = chunk * 32;
-        const values_base = prepared_q8_k_panel16_values_offset + chunk * prepared_k_panel16_nr * 32;
-        const dots_lo = dotI8I8Block8MR2RowsContiguousVec(
-            qx0[off..][0..32],
-            qx1[off..][0..32],
-            panel_block[values_base..][0 .. 8 * 32],
-        );
-        const dots_hi = dotI8I8Block8MR2RowsContiguousVec(
-            qx0[off..][0..32],
-            qx1[off..][0..32],
-            panel_block[values_base + 8 * 32 ..][0 .. 8 * 32],
-        );
-        acc0_lo += dots_lo.r0;
-        acc1_lo += dots_lo.r1;
-        acc0_hi += dots_hi.r0;
-        acc1_hi += dots_hi.r1;
-    }
-    return panel16MR2FromAcc(
-        (input_scale0 * weight_scales_lo) * @as(F32x8, @floatFromInt(acc0_lo)),
-        (input_scale0 * weight_scales_hi) * @as(F32x8, @floatFromInt(acc0_hi)),
-        (input_scale1 * weight_scales_lo) * @as(F32x8, @floatFromInt(acc1_lo)),
-        (input_scale1 * weight_scales_hi) * @as(F32x8, @floatFromInt(acc1_hi)),
-    );
+    const result = q8KDotWide(2, 16, false, .{ q8_input0, q8_input1 }, panel_block);
+    return .{
+        .r0 = result[0],
+        .r1 = result[1],
+    };
     // quant-kernel-codegen:end CPU Q8K dot dotQ8KQ8KBlock16MR2
 }
 
@@ -30796,65 +30652,13 @@ inline fn dotQ8KQ8KBlock16MR4(
     panel_block: []const u8,
 ) Panel16MR4Sums {
     // quant-kernel-codegen:begin CPU Q8K dot dotQ8KQ8KBlock16MR4
-    std.debug.assert(q8_input0.len == 292);
-    std.debug.assert(q8_input1.len == 292);
-    std.debug.assert(q8_input2.len == 292);
-    std.debug.assert(q8_input3.len == 292);
-    std.debug.assert(panel_block.len == prepared_q8_k_panel16_block_bytes);
-    const qx0 = q8_input0[4..260];
-    const qx1 = q8_input1[4..260];
-    const qx2 = q8_input2[4..260];
-    const qx3 = q8_input3[4..260];
-    const input_scale0: F32x8 = @splat(readF32Le(q8_input0[0..4]));
-    const input_scale1: F32x8 = @splat(readF32Le(q8_input1[0..4]));
-    const input_scale2: F32x8 = @splat(readF32Le(q8_input2[0..4]));
-    const input_scale3: F32x8 = @splat(readF32Le(q8_input3[0..4]));
-    const weight_scales_lo = q8KPanel16WeightScalesLo(panel_block);
-    const weight_scales_hi = q8KPanel16WeightScalesHi(panel_block);
-    var acc0_lo: I32x8 = @splat(0);
-    var acc0_hi: I32x8 = @splat(0);
-    var acc1_lo: I32x8 = @splat(0);
-    var acc1_hi: I32x8 = @splat(0);
-    var acc2_lo: I32x8 = @splat(0);
-    var acc2_hi: I32x8 = @splat(0);
-    var acc3_lo: I32x8 = @splat(0);
-    var acc3_hi: I32x8 = @splat(0);
-    inline for (0..8) |chunk| {
-        const off = chunk * 32;
-        const values_base = prepared_q8_k_panel16_values_offset + chunk * prepared_k_panel16_nr * 32;
-        const dots_lo = dotI8I8Block8MR4RowsContiguousVec(
-            qx0[off..][0..32],
-            qx1[off..][0..32],
-            qx2[off..][0..32],
-            qx3[off..][0..32],
-            panel_block[values_base..][0 .. 8 * 32],
-        );
-        const dots_hi = dotI8I8Block8MR4RowsContiguousVec(
-            qx0[off..][0..32],
-            qx1[off..][0..32],
-            qx2[off..][0..32],
-            qx3[off..][0..32],
-            panel_block[values_base + 8 * 32 ..][0 .. 8 * 32],
-        );
-        acc0_lo += dots_lo.r0;
-        acc1_lo += dots_lo.r1;
-        acc2_lo += dots_lo.r2;
-        acc3_lo += dots_lo.r3;
-        acc0_hi += dots_hi.r0;
-        acc1_hi += dots_hi.r1;
-        acc2_hi += dots_hi.r2;
-        acc3_hi += dots_hi.r3;
-    }
-    return panel16MR4FromAcc(
-        (input_scale0 * weight_scales_lo) * @as(F32x8, @floatFromInt(acc0_lo)),
-        (input_scale0 * weight_scales_hi) * @as(F32x8, @floatFromInt(acc0_hi)),
-        (input_scale1 * weight_scales_lo) * @as(F32x8, @floatFromInt(acc1_lo)),
-        (input_scale1 * weight_scales_hi) * @as(F32x8, @floatFromInt(acc1_hi)),
-        (input_scale2 * weight_scales_lo) * @as(F32x8, @floatFromInt(acc2_lo)),
-        (input_scale2 * weight_scales_hi) * @as(F32x8, @floatFromInt(acc2_hi)),
-        (input_scale3 * weight_scales_lo) * @as(F32x8, @floatFromInt(acc3_lo)),
-        (input_scale3 * weight_scales_hi) * @as(F32x8, @floatFromInt(acc3_hi)),
-    );
+    const result = q8KDotWide(4, 16, false, .{ q8_input0, q8_input1, q8_input2, q8_input3 }, panel_block);
+    return .{
+        .r0 = result[0],
+        .r1 = result[1],
+        .r2 = result[2],
+        .r3 = result[3],
+    };
     // quant-kernel-codegen:end CPU Q8K dot dotQ8KQ8KBlock16MR4
 }
 
@@ -52237,4 +52041,87 @@ test "projection context arity retains original physical size and alignment" {
     };
     try std.testing.expectEqual(@sizeOf(OldLegacyPreparedActivationTripleWorkerCtx), @sizeOf(LegacyPreparedActivationProjectedWorkerCtx(3)));
     try std.testing.expectEqual(@alignOf(OldLegacyPreparedActivationTripleWorkerCtx), @alignOf(LegacyPreparedActivationProjectedWorkerCtx(3)));
+}
+
+test "Q8K wide native specialization independent oracle and benchmark" {
+    @setEvalBranchQuota(200_000);
+    const State = struct {
+        inputs: [4][292]u8 align(64) = @splat(@splat(0)),
+        weights: [16][292]u8 align(64) = @splat(@splat(0)),
+        panel8: [prepared_q8_k_panel8_block_bytes]u8 align(64) = undefined,
+        panel16: [prepared_q8_k_panel16_block_bytes]u8 align(64) = undefined,
+
+        inline fn run(self: *@This(), comptime mr: usize, comptime layout: usize) [mr][if (layout == 16) 16 else 8]f32 {
+            if (comptime layout == 0) {
+                const w: [8][]const u8 = .{ &self.weights[0], &self.weights[1], &self.weights[2], &self.weights[3], &self.weights[4], &self.weights[5], &self.weights[6], &self.weights[7] };
+                if (comptime mr == 1) return .{dotQ8KQ8KBlock8Blocks(&self.inputs[0], w)};
+                if (comptime mr == 2) {
+                    const v = dotQ8KQ8KBlock8MR2Blocks(&self.inputs[0], &self.inputs[1], w);
+                    return .{ v.r0, v.r1 };
+                }
+                const v = dotQ8KQ8KBlock8MR4Blocks(&self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], w);
+                return .{ v.r0, v.r1, v.r2, v.r3 };
+            }
+            if (comptime layout == 8) {
+                if (comptime mr == 1) return .{dotQ8KQ8KBlock8(&self.inputs[0], &self.panel8)};
+                if (comptime mr == 2) {
+                    const v = dotQ8KQ8KBlock8MR2(&self.inputs[0], &self.inputs[1], &self.panel8);
+                    return .{ v.r0, v.r1 };
+                }
+                const v = dotQ8KQ8KBlock8MR4(&self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], &self.panel8);
+                return .{ v.r0, v.r1, v.r2, v.r3 };
+            }
+            if (comptime mr == 1) return .{dotQ8KQ8KBlock16(&self.inputs[0], &self.panel16)};
+            if (comptime mr == 2) {
+                const v = dotQ8KQ8KBlock16MR2(&self.inputs[0], &self.inputs[1], &self.panel16);
+                return .{ v.r0, v.r1 };
+            }
+            const v = dotQ8KQ8KBlock16MR4(&self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], &self.panel16);
+            return .{ v.r0, v.r1, v.r2, v.r3 };
+        }
+
+        noinline fn measure(self: *@This(), comptime mr: usize, comptime layout: usize) u64 {
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..2001) |_| {
+                self.inputs[0][4] +%= 1;
+                std.mem.doNotOptimizeAway(self.run(mr, layout));
+            }
+            return @intCast(@divTrunc(std.Io.Clock.awake.now(std.testing.io).nanoseconds - start, 2001));
+        }
+    };
+    var state: State = .{};
+    for (&state.inputs, 0..) |*input, row| {
+        const scale: f32 = @as(f32, @floatFromInt(row + 1)) * (if (row % 2 == 0) @as(f32, 0.125) else -0.125);
+        std.mem.writeInt(u32, input[0..4], @bitCast(scale), .little);
+        for (0..256) |i| input[4 + i] = @bitCast(@as(i8, @intCast(@as(i32, @intCast((i * 13 + row * 7) % 255)) - 127)));
+    }
+    for (&state.weights, 0..) |*weight, col| {
+        const scale: f32 = @as(f32, @floatFromInt(col + 1)) * 0.0625;
+        std.mem.writeInt(u32, weight[0..4], @bitCast(scale), .little);
+        for (0..256) |i| weight[4 + i] = @bitCast(@as(i8, @intCast(@as(i32, @intCast((i * 11 + col * 3) % 255)) - 127)));
+        if (col < 8) {
+            @memcpy(state.panel8[prepared_q8_k_panel8_dsc_offset + col * 4 ..][0..4], weight[0..4]);
+            for (0..8) |chunk| @memcpy(state.panel8[prepared_q8_k_panel8_values_offset + (chunk * 8 + col) * 32 ..][0..32], weight[4 + chunk * 32 ..][0..32]);
+        }
+        @memcpy(state.panel16[prepared_q8_k_panel16_dsc_offset + col * 4 ..][0..4], weight[0..4]);
+        for (0..8) |chunk| @memcpy(state.panel16[prepared_q8_k_panel16_values_offset + (chunk * 16 + col) * 32 ..][0..32], weight[4 + chunk * 32 ..][0..32]);
+    }
+    inline for (.{ 1, 2, 4 }) |mr| inline for (.{ 0, 8, 16 }) |layout| {
+        const output = state.run(mr, layout);
+        for (output, 0..) |row, r| for (row, 0..) |got, c| {
+            var dot: f64 = 0;
+            for (0..256) |i| dot += @as(f64, @floatFromInt(@as(i8, @bitCast(state.inputs[r][4 + i])))) * @as(f64, @floatFromInt(@as(i8, @bitCast(state.weights[c][4 + i]))));
+            const expected: f32 = @floatCast((@as(f64, readF32Le(state.inputs[r][0..4])) * @as(f64, readF32Le(state.weights[c][0..4]))) * dot);
+            try std.testing.expectEqual(expected, got);
+        };
+    };
+    if (platform.env.getenvBool("ANTFLY_Q8_WIDE_BENCH")) {
+        inline for (.{ 1, 2, 4 }) |mr| inline for (.{ 0, 8, 16 }) |layout| {
+            for (0..10) |_| _ = state.measure(mr, layout);
+            var times: [21]u64 = undefined;
+            for (&times) |*sample| sample.* = state.measure(mr, layout);
+            std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+            std.debug.print("q8_wide mr={d} layout={d} p50_ns={d} p95_ns={d}\n", .{ mr, layout, times[10], times[19] });
+        };
+    }
 }

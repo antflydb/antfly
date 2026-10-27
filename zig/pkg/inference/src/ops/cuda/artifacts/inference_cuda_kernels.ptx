@@ -74,64 +74,6 @@
 // _ZZ38termite_gqa_attention_prefill_fast_f32E12shared_denom has been demoted
 // _ZZ38termite_gqa_attention_prefill_fast_f32E12shared_alpha has been demoted
 // _ZZ38termite_gqa_attention_prefill_fast_f32E11shared_beta has been demoted
-.shared .align 4 .b8 _ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE9warp_sums[64];
-.shared .align 4 .f32 _ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score;
-.shared .align 4 .f32 _ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom;
-.shared .align 4 .f32 _ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha;
-.shared .align 4 .f32 _ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta;
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E9warp_sums has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E8head_max has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_denom has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_alpha has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E9head_beta has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E12merged_denom has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta has been demoted
-.shared .align 4 .b8 _ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE9warp_sums[64];
-.shared .align 4 .f32 _ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score;
-.shared .align 4 .f32 _ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom;
-.shared .align 4 .f32 _ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha;
-.shared .align 4 .f32 _ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta;
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E9warp_sums has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E8head_max has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_denom has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_alpha has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E9head_beta has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E12merged_denom has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha has been demoted
-// _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E9warp_sums has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E8head_max has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_denom has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_alpha has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E9head_beta has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E12merged_denom has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E11merge_alpha has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E10merge_beta has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E9warp_sums has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E8head_max has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_denom has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_alpha has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E9head_beta has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E12merged_denom has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E11merge_alpha has been demoted
-// _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E10merge_beta has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E9warp_sums has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E8head_max has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_denom has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_alpha has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E9head_beta has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E12merged_denom has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E9warp_sums has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E8head_max has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_denom has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_alpha has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E9head_beta has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E12merged_denom has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha has been demoted
-// _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta has been demoted
 // _ZZ65antfly_gqa_attention_decode_turboquant_score_prework_hd256_f32_v1E9warp_sums has been demoted
 // _ZZ72antfly_gqa_attention_decode_turboquant_score_prework_serial_hd256_f32_v1E16shared_max_score has been demoted
 // _ZZ72antfly_gqa_attention_decode_turboquant_score_prework_serial_hd256_f32_v1E12shared_denom has been demoted
@@ -428,6 +370,64 @@
 // _ZZ30termite_gqa_scalar_decode_implILb1EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjPKjE6reduce has been demoted
 // _ZZ30termite_gqa_scalar_decode_implILb1EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjPKjE16shared_max_score has been demoted
 // _ZZ30termite_gqa_scalar_decode_implILb1EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjPKjE12shared_denom has been demoted
+.shared .align 4 .b8 _ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums[64];
+.shared .align 4 .f32 _ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score;
+.shared .align 4 .f32 _ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom;
+.shared .align 4 .f32 _ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha;
+.shared .align 4 .f32 _ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta;
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta has been demoted
+// _ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom has been demoted
+// _ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha has been demoted
+// _ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta has been demoted
+.shared .align 4 .b8 _ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums[64];
+.shared .align 4 .f32 _ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score;
+.shared .align 4 .f32 _ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom;
+.shared .align 4 .f32 _ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha;
+.shared .align 4 .f32 _ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta;
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta has been demoted
+// _ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom has been demoted
+// _ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha has been demoted
+// _ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta has been demoted
+// _ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom has been demoted
+// _ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha has been demoted
+// _ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta has been demoted
+// _ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom has been demoted
+// _ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha has been demoted
+// _ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha has been demoted
+// _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta has been demoted
+// _ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom has been demoted
+// _ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha has been demoted
+// _ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha has been demoted
+// _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta has been demoted
+// _ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom has been demoted
+// _ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha has been demoted
+// _ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta has been demoted
 // _ZZN20antfly_splitk_common18splitk_online_bodyILj256ELj512ELj512EEEvPfPjPVfS4_S4_PKfPKhS8_PKjjjjjjjjjjjjjjjjjjjjSA_E9warp_sums has been demoted
 // _ZZN20antfly_splitk_common18splitk_online_bodyILj256ELj512ELj512EEEvPfPjPVfS4_S4_PKfPKhS8_PKjjjjjjjjjjjjjjjjjjjjSA_E11running_max has been demoted
 // _ZZN20antfly_splitk_common18splitk_online_bodyILj256ELj512ELj512EEEvPfPjPVfS4_S4_PKfPKhS8_PKjjjjjjjjjjjjjjjjjjjjSA_E13running_denom has been demoted
@@ -52593,9 +52593,9 @@ $L__BB155_10:
 	@%p29 bra 	$L__BB155_12;
 
 	mov.u32 	%r49, -8388609;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
 	mov.u32 	%r50, 0;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
 
 $L__BB155_12:
 	bar.sync 	0;
@@ -52614,7 +52614,7 @@ $L__BB155_12:
 	shr.u32 	%r55, %r54, 5;
 	shr.u32 	%r17, %r9, 5;
 	shl.b32 	%r56, %r17, 2;
-	mov.u32 	%r57, _ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE9warp_sums;
+	mov.u32 	%r57, _ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r18, %r57, %r56;
 	setp.eq.s32 	%p31, %r17, 0;
 	and.b32  	%r19, %r9, 31;
@@ -52717,7 +52717,7 @@ $L__BB155_22:
 	@%p29 bra 	$L__BB155_24;
 
 	mul.f32 	%f42, %f16, %f83;
-	ld.shared.f32 	%f43, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score];
+	ld.shared.f32 	%f43, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score];
 	max.f32 	%f44, %f43, %f42;
 	sub.f32 	%f45, %f43, %f44;
 	mov.f32 	%f46, 0f3F000000;
@@ -52738,7 +52738,7 @@ $L__BB155_22:
 	mov.b32 	%f59, %r96;
 	ex2.approx.ftz.f32 	%f60, %f58;
 	mul.f32 	%f61, %f60, %f59;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
 	sub.f32 	%f62, %f42, %f44;
 	fma.rn.f32 	%f63, %f62, %f47, %f46;
 	cvt.sat.f32.f32 	%f64, %f63;
@@ -52752,22 +52752,22 @@ $L__BB155_22:
 	mov.b32 	%f70, %r98;
 	ex2.approx.ftz.f32 	%f71, %f69;
 	mul.f32 	%f72, %f71, %f70;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
-	ld.shared.f32 	%f73, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
+	ld.shared.f32 	%f73, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	fma.rn.f32 	%f74, %f61, %f73, %f72;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
 
 $L__BB155_24:
 	bar.sync 	0;
 	@%p33 bra 	$L__BB155_26;
 
 	mad.lo.s32 	%r99, %r105, %r14, %r16;
-	ld.shared.f32 	%f75, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha];
+	ld.shared.f32 	%f75, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha];
 	mul.wide.u32 	%rd14, %r99, 4;
 	add.s64 	%rd15, %rd3, %rd14;
 	ld.global.f32 	%f76, [%rd15];
-	ld.shared.f32 	%f77, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta];
+	ld.shared.f32 	%f77, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta];
 	mul.f32 	%f78, %f77, %f76;
 	fma.rn.f32 	%f84, %f84, %f75, %f78;
 
@@ -52782,7 +52782,7 @@ $L__BB155_27:
 	@%p50 bra 	$L__BB155_31;
 
 	add.s32 	%r23, %r15, %r9;
-	ld.shared.f32 	%f13, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	ld.shared.f32 	%f13, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	setp.leu.f32 	%p51, %f13, 0f00000000;
 	mov.f32 	%f86, 0f00000000;
 	@%p51 bra 	$L__BB155_30;
@@ -52830,15 +52830,15 @@ $L__BB155_31:
 	.reg .b32 	%r<144>;
 	.reg .b64 	%rd<36>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E9warp_sums[32];
+	.shared .align 4 .b8 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums[32];
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E8head_max;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_denom;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_alpha;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E9head_beta;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta;
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1_param_1];
@@ -52962,11 +52962,11 @@ $L__BB156_13:
 	@%p32 bra 	$L__BB156_15;
 
 	mov.u32 	%r73, -8388609;
-	st.shared.u32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E8head_max], %r73;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %r73;
 	mov.u32 	%r74, 0;
-	st.shared.u32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_denom], %r74;
-	st.shared.u32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_alpha], %r74;
-	st.shared.u32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E9head_beta], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %r74;
 
 $L__BB156_15:
 	bar.sync 	0;
@@ -52977,7 +52977,7 @@ $L__BB156_15:
 $L__BB156_17:
 	mul.lo.s32 	%r20, %r9, %r137;
 	shl.b32 	%r75, %r19, 2;
-	mov.u32 	%r76, _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E9warp_sums;
+	mov.u32 	%r76, _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r21, %r76, %r75;
 	setp.lt.u32 	%p34, %r18, 8;
 	setp.eq.s32 	%p35, %r19, 0;
@@ -52991,11 +52991,11 @@ $L__BB156_17:
 	max.u32 	%r81, %r80, %r79;
 	not.b32 	%r82, %r15;
 	max.u32 	%r83, %r81, %r82;
-	add.s32 	%r84, %r135, -1;
-	sub.s32 	%r142, %r84, %r83;
-	add.s32 	%r85, %r136, %r83;
-	add.s32 	%r86, %r85, 1;
-	sub.s32 	%r141, %r86, %r135;
+	add.s32 	%r84, %r136, %r83;
+	add.s32 	%r85, %r84, 1;
+	sub.s32 	%r142, %r85, %r135;
+	add.s32 	%r86, %r135, -1;
+	sub.s32 	%r141, %r86, %r83;
 	mad.lo.s32 	%r87, %r78, %r137, -1;
 	sub.s32 	%r140, %r87, %r83;
 	min.u32 	%r143, %r15, %r16;
@@ -53008,10 +53008,10 @@ $L__BB156_17:
 	mov.f32 	%f103, %f29;
 
 $L__BB156_18:
-	setp.ge.u32 	%p36, %r141, %r46;
+	setp.ge.u32 	%p36, %r142, %r46;
 	setp.ne.s32 	%p37, %r46, 0;
 	and.pred  	%p38, %p37, %p36;
-	setp.lt.u32 	%p39, %r136, %r142;
+	setp.lt.u32 	%p39, %r136, %r141;
 	or.pred  	%p6, %p39, %p38;
 	add.s32 	%r89, %r143, %r20;
 	mad.lo.s32 	%r90, %r89, %r42, %r28;
@@ -53123,9 +53123,9 @@ $L__BB156_28:
 	add.f32 	%f99, %f99, %f53;
 
 $L__BB156_30:
-	ld.shared.f32 	%f15, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f15, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	max.f32 	%f16, %f15, %f99;
-	ld.shared.f32 	%f17, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f17, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	setp.leu.f32 	%p62, %f17, 0f00000000;
 	mov.f32 	%f101, 0f00000000;
 	mov.f32 	%f100, %f101;
@@ -53176,10 +53176,10 @@ $L__BB156_32:
 
 $L__BB156_34:
 	fma.rn.f32 	%f88, %f100, %f17, %f101;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_denom], %f88;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E8head_max], %f16;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_alpha], %f100;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E9head_beta], %f101;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %f88;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %f16;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %f100;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %f101;
 
 $L__BB156_35:
 	bar.sync 	0;
@@ -53192,12 +53192,12 @@ $L__BB156_35:
 	ld.global.f32 	%f102, [%rd24];
 
 $L__BB156_37:
-	ld.shared.f32 	%f90, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_alpha];
-	ld.shared.f32 	%f91, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E9head_beta];
+	ld.shared.f32 	%f90, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha];
+	ld.shared.f32 	%f91, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta];
 	mul.f32 	%f92, %f102, %f91;
 	fma.rn.f32 	%f103, %f103, %f90, %f92;
-	add.s32 	%r142, %r142, 1;
-	add.s32 	%r141, %r141, -1;
+	add.s32 	%r142, %r142, -1;
+	add.s32 	%r141, %r141, 1;
 	add.s32 	%r140, %r140, 1;
 	add.s32 	%r143, %r143, 1;
 	setp.lt.u32 	%p63, %r143, %r16;
@@ -53221,12 +53221,12 @@ $L__BB156_38:
 	st.global.f32 	[%rd30], %f103;
 	@%p32 bra 	$L__BB156_40;
 
-	ld.shared.f32 	%f93, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f93, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	cvta.to.global.u64 	%rd31, %rd6;
 	shl.b64 	%rd32, %rd4, 2;
 	add.s64 	%rd33, %rd31, %rd32;
 	st.global.f32 	[%rd33], %f93;
-	ld.shared.f32 	%f94, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f94, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	cvta.to.global.u64 	%rd34, %rd7;
 	add.s64 	%rd35, %rd34, %rd32;
 	st.global.f32 	[%rd35], %f94;
@@ -53254,11 +53254,11 @@ $L__BB156_40:
 	.reg .b32 	%r<44>;
 	.reg .b64 	%rd<24>;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E12merged_denom;
+	.shared .align 4 .f32 _ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha[32];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha[32];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta[32];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta[32];
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1_param_1];
@@ -53342,8 +53342,8 @@ $L__BB157_6:
 	mov.f32 	%f404, 0f00000000;
 
 $L__BB157_8:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha], %f404;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta], %f405;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha], %f404;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta], %f405;
 	ld.global.f32 	%f9, [%rd1+4];
 	setp.leu.f32 	%p13, %f9, 0f00000000;
 	@%p13 bra 	$L__BB157_12;
@@ -53399,8 +53399,8 @@ $L__BB157_11:
 	mov.f32 	%f411, %f11;
 
 $L__BB157_12:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+4], %f409;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+4], %f410;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4], %f409;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4], %f410;
 	ld.global.f32 	%f20, [%rd1+8];
 	setp.leu.f32 	%p15, %f20, 0f00000000;
 	mov.f32 	%f420, 0f00000000;
@@ -53460,8 +53460,8 @@ $L__BB157_15:
 	mov.f32 	%f411, %f22;
 
 $L__BB157_16:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+8], %f414;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+8], %f415;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+8], %f414;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+8], %f415;
 	ld.global.f32 	%f31, [%rd1+12];
 	setp.leu.f32 	%p17, %f31, 0f00000000;
 	@%p17 bra 	$L__BB157_20;
@@ -53517,8 +53517,8 @@ $L__BB157_19:
 	mov.f32 	%f411, %f33;
 
 $L__BB157_20:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+12], %f419;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+12], %f420;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+12], %f419;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+12], %f420;
 	ld.global.f32 	%f42, [%rd1+16];
 	setp.leu.f32 	%p19, %f42, 0f00000000;
 	mov.f32 	%f430, 0f00000000;
@@ -53578,8 +53578,8 @@ $L__BB157_23:
 	mov.f32 	%f411, %f44;
 
 $L__BB157_24:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+16], %f424;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+16], %f425;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+16], %f424;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+16], %f425;
 	ld.global.f32 	%f53, [%rd1+20];
 	setp.leu.f32 	%p21, %f53, 0f00000000;
 	@%p21 bra 	$L__BB157_28;
@@ -53635,8 +53635,8 @@ $L__BB157_27:
 	mov.f32 	%f411, %f55;
 
 $L__BB157_28:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+20], %f429;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+20], %f430;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+20], %f429;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+20], %f430;
 	ld.global.f32 	%f64, [%rd1+24];
 	setp.leu.f32 	%p23, %f64, 0f00000000;
 	mov.f32 	%f440, 0f00000000;
@@ -53696,8 +53696,8 @@ $L__BB157_31:
 	mov.f32 	%f411, %f66;
 
 $L__BB157_32:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+24], %f434;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+24], %f435;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+24], %f434;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+24], %f435;
 	ld.global.f32 	%f75, [%rd1+28];
 	setp.leu.f32 	%p25, %f75, 0f00000000;
 	@%p25 bra 	$L__BB157_36;
@@ -53752,14 +53752,14 @@ $L__BB157_35:
 	fma.rn.f32 	%f412, %f412, %f439, %f363;
 
 $L__BB157_36:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+28], %f439;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+28], %f440;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E12merged_denom], %f412;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+28], %f439;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+28], %f440;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom], %f412;
 
 $L__BB157_37:
 	shl.b32 	%r42, %r3, 3;
 	bar.sync 	0;
-	ld.shared.f32 	%f365, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha];
+	ld.shared.f32 	%f365, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha];
 	mov.f32 	%f442, 0f00000000;
 	mul.wide.u32 	%rd14, %r42, 256;
 	cvt.u64.u32 	%rd4, %r4;
@@ -53767,46 +53767,46 @@ $L__BB157_37:
 	cvta.to.global.u64 	%rd16, %rd6;
 	shl.b64 	%rd17, %rd15, 2;
 	add.s64 	%rd18, %rd16, %rd17;
-	ld.shared.f32 	%f366, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta];
+	ld.shared.f32 	%f366, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta];
 	ld.global.f32 	%f367, [%rd18];
 	mul.f32 	%f368, %f367, %f366;
 	fma.rn.f32 	%f369, %f365, 0f00000000, %f368;
-	ld.shared.f32 	%f370, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+4];
-	ld.shared.f32 	%f371, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+4];
+	ld.shared.f32 	%f370, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4];
+	ld.shared.f32 	%f371, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4];
 	ld.global.f32 	%f372, [%rd18+1024];
 	mul.f32 	%f373, %f372, %f371;
 	fma.rn.f32 	%f374, %f369, %f370, %f373;
-	ld.shared.f32 	%f375, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+8];
-	ld.shared.f32 	%f376, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+8];
+	ld.shared.f32 	%f375, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+8];
+	ld.shared.f32 	%f376, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+8];
 	ld.global.f32 	%f377, [%rd18+2048];
 	mul.f32 	%f378, %f377, %f376;
 	fma.rn.f32 	%f379, %f374, %f375, %f378;
-	ld.shared.f32 	%f380, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+12];
-	ld.shared.f32 	%f381, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+12];
+	ld.shared.f32 	%f380, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+12];
+	ld.shared.f32 	%f381, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+12];
 	ld.global.f32 	%f382, [%rd18+3072];
 	mul.f32 	%f383, %f382, %f381;
 	fma.rn.f32 	%f384, %f379, %f380, %f383;
-	ld.shared.f32 	%f385, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+16];
-	ld.shared.f32 	%f386, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+16];
+	ld.shared.f32 	%f385, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+16];
+	ld.shared.f32 	%f386, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+16];
 	ld.global.f32 	%f387, [%rd18+4096];
 	mul.f32 	%f388, %f387, %f386;
 	fma.rn.f32 	%f389, %f384, %f385, %f388;
-	ld.shared.f32 	%f390, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+20];
-	ld.shared.f32 	%f391, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+20];
+	ld.shared.f32 	%f390, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+20];
+	ld.shared.f32 	%f391, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+20];
 	ld.global.f32 	%f392, [%rd18+5120];
 	mul.f32 	%f393, %f392, %f391;
 	fma.rn.f32 	%f394, %f389, %f390, %f393;
-	ld.shared.f32 	%f395, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+24];
-	ld.shared.f32 	%f396, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+24];
+	ld.shared.f32 	%f395, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+24];
+	ld.shared.f32 	%f396, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+24];
 	ld.global.f32 	%f397, [%rd18+6144];
 	mul.f32 	%f398, %f397, %f396;
 	fma.rn.f32 	%f399, %f394, %f395, %f398;
-	ld.shared.f32 	%f400, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E11merge_alpha+28];
-	ld.shared.f32 	%f401, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E10merge_beta+28];
+	ld.shared.f32 	%f400, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+28];
+	ld.shared.f32 	%f401, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+28];
 	ld.global.f32 	%f402, [%rd18+7168];
 	mul.f32 	%f403, %f402, %f401;
 	fma.rn.f32 	%f85, %f399, %f400, %f403;
-	ld.shared.f32 	%f86, [_ZZ56antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1E12merged_denom];
+	ld.shared.f32 	%f86, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom];
 	setp.leu.f32 	%p27, %f86, 0f00000000;
 	@%p27 bra 	$L__BB157_39;
 
@@ -53947,9 +53947,9 @@ $L__BB158_10:
 	@%p29 bra 	$L__BB158_12;
 
 	mov.u32 	%r49, -8388609;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
 	mov.u32 	%r50, 0;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
 
 $L__BB158_12:
 	bar.sync 	0;
@@ -53968,7 +53968,7 @@ $L__BB158_12:
 	shr.u32 	%r55, %r54, 5;
 	shr.u32 	%r17, %r9, 5;
 	shl.b32 	%r56, %r17, 2;
-	mov.u32 	%r57, _ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE9warp_sums;
+	mov.u32 	%r57, _ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r18, %r57, %r56;
 	setp.eq.s32 	%p31, %r17, 0;
 	and.b32  	%r19, %r9, 31;
@@ -54071,7 +54071,7 @@ $L__BB158_22:
 	@%p29 bra 	$L__BB158_24;
 
 	mul.f32 	%f42, %f16, %f83;
-	ld.shared.f32 	%f43, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score];
+	ld.shared.f32 	%f43, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score];
 	max.f32 	%f44, %f43, %f42;
 	sub.f32 	%f45, %f43, %f44;
 	mov.f32 	%f46, 0f3F000000;
@@ -54092,7 +54092,7 @@ $L__BB158_22:
 	mov.b32 	%f59, %r96;
 	ex2.approx.ftz.f32 	%f60, %f58;
 	mul.f32 	%f61, %f60, %f59;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
 	sub.f32 	%f62, %f42, %f44;
 	fma.rn.f32 	%f63, %f62, %f47, %f46;
 	cvt.sat.f32.f32 	%f64, %f63;
@@ -54106,22 +54106,22 @@ $L__BB158_22:
 	mov.b32 	%f70, %r98;
 	ex2.approx.ftz.f32 	%f71, %f69;
 	mul.f32 	%f72, %f71, %f70;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
-	ld.shared.f32 	%f73, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
+	ld.shared.f32 	%f73, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	fma.rn.f32 	%f74, %f61, %f73, %f72;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
 
 $L__BB158_24:
 	bar.sync 	0;
 	@%p33 bra 	$L__BB158_26;
 
 	mad.lo.s32 	%r99, %r105, %r14, %r16;
-	ld.shared.f32 	%f75, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha];
+	ld.shared.f32 	%f75, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha];
 	mul.wide.u32 	%rd14, %r99, 4;
 	add.s64 	%rd15, %rd3, %rd14;
 	ld.global.f32 	%f76, [%rd15];
-	ld.shared.f32 	%f77, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta];
+	ld.shared.f32 	%f77, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta];
 	mul.f32 	%f78, %f77, %f76;
 	fma.rn.f32 	%f84, %f84, %f75, %f78;
 
@@ -54136,7 +54136,7 @@ $L__BB158_27:
 	@%p50 bra 	$L__BB158_31;
 
 	add.s32 	%r23, %r15, %r9;
-	ld.shared.f32 	%f13, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	ld.shared.f32 	%f13, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	setp.leu.f32 	%p51, %f13, 0f00000000;
 	mov.f32 	%f86, 0f00000000;
 	@%p51 bra 	$L__BB158_30;
@@ -54184,15 +54184,15 @@ $L__BB158_31:
 	.reg .b32 	%r<144>;
 	.reg .b64 	%rd<36>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E9warp_sums[64];
+	.shared .align 4 .b8 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums[64];
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E8head_max;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_denom;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_alpha;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E9head_beta;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta;
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1_param_1];
@@ -54316,11 +54316,11 @@ $L__BB159_13:
 	@%p32 bra 	$L__BB159_15;
 
 	mov.u32 	%r73, -8388609;
-	st.shared.u32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E8head_max], %r73;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %r73;
 	mov.u32 	%r74, 0;
-	st.shared.u32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_denom], %r74;
-	st.shared.u32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_alpha], %r74;
-	st.shared.u32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E9head_beta], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %r74;
 
 $L__BB159_15:
 	bar.sync 	0;
@@ -54331,7 +54331,7 @@ $L__BB159_15:
 $L__BB159_17:
 	mul.lo.s32 	%r20, %r9, %r137;
 	shl.b32 	%r75, %r19, 2;
-	mov.u32 	%r76, _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E9warp_sums;
+	mov.u32 	%r76, _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r21, %r76, %r75;
 	setp.lt.u32 	%p34, %r18, 16;
 	setp.eq.s32 	%p35, %r19, 0;
@@ -54345,11 +54345,11 @@ $L__BB159_17:
 	max.u32 	%r81, %r80, %r79;
 	not.b32 	%r82, %r15;
 	max.u32 	%r83, %r81, %r82;
-	add.s32 	%r84, %r135, -1;
-	sub.s32 	%r142, %r84, %r83;
-	add.s32 	%r85, %r136, %r83;
-	add.s32 	%r86, %r85, 1;
-	sub.s32 	%r141, %r86, %r135;
+	add.s32 	%r84, %r136, %r83;
+	add.s32 	%r85, %r84, 1;
+	sub.s32 	%r142, %r85, %r135;
+	add.s32 	%r86, %r135, -1;
+	sub.s32 	%r141, %r86, %r83;
 	mad.lo.s32 	%r87, %r78, %r137, -1;
 	sub.s32 	%r140, %r87, %r83;
 	min.u32 	%r143, %r15, %r16;
@@ -54362,10 +54362,10 @@ $L__BB159_17:
 	mov.f32 	%f103, %f29;
 
 $L__BB159_18:
-	setp.ge.u32 	%p36, %r141, %r46;
+	setp.ge.u32 	%p36, %r142, %r46;
 	setp.ne.s32 	%p37, %r46, 0;
 	and.pred  	%p38, %p37, %p36;
-	setp.lt.u32 	%p39, %r136, %r142;
+	setp.lt.u32 	%p39, %r136, %r141;
 	or.pred  	%p6, %p39, %p38;
 	add.s32 	%r89, %r143, %r20;
 	mad.lo.s32 	%r90, %r89, %r42, %r28;
@@ -54477,9 +54477,9 @@ $L__BB159_28:
 	add.f32 	%f99, %f99, %f53;
 
 $L__BB159_30:
-	ld.shared.f32 	%f15, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f15, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	max.f32 	%f16, %f15, %f99;
-	ld.shared.f32 	%f17, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f17, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	setp.leu.f32 	%p62, %f17, 0f00000000;
 	mov.f32 	%f101, 0f00000000;
 	mov.f32 	%f100, %f101;
@@ -54530,10 +54530,10 @@ $L__BB159_32:
 
 $L__BB159_34:
 	fma.rn.f32 	%f88, %f100, %f17, %f101;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_denom], %f88;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E8head_max], %f16;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_alpha], %f100;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E9head_beta], %f101;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %f88;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %f16;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %f100;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %f101;
 
 $L__BB159_35:
 	bar.sync 	0;
@@ -54546,12 +54546,12 @@ $L__BB159_35:
 	ld.global.f32 	%f102, [%rd24];
 
 $L__BB159_37:
-	ld.shared.f32 	%f90, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_alpha];
-	ld.shared.f32 	%f91, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E9head_beta];
+	ld.shared.f32 	%f90, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha];
+	ld.shared.f32 	%f91, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta];
 	mul.f32 	%f92, %f102, %f91;
 	fma.rn.f32 	%f103, %f103, %f90, %f92;
-	add.s32 	%r142, %r142, 1;
-	add.s32 	%r141, %r141, -1;
+	add.s32 	%r142, %r142, -1;
+	add.s32 	%r141, %r141, 1;
 	add.s32 	%r140, %r140, 1;
 	add.s32 	%r143, %r143, 1;
 	setp.lt.u32 	%p63, %r143, %r16;
@@ -54575,12 +54575,12 @@ $L__BB159_38:
 	st.global.f32 	[%rd30], %f103;
 	@%p32 bra 	$L__BB159_40;
 
-	ld.shared.f32 	%f93, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f93, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	cvta.to.global.u64 	%rd31, %rd6;
 	shl.b64 	%rd32, %rd4, 2;
 	add.s64 	%rd33, %rd31, %rd32;
 	st.global.f32 	[%rd33], %f93;
-	ld.shared.f32 	%f94, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f94, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj8ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	cvta.to.global.u64 	%rd34, %rd7;
 	add.s64 	%rd35, %rd34, %rd32;
 	st.global.f32 	[%rd35], %f94;
@@ -54608,11 +54608,11 @@ $L__BB159_40:
 	.reg .b32 	%r<44>;
 	.reg .b64 	%rd<24>;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E12merged_denom;
+	.shared .align 4 .f32 _ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha[32];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha[32];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta[32];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta[32];
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1_param_1];
@@ -54696,8 +54696,8 @@ $L__BB160_6:
 	mov.f32 	%f404, 0f00000000;
 
 $L__BB160_8:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha], %f404;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta], %f405;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha], %f404;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta], %f405;
 	ld.global.f32 	%f9, [%rd1+4];
 	setp.leu.f32 	%p13, %f9, 0f00000000;
 	@%p13 bra 	$L__BB160_12;
@@ -54753,8 +54753,8 @@ $L__BB160_11:
 	mov.f32 	%f411, %f11;
 
 $L__BB160_12:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+4], %f409;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+4], %f410;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4], %f409;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4], %f410;
 	ld.global.f32 	%f20, [%rd1+8];
 	setp.leu.f32 	%p15, %f20, 0f00000000;
 	mov.f32 	%f420, 0f00000000;
@@ -54814,8 +54814,8 @@ $L__BB160_15:
 	mov.f32 	%f411, %f22;
 
 $L__BB160_16:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+8], %f414;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+8], %f415;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+8], %f414;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+8], %f415;
 	ld.global.f32 	%f31, [%rd1+12];
 	setp.leu.f32 	%p17, %f31, 0f00000000;
 	@%p17 bra 	$L__BB160_20;
@@ -54871,8 +54871,8 @@ $L__BB160_19:
 	mov.f32 	%f411, %f33;
 
 $L__BB160_20:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+12], %f419;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+12], %f420;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+12], %f419;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+12], %f420;
 	ld.global.f32 	%f42, [%rd1+16];
 	setp.leu.f32 	%p19, %f42, 0f00000000;
 	mov.f32 	%f430, 0f00000000;
@@ -54932,8 +54932,8 @@ $L__BB160_23:
 	mov.f32 	%f411, %f44;
 
 $L__BB160_24:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+16], %f424;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+16], %f425;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+16], %f424;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+16], %f425;
 	ld.global.f32 	%f53, [%rd1+20];
 	setp.leu.f32 	%p21, %f53, 0f00000000;
 	@%p21 bra 	$L__BB160_28;
@@ -54989,8 +54989,8 @@ $L__BB160_27:
 	mov.f32 	%f411, %f55;
 
 $L__BB160_28:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+20], %f429;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+20], %f430;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+20], %f429;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+20], %f430;
 	ld.global.f32 	%f64, [%rd1+24];
 	setp.leu.f32 	%p23, %f64, 0f00000000;
 	mov.f32 	%f440, 0f00000000;
@@ -55050,8 +55050,8 @@ $L__BB160_31:
 	mov.f32 	%f411, %f66;
 
 $L__BB160_32:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+24], %f434;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+24], %f435;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+24], %f434;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+24], %f435;
 	ld.global.f32 	%f75, [%rd1+28];
 	setp.leu.f32 	%p25, %f75, 0f00000000;
 	@%p25 bra 	$L__BB160_36;
@@ -55106,14 +55106,14 @@ $L__BB160_35:
 	fma.rn.f32 	%f412, %f412, %f439, %f363;
 
 $L__BB160_36:
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+28], %f439;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+28], %f440;
-	st.shared.f32 	[_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E12merged_denom], %f412;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+28], %f439;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+28], %f440;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom], %f412;
 
 $L__BB160_37:
 	shl.b32 	%r42, %r3, 3;
 	bar.sync 	0;
-	ld.shared.f32 	%f365, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha];
+	ld.shared.f32 	%f365, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha];
 	mov.f32 	%f442, 0f00000000;
 	mul.wide.u32 	%rd14, %r42, 512;
 	cvt.u64.u32 	%rd4, %r4;
@@ -55121,46 +55121,46 @@ $L__BB160_37:
 	cvta.to.global.u64 	%rd16, %rd6;
 	shl.b64 	%rd17, %rd15, 2;
 	add.s64 	%rd18, %rd16, %rd17;
-	ld.shared.f32 	%f366, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta];
+	ld.shared.f32 	%f366, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta];
 	ld.global.f32 	%f367, [%rd18];
 	mul.f32 	%f368, %f367, %f366;
 	fma.rn.f32 	%f369, %f365, 0f00000000, %f368;
-	ld.shared.f32 	%f370, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+4];
-	ld.shared.f32 	%f371, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+4];
+	ld.shared.f32 	%f370, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4];
+	ld.shared.f32 	%f371, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4];
 	ld.global.f32 	%f372, [%rd18+2048];
 	mul.f32 	%f373, %f372, %f371;
 	fma.rn.f32 	%f374, %f369, %f370, %f373;
-	ld.shared.f32 	%f375, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+8];
-	ld.shared.f32 	%f376, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+8];
+	ld.shared.f32 	%f375, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+8];
+	ld.shared.f32 	%f376, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+8];
 	ld.global.f32 	%f377, [%rd18+4096];
 	mul.f32 	%f378, %f377, %f376;
 	fma.rn.f32 	%f379, %f374, %f375, %f378;
-	ld.shared.f32 	%f380, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+12];
-	ld.shared.f32 	%f381, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+12];
+	ld.shared.f32 	%f380, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+12];
+	ld.shared.f32 	%f381, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+12];
 	ld.global.f32 	%f382, [%rd18+6144];
 	mul.f32 	%f383, %f382, %f381;
 	fma.rn.f32 	%f384, %f379, %f380, %f383;
-	ld.shared.f32 	%f385, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+16];
-	ld.shared.f32 	%f386, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+16];
+	ld.shared.f32 	%f385, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+16];
+	ld.shared.f32 	%f386, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+16];
 	ld.global.f32 	%f387, [%rd18+8192];
 	mul.f32 	%f388, %f387, %f386;
 	fma.rn.f32 	%f389, %f384, %f385, %f388;
-	ld.shared.f32 	%f390, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+20];
-	ld.shared.f32 	%f391, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+20];
+	ld.shared.f32 	%f390, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+20];
+	ld.shared.f32 	%f391, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+20];
 	ld.global.f32 	%f392, [%rd18+10240];
 	mul.f32 	%f393, %f392, %f391;
 	fma.rn.f32 	%f394, %f389, %f390, %f393;
-	ld.shared.f32 	%f395, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+24];
-	ld.shared.f32 	%f396, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+24];
+	ld.shared.f32 	%f395, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+24];
+	ld.shared.f32 	%f396, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+24];
 	ld.global.f32 	%f397, [%rd18+12288];
 	mul.f32 	%f398, %f397, %f396;
 	fma.rn.f32 	%f399, %f394, %f395, %f398;
-	ld.shared.f32 	%f400, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E11merge_alpha+28];
-	ld.shared.f32 	%f401, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E10merge_beta+28];
+	ld.shared.f32 	%f400, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+28];
+	ld.shared.f32 	%f401, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+28];
 	ld.global.f32 	%f402, [%rd18+14336];
 	mul.f32 	%f403, %f402, %f401;
 	fma.rn.f32 	%f85, %f399, %f400, %f403;
-	ld.shared.f32 	%f86, [_ZZ56antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1E12merged_denom];
+	ld.shared.f32 	%f86, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj8ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom];
 	setp.leu.f32 	%p27, %f86, 0f00000000;
 	@%p27 bra 	$L__BB160_39;
 
@@ -55301,9 +55301,9 @@ $L__BB161_10:
 	@%p29 bra 	$L__BB161_12;
 
 	mov.u32 	%r49, -8388609;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
 	mov.u32 	%r50, 0;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
 
 $L__BB161_12:
 	bar.sync 	0;
@@ -55322,7 +55322,7 @@ $L__BB161_12:
 	shr.u32 	%r55, %r54, 5;
 	shr.u32 	%r17, %r9, 5;
 	shl.b32 	%r56, %r17, 2;
-	mov.u32 	%r57, _ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE9warp_sums;
+	mov.u32 	%r57, _ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r18, %r57, %r56;
 	setp.eq.s32 	%p31, %r17, 0;
 	and.b32  	%r19, %r9, 31;
@@ -55425,7 +55425,7 @@ $L__BB161_22:
 	@%p29 bra 	$L__BB161_24;
 
 	mul.f32 	%f42, %f16, %f83;
-	ld.shared.f32 	%f43, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score];
+	ld.shared.f32 	%f43, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score];
 	max.f32 	%f44, %f43, %f42;
 	sub.f32 	%f45, %f43, %f44;
 	mov.f32 	%f46, 0f3F000000;
@@ -55446,7 +55446,7 @@ $L__BB161_22:
 	mov.b32 	%f59, %r96;
 	ex2.approx.ftz.f32 	%f60, %f58;
 	mul.f32 	%f61, %f60, %f59;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
 	sub.f32 	%f62, %f42, %f44;
 	fma.rn.f32 	%f63, %f62, %f47, %f46;
 	cvt.sat.f32.f32 	%f64, %f63;
@@ -55460,22 +55460,22 @@ $L__BB161_22:
 	mov.b32 	%f70, %r98;
 	ex2.approx.ftz.f32 	%f71, %f69;
 	mul.f32 	%f72, %f71, %f70;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
-	ld.shared.f32 	%f73, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
+	ld.shared.f32 	%f73, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	fma.rn.f32 	%f74, %f61, %f73, %f72;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
 
 $L__BB161_24:
 	bar.sync 	0;
 	@%p33 bra 	$L__BB161_26;
 
 	mad.lo.s32 	%r99, %r105, %r14, %r16;
-	ld.shared.f32 	%f75, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha];
+	ld.shared.f32 	%f75, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha];
 	mul.wide.u32 	%rd14, %r99, 4;
 	add.s64 	%rd15, %rd3, %rd14;
 	ld.global.f32 	%f76, [%rd15];
-	ld.shared.f32 	%f77, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta];
+	ld.shared.f32 	%f77, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta];
 	mul.f32 	%f78, %f77, %f76;
 	fma.rn.f32 	%f84, %f84, %f75, %f78;
 
@@ -55490,7 +55490,7 @@ $L__BB161_27:
 	@%p50 bra 	$L__BB161_31;
 
 	add.s32 	%r23, %r15, %r9;
-	ld.shared.f32 	%f13, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	ld.shared.f32 	%f13, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	setp.leu.f32 	%p51, %f13, 0f00000000;
 	mov.f32 	%f86, 0f00000000;
 	@%p51 bra 	$L__BB161_30;
@@ -55538,15 +55538,15 @@ $L__BB161_31:
 	.reg .b32 	%r<144>;
 	.reg .b64 	%rd<36>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E9warp_sums[32];
+	.shared .align 4 .b8 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums[32];
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E8head_max;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_denom;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_alpha;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E9head_beta;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta;
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1_param_1];
@@ -55670,11 +55670,11 @@ $L__BB162_13:
 	@%p32 bra 	$L__BB162_15;
 
 	mov.u32 	%r73, -8388609;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E8head_max], %r73;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %r73;
 	mov.u32 	%r74, 0;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_denom], %r74;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_alpha], %r74;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E9head_beta], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %r74;
 
 $L__BB162_15:
 	bar.sync 	0;
@@ -55685,7 +55685,7 @@ $L__BB162_15:
 $L__BB162_17:
 	mul.lo.s32 	%r20, %r9, %r137;
 	shl.b32 	%r75, %r19, 2;
-	mov.u32 	%r76, _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E9warp_sums;
+	mov.u32 	%r76, _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r21, %r76, %r75;
 	setp.lt.u32 	%p34, %r18, 8;
 	setp.eq.s32 	%p35, %r19, 0;
@@ -55699,11 +55699,11 @@ $L__BB162_17:
 	max.u32 	%r81, %r80, %r79;
 	not.b32 	%r82, %r15;
 	max.u32 	%r83, %r81, %r82;
-	add.s32 	%r84, %r135, -1;
-	sub.s32 	%r142, %r84, %r83;
-	add.s32 	%r85, %r136, %r83;
-	add.s32 	%r86, %r85, 1;
-	sub.s32 	%r141, %r86, %r135;
+	add.s32 	%r84, %r136, %r83;
+	add.s32 	%r85, %r84, 1;
+	sub.s32 	%r142, %r85, %r135;
+	add.s32 	%r86, %r135, -1;
+	sub.s32 	%r141, %r86, %r83;
 	mad.lo.s32 	%r87, %r78, %r137, -1;
 	sub.s32 	%r140, %r87, %r83;
 	min.u32 	%r143, %r15, %r16;
@@ -55716,10 +55716,10 @@ $L__BB162_17:
 	mov.f32 	%f103, %f29;
 
 $L__BB162_18:
-	setp.ge.u32 	%p36, %r141, %r46;
+	setp.ge.u32 	%p36, %r142, %r46;
 	setp.ne.s32 	%p37, %r46, 0;
 	and.pred  	%p38, %p37, %p36;
-	setp.lt.u32 	%p39, %r136, %r142;
+	setp.lt.u32 	%p39, %r136, %r141;
 	or.pred  	%p6, %p39, %p38;
 	add.s32 	%r89, %r143, %r20;
 	mad.lo.s32 	%r90, %r89, %r42, %r28;
@@ -55831,9 +55831,9 @@ $L__BB162_28:
 	add.f32 	%f99, %f99, %f53;
 
 $L__BB162_30:
-	ld.shared.f32 	%f15, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f15, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	max.f32 	%f16, %f15, %f99;
-	ld.shared.f32 	%f17, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f17, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	setp.leu.f32 	%p62, %f17, 0f00000000;
 	mov.f32 	%f101, 0f00000000;
 	mov.f32 	%f100, %f101;
@@ -55884,10 +55884,10 @@ $L__BB162_32:
 
 $L__BB162_34:
 	fma.rn.f32 	%f88, %f100, %f17, %f101;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_denom], %f88;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E8head_max], %f16;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_alpha], %f100;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E9head_beta], %f101;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %f88;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %f16;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %f100;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %f101;
 
 $L__BB162_35:
 	bar.sync 	0;
@@ -55900,12 +55900,12 @@ $L__BB162_35:
 	ld.global.f32 	%f102, [%rd24];
 
 $L__BB162_37:
-	ld.shared.f32 	%f90, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_alpha];
-	ld.shared.f32 	%f91, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E9head_beta];
+	ld.shared.f32 	%f90, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha];
+	ld.shared.f32 	%f91, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta];
 	mul.f32 	%f92, %f102, %f91;
 	fma.rn.f32 	%f103, %f103, %f90, %f92;
-	add.s32 	%r142, %r142, 1;
-	add.s32 	%r141, %r141, -1;
+	add.s32 	%r142, %r142, -1;
+	add.s32 	%r141, %r141, 1;
 	add.s32 	%r140, %r140, 1;
 	add.s32 	%r143, %r143, 1;
 	setp.lt.u32 	%p63, %r143, %r16;
@@ -55929,12 +55929,12 @@ $L__BB162_38:
 	st.global.f32 	[%rd30], %f103;
 	@%p32 bra 	$L__BB162_40;
 
-	ld.shared.f32 	%f93, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f93, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	cvta.to.global.u64 	%rd31, %rd6;
 	shl.b64 	%rd32, %rd4, 2;
 	add.s64 	%rd33, %rd31, %rd32;
 	st.global.f32 	[%rd33], %f93;
-	ld.shared.f32 	%f94, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f94, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	cvta.to.global.u64 	%rd34, %rd7;
 	add.s64 	%rd35, %rd34, %rd32;
 	st.global.f32 	[%rd35], %f94;
@@ -55962,11 +55962,11 @@ $L__BB162_40:
 	.reg .b32 	%r<20>;
 	.reg .b64 	%rd<23>;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E12merged_denom;
+	.shared .align 4 .f32 _ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E11merge_alpha[8];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha[8];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E10merge_beta[8];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta[8];
 
 	ld.param.u64 	%rd4, [antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1_param_0];
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1_param_1];
@@ -56050,8 +56050,8 @@ $L__BB163_6:
 	mov.f32 	%f92, 0f00000000;
 
 $L__BB163_8:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E11merge_alpha], %f92;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E10merge_beta], %f93;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha], %f92;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta], %f93;
 	ld.global.f32 	%f9, [%rd1+4];
 	setp.leu.f32 	%p13, %f9, 0f00000000;
 	@%p13 bra 	$L__BB163_12;
@@ -56106,14 +56106,14 @@ $L__BB163_11:
 	fma.rn.f32 	%f99, %f99, %f97, %f81;
 
 $L__BB163_12:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E11merge_alpha+4], %f97;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E10merge_beta+4], %f98;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E12merged_denom], %f99;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4], %f97;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4], %f98;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom], %f99;
 
 $L__BB163_13:
 	shl.b32 	%r18, %r3, 1;
 	bar.sync 	0;
-	ld.shared.f32 	%f83, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E11merge_alpha];
+	ld.shared.f32 	%f83, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha];
 	mov.f32 	%f100, 0f00000000;
 	mul.wide.u32 	%rd13, %r18, 256;
 	cvt.u64.u32 	%rd3, %r4;
@@ -56121,16 +56121,16 @@ $L__BB163_13:
 	cvta.to.global.u64 	%rd15, %rd5;
 	shl.b64 	%rd16, %rd14, 2;
 	add.s64 	%rd17, %rd15, %rd16;
-	ld.shared.f32 	%f84, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E10merge_beta];
+	ld.shared.f32 	%f84, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta];
 	ld.global.f32 	%f85, [%rd17];
 	mul.f32 	%f86, %f85, %f84;
 	fma.rn.f32 	%f87, %f83, 0f00000000, %f86;
-	ld.shared.f32 	%f88, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E11merge_alpha+4];
-	ld.shared.f32 	%f89, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E10merge_beta+4];
+	ld.shared.f32 	%f88, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4];
+	ld.shared.f32 	%f89, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4];
 	ld.global.f32 	%f90, [%rd17+1024];
 	mul.f32 	%f91, %f90, %f89;
 	fma.rn.f32 	%f19, %f87, %f88, %f91;
-	ld.shared.f32 	%f20, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1E12merged_denom];
+	ld.shared.f32 	%f20, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom];
 	setp.leu.f32 	%p15, %f20, 0f00000000;
 	@%p15 bra 	$L__BB163_15;
 
@@ -56271,9 +56271,9 @@ $L__BB164_10:
 	@%p29 bra 	$L__BB164_12;
 
 	mov.u32 	%r49, -8388609;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
 	mov.u32 	%r50, 0;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
 
 $L__BB164_12:
 	bar.sync 	0;
@@ -56292,7 +56292,7 @@ $L__BB164_12:
 	shr.u32 	%r55, %r54, 5;
 	shr.u32 	%r17, %r9, 5;
 	shl.b32 	%r56, %r17, 2;
-	mov.u32 	%r57, _ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE9warp_sums;
+	mov.u32 	%r57, _ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r18, %r57, %r56;
 	setp.eq.s32 	%p31, %r17, 0;
 	and.b32  	%r19, %r9, 31;
@@ -56395,7 +56395,7 @@ $L__BB164_22:
 	@%p29 bra 	$L__BB164_24;
 
 	mul.f32 	%f42, %f16, %f83;
-	ld.shared.f32 	%f43, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score];
+	ld.shared.f32 	%f43, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score];
 	max.f32 	%f44, %f43, %f42;
 	sub.f32 	%f45, %f43, %f44;
 	mov.f32 	%f46, 0f3F000000;
@@ -56416,7 +56416,7 @@ $L__BB164_22:
 	mov.b32 	%f59, %r96;
 	ex2.approx.ftz.f32 	%f60, %f58;
 	mul.f32 	%f61, %f60, %f59;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
 	sub.f32 	%f62, %f42, %f44;
 	fma.rn.f32 	%f63, %f62, %f47, %f46;
 	cvt.sat.f32.f32 	%f64, %f63;
@@ -56430,22 +56430,22 @@ $L__BB164_22:
 	mov.b32 	%f70, %r98;
 	ex2.approx.ftz.f32 	%f71, %f69;
 	mul.f32 	%f72, %f71, %f70;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
-	ld.shared.f32 	%f73, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
+	ld.shared.f32 	%f73, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	fma.rn.f32 	%f74, %f61, %f73, %f72;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
 
 $L__BB164_24:
 	bar.sync 	0;
 	@%p33 bra 	$L__BB164_26;
 
 	mad.lo.s32 	%r99, %r105, %r14, %r16;
-	ld.shared.f32 	%f75, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha];
+	ld.shared.f32 	%f75, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha];
 	mul.wide.u32 	%rd14, %r99, 4;
 	add.s64 	%rd15, %rd3, %rd14;
 	ld.global.f32 	%f76, [%rd15];
-	ld.shared.f32 	%f77, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta];
+	ld.shared.f32 	%f77, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta];
 	mul.f32 	%f78, %f77, %f76;
 	fma.rn.f32 	%f84, %f84, %f75, %f78;
 
@@ -56460,7 +56460,7 @@ $L__BB164_27:
 	@%p50 bra 	$L__BB164_31;
 
 	add.s32 	%r23, %r15, %r9;
-	ld.shared.f32 	%f13, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	ld.shared.f32 	%f13, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	setp.leu.f32 	%p51, %f13, 0f00000000;
 	mov.f32 	%f86, 0f00000000;
 	@%p51 bra 	$L__BB164_30;
@@ -56508,15 +56508,15 @@ $L__BB164_31:
 	.reg .b32 	%r<144>;
 	.reg .b64 	%rd<36>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E9warp_sums[64];
+	.shared .align 4 .b8 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums[64];
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E8head_max;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_denom;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_alpha;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E9head_beta;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta;
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1_param_1];
@@ -56640,11 +56640,11 @@ $L__BB165_13:
 	@%p32 bra 	$L__BB165_15;
 
 	mov.u32 	%r73, -8388609;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E8head_max], %r73;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %r73;
 	mov.u32 	%r74, 0;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_denom], %r74;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_alpha], %r74;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E9head_beta], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %r74;
 
 $L__BB165_15:
 	bar.sync 	0;
@@ -56655,7 +56655,7 @@ $L__BB165_15:
 $L__BB165_17:
 	mul.lo.s32 	%r20, %r9, %r137;
 	shl.b32 	%r75, %r19, 2;
-	mov.u32 	%r76, _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E9warp_sums;
+	mov.u32 	%r76, _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r21, %r76, %r75;
 	setp.lt.u32 	%p34, %r18, 16;
 	setp.eq.s32 	%p35, %r19, 0;
@@ -56669,11 +56669,11 @@ $L__BB165_17:
 	max.u32 	%r81, %r80, %r79;
 	not.b32 	%r82, %r15;
 	max.u32 	%r83, %r81, %r82;
-	add.s32 	%r84, %r135, -1;
-	sub.s32 	%r142, %r84, %r83;
-	add.s32 	%r85, %r136, %r83;
-	add.s32 	%r86, %r85, 1;
-	sub.s32 	%r141, %r86, %r135;
+	add.s32 	%r84, %r136, %r83;
+	add.s32 	%r85, %r84, 1;
+	sub.s32 	%r142, %r85, %r135;
+	add.s32 	%r86, %r135, -1;
+	sub.s32 	%r141, %r86, %r83;
 	mad.lo.s32 	%r87, %r78, %r137, -1;
 	sub.s32 	%r140, %r87, %r83;
 	min.u32 	%r143, %r15, %r16;
@@ -56686,10 +56686,10 @@ $L__BB165_17:
 	mov.f32 	%f103, %f29;
 
 $L__BB165_18:
-	setp.ge.u32 	%p36, %r141, %r46;
+	setp.ge.u32 	%p36, %r142, %r46;
 	setp.ne.s32 	%p37, %r46, 0;
 	and.pred  	%p38, %p37, %p36;
-	setp.lt.u32 	%p39, %r136, %r142;
+	setp.lt.u32 	%p39, %r136, %r141;
 	or.pred  	%p6, %p39, %p38;
 	add.s32 	%r89, %r143, %r20;
 	mad.lo.s32 	%r90, %r89, %r42, %r28;
@@ -56801,9 +56801,9 @@ $L__BB165_28:
 	add.f32 	%f99, %f99, %f53;
 
 $L__BB165_30:
-	ld.shared.f32 	%f15, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f15, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	max.f32 	%f16, %f15, %f99;
-	ld.shared.f32 	%f17, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f17, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	setp.leu.f32 	%p62, %f17, 0f00000000;
 	mov.f32 	%f101, 0f00000000;
 	mov.f32 	%f100, %f101;
@@ -56854,10 +56854,10 @@ $L__BB165_32:
 
 $L__BB165_34:
 	fma.rn.f32 	%f88, %f100, %f17, %f101;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_denom], %f88;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E8head_max], %f16;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_alpha], %f100;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E9head_beta], %f101;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %f88;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %f16;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %f100;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %f101;
 
 $L__BB165_35:
 	bar.sync 	0;
@@ -56870,12 +56870,12 @@ $L__BB165_35:
 	ld.global.f32 	%f102, [%rd24];
 
 $L__BB165_37:
-	ld.shared.f32 	%f90, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_alpha];
-	ld.shared.f32 	%f91, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E9head_beta];
+	ld.shared.f32 	%f90, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha];
+	ld.shared.f32 	%f91, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta];
 	mul.f32 	%f92, %f102, %f91;
 	fma.rn.f32 	%f103, %f103, %f90, %f92;
-	add.s32 	%r142, %r142, 1;
-	add.s32 	%r141, %r141, -1;
+	add.s32 	%r142, %r142, -1;
+	add.s32 	%r141, %r141, 1;
 	add.s32 	%r140, %r140, 1;
 	add.s32 	%r143, %r143, 1;
 	setp.lt.u32 	%p63, %r143, %r16;
@@ -56899,12 +56899,12 @@ $L__BB165_38:
 	st.global.f32 	[%rd30], %f103;
 	@%p32 bra 	$L__BB165_40;
 
-	ld.shared.f32 	%f93, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f93, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	cvta.to.global.u64 	%rd31, %rd6;
 	shl.b64 	%rd32, %rd4, 2;
 	add.s64 	%rd33, %rd31, %rd32;
 	st.global.f32 	[%rd33], %f93;
-	ld.shared.f32 	%f94, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f94, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj2ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	cvta.to.global.u64 	%rd34, %rd7;
 	add.s64 	%rd35, %rd34, %rd32;
 	st.global.f32 	[%rd35], %f94;
@@ -56932,11 +56932,11 @@ $L__BB165_40:
 	.reg .b32 	%r<20>;
 	.reg .b64 	%rd<23>;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E12merged_denom;
+	.shared .align 4 .f32 _ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E11merge_alpha[8];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha[8];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E10merge_beta[8];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta[8];
 
 	ld.param.u64 	%rd4, [antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1_param_0];
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1_param_1];
@@ -57020,8 +57020,8 @@ $L__BB166_6:
 	mov.f32 	%f92, 0f00000000;
 
 $L__BB166_8:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E11merge_alpha], %f92;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E10merge_beta], %f93;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha], %f92;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta], %f93;
 	ld.global.f32 	%f9, [%rd1+4];
 	setp.leu.f32 	%p13, %f9, 0f00000000;
 	@%p13 bra 	$L__BB166_12;
@@ -57076,14 +57076,14 @@ $L__BB166_11:
 	fma.rn.f32 	%f99, %f99, %f97, %f81;
 
 $L__BB166_12:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E11merge_alpha+4], %f97;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E10merge_beta+4], %f98;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E12merged_denom], %f99;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4], %f97;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4], %f98;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom], %f99;
 
 $L__BB166_13:
 	shl.b32 	%r18, %r3, 1;
 	bar.sync 	0;
-	ld.shared.f32 	%f83, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E11merge_alpha];
+	ld.shared.f32 	%f83, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha];
 	mov.f32 	%f100, 0f00000000;
 	mul.wide.u32 	%rd13, %r18, 512;
 	cvt.u64.u32 	%rd3, %r4;
@@ -57091,16 +57091,16 @@ $L__BB166_13:
 	cvta.to.global.u64 	%rd15, %rd5;
 	shl.b64 	%rd16, %rd14, 2;
 	add.s64 	%rd17, %rd15, %rd16;
-	ld.shared.f32 	%f84, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E10merge_beta];
+	ld.shared.f32 	%f84, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta];
 	ld.global.f32 	%f85, [%rd17];
 	mul.f32 	%f86, %f85, %f84;
 	fma.rn.f32 	%f87, %f83, 0f00000000, %f86;
-	ld.shared.f32 	%f88, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E11merge_alpha+4];
-	ld.shared.f32 	%f89, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E10merge_beta+4];
+	ld.shared.f32 	%f88, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4];
+	ld.shared.f32 	%f89, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4];
 	ld.global.f32 	%f90, [%rd17+2048];
 	mul.f32 	%f91, %f90, %f89;
 	fma.rn.f32 	%f19, %f87, %f88, %f91;
-	ld.shared.f32 	%f20, [_ZZ57antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1E12merged_denom];
+	ld.shared.f32 	%f20, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj2ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom];
 	setp.leu.f32 	%p15, %f20, 0f00000000;
 	@%p15 bra 	$L__BB166_15;
 
@@ -57241,9 +57241,9 @@ $L__BB167_10:
 	@%p29 bra 	$L__BB167_12;
 
 	mov.u32 	%r49, -8388609;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
 	mov.u32 	%r50, 0;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
 
 $L__BB167_12:
 	bar.sync 	0;
@@ -57262,7 +57262,7 @@ $L__BB167_12:
 	shr.u32 	%r55, %r54, 5;
 	shr.u32 	%r17, %r9, 5;
 	shl.b32 	%r56, %r17, 2;
-	mov.u32 	%r57, _ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE9warp_sums;
+	mov.u32 	%r57, _ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r18, %r57, %r56;
 	setp.eq.s32 	%p31, %r17, 0;
 	and.b32  	%r19, %r9, 31;
@@ -57365,7 +57365,7 @@ $L__BB167_22:
 	@%p29 bra 	$L__BB167_24;
 
 	mul.f32 	%f42, %f16, %f83;
-	ld.shared.f32 	%f43, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score];
+	ld.shared.f32 	%f43, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score];
 	max.f32 	%f44, %f43, %f42;
 	sub.f32 	%f45, %f43, %f44;
 	mov.f32 	%f46, 0f3F000000;
@@ -57386,7 +57386,7 @@ $L__BB167_22:
 	mov.b32 	%f59, %r96;
 	ex2.approx.ftz.f32 	%f60, %f58;
 	mul.f32 	%f61, %f60, %f59;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
 	sub.f32 	%f62, %f42, %f44;
 	fma.rn.f32 	%f63, %f62, %f47, %f46;
 	cvt.sat.f32.f32 	%f64, %f63;
@@ -57400,22 +57400,22 @@ $L__BB167_22:
 	mov.b32 	%f70, %r98;
 	ex2.approx.ftz.f32 	%f71, %f69;
 	mul.f32 	%f72, %f71, %f70;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
-	ld.shared.f32 	%f73, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
+	ld.shared.f32 	%f73, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	fma.rn.f32 	%f74, %f61, %f73, %f72;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
 
 $L__BB167_24:
 	bar.sync 	0;
 	@%p33 bra 	$L__BB167_26;
 
 	mad.lo.s32 	%r99, %r105, %r14, %r16;
-	ld.shared.f32 	%f75, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha];
+	ld.shared.f32 	%f75, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha];
 	mul.wide.u32 	%rd14, %r99, 4;
 	add.s64 	%rd15, %rd3, %rd14;
 	ld.global.f32 	%f76, [%rd15];
-	ld.shared.f32 	%f77, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta];
+	ld.shared.f32 	%f77, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta];
 	mul.f32 	%f78, %f77, %f76;
 	fma.rn.f32 	%f84, %f84, %f75, %f78;
 
@@ -57430,7 +57430,7 @@ $L__BB167_27:
 	@%p50 bra 	$L__BB167_31;
 
 	add.s32 	%r23, %r15, %r9;
-	ld.shared.f32 	%f13, [_ZZ43antfly_serial_attention_hd256_t256_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	ld.shared.f32 	%f13, [_ZZ17antfly_gqa_serialILj256ELj256ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	setp.leu.f32 	%p51, %f13, 0f00000000;
 	mov.f32 	%f86, 0f00000000;
 	@%p51 bra 	$L__BB167_30;
@@ -57478,15 +57478,15 @@ $L__BB167_31:
 	.reg .b32 	%r<144>;
 	.reg .b64 	%rd<36>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E9warp_sums[32];
+	.shared .align 4 .b8 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums[32];
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E8head_max;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_denom;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_alpha;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E9head_beta;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta;
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1_param_1];
@@ -57610,11 +57610,11 @@ $L__BB168_13:
 	@%p32 bra 	$L__BB168_15;
 
 	mov.u32 	%r73, -8388609;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E8head_max], %r73;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %r73;
 	mov.u32 	%r74, 0;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_denom], %r74;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_alpha], %r74;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E9head_beta], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %r74;
 
 $L__BB168_15:
 	bar.sync 	0;
@@ -57625,7 +57625,7 @@ $L__BB168_15:
 $L__BB168_17:
 	mul.lo.s32 	%r20, %r9, %r137;
 	shl.b32 	%r75, %r19, 2;
-	mov.u32 	%r76, _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E9warp_sums;
+	mov.u32 	%r76, _ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r21, %r76, %r75;
 	setp.lt.u32 	%p34, %r18, 8;
 	setp.eq.s32 	%p35, %r19, 0;
@@ -57639,11 +57639,11 @@ $L__BB168_17:
 	max.u32 	%r81, %r80, %r79;
 	not.b32 	%r82, %r15;
 	max.u32 	%r83, %r81, %r82;
-	add.s32 	%r84, %r135, -1;
-	sub.s32 	%r142, %r84, %r83;
-	add.s32 	%r85, %r136, %r83;
-	add.s32 	%r86, %r85, 1;
-	sub.s32 	%r141, %r86, %r135;
+	add.s32 	%r84, %r136, %r83;
+	add.s32 	%r85, %r84, 1;
+	sub.s32 	%r142, %r85, %r135;
+	add.s32 	%r86, %r135, -1;
+	sub.s32 	%r141, %r86, %r83;
 	mad.lo.s32 	%r87, %r78, %r137, -1;
 	sub.s32 	%r140, %r87, %r83;
 	min.u32 	%r143, %r15, %r16;
@@ -57656,10 +57656,10 @@ $L__BB168_17:
 	mov.f32 	%f103, %f29;
 
 $L__BB168_18:
-	setp.ge.u32 	%p36, %r141, %r46;
+	setp.ge.u32 	%p36, %r142, %r46;
 	setp.ne.s32 	%p37, %r46, 0;
 	and.pred  	%p38, %p37, %p36;
-	setp.lt.u32 	%p39, %r136, %r142;
+	setp.lt.u32 	%p39, %r136, %r141;
 	or.pred  	%p6, %p39, %p38;
 	add.s32 	%r89, %r143, %r20;
 	mad.lo.s32 	%r90, %r89, %r42, %r28;
@@ -57771,9 +57771,9 @@ $L__BB168_28:
 	add.f32 	%f99, %f99, %f53;
 
 $L__BB168_30:
-	ld.shared.f32 	%f15, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f15, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	max.f32 	%f16, %f15, %f99;
-	ld.shared.f32 	%f17, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f17, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	setp.leu.f32 	%p62, %f17, 0f00000000;
 	mov.f32 	%f101, 0f00000000;
 	mov.f32 	%f100, %f101;
@@ -57824,10 +57824,10 @@ $L__BB168_32:
 
 $L__BB168_34:
 	fma.rn.f32 	%f88, %f100, %f17, %f101;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_denom], %f88;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E8head_max], %f16;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_alpha], %f100;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E9head_beta], %f101;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %f88;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %f16;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %f100;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %f101;
 
 $L__BB168_35:
 	bar.sync 	0;
@@ -57840,12 +57840,12 @@ $L__BB168_35:
 	ld.global.f32 	%f102, [%rd24];
 
 $L__BB168_37:
-	ld.shared.f32 	%f90, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_alpha];
-	ld.shared.f32 	%f91, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E9head_beta];
+	ld.shared.f32 	%f90, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha];
+	ld.shared.f32 	%f91, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta];
 	mul.f32 	%f92, %f102, %f91;
 	fma.rn.f32 	%f103, %f103, %f90, %f92;
-	add.s32 	%r142, %r142, 1;
-	add.s32 	%r141, %r141, -1;
+	add.s32 	%r142, %r142, -1;
+	add.s32 	%r141, %r141, 1;
 	add.s32 	%r140, %r140, 1;
 	add.s32 	%r143, %r143, 1;
 	setp.lt.u32 	%p63, %r143, %r16;
@@ -57869,12 +57869,12 @@ $L__BB168_38:
 	st.global.f32 	[%rd30], %f103;
 	@%p32 bra 	$L__BB168_40;
 
-	ld.shared.f32 	%f93, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f93, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	cvta.to.global.u64 	%rd31, %rd6;
 	shl.b64 	%rd32, %rd4, 2;
 	add.s64 	%rd33, %rd31, %rd32;
 	st.global.f32 	[%rd33], %f93;
-	ld.shared.f32 	%f94, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f94, [_ZZ22antfly_gqa_split_stageILj256ELj256ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	cvta.to.global.u64 	%rd34, %rd7;
 	add.s64 	%rd35, %rd34, %rd32;
 	st.global.f32 	[%rd35], %f94;
@@ -57902,11 +57902,11 @@ $L__BB168_40:
 	.reg .b32 	%r<28>;
 	.reg .b64 	%rd<24>;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E12merged_denom;
+	.shared .align 4 .f32 _ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha[16];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha[16];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta[16];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta[16];
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1_param_1];
@@ -57990,8 +57990,8 @@ $L__BB169_6:
 	mov.f32 	%f196, 0f00000000;
 
 $L__BB169_8:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha], %f196;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta], %f197;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha], %f196;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta], %f197;
 	ld.global.f32 	%f9, [%rd1+4];
 	setp.leu.f32 	%p13, %f9, 0f00000000;
 	@%p13 bra 	$L__BB169_12;
@@ -58047,8 +58047,8 @@ $L__BB169_11:
 	mov.f32 	%f203, %f11;
 
 $L__BB169_12:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha+4], %f201;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta+4], %f202;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4], %f201;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4], %f202;
 	ld.global.f32 	%f20, [%rd1+8];
 	setp.leu.f32 	%p15, %f20, 0f00000000;
 	mov.f32 	%f212, 0f00000000;
@@ -58108,8 +58108,8 @@ $L__BB169_15:
 	mov.f32 	%f203, %f22;
 
 $L__BB169_16:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha+8], %f206;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta+8], %f207;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+8], %f206;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+8], %f207;
 	ld.global.f32 	%f31, [%rd1+12];
 	setp.leu.f32 	%p17, %f31, 0f00000000;
 	@%p17 bra 	$L__BB169_20;
@@ -58164,14 +58164,14 @@ $L__BB169_19:
 	fma.rn.f32 	%f204, %f204, %f211, %f175;
 
 $L__BB169_20:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha+12], %f211;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta+12], %f212;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E12merged_denom], %f204;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+12], %f211;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+12], %f212;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom], %f204;
 
 $L__BB169_21:
 	shl.b32 	%r26, %r3, 2;
 	bar.sync 	0;
-	ld.shared.f32 	%f177, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha];
+	ld.shared.f32 	%f177, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha];
 	mov.f32 	%f214, 0f00000000;
 	mul.wide.u32 	%rd14, %r26, 256;
 	cvt.u64.u32 	%rd4, %r4;
@@ -58179,26 +58179,26 @@ $L__BB169_21:
 	cvta.to.global.u64 	%rd16, %rd6;
 	shl.b64 	%rd17, %rd15, 2;
 	add.s64 	%rd18, %rd16, %rd17;
-	ld.shared.f32 	%f178, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta];
+	ld.shared.f32 	%f178, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta];
 	ld.global.f32 	%f179, [%rd18];
 	mul.f32 	%f180, %f179, %f178;
 	fma.rn.f32 	%f181, %f177, 0f00000000, %f180;
-	ld.shared.f32 	%f182, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha+4];
-	ld.shared.f32 	%f183, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta+4];
+	ld.shared.f32 	%f182, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4];
+	ld.shared.f32 	%f183, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4];
 	ld.global.f32 	%f184, [%rd18+1024];
 	mul.f32 	%f185, %f184, %f183;
 	fma.rn.f32 	%f186, %f181, %f182, %f185;
-	ld.shared.f32 	%f187, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha+8];
-	ld.shared.f32 	%f188, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta+8];
+	ld.shared.f32 	%f187, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+8];
+	ld.shared.f32 	%f188, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+8];
 	ld.global.f32 	%f189, [%rd18+2048];
 	mul.f32 	%f190, %f189, %f188;
 	fma.rn.f32 	%f191, %f186, %f187, %f190;
-	ld.shared.f32 	%f192, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E11merge_alpha+12];
-	ld.shared.f32 	%f193, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E10merge_beta+12];
+	ld.shared.f32 	%f192, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+12];
+	ld.shared.f32 	%f193, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+12];
 	ld.global.f32 	%f194, [%rd18+3072];
 	mul.f32 	%f195, %f194, %f193;
 	fma.rn.f32 	%f41, %f191, %f192, %f195;
-	ld.shared.f32 	%f42, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1E12merged_denom];
+	ld.shared.f32 	%f42, [_ZZ23antfly_gqa_split_reduceILj256ELj256ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom];
 	setp.leu.f32 	%p19, %f42, 0f00000000;
 	@%p19 bra 	$L__BB169_23;
 
@@ -58339,9 +58339,9 @@ $L__BB170_10:
 	@%p29 bra 	$L__BB170_12;
 
 	mov.u32 	%r49, -8388609;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %r49;
 	mov.u32 	%r50, 0;
-	st.shared.u32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
+	st.shared.u32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %r50;
 
 $L__BB170_12:
 	bar.sync 	0;
@@ -58360,7 +58360,7 @@ $L__BB170_12:
 	shr.u32 	%r55, %r54, 5;
 	shr.u32 	%r17, %r9, 5;
 	shl.b32 	%r56, %r17, 2;
-	mov.u32 	%r57, _ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE9warp_sums;
+	mov.u32 	%r57, _ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r18, %r57, %r56;
 	setp.eq.s32 	%p31, %r17, 0;
 	and.b32  	%r19, %r9, 31;
@@ -58463,7 +58463,7 @@ $L__BB170_22:
 	@%p29 bra 	$L__BB170_24;
 
 	mul.f32 	%f42, %f16, %f83;
-	ld.shared.f32 	%f43, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score];
+	ld.shared.f32 	%f43, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score];
 	max.f32 	%f44, %f43, %f42;
 	sub.f32 	%f45, %f43, %f44;
 	mov.f32 	%f46, 0f3F000000;
@@ -58484,7 +58484,7 @@ $L__BB170_22:
 	mov.b32 	%f59, %r96;
 	ex2.approx.ftz.f32 	%f60, %f58;
 	mul.f32 	%f61, %f60, %f59;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha], %f61;
 	sub.f32 	%f62, %f42, %f44;
 	fma.rn.f32 	%f63, %f62, %f47, %f46;
 	cvt.sat.f32.f32 	%f64, %f63;
@@ -58498,22 +58498,22 @@ $L__BB170_22:
 	mov.b32 	%f70, %r98;
 	ex2.approx.ftz.f32 	%f71, %f69;
 	mul.f32 	%f72, %f71, %f70;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
-	ld.shared.f32 	%f73, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta], %f72;
+	ld.shared.f32 	%f73, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	fma.rn.f32 	%f74, %f61, %f73, %f72;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
-	st.shared.f32 	[_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom], %f74;
+	st.shared.f32 	[_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE16shared_max_score], %f44;
 
 $L__BB170_24:
 	bar.sync 	0;
 	@%p33 bra 	$L__BB170_26;
 
 	mad.lo.s32 	%r99, %r105, %r14, %r16;
-	ld.shared.f32 	%f75, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_alpha];
+	ld.shared.f32 	%f75, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_alpha];
 	mul.wide.u32 	%rd14, %r99, 4;
 	add.s64 	%rd15, %rd3, %rd14;
 	ld.global.f32 	%f76, [%rd15];
-	ld.shared.f32 	%f77, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE11shared_beta];
+	ld.shared.f32 	%f77, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE11shared_beta];
 	mul.f32 	%f78, %f77, %f76;
 	fma.rn.f32 	%f84, %f84, %f75, %f78;
 
@@ -58528,7 +58528,7 @@ $L__BB170_27:
 	@%p50 bra 	$L__BB170_31;
 
 	add.s32 	%r23, %r15, %r9;
-	ld.shared.f32 	%f13, [_ZZ43antfly_serial_attention_hd512_t512_g16_implPfPKfS1_S1_PKhS1_jjjjjjjjjjjjjPKjE12shared_denom];
+	ld.shared.f32 	%f13, [_ZZ17antfly_gqa_serialILj512ELj512ELj16ELj32EEvPfPKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE12shared_denom];
 	setp.leu.f32 	%p51, %f13, 0f00000000;
 	mov.f32 	%f86, 0f00000000;
 	@%p51 bra 	$L__BB170_30;
@@ -58576,15 +58576,15 @@ $L__BB170_31:
 	.reg .b32 	%r<144>;
 	.reg .b64 	%rd<36>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E9warp_sums[64];
+	.shared .align 4 .b8 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums[64];
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E8head_max;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_denom;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_alpha;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E9head_beta;
+	.shared .align 4 .f32 _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta;
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1_param_1];
@@ -58708,11 +58708,11 @@ $L__BB171_13:
 	@%p32 bra 	$L__BB171_15;
 
 	mov.u32 	%r73, -8388609;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E8head_max], %r73;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %r73;
 	mov.u32 	%r74, 0;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_denom], %r74;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_alpha], %r74;
-	st.shared.u32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E9head_beta], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %r74;
+	st.shared.u32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %r74;
 
 $L__BB171_15:
 	bar.sync 	0;
@@ -58723,7 +58723,7 @@ $L__BB171_15:
 $L__BB171_17:
 	mul.lo.s32 	%r20, %r9, %r137;
 	shl.b32 	%r75, %r19, 2;
-	mov.u32 	%r76, _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E9warp_sums;
+	mov.u32 	%r76, _ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9warp_sums;
 	add.s32 	%r21, %r76, %r75;
 	setp.lt.u32 	%p34, %r18, 16;
 	setp.eq.s32 	%p35, %r19, 0;
@@ -58737,11 +58737,11 @@ $L__BB171_17:
 	max.u32 	%r81, %r80, %r79;
 	not.b32 	%r82, %r15;
 	max.u32 	%r83, %r81, %r82;
-	add.s32 	%r84, %r135, -1;
-	sub.s32 	%r142, %r84, %r83;
-	add.s32 	%r85, %r136, %r83;
-	add.s32 	%r86, %r85, 1;
-	sub.s32 	%r141, %r86, %r135;
+	add.s32 	%r84, %r136, %r83;
+	add.s32 	%r85, %r84, 1;
+	sub.s32 	%r142, %r85, %r135;
+	add.s32 	%r86, %r135, -1;
+	sub.s32 	%r141, %r86, %r83;
 	mad.lo.s32 	%r87, %r78, %r137, -1;
 	sub.s32 	%r140, %r87, %r83;
 	min.u32 	%r143, %r15, %r16;
@@ -58754,10 +58754,10 @@ $L__BB171_17:
 	mov.f32 	%f103, %f29;
 
 $L__BB171_18:
-	setp.ge.u32 	%p36, %r141, %r46;
+	setp.ge.u32 	%p36, %r142, %r46;
 	setp.ne.s32 	%p37, %r46, 0;
 	and.pred  	%p38, %p37, %p36;
-	setp.lt.u32 	%p39, %r136, %r142;
+	setp.lt.u32 	%p39, %r136, %r141;
 	or.pred  	%p6, %p39, %p38;
 	add.s32 	%r89, %r143, %r20;
 	mad.lo.s32 	%r90, %r89, %r42, %r28;
@@ -58869,9 +58869,9 @@ $L__BB171_28:
 	add.f32 	%f99, %f99, %f53;
 
 $L__BB171_30:
-	ld.shared.f32 	%f15, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f15, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	max.f32 	%f16, %f15, %f99;
-	ld.shared.f32 	%f17, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f17, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	setp.leu.f32 	%p62, %f17, 0f00000000;
 	mov.f32 	%f101, 0f00000000;
 	mov.f32 	%f100, %f101;
@@ -58922,10 +58922,10 @@ $L__BB171_32:
 
 $L__BB171_34:
 	fma.rn.f32 	%f88, %f100, %f17, %f101;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_denom], %f88;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E8head_max], %f16;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_alpha], %f100;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E9head_beta], %f101;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom], %f88;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max], %f16;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha], %f100;
+	st.shared.f32 	[_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta], %f101;
 
 $L__BB171_35:
 	bar.sync 	0;
@@ -58938,12 +58938,12 @@ $L__BB171_35:
 	ld.global.f32 	%f102, [%rd24];
 
 $L__BB171_37:
-	ld.shared.f32 	%f90, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_alpha];
-	ld.shared.f32 	%f91, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E9head_beta];
+	ld.shared.f32 	%f90, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_alpha];
+	ld.shared.f32 	%f91, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE9head_beta];
 	mul.f32 	%f92, %f102, %f91;
 	fma.rn.f32 	%f103, %f103, %f90, %f92;
-	add.s32 	%r142, %r142, 1;
-	add.s32 	%r141, %r141, -1;
+	add.s32 	%r142, %r142, -1;
+	add.s32 	%r141, %r141, 1;
 	add.s32 	%r140, %r140, 1;
 	add.s32 	%r143, %r143, 1;
 	setp.lt.u32 	%p63, %r143, %r16;
@@ -58967,12 +58967,12 @@ $L__BB171_38:
 	st.global.f32 	[%rd30], %f103;
 	@%p32 bra 	$L__BB171_40;
 
-	ld.shared.f32 	%f93, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E8head_max];
+	ld.shared.f32 	%f93, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE8head_max];
 	cvta.to.global.u64 	%rd31, %rd6;
 	shl.b64 	%rd32, %rd4, 2;
 	add.s64 	%rd33, %rd31, %rd32;
 	st.global.f32 	[%rd33], %f93;
-	ld.shared.f32 	%f94, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1E10head_denom];
+	ld.shared.f32 	%f94, [_ZZ22antfly_gqa_split_stageILj512ELj512ELj16ELj4ELj32EEvPfS0_S0_PKfS2_S2_PKhS2_jjjjjjjjjjjjjPKjE10head_denom];
 	cvta.to.global.u64 	%rd34, %rd7;
 	add.s64 	%rd35, %rd34, %rd32;
 	st.global.f32 	[%rd35], %f94;
@@ -59000,11 +59000,11 @@ $L__BB171_40:
 	.reg .b32 	%r<28>;
 	.reg .b64 	%rd<24>;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E12merged_denom;
+	.shared .align 4 .f32 _ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha[16];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha[16];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta[16];
+	.shared .align 4 .b8 _ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta[16];
 
 	ld.param.u64 	%rd5, [antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1_param_1];
@@ -59088,8 +59088,8 @@ $L__BB172_6:
 	mov.f32 	%f196, 0f00000000;
 
 $L__BB172_8:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha], %f196;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta], %f197;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha], %f196;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta], %f197;
 	ld.global.f32 	%f9, [%rd1+4];
 	setp.leu.f32 	%p13, %f9, 0f00000000;
 	@%p13 bra 	$L__BB172_12;
@@ -59145,8 +59145,8 @@ $L__BB172_11:
 	mov.f32 	%f203, %f11;
 
 $L__BB172_12:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha+4], %f201;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta+4], %f202;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4], %f201;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4], %f202;
 	ld.global.f32 	%f20, [%rd1+8];
 	setp.leu.f32 	%p15, %f20, 0f00000000;
 	mov.f32 	%f212, 0f00000000;
@@ -59206,8 +59206,8 @@ $L__BB172_15:
 	mov.f32 	%f203, %f22;
 
 $L__BB172_16:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha+8], %f206;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta+8], %f207;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+8], %f206;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+8], %f207;
 	ld.global.f32 	%f31, [%rd1+12];
 	setp.leu.f32 	%p17, %f31, 0f00000000;
 	@%p17 bra 	$L__BB172_20;
@@ -59262,14 +59262,14 @@ $L__BB172_19:
 	fma.rn.f32 	%f204, %f204, %f211, %f175;
 
 $L__BB172_20:
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha+12], %f211;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta+12], %f212;
-	st.shared.f32 	[_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E12merged_denom], %f204;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+12], %f211;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+12], %f212;
+	st.shared.f32 	[_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom], %f204;
 
 $L__BB172_21:
 	shl.b32 	%r26, %r3, 2;
 	bar.sync 	0;
-	ld.shared.f32 	%f177, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha];
+	ld.shared.f32 	%f177, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha];
 	mov.f32 	%f214, 0f00000000;
 	mul.wide.u32 	%rd14, %r26, 512;
 	cvt.u64.u32 	%rd4, %r4;
@@ -59277,26 +59277,26 @@ $L__BB172_21:
 	cvta.to.global.u64 	%rd16, %rd6;
 	shl.b64 	%rd17, %rd15, 2;
 	add.s64 	%rd18, %rd16, %rd17;
-	ld.shared.f32 	%f178, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta];
+	ld.shared.f32 	%f178, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta];
 	ld.global.f32 	%f179, [%rd18];
 	mul.f32 	%f180, %f179, %f178;
 	fma.rn.f32 	%f181, %f177, 0f00000000, %f180;
-	ld.shared.f32 	%f182, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha+4];
-	ld.shared.f32 	%f183, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta+4];
+	ld.shared.f32 	%f182, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+4];
+	ld.shared.f32 	%f183, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+4];
 	ld.global.f32 	%f184, [%rd18+2048];
 	mul.f32 	%f185, %f184, %f183;
 	fma.rn.f32 	%f186, %f181, %f182, %f185;
-	ld.shared.f32 	%f187, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha+8];
-	ld.shared.f32 	%f188, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta+8];
+	ld.shared.f32 	%f187, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+8];
+	ld.shared.f32 	%f188, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+8];
 	ld.global.f32 	%f189, [%rd18+4096];
 	mul.f32 	%f190, %f189, %f188;
 	fma.rn.f32 	%f191, %f186, %f187, %f190;
-	ld.shared.f32 	%f192, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E11merge_alpha+12];
-	ld.shared.f32 	%f193, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E10merge_beta+12];
+	ld.shared.f32 	%f192, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE11merge_alpha+12];
+	ld.shared.f32 	%f193, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE10merge_beta+12];
 	ld.global.f32 	%f194, [%rd18+6144];
 	mul.f32 	%f195, %f194, %f193;
 	fma.rn.f32 	%f41, %f191, %f192, %f195;
-	ld.shared.f32 	%f42, [_ZZ57antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1E12merged_denom];
+	ld.shared.f32 	%f42, [_ZZ23antfly_gqa_split_reduceILj512ELj512ELj4ELj32EEvPfPKfS2_S2_jjjjjPKjE12merged_denom];
 	setp.leu.f32 	%p19, %f42, 0f00000000;
 	@%p19 bra 	$L__BB172_23;
 

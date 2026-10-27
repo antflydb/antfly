@@ -418,6 +418,11 @@ fn compiledSourceForArtifact(
         .microkernel, .attention => {
             const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
                 return error.MissingGeneratedQuantKernelSource;
+            if (artifact.backend == .cuda and artifact.opKind() == .attention) {
+                if (try cuda_renderer.compactAttentionSourceFile(allocator, source)) |compact| {
+                    return .{ .data = compact, .owned = true };
+                }
+            }
             return .{ .data = source, .owned = false };
         },
     }
@@ -789,7 +794,7 @@ test "quant kernel codegen sources map to compiler artifacts" {
     for (quant_kernel_compiler.first_generated_artifacts, sources[0..quant_kernel_compiler.first_generated_artifacts.len]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
-        if (artifact.backend == .cuda and artifact.opKind() == .small_batch_matmul) {
+        if (artifact.backend == .cuda and (artifact.opKind() == .small_batch_matmul or std.mem.indexOf(u8, source.data, "#include \"../../../graph/templates/") != null)) {
             try std.testing.expect(source.owned);
         } else {
             try std.testing.expect(!source.owned);
@@ -908,8 +913,8 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
         try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, kernel_decl));
         try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <metal_stdlib>"));
     }
-    // Attention sources follow the microkernels; each is self-contained for
-    // its backend and is emitted from the typed attention renderer plan.
+    // Attention sources follow the microkernels. CUDA template instantiations
+    // include their canonical owner; runtime/JIT source remains self-contained.
     for (quant_kernel_compiler.first_generated_attention_artifacts, sources[matmul_count + micro_count .. matmul_count + micro_count + attn_count]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
@@ -934,14 +939,18 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
                 // Self-contained: its own params struct + paging helper travel with it.
                 try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "struct antfly_paged_attention_1x_params {"));
             },
-            .cuda => if (artifact.cuda_flash_prefill_kernel != null or
-                artifact.cuda_splitk_online_decode_kernel != null)
-            {
-                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <cuda_fp16.h>"));
-                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "const unsigned* decode_scalars"));
-            } else {
-                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <math.h>"));
-                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "const unsigned int* decode_scalars"));
+            .cuda => {
+                const expanded = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedQuantKernelSource;
+                const compact = std.mem.indexOf(u8, source.data, "#include \"../../../graph/templates/cuda_gqa_") != null;
+                if (compact) {
+                    try std.testing.expect(source.owned);
+                    try std.testing.expect(source.data.len < expanded.len);
+                } else try std.testing.expectEqualStrings(expanded, source.data);
+                // Fingerprints and JIT use complete source, never a path-only
+                // wrapper whose include resolution depends on the working dir.
+                try std.testing.expect(std.mem.indexOf(u8, expanded, "../../../graph/templates/") == null);
+                const scalar_type = if (artifact.cuda_flash_prefill_kernel != null or artifact.cuda_splitk_online_decode_kernel != null) "const unsigned* decode_scalars" else "const unsigned int* decode_scalars";
+                try std.testing.expect(std.mem.containsAtLeast(u8, expanded, 1, scalar_type));
             },
         }
     }

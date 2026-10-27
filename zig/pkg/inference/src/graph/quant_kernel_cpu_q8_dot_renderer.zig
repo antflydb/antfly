@@ -183,96 +183,24 @@ fn fusedLoop(out: *Emitter, mr: usize) !void {
     try out.raw("}\n");
 }
 fn wideBody(out: *Emitter, layout: Layout, mr: usize) !void {
-    const wide = layout == .panel16;
-    const blocks = layout == .blocks8;
-    const halves: usize = if (wide) 2 else 1;
-    try asserts(out, mr, layout);
-    try queryViews(out, mr);
-    try inputScales(out, mr, true);
-    for (0..halves) |half| {
-        try out.add("const weight_scales{s} = ", .{halfSuffix(wide, half)});
-        if (blocks) try out.raw("q8KBlock8WeightScales(weights);\n") else if (wide) try out.add("q8KPanel16WeightScales{s}(panel_block);\n", .{if (half == 0) "Lo" else "Hi"}) else try out.raw("q8KPanel8WeightScales(panel_block);\n");
+    try out.add("const result = q8KDotWide({d}, {d}, {s}, .{{", .{ mr, @as(usize, if (layout == .panel16) 16 else 8), if (layout == .blocks8) "true" else "false" });
+    for (0..mr) |r| {
+        if (r != 0) try out.raw(", ");
+        try symbol(out, "q8_input", mr, r);
     }
-    for (0..mr) |r| for (0..halves) |half| {
-        try out.raw("var ");
-        try symbol(out, "acc", mr, r);
-        try out.add("{s}: I32x8 = @splat(0);\n", .{halfSuffix(wide, half)});
-    };
-    try out.raw("inline for (0..8) |chunk| {\nconst off = chunk * 32;\n");
-    if (!blocks) try out.add("const values_base = prepared_q8_k_panel{d}_values_offset + chunk * prepared_k_panel{d}_nr * 32;\n", .{ @as(usize, if (wide) 16 else 8), @as(usize, if (wide) 16 else 8) });
-    for (0..halves) |half| {
-        const vertical = mr != 1 or blocks;
-        if (mr == 1) {
-            try symbol(out, "acc", mr, 0);
-            try out.add("{s} += ", .{halfSuffix(wide, half)});
-        } else try out.add("const dots{s} = ", .{halfSuffix(wide, half)});
-        if (blocks and mr == 1) try out.raw("i32ArrayToVec8(");
-        try out.raw("dotI8I8Block8");
-        if (mr != 1) try out.add("MR{d}Rows", .{mr});
-        if (!blocks) try out.raw("Contiguous");
-        if (!(blocks and mr == 1)) try out.raw("Vec");
-        try out.raw(if (vertical) "(\n" else "(");
-        for (0..mr) |r| {
-            try symbol(out, "qx", mr, r);
-            try out.raw("[off..][0..32],");
-            try out.raw(if (vertical) "\n" else " ");
-        }
-        if (blocks) {
-            for (0..8) |c| try out.add("weights[{d}][4 + off ..][0..32],\n", .{c});
-        } else {
-            try out.raw("panel_block[values_base");
-            if (half != 0) try out.raw(" + 8 * 32 ");
-            try out.raw("..][0 .. ");
-            try out.raw(if (wide) "8 * 32]" else "prepared_k_panel8_nr * 32]");
-            if (vertical) try out.raw(",\n");
-        }
-        try out.raw(if (blocks and mr == 1) "));\n" else ");\n");
+    try out.raw(if (layout == .blocks8) "}, weights);\nreturn " else "}, panel_block);\nreturn ");
+    if (mr == 1) try out.raw("result[0]") else {
+        try out.raw(".{");
+        for (0..mr) |r| try out.add(".r{d} = result[{d}],", .{ r, r });
+        try out.raw("}");
     }
-    if (mr != 1) for (0..halves) |half| for (0..mr) |r| {
-        try symbol(out, "acc", mr, r);
-        try out.add("{s} += dots{s}.r{d};\n", .{ halfSuffix(wide, half), halfSuffix(wide, half), r });
-    };
-    try out.raw("}\nreturn ");
-    if (wide) {
-        try out.add("panel16{s}FromAcc(\n", .{switch (mr) {
-            1 => "",
-            2 => "MR2",
-            4 => "MR4",
-            else => unreachable,
-        }});
-        for (0..mr) |r| for (0..halves) |half| {
-            try scaledAccumulator(out, mr, r, true, half);
-            try out.raw(",\n");
-        };
-        try out.raw(");\n");
-    } else {
-        if (mr != 1) try out.raw(".{\n");
-        for (0..mr) |r| {
-            if (mr != 1) try out.add(".r{d} = ", .{r});
-            try out.raw("f32x8ToArray(");
-            try scaledAccumulator(out, mr, r, false, 0);
-            try out.raw(")");
-            if (mr != 1) try out.raw(",\n");
-        }
-        if (mr != 1) try out.raw("}");
-        try out.raw(";\n");
-    }
-}
-fn halfSuffix(wide: bool, half: usize) []const u8 {
-    return if (!wide) "" else if (half == 0) "_lo" else "_hi";
-}
-fn scaledAccumulator(out: *Emitter, mr: usize, r: usize, wide: bool, half: usize) !void {
-    try out.raw("(");
-    try symbol(out, "input_scale", mr, r);
-    try out.add(" * weight_scales{s}) * @as(F32x8, @floatFromInt(", .{halfSuffix(wide, half)});
-    try symbol(out, "acc", mr, r);
-    try out.add("{s}))", .{halfSuffix(wide, half)});
+    try out.raw(";\n");
 }
 
 test "Q8K dot policies preserve native widths and integer scale boundaries" {
     inline for (owners) |O| {
         const source = try O.render(std.testing.allocator);
         defer std.testing.allocator.free(source);
-        try std.testing.expect(std.mem.indexOf(u8, source, "[4..260]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "[4..260]") != null or std.mem.indexOf(u8, source, "q8KDotWide(") != null);
     }
 }

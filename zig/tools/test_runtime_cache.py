@@ -1708,6 +1708,14 @@ class RuntimeCacheTest(unittest.TestCase):
                     if backend == "metal"
                     else None
                 )
+                native_templates = [
+                    self.own("zig/pkg/inference/src/graph/templates/" + name)
+                    for name in (
+                        "cuda_gqa_flash_prefill_f16_sm89.cuh",
+                        "cuda_gqa_decode_splitk_online_sm89.cuh",
+                        "cuda_gqa_split_decode_f32.cuh",
+                    )
+                ] if backend == "cuda" else []
                 first = self.build(
                     "cache-identity", "runtime-unit-cli", backend=backend
                 )
@@ -1782,6 +1790,9 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/cuda/prototypes/lighton_activation.cu",
                     "src/ops/cuda/prototypes/lighton_vision.cu",
                     "src/ops/cuda/prototypes/florence_fused.cu",
+                    "src/graph/templates/cuda_gqa_flash_prefill_f16_sm89.cuh",
+                    "src/graph/templates/cuda_gqa_decode_splitk_online_sm89.cuh",
+                    "src/graph/templates/cuda_gqa_split_decode_f32.cuh",
                     "src/ops/cuda/launch_abi.zig",
                     "src/ops/cuda/driver.zig",
                     "src/graph/templates/cuda_q4_0_bf16_staged.cuh",
@@ -1862,6 +1873,18 @@ class RuntimeCacheTest(unittest.TestCase):
                     self.assertEqual(after_options[0], before_options[0])
                     self.assertNotEqual(after_options[1], before_options[1])
                     self.assertEqual(after_options[1], self.bundle_digest(qualifier))
+                    self.assert_compile(output, "cli", "cached")
+
+                for template in native_templates:
+                    before_template = self.probe(output, label).split()
+                    template.write_bytes(template.read_bytes() + b"\n// native owner edit\n")
+                    output = self.build(
+                        "cache-identity", "runtime-unit-cli", backend=backend
+                    )
+                    after_template = self.probe(output, label).split()
+                    self.assertEqual(after_template[0], before_template[0])
+                    self.assertNotEqual(after_template[1], before_template[1])
+                    self.assertEqual(after_template[1], self.bundle_digest(qualifier))
                     self.assert_compile(output, "cli", "cached")
 
     def bundle_digest(self, paths):

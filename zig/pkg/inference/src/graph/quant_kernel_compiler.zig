@@ -5168,11 +5168,10 @@ pub fn cudaSplitkOnlineDecodeArtifactRuntimeWired(artifact: GeneratedArtifact) b
 pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, cuda_renderer.attentionSplitCommonSource());
     var emitted: usize = 0;
     var flash_common_emitted = false;
     var splitk_common_emitted = false;
-    var serial_common_emitted: [first_generated_attention_artifacts.len]cuda_renderer.AttentionSerialIdentity = undefined;
-    var serial_common_count: usize = 0;
     for (first_generated_attention_artifacts) |artifact| {
         if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
         if (emitted != 0) try out.append(allocator, '\n');
@@ -5206,19 +5205,6 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
             const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse return error.MissingCudaAttentionRenderPlan;
             const plan_id = try cuda_renderer.attentionPlanId(plan, allocator);
             defer allocator.free(plan_id);
-            if (plan.lowering.reduction != .parallel_scores_then_serial) {
-                const identity = cuda_renderer.attentionSerialIdentity(plan);
-                const already_emitted = for (serial_common_emitted[0..serial_common_count]) |previous| {
-                    if (std.meta.eql(previous, identity)) break true;
-                } else false;
-                if (!already_emitted) {
-                    const common = try cuda_renderer.renderAttentionSerialCommonAlloc(allocator, plan);
-                    defer allocator.free(common);
-                    try out.appendSlice(allocator, common);
-                    serial_common_emitted[serial_common_count] = identity;
-                    serial_common_count += 1;
-                }
-            }
             const body = try cuda_renderer.renderAttentionInstantiationAlloc(allocator, plan);
             defer allocator.free(body);
             try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
@@ -8238,12 +8224,9 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             defer std.testing.allocator.free(body);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
             if (plan.lowering.reduction != .parallel_scores_then_serial) {
-                const common = try cuda_renderer.renderAttentionSerialCommonAlloc(std.testing.allocator, plan);
-                defer std.testing.allocator.free(common);
-                try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bundle, common));
                 const standalone = try cuda_renderer.renderAttentionKernel(std.testing.allocator, plan);
                 defer std.testing.allocator.free(standalone);
-                try std.testing.expect(std.mem.containsAtLeast(u8, standalone, 1, common));
+                try std.testing.expect(std.mem.containsAtLeast(u8, standalone, 1, cuda_renderer.attentionSplitCommonSource()));
                 try std.testing.expect(std.mem.containsAtLeast(u8, standalone, 1, body));
             }
         }
@@ -12549,8 +12532,8 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     // tile across every query head in the group. Keep the shader guard exact
     // for both the legacy E2B/E4B geometries and the separately admitted A4B
     // local/global geometries.
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_stage("));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_reduce("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_MSL_ABI_PAGED_GQA_SPLIT_STAGE(termite_paged_attention_kv_decode_gqa_split_stage)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_MSL_ABI_PAGED_GQA_SPLIT_REDUCE(termite_paged_attention_kv_decode_gqa_split_reduce)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint query_pos = p.query_position_offset + qi;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const bool legacy_geometry = p.num_heads == 8u"));
@@ -12591,7 +12574,7 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !use_decode_gqa_split"));
     // Cached decode also excludes explicit-position requests from the 1x path.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !has_explicit_positions && !use_decode_gqa_split"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "split_launch.scratch_bytes"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "use_decode_gqa_split ? split_launch.scratch_bytes"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "launch->scratch_bytes"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "if (needs_explicit_split_barrier) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "runtime->decode_gqa_split_calls += 1"));
@@ -14037,11 +14020,7 @@ test "quant kernel compiler rendered bodies carry their schedule cols marker" {
 test "quant kernel compiler serial schedules emit one owner and retain every export" {
     const source = try renderCudaRuntimeAttentionRegion(std.testing.allocator);
     defer std.testing.allocator.free(source);
-    for ([_][]const u8{ "antfly_serial_attention_hd256_t256_g16_impl", "antfly_serial_attention_hd512_t512_g16_impl" }) |name| {
-        const definition = try std.fmt.allocPrint(std.testing.allocator, "__device__ __forceinline__ void {s}(", .{name});
-        defer std.testing.allocator.free(definition);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, definition));
-    }
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "__device__ __forceinline__ void antfly_gqa_serial("));
     for (first_generated_attention_artifacts) |artifact| {
         if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
         const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse continue;
