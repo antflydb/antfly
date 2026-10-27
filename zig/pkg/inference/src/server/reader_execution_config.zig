@@ -144,6 +144,18 @@ pub fn Features(comptime Hooks: type) type {
             return result;
         }
 
+        /// The existing operator limit bounds leader fairness. It does not
+        /// prevent compatible prefills from filling a decode-led step.
+        pub fn withDecodeStreakOverride(self: @This(), text: ?[]const u8) @This() {
+            if (!self.prepared) return self;
+            const configured = text orelse return self;
+            const turns = std.fmt.parseInt(u8, configured, 10) catch return self;
+            if (turns > 16) return self;
+            var result = self;
+            result.prefill_decode_streak = turns;
+            return result;
+        }
+
         pub fn fromEnvironment() @This() {
             // Without a model and backend there is no qualified epoch profile.
             return .{};
@@ -166,6 +178,7 @@ pub fn Features(comptime Hooks: type) type {
                 return forProfile(.conservative, cfg, 1);
             var result = forProfile(profile, cfg, Hooks.effectiveLightOnReadRows());
             if (backend == .cuda) {
+                result = result.withDecodeStreakOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK"));
                 result = result.withPreparedPrefillChunkOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS"));
                 const wide = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES");
                 result = result.withBatchOverrides(platform.env.getenv("ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS"), platform.env.getenv("ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS"), if (wide) 16 else 8, if (wide) 16 else 4);
@@ -321,4 +334,21 @@ test "LightOnOCR3 CUDA reader batch overrides preserve operator bounds and backe
     try std.testing.expectEqual(@as(u8, 4), narrow.packed_prefill_items);
     const fallback = F.forProfile(.conservative, .{}, 1);
     try std.testing.expectEqualDeep(fallback, fallback.withBatchOverrides("16", "16", 16, 16));
+}
+
+test "LightOnOCR3 CUDA prefill fairness limit preserves selected defaults and operator bounds" {
+    const F = Features(struct {});
+    const selected = F.forProfile(.cuda_lighton4b, .{}, 128);
+    try std.testing.expectEqualDeep(selected, selected.withDecodeStreakOverride(null));
+    for ([_]u8{ 0, 1, 4, 8, 16 }) |turns| {
+        var text: [3]u8 = undefined;
+        const value = try std.fmt.bufPrint(&text, "{d}", .{turns});
+        var resolved = selected.withDecodeStreakOverride(value);
+        try std.testing.expectEqual(turns, resolved.prefill_decode_streak);
+        resolved.prefill_decode_streak = selected.prefill_decode_streak;
+        try std.testing.expectEqualDeep(selected, resolved);
+    }
+    for ([_][]const u8{ "", "-1", "17", "256", "junk" }) |text| try std.testing.expectEqualDeep(selected, selected.withDecodeStreakOverride(text));
+    const fallback = F.forProfile(.conservative, .{}, 1);
+    try std.testing.expectEqualDeep(fallback, fallback.withDecodeStreakOverride("8"));
 }
