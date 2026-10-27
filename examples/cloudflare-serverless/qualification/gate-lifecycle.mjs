@@ -14,6 +14,7 @@
 // limitations under the License.
 
 import{assertGateRun,assertGateConfig}from'./gate-scope.mjs';
+import{drainBucket}from'./drain-bucket.mjs';
 import{verifySealedRun,assertUnusedRecovery,runtimePlacement}from'./gate-provenance.mjs';
 import{verifyWalTailReaders}from'./wal-compatibility.mjs';
 import{verifyInlineMetadataReaders}from'./metadata-compatibility.mjs';
@@ -116,15 +117,18 @@ async function lifecycle(path){
  const step=async(name,perform)=>{if(run.cleanup_steps[name])return;await perform();run.cleanup_steps[name]=true;await save(run);};
  // Detach the public app from actor namespaces, stop all private writers, then
  // drain through its R2-only qualification endpoint. It never wakes an actor.
- await step('detach-app',async()=>{const config=JSON.parse(await readFile(run.config));config.durable_objects.bindings=[];await writeFile(run.config,JSON.stringify(config,null,2));await command(run,['deploy','--no-bundle','--config',run.config]);});
+ await step('detach-app',async()=>{const config=JSON.parse(await readFile(run.config));config.main=resolve(cwd,'qualification/drain-worker.mjs');config.durable_objects.bindings=[];config.triggers={crons:[]};await writeFile(run.config,JSON.stringify(config,null,2));await command(run,['deploy','--no-bundle','--config',run.config]);run.cleanup_steps['install-drain-worker']=true;});
  await step('remove-consumer',()=>command(run,['queues','consumer','remove',run.id,run.id+'-builder','--config',builder.config],{allowMissing:true}));
  for(const role of['builder','reader','writer'])await step('delete-'+role,()=>command(run,['delete','--force','--config',run.services.find(s=>s.role===role).config],{allowMissing:true}));
  await step('quiescence',()=>new Promise(r=>setTimeout(r,31000)));
+ // Resume cleanups begun by older versions without loading the application
+ // WASM or waking an actor just to delete disposable R2 data.
+ await step('install-drain-worker',async()=>{const config=JSON.parse(await readFile(run.config)),entry=resolve(cwd,'qualification/drain-worker.mjs');config.main=entry;config.durable_objects.bindings=[];config.triggers={crons:[]};await writeFile(run.config,JSON.stringify(config,null,2));await command(run,['deploy','--no-bundle','--config',run.config]);});
  await step('drain',async()=>{
   if(!run.token_installed)throw Error('approved disposable token installation required for authenticated drain');
-  const token=(await readFile(run.token_file,'utf8')).trim(),drain={objects:0,bytes:0};let done=false;
-  for(let i=0;i<10000;i++){const response=await fetch(new URL('/_qualification/drain',run.origin),{method:'POST',headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(35000)});if(!response.ok)throw Error('drain failed: '+response.status);const page=await response.json();drain.objects+=page.deleted??0;drain.bytes+=page.bytes??0;if(page.done){done=true;break;}}
-  if(!done)throw Error('drain did not finish');await writeFile(resolve(run.dir,'drain-report.json'),JSON.stringify(drain,null,2));
+  const token=(await readFile(run.token_file,'utf8')).trim();
+  const drain=await drainBucket(async()=>{const response=await fetch(new URL('/_qualification/drain',run.origin),{method:'POST',headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(35000)});if(!response.ok){const error=Error('CleanupDrainStatus'+response.status);error.retryable=[429,500,502,503,504].includes(response.status);await response.body?.cancel();throw error;}return response.json();});
+  await writeFile(resolve(run.dir,'drain-report.json'),JSON.stringify(drain,null,2));
  });
  await step('delete-app',()=>command(run,['delete','--force','--config',run.config],{allowMissing:true}));
  for(const queue of run.queues)await step('delete-'+queue,()=>command(run,['queues','delete',queue,'--config',run.config],{allowMissing:true}));

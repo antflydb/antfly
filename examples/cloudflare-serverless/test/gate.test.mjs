@@ -288,3 +288,31 @@ test('cancelled offered workloads stop before another arrival and join outstandi
  const{runOfferedWorkload}=await import('../qualification/offered-workload.mjs'),abortController=new AbortController();let calls=0,settled=false;const side={abortController,errors:[],round:async()=>{calls++;await new Promise(r=>setTimeout(r,20));settled=true;},progress:async()=>{}};
  await assert.rejects(runOfferedWorkload({sides:[side],seconds:60,period:100,onProgress:()=>abortController.abort(Error('QualificationInterrupted'))}),/QualificationInterrupted/);assert.equal(calls,1);assert.equal(settled,true);
 });
+
+
+test("cleanup-only draining rejects unauthorized and non-disposable calls before storage access",async()=>{
+ const drain=(await import("../qualification/drain-worker.mjs")).default;
+ const env={API_TOKEN:"disposable",ANTFLY_INCARNATION:"qualification-drain",COORDINATOR_BACKEND:"r2",DATABASE:{list(){throw Error("UnexpectedStorageAccess");}}};
+ const req=(path="/_qualification/drain",token="disposable",method="POST")=>new Request("https://cleanup.invalid"+path,{method,headers:{Authorization:"Bearer "+token}});
+ for(const [request,settings]of[[req("/api"),env],[req(undefined,"wrong"),env],[req(undefined,undefined,"GET"),env],[req(),{...env,API_TOKEN:""}],[req(),{...env,ANTFLY_INCARNATION:"production"}],[req(),{...env,COORDINATOR_BACKEND:"sqlite"}]])assert.equal((await drain.fetch(request,settings)).status,401);
+});
+test("cleanup-only draining bounds deletes and confirms emptiness after completed storage operations",async()=>{
+ const drain=(await import("../qualification/drain-worker.mjs")).default;
+ let rows=Array.from({length:1005},(_,i)=>({key:"object/"+i,size:2})),fail=false;
+ const env={API_TOKEN:"disposable",ANTFLY_INCARNATION:"qualification-drain",COORDINATOR_BACKEND:"r2",DATABASE:{async list({limit}){assert.equal(limit,1000);return{objects:rows.slice(0,limit),truncated:rows.length>limit};},async delete(keys){if(fail)throw Error("DeletionUnavailable");assert.ok(keys.length<=1000);const removed=new Set(keys);rows=rows.filter(r=>!removed.has(r.key));}}};
+ const request=()=>new Request("https://cleanup.invalid/_qualification/drain",{method:"POST",headers:{Authorization:"Bearer disposable"}});
+ fail=true;await assert.rejects(drain.fetch(request(),env),/DeletionUnavailable/);assert.equal(rows.length,1005);fail=false;
+ assert.deepEqual(await(await drain.fetch(request(),env)).json(),{done:false,deleted:1000,bytes:2000});
+ assert.deepEqual(await(await drain.fetch(request(),env)).json(),{done:false,deleted:5,bytes:10});
+ assert.deepEqual(await(await drain.fetch(request(),env)).json(),{done:true,deleted:0,bytes:0});
+});
+
+test("disposable drain retries lost acknowledgements without claiming exact deletion counts",async()=>{
+ const{drainBucket}=await import("../qualification/drain-bucket.mjs");let calls=0;
+ const report=await drainBucket(async()=>{calls++;if(calls===1)throw new TypeError("fetch failed",{cause:{code:"ECONNRESET"}});return calls===2?{done:false,deleted:4,bytes:8}:{done:true,deleted:0,bytes:0};},{delay:async()=>{}});
+ assert.equal(calls,3);assert.equal(report.objects,4);assert.equal(report.transport_retries,1);assert.equal(report.counts_complete,false);
+ let attempts=0;await assert.rejects(drainBucket(async()=>{attempts++;throw new TypeError("fetch failed");},{delay:async()=>{}}),/fetch failed/);assert.equal(attempts,3);
+ attempts=0;await assert.rejects(drainBucket(async()=>{attempts++;throw Error("CleanupDrainStatus401");},{delay:async()=>{}}),/401/);assert.equal(attempts,1);
+ await assert.rejects(drainBucket(async()=>({done:true,deleted:1,bytes:2})),/InvalidCleanupDrainPage/);
+ await assert.rejects(drainBucket(async()=>({done:false,deleted:1,bytes:2}),{maxPages:1}),/CleanupDrainPageLimitExceeded/);
+});

@@ -6,7 +6,9 @@ Objects as warm writers. No application SQLite/KV path is added.
 
 Current opt-in latency experiments, local measurements, rollout requirements and
 Cloudflare diagnostic results are tracked in
-[native latency experiments](cloudflare-latency-experiments.md).
+[native latency experiments](cloudflare-latency-experiments.md). The proposed
+[architecture steps](cloudflare-runtime-target.md) prioritize native resumable
+publication and storage dependency reduction.
 
 ## Read path
 

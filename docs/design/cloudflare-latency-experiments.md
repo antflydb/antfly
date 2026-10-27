@@ -5,6 +5,9 @@ thresholds, resource caps or the approved `c44896ac8c` control. New runtime
 behaviors are opt-in. Local injected-delay results characterize dependency
 depth, not Cloudflare placement, billing or production SLOs.
 
+The proposed next implementation order is in
+[Cloudflare runtime architecture steps](cloudflare-runtime-target.md).
+
 ## Experiments and controls
 
 The baseline native modules are copied from implementation `80615f8acf` before
