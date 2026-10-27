@@ -899,6 +899,7 @@ const CudaDispatchEntry = struct {
 };
 
 const CudaDispatchStats = struct {
+    enabled: bool = false,
     route_counts: [cuda_dispatch_route_count]u64 = @as([cuda_dispatch_route_count]u64, @splat(0)),
     entries: std.ArrayListUnmanaged(CudaDispatchEntry) = .empty,
     dropped_entries: u64 = 0,
@@ -921,7 +922,7 @@ const CudaDispatchStats = struct {
         tc_pack_bytes: usize,
     ) void {
         self.route_counts[@backingInt(route)] += 1;
-        if (!cudaDispatchStatsEnabled()) return;
+        if (!self.enabled) return;
         for (self.entries.items) |*entry| {
             if (entry.matches(op, quant, route, epilogue, fallback, rows, in_dim, out_dim)) {
                 entry.calls += 1;
@@ -1005,7 +1006,7 @@ const CudaDispatchStats = struct {
     }
 
     fn printIfEnabled(self: *const CudaDispatchStats, q4_census_enabled: bool) void {
-        if (!cudaDispatchStatsEnabled() and !q4_census_enabled) return;
+        if (!self.enabled and !q4_census_enabled) return;
         std.debug.print("ANTFLY_CUDA_DISPATCH_STATS {{\"routes\":{{", .{});
         inline for (@typeInfo(CudaDispatchRoute).@"enum".field_names, 0..) |reflected_name, i| {
             if (i != 0) std.debug.print(",", .{});
@@ -3783,6 +3784,7 @@ pub const CudaCompute = struct {
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     deferred_device_free_bytes: usize = 0,
     temp_trace_seq: usize = 0,
+    runtime_policy: @import("runtime_policy.zig").Policy = .{},
     florence_tail_row_f32: ?CT = null,
     florence_tail_col_f32: ?CT = null,
     florence_tail_temporal_f32: ?CT = null,
@@ -4799,6 +4801,8 @@ pub const CudaCompute = struct {
             .tuned_route_gates = tuned_route_gates,
             .capture_gates = capture_gates,
             .temp_slot_config = CudaTempSlotConfig.resolve(capture_gates),
+            .runtime_policy = @import("runtime_policy.zig").Policy.resolve(),
+            .dispatch_stats = .{ .enabled = cudaDispatchStatsEnabled() },
             .runtime_jit_shape_gating = jit_config.mode.activates(),
         };
     }
@@ -7505,14 +7509,6 @@ fn cudaDeviceMirrorDequantEnabled() bool {
 
 fn cudaRmsNormBf16MirrorEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR", false);
-}
-
-fn cudaCublasLtWorkspaceBytes() usize {
-    const workspace_mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CUBLASLT_WORKSPACE_MB") orelse
-        platform.env.getenvUsize("ANTFLY_CUDA_CUBLASLT_WORKSPACE_MB") orelse
-        platform.env.getenvUsize("TERMITE_CUDA_CUBLASLT_WORKSPACE_MB") orelse
-        0;
-    return std.math.mul(usize, workspace_mb, 1024 * 1024) catch 0;
 }
 
 const cuda_kv_format_polar4: u32 = 0;
@@ -10529,7 +10525,7 @@ fn weightBf16MirrorForRows(self: *const CudaCompute, weight: *const CudaTensor, 
 }
 
 fn cublasLtWorkspace(self: *CudaCompute) buffer_mod.DeviceBuffer {
-    const bytes = cudaCublasLtWorkspaceBytes();
+    const bytes = self.runtime_policy.workspace_bytes;
     if (bytes == 0) return .{};
     return self.cublaslt_workspace_scratch.acquire(&self.ctx, bytes) catch .{};
 }
@@ -11464,22 +11460,14 @@ fn tryCublasLtF16Qkv(
     return true;
 }
 
-const default_max_temp_buffers = 256;
 const default_temp_arena_admission_budget_bytes: usize = 512 * 1024 * 1024;
 
 fn cudaTempCacheMaxBuffers(self: *const CudaCompute) usize {
-    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MAX_BUFFERS") orelse
-        if (self.resident_training_cache) @as(usize, 4096) else default_max_temp_buffers;
+    return self.runtime_policy.bufferLimit(self.resident_training_cache);
 }
 
 fn cudaTempCacheConfiguredBytes(self: *const CudaCompute) usize {
-    // Resident training revisits large, exact-size transaction buffers. Keep
-    // enough idle storage to reuse them across accumulation/update boundaries.
-    // All retained allocations remain charged to the owner's physical ceiling;
-    // allocDeviceBuffer reclaims idle entries before retrying a bounded miss.
-    const mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB") orelse
-        if (self.resident_training_cache) @as(usize, 2048) else 1024;
-    return std.math.mul(usize, mb, 1024 * 1024) catch 0;
+    return self.runtime_policy.cacheBytes(self.resident_training_cache);
 }
 
 fn cudaTempCacheBudgetBytes(self: *const CudaCompute) usize {
@@ -11587,14 +11575,6 @@ fn cudaDeferredFreeConfiguredBytes() usize {
 fn cudaDeferredFreeBudgetBytes(self: *const CudaCompute) usize {
     const configured = cudaDeferredFreeConfiguredBytes();
     return if (self.ocr_deferred_free_budget_bytes) |ceiling| @min(configured, ceiling) else configured;
-}
-
-fn cudaTempTraceEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TEMP_TRACE", false);
-}
-
-fn cudaTempTraceLimit() usize {
-    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_TRACE_LIMIT") orelse 4096;
 }
 
 fn cudaTempTraceSkip() usize {
@@ -11942,7 +11922,7 @@ fn beginDecodeProfile(self: *CudaCompute, category: CudaDecodeProfileCategory, r
 fn beginPrefillProfile(self: *CudaCompute, category: ?CudaPrefillProfileCategory, rows: usize) ?CudaPrefillProfileScope {
     const resolved_category = category orelse return null;
     if (rows <= 1) return null;
-    if (!cudaPrefillOpProfileEnabled()) return null;
+    if (!self.runtime_policy.prefill_profile) return null;
     if (self.debug_cuda_graph_capture_active) return null;
     const slot = acquireProfileSlot(self) orelse return null;
     return .{ .compute = self, .category = resolved_category, .slot = slot };
@@ -11993,6 +11973,7 @@ test "CUDA op-profile pool free-stack, drain no-op, and category mapping" {
     var compute: CudaCompute = undefined;
 
     compute.temp_scan_profile = .{};
+    compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     compute.lighton_fused_vision_qkv_enabled = false;
     compute.lighton_ragged_recurrent_enabled = false;
     compute.lighton_ffn_bf16_inputs = false;
@@ -12131,11 +12112,11 @@ fn traceCudaTempAlloc(
     requested_len: usize,
     buffer: buffer_mod.DeviceBuffer,
 ) void {
-    if (!cudaTempTraceEnabled()) return;
-    const skip = cudaTempTraceSkip();
+    if (!self.runtime_policy.trace) return;
+    const skip = self.runtime_policy.trace_skip;
     if (seq < skip) return;
     const trace_seq = seq - skip;
-    const limit = cudaTempTraceLimit();
+    const limit = self.runtime_policy.trace_limit;
     if (trace_seq >= limit) return;
     if (trace_seq == 0) {
         std.log.info(
@@ -12144,7 +12125,7 @@ fn traceCudaTempAlloc(
                 skip,
                 limit,
                 cudaTempCacheBudgetBytes(self) / (1024 * 1024),
-                cudaTempStableReuseEnabled(),
+                self.runtime_policy.stable_temp_reuse,
                 cudaEffectiveTempSlotPeriod(self),
                 cudaEffectiveTempSlotSkip(self),
             },
@@ -12543,6 +12524,7 @@ test "CUDA greedy graph output borrows only the prepared replay slot" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -12581,6 +12563,7 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -12662,7 +12645,7 @@ fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceB
         std.log.warn("cuda_graph_capture_probe: unpinned_temp_during_capture seq={d} bytes={d} disabled=1", .{ seq, len });
         return error.CudaGraphCaptureUnsafeTempAlloc;
     }
-    const stable_reuse = self.resident_training_cache or cudaTempStableReuseEnabled();
+    const stable_reuse = self.resident_training_cache or self.runtime_policy.stable_temp_reuse;
     var best_index: ?usize = null;
     var best_len: usize = std.math.maxInt(usize);
     const scan_sample = self.temp_scan_profile.begin(0);
@@ -13242,6 +13225,7 @@ fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13714,6 +13698,7 @@ test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13776,6 +13761,7 @@ test "CUDA persistent buffer reallocation invalidates graph pointers and rejects
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13820,6 +13806,7 @@ test "clearing CUDA graph capture state removes stale disabled latch" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13850,6 +13837,7 @@ test "CUDA graph request reset clears stale capture and scalar state" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13898,6 +13886,7 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -15486,6 +15475,7 @@ test "Gemma 4 audio CUDA hooks decline pre-Ampere before touching tensors" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -18344,6 +18334,7 @@ test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     var compute: CudaCompute = undefined;
 
     compute.temp_scan_profile = .{};
+    compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     compute.lighton_fused_vision_qkv_enabled = false;
     compute.lighton_ragged_recurrent_enabled = false;
     compute.lighton_ffn_bf16_inputs = false;
@@ -23308,6 +23299,7 @@ test "GLiNER Decide CUDA Q8 long-context attention requires complete supported m
     var compute: CudaCompute = undefined;
 
     compute.temp_scan_profile = .{};
+    compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     compute.lighton_fused_vision_qkv_enabled = false;
     compute.lighton_ragged_recurrent_enabled = false;
     compute.lighton_ffn_bf16_inputs = false;
@@ -31667,6 +31659,7 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             var compute: CudaCompute = undefined;
 
             compute.temp_scan_profile = .{};
+            compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
             compute.lighton_fused_vision_qkv_enabled = false;
             compute.lighton_ragged_recurrent_enabled = false;
             compute.lighton_ffn_bf16_inputs = false;
@@ -31756,6 +31749,7 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     var compute: CudaCompute = undefined;
 
     compute.temp_scan_profile = .{};
+    compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     compute.lighton_fused_vision_qkv_enabled = false;
     compute.lighton_ragged_recurrent_enabled = false;
     compute.lighton_ffn_bf16_inputs = false;

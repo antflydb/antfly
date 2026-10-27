@@ -465,7 +465,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (ctx.cb != null) return;
             var cb = try session_factory.getComputeBackendWithBudget(ctx.model.session, ctx.allocator, &ctx.budget);
             errdefer cb.deinit();
-            const config = generation.kvPoolConfig(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, ctx.cfg, Hooks.generationKvSlidingTrimForced());
+            // The device hook owns CUDA KV bytes. Both epoch pools retain
+            // logical pages without allocating a second pair of host mirrors.
+            const config = generation.requestKvManagerPoolConfig(generation.kvPoolConfig(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, ctx.cfg, Hooks.generationKvSlidingTrimForced()));
             ctx.pool = try ctx.manager.addPool(config);
             ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, config);
             errdefer ctx.storage.deinit();

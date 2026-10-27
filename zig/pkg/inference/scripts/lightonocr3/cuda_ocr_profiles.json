@@ -34,7 +34,7 @@
         "ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES": "1024",
         "ANTFLY_INFERENCE_CUDA_CUBLASLT_WORKSPACE_MB": "0",
         "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "mma",
-        "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "0",
+        "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
         "ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MAX_BUFFERS": "4096",
         "ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB": "16384",
         "ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE": "0",
@@ -90,20 +90,19 @@
         "ANTFLY_LIGHTONOCR3_PHYSICAL128": "1",
         "ANTFLY_LIGHTONOCR3_COMPACT_KV": "1"
       },
-      "qualification": "Experimental original-F32 compact attention KV and bounded 128-row cohort; packets stay at most 64 rows. Fixture agreement passed on historical builds; requalify after cleanup."
+      "qualification": "Experimental CUDA profile with original F32 recurrent state, compact attention-layer KV ownership and a bounded 128-row cohort; transport packets stay at most 64 rows. Full-output qualification covers three synthetic fixtures."
     },
     "lighton4b": {
       "extends": "lighton08",
       "environment": {
         "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS": "1",
-        "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
         "ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128": "1",
         "ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS": "1",
         "ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US": "0",
         "ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS": "4",
         "ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS": "256"
       },
-      "qualification": "Experimental original-F32 compact attention KV and bounded 128-row cohort; packets stay at most 64 rows. Fixture agreement passed on historical builds; requalify after cleanup."
+      "qualification": "Experimental CUDA profile with original F32 recurrent state, compact attention-layer KV ownership and a bounded 128-row cohort; transport packets stay at most 64 rows. Full-output qualification covers three synthetic fixtures."
     },
     "florence": {
       "environment": {

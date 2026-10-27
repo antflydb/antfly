@@ -644,9 +644,9 @@ pub fn kvPoolConfig(
     };
 }
 
-/// Request-local CUDA managers track logical pages; the separately attached
-/// KvStorageRuntime owns all cache bytes. Avoid a second full host KV allocation
-/// in the manager. Shared prompt-cache pools keep their existing ownership.
+/// CUDA logical owners do not need host KV mirrors when their numerical
+/// storage uses a device hook. This applies to request managers and both
+/// shared reader-epoch pools. Shared prompt-cache pools retain their ownership.
 pub fn requestKvManagerPoolConfig(storage_config: runtime.kv.pool.KvPoolConfig) runtime.kv.pool.KvPoolConfig {
     var config = storage_config;
     if (config.backend == .cuda) config.store_cpu_bytes = false;
@@ -20558,4 +20558,44 @@ test "LightOnOCR3 CUDA final prefix logits layout skips intermediate rows and pr
     try std.testing.expectEqualSlices(f32, &logits, sampled.logits.?);
     @memset(&logits, 999);
     try std.testing.expectEqual(@as(f32, 0.3), sampled.logits.?[0]);
+}
+
+test "LightOnOCR3 CUDA reader epoch logical pools retain positions across growth and reset without host mirrors" {
+    const allocator = std.testing.allocator;
+    for ([_]runtime.kv.pool.BackendKind{ .cuda, .metal }) |backend| {
+        const config = requestKvManagerPoolConfig(kvPoolConfig(backend, .f16, .{
+            .family = .gemma,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 2,
+            .num_key_value_heads = 1,
+            .attention_head_dim = 8,
+        }, false));
+        var manager = runtime.kv.manager.KvManager.init(allocator);
+        defer manager.deinit();
+        const pool = try manager.addPool(config);
+        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, config);
+        defer storage.deinit();
+        for (0..2) |_| {
+            var state = NativeDecodeState.initPaged(allocator, &manager, pool, null);
+            state.kv_storage = &storage;
+            defer state.deinit();
+            try state.notePrefill(17);
+            for (0..40) |_| try state.appendGeneratedToken();
+            const sequence = state.sequence_id.?;
+            try std.testing.expectEqual(@as(?usize, 57), manager.tokenCount(sequence));
+            try std.testing.expectEqual(@as(?usize, 57), storage.tokenCount(sequence));
+            try std.testing.expectEqual(@as(usize, 57), state.kvView().?.token_count);
+            for ([_]*runtime.kv.pool.KvPool{ manager.pools.items[pool].hostPool().?, storage.storage.hostPool().? }) |owner| {
+                try std.testing.expect(owner.blocks.items.len >= 4);
+                for (owner.blocks.items) |page| {
+                    if (backend == .cuda) {
+                        try std.testing.expectEqual(@as(usize, 0), page.k_data.len);
+                        try std.testing.expectEqual(@as(usize, 0), page.v_data.len);
+                    } else {
+                        try std.testing.expect(page.k_data.len > 0 and page.v_data.len > 0);
+                    }
+                }
+            }
+        }
+    }
 }
