@@ -753,3 +753,21 @@ CPU improvement, not a solution to the whole unit job's duration. An earlier
 experiment disabling stack capture on fixture allocations showed little benefit
 and was reverted. The corpus sizes, spill assertions, memory budgets, allocator
 diagnostics, and job timeout are retained. Other builds were running on the host.
+
+### Allocator proof follow-up
+
+The merged read-window/gate changes were also measured with a copied 6.93 GB
+Lite file: first-write proof time fell from 138.308 to 62.974 seconds. A complete
+frozen import fell from 566.953 to 341.498 seconds, retaining all 238,157 source
+items and 76,638 normalized rows. Both used ReleaseFast with concurrent host
+builds; the new library was stripped and the baseline retained debug symbols.
+These are end-to-end observations, not an isolated attribution of every gain.
+The resulting file was 3.33 GB versus 3.00 GB; this is not a file-size improvement.
+
+The remaining proof still walked the active checkpoint twice. Ownership now
+reuses the already validated active graph and its reference counts, while the
+fallback checkpoint, pending retirements, CRCs, and exact reference counts are
+still checked. The 33 allocator regressions pass, including positive-but-wrong
+reference counts, corrupt values, cancellation, shared ownership, and denied
+optional scratch admission. The optimized real-file measurement of this further
+traversal reduction is pending.
