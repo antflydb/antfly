@@ -3290,3 +3290,10 @@ panel16 accumulation owner across direct and cached MR1/MR2/MR4/MR8 entries,
 including generated cached-result wrappers. It separates maintained and
 generated reductions, independent oracles, native/non-SDOT timing, unchanged
 machine-code controls and explicitly changed projection resource bounds.
+
+### AF native CPU panel and block consolidation
+
+[The AF outcome register](unified-execution-af-outcomes.md) records the main
+merge, Q4/Q5 sharing across eight/sixteen-column panels, Q6 panel16 rows and
+K16 four-column block traversal, with post-merge baselines and separate
+source/performance accounting.
