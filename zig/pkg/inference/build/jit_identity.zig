@@ -55,6 +55,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     const qualification: []const []const u8 = switch (backend) {
         .metal => &.{
             "src/backends/metal_runtime.zig",
+            "src/backends/metal_compile_options.h",
             "src/graph/kernel_jit.zig",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",

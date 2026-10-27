@@ -14,9 +14,12 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const document_runs = @import("antfly_document_runs");
+pub const document_failure = @import("document_failure.zig");
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference_api = @import("inference_api");
+const hosted = @import("hosted_response.zig");
 const config = @import("antfly_reader_config");
 const data_uri = @import("antfly_scraping").data_uri;
 const antfly_image = @import("antfly_image");
@@ -50,13 +53,31 @@ pub const Provider = config.Provider;
 pub const Config = config.Config;
 pub const apple = @import("apple.zig");
 
+/// Validated, borrowed MIME essence shared by transport and source adapters.
+/// Parameters do not participate in media dispatch; the bytes still establish
+/// the actual image format at the source boundary.
+pub fn mediaTypeEssence(value: []const u8) ![]const u8 {
+    return data_uri.mediaTypeEssence(value);
+}
+
 pub const InlineContentTrust = enum {
     untrusted,
     trusted_internal,
 };
 
+pub const DocumentSource = struct {
+    /// Clockwise image-edge corners: top-left, top-right, bottom-right, bottom-left.
+    quadrilateral: ?[4][2]f64 = null,
+    id: []const u8,
+    url: []const u8,
+    media_type: []const u8,
+    pages: ?[]const usize = null,
+    include_notes: bool = false,
+    include_hidden: bool = false,
+};
 pub const Request = struct {
-    images: []const []const u8,
+    images: []const []const u8 = &.{},
+    documents: []const DocumentSource = &.{},
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
     /// Trust applies only to inline `data:` image content. Network locations
@@ -83,6 +104,8 @@ pub const EncodedImage = struct {
 };
 
 pub const EncodedRequest = struct {
+    /// Composition may inspect incomplete output; ordinary callers keep strict behavior.
+    allow_incomplete: bool = false,
     images: []const EncodedImage,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -117,8 +140,8 @@ pub fn validateEncodedRequest(request: EncodedRequest) !void {
         if (image.bytes.len == 0) return error.InvalidImageInput;
         const mime_type = std.mem.trim(u8, image.mime_type, &std.ascii.whitespace);
         if (mime_type.len != image.mime_type.len) return error.InvalidArguments;
-        const parsed = data_uri.parseMediaType(mime_type) catch return error.InvalidArguments;
-        if (!std.ascii.startsWithIgnoreCase(parsed.essence, "image/")) {
+        const essence = mediaTypeEssence(mime_type) catch return error.InvalidArguments;
+        if (!std.ascii.startsWithIgnoreCase(essence, "image/")) {
             return error.InvalidArguments;
         }
     }
@@ -152,7 +175,13 @@ test "encoded reader validation is execution-mode independent" {
     );
 }
 
+pub const Completion = enum { complete, length, unresolved };
+
 pub const Result = struct {
+    completion: Completion = .complete,
+    prompt_tokens: ?usize = null,
+    completion_tokens: ?usize = null,
+    document_json: ?[]const u8 = null,
     text: []const u8,
     fields_json: ?[]const u8 = null,
     regions_json: ?[]const u8 = null,
@@ -163,6 +192,7 @@ pub const Result = struct {
 
 pub fn deinitResult(alloc: Allocator, result: *Result) void {
     alloc.free(@constCast(result.text));
+    if (result.document_json) |value| alloc.free(@constCast(value));
     if (result.fields_json) |value| alloc.free(@constCast(value));
     if (result.regions_json) |value| alloc.free(@constCast(value));
     if (result.item_id.len > 0) alloc.free(@constCast(result.item_id));
@@ -204,21 +234,43 @@ pub const BatchResult = struct {
     }
 };
 
+/// Aggregate measured counters only. Text-length estimates never establish completion.
+pub fn measuredUsage(items: []const Result) !?inference_api.GenerateUsage {
+    var prompt: usize = 0;
+    var output: usize = 0;
+    var measured = false;
+    for (items) |item| {
+        if (item.prompt_tokens) |n| {
+            prompt = try std.math.add(usize, prompt, n);
+            measured = true;
+        }
+        if (item.completion_tokens) |n| {
+            output = try std.math.add(usize, output, n);
+            measured = true;
+        }
+    }
+    if (!measured) return null;
+    return .{ .prompt_tokens = std.math.cast(i64, prompt) orelse return error.InvalidReadExecutionReport, .completion_tokens = std.math.cast(i64, output) orelse return error.InvalidReadExecutionReport, .total_tokens = std.math.cast(i64, try std.math.add(usize, prompt, output)) orelse return error.InvalidReadExecutionReport };
+}
+
 pub const Reader = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        accepts_documents: bool = false,
         read: *const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result,
         read_reported: ?*const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult = null,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
     pub fn read(self: Reader, alloc: Allocator, req: Request) ![]Result {
+        if (req.documents.len > 0 and !self.vtable.accepts_documents) return error.UnsupportedDocumentFormat;
         return try self.vtable.read(self.ptr, alloc, req);
     }
 
     pub fn readReported(self: Reader, alloc: Allocator, req: Request) !BatchResult {
+        if (req.documents.len > 0 and !self.vtable.accepts_documents) return error.UnsupportedDocumentFormat;
         if (self.vtable.read_reported) |reported| return try reported(self.ptr, alloc, req);
         const items = try self.read(alloc, req);
         return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
@@ -352,12 +404,12 @@ pub const Registry = struct {
 
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
     var owned = cfg;
-    inline for (.{ "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
+    inline for (.{ "account_id", "gateway_id", "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
         @field(owned, field) = null;
     }
     owned.recognition_languages = &.{};
     errdefer deinitConfig(alloc, &owned);
-    inline for (.{ "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
+    inline for (.{ "account_id", "gateway_id", "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
         @field(owned, field) = try dupOpt(alloc, @field(cfg, field));
     }
     const languages = try alloc.alloc([]const u8, cfg.recognition_languages.len);
@@ -375,6 +427,8 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
 }
 
 pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
+    freeOpt(alloc, cfg.account_id);
+    freeOpt(alloc, cfg.gateway_id);
     freeOpt(alloc, cfg.model);
     freeOpt(alloc, cfg.prompt);
     freeOpt(alloc, cfg.api_key);
@@ -411,6 +465,7 @@ fn initReaderWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, opt
     try cfg.validate();
     return switch (cfg.provider) {
         .antfly => try AntflyReaderState.init(alloc, http, cfg, options),
+        .cloudflare => try CloudReaderState(.cloudflare).init(alloc, http, cfg, options),
         .openai => try OpenAiReaderState.init(alloc, http, cfg, options),
         .vertex => try VertexReaderState.init(alloc, http, cfg, options),
         .apple => try AppleReaderState.init(alloc, http, cfg, options),
@@ -545,7 +600,7 @@ const AntflyReaderState = struct {
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
         }
-        return .{ .ptr = state, .vtable = &.{ .read = read, .read_reported = readReported, .deinit = deinit } };
+        return .{ .ptr = state, .vtable = &.{ .accepts_documents = true, .read = read, .read_reported = readReported, .deinit = deinit } };
     }
 
     pub fn deinit(ptr: *anyopaque) void {
@@ -571,6 +626,35 @@ const AntflyReaderState = struct {
 
     fn readReported(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult {
         const self: *AntflyReaderState = @ptrCast(@alignCast(ptr));
+        if (req.documents.len > 0) {
+            if (req.images.len > 0) return error.InvalidDocumentSource;
+            const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = self.model, .documents = req.documents, .prompt = req.prompt, .max_tokens = req.max_tokens }, .{ .emit_null_optional_fields = false });
+            defer alloc.free(body);
+            const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
+            defer alloc.free(url);
+            var headers: [5][2][]const u8 = undefined;
+            var count: usize = 0;
+            if (self.auth_header) |header| {
+                headers[count] = header;
+                count += 1;
+            }
+            if (self.source_table) |v| {
+                headers[count] = .{ "X-Antfly-Source-Table", v };
+                count += 1;
+            }
+            if (self.capability_token) |v| {
+                headers[count] = .{ "X-Antfly-Capability-Token", v };
+                count += 1;
+            }
+            if (self.capability_revision) |v| {
+                headers[count] = .{ "X-Antfly-Capability-Revision", v };
+                count += 1;
+            }
+            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
+            defer response.deinit();
+            if (!response.ok()) return readHttpStatusError(response.status.code, responseCapabilityStale(response));
+            return documentBatchResult(alloc, response.body orelse return error.InvalidReadResultCount);
+        }
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
         defer alloc.free(images);
         for (req.images, 0..) |image, i| images[i] = .{ .url = image };
@@ -614,49 +698,7 @@ const AntflyReaderState = struct {
         defer resp.deinit();
         if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
 
-        const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-        if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
-
-        const out = try alloc.alloc(Result, req.images.len);
-        const assigned = alloc.alloc(bool, req.images.len) catch |err| {
-            alloc.free(out);
-            return err;
-        };
-        defer alloc.free(assigned);
-        @memset(assigned, false);
-        errdefer {
-            for (out, assigned) |*item, was_assigned| {
-                if (was_assigned) deinitResult(alloc, item);
-            }
-            alloc.free(out);
-        }
-        var initialized: usize = 0;
-        for (parsed.value.data) |item| {
-            if (item.index < 0) return error.InvalidReadResultCount;
-            const result_index = std.math.cast(usize, item.index) orelse return error.InvalidReadResultCount;
-            if (result_index >= req.images.len or assigned[result_index]) return error.InvalidReadResultCount;
-            var result = Result{
-                .text = try alloc.dupe(u8, item.text),
-                .fields_json = null,
-                .regions_json = null,
-            };
-            errdefer deinitResult(alloc, &result);
-            if (item.fields) |fields| result.fields_json = try std.json.Stringify.valueAlloc(alloc, fields, .{});
-            if (item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
-            out[result_index] = result;
-            assigned[result_index] = true;
-            initialized += 1;
-        }
-        if (initialized != req.images.len) return error.InvalidReadResultCount;
-        return .{
-            .items = out,
-            .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
-            .usage = parsed.value.usage,
-        };
+        return decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
     }
 
     fn readEncodedReported(self: *AntflyReaderState, alloc: Allocator, req: EncodedRequest) !BatchResult {
@@ -720,68 +762,17 @@ const AntflyReaderState = struct {
         defer resp.deinit();
         if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
 
-        const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-        if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
-
-        const out = try alloc.alloc(Result, req.images.len);
-        const assigned = alloc.alloc(bool, req.images.len) catch |err| {
-            alloc.free(out);
-            return err;
-        };
-        defer alloc.free(assigned);
-        @memset(assigned, false);
-        errdefer {
-            for (out, assigned) |*item, was_assigned| if (was_assigned) deinitResult(alloc, item);
-            alloc.free(out);
+        var batch = try decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
+        errdefer batch.deinit(alloc);
+        for (batch.items, req.images) |*item, original| {
+            if (item.item_id.len > 0) alloc.free(@constCast(item.item_id));
+            item.item_id = "";
+            if (original.item_id.len > 0) item.item_id = try alloc.dupe(u8, original.item_id);
+            item.page_number = original.page_number;
+            if (original.source_fingerprint) |value| item.source_fingerprint = try alloc.dupe(u8, value);
         }
-        var initialized: usize = 0;
-        for (parsed.value.data) |wire_item| {
-            if (wire_item.index < 0) return error.InvalidReadResultCount;
-            const result_index = std.math.cast(usize, wire_item.index) orelse return error.InvalidReadResultCount;
-            if (result_index >= req.images.len or assigned[result_index]) return error.InvalidReadResultCount;
-            const text = try alloc.dupe(u8, wire_item.text);
-            var owns_text = true;
-            errdefer if (owns_text) alloc.free(text);
-            const item_id = if (req.images[result_index].item_id.len > 0)
-                try alloc.dupe(u8, req.images[result_index].item_id)
-            else
-                "";
-            var owns_item_id = item_id.len > 0;
-            errdefer if (owns_item_id) alloc.free(@constCast(item_id));
-            const source_fingerprint = if (req.images[result_index].source_fingerprint) |value|
-                try alloc.dupe(u8, value)
-            else
-                null;
-            var owns_source_fingerprint = source_fingerprint != null;
-            errdefer if (owns_source_fingerprint) alloc.free(source_fingerprint.?);
-            var result = Result{
-                .text = text,
-                .fields_json = null,
-                .regions_json = null,
-                .item_id = item_id,
-                .source_fingerprint = source_fingerprint,
-                .page_number = req.images[result_index].page_number,
-            };
-            owns_text = false;
-            owns_item_id = false;
-            owns_source_fingerprint = false;
-            errdefer deinitResult(alloc, &result);
-            if (wire_item.fields) |fields| result.fields_json = try std.json.Stringify.valueAlloc(alloc, fields, .{});
-            if (wire_item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
-            out[result_index] = result;
-            assigned[result_index] = true;
-            initialized += 1;
-        }
-        if (initialized != req.images.len) return error.InvalidReadResultCount;
-        return .{
-            .items = out,
-            .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
-            .usage = parsed.value.usage,
-        };
+        if (!req.allow_incomplete) try requireComplete(batch.items);
+        return batch;
     }
 };
 
@@ -864,6 +855,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         project_id: ?[]const u8 = null,
         location: ?[]const u8 = null,
 
+        gateway_id: ?[]const u8 = null,
         options: RemoteOptions,
 
         const Self = @This();
@@ -871,28 +863,23 @@ fn CloudReaderState(comptime provider: Provider) type {
         fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
             const state = try alloc.create(Self);
             errdefer alloc.destroy(state);
-            state.* = .{
-                .alloc = alloc,
-                .http = http,
-                .options = options,
-                .base_url = try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
-                    .openai => "https://api.openai.com/v1",
-                    .vertex => "https://aiplatform.googleapis.com/v1",
-                    else => unreachable,
-                }),
-                .model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
-                    .openai => "gpt-4.1-mini",
-                    // Stored reader recipes may omit these fields. Keep their
-                    // legacy defaults stable; newer profiles pin model/location.
-                    .vertex => "gemini-2.5-flash",
-                    else => unreachable,
-                }),
-                .prompt = try dupOpt(alloc, cfg.prompt),
-                .max_tokens = cfg.max_tokens,
-                .project_id = try dupOpt(alloc, cfg.project_id),
-                .location = try dupOpt(alloc, cfg.location),
-            };
+            state.* = .{ .alloc = alloc, .http = http, .options = options, .base_url = "", .model = "", .max_tokens = cfg.max_tokens };
             errdefer state.deinitState();
+            state.gateway_id = try dupOpt(alloc, cfg.gateway_id);
+            state.base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
+                .openai => "https://api.openai.com/v1",
+                .vertex => "https://aiplatform.googleapis.com/v1",
+                else => unreachable,
+            });
+            state.model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
+                .cloudflare => return error.InvalidReaderConfig,
+                .openai => "gpt-4.1-mini",
+                .vertex => "gemini-2.5-flash",
+                else => unreachable,
+            });
+            state.prompt = try dupOpt(alloc, cfg.prompt);
+            state.project_id = try dupOpt(alloc, cfg.project_id);
+            state.location = try dupOpt(alloc, cfg.location);
             if (provider == .vertex) {
                 if (state.project_id == null) {
                     state.project_id = try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path);
@@ -905,10 +892,11 @@ fn CloudReaderState(comptime provider: Provider) type {
             }
             if (provider == .vertex and state.project_id == null) return error.InvalidReaderConfig;
             if (provider == .vertex and state.location == null) state.location = try alloc.dupe(u8, "us-central1");
-            return .{ .ptr = state, .vtable = &.{ .read = read, .deinit = deinit } };
+            return .{ .ptr = state, .vtable = &.{ .read = read, .read_reported = readReported, .deinit = deinit } };
         }
 
         fn deinitState(self: *Self) void {
+            freeOpt(self.alloc, self.gateway_id);
             self.alloc.free(self.base_url);
             self.alloc.free(self.model);
             freeOpt(self.alloc, self.prompt);
@@ -950,15 +938,21 @@ fn CloudReaderState(comptime provider: Provider) type {
         }
 
         pub fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
+            return (try readReported(ptr, alloc, req)).items;
+        }
+        fn readReported(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            return switch (provider) {
-                .openai => try self.readOpenAi(alloc, req),
+            var result = switch (provider) {
+                .cloudflare, .openai => try self.readOpenAi(alloc, req),
                 .vertex => try self.readVertex(alloc, req),
                 else => unreachable,
             };
+            errdefer result.deinit(alloc);
+            try requireComplete(result.items);
+            return result;
         }
 
-        fn readOpenAi(self: *Self, alloc: Allocator, req: Request) ![]Result {
+        fn readOpenAi(self: *Self, alloc: Allocator, req: Request) !BatchResult {
             const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
             var content = std.json.Array.init(alloc);
             defer {
@@ -988,6 +982,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             var minted_auth: ?[]u8 = null;
             defer if (minted_auth) |value| alloc.free(value);
             try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
+            if (self.gateway_id) |id| try headers.append(alloc, .{ "cf-aig-gateway-id", id });
             var resp = try self.http.post(url, .{
                 .json = body,
                 .headers = headers.items,
@@ -1000,10 +995,10 @@ fn CloudReaderState(comptime provider: Provider) type {
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
-            return parseOpenAiTextResultAlloc(alloc, resp.body orelse return error.EmptyResponse);
+            return hosted.chat(alloc, resp.body orelse return error.EmptyResponse);
         }
 
-        fn readVertex(self: *Self, alloc: Allocator, req: Request) ![]Result {
+        fn readVertex(self: *Self, alloc: Allocator, req: Request) !BatchResult {
             const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
             var parts = std.json.Array.init(alloc);
             defer {
@@ -1048,7 +1043,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
-            return parseVertexTextResultAlloc(alloc, resp.body orelse return error.EmptyResponse);
+            return hosted.vertex(alloc, resp.body orelse return error.EmptyResponse);
         }
     };
 }
@@ -1127,52 +1122,6 @@ fn parseDataUriImage(url: []const u8) ?DataUriImage {
     return .{ .mime_type = parsed.media_type_essence, .data = parsed.payload };
 }
 
-fn parseOpenAiTextResultAlloc(alloc: Allocator, payload: []const u8) ![]Result {
-    const Response = struct { choices: []const struct {
-        message: struct { content: ?[]const u8 = null },
-        finish_reason: ?[]const u8 = null,
-    } = &.{} };
-    var parsed = try std.json.parseFromSlice(Response, alloc, payload, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    if (parsed.value.choices.len == 0) return error.EmptyResponse;
-    const choice = parsed.value.choices[0];
-    const reason = choice.finish_reason orelse return error.IncompleteReaderResponse;
-    if (!std.mem.eql(u8, reason, "stop")) return error.IncompleteReaderResponse;
-    return singleTextResult(alloc, choice.message.content orelse return error.EmptyResponse);
-}
-
-fn parseVertexTextResultAlloc(alloc: Allocator, payload: []const u8) ![]Result {
-    const Response = struct { candidates: []const struct {
-        finishReason: ?[]const u8 = null,
-        content: struct { parts: []const struct { text: ?[]const u8 = null, thought: bool = false } = &.{} } = .{},
-    } = &.{} };
-    var parsed = try std.json.parseFromSlice(Response, alloc, payload, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    if (parsed.value.candidates.len == 0) return error.EmptyResponse;
-    const candidate = parsed.value.candidates[0];
-    const reason = candidate.finishReason orelse return error.IncompleteReaderResponse;
-    if (!std.mem.eql(u8, reason, "STOP")) return error.IncompleteReaderResponse;
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(alloc);
-    var found_text = false;
-    for (candidate.content.parts) |part| {
-        if (part.thought) continue;
-        if (part.text) |value| {
-            found_text = true;
-            try text.appendSlice(alloc, value);
-        }
-    }
-    if (!found_text) return error.EmptyResponse;
-    return singleTextResult(alloc, text.items);
-}
-
-fn singleTextResult(alloc: Allocator, text: []const u8) ![]Result {
-    const out = try alloc.alloc(Result, 1);
-    errdefer alloc.free(out);
-    out[0] = .{ .text = try alloc.dupe(u8, text) };
-    return out;
-}
-
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
     var cfg = if (credentials_path) |path| blk: {
         break :blk google_auth.configFromFileAlloc(alloc, path, vertex_auth_scope) catch return error.MissingVertexCredentials;
@@ -1223,7 +1172,7 @@ test "reader encodes a large inline image within one request buffer budget" {
 
     var parsed = try std.json.parseFromSlice(inference_api.ReadRequest, alloc, body, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings(image_url, parsed.value.images[0].url);
+    try std.testing.expectEqualStrings(image_url, parsed.value.images.?[0].url);
     try std.testing.expectEqualStrings(prompt, parsed.value.prompt.?);
 }
 
@@ -1428,7 +1377,7 @@ test "vertex reader exchanges service account credentials and sends bearer auth"
             .body = "{\"access_token\":\"vertex-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}",
         } },
         .{ .method = .POST, .path = "/projects/proj-from-json/locations/us-central1/publishers/google/models/gemini-test:generateContent", .assert_request = expectVertexBearer, .respond = .{
-            .body = "{\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"read from vertex\"}]}}]}",
+            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read from vertex\"}]},\"finishReason\":\"STOP\"}]}",
         } },
     });
     defer server.deinit();
@@ -1491,7 +1440,7 @@ test "vertex reader explicit bearer still defaults project id from credentials" 
 
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/projects/proj-from-json/locations/us-central1/publishers/google/models/gemini-test:generateContent", .assert_request = expectExplicitVertexBearer, .respond = .{
-            .body = "{\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"read with explicit auth\"}]}}]}",
+            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read with explicit auth\"}]},\"finishReason\":\"STOP\"}]}",
         } },
     });
     defer server.deinit();
@@ -1601,9 +1550,9 @@ fn expectAntflyReaderBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("reader", parsed.value.model);
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.images.len);
-    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTE=", parsed.value.images[0].url);
-    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTI=", parsed.value.images[1].url);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.images.?.len);
+    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTE=", parsed.value.images.?[0].url);
+    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTI=", parsed.value.images.?[1].url);
     try std.testing.expectEqualStrings("read pages", parsed.value.prompt orelse return error.MissingPrompt);
     try std.testing.expectEqual(@as(?i64, 42), parsed.value.max_tokens);
 }
@@ -1613,27 +1562,280 @@ fn canonicalName(name: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
 }
 
-test "cloud OCR rejects truncated or blocked completions" {
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{ "MAX_TOKENS", "SAFETY", "RECITATION" }) |reason| {
-        const payload = try std.fmt.allocPrint(alloc, "{{\"candidates\":[{{\"finishReason\":\"{s}\",\"content\":{{\"parts\":[{{\"text\":\"partial\"}}]}}}}]}}", .{reason});
-        defer alloc.free(payload);
-        try std.testing.expectError(error.IncompleteReaderResponse, parseVertexTextResultAlloc(alloc, payload));
-    }
-    try std.testing.expectError(error.IncompleteReaderResponse, parseOpenAiTextResultAlloc(alloc, "{\"choices\":[{\"finish_reason\":\"length\",\"message\":{\"content\":\"partial\"}}]}"));
-    try std.testing.expectError(error.IncompleteReaderResponse, parseVertexTextResultAlloc(alloc, "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"unproven\"}]}}]}"));
+/// Canonical whole-document response decoder shared by HTTP and native hosts.
+pub fn documentResults(a: Allocator, json: []const u8) ![]Result {
+    return (try documentBatchResult(a, json)).items;
 }
 
-test "vertex OCR joins all final text parts and excludes thought content" {
-    const alloc = std.testing.allocator;
-    const results = try parseVertexTextResultAlloc(alloc,
-        \\{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"private reasoning","thought":true},{"text":"first\n"},{"text":"second"}]}}]}
-    );
-    defer {
-        for (results) |*result| deinitResult(alloc, result);
-        alloc.free(results);
+/// Parse the document envelope once, preserving completion and aggregate usage.
+pub fn documentBatchResult(a: Allocator, json: []const u8) !BatchResult {
+    return decodeReadBatch(a, json, null);
+}
+
+/// Lossless, shared URI/attachment/document decoder. Image requests enforce
+/// their exact indexed cardinality; document requests retain page order.
+fn decodeReadBatch(a: Allocator, json: []const u8, expected_images: ?usize) !BatchResult {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidReadResultCount;
+    const data = parsed.value.object.get("data") orelse return error.InvalidReadResultCount;
+    if (data != .array or data.array.items.len > 10000) return error.InvalidReadResultCount;
+    if (expected_images) |count| {
+        if (data.array.items.len != count) return error.InvalidReadResultCount;
+        const object = parsed.value.object.get("object") orelse return error.InvalidReadResultCount;
+        const model = parsed.value.object.get("model") orelse return error.InvalidReadResultCount;
+        const counts = parsed.value.object.get("usage") orelse return error.InvalidReadExecutionReport;
+        if (object != .string or model != .string or counts != .object) return error.InvalidReadResultCount;
     }
-    try std.testing.expectEqualStrings("first\nsecond", results[0].text);
+    const out = try a.alloc(Result, data.array.items.len);
+    const assigned = a.alloc(bool, out.len) catch |err| {
+        a.free(out);
+        return err;
+    };
+    defer a.free(assigned);
+    @memset(assigned, false);
+    errdefer {
+        for (out, assigned) |*item, ready| if (ready) deinitResult(a, item);
+        a.free(out);
+    }
+    for (data.array.items, 0..) |row, position| {
+        if (row != .object) return error.InvalidReadResultCount;
+        if (expected_images != null) {
+            const object = row.object.get("object") orelse return error.InvalidReadResultCount;
+            if (object != .string) return error.InvalidReadResultCount;
+        }
+        const index = if (expected_images != null)
+            try readUnsigned(usize, a, row.object.get("index") orelse return error.InvalidReadResultCount)
+        else
+            position;
+        if (index >= out.len or assigned[index]) return error.InvalidReadResultCount;
+        const item = &out[index];
+        const text = row.object.get("text") orelse return error.InvalidReadResultCount;
+        if (text != .string) return error.InvalidReadResultCount;
+        item.* = .{ .text = try a.dupe(u8, text.string) };
+        assigned[index] = true;
+        if (row.object.get("status")) |status| if (status != .null) {
+            if (status != .string) return error.InvalidReadResultCount;
+            item.completion = if (std.mem.eql(u8, status.string, "complete")) .complete else if (std.mem.eql(u8, status.string, "truncated")) .length else if (std.mem.eql(u8, status.string, "unresolved")) .unresolved else return error.InvalidReadResultCount;
+        };
+        if (expected_images == null or row.object.contains("status") or row.object.contains("source_id"))
+            item.document_json = try std.json.Stringify.valueAlloc(a, row, .{});
+        if (row.object.get("source_id")) |id| if (id != .null) {
+            if (id != .string) return error.InvalidReadResultCount;
+            item.item_id = try a.dupe(u8, id.string);
+        };
+        if (row.object.get("number")) |number| if (number != .null) {
+            const n = try readUnsigned(u32, a, number);
+            if (n == 0) return error.InvalidReadResultCount;
+            item.page_number = n;
+        };
+        if (row.object.get("fields")) |value| if (value != .null) {
+            item.fields_json = try std.json.Stringify.valueAlloc(a, value, .{});
+        };
+        if (row.object.get("regions")) |value| if (value != .null) {
+            if (value != .array) return error.InvalidReadResultCount;
+            item.regions_json = try std.json.Stringify.valueAlloc(a, value, .{});
+        };
+    }
+    var usage: ?inference_api.GenerateUsage = null;
+    if (parsed.value.object.get("usage")) |value| {
+        var decoded = try std.json.parseFromValue(inference_api.GenerateUsage, a, value, .{ .ignore_unknown_fields = true });
+        defer decoded.deinit();
+        const counts = decoded.value;
+        if (counts.prompt_tokens < 0 or counts.completion_tokens < 0 or counts.total_tokens < 0) return error.InvalidReadExecutionReport;
+        usage = counts;
+    }
+    var execution = try batchExecutionFromWire(null, out.len);
+    if (parsed.value.object.get("execution")) |value| if (value != .null) {
+        var decoded = try std.json.parseFromValue(inference_api.BatchExecutionReport, a, value, .{ .ignore_unknown_fields = true });
+        defer decoded.deinit();
+        execution = try batchExecutionFromWire(decoded.value, out.len);
+    };
+    return .{ .items = out, .usage = usage, .execution = execution };
+}
+
+fn readUnsigned(comptime T: type, a: Allocator, value: std.json.Value) !T {
+    if (value != .integer and value != .number_string) return error.InvalidReadResultCount;
+    // Typed conversion keeps integer metadata (including exponent notation)
+    // separate from the lossless structured payload. Primitive parsing allocates nothing.
+    return std.json.parseFromValueLeaky(T, a, value, .{}) catch error.InvalidReadResultCount;
+}
+
+/// Plain-text materialization cannot carry completion metadata. Refuse partial
+/// readings before ownership transfer or indexing; compositions opt in explicitly.
+pub fn requireComplete(items: []const Result) !void {
+    for (items) |item| switch (item.completion) {
+        .complete => {},
+        .length => return error.ReadOutputTruncated,
+        .unresolved => return error.DocumentUnresolved,
+    };
+}
+
+test "antfly reader canonical decoding preserves exact fields and indexed completion" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            const bytes =
+                \\{"object":"list","model":"reader","data":[{"object":"read","index":1e0,"text":"Second","status":"unresolved","source_id":"receipt","number":2,"fields":{"amount":9007199254740993.01}},{"object":"read","index":0,"text":"First","status":"truncated","source_id":"receipt","number":1}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5},"execution":{"requested_items":2,"native_batches":0,"native_items":0,"serial_items":2,"fallback_items":0,"rejected_items":0}}
+            ;
+            var batch = try decodeReadBatch(a, bytes, 2);
+            defer batch.deinit(a);
+            try std.testing.expectEqualStrings("First", batch.items[0].text);
+            try std.testing.expectEqual(Completion.length, batch.items[0].completion);
+            try std.testing.expectEqual(Completion.unresolved, batch.items[1].completion);
+            try std.testing.expectEqual(@as(?u32, 2), batch.items[1].page_number);
+            try std.testing.expectEqualStrings("{\"amount\":9007199254740993.01}", batch.items[1].fields_json.?);
+            try std.testing.expect(std.mem.indexOf(u8, batch.items[1].document_json.?, "9007199254740993.01") != null);
+            try std.testing.expectEqual(@as(i64, 5), batch.usage.?.total_tokens);
+            try std.testing.expectError(error.ReadOutputTruncated, requireComplete(batch.items));
+            try std.testing.expectError(error.DocumentUnresolved, requireComplete(batch.items[1..]));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "[{\"object\":\"read\",\"index\":0,\"text\":\"a\"},{\"object\":\"read\",\"index\":0,\"text\":\"b\"}]",
+        "[{\"object\":\"read\",\"index\":2,\"text\":\"a\"},{\"object\":\"read\",\"index\":1,\"text\":\"b\"}]",
+        "[{\"object\":\"read\",\"index\":0.5,\"text\":\"a\"},{\"object\":\"read\",\"index\":1,\"text\":\"b\"}]",
+    }) |data| {
+        const bytes = try std.fmt.allocPrint(a, "{{\"object\":\"list\",\"model\":\"reader\",\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}},\"data\":{s}}}", .{data});
+        defer a.free(bytes);
+        try std.testing.expectError(error.InvalidReadResultCount, decodeReadBatch(a, bytes, 2));
+    }
+}
+
+test "antfly reader URI and encoded transports retain composite completion and exact fields" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Serve = struct {
+        fn run(server: *httpx.TestServer) void {
+            server.handleOne() catch {};
+        }
+    };
+    for (0..3) |mode| {
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/read", .respond = .{ .body = "{\"object\":\"list\",\"model\":\"agent\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"Partial receipt\",\"status\":\"truncated\",\"source_id\":\"image-0\",\"number\":1,\"fields\":{\"amount\":9007199254740993.01}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}" } }});
+        defer server.deinit();
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Serve.run, .{&server});
+        var client = httpx.Client.init(a, io);
+        defer client.deinit();
+        const cfg = Config{ .provider = .antfly, .model = "agent", .api_url = server.baseUrl() };
+        const encoded = EncodedRequest{ .allow_incomplete = mode == 1, .images = &.{.{ .bytes = &.{1}, .mime_type = "image/png", .item_id = "original", .page_number = 8 }} };
+        if (mode == 2) {
+            try std.testing.expectError(error.ReadOutputTruncated, readEncodedWithConfigReported(a, &client, cfg, encoded, .{}));
+        } else {
+            var batch = if (mode == 0)
+                try readWithConfigReported(a, &client, cfg, .{ .images = &.{"https://example.invalid/receipt.png"} }, .{})
+            else
+                try readEncodedWithConfigReported(a, &client, cfg, encoded, .{});
+            defer batch.deinit(a);
+            try std.testing.expectEqual(Completion.length, batch.items[0].completion);
+            try std.testing.expectEqualStrings("{\"amount\":9007199254740993.01}", batch.items[0].fields_json.?);
+            if (mode == 1) {
+                try std.testing.expectEqualStrings("original", batch.items[0].item_id);
+                try std.testing.expectEqual(@as(?u32, 8), batch.items[0].page_number);
+            }
+        }
+        try group.await(io);
+    }
+}
+
+test "document reader decoding preserves completion and usage with allocation rollback" {
+    const Case = struct {
+        fn check(a: Allocator) !void {
+            var batch = try documentBatchResult(a,
+                \\{"data":[{"source_id":"pdf","number":1,"text":"Partial","status":"truncated"},{"source_id":"pdf","number":2,"text":"Uncertain","status":"unresolved"}],"usage":{"prompt_tokens":2,"completion_tokens":7,"total_tokens":9}}
+            );
+            defer batch.deinit(a);
+            try std.testing.expectEqual(Completion.length, batch.items[0].completion);
+            try std.testing.expectEqual(Completion.unresolved, batch.items[1].completion);
+            try std.testing.expectEqual(@as(i64, 9), batch.usage.?.total_tokens);
+            try std.testing.expectEqual(@as(usize, 2), batch.execution.requested_items);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
+}
+
+test "hosted reader initialization rolls back every owned allocation" {
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            var http = httpx.Client.init(a, std.testing.io);
+            defer http.deinit();
+            for ([_]Provider{ .cloudflare, .openai, .vertex }) |provider| {
+                const reader = try initReaderWithOptions(a, &http, .{
+                    .provider = provider,
+                    .account_id = if (provider == .cloudflare) "account" else null,
+                    .gateway_id = if (provider == .cloudflare) "gateway" else null,
+                    .model = if (provider == .cloudflare) "@cf/mistralai/mistral-small-3.1-24b-instruct" else "reader",
+                    .prompt = "Read all text",
+                    .project_id = "project",
+                    .bearer_token = "fixture",
+                }, .{});
+                defer reader.deinit();
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "hosted reader transports enforce complete OCR and retain measured usage for every provider" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Serve = struct {
+        fn run(server: *httpx.TestServer) void {
+            server.handleOne() catch {};
+        }
+    };
+    for ([_]Provider{ .cloudflare, .openai, .vertex }) |provider| {
+        for (0..4) |mode| {
+            const body: []const u8 = if (provider == .vertex) switch (mode) {
+                0 => "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Receipt \"},{\"text\":\"12.50\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":2,\"totalTokenCount\":9}}",
+                1 => "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"finishReason\":\"MAX_TOKENS\"}]}",
+                2 => "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"finishReason\":\"SAFETY\"}]}",
+                else => "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}",
+            } else switch (mode) {
+                0 => "{\"choices\":[{\"message\":{\"content\":\"Receipt 12.50\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}",
+                1 => "{\"choices\":[{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}",
+                2 => "{\"choices\":[{\"message\":{\"content\":null},\"finish_reason\":\"content_filter\"}]}",
+                else => "{\"choices\":[{\"message\":{\"content\":\"partial\"}}]}",
+            };
+            const path = if (provider == .vertex) "/projects/project/locations/us-central1/publishers/google/models/reader:generateContent" else "/chat/completions";
+            var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = path, .respond = .{ .body = body } }});
+            defer server.deinit();
+            var group = std.Io.Group.init;
+            defer group.cancel(io);
+            try group.concurrent(io, Serve.run, .{&server});
+            var client = httpx.Client.init(a, io);
+            defer client.deinit();
+            const cfg = Config{
+                .provider = provider,
+                .account_id = if (provider == .cloudflare) "account" else null,
+                .model = if (provider == .cloudflare) "@cf/mistralai/mistral-small-3.1-24b-instruct" else "reader",
+                .base_url = server.baseUrl(),
+                .bearer_token = "fixture",
+                .project_id = "project",
+            };
+            const request = Request{ .images = &.{"https://example.invalid/receipt.png"}, .max_tokens = 2 };
+            if (mode == 0) {
+                var result = try readWithConfigReported(a, &client, cfg, request, .{});
+                defer result.deinit(a);
+                try std.testing.expectEqualStrings("Receipt 12.50", result.items[0].text);
+                try std.testing.expectEqual(Completion.complete, result.items[0].completion);
+                // Hitting max_tokens alone never establishes truncation.
+                try std.testing.expectEqual(@as(usize, 2), result.items[0].completion_tokens.?);
+                try std.testing.expectEqual(@as(i64, 9), result.usage.?.total_tokens);
+            } else {
+                const reader = try initReader(a, &client, cfg);
+                defer reader.deinit();
+                const expected = if (mode == 1) error.ReadOutputTruncated else error.DocumentUnresolved;
+                if (mode == 2) try std.testing.expectError(expected, reader.read(a, request)) else try std.testing.expectError(expected, reader.readReported(a, request));
+            }
+        }
+    }
 }
 
 test "Vertex OCR preserves legacy defaults and respects pinned modern profiles" {
@@ -1663,3 +1865,9 @@ test "Vertex OCR preserves legacy defaults and respects pinned modern profiles" 
         try std.testing.expectEqualStrings(location, modern_state.location.?);
     }
 }
+
+pub const document_rpc = @import("document_rpc.zig");
+
+pub const testing = document_runs.testing;
+
+pub const document_stream = @import("document_stream.zig");

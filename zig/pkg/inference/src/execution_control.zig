@@ -125,6 +125,9 @@ pub const UninterruptibleGuard = struct {
 /// monotonic clock domain. The legacy check hook is retained so existing
 /// callers can migrate without weakening cancellation coverage.
 pub const InferenceExecutionControl = struct {
+    document_store: @import("antfly_runtime_abi").document_abi.View = .{},
+    document_session: ?*@import("antfly_document_runs").Session = null,
+    document_dispatch_meter: ?*@import("antfly_document_runs").DispatchMeter = null,
     /// Runtime used for cancellation monitors and other structured background
     /// work. HTTP requests always supply their owning runtime; library callers
     /// may omit it when no monitor is required.
@@ -203,12 +206,23 @@ pub const InferenceExecutionControl = struct {
     /// Acquire a process-local execution gate without turning queueing behind
     /// another inference request into an uncancellable wait.
     pub fn lock(self: InferenceExecutionControl, mutex: *std.atomic.Mutex) !void {
+        return self.lockWithPoll(mutex, 0);
+    }
+
+    /// Shared inference epochs can park between gate attempts instead of
+    /// repeatedly yielding during a long GPU step. Cancellation is checked on
+    /// every attempt and after acquiring the gate. Cap each requested sleep
+    /// at 1ms so a caller cannot create an unbounded cancellation interval.
+    /// Existing callers requesting 100us retain that interval.
+    pub fn lockWithPoll(self: InferenceExecutionControl, mutex: *std.atomic.Mutex, poll_ns: u64) !void {
         var spins: usize = 0;
         while (!mutex.tryLock()) {
             try self.check();
             if (spins < 64) {
                 std.atomic.spinLoopHint();
                 spins += 1;
+            } else if (poll_ns != 0) {
+                platform_time.sleepNs(@min(poll_ns, std.time.ns_per_ms));
             } else {
                 @import("antfly_platform").time.yieldNow();
             }
@@ -346,6 +360,8 @@ pub const ExecutionLane = struct {
     tail: ?*Waiter = null,
     owned: bool = false,
     interactive_burst: usize = 0,
+    acquisitions: usize = 0,
+    event_waits: usize = 0,
 
     pub const Lease = struct {
         lane: *ExecutionLane,
@@ -398,7 +414,17 @@ pub const ExecutionLane = struct {
     }
 
     pub fn acquireWithPriority(self: *ExecutionLane, control: InferenceExecutionControl, interactive: bool) !Lease {
-        try control.check();
+        return self.acquireInternal(control, interactive, true);
+    }
+
+    /// Cleanup retains borrowed native state even when its owning Io task is
+    /// already cancelled. Owner release still wakes this waiter immediately.
+    pub fn acquireForCleanup(self: *ExecutionLane, io: ?std.Io, interactive: bool) Lease {
+        return self.acquireInternal(.{ .io = io }, interactive, false) catch unreachable;
+    }
+
+    fn acquireInternal(self: *ExecutionLane, control: InferenceExecutionControl, interactive: bool, comptime cancelable: bool) !Lease {
+        if (cancelable) try control.check();
         var waiter = Waiter{ .io = control.io, .interactive = interactive };
         self.lock();
         if (self.tail) |tail| tail.next = &waiter else self.head = &waiter;
@@ -411,11 +437,12 @@ pub const ExecutionLane = struct {
             self.mutex.unlock();
         }
         while (true) {
-            try control.check();
+            if (cancelable) try control.check();
             self.lock();
             if (!self.owned and self.selected() == &waiter) {
                 self.remove(&waiter);
                 self.owned = true;
+                self.acquisitions += 1;
                 self.interactive_burst = if (interactive) self.interactive_burst +| 1 else 0;
                 self.mutex.unlock();
                 return .{ .lane = self };
@@ -423,8 +450,13 @@ pub const ExecutionLane = struct {
             // A newly queued query can supersede a signaled bulk waiter. Reset
             // under the lane lock so that waiter sleeps without losing a wake.
             waiter.ready.reset();
+            if (control.io != null) self.event_waits += 1;
             self.mutex.unlock();
             if (control.io) |io| {
+                if (!cancelable) {
+                    waiter.ready.waitUncancelable(io);
+                    continue;
+                }
                 // Release signals the next waiter immediately. The bounded
                 // timeout only observes callback cancellation that has no Io
                 // wake capability, and always respects the request deadline.
@@ -554,4 +586,91 @@ test "execution lane wakes a query ahead of queued enrichment" {
     released = true;
     try std.testing.expectEqual(@as(usize, 0), try query.await(std.testing.io));
     try std.testing.expectEqual(@as(usize, 1), try bulk.await(std.testing.io));
+}
+
+test "LightOnOCR3 parked execution gate preserves cancellation and lock ownership" {
+    const Cancel = struct {
+        calls: usize = 0,
+        limit: usize,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls >= self.limit) return error.Cancelled;
+        }
+    };
+    var mutex = std.atomic.Mutex.unlocked;
+    try std.testing.expect(mutex.tryLock());
+    var blocked = Cancel{ .limit = 67 };
+    const waiting = InferenceExecutionControl{ .ptr = &blocked, .check_fn = Cancel.check };
+    const started = platform_time.monotonicNs();
+    try std.testing.expectError(error.Cancelled, waiting.lockWithPoll(&mutex, std.time.ns_per_s));
+    // A caller-supplied second cannot delay each cancellation check by a second.
+    try std.testing.expect(platform_time.monotonicNs() - started < 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 67), blocked.calls);
+    try std.testing.expect(!mutex.tryLock());
+    mutex.unlock();
+    var cancelled = Cancel{ .limit = 1 };
+    const acquired = InferenceExecutionControl{ .ptr = &cancelled, .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, acquired.lockWithPoll(&mutex, 100 * std.time.ns_per_us));
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+    try (InferenceExecutionControl{}).lockWithPoll(&mutex, 100 * std.time.ns_per_us);
+    try std.testing.expect(!mutex.tryLock());
+    mutex.unlock();
+}
+
+test "LightOnOCR3 execution lane cleanup survives cancellation of its owning Io task" {
+    const Worker = struct {
+        fn run(lane: *ExecutionLane, started: *std.Io.Event, done: *std.atomic.Value(bool)) anyerror!void {
+            defer {
+                const cleanup = lane.acquireForCleanup(std.testing.io, true);
+                cleanup.release();
+                done.store(true, .release);
+            }
+            started.set(std.testing.io);
+            return;
+        }
+        fn cancel(future: *std.Io.Future(anyerror!void), entered: *std.atomic.Value(bool)) void {
+            entered.store(true, .release);
+            _ = future.cancel(std.testing.io) catch {};
+        }
+    };
+    var lane: ExecutionLane = .{};
+    const owner = try lane.acquire(.{});
+    var released = false;
+    var started: std.Io.Event = .unset;
+    var done: std.atomic.Value(bool) = .init(false);
+    var pending = try std.testing.io.concurrent(Worker.run, .{ &lane, &started, &done });
+    var cancel_task: ?std.Io.Future(void) = null;
+    var cancel_entered: std.atomic.Value(bool) = .init(false);
+    defer {
+        if (!released) owner.release();
+        if (cancel_task) |*task| task.cancel(std.testing.io);
+        _ = pending.cancel(std.testing.io) catch {};
+    }
+    try started.wait(std.testing.io);
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        lane.lock();
+        const waiting = if (lane.head) |head| @atomicLoad(std.Io.Event, &head.ready, .acquire) == .waiting else false;
+        lane.mutex.unlock();
+        if (waiting) break;
+        if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // Cancel while cleanup is already parked, rather than consuming the Io
+    // cancellation in an earlier operation before entering cleanup.
+    cancel_task = try std.testing.io.concurrent(Worker.cancel, .{ &pending, &cancel_entered });
+    while (!cancel_entered.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    try std.testing.expect(!done.load(.acquire));
+    owner.release();
+    released = true;
+    cancel_task.?.await(std.testing.io);
+    cancel_task = null;
+    try std.testing.expect(done.load(.acquire));
+    try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
 }

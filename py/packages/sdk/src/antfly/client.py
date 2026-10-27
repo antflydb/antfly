@@ -51,6 +51,8 @@ from antfly.client_generated.models import (
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
+    InferenceReadRequest,
+    InferenceReadResponse,
     OllamaEmbedderConfig,
     OpenAIEmbedderConfig,
     QueryResponses,
@@ -404,16 +406,16 @@ def _validate_extraction_v2_response(payload: dict[str, Any], request: dict[str,
         raise ValueError("version 2 response has an invalid schema version")
     if not isinstance(payload.get("model"), str) or payload["model"] != request.get("model"):
         raise ValueError("version 2 response model does not match the request")
-    inputs = request.get("inputs", [])
+    inputs = request.get("inputs", request.get("documents"))
     rows = payload.get("data")
-    if not isinstance(rows, list) or len(rows) != len(inputs):
+    if not isinstance(rows, list) or (inputs is not None and len(rows) != len(inputs)):
         raise ValueError("version 2 response has an invalid item cardinality")
-    for index, (item, row) in enumerate(zip(inputs, rows, strict=True)):
+    for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise ValueError(f"version 2 response item {index} must be an object")
         if "id" in row and not isinstance(row["id"], str):
             raise ValueError(f"version 2 response item {index} id must be a string")
-        if row.get("id") != item.get("id"):
+        if inputs is not None and row.get("id") != inputs[index].get("id"):
             raise ValueError(f"version 2 response item {index} id does not match the request")
 
 
@@ -997,6 +999,25 @@ class AntflyClient:
                 return InferenceDecideResponse.from_dict(payload)
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 raise AntflyException(f"decision returned invalid JSON: {exc}") from exc
+
+    def read(self, request: InferenceReadRequest | Mapping[str, Any]) -> InferenceReadResponse:
+        """Read images or complete documents with a registered reader/composite."""
+        body = request.to_dict() if isinstance(request, InferenceReadRequest) else dict(request)
+        with self._client.get_httpx_client().stream(
+            "POST", "/ai/v1/read", json=body, headers={"Accept": "application/json"}
+        ) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                _raise_inference_error(response)
+            raw, truncated = _read_limited_response(response, self.max_json_response_bytes)
+            if truncated:
+                raise AntflyException(f"read response exceeded {self.max_json_response_bytes} bytes")
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict) or payload.get("object") != "list":
+                    raise ValueError("response must be a canonical read list")
+                return InferenceReadResponse.from_dict(payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise AntflyException(f"read returned invalid JSON: {exc}") from exc
 
     def extract(
         self, request: ExtractionRequest | GeneratedExtractionRequest | Mapping[str, Any]

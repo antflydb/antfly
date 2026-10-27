@@ -23,6 +23,11 @@ class ExtractionStructureFieldType1:
     """
     Attributes:
         type_ (ExtractionStructureFieldType1Type | Unset):
+        decimals (int | Unset): Decimal precision for compatible hosted number fields.
+        unit (str | Unset):
+        min_ (float | Unset): Minimum of a hosted estimate distribution.
+        max_ (float | Unset):
+        step (float | Unset):
         enum (list[str] | Unset):
         dtype (ExtractionStructureFieldType1Dtype | Unset):
         choices (list[str] | Unset):
@@ -35,6 +40,11 @@ class ExtractionStructureFieldType1:
     """
 
     type_: ExtractionStructureFieldType1Type | Unset = UNSET
+    decimals: int | Unset = UNSET
+    unit: str | Unset = UNSET
+    min_: float | Unset = UNSET
+    max_: float | Unset = UNSET
+    step: float | Unset = UNSET
     enum: list[str] | Unset = UNSET
     dtype: ExtractionStructureFieldType1Dtype | Unset = UNSET
     choices: list[str] | Unset = UNSET
@@ -49,6 +59,16 @@ class ExtractionStructureFieldType1:
         type_: str | Unset = UNSET
         if not isinstance(self.type_, Unset):
             type_ = self.type_.value
+
+        decimals = self.decimals
+
+        unit = self.unit
+
+        min_ = self.min_
+
+        max_ = self.max_
+
+        step = self.step
 
         enum: list[str] | Unset = UNSET
         if not isinstance(self.enum, Unset):
@@ -84,6 +104,16 @@ class ExtractionStructureFieldType1:
         field_dict.update({})
         if type_ is not UNSET:
             field_dict["type"] = type_
+        if decimals is not UNSET:
+            field_dict["decimals"] = decimals
+        if unit is not UNSET:
+            field_dict["unit"] = unit
+        if min_ is not UNSET:
+            field_dict["min"] = min_
+        if max_ is not UNSET:
+            field_dict["max"] = max_
+        if step is not UNSET:
+            field_dict["step"] = step
         if enum is not UNSET:
             field_dict["enum"] = enum
         if dtype is not UNSET:
@@ -114,6 +144,16 @@ class ExtractionStructureFieldType1:
             type_ = UNSET
         else:
             type_ = ExtractionStructureFieldType1Type(_type_)
+
+        decimals = d.pop("decimals", UNSET)
+
+        unit = d.pop("unit", UNSET)
+
+        min_ = d.pop("min", UNSET)
+
+        max_ = d.pop("max", UNSET)
+
+        step = d.pop("step", UNSET)
 
         enum = cast(list[str], d.pop("enum", UNSET))
 
@@ -150,6 +190,11 @@ class ExtractionStructureFieldType1:
 
         extraction_structure_field_type_1 = cls(
             type_=type_,
+            decimals=decimals,
+            unit=unit,
+            min_=min_,
+            max_=max_,
+            step=step,
             enum=enum,
             dtype=dtype,
             choices=choices,

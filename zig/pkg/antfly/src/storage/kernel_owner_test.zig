@@ -4458,3 +4458,51 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
 }
+
+test "opaque metadata durable job state reads preserve group cursor and ownership" {
+    const a = std.testing.allocator;
+    const contract = @import("../metadata/job_state.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    const key = "documents/compiled-job-state";
+    const value = "{\"owner\":\"compiled\",\"state\":\"queued\"}";
+    var previous: abi.MetadataProjectionRequest = .{ .kind = .job_state };
+    previous.version = abi.abi_version - 1;
+    var rejected: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_projection(null, &previous, &rejected));
+    try std.testing.expectEqual(@as(u64, 0), rejected.len);
+    try std.testing.expect((try store.getJobState(a, 41, key)) == null);
+    try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 41, "compiled"));
+    try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "", .value = value } });
+    {
+        const found = (try store.getJobState(a, 41, key)).?;
+        defer a.free(found);
+        try std.testing.expectEqualStrings(value, found);
+        try std.testing.expectEqual(@as(u64, 1), try store.getJobOwnerCount(a, 41, "compiled"));
+        try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 42, "compiled"));
+        try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 41, "other"));
+        try std.testing.expect((try store.getJobState(a, 42, key)) == null);
+        const bytes = try store.scanJobState(a, 41, null);
+        defer a.free(bytes);
+        const page = try std.json.parseFromSlice(contract.Page, a, bytes, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
+        try std.testing.expectEqualStrings(key, page.value.rows[0].key);
+        try std.testing.expectEqualStrings(value, page.value.rows[0].value);
+        const rest_bytes = try store.scanJobState(a, 41, "0:0000000000000000:" ++ key);
+        defer a.free(rest_bytes);
+        const rest = try std.json.parseFromSlice(contract.Page, a, rest_bytes, .{});
+        defer rest.deinit();
+        try std.testing.expectEqual(@as(usize, 0), rest.value.rows.len);
+        try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, ""));
+    }
+    store.deinit();
+    store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    const recovered = (try store.getJobState(a, 41, key)).?;
+    defer a.free(recovered);
+    try std.testing.expectEqualStrings(value, recovered);
+}

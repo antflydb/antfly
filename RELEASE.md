@@ -104,6 +104,14 @@ native Linux architectures; portable musl arm64 and macOS arm64 cross-compile
 from the amd64 Linux runner. The macOS build uses the pinned cross-compilation
 SDK and enables Metal and Accelerate.
 
+Release archive jobs prepare pinned Zig source dependencies from the private
+GCS mirror using the controller's authenticated preparation action. Preparation
+and the server/embedded builds share `.zig-cache/release-dependencies/global`;
+release preparation requires the mirror and never falls back to upstream. Every
+package is verified against the source inventory's Zig content hash. The
+short-lived, bucket-scoped reader token is limited to preparation and is not
+passed to the compiler.
+
 ## Pipeline Ownership
 
 Release is split into an untrusted request plane, a default-branch artifact
@@ -126,7 +134,8 @@ credentials.
    the versioned builder inputs.
    The controller first requires that source to declare the supported
    `scripts/release/build-contract.json` schema and all required build paths.
-   With only read permission, it builds the canonical Zig archives,
+   With read-only repository permission and keyless source-mirror read access
+   limited to archive jobs, it builds the canonical Zig archives,
    calls `.github/workflows/cli-package.yml`, extracts `install.sh` and
    `openapi.yaml` directly from the selected Git commit, and uploads the native
    archives, CLI snapshot, commit-bound source snapshot, and
@@ -391,6 +400,9 @@ exist on `main` before a newly introduced label can be used. The suites share
 every product declared by `build-contract.json` through the production archive
 script with the pinned Nix Zig. Linux includes x86-64 and ARM64, GNU and musl;
 Darwin cross-compiles on the Linux x86-64 release runner with the pinned SDK.
+The macOS SDK is pinned to 26.1 (including Metal 4 declarations), while the
+Darwin deployment target remains macOS 15.0. Optional newer Metal paths retain
+runtime OS and device availability checks.
 Both entry workflows can also be dispatched on `main` without publishing.
 Embedded package snapshots record their source policy's wheel platform tags;
 verification preserves historical schema-1 snapshots and does not reinterpret
