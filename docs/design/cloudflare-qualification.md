@@ -1800,3 +1800,15 @@ suite now contains 241 tests. Final diagnostic evaluation independently checks
 all eight journal paths, byte counts and hashes; truncated or substituted
 journals cannot qualify. Hashing streams bounded chunks, with a 256 MiB ceiling
 per journal. The native regression logs preserve both pre-fix failures separately.
+
+
+The first three corrected-pin trials are intentionally interrupted during setup
+because the initial diagnostic classifier incorrectly treats a completed native
+cancellation as unsettled binding I/O. Two controls emit such completed
+cancellations; there are zero observed resource signals across all six profiles,
+and all 24 diagnostic journals verify. These reports stay failed and archived.
+The host now reports the exact `io_draining` state. Actual-workerd coverage checks
+that it is true across a timed-out RPC with held storage and false for the next
+completed caller; a completed native cancellation alone remains recoverable.
+Native artifacts and acceptance thresholds are unchanged by this diagnostic fix.
+The corrected 50,000-document run also completes all nine stages successfully.

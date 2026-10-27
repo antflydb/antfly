@@ -1207,7 +1207,9 @@ changed, duplicate or substituted artifacts fail closed. Journal finalization an
 verification use bounded chunks and a 256 MiB per-stream size ceiling.
 
 
-A native deadline/cancellation can leave non-cancelable binding I/O beyond the
-journal's observation window. Qualification conservatively rejects a population
-with either native failure code, even if an HTTP retry succeeds. It never infers
-a safe late settlement merely because the tail capture has ended.
+The host reports `io_draining` when a request returns with abandoned,
+non-cancelable binding I/O. Qualification rejects a population with that flag,
+even if an HTTP retry succeeds. A completed native cancellation can carry the
+same failure code with `io_draining=false`; it retains ordinary warm retry
+semantics. The failure code alone cannot identify unsettled I/O. The original
+control waits for its transport before native cancellation and remains unchanged.

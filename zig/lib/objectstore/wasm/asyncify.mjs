@@ -220,7 +220,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
       activeOptions = null;
       busy = false;
       const metrics = Object.freeze({outcome, failure_code: failureCode, clock_valid: !invalidClock, clock_refreshes: clockRefreshes, clock_regression_ms: clockRegressionMs, operations, inference_calls: inferenceCalls,
-        transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs,
+        transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs, io_draining: Boolean(draining),
         wasm_linear_bytes: wasm.memory.buffer.byteLength,
         decoded_manifest_cache_hits: Number(wasm.antfly_host_manifest_cache_hits?.() ?? 0)-manifestCacheHitsBefore,
         decoded_manifest_cache_bytes: wasm.antfly_host_manifest_cache_bytes?.() ?? 0,

@@ -141,7 +141,7 @@ for(const mode of ['deadline','abort'])test(`suspended host ${mode} returns befo
  const work=host.request(request('latest'),{signal:controller.signal,deadlineMs:Date.now()+(mode==='deadline'?25:2000),drainTransport:()=>auxiliary,onMetrics:m=>metrics.push(m)}).then(value=>({value}),error=>({error}));await started;if(mode==='abort')controller.abort();
  try{
   const result=await Promise.race([work,new Promise(r=>timer=setTimeout(()=>r({late:true}),500))]);assert.equal(result.late,undefined,'caller must finish while underlying storage is still suspended');assert.match(result.error.message,mode==='deadline'?/DeadlineExceeded/:/Canceled/);assert.equal(host.usable(),false);assert.equal(bucket.writes,0);
-  const draining=host.draining();assert.ok(draining);assert.equal(result.error.ioSettled,draining);release();await new Promise(r=>setTimeout(r,0));assert.ok(host.draining(),'all auxiliary prefetch must settle before releasing the reservation');releaseAux();await draining;assert.equal(host.draining(),null);assert.equal(metrics.length,1);assert.equal(metrics[0].failure_code,mode==='deadline'?'DeadlineExceeded':'Canceled');
+  const draining=host.draining();assert.ok(draining);assert.equal(result.error.ioSettled,draining);release();await new Promise(r=>setTimeout(r,0));assert.ok(host.draining(),'all auxiliary prefetch must settle before releasing the reservation');releaseAux();await draining;assert.equal(host.draining(),null);assert.equal(metrics.length,1);assert.equal(metrics[0].failure_code,mode==='deadline'?'DeadlineExceeded':'Canceled');assert.equal(metrics[0].io_draining,true);
  }finally{clearTimeout(timer);release();releaseAux();await work;await host.draining();}
 });
 

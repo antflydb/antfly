@@ -36,9 +36,9 @@ export class DiagnosticCoverage{
   for(const error of event.exceptions??[])if(resourceFailureCode(error.message))row.resource_failures++;
   for(const log of event.logs??[])for(const message of log.message??[]){let value;try{value=JSON.parse(message);}catch{continue;}
    if(resourceFailureCode(value.failure_code)||resourceFailureCode(value.error)||value.physical?.resource_failures>0)row.resource_failures++;
-   // A native timeout can leave non-cancelable binding I/O beyond the audit
-   // window. Reject this population rather than assume its late result is safe.
-   if(['DeadlineExceeded','Canceled'].includes(value.failure_code))row.gap=true;
+   // The host reports actual abandoned binding I/O. Completed native
+   // cancellations have no such uncertainty and retain ordinary retry policy.
+   if(value.io_draining===true)row.gap=true;
   }
  }
  report(){const streams=this.streams.map(row=>({...row}));return{passed:streams.length===8&&streams.every(s=>s.connected&&!s.gap&&s.resource_failures===0),streams};}
