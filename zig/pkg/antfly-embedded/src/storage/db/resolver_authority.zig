@@ -3968,8 +3968,8 @@ test "native resolver authority effective root pin membership skips dense split 
     defer arena.deinit();
     const a = arena.allocator();
     for ([_]usize{ 100, 1000 }) |count| {
-        var memory: TestMemory = .{ .a = a };
-        const store: Store = .{ .a = a, .prefix = try std.fmt.allocPrint(a, "dense-split-{d}/", .{count}), .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+        var memory: OrderedPinMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = try std.fmt.allocPrint(a, "dense-split-{d}/", .{count}), .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
         const template = "entity/{{_key}}";
         const aliases = try a.alloc(resolver.KeyAlias, count);
         const pairs = try a.alloc(c.Pair, count);
@@ -4202,8 +4202,8 @@ test "resolver curation pin join excludes ten thousand unrelated overrides cold 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var memory: TestMemory = .{ .a = a };
-    const store: Store = .{ .a = a, .prefix = "pin-join-large/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "pin-join-large/", .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
     const aliases = try a.alloc(resolver.KeyAlias, 10000);
     const natives = try a.alloc(resolver.KeyAlias, aliases.len);
     for (aliases, natives, 0..) |*alias, *edge, i| {
