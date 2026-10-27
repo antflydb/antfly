@@ -40709,8 +40709,13 @@ test "metal_compute: native dense views compose across host and device consumers
 fn testNativeDenseMaterializationAllocationFailures(allocator: std.mem.Allocator) !void {
     const bytes = [_]u8{ 0x80, 0x3f, 0x00, 0x40 };
     const source = try testNativeDenseTensor(allocator, &bytes, .bf16, &.{2}, false);
-    var fake_ctx: u8 align(@alignOf(MetalCompute)) = 0;
-    defer MetalCompute.freeOp(&fake_ctx, source);
+    var store = testMetalWeightStoreInit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    var provider: MetalCompute.ProviderImpl = undefined;
+    provider.raw_decode_runtime = null;
+    var compute = MetalCompute{ .allocator = allocator, .data = &store, .provider_impl = &provider };
+    defer compute.deinitWeightCaches();
+    defer MetalCompute.freeOp(&compute, source);
     const values = try MetalCompute.hostSliceForBuf(MetalCompute.toBuf(source));
     try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, values);
 }
@@ -45446,10 +45451,15 @@ test "metal_compute: toFloat32 materializes zero-copy bf16 weights" {
         .native_dense_bytes = bytes[0..],
         .native_dense_dtype = .bf16,
     };
-    var fake_ctx: u8 align(@alignOf(MetalCompute)) = 0;
-    defer if (buf.native_dense_host_cache) |cache| MetalCompute.freeOp(&fake_ctx, cache);
+    var store = testMetalWeightStoreInit(std.testing.allocator);
+    defer store.lazy_weights.deinit(std.testing.allocator);
+    var provider: MetalCompute.ProviderImpl = undefined;
+    provider.raw_decode_runtime = null;
+    var compute = MetalCompute{ .allocator = std.testing.allocator, .data = &store, .provider_impl = &provider };
+    defer compute.deinitWeightCaches();
+    defer if (buf.native_dense_host_cache) |cache| MetalCompute.freeOp(&compute, cache);
 
-    const values = try MetalCompute.toFloat32Op(&fake_ctx, @ptrCast(&buf), std.testing.allocator);
+    const values = try MetalCompute.toFloat32Op(&compute, @ptrCast(&buf), std.testing.allocator);
     defer std.testing.allocator.free(values);
 
     try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.5, 0.5, 3.0 }, values);

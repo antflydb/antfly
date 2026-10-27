@@ -47322,9 +47322,18 @@ test "metal native decoder runtime bf16 fused gate up preserves scalar FFN tails
     // production rollout. Enable BF16_VECTOR_LOADS and TRACE_DENSE_LINEAR_SHAPES
     // to qualify vector fusion at M64/M511, mixed tails and offset260 fallback.
     for ([_]Case{
-        .{ .rows = 32 },                      .{ .rows = 33 },                     .{ .rows = 64 },                                  .{ .rows = 65 },
-        .{ .rows = 128 },                     .{ .rows = 129 },                    .{ .rows = 511 },                                 .{ .rows = 64, .k = 128, .n = 128 },
-        .{ .rows = 511, .k = 128, .n = 128 }, .{ .rows = 65, .k = 132, .n = 133 }, .{ .rows = 64, .k = 128, .n = 128, .guard = 65 },
+        .{ .rows = 1, .k = 128, .n = 128 },
+        .{ .rows = 32 },
+        .{ .rows = 33 },
+        .{ .rows = 64 },
+        .{ .rows = 65 },
+        .{ .rows = 128 },
+        .{ .rows = 129 },
+        .{ .rows = 511 },
+        .{ .rows = 64, .k = 128, .n = 128 },
+        .{ .rows = 511, .k = 128, .n = 128 },
+        .{ .rows = 65, .k = 132, .n = 133 },
+        .{ .rows = 64, .k = 128, .n = 128, .guard = 65 },
     }) |case| {
         const rows = case.rows;
         const k = case.k;
@@ -47371,7 +47380,10 @@ test "metal native decoder runtime bf16 fused gate up preserves scalar FFN tails
         {
             try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_should_apply_bf16_gate_up(runtime, 0, 1, guard * 4, rows, k, n));
         }
-        for ([_]usize{ 0, 1, 31, std.math.maxInt(usize) }) |unsupported_rows| {
+        // The aligned single-row GEMV is supported independently of the
+        // tiled multi-row path. Unaligned tails still decline that route.
+        try std.testing.expectEqual(@as(c_int, if (k % 128 == 0 and n % 128 == 0) 1 else 0), termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, 1, k, n));
+        for ([_]usize{ 0, 31, std.math.maxInt(usize) }) |unsupported_rows| {
             try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, unsupported_rows, k, n));
         }
         try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, rows, k + 1, n));

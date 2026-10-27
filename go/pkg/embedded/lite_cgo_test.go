@@ -1637,7 +1637,7 @@ func TestLiteNativeRemoteProviderSemanticSearchMatchesDogfoodRequestShape(t *tes
 // GET capability probe) with 404, which the client tolerates.
 func newFakeAntflyExtractServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(fakeDocumentExtractHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/extract") {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -1889,7 +1889,7 @@ func TestLiteNativeGraphEdgesFromExtractionArtifact(t *testing.T) {
 // enrichment_runtime.zig) rather than only its inline-text fallback.
 func newFakeAntflyExtractServerBoundaryV2(t *testing.T) *httptest.Server {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(fakeDocumentExtractHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/extract") {
 			w.WriteHeader(http.StatusNotFound)
 			return
