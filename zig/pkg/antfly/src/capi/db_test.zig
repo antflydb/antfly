@@ -5243,59 +5243,77 @@ test "capi native idle maintenance verifies allocator outside connection and wri
     const a = std.testing.allocator;
     const native = @import("antfly_local_sources").storage_lite_native;
     inline for (.{ false, true }) |cancel| {
-        var directory = try TestDirectory.init("capi-allocator-proof-gates");
-        defer directory.cleanup();
-        const path = try tempTestAflitePath(a, directory.path(), "database");
-        defer a.free(path);
-        defer cleanupTestFile(path);
-        var options: capi.OpenOptions = .{};
-        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
-        options.storage_kind = capi.storage_kind_lite;
-        options.profile = capi.profile_hosted;
-        var handle: ?*anyopaque = null;
-        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
-        defer antfly_db_close(handle);
-        const owner = blk: {
-            const guard = public.enterHandle(handle, .exclusive).?;
-            defer guard.leave();
-            guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
-            break :blk guard.connection.?.owner;
-        };
-        const Owner = @TypeOf(owner.*);
-        const Probe = struct {
-            owner: *Owner,
-            calls: usize = 0,
-            failure: ?anyerror = null,
-            fn notify(ptr: *anyopaque, _: *native.NativeFile) void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                self.calls += 1;
-                if (!self.owner.gate.mutex.tryLock()) {
-                    self.failure = error.TestUnexpectedResult;
-                    return;
+        inline for (.{ false, true }) |replace| {
+            var directory = try TestDirectory.init("capi-allocator-proof-gates");
+            defer directory.cleanup();
+            const path = try tempTestAflitePath(a, directory.path(), "database");
+            defer a.free(path);
+            defer cleanupTestFile(path);
+            var options: capi.OpenOptions = .{};
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+            options.storage_kind = capi.storage_kind_lite;
+            options.profile = capi.profile_hosted;
+            var handle: ?*anyopaque = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+            defer antfly_db_close(handle);
+            const owner = blk: {
+                const guard = public.enterHandle(handle, .exclusive).?;
+                defer guard.leave();
+                guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+                break :blk guard.connection.?.owner;
+            };
+            const Owner = @TypeOf(owner.*);
+            const Probe = struct {
+                owner: *Owner,
+                calls: usize = 0,
+                failure: ?anyerror = null,
+                fn notify(ptr: *anyopaque, _: *native.NativeFile) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.inspect() catch |err| {
+                        self.failure = err;
+                    };
                 }
-                self.owner.gate.mutex.unlock(shared.handleLockIo());
-                var lease = native.lockWriterPathWithIo(std.testing.allocator, shared.handleLockIo(), self.owner.path) catch |err| {
-                    self.failure = err;
-                    return;
-                };
-                lease.close();
-                if (cancel) self.owner.verification_cancel.request();
+                fn inspect(self: *@This()) !void {
+                    self.calls += 1;
+                    if (!self.owner.gate.mutex.tryLock()) return error.TestUnexpectedResult;
+                    defer self.owner.gate.mutex.unlock(shared.handleLockIo());
+                    var lease = try native.lockWriterPathWithIo(std.testing.allocator, shared.handleLockIo(), self.owner.path);
+                    defer lease.close();
+                    if (replace) {
+                        const previous = self.owner.current.?;
+                        {
+                            // Model a captured mutating runtime forcing refresh.
+                            // The independent proof must keep its borrowed owner
+                            // alive even after the mutating capture is released.
+                            previous.maintenance_references += 1;
+                            defer previous.maintenance_references -= 1;
+                            try std.testing.expect(try self.owner.refresh() != previous);
+                        }
+                        self.owner.collectRetired();
+                        try std.testing.expectEqual(@as(usize, 1), self.owner.retired.items.len);
+                    }
+                    if (cancel) self.owner.verification_cancel.request();
+                }
+            };
+            var probe: Probe = .{ .owner = owner };
+            owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
+            defer owner.test_after_allocator_capture = null;
+            if (cancel) {
+                try std.testing.expectError(error.MaintenanceCanceled, owner.maintenanceTurnForTest());
+            } else {
+                try std.testing.expect(try owner.maintenanceTurnForTest());
             }
-        };
-        var probe: Probe = .{ .owner = owner };
-        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
-        defer owner.test_after_allocator_capture = null;
-        if (cancel) {
-            try std.testing.expectError(error.MaintenanceCanceled, owner.maintenanceTurnForTest());
-        } else {
-            try std.testing.expect(try owner.maintenanceTurnForTest());
+            if (probe.failure) |err| return err;
+            try std.testing.expectEqual(@as(usize, 1), probe.calls);
+            // Completion must release the retired proof owner before another API call.
+            try std.testing.expectEqual(@as(usize, 0), owner.retired.items.len);
+            const guard = public.enterHandle(handle, .read).?;
+            defer guard.leave();
+            // Reopening can change the header fence; only inherit an exact proof.
+            if (!replace) try std.testing.expectEqual(!cancel, guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            try std.testing.expectEqual(@as(usize, 0), guard.handle.maintenance_references);
+            try std.testing.expectEqual(@as(usize, 0), guard.handle.allocator_verification_references);
         }
-        if (probe.failure) |err| return err;
-        try std.testing.expectEqual(@as(usize, 1), probe.calls);
-        const guard = public.enterHandle(handle, .read).?;
-        defer guard.leave();
-        try std.testing.expectEqual(!cancel, guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
-        try std.testing.expectEqual(@as(usize, 0), guard.handle.maintenance_references);
     }
 }
 
