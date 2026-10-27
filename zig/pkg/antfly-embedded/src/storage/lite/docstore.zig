@@ -3727,6 +3727,15 @@ pub const Txn = struct {
         return .{ .parent = self, .workspace = workspace, .scratch = @import("result_scratch.zig").Scratch.init(allocator, 256 * 1024) };
     }
 
+    /// The caller must retain this read transaction while comparing identities
+    /// against a later checkpoint, so record-page reuse cannot create ABA.
+    pub fn valueIdentity(self: *Txn, key: []const u8) !?u64 {
+        if (!self.read_only or self.pending_count != 0) return error.InvalidArgument;
+        const lookup_key = try self.prefixedKey(key);
+        defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
+        return (try self.readFile()).documentReferenceAtCheckpoint(self.checkpoint, lookup_key);
+    }
+
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
         const lookup_key = try self.prefixedKey(key);
         defer if (self.prefix.len > 0) self.allocator.free(lookup_key);

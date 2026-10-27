@@ -126,27 +126,29 @@ fn producerDefinitions(hash: *Hash, alloc: std.mem.Allocator, enrichments: []con
             @import("catalog/resolver_catalog.zig").catalogRows(parsed.value) catch return error.InvalidArtifactCatalogCommand
         else
             parsed.value;
-        const rows = try std.json.parseFromSliceLeaky(std.json.Value, projection_arena.allocator(), try std.json.Stringify.valueAlloc(projection_arena.allocator(), raw_rows, .{}), .{});
+        const rows = raw_rows;
         if (rows != .array) return error.InvalidArtifactCatalogCommand;
         const dictionary = if (parsed.value == .object) parsed.value.object.get("projections") else null;
-        if (dictionary) |projections| for (rows.array.items) |*row| {
-            const reference = row.object.get("projection_ref") orelse continue;
-            if (reference != .string or projections != .object) return error.InvalidArtifactCatalogCommand;
-            const projection = projections.object.get(reference.string) orelse return error.InvalidArtifactCatalogCommand;
-            // Work on an arena-owned copy; physical dictionary references are
-            // not part of the logical producer contract.
-            row.* = try std.json.parseFromSliceLeaky(std.json.Value, projection_arena.allocator(), try std.json.Stringify.valueAlloc(projection_arena.allocator(), row.*, .{}), .{});
-            _ = row.object.swapRemove("projection_ref");
-            const curation = projection.object.get("curation_json") orelse return error.InvalidArtifactCatalogCommand;
-            if (curation != .string) return error.InvalidArtifactCatalogCommand;
-            if (curation.string.len != 0) try row.object.put(projection_arena.allocator(), "curation_json", curation);
-        };
         if (rows.array.items.len == 0) continue; // Preserve main/v14 empty-family identity.
         const Entry = struct { name: []const u8, value: std.json.Value };
         const entries = try alloc.alloc(Entry, rows.array.items.len);
         defer alloc.free(entries);
-        for (rows.array.items, entries) |value, *entry| {
-            if (value != .object) return error.InvalidArtifactCatalogCommand;
+        for (rows.array.items, entries) |raw_value, *entry| {
+            if (raw_value != .object) return error.InvalidArtifactCatalogCommand;
+            var value = raw_value;
+            if (dictionary) |projections| if (value.object.get("projection_ref")) |reference| {
+                if (reference != .string or projections != .object) return error.InvalidArtifactCatalogCommand;
+                const projection = projections.object.get(reference.string) orelse return error.InvalidArtifactCatalogCommand;
+                if (projection != .object) return error.InvalidArtifactCatalogCommand;
+                const curation = projection.object.get("curation_json") orelse return error.InvalidArtifactCatalogCommand;
+                if (curation != .string) return error.InvalidArtifactCatalogCommand;
+                // Borrow immutable aliases, strings and shared projection data.
+                // Only the row's field map changes; serializing and reparsing
+                // whole catalogs multiplies the maintenance working set.
+                value.object = try value.object.clone(projection_arena.allocator());
+                _ = value.object.swapRemove("projection_ref");
+                if (curation.string.len != 0) try value.object.put(projection_arena.allocator(), "curation_json", curation);
+            };
             const name = value.object.get("name") orelse return error.InvalidArtifactCatalogCommand;
             if (name != .string or name.string.len == 0) return error.InvalidArtifactCatalogCommand;
             entry.* = .{ .name = name.string, .value = value };

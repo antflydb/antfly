@@ -81,8 +81,7 @@ pub fn configureBrowserModule(
 }
 const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 const addFilteredTestRunArtifact = @import("../antfly/test_support.zig").addFilteredTestRunArtifact;
-const addFilteredTestRunArtifactWithRuntimeFilters = @import("../antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
-const addCuratedTestRunArtifact = @import("../antfly/test_support.zig").addCuratedTestRunArtifact;
+const linked_tests = @import("../../pkg/antfly/build/linked_tests.zig");
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 const selectTestFilters = @import("../antfly/test_support.zig").selectTestFilters;
 
@@ -610,12 +609,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "inline resolver replacement",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
-    const memory_capi_check = b.addTest(.{ .name = "memory-capi-check", .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
-    b.step("memory-capi-check", "Compile native memory C ABI persistence tests").dependOn(&memory_capi_check.step);
-    const memory_capi_tests = b.addTest(.{ .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
-    b.step("memory-capi-test", "Verify native memory persistence through the public C ABI").dependOn(&addFilteredTestRunArtifact(b, memory_capi_tests).step);
+    const memory_capi_check = linked_tests.add(b, .{ .name = "memory-capi-check", .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("memory-capi-check", "Compile native memory C ABI persistence tests").dependOn(&memory_capi_check.object.step);
+    const memory_capi_tests = linked_tests.add(b, .{ .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("memory-capi-test", "Verify native memory persistence through the public C ABI").dependOn(&capiTestRun(b, memory_capi_tests, &.{"capi native memory"}, false).step);
     const capi_compile_filters = capi_default_filters ++ capi_model_filters;
-    const capi_tests = b.addTest(.{
+    const capi_tests = linked_tests.add(b, .{
         .name = @import("../../pkg/antfly/build/test_owner_names.zig").capi_contract,
         .root_module = capi_root_mod,
         // Keep this consumer's measured native floor separate from its
@@ -630,14 +629,14 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // Share compilation and its memory admission between hermetic API contracts
     // and explicit model qualification. Installed models must not silently
     // change the cost or selection of the ordinary unit gate.
-    const run_capi_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, capi_tests, selectTestFilters(b, &capi_default_filters));
+    const run_capi_tests = capiTestRun(b, capi_tests, &capi_default_filters, false);
     run_capi_tests.addArgs(&.{ "--skip-test-filter", "capi local model " });
     // The remote-content boundary fixture shares this C API compilation.
     // Its focused target remains independently selectable; the unit gate runs
     // it once through capi_default_filters.
     b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
-        .dependOn(&addCuratedTestRunArtifact(b, capi_tests, &.{"storage owner remote content source"}).step);
-    const run_capi_models = addCuratedTestRunArtifact(b, capi_tests, &capi_model_filters);
+        .dependOn(&capiTestRun(b, capi_tests, &.{"storage owner remote content source"}, true).step);
+    const run_capi_models = capiTestRun(b, capi_tests, &capi_model_filters, true);
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")
         .dependOn(&run_capi_models.step);
@@ -710,4 +709,16 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .run_cabi_packaging_tests = run_cabi_packaging_tests,
         .run_capi_tests = run_capi_tests,
     };
+}
+
+// C ABI consumers use the same independently emitted test objects and native
+// final links as other runtime-owner tests. In particular, large Mach-O Debug
+// images must not send C/ObjC provider relocations through Zig's direct linker.
+fn capiTestRun(b: *std.Build, artifact: linked_tests.Artifact, filters: []const []const u8, curated: bool) *std.Build.Step.Run {
+    const support = @import("../antfly/test_support.zig");
+    const run = b.addRunArtifact(artifact.executable);
+    support.configureTestRun(run);
+    if (curated) for (filters) |filter| run.addArgs(&.{ "--suite-filter", filter });
+    support.addRuntimeTestFilters(b, run, support.selectTestFilters(b, filters));
+    return run;
 }
