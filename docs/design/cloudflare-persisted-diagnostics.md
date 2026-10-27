@@ -8,7 +8,9 @@ filter, and receives the same session ID and expiry each time. Both connections
 can therefore fail together. Existing failed reports remain failed.
 
 Cloudflare's persisted Workers Logs query API is the next diagnostic source to
-evaluate. The current account credential returns HTTP `403`, code `10000`.
+evaluate. The original Wrangler credential returns HTTP `403`, code `10000`;
+the subsequently supplied observability token passes the access probe with
+HTTP `200`. Authorization is no longer the diagnostic blocker.
 The documented permission for its query endpoint is **Workers Observability
 Write**. The probe below uses `dry: true`, an aggregate count, an exact disposable
 Worker filter and a one-hour time range; it does not create a saved query or
@@ -74,11 +76,9 @@ resource/gap counters. Total artifact bytes are bounded to 256 MiB. Truncated,
 substituted or missing files fail verification. Existing failed gate evidence
 is never repaired or overwritten.
 
-This collector is implemented and covered by adversarial local fixtures, but
-has **not been verified against live API responses**: the requested token is
-still absent. Provider field conventions are strict hypotheses until the live
-probe confirms them. The CLI always reports `qualification: false`, and the
-gate evaluator does not accept these artifacts as a substitute for live tails.
+This collector is covered by adversarial fixtures and selected live API checks.
+The CLI always reports `qualification: false`, and the gate evaluator does not
+accept these artifacts as a substitute for live tails.
 Stable query counts only prove consistency of the stored result set; they do
 not prove the platform stored every invocation.
 
@@ -89,6 +89,52 @@ retention measurements, settled-window scheduling with boundary deduplication,
 and late-error reconciliation across the entire measured execution. A quiet
 role with zero stored events is not a coverage proof. None of those requirements
 can be replaced by two matching query results or a newly permissive token.
+
+## Live access and schema checks
+
+The supplied private token succeeds against the scoped query endpoint. No
+additional permissions are needed for these probes. Live responses expose
+three compatibility defects in the initial offline collector:
+
+- `view` belongs at the request root. Placing it inside `parameters` is silently
+  ignored: an events request returns calculations instead of log rows.
+- Actual custom console logs use metadata type `cf-worker`, alongside invocation
+  type `cf-worker-event`. The decoder retains `cf-worker-log` compatibility and
+  rejects unknown types.
+- Serialized metric objects must not be treated as exception text. Combining
+  `cpuTimeMs` and a later memory-limit field name in serialized JSON falsely
+  matches a broad CPU-error recognizer. Only the provider's actual error field
+  becomes an exception; structured logs retain their existing sanitizer. The
+  initial probe's 134 apparent CPU failures were parser false positives, not
+  source Worker resource failures. That failed probe stays preserved.
+
+The API also returns an average sample interval of zero for zero matched rows.
+The collector accepts that only with exact zero counts, an independently empty
+events page and a repeated zero count. This establishes an empty stored set,
+not unsampled delivery or workload coverage.
+
+On historical window `1793122393713..1793122453713`, two separated baseline-writer
+queries reconcile 639 events / 145 invocations, with identical sanitized event
+hashes and zero observed resource failures, terminal invocation errors or gaps. All eight current script-settings
+responses confirm logging, invocation logs and persistence enabled, with both
+root and log head-sampling rates equal to one.
+
+Nevertheless, this historical window reports query ABR level one but ingestion
+sample intervals above one: baseline builder `1.100558659217877`, candidate app
+`1.0895522388059702`, writer `1.0833333333333333`, and builder
+`1.3333333333333333`. The candidate reader has zero matched events. These are
+not authorization failures. The collector correctly rejects the sampled
+population with `DiagnosticIngestionSampled`; configured rates alone cannot
+prove complete delivery. Cloudflare's [query API](https://developers.cloudflare.com/api/resources/workers/subresources/observability/subresources/telemetry/methods/query/)
+documents ingestion sampling separately from query ABR. The cause of the
+historical sampling is not established by current settings; no account quota,
+billing, sampling policy, Worker deployment or acceptance threshold was changed.
+
+The next coverage prerequisite is a controlled active window with verified
+unsampled delivery and independent invocation accounting, or a durable capture
+path that meets the same requirements. The existing sampled history cannot
+establish the missing events retroactively. Eight-role whole-execution
+qualification remains incomplete; all reserved cold epochs remain unused.
 
 References: [Workers Query Builder](https://developers.cloudflare.com/workers/observability/query-builder/)
 and [telemetry query API](https://developers.cloudflare.com/api/resources/workers/subresources/observability/subresources/telemetry/methods/query/).

@@ -11,9 +11,10 @@ Worker tests, the 16,384-row metadata fixture, the 1,000-document reindex
 fixture and both frozen ANN comparisons. Earlier 50,000-document passes and the
 post-main-merge fixture refresh are distinguished below. The three-pair live gate remains
 unpassed. The approved control is `c44896ac8c` with its original native modules.
-Live trials are paused after reproducing shared provider tail resets. The next
-diagnostic backend needs the account permission described in the
-[persisted diagnostic access proposal](cloudflare-persisted-diagnostics.md).
+Live trials are paused after reproducing shared provider tail resets. The
+dedicated observability token now passes API access; historical ingestion
+sampling still prevents complete coverage. See the
+[persisted diagnostic findings](cloudflare-persisted-diagnostics.md).
 
 ## Durability and collection
 
@@ -1868,7 +1869,9 @@ The [persisted diagnostic collector](cloudflare-persisted-diagnostics.md) now
 has bounded pagination, query/ingestion sampling checks, before/after counts,
 two separated snapshots and independent sixteen-artifact verification. It is
 not connected to the gate evaluator and always reports `qualification: false`.
-Its live schema/delivery checks remain blocked by the absent observability token.
+The supplied observability token now passes access and selected live schema
+checks. Historical ingestion sampling still prevents complete coverage; see the
+[live persisted-log findings](cloudflare-persisted-diagnostics.md#live-access-and-schema-checks).
 
 Candidate 3 is deployed at `2151adfdf1227e292890e85b186779243cce3e95` over its
 existing diagnostic corpus, preserving the approved baseline bundles. A new
@@ -1905,5 +1908,5 @@ most 871 operations and 28,867,885 transferred bytes per request, inside the
 unchanged budgets. The fixture appends 21,526,325,594 bytes to its local backing
 file and removes it on completion. This is local native capacity evidence,
 not a total-isolate-memory or live latency result. The refreshed evidence
-manifest binds 22 artifacts to the new native module; the prior manifest and
+manifest binds 27 artifacts to the new native module; the prior manifests and
 all original report files remain preserved.

@@ -31,10 +31,10 @@ export function persistedWindowQuery(run, role, timeframe, {view = 'events', off
   if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 0 || from >= to || to - from > 60000) fail('InvalidDiagnosticWindow');
   if (offset !== undefined && (typeof offset !== 'string' || !/^[\w-]{1,256}$/.test(offset))) fail('InvalidDiagnosticCursor');
   return {
-    queryId: crypto.randomUUID(), dry: true, timeframe: {from, to}, limit: 1000,
+    queryId: crypto.randomUUID(), dry: true, view, timeframe: {from, to}, limit: 1000,
     ...(view === 'calculations' ? {chartType: 'aggregate'} : {}),
     ...(offset === undefined ? {} : {offset, offsetDirection: 'next'}),
-    parameters: {view, filterCombination: 'and',
+    parameters: {filterCombination: 'and',
       filters: [{key: '$metadata.service', type: 'string', operation: 'eq', value: run.id + (role === 'app' ? '' : '-' + role)}],
       ...(view === 'calculations' ? {calculations: [{operator: 'count', alias: 'events'}]} : {}),
     },
@@ -46,7 +46,7 @@ export function sanitizePersistedEvent(row, worker, timeframe) {
   if (!metadata || metadata.service !== worker || context?.scriptName && context.scriptName !== worker ||
       typeof metadata.id !== 'string' || !/^[\w-]{1,256}$/.test(metadata.id) ||
       !Number.isSafeInteger(row.timestamp) || row.timestamp < timeframe.from || row.timestamp > timeframe.to) fail('DiagnosticEventScopeMismatch');
-  if (!['cf-worker-event', 'cf-worker-log'].includes(metadata.type)) fail('DiagnosticEventSchemaUnknown');
+  if (!['cf-worker-event', 'cf-worker', 'cf-worker-log'].includes(metadata.type)) fail('DiagnosticEventSchemaUnknown');
   const invocation = metadata.type === 'cf-worker-event';
   if (invocation && !['ok', 'exception', 'canceled', 'exceededMemory', 'exceededCpu'].includes(context?.outcome)) fail('DiagnosticOutcomeUnknown');
   const requestId = metadata.requestId ?? context?.requestId;
@@ -62,7 +62,10 @@ export function sanitizePersistedEvent(row, worker, timeframe) {
   const event = sanitizeTailEvent({outcome: invocation ? context.outcome : undefined,
     truncated: context?.truncated === true,
     logs: [{timestamp: row.timestamp, message: messages.filter(v => typeof v === 'string')}],
-    exceptions: messages.map(message=>({name:'Error',message})),
+    // Only the provider's error field is an exception. Scanning serialized
+    // metric objects as error text misclassifies cpuTimeMs + memory_limit
+    // field names as a CPU-limit failure.
+    ...(typeof metadata.error==='string'?{exceptions:[{name:'Error',message:metadata.error}]}:{}),
   }) ?? {};
   return {event_id_sha256: digest(metadata.id), invocation_id_sha256: digest(requestId), timestamp: row.timestamp, invocation, event};
 }
@@ -103,14 +106,19 @@ export async function collectPersistedWindow(run, role, token, timeframe, {fetch
     const result = await query('calculations'), calculations = result.calculations;
     if (!Array.isArray(calculations) || calculations.length !== 1 || calculations[0].alias !== 'events' || calculations[0].aggregates?.length !== 1) fail('DiagnosticCountSchemaUnknown');
     const aggregate = calculations[0].aggregates[0];
-    if (aggregate.sampleInterval !== 1) fail('DiagnosticIngestionSampled');
     if (!Number.isSafeInteger(aggregate.value) || aggregate.value < 0 || aggregate.value > 20000 || aggregate.count !== aggregate.value) fail('DiagnosticCountInvalid');
+    // The live API reports zero average interval for no matched events. It
+    // conveys no sampling/delivery evidence; pagination and the final count
+    // still must independently confirm an empty stored set.
+    if(aggregate.value===0&&aggregate.sampleInterval===0)return 0;
+    if (aggregate.sampleInterval !== 1) fail('DiagnosticIngestionSampled');
     return aggregate.value;
   }
   const before = await count(), rows = [], seen = new Set(), invocations = new Set(); let offset;
   for (;;) {
     const result = await query('events', offset), page = result.events;
-    if (page?.count !== before || !Array.isArray(page.events) || page.events.length > 1000) fail('DiagnosticCountChanged');
+    if (!page || !Array.isArray(page.events) || page.events.length > 1000) fail('DiagnosticEventsSchemaUnknown');
+    if (page.count !== before) fail('DiagnosticCountChanged');
     for (const row of page.events) {
       const safe = sanitizePersistedEvent(row, worker, timeframe);
       if (seen.has(safe.event_id_sha256)) fail('DiagnosticCursorRepeated');

@@ -24,10 +24,10 @@ const row=(id,extra={})=>({$metadata:{id,service:run.id,type:'cf-worker-event',r
 function fixture(rows,{changeCount=false,sampleInterval=1,abr=1,pages,transform=x=>x}={}){
  let counts=0,reads=0;const requests=[];
  return{requests,fetch:async(url,options)=>{
-  const query=JSON.parse(options.body);requests.push(query);assert.equal(options.headers.Authorization,'Bearer '+token);assert.equal(query.dry,true);
+  const query=JSON.parse(options.body);requests.push(query);assert.equal(options.headers.Authorization,'Bearer '+token);assert.equal(query.dry,true);assert.equal(query.parameters.view,undefined);assert.ok(['events','calculations'].includes(query.view));
   const n=rows.length+(changeCount&&counts>0?1:0);
-  const result={run:{status:'COMPLETED'},statistics:{abr_level:abr},...(query.parameters.view==='calculations'?{calculations:[{alias:'events',aggregates:[{count:n,value:n,sampleInterval}]}]}:{events:{count:rows.length,events:pages?pages[reads++]??[]:rows}})};
-  if(query.parameters.view==='calculations')counts++;
+  const result={run:{status:'COMPLETED'},statistics:{abr_level:abr},...(query.view==='calculations'?{calculations:[{alias:'events',aggregates:[{count:n,value:n,sampleInterval}]}]}:{events:{count:rows.length,events:pages?pages[reads++]??[]:rows}})};
+  if(query.view==='calculations')counts++;
   return Response.json({success:true,result:transform(result)});
  }};
 }
@@ -43,13 +43,17 @@ test('persisted diagnostics reject sampling, changing counts, repeated cursors a
  const rows=[row('first'),row('second')];
  for(const[options,pattern]of[[{sampleInterval:2},/IngestionSampled/],[{abr:2},/QuerySampled/],[{changeCount:true},/CountChanged/],[{pages:[[rows[0]],[rows[0]]]},/CursorRepeated/],[{pages:[[rows[0]],[]]},/PaginationIncomplete/],[{transform:result=>({...result,run:{status:'STARTED'}})},/QueryIncomplete/]])await assert.rejects(collectPersistedWindow(run,'app',token,time,fixture(rows,options)),pattern);
  const duplicate=row('second');duplicate.$metadata.requestId='request-first';await assert.rejects(collectPersistedWindow(run,'app',token,time,fixture([rows[0],duplicate])),/InvocationRepeated/);
+ await assert.rejects(collectPersistedWindow(run,'app',token,time,fixture(rows,{transform:result=>result.events?{...result,events:undefined,calculations:[]}:result})),/EventsSchemaUnknown/);
+ const empty=await collectPersistedWindow(run,'app',token,time,fixture([],{sampleInterval:0}));assert.equal(empty.events,0);assert.equal(empty.qualification,false);assert.equal(empty.reconciled,true);
 });
 test('persisted event parsing rejects wrong scope and unknown outcomes and retains late resource failures',async()=>{
  for(const value of[row('wrong',{$metadata:{id:'wrong',service:'production'}}),row('late',{timestamp:2001}),row('unknown',{$workers:{outcome:'new-platform-outcome'}})])assert.throws(()=>sanitizePersistedEvent(value,run.id,time));
- const log=row('late-resource',{$metadata:{id:'late-resource',service:run.id,type:'cf-worker-log',requestId:'request-first'},$workers:{scriptName:run.id},source:JSON.stringify({event:'antfly.resource_failure',failure_code:'SQLITE_NOMEM secret-must-not-persist'})});
+ const log=row('late-resource',{$metadata:{id:'late-resource',service:run.id,type:'cf-worker',requestId:'request-first'},$workers:{scriptName:run.id},source:JSON.stringify({event:'antfly.resource_failure',failure_code:'SQLITE_NOMEM secret-must-not-persist'})});
  const report=await collectPersistedWindow(run,'app',token,time,fixture([row('first'),log]));assert.ok(report.resource_failures>0);assert.ok(!JSON.stringify(report).includes('secret-must-not-persist'));
  const draining={...log,$metadata:{...log.$metadata,id:'draining'},source:{event:'antfly.coordinator',failure_code:'Canceled',io_draining:true}};
  assert.equal((await collectPersistedWindow(run,'app',token,time,fixture([draining]))).gap,true);
+ const metrics={...log,$metadata:{...log.$metadata,id:'metrics'},source:{cpuTimeMs:1,memory_limit_bytes:8388608}};
+ const healthy=await collectPersistedWindow(run,'app',token,time,fixture([metrics]));assert.equal(healthy.resource_failures,0);assert.equal(healthy.rows[0].event.exceptions,undefined);
 });
 test('persisted query failures expose fixed codes and bound all response and query memory',async()=>{
  await assert.rejects(collectPersistedWindow(run,'app',token,time,{fetch:async()=>Response.json({errors:[{message:'secret'}]},{status:403})}),/DiagnosticQueryStatus403/);

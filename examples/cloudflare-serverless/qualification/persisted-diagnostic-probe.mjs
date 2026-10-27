@@ -23,7 +23,7 @@ import {assertGateRun} from './gate-scope.mjs';
 export function persistedDiagnosticQuery(run,{from,to}){
  assertGateRun(run);
  if(!Number.isSafeInteger(from)||!Number.isSafeInteger(to)||from<0||from>=to||to-from>86400000)throw Error('InvalidDiagnosticTimeframe');
- return{queryId:crypto.randomUUID(),dry:true,timeframe:{from,to},chartType:'aggregate',limit:1,parameters:{view:'calculations',calculations:[{operator:'count',alias:'events'}],filterCombination:'and',filters:[{key:'$metadata.service',type:'string',operation:'eq',value:run.id}]}};
+ return{queryId:crypto.randomUUID(),dry:true,view:'calculations',timeframe:{from,to},chartType:'aggregate',limit:1,parameters:{calculations:[{operator:'count',alias:'events'}],filterCombination:'and',filters:[{key:'$metadata.service',type:'string',operation:'eq',value:run.id}]}};
 }
 export async function probePersistedDiagnostics(run,token,timeframe,{fetch:request=fetch}={}){
  const query=persistedDiagnosticQuery(run,timeframe);
