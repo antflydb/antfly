@@ -109,13 +109,14 @@ fn interpretedKey(comptime T: type, cached: artifacts.CachedRead, ref: local.ser
     }
     return key;
 }
-pub fn residentRequiredInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, limit: usize) !bool {
+pub fn lookupRequiredInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, limit: usize) !?Owned(T) {
     try token.check();
     try cached.context.ensureActive();
-    const held = cached.cache.decoded.lookup(try interpretedKey(T, cached, ref, interpretation, limit)) orelse return false;
-    defer held.release();
+    const held = cached.cache.decoded.lookup(try interpretedKey(T, cached, ref, interpretation, limit)) orelse return null;
+    errdefer held.release();
+    try token.check();
     try cached.context.ensureActive();
-    return true;
+    return .{ .lease = held, .value = @ptrCast(@alignCast(held.item.payload.extension)) };
 }
 fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T, decline_error: ?anyerror) !Owned(T) {
     try cached.context.ensureActive();

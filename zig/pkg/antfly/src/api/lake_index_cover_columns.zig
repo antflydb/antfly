@@ -266,6 +266,8 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
         const end = @min(selected.items.len, begin + ranges.max_batch);
         var units: [ranges.max_batch]ranges.Unit = undefined;
         var cold: [ranges.max_batch]?usize = @splat(null);
+        var warm: [ranges.max_batch]?metadata.Owned(Block) = @splat(null);
+        defer for (&warm) |*slot| if (slot.*) |held| held.release();
         var count: usize = 0;
         var admitted: u64 = 0;
         for (selected.items[begin..end], 0..) |index, position| {
@@ -275,7 +277,12 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
             admitted += section.bytes;
             if (cached) |cache| {
                 var buffer: [160]u8 = undefined;
-                if (try metadata.residentRequiredInterpretedBounded(Block, cache, reference, token, try interpretation(&buffer, section), limit)) continue;
+                if (try metadata.lookupRequiredInterpretedBounded(Block, cache, reference, token, try interpretation(&buffer, section), limit)) |held| {
+                    warm[position] = held;
+                    live = std.math.add(usize, live, held.lease.item.budget.live) catch return error.SqlMemoryLimitExceeded;
+                    if (live > limit) return error.SqlMemoryLimitExceeded;
+                    continue;
+                }
             }
             cold[position] = count;
             units[count] = .{ .object = directory.pack, .offset = section.offset, .bytes = section.bytes, .digest = section.digest };
@@ -297,10 +304,12 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
             };
             const block = if (cached) |cache| blk: {
                 var buffer: [160]u8 = undefined;
-                const owned = try metadata.acquireRequiredInterpretedBounded(Block, cache, store, reference, token, try interpretation(&buffer, section), Loader.Arguments{ .stripe = section, .encoded = bytes }, Loader.decode, limit);
+                const retained = warm[position] != null;
+                const owned = warm[position] orelse try metadata.acquireRequiredInterpretedBounded(Block, cache, store, reference, token, try interpretation(&buffer, section), Loader.Arguments{ .stripe = section, .encoded = bytes }, Loader.decode, limit);
+                warm[position] = null;
                 var transfer = false;
                 defer if (!transfer) owned.release();
-                live = std.math.add(usize, live, owned.lease.item.budget.live) catch return error.SqlMemoryLimitExceeded;
+                if (!retained) live = std.math.add(usize, live, owned.lease.item.budget.live) catch return error.SqlMemoryLimitExceeded;
                 if (live > limit) return error.SqlMemoryLimitExceeded;
                 try result.leases.append(a, owned);
                 transfer = true;

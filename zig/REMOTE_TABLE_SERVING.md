@@ -1793,8 +1793,8 @@ releasing provider/context state. Required reads run inline if shared I/O slots
 are occupied. Distinct ranges within a pack can run concurrently; block waves
 retain their existing shared scheduler admission.
 
-Cover readers probe decoded stripe residency before physical preparation. Warm
-decoded stripes require no raw-cache residency and do not refetch evicted wire
+Cover readers acquire decoded stripe leases before physical preparation. Hits
+remain pinned through the wave without a second lookup. Warm decoded stripes require no raw-cache residency and do not refetch evicted wire
 bytes. Uncached single-unit ranges transfer transport ownership without a second
 large allocation. Decoded metadata and retained raw bodies remain operation-owned
 and release on successful consumption, cancellation and allocation failures. The
