@@ -164,3 +164,28 @@ func acquisitionMetadata(resource, path string, data []byte) []byte {
 	}
 	return encoded
 }
+
+// ScopedAcquisitionCache separates independent acquisition passes within one run.
+// Progress is shared with the durable backing cache, including reconciliation.
+func ScopedAcquisitionCache(cache AcquisitionCache, scope string) AcquisitionCache {
+	if cache == nil {
+		return nil
+	}
+	return &scopedAcquisitionCache{cache: cache, prefix: acquisitionKey(scope) + "/"}
+}
+
+type scopedAcquisitionCache struct {
+	cache  AcquisitionCache
+	prefix string
+}
+
+func (c *scopedAcquisitionCache) Load(ctx context.Context, key string) ([]byte, bool, error) {
+	return c.cache.Load(ctx, c.prefix+key)
+}
+func (c *scopedAcquisitionCache) Save(ctx context.Context, key string, data []byte) error {
+	return c.cache.Save(ctx, c.prefix+key, data)
+}
+func (c *scopedAcquisitionCache) HasProgress() bool {
+	p, ok := c.cache.(interface{ HasProgress() bool })
+	return ok && p.HasProgress()
+}

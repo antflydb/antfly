@@ -63,6 +63,9 @@ type CollaborationConnector struct {
 	previewSelection                            string
 	ExtractorVersion                            string
 	scopeChecks                                 map[string]time.Time
+	calendarRoles                               map[string]string
+	accessAuditWindow                           time.Duration
+	accessWait                                  func(context.Context, time.Duration) error
 	observedScopes                              map[string]collaborationRef
 	ProviderName                                string
 	HTTPClient                                  *http.Client
@@ -304,6 +307,7 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 	c.retainedBundle = nil
 	c.retainedRef = ""
 	c.scopeChecks = nil
+	c.calendarRoles = nil
 	c.observedScopes = nil
 	if r.SourceNamespace == "" {
 		return Inventory{}, fmt.Errorf("%w: source namespace required", ErrInvalidInput)
@@ -602,6 +606,7 @@ func (c *CollaborationConnector) CheckAccess(ctx context.Context, r Request, ite
 }
 func (c *CollaborationConnector) ValidateInventory(ctx context.Context, r Request, inventory Inventory) error {
 	c.scopeChecks = nil
+	c.calendarRoles = nil
 	if err := c.Validate(ctx, r); err != nil {
 		return err
 	}
@@ -659,36 +664,6 @@ func (c *CollaborationConnector) ValidateInventory(ctx context.Context, r Reques
 					return err
 				}
 			}
-		}
-	}
-	return nil
-}
-func (c *CollaborationConnector) ValidateAbsentSources(ctx context.Context, r Request, ids []string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	// A fresh, fully authorized inventory distinguishes deletion/selection changes
-	// from a truncated listing or revoked container. Never infer absence from 403/404.
-	full := r
-	full.Preview = false
-	full.RetrySourceKeys = nil
-	fresh := *c
-	fresh.Cache = nil
-	fresh.hydratedItems = nil
-	fresh.retainedRef = ""
-	fresh.retainedBundle = nil
-	fresh.Baseline = nil
-	inv, err := fresh.Enumerate(ctx, full)
-	if err != nil {
-		return err
-	}
-	if !inv.Authoritative {
-		return ErrInventoryIncomplete
-	}
-	absent := exactSourceKeySet(ids)
-	for _, item := range inv.Objects {
-		if _, ok := absent[item.ID]; ok {
-			return ErrInventoryIncomplete
 		}
 	}
 	return nil

@@ -72,6 +72,10 @@ func (c *CollaborationConnector) calendarID(ctx context.Context, id string) (str
 	if entry.ID == "" || (entry.AccessRole != "reader" && entry.AccessRole != "writer" && entry.AccessRole != "owner") {
 		return "", fmt.Errorf("calendar requires event read access")
 	}
+	if c.calendarRoles == nil {
+		c.calendarRoles = map[string]string{}
+	}
+	c.calendarRoles[entry.ID] = entry.AccessRole
 	return entry.ID, nil
 }
 func (c *CollaborationConnector) workspaceRefs(ctx context.Context, config CollaborationConfig) ([]collaborationRef, error) {
@@ -373,6 +377,7 @@ func calendarInvitationUIDs(data []byte) []string {
 type calendarEvent struct {
 	ID                string           `json:"id"`
 	ETag              string           `json:"etag"`
+	Visibility        string           `json:"visibility"`
 	Status            string           `json:"status"`
 	Summary           string           `json:"summary"`
 	Description       string           `json:"description"`
@@ -405,6 +410,8 @@ func (c *CollaborationConnector) calendarLoad(ctx context.Context, config Collab
 	}
 	meta := map[string]any{"calendar_id": ref.Container, "etag": event.ETag, "ical_uid": event.ICalUID, "recurring_event_id": event.RecurringEventID, "start": event.Start, "end": event.End, "original_start_time": event.OriginalStartTime, "recurrence": event.Recurrence, "organizer": event.Organizer, "attendees": event.Attendees}
 	meta["status"] = event.Status
+	meta["visibility"] = event.Visibility
+	meta["details_visible"] = event.Visibility != "private" || c.calendarRoles[ref.Container] == "writer" || c.calendarRoles[ref.Container] == "owner"
 	text := event.Summary + "\n" + string(htmlText([]byte(event.Description))) + "\n" + event.Location
 	if event.Status == "cancelled" {
 		text = "Canceled occurrence\n" + text

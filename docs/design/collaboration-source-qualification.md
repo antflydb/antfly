@@ -47,7 +47,7 @@ before their fixes.
 ## Release prerequisites
 
 Publish/pin the portable sources module and Cloud CLI/SDK revision, then deploy the
-matching Colony API, worker and dashboard with migrations 125–128. Colony must pin this published module revision; final release checks must use
+matching Colony API, worker and dashboard with migrations 125–129. Colony must pin this published module revision; final release checks must use
 `GOWORK=off` with that dependency. Drain older workers for the unreleased provider migration.
 
 Register the exact backend callback for each enabled provider:
@@ -62,8 +62,8 @@ Google requires an enabled OAuth app with the selected APIs/scopes and a user gr
 The existing Antfly Google app can be reused once its callback and consent setup
 are configured; Google account sign-in alone does not grant ingestion scopes.
 Discord needs app credentials, the managed bot token, Message Content intent, and
-browser installation into the chosen test server. Slack live qualification is
-explicitly deferred. Operator deployment instructions are in Colony's
+browser installation into the chosen test server. Slack qualification will use Antfly Inc. (`@antfly.io`), channel
+`#all-antfly-inc`; installation and hosted sync/search remain unqualified. Operator deployment instructions are in Colony's
 `docs/dev/connected-source-search.md`; no provider secret belongs in a source.
 
 Slack/Discord remain bounded polling sources with resumable acquisition pages and normalized-content checkpoints.
@@ -80,7 +80,7 @@ Run the updated CLI, using IDs returned by each preceding command:
 antfly-cloud --org antfly-inc --instance grepstein connections connect google-workspace --services drive,gmail,calendar
 antfly-cloud --org antfly-inc --instance grepstein connections resources CONNECTION_ID --resource gmail
 antfly-cloud --org antfly-inc --instance grepstein sources preview --connection CONNECTION_ID --resource gmail --select LABEL_ID --attachments
-antfly-cloud --org antfly-inc --instance grepstein sources add --connection CONNECTION_ID --resource gmail --select LABEL_ID --attachments --name workspace-qualification --table QUALIFICATION_TABLE --every 15m
+antfly-cloud --org antfly-inc --instance grepstein sources add --connection CONNECTION_ID --resource gmail --select LABEL_ID --attachments --name workspace-qualification --table QUALIFICATION_TABLE --every 24h --permission-ttl 15m
 antfly-cloud --org antfly-inc --instance grepstein sources list
 ```
 
@@ -101,3 +101,10 @@ without affecting sibling sources. Revoke provider access and verify the source
 cannot renew its searchable lease. Exercise consent denial/reconnect, another
 Antfly user's denied access, and retained query snapshots before recording live
 qualification as passed. Do not label queue acceptance as successful ingestion.
+
+
+Local regressions additionally cover cached Drive download revocation, resumable
+identity-only absence checks, rate-limited permission audits, managed chat token
+validation, daily content schedules with independent access renewal, discovery
+clock agreement, and bounded checkpoint cleanup. These fixture results do not
+establish a live provider installation or hosted qualification.

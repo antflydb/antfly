@@ -112,7 +112,7 @@ type hydrationCheckpoint struct {
 func (c *CollaborationConnector) hydrationSelection(r Request) string {
 	version := c.ExtractorVersion
 	if version == "" {
-		version = "attachment-text-v1"
+		version = "attachment-text-v2"
 	}
 	return acquisitionKey(c.ProviderName + "\x00" + workspaceSelectionKey(r) + "\x00" + version)
 }
@@ -244,11 +244,14 @@ func (c *CollaborationConnector) retainedInputs(ctx context.Context, r Request, 
 // normalized snapshot does not need another rate-limited history request. Calendar
 // events and independently authorized Drive files retain revision/access checks.
 func (c *CollaborationConnector) authorizeRetained(ctx context.Context, config CollaborationConfig, ref collaborationRef, item Item) error {
+	return c.authorizeCurrent(ctx, config, ref, item, true)
+}
+func (c *CollaborationConnector) authorizeCurrent(ctx context.Context, config CollaborationConfig, ref collaborationRef, item Item, pinRevision bool) error {
 	key := refKey(ref.Resource, ref.Container, "")
 	if c.scopeChecks == nil {
 		c.scopeChecks = map[string]time.Time{}
 	}
-	if time.Since(c.scopeChecks[key]) > 30*time.Second {
+	if time.Since(c.scopeChecks[key]) > c.accessCheckWindow() {
 		if err := c.validateRef(ctx, config, ref); err != nil {
 			return err
 		}
@@ -259,20 +262,38 @@ func (c *CollaborationConnector) authorizeRetained(ctx context.Context, config C
 	}
 	c.observedScopes[key] = ref
 	if ref.Resource == "calendar" {
-		eventKey := refKey(ref.Resource, ref.Container, ref.ID) + configString(item.Metadata, "etag")
-		if time.Since(c.scopeChecks[eventKey]) > 30*time.Second {
+		eventKey := "event/" + refKey(ref.Resource, ref.Container, ref.ID)
+		if pinRevision {
+			eventKey += "/" + configString(item.Metadata, "etag")
+		}
+		if time.Since(c.scopeChecks[eventKey]) > c.accessCheckWindow() {
 			var event calendarEvent
-			if err := c.get(ctx, "calendar", "/calendars/"+url.PathEscape(ref.Container)+"/events/"+url.PathEscape(ref.ID)+"?fields=id,etag,status,recurringEventId", &event); err != nil {
+			if err := c.get(ctx, "calendar", "/calendars/"+url.PathEscape(ref.Container)+"/events/"+url.PathEscape(ref.ID)+"?fields=id,etag,status,recurringEventId,visibility", &event); err != nil {
 				return err
 			}
-			if event.ID != ref.ID || event.ETag != configString(item.Metadata, "etag") {
+			if event.ID != ref.ID {
+				return ErrInvalidInput
+			}
+			if pinRevision && event.ETag != configString(item.Metadata, "etag") {
 				return &RevisionChangedError{Expected: configString(item.Metadata, "etag"), Actual: event.ETag}
+			}
+			limited, known := item.Metadata["details_visible"].(bool)
+			if event.Visibility == "private" && c.calendarRoles[ref.Container] == "reader" && (!known || limited) {
+				return fmt.Errorf("%w: private Calendar event detail access revoked", ErrInvalidInput)
 			}
 			c.scopeChecks[eventKey] = time.Now()
 		}
 		if ref.Attachment != "" {
-			if err := c.drive().checkDriveRevision(ctx, c.HTTPClient, ref.Attachment, configString(item.Metadata, "drive_revision")); err != nil {
-				return err
+			version := ""
+			if pinRevision {
+				version = configString(item.Metadata, "drive_revision")
+			}
+			fileKey := "drive/" + ref.Attachment + "/" + version
+			if time.Since(c.scopeChecks[fileKey]) > c.accessCheckWindow() {
+				if err := c.checkDriveContentAccess(ctx, ref.Attachment, version); err != nil {
+					return err
+				}
+				c.scopeChecks[fileKey] = time.Now()
 			}
 		}
 	}
@@ -291,4 +312,11 @@ func (c *CollaborationConnector) rememberHydration(key string, items []Item) {
 		c.hydratedItems = make(map[string][]Item)
 	}
 	c.hydratedItems[key] = items
+}
+
+func (c *CollaborationConnector) accessCheckWindow() time.Duration {
+	if c.accessAuditWindow > 0 {
+		return c.accessAuditWindow
+	}
+	return 30 * time.Second
 }

@@ -302,3 +302,34 @@ regardless of destination table grants. The CLI and dashboard share an Antfly-ow
 installation entry. It establishes a dashboard session before issuing provider
 consent, verifies the initiating user and tenant, and preserves PKCE and single-use
 callback state. The CLI validates the installation origin and path before opening it.
+
+
+## Independent permission maintenance and deletion reconciliation
+
+Content sync cadence and access freshness are separate. Hosted workers renew the
+published Google Workspace, Slack and Discord permission lease at one third of
+`permission_ttl_seconds` (default 900), even for hourly or daily content schedules.
+The audit reads only manifest identity and authority metadata, checks current
+provider grants, and performs no content downloads, extraction or blob reads.
+Calendar checks include event visibility; Drive metadata must explicitly allow
+content download. Remote edits do not require replacing the published snapshot
+just to renew access. Pinned acquisition still requires matching revisions.
+
+Lease clocks start before the final authority check and are shared by discovery
+and catalog publication. A rate-limited audit retains successful scope checks
+within that audit's validity window; unsuccessful audits never extend access.
+Audits serialize per source, independently of the global content import lock.
+Provider calls hold no source or credential database locks. A short publication
+transaction rechecks the current completed run, source config, credential version,
+instance state, sharing policy and published revision before renewing the lease.
+
+Deletion reconciliation uses a separate durable identity-only page namespace.
+Only omitted attachments with surviving parents need current attachment identity
+metadata. Checkpoints contain neither message bodies nor download URLs. Progress
+in this pass replenishes the same bounded retry budget as initial acquisition.
+
+Hosted SQL checkpoints expire seven days after run creation, matching bounded
+backfill retention. Completed runs enqueue bounded cleanup; the scheduler also
+sweeps expired rows with indexed, skip-locked batches. A run past retention must
+start over. Default extraction version `attachment-text-v2` invalidates cached
+Calendar records that predate visibility metadata.
