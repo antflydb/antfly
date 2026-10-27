@@ -3451,7 +3451,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         else => {},
     }
-    if (command == .apply_resolver_authority) return metadata_topology_protocol.resolver_records_version;
+    if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
         return metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {

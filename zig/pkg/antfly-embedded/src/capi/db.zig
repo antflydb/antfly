@@ -7401,11 +7401,9 @@ pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     const handle = guard.handle;
-    const configs = handle.database().core.index_manager.listResolverRoutingDescriptors(handle.alloc) catch |err| return capi.mapError(err);
-    defer {
-        for (configs) |*cfg| cfg.deinit(handle.alloc);
-        handle.alloc.free(configs);
-    }
+    const admission = handle.database().core.index_manager.resolverQueryAdmission(handle.alloc, resolver_name.bytes(), false) catch |err| return capi.mapError(err);
+    defer admission.deinit();
+    const configs = admission.configs;
     for (configs) |cfg| {
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
         const Mention = struct { text: []const u8, label: []const u8, local_id: []const u8 = "query" };
@@ -7422,16 +7420,30 @@ pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name
         defer handle.alloc.free(minted);
         var authority_arena = std.heap.ArenaAllocator.init(handle.alloc);
         defer authority_arena.deinit();
-        const current = @import("resolver_authority.zig").currentConfig(handle.parent_handle orelse handle, handle.database(), authority_arena.allocator(), cfg, .{ .key = minted, .text = parsed.value.text }) catch |err| return capi.mapError(err);
-        const effective_aliases = current.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
-        defer handle.alloc.free(effective_aliases);
-        var policy_arena = std.heap.ArenaAllocator.init(handle.alloc);
-        defer policy_arena.deinit();
-        const redirects = resolver_lib.curation.RedirectIndex.init(policy_arena.allocator(), effective_aliases) catch |err| return capi.mapError(err);
-        const key = redirects.canonical(minted);
-        const policy = resolver_lib.curation.Index.init(policy_arena.allocator(), current.suppress_json, current.curation_json) catch |err| return capi.mapError(err);
-        const suppressed = ((policy.textReason(policy_arena.allocator(), parsed.value.text) catch |err| return capi.mapError(err)) != null) or policy.keySuppressed(minted) or policy.keySuppressed(key);
-        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = current.effectiveGeneration(), .namespace_curation_generation = current.namespace_curation_generation, .namespace_curation_table_id = current.namespace_curation_table_id, .suppressed = suppressed }) catch |err| return capi.mapError(err);
+        const authority = @import("resolver_authority.zig");
+        // Native rendering shares resolve's scoped policy and final fences.
+        // A missing destination remains a valid declaration-only key render.
+        const destination = @import("tables.zig").get(handle.parent_handle orelse handle, cfg.table) catch |err| switch (err) {
+            error.UndefinedTable => null,
+            else => return capi.mapError(err),
+        };
+        var observation: struct { table_id: u64, revision: u64 } = .{ .table_id = cfg.namespace_curation_table_id, .revision = cfg.namespace_curation_generation };
+        if (destination != null) {
+            var session = authority.QuerySession.initRenderAdmitted(authority_arena.allocator(), handle, cfg, &admission) catch |err| return capi.mapError(err);
+            session.prepareMention(authority_arena.allocator(), &cfg, &resolver, .{ .text = parsed.value.text, .label = parsed.value.label, .local_id = parsed.value.local_id }) catch |err| return capi.mapError(err);
+            session.verify(handle) catch |err| return capi.mapError(err);
+            const captured = session.namespaceObservation(authority_arena.allocator(), cfg) catch |err| return capi.mapError(err);
+            observation = .{ .table_id = captured.table_id, .revision = captured.revision };
+        } else {
+            const current = authority.currentConfig(handle.parent_handle orelse handle, handle.database(), authority_arena.allocator(), cfg, .{ .key = minted, .text = parsed.value.text }) catch |err| return capi.mapError(err);
+            resolver.installCachedPolicy(current.aliases, current.merges, current.suppress_json, current.curation_json) catch |err| return capi.mapError(err);
+            observation = .{ .table_id = current.namespace_curation_table_id, .revision = current.namespace_curation_generation };
+        }
+        const index = resolver.alias_index.?;
+        const key = index.canonical(minted);
+        const policy = resolver.curation_index;
+        const suppressed = ((policy.textReason(authority_arena.allocator(), parsed.value.text) catch |err| return capi.mapError(err)) != null) or policy.keySuppressed(minted) or policy.keySuppressed(key);
+        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = cfg.effectiveGeneration(), .namespace_curation_generation = observation.revision, .namespace_curation_table_id = observation.table_id, .suppressed = suppressed }) catch |err| return capi.mapError(err);
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
@@ -7462,13 +7474,14 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
     if (extraction) |value| {
         if (value != .object or value.object.get("entities") == null or value.object.get("entities").? != .array) return capi.mapErrorContext(error.InvalidArgument, "extraction must contain an entities array");
     }
-    const configs = handle.database().listResolvers(alloc) catch |err| return capi.mapError(err);
-    defer {
-        for (configs) |*cfg| cfg.deinit(alloc);
-        alloc.free(configs);
-    }
+    const admission = handle.database().core.index_manager.resolverQueryAdmission(alloc, resolver_name.bytes(), true) catch |err| return capi.mapError(err);
+    defer admission.deinit();
+    const configs = admission.configs;
     for (configs) |*cfg| {
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        var query_arena = std.heap.ArenaAllocator.init(alloc);
+        defer query_arena.deinit();
+        var policy_session = @import("resolver_authority.zig").QuerySession.initAdmitted(query_arena.allocator(), handle, cfg.*, &admission) catch |err| return capi.mapError(err);
         if (cfg.source_artifact_kind == .chunk) return capi.mapErrorContext(error.InvalidArgument, "query resolution requires an asset-scoped resolver");
         // Native connections cache producers on their provider-owning snapshot;
         // read-only databases otherwise have no enrichment producer. Repeated
@@ -7503,27 +7516,16 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
             handle = guard.handle;
             // Canonical lookup uses the latest snapshot. Configuration changes
             // require a retry rather than mixing two resolver/schema versions.
-            const current = handle.database().listResolvers(alloc) catch |err| {
+            policy_session.verify(handle) catch |err| {
                 alloc.free(bytes);
                 return capi.mapError(err);
-            };
-            defer {
-                for (current) |*entry| entry.deinit(alloc);
-                alloc.free(current);
-            }
-            var unchanged = current.len == configs.len;
-            if (unchanged) for (current, configs) |a, b| {
-                if (!a.eql(b)) {
-                    unchanged = false;
-                    break;
-                }
             };
             var latest_plan = handle.database().resolverQueryPlanAlloc(alloc, cfg.*) catch |err| {
                 alloc.free(bytes);
                 return capi.mapError(err);
             };
             defer latest_plan.deinit(alloc);
-            if (!unchanged or !plan.eql(latest_plan)) {
+            if (!plan.eql(latest_plan)) {
                 alloc.free(bytes);
                 return capi.mapErrorContext(error.Busy, "resolver or extractor configuration changed during extraction; retry");
             }
@@ -7534,7 +7536,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
         const mention_embedder = handle.database().resolution_embedder;
         const suspend_resolution = guard.connection != null and (cfg.adjudicate_json.len > 0 or cfg.name_embedding.len > 0);
         if (suspend_resolution) guard.suspendQuery();
-        const computed = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionAlloc(alloc, configs, cfg, extracted, candidates, mention_embedder);
+        const computed = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionWithPolicyAlloc(alloc, configs, cfg, extracted, candidates, mention_embedder, policy_session.loader());
         if (!guard.resumeQuery(handle_ptr)) {
             if (computed) |bytes| alloc.free(bytes) else |_| {}
             return capi.mapErrorContext(error.Busy, "query handle closed during resolution; retry");
@@ -7546,21 +7548,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
         handle = guard.handle;
         const resolution = computed catch |err| return capi.mapErrorContext(err, "resolving query mentions against canonical entities");
         defer alloc.free(resolution);
-        if (suspend_resolution) {
-            const current = handle.database().listResolvers(alloc) catch |err| return capi.mapError(err);
-            defer {
-                for (current) |*entry| entry.deinit(alloc);
-                alloc.free(current);
-            }
-            var unchanged = current.len == configs.len;
-            if (unchanged) for (current, configs) |actual, captured| {
-                if (!actual.eql(captured)) {
-                    unchanged = false;
-                    break;
-                }
-            };
-            if (!unchanged) return capi.mapErrorContext(error.Busy, "resolver configuration changed during resolution; retry");
-        }
+        policy_session.verify(handle) catch |err| return capi.mapErrorContext(err, "resolver dependencies changed during resolution; retry");
         var parsed_extraction = std.json.parseFromSlice(std.json.Value, alloc, extracted, .{}) catch |err| return capi.mapError(err);
         defer parsed_extraction.deinit();
         var parsed_resolution = std.json.parseFromSlice(std.json.Value, alloc, resolution, .{}) catch |err| return capi.mapError(err);
@@ -7684,7 +7672,7 @@ const CurationWaitTarget = struct {
     cfg: ResolverObservation,
     authority_id: ?u64,
 };
-const CurationObserved = struct { db: *db_mod.DB, cfg: ResolverObservation, applied: bool, authority_id: ?u64 };
+const CurationObserved = struct { db: *db_mod.DB, cfg: ResolverObservation, applied: bool, authority_id: ?u64, replay: ?db_mod.types.ResolverReplayObservation = null };
 fn curationRows(result: *std.json.Value) []std.json.Value {
     if (result.* != .object) return &.{};
     if (result.object.getPtr("results")) |items| return if (items.* == .array) items.array.items else &.{};
@@ -7715,19 +7703,10 @@ fn curationObservationCut(root: *Handle, fallback: *db_mod.DB, a: std.mem.Alloca
         const descriptors = try group.db.core.index_manager.resolverObservationDescriptors(a, group.names.items);
         var by_name: std.StringHashMapUnmanaged(ResolverObservation) = .empty;
         for (descriptors) |cfg| try by_name.put(a, cfg.name, cfg);
-        var stages: [2]?bool = .{ null, null };
+        const replay = if (sample) group.db.resolverReplayObservation(a) catch null else null;
         for (group.rows.items, group.names.items) |row, name| {
             const cfg = by_name.get(name) orelse continue;
-            var applied = false;
-            if (sample) {
-                if (cfg.retired) {
-                    applied = true;
-                } else {
-                    const stage: usize = @intFromBool(cfg.promote);
-                    if (stages[stage] == null) stages[stage] = @import("../storage/db/resolver_curation.zig").applied(group.db, cfg) catch false;
-                    applied = stages[stage].?;
-                }
-            }
+            const applied = sample and (cfg.retired or if (replay) |stats| stats.applied(cfg.promote) else false);
             const scope = try std.json.Stringify.valueAlloc(a, .{ cfg.table, cfg.key_template }, .{});
             const authority = try authorities.getOrPut(a, scope);
             if (!authority.found_existing) {
@@ -7735,7 +7714,7 @@ fn curationObservationCut(root: *Handle, fallback: *db_mod.DB, a: std.mem.Alloca
                 const native = if (destination) |db| try @import("resolver_authority.zig").owns(db, a, cfg.key_template) else false;
                 authority.value_ptr.* = if (native) destination.?.core.identity_namespace.table_id else null;
             }
-            output[row] = .{ .db = group.db, .cfg = cfg, .applied = applied, .authority_id = authority.value_ptr.* };
+            output[row] = .{ .db = group.db, .cfg = cfg, .applied = applied, .authority_id = authority.value_ptr.*, .replay = replay };
         }
     }
     return output;
@@ -7821,15 +7800,14 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
                 };
                 if (row.object.get("replay_sequence_kind")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "source_journal")) {
                     if (row.object.get("replay_sequence")) |sequence| if (sequence == .integer and sequence.integer >= 0) {
-                        const stats = current.db.pendingWorkStats();
                         const floor: u64 = @intCast(sequence.integer);
-                        done = done and stats.resolution.applied_sequence >= floor and (!current.cfg.promote or stats.promotion.applied_sequence >= floor);
+                        done = done and if (current.replay) |stats| stats.resolution.applied_sequence >= floor and (!current.cfg.promote or stats.promotion.applied_sequence >= floor) else false;
                     };
                 };
                 caught_up = caught_up and done;
                 if (!done) continue;
                 row.object.put(a, "applied", .{ .bool = true }) catch return .ok;
-                const progress = std.json.Stringify.valueAlloc(a, current.db.pendingWorkStats(), .{}) catch return .ok;
+                const progress = std.json.Stringify.valueAlloc(a, current.replay, .{}) catch return .ok;
                 row.object.put(a, "progress", std.json.parseFromSliceLeaky(std.json.Value, a, progress, .{}) catch return .ok) catch return .ok;
             }
         }

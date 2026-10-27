@@ -3105,7 +3105,23 @@ const DocumentPrimaryReadWindow = struct {
 };
 const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
 
+var next_query_schema_identity: std.atomic.Value(u64) = .init(1);
+
 pub const DB = struct {
+    /// Content-only proof for this physical owner and immutable catalog cut.
+    /// Native heads, grants and live logical bindings are validated separately.
+    pub const ResolverQuerySchemaEpoch = struct {
+        instance: u64,
+        core: usize,
+        namespace: DocIdentityNamespace,
+        catalog: u64,
+        schema_generation: u64,
+        schema_version: ?u32,
+    };
+    query_schema_identity: std.atomic.Value(u64) = .init(0),
+    resolver_query_schema_mutex: std.atomic.Mutex = .unlocked,
+    resolver_query_schema_epoch: ?ResolverQuerySchemaEpoch = null,
+    resolver_query_schema_digest: [32]u8 = undefined,
     /// Installed only after immutable query-cut admission. Never persisted.
     retained_value_scope: ?@import("../../search/value_membership.zig").Scope = null,
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
@@ -3363,6 +3379,15 @@ pub const DB = struct {
         failed_check: ?u16,
     };
 
+    /// A process-local incarnation prevents epoch ABA across reopened or
+    /// refreshed immutable DB snapshots, including allocator address reuse.
+    pub fn querySchemaIdentity(self: *DB) u64 {
+        const existing = self.query_schema_identity.load(.acquire);
+        if (existing != 0) return existing;
+        const fresh = next_query_schema_identity.fetchAdd(1, .monotonic);
+        std.debug.assert(fresh != 0);
+        return self.query_schema_identity.cmpxchgStrong(0, fresh, .acq_rel, .acquire) orelse fresh;
+    }
     pub fn constraintValidationStatus(self: *DB) !ConstraintValidationStatus {
         if (comptime storage_engine.enabled) return storage_engine.call("constraintValidationStatus", .{self});
         try self.lockApplySharedForPortableRuntime();
@@ -18917,8 +18942,8 @@ pub const DB = struct {
                 const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                 break :blk try std.json.Stringify.valueAlloc(a, ready, .{});
             },
-            .retirement => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").load(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try (try @import("artifact_inventory.zig").catalogs(&read)).semanticDigest(owned))), .{}),
-            .retirement_page => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").preparePage(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try (try @import("artifact_inventory.zig").catalogs(&read)).semanticDigest(owned))), .{}),
+            .retirement => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").load(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try self.core.index_manager.artifact_semantic_cache.get(owned, try @import("artifact_inventory.zig").catalogs(&read)))), .{}),
+            .retirement_page => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").preparePage(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try self.core.index_manager.artifact_semantic_cache.get(owned, try @import("artifact_inventory.zig").catalogs(&read)))), .{}),
             .backfill_page => try std.json.Stringify.valueAlloc(a, try baseline.preparePage(owned, &read, query.definition, baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation)), .{}),
             .readiness => blk: {
                 const completion = @import("artifact_completion_progress.zig");
@@ -31296,6 +31321,25 @@ pub const DB = struct {
         }
         try self.enforceVectorMigrationConfigurationGate();
         return try self.core.deleteEnrichment(kind, name);
+    }
+
+    pub fn resolverReplayObservation(self: *DB, alloc: Allocator) !types.ResolverReplayObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolverReplayObservation", .{ self, alloc });
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var result: types.ResolverReplayObservation = .{
+            .backfill_pending = try resolution_runtime_mod.hasDurableReresolveBacklog(self.core.store),
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
+        };
+        if (self.core.nextDerivedSequence() == 0) {
+            const count = try @import("range_cardinality.zig").loadOrProveEmpty(alloc, self.core.store);
+            result.empty = count != null and count.? == 0;
+        }
+        result.resolution.blocked_reason = try alloc.dupe(u8, result.resolution.blocked_reason);
+        errdefer alloc.free(result.resolution.blocked_reason);
+        result.promotion.blocked_reason = try alloc.dupe(u8, result.promotion.blocked_reason);
+        return result;
     }
 
     pub fn pendingWorkStats(self: *DB) db_core.PendingWorkStats {
