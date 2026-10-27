@@ -5239,6 +5239,64 @@ test "capi SQL conflict owner probes leave unrelated namespaces unopened" {
     try std.testing.expect(!root.embedded_tables.contains("unrelated"));
 }
 
+test "capi SQL staged transcript upserts keep large values and unrelated namespaces lazy" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-transcript-upserts");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE threads(id TEXT PRIMARY KEY, title TEXT)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE history(id TEXT PRIMARY KEY, body TEXT)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE unrelated(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "INSERT INTO history(id,body) VALUES ('existing','old')");
+    try sqlRefreshCleanGeneration(handle);
+
+    var session: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, struct {
+        extern fn antfly_db_sql_session_open(?*anyopaque, *u64) capi.ErrorCode;
+    }.antfly_db_sql_session_open(handle, &session));
+    try sqlSessionStatement(handle, session, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    try sqlSessionStatement(handle, session, "INSERT INTO threads(id,title) VALUES ('thread','transcript') ON CONFLICT(id) DO UPDATE SET title=excluded.title");
+    // #1304 combines a value larger than 1 MiB with conflict resolution after
+    // another table has staged writes. That path needs the complete metadata
+    // catalog, but must not construct unrelated table/index runtimes.
+    const body = try a.alloc(u8, 1024 * 1024 + 128 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    const statement = try std.fmt.allocPrint(a, "INSERT INTO history(id,body) VALUES ('existing','{s}') ON CONFLICT(id) DO UPDATE SET body=excluded.body", .{body});
+    defer a.free(statement);
+    try sqlSessionStatement(handle, session, statement);
+    try sqlSessionStatement(handle, session, "INSERT INTO history(id,body) VALUES ('new','tail') ON CONFLICT(id) DO UPDATE SET body=excluded.body");
+    try sqlSessionStatement(handle, session, "COMMIT");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expectEqual(@as(usize, 2), guard.handle.embedded_tables.count());
+        try std.testing.expect(guard.handle.embedded_tables.contains("threads"));
+        try std.testing.expect(guard.handle.embedded_tables.contains("history"));
+        try std.testing.expect(!guard.handle.embedded_tables.contains("unrelated"));
+        try std.testing.expect(!guard.handle.embedded_tables_discovered);
+    }
+    // Reopening the generation must retain the complete large conflict update.
+    try sqlRefreshCleanGeneration(handle);
+    var response: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("{\"statement\":\"SELECT body FROM history WHERE id='existing'\"}"), &response));
+    defer freeRawBuffer(response.ptr, response.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.ptr.?[0..response.len], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings(body, rows[0].array.items[0].string);
+}
+
 test "capi SQL refreshed generations retain complete FK catalogs and unqualified indexes" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-refreshed-integrity");
