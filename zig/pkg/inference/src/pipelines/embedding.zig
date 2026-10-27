@@ -739,7 +739,7 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn boundedQwenBatchingEnabled(self: *const EmbeddingPipeline) bool {
-        if (!metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true) or
+        if (!metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true) or
             self.text_projection != null) return false;
         const cfg = session_factory.getGptConfig(self.textEncodingSession()) orelse return false;
         return residentQwen3EmbeddingEligible(self.textEncodingSession(), cfg, self.config) and
