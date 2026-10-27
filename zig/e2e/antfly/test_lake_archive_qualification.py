@@ -1699,11 +1699,17 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
                             "order_by": [{"field": "id", "desc": descending}],
                             "limit": 96,
                         }
-                        first = client.query({"request": request})["hits"]["hits"]
+                        first = client.query({"request": request})
                         second = client.query(
-                            {"request": dict(request, search_after=first[-1]["_sort"])}
-                        )["hits"]["hits"]
-                        hits = first + second
+                            {
+                                "request": dict(
+                                    request,
+                                    search_after=first["hits"]["hits"][-1]["_sort"],
+                                    remote_snapshot=first["remote_snapshot"],
+                                )
+                            }
+                        )
+                        hits = first["hits"]["hits"] + second["hits"]["hits"]
                         assert [hit["_source"]["id"] for hit in hits] == ids
                         for hit in hits:
                             row = hit["_source"]
