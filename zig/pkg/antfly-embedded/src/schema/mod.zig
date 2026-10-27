@@ -4574,7 +4574,7 @@ test "document generated dependencies require persisted sources and unwind rejec
     }
 }
 
-test "SQL COPY candidates defer generated NOT NULL and CHECK while selected rows finalize strictly" {
+test "document generated SQL COPY candidates defer NOT NULL and CHECK while selected rows finalize strictly" {
     const a = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(a);
     defer arena.deinit();
@@ -4586,11 +4586,20 @@ test "SQL COPY candidates defer generated NOT NULL and CHECK while selected rows
     for ([_][]const u8{ "relational", "document" }) |mode| {
         var declaration = try std.json.parseFromSliceLeaky(std.json.Value, owned, json, .{});
         try declaration.object.put(owned, "storage_mode", .{ .string = mode });
+        if (std.mem.eql(u8, mode, "document")) {
+            try declaration.object.put(owned, "enforce_types", .{ .bool = true });
+            for ([_][]const u8{ "column_defaults", "checks", "relational_indexes", "unique_constraints", "foreign_keys" }) |name| _ = declaration.object.orderedRemove(name);
+            const properties = declaration.object.get("document_schemas").?.object.get("row").?.object.get("schema").?.object.get("properties").?.object;
+            for (properties.values()) |*property| _ = property.object.orderedRemove("x-antfly-sql-type");
+        }
         const current = try std.json.Stringify.valueAlloc(a, declaration, .{});
         defer a.free(current);
         var validator = try CompiledTableValidator.init(a, current);
         defer validator.deinit(a);
         var candidate: std.json.Value = .{ .object = .empty };
+        // Documents support generated fields, while omitted SQL defaults and
+        // relational CHECK declarations remain relational schema features.
+        if (std.mem.eql(u8, mode, "document")) try candidate.object.put(owned, "n", .{ .integer = 7 });
         const nulls = try validator.prepareCandidateValueWithNulls(owned, &candidate, &.{});
         try std.testing.expectEqual(@as(i64, 7), candidate.object.get("n").?.integer);
         try std.testing.expect(!candidate.object.contains("g"));

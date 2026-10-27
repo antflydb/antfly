@@ -77,7 +77,9 @@ Candidates may still contain NULL in required columns; excluded rows do not run
 generated expressions, NOT NULL or CHECK constraints. Selected rows finalize
 through that same program without applying defaults again, then enter the
 ordinary atomic mutation path. Sequence effects from excluded rows are retained.
-The shared phases support both relational and document schemas.
+The shared phases support both relational and document schemas. Document
+schemas retain their generated-field contract; SQL defaults and relational
+CHECK declarations remain relational-only schema features.
 
 Prepared COPY predicates own a parameter frame separate from each batch's input
 row parameters. Descriptor inference and NULL/numeric provenance remain intact;
@@ -149,6 +151,14 @@ allocator storage: 409 bytes retained for text/CSV and 424 bytes for binary.
 Observed local times were approximately 12–25 ms per codec. These measure the
 framing decoder, not end-to-end ingestion throughput. A separate structural
 assertion verifies that 300 input rows use three mutation batches.
+
+The WHERE cohort passed the merged tree's full Debug SQL suite (1,673 tests,
+four optional benchmark skips), all 164 pgwire tests, all three native COPY
+lifecycle tests, and the metadata/compiled-owner recovery regressions. A focused
+COPY rerun verifies the shared phase regression for both valid relational and
+document schemas; it is selected by the default schema-test filter. No tested
+mutation path reported leaks. The oracle reproduces 41 atomic-failure postimages
+and 21 option contracts across the input and predicate profiles.
 
 COPY WHERE is verified against four PostgreSQL profiles, including the exact
 original, omitted defaults, prepared numeric/NULL parameters, excluded invalid
