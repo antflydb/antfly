@@ -600,6 +600,9 @@ pub const MetadataProjectionKind = enum(u32) {
     resolver_namespace_replacement_matches = 69,
     resolver_catalog_read = 70,
     resolver_projection_valid = 71,
+    job_state_value = 72,
+    job_state_page = 73,
+    job_owner_count = 74,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };

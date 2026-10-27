@@ -967,6 +967,22 @@ pub const RaftApplyStore = struct {
         return try alloc.dupe(u8, response.slice());
     }
 
+    pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
+        return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .job_state_value, .group_id = group_id, .key = .fromSlice(key) });
+    }
+
+    pub fn scanJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8) ![]u8 {
+        var response: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &.{ .kind = .job_state_page, .group_id = group_id, .key = .fromSlice(after orelse "") }, &response));
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        // The kernel owns encoding the bounded Page envelope exactly once.
+        return try alloc.dupe(u8, response.slice());
+    }
+
+    pub fn getJobOwnerCount(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner: []const u8) !u64 {
+        return try self.projectionWithAllocator(u64, alloc, .{ .kind = .job_owner_count, .group_id = group_id, .key = .fromSlice(owner) });
+    }
+
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
         return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_job_value, .group_id = group_id, .key = .fromSlice(key) });
     }
@@ -1100,3 +1116,29 @@ fn statusToError(status: abi.Status) !void {
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const store_report_update = @import("../metadata/store_report_update.zig");
 const topology_protocol = @import("../metadata/topology_protocol.zig");
+
+test "metadata durable job facade preserves state owner counts and bounded scan envelopes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root, .no_sync = true });
+    defer store.deinit();
+    try std.testing.expect((try store.getJobState(a, 41, "documents/example")) == null);
+    try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 41, "alice"));
+    const queued = "{\"owner\":\"alice\",\"state\":\"queued\"}";
+    try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = "documents/example", .expected_hash = "", .value = queued } });
+    const value = (try store.getJobState(a, 41, "documents/example")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings(queued, value);
+    try std.testing.expectEqual(@as(u64, 1), try store.getJobOwnerCount(a, 41, "alice"));
+    const encoded = try store.scanJobState(a, 41, null);
+    defer a.free(encoded);
+    const page = try std.json.parseFromSlice(@import("../metadata/job_state.zig").Page, a, encoded, .{});
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
+    try std.testing.expectEqualStrings("documents/example", page.value.rows[0].key);
+    try std.testing.expectEqualStrings(queued, page.value.rows[0].value);
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, "../bad"));
+}

@@ -69,6 +69,14 @@ pub fn get(self: *Self, index: usize) !?*const Pin {
     } else if (!job.attempted) try job.run();
     return if (job.pin) |*pin| pin else null;
 }
+/// A joined consumer can release a completed pin before the next required open.
+/// This restores cache headroom when speculative admission was saturated.
+pub fn release(self: *Self, index: usize) void {
+    const job = &self.jobs[index];
+    std.debug.assert(job.task == null);
+    if (job.pin) |*pin| pin.deinit();
+    job.pin = null;
+}
 pub fn deinit(self: *Self) void {
     // A canceled job can have completed its pin. Join all jobs before freeing
     // either the result pins or their source callback's publication/context.
