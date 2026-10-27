@@ -164,3 +164,14 @@ A repeat of the point experiment on the final codec module at 512 documents
 records no-inline versus inline p95 of 224/207 ms with the immutable cache
 cleared, and 176/158 ms warm. The GET reduction and retained-payload tradeoff
 remain the same as the earlier intermediate-module experiment.
+
+The first fresh 512-document-per-tenant Cloudflare preparation was interrupted
+after about nineteen minutes once the control stalled at publication budget one
+with repeated cancellation. The candidate had completed two tenants and begun
+the third. This is failed preparation evidence, not a completed latency trial;
+it cannot attribute the difference to inline bodies because locality differs
+and both profiles record cancellations. Neither limits nor the gate population
+were changed. The diagnostic driver additionally accepts explicit 64/128-document
+corpora, records their size and remains `qualification:false`; strict gate runs
+continue requiring 512 documents per tenant. Smaller diagnostic corpora isolate
+steady-state/placement experiments from the bulk-preparation blocker.
