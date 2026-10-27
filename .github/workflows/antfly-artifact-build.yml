@@ -127,6 +127,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.release-plan.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # The source prefetch and both products must use the same package cache.
+      ANTFLY_ZIG_CACHE_ROOT: ${{ github.workspace }}/.zig-cache/release-toolchain
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/release-toolchain/global
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -181,6 +188,21 @@ jobs:
 
       - name: Test reproducible archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
+
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.build_controller_commit }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Build source-declared runtime archives
         env:
