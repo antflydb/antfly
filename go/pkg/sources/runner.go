@@ -253,17 +253,34 @@ func canonicalID(id string) bool {
 	}
 	return true
 }
-func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection) (int64, string, error) {
-	statePath := filepath.Join(r.StateDir, s.ID+".json")
-	hashSource := s
-	hashSource.Alias = ""
-	hashSource.PermissionTTLSeconds = 0
-	identity, _ := json.Marshal(struct {
+
+// Hash the source and credential references, excluding only the fields that do
+// not change acquisition identity. Legacy checkpoints used this same encoding
+// with the full Workspace service list; an exact match permits safe adoption.
+func sourceConfigurationHash(source Source, connection Connection) (string, error) {
+	source.Alias = ""
+	source.PermissionTTLSeconds = 0
+	identity, err := json.Marshal(struct {
 		Source     Source
 		Connection Connection
-	}{hashSource, connection})
+	}{source, connection})
+	if err != nil {
+		return "", fmt.Errorf("encode source configuration: %w", err)
+	}
 	digest := sha256.Sum256(identity)
-	hash := hex.EncodeToString(digest[:])
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection) (int64, string, error) {
+	statePath := filepath.Join(r.StateDir, s.ID+".json")
+	identityConnection := connection
+	if connection.Provider == ProviderGoogleWorkspace {
+		identityConnection.Services = nil
+	}
+	hash, err := sourceConfigurationHash(s, identityConnection)
+	if err != nil {
+		return 0, "", err
+	}
 	state := runState{Version: 1, Endpoint: r.Profile.Endpoint, Table: s.Table, SourceID: s.ID, ConfigHash: hash, Owned: map[string]string{}}
 	var persisted runState
 	if err := loadJSON(statePath, &persisted, 256<<20); err == nil {
@@ -274,6 +291,17 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			return 0, "", fmt.Errorf("unsupported source record format")
 		}
 		state = persisted
+		if connection.Provider == ProviderGoogleWorkspace && state.ConfigHash != hash {
+			legacyHash, err := sourceConfigurationHash(s, connection)
+			if err != nil {
+				return 0, "", err
+			}
+			if state.ConfigHash == legacyHash {
+				// The full old configuration is unchanged. Preserve its inventory,
+				// cursors and hydration namespace while adopting normalized identity.
+				state.ConfigHash = hash
+			}
+		}
 		if state.ConfigHash != hash {
 			if state.Pending != nil && !r.Restart {
 				return 0, "", fmt.Errorf("source configuration changed during a pinned run; use --restart")

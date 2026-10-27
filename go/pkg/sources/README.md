@@ -235,3 +235,12 @@ stable, and overlapping writers for the same source must be serialized (the
 standalone state lock or Colony's job admission). Distinct sources can sync
 independently. `antfly-grep` continues to use the catalog and ordinary queries;
 it does not schedule ingestion.
+
+
+Workspace consent expansion preserves standalone acquisition checkpoints and the
+published Gmail/Calendar incremental baseline. Only the connection's service list
+is excluded from replay identity; credential references, source selection and
+sharing remain bound, and resumed reads recheck current account/service access.
+Old checkpoints adopt this identity when their complete old configuration still
+matches. If that proof is unavailable after an earlier configuration change, use
+an explicit restart to select fresh content.

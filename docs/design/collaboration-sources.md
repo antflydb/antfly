@@ -356,3 +356,19 @@ acquisition checkpoints, even when the connector has durable stores configured.
 Reading the sample reuses the captured bytes after current scope checks. Attachment
 download failures preserve provider Retry-After deadlines through normal worker
 retry scheduling; numeric and HTTP-date forms share the API request parser.
+
+
+The standalone runner uses a consent-stable Workspace identity too. It omits the
+service list from the connection hash while retaining credential references,
+selection, target and sharing. Pinned hydration bundles and published change
+cursors survive grant expansion, with current selected-service and account checks
+before reuse. Legacy state adopts the new hash only when its old full-config hash
+matches the current configuration; unproven legacy drift requires an explicit
+restart. Other provider identities keep their previous hash encoding.
+
+Hosted publication's final permission audit uses normal durable run recovery for
+transient provider errors, including Retry-After deadlines. The retry keeps its
+pinned inventory and private normalized content; canonical content hashes avoid
+rewriting unchanged records. Early redelivery consumes no attempt and performs no
+provider check. Permanent denial records a terminal source-permissions phase and
+cannot publish a fresh searchable lease.
