@@ -21,6 +21,7 @@ import {readFile, writeFile, mkdir} from "node:fs/promises";
 import {dirname} from "node:path";
 import {createHash} from "node:crypto";
 import {Bucket} from "../test/object-fixture.mjs";
+import {FileBucket} from "../test/file-bucket.mjs";
 import {instantiateHost} from "../../../zig/lib/objectstore/wasm/asyncify.mjs";
 import {createR2Transport, ObjectStoreError} from "../../../zig/lib/objectstore/wasm/r2.mjs";
 import {createImmutableReadCache} from "../../../zig/lib/objectstore/wasm/cache.mjs";
@@ -76,13 +77,25 @@ const bytes = await readFile(wasmPath??new URL("../dist/antfly-serverless.wasm",
 const module = await WebAssembly.compile(bytes);
 const readerPath=process.argv.find(arg=>arg.startsWith("--reader-wasm="))?.slice(14),readerBytes=readerPath?await readFile(readerPath):null,readerModule=readerBytes?await WebAssembly.compile(readerBytes):null;
 const reads=new Set(["lookup","list","count","status","search","latest"]);
-const report = {reader_wasm_sha256:readerBytes?createHash("sha256").update(readerBytes).digest("hex"):null,reader_working_set_bytes:readerBytes?8*1024*1024:null,exact_continuations:exactContinuations,deterministic_fixture:deterministic,profile: "local native WASM/R2 contract fixture", wasm_sha256: createHash("sha256").update(bytes).digest("hex"),
+const fileBucket=process.argv.includes("--file-bucket")||sizes.some(size=>size>=10000);
+const report = {fixture_backend:fileBucket?"file":"memory",reader_wasm_sha256:readerBytes?createHash("sha256").update(readerBytes).digest("hex"):null,reader_working_set_bytes:readerBytes?8*1024*1024:null,exact_continuations:exactContinuations,deterministic_fixture:deterministic,profile: "local native WASM/R2 contract fixture", wasm_sha256: createHash("sha256").update(bytes).digest("hex"),
   embedding_fixture_sha256:embeddingBytes?createHash("sha256").update(embeddingBytes).digest("hex"):null, embedding_model:embeddingFixture?.model??null, timestamp: new Date().toISOString(), max_put_bytes: maxPutBytes, compaction_max_documents: maxCompactionDocuments, recycle_at_bytes: recycleAtBytes,
   publication_records: publicationRecords, wal_inline_tail:walInlineTail, reindex, recall_queries: recallQueries, paged_projections: pagedProjections, dimensions: pagedProjections ? dimensions : null, paged_text: pagedText, body_bytes: bodyBytes, clock: deterministic?"logical per-request fixture clock":"monotonic epoch fixture", total_isolate_memory: null, cases: []};
 for (const count of sizes) {
-  const bucket = new Bucket(), stages = [];
+  const bucket = fileBucket?await FileBucket.create():new Bucket(), stages = [];
+  try{
   let group, cache, host, hostRole="builder", accepted = 0, recycled = 0;
   const recall = [];let routingShape;
+  // Inspect roots while their uploaded bytes are already resident. Scanning
+  // every retained historical artifact after ingestion can fault tens of GB
+  // into the benchmark process, unrelated to native request memory.
+  const put=bucket.put.bind(bucket);bucket.put=async(key,body,options)=>{
+    const result=await put(key,body,options);
+    if(result&&group?.name==="ingest-and-publication"&&body?.[0]===123&&new TextDecoder().decode(body.subarray(0,128)).includes('"kind":"vector_segment"')){
+      try{const root=JSON.parse(new TextDecoder().decode(body));if(root.kind==="vector_segment"&&(root.vector_records??root.docs?.records)===count)routingShape={format:root.format,coarse_centers:root.global_centers?.records??0,routes:root.centroids?.records,shards:root.directory?.records};}catch{}
+    }
+    return result;
+  };
   let requestTrace=new Map(),requestOperation;
   const epoch = deterministic?1700000000000:Date.now(), monotonic = performance.now();let fixtureTick=0;if(deterministic)fixtureRandom=(count+1)>>>0;
   // The benchmark measures memory and traffic, not clock recovery. Clock
@@ -105,7 +118,7 @@ for (const count of sizes) {
     };
     host = await instantiateHost(hostRole==="reader"?readerModule:module, cache.wrap(transport, "benchmark"), {
       clock,
-      onMetrics(sample) { group.samples.push({...sample, cache_retained_bytes: cache.retainedBytes()});if(diagnostics&&sample.outcome!=='ok')console.error(JSON.stringify({failed_request:requestOperation,metrics:sample,objects:[...requestTrace.values()].sort((a,b)=>b.read_bytes+b.write_bytes-a.read_bytes-a.write_bytes).slice(0,20).map(entry=>({...entry,stored_bytes:bucket.objects.get(entry.key)?.body.byteLength}))})); },
+      onMetrics(sample) { group.samples.push({...sample, cache_retained_bytes: cache.retainedBytes()});if(diagnostics&&sample.outcome!=='ok')console.error(JSON.stringify({failed_request:requestOperation,metrics:sample,objects:[...requestTrace.values()].sort((a,b)=>b.read_bytes+b.write_bytes-a.read_bytes-a.write_bytes).slice(0,20).map(entry=>({...entry,stored_bytes:bucket.objects.get(entry.key)?.size??bucket.objects.get(entry.key)?.body.byteLength}))})); },
     });
   }
   async function call(op, fields = {}) {
@@ -172,9 +185,6 @@ for (const count of sizes) {
     assert.equal((await call("count")).count, String(accepted), "publication rejection must preserve accepted WAL visibility");
   });
   if (complete) {
-    for(const object of bucket.objects.values()){
-      if(object.body[0]!==123||!new TextDecoder().decode(object.body.subarray(0,128)).includes('"kind":"vector_segment"'))continue;try{const root=JSON.parse(new TextDecoder().decode(object.body));if(root.kind==="vector_segment"&&(root.vector_records??root.docs?.records)===count)routingShape={format:root.format,coarse_centers:root.global_centers?.records??0,routes:root.centroids?.records,shards:root.directory?.records};}catch{}
-    }
     await stage("cold-query", async () => {
       await reopen(); assert.equal((await call("count")).count, String(count));
       assert.equal((await call("search", {text: "durable", limit: 10})).hits.length, Math.min(10, count));
@@ -242,9 +252,10 @@ for (const count of sizes) {
     });
     await stage("compaction", async () => { await call("compact", {compaction_max_documents: maxCompactionDocuments}); assert.equal((await call("count")).count, String(count - 1)); });
   }
-  const result = {documents: count, accepted_documents: accepted, published_lsn: publishedLsn, recycled_instances: recycled, stages, routing_shape:routingShape,vector_recall: recall, objects: bucket.objects.size};
+  const result = {documents: count, accepted_documents: accepted, published_lsn: publishedLsn, recycled_instances: recycled, stages, routing_shape:routingShape,vector_recall: recall, objects: bucket.objects.size,fixture_storage_bytes:bucket.storageBytes??null};
   result.ok=accepted===count&&stages.every(stage=>stage.ok===true);if(!result.ok)process.exitCode=2;
   report.cases.push(result); console.log(JSON.stringify(result));
   await mkdir(dirname(output), {recursive: true}); await writeFile(output, JSON.stringify(report, null, 2));
+  }finally{await bucket.close?.();}
 }
 console.log(`Saved ${output}`);

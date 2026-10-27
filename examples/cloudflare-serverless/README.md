@@ -589,7 +589,12 @@ not measure deployed R2 latency or total isolate memory.
 Defaults match the host's 4 MiB upload cap, 16-record publication prefix,
 24 MiB recycling threshold, and 1,000-document compaction preflight. Override
 `--max-put-bytes`, `--publication-records`, `--recycle-at-bytes`, and
-`--compaction-documents` to compare admitted profiles. For example, the measured
+`--compaction-documents` to compare admitted profiles. Corpora of at least 10,000
+documents use a disk-backed local bucket so emulated R2 artifact payloads do not
+accumulate in the test process's RAM; `--file-bucket` selects it for smaller
+fixtures. This storage belongs to the test harness, outside native request
+budgets. See the [fixture design](../../docs/design/cloudflare-local-scale-fixtures.md).
+For example, the measured
 5,000-document compaction case uses `--compaction-documents=5000`; the default
 host still rejects that compaction unless configured for it.
 
