@@ -38,6 +38,17 @@ pub const Frame = struct {
 };
 pub const Checkpoint = struct { format: u8 = 1, written_ms: u64, state: State };
 pub const Recovery = struct { state: State, has_more: bool = false };
+pub const max_root_bytes = 12 * 1024;
+// Keep space for epoch rotation, larger counters and checkpoint headers under
+// the existing sixteen-KiB record limit. Optional read capsules may be evicted;
+// authoritative tree roots and WAL records cannot be silently truncated.
+pub fn rootFits(a: A, source: State, root: []const u8) !bool {
+    if (root.len > max_root_bytes) return false;
+    const next = State{ .epoch = source.epoch, .owner = source.owner, .next = source.next +| 1, .revision = source.revision +| 1, .root = root };
+    const bytes = try std.json.Stringify.valueAlloc(a, Frame{ .kind = .commit, .epoch = source.epoch, .slot = source.next, .parent_revision = source.revision, .state = next }, .{});
+    defer a.free(bytes);
+    return bytes.len <= 15360;
+}
 pub const Log = struct {
     client: Client,
     bucket: []const u8,
@@ -80,7 +91,7 @@ pub const Log = struct {
     }
     fn validate(state: State) !void {
         if (state.revision > 9_007_199_254_740_991) return error.ImmutableLogRevisionExceeded;
-        if (state.format != 1 or state.root.len > 4096 or state.next > epoch_commits) return error.InvalidImmutableLog;
+        if (state.format != 1 or state.root.len > max_root_bytes or state.next > epoch_commits) return error.InvalidImmutableLog;
     }
     fn frame(a: A, bytes: []const u8, epoch: [16]u8, slot: ?u64) !Frame {
         const value = (try std.json.parseFromSlice(Frame, a, bytes, .{ .allocate = .alloc_always })).value;
@@ -92,6 +103,7 @@ pub const Log = struct {
         return value;
     }
     fn immutable(self: Log, a: A, k: []const u8, bytes: []const u8) !void {
+        if (bytes.len > 16384) return error.InvalidImmutableLog;
         var client = self.client;
         client.allocator = a;
         var receipt = client.putObject(self.bucket, k, bytes, .{ .if_none_match = true, .content_type = "application/json", .cancellation = self.cancellation }) catch |err| switch (err) {
@@ -329,6 +341,7 @@ pub const Log = struct {
             if (now < old.written_ms +| 1000) return false;
         } else if (!force and state.revision < self.checkpoint_commits) return false;
         const bytes = try std.json.Stringify.valueAlloc(a, Checkpoint{ .written_ms = now, .state = state }, .{});
+        if (bytes.len > 16384) return error.InvalidImmutableLog;
         var client = self.client;
         client.allocator = a;
         var receipt = client.putObject(self.bucket, k, bytes, .{ .if_none_match = previous == null, .if_match_etag = if (previous) |value| value.metadata.etag orelse return error.ConditionalReadUnsupported else null, .content_type = "application/json", .cancellation = self.cancellation }) catch |err| switch (err) {

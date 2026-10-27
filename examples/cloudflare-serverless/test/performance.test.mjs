@@ -518,6 +518,22 @@ test('ambiguous metadata deadlines retain native reservations and recover the la
  assert.equal(pool.reservedBytes,0);assert.equal(await store.transaction(tx=>tx.get('value')),2,'fresh native recovery must authenticate the late commit');assert.equal(created,2);assert.equal(pool.reservedBytes,0);
 });
 
+test('native inline read views avoid metadata pages across logical storage identities and preserve migration barriers',async()=>{
+ const{NativeReadViews}=await import('../native-read-views.mjs'),{openAuthority}=await import('../coordinator-authority.mjs'),{inlineReadSet}=await import('../read-view.mjs'),{MIGRATION}=await import('../r2-coordinator-migration.mjs'),{RequestPool}=await import('../request-pool.mjs'),{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs');
+ const small=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-observe.wasm',import.meta.url))),bucket=new Bucket(),namespace='logical-capsule',storage='distinct-storage-capsule',keys=await metadataKeys(namespace),now=Date.now(),env={DATABASE:bucket,ANTFLY_INCARNATION:namespace,COORDINATOR_STORAGE_ID:storage,COORDINATOR_BACKEND:'r2'};
+ await openAuthority(env,'r2');const writer=new R2CoordinatorStore(module,bucket,storage,{inlineReadSet:inlineReadSet(namespace)});
+ const pin=version=>keys.progress+'READ_PINS/'+version;await writer.transaction(tx=>{tx.put(keys.head,record('7'));tx.put(keys.wal,record('{"latest_lsn":1}'));tx.put(keys.floor,record('0'));tx.put(pin('7'),record(String(BigInt(now+600000)*1000000n)));});
+ const events=[],pool=new RequestPool(()=>instantiateHost(small,null),2,{reservationBytes:8*1024*1024,maxReservedBytes:16*1024*1024}),observer=new NativeReadViews(small,env,{kernel:pool,clock:()=>now,onMetrics:e=>events.push(e),cohortDelayMs:0}),writes=bucket.writes;
+ assert.equal((await observer.open()).version,'7');assert.equal(bucket.writes,writes);assert.ok(events.some(e=>e.action==='read'));assert.ok(events.filter(e=>e.action==='read').every(e=>e.operations===0),'authenticated rows must not fetch ordered metadata pages');assert.equal(events.findLast(e=>e.event==='antfly.coordinator_snapshot').inline_root_has_pin,true);
+ await writer.transaction(tx=>{tx.put(keys.head,record('8'));tx.put(pin('8'),record(String(BigInt(now+600000)*1000000n)));});assert.equal((await observer.open()).version,'8');assert.ok(events.filter(e=>e.action==='read').every(e=>e.operations===0));
+ await writer.transaction(tx=>tx.put(MIGRATION,{phase:'freeze'}));await assert.rejects(observer.open(),/CoordinatorMigrationRequired/);assert.equal(writer.acquired,true);assert.equal(observer.store.acquired,false);
+});
+
+test('metadata activation qualifies full compact and observation binaries beyond legacy root limits',async()=>{
+ const{verifyInlineMetadataReaders}=await import('../qualification/metadata-compatibility.mjs'),[compact,observe]=await Promise.all(['antfly-serverless-compact.wasm','antfly-serverless-observe.wasm'].map(async name=>WebAssembly.compile(await readFile(new URL('../dist/'+name,import.meta.url)))));
+ const result=await verifyInlineMetadataReaders(module,compact,observe);assert.equal(result.format,3);assert.equal(result.readers,3);assert.equal(result.physical_row_reads,0);assert.ok(result.root_bytes>4096&&result.root_bytes<=12288);await assert.rejects(verifyInlineMetadataReaders(module,compact),/ReaderCoverageRequired/);
+});
+
 test("point reads keep stable bounded placement across app isolate restarts",async()=>{
  const{readerSlot}=await import('../runtime-routing.mjs');for(const slots of[1,2,3,4]){const seen=new Set();for(let i=0;i<512;i++){const input={op:'lookup',doc_id:'gate/'+i},slot=readerSlot(input,slots,i);assert.ok(slot>=0&&slot<slots);assert.equal(readerSlot(input,slots,0),slot);assert.equal(readerSlot(input,slots,123456),slot);seen.add(slot);}assert.equal(seen.size,slots);}
  for(let i=0;i<512;i+=2)assert.notEqual(readerSlot({op:'lookup',doc_id:'gate/'+i},2),readerSlot({op:'lookup',doc_id:'gate/'+(i+1)},2));assert.equal(readerSlot({op:'count'},2,3),1);assert.equal(readerSlot({op:'lookup',doc_id:'😀/é'},4),readerSlot({op:'lookup',doc_id:'😀/é'},4,9));

@@ -16,6 +16,8 @@
 import{assertGateRun,assertGateConfig}from'./gate-scope.mjs';
 import{verifySealedRun,assertUnusedRecovery,runtimePlacement}from'./gate-provenance.mjs';
 import{verifyWalTailReaders}from'./wal-compatibility.mjs';
+import{verifyInlineMetadataReaders}from'./metadata-compatibility.mjs';
+import{isDeepStrictEqual}from'node:util';
 import {readFile,writeFile,appendFile,mkdir,readdir,unlink,rm} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -23,7 +25,7 @@ import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 const cwd=fileURLToPath(new URL('../',import.meta.url)),cli=resolve(cwd,'node_modules/wrangler/bin/wrangler.js');
 const gate=JSON.parse(await readFile(process.argv[2])),action=process.argv[3],selection=process.argv[4];
-if(gate.schema!==1||!/^gate-[a-z0-9]+$/.test(gate.id)||!['seal','deploy','enable-wal-inline','upload-token','pause','resume','cleanup'].includes(action))throw Error('invalid lifecycle manifest/action');
+if(gate.schema!==1||!/^gate-[a-z0-9]+$/.test(gate.id)||!['seal','deploy','enable-wal-inline','enable-inline-metadata','upload-token','pause','resume','cleanup'].includes(action))throw Error('invalid lifecycle manifest/action');
 const paths=gate.trials.flatMap(t=>[t.baseline,t.candidate]).filter(path=>!selection||path.includes(selection));
 const save=run=>writeFile(resolve(run.dir,'run.json'),JSON.stringify(run,null,2));
 async function command(run,args,{input,allowExists=false,allowMissing=false}={}){
@@ -43,6 +45,31 @@ async function lifecycle(path){
   const paths=['-antfly-serverless.wasm','-antfly-serverless-compact.wasm'].map(suffix=>resolve(dir,Object.keys(hashes).find(name=>name.endsWith(suffix))));
   const modules=await Promise.all(paths.map(async path=>WebAssembly.compile(await readFile(path))));
   return verifyWalTailReaders(...modules);
+ }
+ async function inlineReaders(){
+  let errors=await verifySealedRun(run);
+  if(run.inline_metadata_roots_activating){
+   // A resumable activation may differ only in this feature flag. All other
+   // placement settings and sealed files remain fixed throughout deployment.
+   for(const service of run.services){const config=JSON.parse(await readFile(service.config));if(Object.hasOwn(run.runtime_placement??{},'inline_metadata_roots'))config.vars.INLINE_METADATA_ROOTS=String(run.runtime_placement.inline_metadata_roots);else delete config.vars.INLINE_METADATA_ROOTS;if(!isDeepStrictEqual(runtimePlacement(config),run.runtime_placement))throw Error('runtime placement changed during metadata activation');}
+   errors=errors.filter(error=>!error.endsWith(': runtime placement policy changed'));
+  }
+  if(errors.length)throw Error(errors.join('; '));
+  const hashes=run.bundle_hashes.writer,dir=resolve(run.dir,'bundle-writer');
+  const modules=await Promise.all(['-antfly-serverless.wasm','-antfly-serverless-compact.wasm','-antfly-serverless-observe.wasm'].map(async suffix=>{const name=Object.keys(hashes).find(name=>name.endsWith(suffix));if(!name)throw Error('metadata reader binary missing');return WebAssembly.compile(await readFile(resolve(dir,name)));}));
+  return verifyInlineMetadataReaders(...modules);
+ }
+ if(action==='enable-inline-metadata'){
+  if(run.kind!=='candidate'||!run.deployed&&!run.inline_metadata_roots_activating||!['app','writer','reader','builder'].every(role=>run.versions?.[role]))throw Error('deploy every compatible role before metadata activation');
+  assertUnusedRecovery(run);run.inline_metadata_probe=await inlineReaders();
+  if(run.inline_metadata_roots_enabled)return;
+  run.deployed=false;run.inline_metadata_roots_activating=true;await save(run);
+  // Install readers before allowing the writer to emit format-three roots.
+  for(const role of['reader','builder','app','writer']){
+   const service=run.services.find(service=>service.role===role),config=JSON.parse(await readFile(service.config));config.vars.INLINE_METADATA_ROOTS='true';await writeFile(service.config,JSON.stringify(config,null,2));
+   const output=await command(run,['deploy','--no-bundle','--config',service.config]),version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('missing metadata activation version');run.versions[role]=version;if(role==='app')run.version=version;await save(run);
+  }
+  run.runtime_placement=runtimePlacement(JSON.parse(await readFile(run.config)));run.inline_metadata_roots_enabled=true;delete run.inline_metadata_roots_activating;run.deployed=true;await save(run);return;
  }
  if(action==='enable-wal-inline'){
   if(run.kind!=='candidate'||!run.deployed&&!run.wal_inline_tail_activating||!['app','writer','reader','builder'].every(role=>run.versions?.[role]))throw Error('deploy every compatible role before WAL activation');
@@ -71,6 +98,7 @@ async function lifecycle(path){
  if(action==='deploy'){
   const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));
   if(run.wal_inline_tail_enabled||run.wal_inline_tail_activating)await walReaders();
+  if(run.inline_metadata_roots_enabled||run.inline_metadata_roots_activating)await inlineReaders();
   if(!run.bundle_hashes)throw Error('seal before deploying');for(const args of[['r2','bucket','create',run.id],['queues','create',run.id],['queues','create',run.id+'-dead']])await command(run,[...args,'--config',run.config],{allowExists:true});
   run.versions={};for(const service of run.services){const output=await command(run,['deploy','--no-bundle','--config',service.config]);const version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('missing deployment version');run.versions[service.role]=version;if(service.role==='app'){run.origin=/https:\/\/[^\s]+\.workers\.dev/.exec(output)?.[0];if(!run.origin||!new URL(run.origin).hostname.startsWith(run.id+'.'))throw Error('origin mismatch');run.version=version;}await save(run);}run.deployed=true;await save(run);return;
  }

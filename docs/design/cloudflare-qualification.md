@@ -1751,3 +1751,13 @@ in [performance design](cloudflare-performance.md) passes 231 Node checks and
 16 persisted Worker checks, including late durable-commit recovery and a real
 RPC context/reservation handoff. The candidate native modules are unchanged at
 this checkpoint; live deadline and latency qualification remains outstanding.
+
+
+The next candidate adds bounded native read capsules and reader-first activation,
+with 234 passing Node tests, 18 passing persisted Worker tests and 660 passing
+native tests (six skipped). The full R2 eviction/collection/reindex/storage-erasure
+fixture now runs with format-three roots. Preparation bounds unpublished seed
+work to one tenant and 64 documents on both sides under the original thirty-minute
+setup budget. Native binaries changed, so ANN, capacity evidence, sealed profiles
+and live trials must be refreshed. No reserved cold epoch has been used; the gate
+remains unpassed at this checkpoint.

@@ -90,6 +90,13 @@ cannot turn measured writes into receipt replays.
 | ANN | Both corpora below: equal/better recall with no additional mean physical GETs or bytes at 8/32/full effort |
 | Failure tests | Content-addressed passing native, Node and persisted Worker test logs |
 
+Setup uses one tenant at a time and waits for publication after each 64-document
+seed batch. Both sides use the same preparation policy and a single thirty-minute
+setup deadline; reports record it as `setup_policy`. This bounds unpublished work
+on the original control's single builder lane. It changes neither the 2,048 seed
+documents nor the measured fixed-arrival workload, retry budgets or thresholds.
+A failed preparation remains a failed report; never replay its measured corpus.
+
 The fixed arrival interval is 30 seconds per deployment. Each arrival schedules
 four writes, twelve fenced reads and, every fourth arrival, four compactions.
 Each minute also samples all four publication frontiers and Queue/DLQ metrics.
@@ -425,3 +432,20 @@ records the corpus routes in each manifest/report; all roles must agree, paired
 corpus IDs must match, and the three trials must have distinct corpus IDs.
 Setup replay rejects a changed corpus. A consumed recovery marker still requires
 a new deployment pair; changing a table incarnation never clears it.
+
+
+## Read-capsule candidate rollout
+
+For the format-three candidate described in
+[performance design](cloudflare-performance.md#native-read-capsules), seal with
+`INLINE_METADATA_ROOTS=false`, deploy every compatible role, then run
+`node qualification/gate-lifecycle.mjs GATE_JSON enable-inline-metadata -c`.
+The lifecycle probes the three sealed native variants and activates readers
+before writers. The frozen corrected control remains unchanged. Profile hashes,
+format activation and deployment versions must precede fresh qualification.
+
+Store completed logs and benchmark reports under the worktree's ignored
+`dist/qualification/` directory before hashing them into evidence. Temporary
+system-directory logs may disappear between sessions; a missing artifact
+invalidates its evidence manifest. Preserve such manifests as historical failed
+evidence and regenerate current evidence from available, verified artifacts.

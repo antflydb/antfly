@@ -13,6 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Native root v2 inlines the WAL head and publication outbox. Only the
-// remaining ordered tree owns metadata page objects for self-collection.
-export function metadataTreeRoot(state){const root=state.root?JSON.parse(state.root):null;if(root?.format!=null){if(root.format!==2||!Object.hasOwn(root,"metadata_tree"))throw new Error("UnsupportedCoordinatorRoot");return root.metadata_tree;}return root;}
+// Native roots inline the WAL/outbox (v2) and optional read capsules (v3).
+// Cached rows remain in the ordered tree; only that tree owns page objects.
+export function metadataTreeRoot(state){const root=state.root?JSON.parse(state.root):null;if(root?.format!=null){if(![2,3].includes(root.format)||!Object.hasOwn(root,"metadata_tree"))throw new Error("UnsupportedCoordinatorRoot");return root.metadata_tree;}return root;}

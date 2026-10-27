@@ -17,6 +17,7 @@ export class Bucket {
   objects = new Map(); revision = 0; writes = 0; readBytes = 0; reads = 0;
   metadata(key, object) { return { key, size: object.body.length, etag: object.etag, uploaded: new Date(0), httpMetadata: object.httpMetadata ?? {} }; }
   async put(key, body, options = {}) {
+    if (typeof body === "string") body = new TextEncoder().encode(body);
     await Promise.resolve();
     const old = this.objects.get(key), condition = options.onlyIf;
     if ((condition?.etagDoesNotMatch === "*" && old) || (condition?.etagMatches != null && old?.etag !== condition.etagMatches)) return null;
@@ -33,8 +34,9 @@ export class Bucket {
     const offset = options.range?.offset ?? 0;
     const data = value.body.slice(offset, options.range?.length == null ? undefined : offset + options.range.length);
     this.readBytes += data.length;
+    const stream = new ReadableStream({ start(controller) { controller.enqueue(data); controller.close(); } });
     return { ...meta, range: options.range ? { offset, length: data.length } : undefined,
-      body: new ReadableStream({ start(controller) { controller.enqueue(data); controller.close(); } }) };
+      body: stream, json: () => new Response(stream).json() };
   }
   async head(key) { const value = this.objects.get(key); return value ? this.metadata(key, value) : null; }
   async delete(key) { for (const item of Array.isArray(key) ? key : [key]) this.objects.delete(item); }

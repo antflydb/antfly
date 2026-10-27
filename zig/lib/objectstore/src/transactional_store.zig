@@ -38,6 +38,20 @@ pub const Request = struct {
     before: []const u8 = "0",
     checkpoint_commits: u8 = 64,
     wal_commit: ?WalCommit = null,
+    inline_read_set: ?InlineReadSet = null,
+};
+pub const InlineReadSet = struct {
+    keys: []const []const u8,
+    prefix: ?[]const u8 = null,
+
+    fn validate(self: InlineReadSet) !void {
+        if (self.keys.len > 8) return error.InvalidCoordinatorReadSet;
+        for (self.keys, 0..) |key, i| {
+            if (key.len == 0 or key.len > 1024 or !std.unicode.utf8ValidateSlice(key)) return error.InvalidCoordinatorReadSet;
+            for (self.keys[0..i]) |previous| if (std.mem.eql(u8, previous, key)) return error.InvalidCoordinatorReadSet;
+        }
+        if (self.prefix) |prefix| if (prefix.len == 0 or prefix.len > 1024 or !std.unicode.utf8ValidateSlice(prefix)) return error.InvalidCoordinatorReadSet;
+    }
 };
 pub const WalCommit = struct {
     wal_key: []const u8,
@@ -51,14 +65,44 @@ pub const WalCommit = struct {
 };
 const HotRecord = struct { key: []const u8, value: ?[]const u8 = null };
 const HotRoot = struct { format: u8 = 2, metadata_tree: ?tree.Ref = null, wal: HotRecord, publication: HotRecord };
+// Cached rows remain in the ordered tree. Native commits update both copies
+// atomically; absence is represented explicitly. The selected prefix record
+// accelerates a changing pin key without claiming absence for other pins.
+const InlineRows = struct { exact: []HotRecord = &.{}, prefix: ?[]const u8 = null, selected: ?HotRecord = null };
+const ReadRoot = struct { format: u8 = 3, metadata_tree: ?tree.Ref = null, wal: ?HotRecord = null, publication: ?HotRecord = null, read_rows: InlineRows };
 const Row = struct { key: []const u8, value: []const u8 };
 const Root = struct {
     page: ?tree.Ref = null,
     hot: ?HotRoot = null,
+    read_rows: ?InlineRows = null,
     fn load(a: A, bytes: []const u8) !Root {
+        if (bytes.len > journal.max_root_bytes) return error.InvalidCoordinatorRoot;
         if (bytes.len == 0) return .{};
         const value = (try std.json.parseFromSlice(std.json.Value, a, bytes, .{})).value;
         if (value == .object and value.object.contains("format")) {
+            const format = value.object.get("format").?;
+            if (format == .integer and format.integer == 3) {
+                const current = (try std.json.parseFromValue(ReadRoot, a, value, .{})).value;
+                if (current.metadata_tree) |ref| try ref.validate();
+                if ((current.wal == null) != (current.publication == null) or current.read_rows.exact.len > 8) return error.InvalidCoordinatorRoot;
+                var hot: ?HotRoot = null;
+                if (current.wal) |wal| {
+                    if (wal.key.len == 0 or current.publication.?.key.len == 0 or std.mem.eql(u8, wal.key, current.publication.?.key)) return error.InvalidCoordinatorRoot;
+                    hot = .{ .metadata_tree = current.metadata_tree, .wal = wal, .publication = current.publication.? };
+                }
+                for (current.read_rows.exact, 0..) |record, i| {
+                    try validateInlineRecord(record);
+                    for (current.read_rows.exact[0..i]) |prior| if (std.mem.eql(u8, prior.key, record.key)) return error.InvalidCoordinatorRoot;
+                }
+                if (current.read_rows.prefix) |prefix| {
+                    if (prefix.len == 0 or prefix.len > 1024 or !std.unicode.utf8ValidateSlice(prefix)) return error.InvalidCoordinatorRoot;
+                    if (current.read_rows.selected) |record| {
+                        try validateInlineRecord(record);
+                        if (!std.mem.startsWith(u8, record.key, prefix)) return error.InvalidCoordinatorRoot;
+                    }
+                } else if (current.read_rows.selected != null) return error.InvalidCoordinatorRoot;
+                return .{ .page = current.metadata_tree, .hot = hot, .read_rows = current.read_rows };
+            }
             const hot = (try std.json.parseFromValue(HotRoot, a, value, .{})).value;
             if (hot.format != 2 or hot.wal.key.len == 0 or hot.publication.key.len == 0 or std.mem.eql(u8, hot.wal.key, hot.publication.key)) return error.InvalidCoordinatorRoot;
             if (hot.metadata_tree) |ref| try ref.validate();
@@ -71,6 +115,10 @@ const Root = struct {
             if (std.mem.eql(u8, key, hot.wal.key)) return if (hot.wal.value) |value| try compactRecord(a, value, false) else null;
             if (std.mem.eql(u8, key, hot.publication.key)) return hot.publication.value;
         }
+        if (self.read_rows) |rows| {
+            for (rows.exact) |record| if (std.mem.eql(u8, key, record.key)) return if (record.value) |value| try a.dupe(u8, value) else null;
+            if (rows.selected) |record| if (std.mem.eql(u8, key, record.key)) return if (record.value) |value| try a.dupe(u8, value) else null;
+        }
         const values = try tree.lookupMany(scratch, store, self.page, &.{key});
         defer {
             for (values) |value| if (value) |entry| entry.deinit(scratch);
@@ -79,6 +127,13 @@ const Root = struct {
         return if (values[0]) |entry| try a.dupe(u8, entry.value) else null;
     }
     fn encode(self: Root, a: A) ![]u8 {
+        if (self.read_rows) |rows| {
+            var wal: ?HotRecord = if (self.hot) |hot| hot.wal else null;
+            if (wal) |*record| if (record.value) |value| {
+                record.value = try compactRecord(a, value, true);
+            };
+            return std.json.Stringify.valueAlloc(a, ReadRoot{ .metadata_tree = self.page, .wal = wal, .publication = if (self.hot) |hot| hot.publication else null, .read_rows = rows }, .{});
+        }
         if (self.hot) |value| {
             var hot = value;
             if (hot.wal.value) |record| hot.wal.value = try compactRecord(a, record, true);
@@ -86,7 +141,59 @@ const Root = struct {
         }
         return std.json.Stringify.valueAlloc(a, self.page, .{});
     }
+    fn updateInline(self: *Root, key: []const u8, value: ?[]const u8) void {
+        if (self.read_rows) |*rows| {
+            for (rows.exact) |*record| if (std.mem.eql(u8, key, record.key)) {
+                record.value = value;
+            };
+            if (rows.prefix) |prefix| if (std.mem.startsWith(u8, key, prefix)) {
+                if (value != null or rows.selected != null and std.mem.eql(u8, rows.selected.?.key, key)) rows.selected = .{ .key = key, .value = value };
+            };
+        }
+    }
+    fn captureInline(self: *Root, a: A, scratch: A, store: tree.Store, requested: ?InlineReadSet, commands: []const Command) !void {
+        const rules = requested orelse return;
+        var exact = std.ArrayList(HotRecord).empty;
+        for (rules.keys) |key| {
+            if (self.hot) |hot| if (std.mem.eql(u8, key, hot.wal.key) or std.mem.eql(u8, key, hot.publication.key)) continue;
+            try exact.append(a, .{ .key = key, .value = try self.get(a, scratch, store, key) });
+        }
+        var selected: ?HotRecord = null;
+        if (rules.prefix) |prefix| {
+            if (self.read_rows) |prior| if (prior.prefix != null and std.mem.eql(u8, prefix, prior.prefix.?)) {
+                selected = prior.selected;
+            };
+            for (commands) |command| if (std.mem.startsWith(u8, command.key, prefix)) {
+                if (command.kind == .put or selected != null and std.mem.eql(u8, command.key, selected.?.key)) selected = .{ .key = command.key, .value = command.value };
+            };
+        }
+        self.read_rows = .{ .exact = exact.items, .prefix = rules.prefix, .selected = selected };
+    }
+    fn encodeBounded(self: *Root, a: A, state: journal.State) ![]u8 {
+        while (true) {
+            const encoded = try self.encode(a);
+            if (try journal.rootFits(a, state, encoded)) return encoded;
+            if (self.read_rows) |*rows| {
+                if (rows.exact.len != 0) {
+                    var largest: usize = 0;
+                    for (rows.exact, 0..) |record, i| if (inlineCharge(record) > inlineCharge(rows.exact[largest])) {
+                        largest = i;
+                    };
+                    const remaining = try a.alloc(HotRecord, rows.exact.len - 1);
+                    @memcpy(remaining[0..largest], rows.exact[0..largest]);
+                    @memcpy(remaining[largest..], rows.exact[largest + 1 ..]);
+                    rows.exact = remaining;
+                } else if (rows.selected != null) rows.selected = null else self.read_rows = null;
+            } else return error.CoordinatorRootExceeded;
+        }
+    }
 };
+fn validateInlineRecord(record: HotRecord) !void {
+    if (record.key.len == 0 or record.key.len > 1024 or !std.unicode.utf8ValidateSlice(record.key) or record.value != null and (record.value.?.len > 32768 or !std.unicode.utf8ValidateSlice(record.value.?))) return error.InvalidCoordinatorRoot;
+}
+fn inlineCharge(record: HotRecord) usize {
+    return record.key.len + if (record.value) |value| value.len else @as(usize, 0);
+}
 // The mutable WAL HEAD is UTF-8 JSON. Inline roots keep its bytes as a JSON
 // string instead of decimal byte arrays; generic reads restore the exact byte
 // representation. Other record fields and non-UTF-8 payloads are unchanged.
@@ -127,6 +234,7 @@ pub const Context = struct {
     cancellation: ?objects.CancellationToken = null,
 
     pub fn execute(self: Context, req: Request) ![]u8 {
+        if (req.inline_read_set) |rules| try rules.validate();
         if (req.checkpoint_commits < 8 or req.checkpoint_commits > 64 or (req.checkpoint_commits & (req.checkpoint_commits - 1)) != 0) return error.InvalidCoordinatorCheckpointCadence;
         var metadata = std.heap.ArenaAllocator.init(self.alloc);
         defer metadata.deinit();
@@ -237,7 +345,10 @@ pub const Context = struct {
                 root.page = try tree.apply(self.alloc, cache.store(), root.page, &retired);
             }
             root.hot = .{ .metadata_tree = root.page, .wal = .{ .key = commit.wal_key, .value = commit.value }, .publication = .{ .key = commit.publication_key, .value = try std.json.Stringify.valueAlloc(m, publication, .{}) } };
-            const encoded = try root.encode(m);
+            root.updateInline(commit.wal_key, commit.value);
+            root.updateInline(commit.publication_key, root.hot.?.publication.value);
+            try root.captureInline(m, self.alloc, cache.store(), req.inline_read_set, &.{});
+            const encoded = try root.encodeBounded(m, state);
             try uploads.flush();
             const next = try log.append(m, state, encoded);
             return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
@@ -257,6 +368,7 @@ pub const Context = struct {
                 .delete => null,
                 else => return error.CoordinatorWriteRequired,
             };
+            root.updateInline(command.key, value);
             if (root.hot) |*hot| {
                 if (std.mem.eql(u8, command.key, hot.wal.key)) {
                     hot.wal.value = value;
@@ -276,7 +388,8 @@ pub const Context = struct {
         }.less);
         if (changes.items.len != 0) root.page = try tree.apply(self.alloc, cache.store(), root.page, changes.items);
         if (root.hot) |*hot| hot.metadata_tree = root.page;
-        const encoded = try root.encode(m);
+        try root.captureInline(m, self.alloc, cache.store(), req.inline_read_set, req.commands);
+        const encoded = try root.encodeBounded(m, state);
         try uploads.flush();
         const next = try log.append(m, state, encoded);
         return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .base = base }, .{});
@@ -293,6 +406,118 @@ fn upperBound(a: A, prefix: []const u8) !?[]u8 {
         return result;
     }
     return null;
+}
+
+test "object-native inline read capsules preserve ordered authority through updates and pin rotation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("fixture");
+    const ctx = Context{ .alloc = a, .client = client, .bucket = "fixture", .prefix = "native", .namespace = "inline", .io = std.testing.io };
+    const Header = struct { state: journal.State };
+    const initial = try ctx.execute(.{ .action = .begin, .owner = @splat(1) });
+    defer a.free(initial);
+    var state = (try std.json.parseFromSlice(Header, m, initial, .{ .ignore_unknown_fields = true })).value.state;
+    const committed = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = state, .inline_read_set = .{ .keys = &.{ "head", "hints", "missing" }, .prefix = "pins/" }, .commands = &.{ .{ .kind = .put, .key = "head", .value = "1" }, .{ .kind = .put, .key = "hints", .value = "proof" }, .{ .kind = .put, .key = "pins/1", .value = "clock-1" } } });
+    defer a.free(committed);
+    state = (try std.json.parseFromSlice(Header, m, committed, .{ .ignore_unknown_fields = true })).value.state;
+    const observed = try ctx.execute(.{ .action = .observe_committed, .owner = @splat(9) });
+    defer a.free(observed);
+    const cold = (try std.json.parseFromSlice(Header, m, observed, .{ .ignore_unknown_fields = true })).value.state;
+    try std.testing.expectEqualStrings(state.root, cold.root);
+    const Hook = struct {
+        fn deny(_: *anyopaque, _: A, _: []const u8, _: []const u8, _: @import("types.zig").GetOptions) !@import("types.zig").GetResult {
+            return error.UnexpectedPhysicalRead;
+        }
+    };
+    var table = client.vtable.*;
+    table.get_object = Hook.deny;
+    var cached = ctx;
+    cached.client.vtable = &table;
+    const first = try cached.execute(.{ .action = .read, .owner = cold.owner, .state = cold, .commands = &.{ .{ .kind = .get, .key = "head" }, .{ .kind = .get, .key = "hints" }, .{ .kind = .get, .key = "missing" }, .{ .kind = .get, .key = "pins/1" } } });
+    defer a.free(first);
+    const before = (try std.json.parseFromSlice(struct { results: [][]Row }, m, first, .{})).value.results;
+    try std.testing.expectEqualStrings("1", before[0][0].value);
+    try std.testing.expectEqualStrings("proof", before[1][0].value);
+    try std.testing.expectEqual(@as(usize, 0), before[2].len);
+    try std.testing.expectEqualStrings("clock-1", before[3][0].value);
+    // Existing capsules remain coherent even when a caller omits read rules.
+    const changed = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = state, .commands = &.{ .{ .kind = .put, .key = "head", .value = "2" }, .{ .kind = .delete, .key = "hints" }, .{ .kind = .put, .key = "pins/2", .value = "clock-2" }, .{ .kind = .put, .key = "cold", .value = "tree-value" } } });
+    defer a.free(changed);
+    state = (try std.json.parseFromSlice(Header, m, changed, .{ .ignore_unknown_fields = true })).value.state;
+    const updated = try cached.execute(.{ .action = .read, .owner = state.owner, .state = state, .commands = &.{ .{ .kind = .get, .key = "head" }, .{ .kind = .get, .key = "hints" }, .{ .kind = .get, .key = "pins/2" } } });
+    defer a.free(updated);
+    const after = (try std.json.parseFromSlice(struct { results: [][]Row }, m, updated, .{})).value.results;
+    try std.testing.expectEqualStrings("2", after[0][0].value);
+    try std.testing.expectEqual(@as(usize, 0), after[1].len);
+    try std.testing.expectEqualStrings("clock-2", after[2][0].value);
+    const listed = try ctx.execute(.{ .action = .read, .owner = state.owner, .state = state, .commands = &.{ .{ .kind = .list, .key = "" }, .{ .kind = .get, .key = "pins/1" } } });
+    defer a.free(listed);
+    const rows = (try std.json.parseFromSlice(struct { results: [][]Row }, m, listed, .{})).value.results;
+    try std.testing.expectEqual(@as(usize, 4), rows[0].len);
+    try std.testing.expectEqualStrings("cold", rows[0][0].key);
+    try std.testing.expectEqualStrings("clock-1", rows[1][0].value);
+}
+
+test "object-native inline read capsule budgets fall back to complete ordered values" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("fixture");
+    const ctx = Context{ .alloc = a, .client = client, .bucket = "fixture", .prefix = "native", .namespace = "capsule-bound", .io = std.testing.io };
+    const Header = struct { state: journal.State, base: []const u8 };
+    const initial = try ctx.execute(.{ .action = .begin, .owner = @splat(1) });
+    defer a.free(initial);
+    const source = (try std.json.parseFromSlice(Header, m, initial, .{ .ignore_unknown_fields = true })).value;
+    const large = try m.alloc(u8, 12000);
+    @memset(large, '\\');
+    const committed = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = source.state, .inline_read_set = .{ .keys = &.{ "large", "small" } }, .commands = &.{ .{ .kind = .put, .key = "large", .value = large }, .{ .kind = .put, .key = "small", .value = "kept" } } });
+    defer a.free(committed);
+    const state = (try std.json.parseFromSlice(struct { state: journal.State }, m, committed, .{ .ignore_unknown_fields = true })).value.state;
+    const root = try Root.load(m, state.root);
+    try std.testing.expect(root.read_rows != null);
+    try std.testing.expectEqual(@as(usize, 1), root.read_rows.?.exact.len);
+    try std.testing.expectEqualStrings("small", root.read_rows.?.exact[0].key);
+    const key = try std.fmt.allocPrint(m, "{s}/epochs/{s}/{d:0>20}.json", .{ source.base, std.fmt.bytesToHex(source.state.epoch, .lower), source.state.next });
+    var frame = try client.getObject("fixture", key, .{});
+    defer frame.deinit(a);
+    try std.testing.expect(frame.body.len <= 15360);
+    const read = try ctx.execute(.{ .action = .read, .owner = state.owner, .state = state, .commands = &.{ .{ .kind = .get, .key = "large" }, .{ .kind = .get, .key = "small" } } });
+    defer a.free(read);
+    const rows = (try std.json.parseFromSlice(struct { results: [][]Row }, m, read, .{})).value.results;
+    try std.testing.expectEqualStrings(large, rows[0][0].value);
+    try std.testing.expectEqualStrings("kept", rows[1][0].value);
+    // The new bounded root carries useful hints larger than the legacy 4-KiB
+    // state limit, while every log record remains below sixteen KiB.
+    const hint = try m.alloc(u8, 5000);
+    @memset(hint, 'x');
+    const enlarged = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = state, .inline_read_set = .{ .keys = &.{ "hint", "small" } }, .commands = &.{.{ .kind = .put, .key = "hint", .value = hint }} });
+    defer a.free(enlarged);
+    const updated = (try std.json.parseFromSlice(struct { state: journal.State }, m, enlarged, .{ .ignore_unknown_fields = true })).value.state;
+    try std.testing.expect(updated.root.len > 4096 and updated.root.len <= journal.max_root_bytes);
+    const observed = try ctx.execute(.{ .action = .observe_committed, .owner = @splat(9) });
+    defer a.free(observed);
+    const recovered = (try std.json.parseFromSlice(struct { state: journal.State }, m, observed, .{ .ignore_unknown_fields = true })).value.state;
+    try std.testing.expectEqualStrings(updated.root, recovered.root);
+}
+
+test "object-native inline read capsules reject ambiguous declarations and malformed pins" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    try std.testing.expectError(error.InvalidCoordinatorReadSet, (InlineReadSet{ .keys = &.{ "same", "same" } }).validate());
+    try std.testing.expectError(error.InvalidCoordinatorReadSet, (InlineReadSet{ .keys = &.{}, .prefix = "" }).validate());
+    try std.testing.expectError(error.InvalidCoordinatorRoot, Root.load(m, "{\"format\":3,\"metadata_tree\":null,\"wal\":null,\"publication\":null,\"read_rows\":{\"exact\":[{\"key\":\"same\"},{\"key\":\"same\"}]}}"));
+    try std.testing.expectError(error.InvalidCoordinatorRoot, Root.load(m, "{\"format\":3,\"metadata_tree\":null,\"wal\":null,\"publication\":null,\"read_rows\":{\"exact\":[],\"prefix\":\"pins/\",\"selected\":{\"key\":\"other\",\"value\":\"value\"}}}"));
 }
 
 test "object-native store read allocation failures release all request ownership" {

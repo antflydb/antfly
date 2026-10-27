@@ -1118,3 +1118,49 @@ another mutation. Background checkpoint hints defer during that drain. Tests
 hold a real metadata commit past its deadline, verify retained capacity and
 rejected intervening writes, then recover its late durable value. Actual-workerd
 coverage checks capacity across the completed RPC and the next caller's context.
+
+## Native read capsules
+
+A fresh observation still required ordered metadata page reads before the data
+query could begin. Format-three coordinator roots now include bounded copies of
+the read-critical rows: migration status, HEAD, recovery floor, immutable hints
+and the most recently written read pin. The existing format-two inline WAL and
+publication records retain their semantics. The root and its ordered metadata
+tree commit atomically in the native object store; JavaScript does not maintain
+another authoritative head. Every admission authenticates a fresh committed log
+prefix, including negative results. There is no completed-view TTL cache.
+
+An exact capsule row can prove absence. A selected pin can answer only its exact
+key; another pin falls back to the tree. All capsule rows remain in that ordered
+tree, and native updates/deletes maintain both copies even when a caller omits
+the read-set declaration. Listing and garbage collection continue to follow the
+complete tree. Both metadata collectors recognize format three and trace the
+same tree reference. Logical namespace and physical storage identities remain
+separate, and the migration barrier is included in read admission.
+
+The declaration admits at most eight distinct UTF-8 keys of at most 1,024 bytes
+and one bounded pin prefix. The root ceiling becomes 12 KiB within the existing
+16 KiB journal record limit. Admission serializes the actual next frame, reserves
+1 KiB for rotation/counter growth and drops optional rows until it fits. Oversize
+values remain complete in the tree. An authoritative root that still cannot fit
+fails before publication. The 32/16/8 MiB native modules and role admission
+budgets are unchanged. This is a bounded on-disk format change, so old readers
+must not follow a writer that has begun emitting it.
+
+Rollout first deploys all four compatible services with
+`INLINE_METADATA_ROOTS=false`. The lifecycle's `enable-inline-metadata` action
+checks the sealed full, compact and observation modules against a real native
+format-three root larger than the legacy 4 KiB ceiling. Each reader must return
+head, absent row, selected pin, hints and WAL without a physical row GET. It then
+activates reader, builder, app and finally writer. Activation is resumable;
+provenance permits only the expected flag transition. Subsequent deployments
+repeat the compatibility probe when the feature has been activated, preventing
+rollback to binaries that cannot read persisted roots. Disabling emission does
+not make an incompatible reader safe.
+
+Native tests cover atomic updates, deletion, pin rotation, ordered listing,
+escaped-value overflow, larger roots and malformed declarations. Worker tests
+cover staged activation, eviction, both collectors, checkpointed reindex,
+receipt replay and recovery after platform storage erasure. This removes
+metadata page fetches from the covered read path; end-to-end live latency and
+the full acceptance gate remain separate requirements.

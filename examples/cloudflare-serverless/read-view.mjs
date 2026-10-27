@@ -16,11 +16,16 @@
 import {normalizeReadHints,decodeReadHints} from "./publication-read-hints.mjs";
 import {unsupportedRpc} from "./performance.mjs";
 import {ObjectStoreError} from "../../zig/lib/objectstore/wasm/r2.mjs";
+import {MIGRATION} from "./r2-coordinator-migration.mjs";
 const utf8=new TextEncoder(),text=new TextDecoder();
 export async function metadataKeys(namespace){
  const hash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",utf8.encode(namespace))),b=>b.toString(16).padStart(2,"0")).join("");
  const progress=`antfly/progress/${namespace}/`;
  return {namespace,hints:`__antfly_read_hints/${namespace}`,progress,head:progress+"HEAD",wal:`antfly/wal-v1/${hash}/HEAD`,floor:progress+"MANIFEST_GC_FLOOR"};
+}
+export async function inlineReadSet(namespace){
+ const keys=await metadataKeys(namespace);
+ return{keys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],prefix:keys.progress+"READ_PINS/"};
 }
 export async function openReadView(store,namespace,{version,trace_id,immutable}={},now=Date.now){
  const keys=await metadataKeys(namespace);

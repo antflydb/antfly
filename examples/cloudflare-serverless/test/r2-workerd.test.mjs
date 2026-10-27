@@ -20,7 +20,7 @@ import {mkdtemp,rm,readdir} from "node:fs/promises";
 import {join} from "node:path";
 import {tmpdir} from "node:os";
 import {fileURLToPath} from "node:url";
-async function fixture(namespace, migration = false) {
+async function fixture(namespace, migration = false, inlineRoots = false) {
   const persist=await mkdtemp(join(tmpdir(),"antfly-r2-workerd-"));
   const output=fileURLToPath(new URL("../dist/worker/",import.meta.url));
   const wasm=(await readdir(output)).filter(name=>name.endsWith(".wasm"));
@@ -30,6 +30,7 @@ async function fixture(namespace, migration = false) {
     export class R2CommitCoordinator extends R2Base {
       commitMutations(inputs,deadline){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs,deadline);}
       mutationDiagnostics(){return this.groupSizes??[];}
+      rootFormat(){return this.store.transaction(tx=>JSON.parse(tx.snapshot().root).format??0);}
       async erasePlatformStorage(){await this.ctx.storage.deleteAll();}
       diagnostics(){return this.store.transaction(async tx=>({state:await tx.get("__antfly_collection"),tasks:(await tx.list({prefix:"__antfly_gc/tasks/"})).size,pending:(await tx.list({prefix:"__antfly_gc/pending/"})).size,marks:(await tx.list({prefix:"__antfly_gc/marks/"})).size}));}
     }
@@ -47,9 +48,10 @@ async function fixture(namespace, migration = false) {
       if(path==="/source-diagnostics")return Response.json(await source.diagnostics());
       if(path==="/source-frozen-write"){try {await source.objectCall({op:"put",key:"antfly/progress/test/HEAD"},new Uint8Array([1]));return Response.json({accepted:true});}catch(error){return Response.json({error:String(error)});}}
       if(path==="/profile")return Response.json(await stub.ensureEmbeddingProfile({model:"@cf/test/profile",dimensions:4,revision:"1"}));
+      if(path==="/native-root")return Response.json(await stub.rootFormat());
       return worker.fetch(request,{...env,MAINTENANCE:{async send(){}}},ctx);
     }};
-  `},{type:"ESModule",path:join(output,"worker.js")},...wasm.map(name=>({type:"CompiledWasm",path:join(output,name)}))],compatibilityDate:"2026-10-23",bindings:{...(process.env.ANTFLY_TEST_TRACE?{LOG_METRICS:"true"}:{}),EDGE_IMMUTABLE_CACHE_SCOPE:"01234567-0123-4567-89ab-0123456789aa",EDGE_IMMUTABLE_CACHE:"true",API_TOKEN:"test-r2",ANTFLY_INCARNATION:namespace,PAGED_PROJECTIONS:"true",PUBLICATION_RECORDS:"8",COORDINATOR_BACKEND:migration?"sqlite":"r2"},r2Buckets:["DATABASE"],durableObjects:{COMMITS:{className:migration?"CommitCoordinator":"R2CommitCoordinator",useSQLite:true,unsafeUniqueKey:migration?"legacy":"native"}},resourcePersistencePath:join(persist,"resources"),isolatedResourcePersistencePath:join(persist,"isolated")};
+  `},{type:"ESModule",path:join(output,"worker.js")},...wasm.map(name=>({type:"CompiledWasm",path:join(output,name)}))],compatibilityDate:"2026-10-23",bindings:{...(inlineRoots?{INLINE_METADATA_ROOTS:"true"}:{}),...(process.env.ANTFLY_TEST_TRACE?{LOG_METRICS:"true"}:{}),EDGE_IMMUTABLE_CACHE_SCOPE:"01234567-0123-4567-89ab-0123456789aa",EDGE_IMMUTABLE_CACHE:"true",API_TOKEN:"test-r2",ANTFLY_INCARNATION:namespace,PAGED_PROJECTIONS:"true",PUBLICATION_RECORDS:"8",COORDINATOR_BACKEND:migration?"sqlite":"r2"},r2Buckets:["DATABASE"],durableObjects:{COMMITS:{className:migration?"CommitCoordinator":"R2CommitCoordinator",useSQLite:true,unsafeUniqueKey:migration?"legacy":"native"}},resourcePersistencePath:join(persist,"resources"),isolatedResourcePersistencePath:join(persist,"isolated")};
   options.durableObjects.READERS={className:"R2ReadRuntime",useSQLite:true,unsafeUniqueKey:"readers"};options.durableObjects.BUILDERS={className:"R2BuildRuntime",useSQLite:true,unsafeUniqueKey:"builders"};
   let mf;
   const reopen=async()=>{if(mf)await mf.dispose();mf=new Miniflare(convertV4MiniflareOptions(options));};
@@ -65,8 +67,20 @@ async function fixture(namespace, migration = false) {
   await reopen();
   return {options,reopen,call,close:async()=>{if(mf)await mf.dispose();await rm(persist,{recursive:true,force:true});}};
 }
+test('native read capsules activate after compatible readers and survive erased platform storage',{timeout:120000},async()=>{
+ const f=await fixture('capsule-rollout');
+ try{
+  const before={op:'mutate',operation_id:'before-capsules',mutations:[{kind:'upsert',doc_id:'before',body:'{"text":"before"}'}]},first=await f.call(before);while((await f.call({op:'publish'})).has_more){}assert.equal(await f.call({},'/native-root'),2);
+  // All binaries already parse both formats; writer activation is a separate
+  // profile transition over the same persisted R2 data and table identity.
+  f.options.bindings.INLINE_METADATA_ROOTS='true';await f.reopen();
+  const after={op:'mutate',operation_id:'after-capsules',mutations:[{kind:'upsert',doc_id:'after',body:'{"text":"after"}'}]},second=await f.call(after);assert.equal(JSON.parse((await f.call({op:'lookup',doc_id:'after',required_visibility:second.visibility})).body).text,'after');while((await f.call({op:'publish'})).has_more){}assert.equal(await f.call({},'/native-root'),3);
+  await f.call({},'/wipe-platform');await f.reopen();assert.equal((await f.call({op:'count'})).count,'2');assert.equal((await f.call(before)).visibility,first.visibility);assert.equal((await f.call(after)).visibility,second.visibility);assert.equal(await f.call({},'/native-root'),3);
+ }finally{await f.close();}
+});
+
 test("R2-native coordination survives eviction, both collectors, reindex and erased platform storage",{timeout:240000},async()=>{
-  const f=await fixture("r2-native-fixture");
+  const f=await fixture("r2-native-fixture",false,true);
   try {
     const mutation={op:"mutate",operation_id:"native-source",mutations:Array.from({length:40},(_,i)=>({kind:"upsert",doc_id:`doc/${i}`,body:JSON.stringify({text:"durable native",embedding:[1,i/40],sparse_embedding:{durable:1}})}))};
     const receipt=await f.call(mutation);

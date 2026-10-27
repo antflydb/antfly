@@ -23,7 +23,7 @@ import{createHash}from'node:crypto';
 const gate=JSON.parse(await readFile(process.argv[2])),artifacts=[];
 async function artifact(path){const bytes=await readFile(path),sha256=createHash('sha256').update(bytes).digest('hex');artifacts.push({path:resolve(path),sha256});return bytes;}
 const native=(await artifact(process.argv[3])).toString(),node=(await artifact(process.argv[4])).toString(),worker=(await artifact(process.argv[5])).toString();
-if(![...native.matchAll(/([0-9]+) passed; [0-9]+ skipped; 0 failed; 0 leaked/g)].some(match=>Number(match[1])>=545)||/error:|FAIL|[1-9][0-9]* leaked|[1-9][0-9]* failed/.test(native)||!passingNodeTestLog(node,231)||!passingNodeTestLog(worker,16))throw Error('complete passing test logs required');
+if(![...native.matchAll(/([0-9]+) passed; [0-9]+ skipped; 0 failed; 0 leaked/g)].some(match=>Number(match[1])>=545)||/error:|FAIL|[1-9][0-9]* leaked|[1-9][0-9]* failed/.test(native)||!passingNodeTestLog(node,234)||!passingNodeTestLog(worker,18))throw Error('complete passing test logs required');
 for(const pattern of [/suspended host deadline returns before storage settles/,/suspended host abort returns before storage settles/,/ambiguous metadata deadlines retain native reservations/])if(!pattern.test(node))throw Error('draining deadline safety regression missing');
 if(!/expired native I\/O retains reservations through RPC completion/.test(worker))throw Error('draining I/O caller-context regression missing');
 if(!/constructor reset replay preserves stable warm identities/.test(node))throw Error('constructor reset replay safety regression missing');
@@ -38,6 +38,9 @@ if(!/transaction groups resume native work in the first pending callers context/
 if(!/cold committed observations preserve authority without taking writer ownership/.test(node))throw Error('cold committed observation regression missing');
 for(const pattern of[/cold observers authenticate sealed owners without writing or repairing hints/,/partial epoch announcement batches recover from the accepted seal/])if(!pattern.test(native))throw Error('required native recovery regression missing');
 for(const pattern of[/direct app reads avoid reader actors.*\(native\)/,/direct app reads avoid reader actors/,/Cache API shares confirmed immutable bytes across actors/,/R2 authority loading admits control RPCs/,/pooled kernels preserve originating Durable Object contexts/,/qualification epochs reopen/,/SQLite migration freezes/,/R2-native coordination survives/])if(!pattern.test(worker))throw Error('required persisted integration missing');
+for(const pattern of[/object-native inline read capsules preserve ordered authority/,/object-native inline read capsule budgets fall back/,/object-native inline read capsules reject ambiguous/])if(!pattern.test(native))throw Error('native read capsule regression missing');
+for(const pattern of[/native inline read views avoid metadata pages/,/metadata activation qualifies full compact and observation binaries/,/paired preparation bounds unpublished data/])if(!pattern.test(node))throw Error('read capsule or bounded preparation regression missing');
+for(const pattern of[/direct app reads avoid reader actors.*\(capsules\)/,/native read capsules activate after compatible readers and survive erased platform storage/])if(!pattern.test(worker))throw Error('persisted read capsule regression missing');
 const baseline=JSON.parse(await readFile(gate.trials[0].baseline)),candidate=JSON.parse(await readFile(gate.trials[0].candidate)),datasets=[];
 for(const kind of['synthetic','real']){
  const a=JSON.parse(await artifact(resolve(gate.dir,'ann-'+kind+'-baseline.json'))),b=JSON.parse(await artifact(resolve(gate.dir,'ann-'+kind+'-candidate.json')));

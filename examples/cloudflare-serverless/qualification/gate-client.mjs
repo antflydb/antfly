@@ -20,6 +20,7 @@ import {readFile} from 'node:fs/promises';
 // Keep connections across the fixed 30-second arrivals, identically for both sides.
 const transportPolicy=Object.freeze({keep_alive_ms:60000,max_connections:128,constructor_reset_replay:'idempotent-warm-only'});
 const constructorReset='A call to blockConcurrencyWhile() in a Durable Object waited for too long. The call was canceled and the Durable Object was reset.';
+const setupPolicy=Object.freeze({concurrent_tenants:1,publication_window_documents:64,deadline_ms:1800000});
 const dispatcher=new Agent({connections:transportPolicy.max_connections,keepAliveTimeout:transportPolicy.keep_alive_ms,keepAliveMaxTimeout:transportPolicy.keep_alive_ms});
 const pooledFetch=(url,options)=>globalThis.fetch(url,{...options,dispatcher});
 // Replaying an acknowledged setup is safe only before any workload mutation.
@@ -67,9 +68,21 @@ export class GateClient {
  }
  async seed(documents,{executionId=this.executionId}={}){
   if(!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(executionId))throw Error('invalid seed execution identity');
-  const seeds=await Promise.allSettled(['a','b','c','d'].map(async tenant=>{
-   for(let start=0;start<documents;start+=64){const input={op:'mutate',operation_id:'gate/'+executionId+'/seed/'+start,mutations:Array.from({length:Math.min(64,documents-start)},(_,i)=>{const id=start+i,body=this.body(tenant,id);this.expected.set(tenant+'/'+id,body);return{kind:'upsert',doc_id:'gate/'+id,body};})};const {value}=await this.call(tenant,input,'seed');this.receipts[tenant]=value.visibility;this.seeds[tenant]={input,visibility:value.visibility};}
-  }));for(const result of seeds)if(result.status==='rejected')throw result.reason;await this.converge(1800000);
+  const deadline=Date.now()+setupPolicy.deadline_ms;this.converged=false;
+  // Preparation is bounded independently of the measured fixed-arrival load.
+  // The original control has one builder lane; do not fill four unbounded WAL
+  // tails while publication is still working on their first prefixes.
+  for(const tenant of ['a','b','c','d'])for(let start=0;start<documents;start+=64){
+   if(Date.now()>=deadline)throw Error('publication did not converge');
+   const input={op:'mutate',operation_id:'gate/'+executionId+'/seed/'+start,mutations:Array.from({length:Math.min(64,documents-start)},(_,i)=>{const id=start+i,body=this.body(tenant,id);this.expected.set(tenant+'/'+id,body);return{kind:'upsert',doc_id:'gate/'+id,body};})},receipt=(await this.call(tenant,input,'seed')).value.visibility;this.receipts[tenant]=receipt;this.seeds[tenant]={input,visibility:receipt};
+   for(;;){
+    if(Date.now()>=deadline)throw Error('publication did not converge');
+    const{value}=await this.call(tenant,{op:'status'},'converge');
+    if(BigInt(value.published_lsn??0)>=BigInt('0x'+receipt.slice(-16)))break;
+    await new Promise(r=>setTimeout(r,500));
+   }
+  }
+  this.converged=true;
  }
  async round(index,documents,scheduled){
   const outcomes=await Promise.allSettled(['a','b','c','d'].map(async tenant=>{
@@ -102,5 +115,5 @@ export class GateClient {
   for(const outcome of outcomes)if(outcome.status==='rejected')throw outcome.reason;
   this.verification={passed:true,bodies,receipts};
  }
- report(){return{source_revision:this.run.revision,original_control_revision:this.run.original_control_revision,control_correctness_patch_sha256:this.run.control_correctness_patch_sha256,corpus:this.run.corpus??null,execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,runtime_placement:this.run.runtime_placement??null,transport_policy:transportPolicy,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
+ report(){return{source_revision:this.run.revision,original_control_revision:this.run.original_control_revision,control_correctness_patch_sha256:this.run.control_correctness_patch_sha256,corpus:this.run.corpus??null,execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,runtime_placement:this.run.runtime_placement??null,transport_policy:transportPolicy,setup_policy:setupPolicy,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
 }

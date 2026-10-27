@@ -36,7 +36,7 @@ test('setup replay requires a completely acknowledged corpus and no offered work
 });
 test('setup replay keeps mutation identities while measured execution remains fresh',async()=>{
  const client=new GateClient({},'disposable-fixture'),seedExecution=crypto.randomUUID(),measuredExecution=client.executionId,inputs=[];
- client.call=async(tenant,input)=>{inputs.push({tenant,input});return{value:{visibility:'seed-receipt'}};};client.converge=async()=>{};
+ client.call=async(tenant,input)=>{if(input.op==='status')return{value:{published_lsn:'512'}};inputs.push({tenant,input});return{value:{visibility:'seed-'+BigInt(Number(input.operation_id.split('/').at(-1))+input.mutations.length).toString(16).padStart(16,'0')}};};
  await client.seed(512,{executionId:seedExecution});
  assert.equal(inputs.length,32);assert.equal(client.expected.size,2048);
  assert.ok(inputs.every(({input})=>input.operation_id.startsWith('gate/'+seedExecution+'/seed/')));
@@ -137,6 +137,7 @@ test('sealed artifact verification detects file replacement and module/report mi
   assert.ok(verifyReportedRun({runtime_placement:{generation:'one',location_hint:'wnam'}},run).includes('runtime placement profile changed'));
   await writeFile(configPath,JSON.stringify({...originalConfig,vars:{EDGE_IMMUTABLE_CACHE:'true',LOCAL_METADATA_READS:'true'}}));assert.match((await verifySealedRun(run)).join(','),/runtime placement policy changed/);await writeFile(configPath,JSON.stringify(originalConfig));
   const{runtimePlacement}=await import('../qualification/gate-provenance.mjs');assert.deepEqual(runtimePlacement({vars:{EDGE_IMMUTABLE_CACHE:'true',LOCAL_METADATA_READS:'false'}}),{generation:null,location_hint:null,immutable_cache:true,immutable_cache_scope:null,local_metadata_reads:false});
+  assert.deepEqual(runtimePlacement({vars:{INLINE_METADATA_ROOTS:'false'}}),{generation:null,location_hint:null,inline_metadata_roots:false});await writeFile(configPath,JSON.stringify({...originalConfig,vars:{INLINE_METADATA_ROOTS:'true'}}));assert.match((await verifySealedRun(run)).join(','),/runtime placement policy changed/);await writeFile(configPath,JSON.stringify(originalConfig));
   assert.deepEqual(runtimePlacement({vars:{DIRECT_READS:'true'}}),{generation:null,location_hint:null,direct_reads:true});assert.deepEqual(runtimePlacement({vars:{LOCAL_METADATA_READS:'true'}}),{generation:null,location_hint:null,local_metadata_reads:true});assert.equal(runtimePlacement({vars:{READ_VIEW_BATCH_MS:'10'}}).read_view_batch_ms,10);await writeFile(configPath,JSON.stringify({...originalConfig,vars:{DIRECT_READS:'true'}}));assert.match((await verifySealedRun(run)).join(','),/runtime placement policy changed/);await writeFile(configPath,JSON.stringify(originalConfig));
   const expectedNative=run.wasm_sha256;run.wasm_sha256='f'.repeat(64);assert.match((await verifySealedRun(run)).join(','),/declared native module missing/);run.wasm_sha256=expectedNative;
   const side={run:run.id,version:run.version,wasm_sha256:run.wasm_sha256,reader_wasm_sha256:run.reader_wasm_sha256,bundle_hashes:structuredClone(run.bundle_hashes)};
@@ -207,6 +208,12 @@ test('local gate evidence fails closed on missing changed or foreign artifacts b
  }finally{await rm(dir,{recursive:true,force:true});}
 });
 
+
+test('paired preparation bounds unpublished data without changing the corpus or seed identities',async()=>{
+ const version='01234567-0123-4567-89ab-0123456789ab',accepted={},published={},active=new Set(),identities=new Set();let maximum=0;
+ const client=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async(url,request)=>{const tenant=request.headers['X-Antfly-Tenant'],input=JSON.parse(request.body);if(input.op==='mutate'){assert.ok(active.size===0||active.has(tenant),'a preparation lane must drain before admitting another tenant');const lag=(accepted[tenant]??0)-(published[tenant]??0)+input.mutations.length;assert.ok(lag<=64,'a slow publisher must not receive an unbounded WAL tail');maximum=Math.max(maximum,lag);active.add(tenant);accepted[tenant]=(accepted[tenant]??0)+input.mutations.length;identities.add(tenant+'/'+input.operation_id);return Response.json({committed:true,visibility:'receipt-'+accepted[tenant].toString(16).padStart(16,'0')},{headers:{'X-Antfly-Version':version}});}assert.equal(input.op,'status');published[tenant]=accepted[tenant];active.delete(tenant);return Response.json({published_lsn:String(published[tenant])},{headers:{'X-Antfly-Version':version}});}});
+ client.executionId=crypto.randomUUID();await client.seed(512);assert.equal(maximum,64);assert.equal(client.expected.size,2048);assert.equal(identities.size,32);assert.ok(Object.values(published).every(n=>n===512));assert.equal(client.converged,true);assert.equal(client.errors.length,0);assert.equal(client.report().setup_policy.deadline_ms,1800000);
+});
 
 test('warm transport retries retain original input and include all retry and scheduling time',async()=>{
  const version='01234567-0123-4567-89ab-0123456789ab',bodies=[],client=new GateClient({origin:'https://fixture.invalid',version},'disposable-fixture',{fetch:async(url,request)=>{bodies.push(request.body);if(bodies.length===1)throw new DOMException('network timed out','TimeoutError');return Response.json({count:'512'},{headers:{'X-Antfly-Version':version}});}});
