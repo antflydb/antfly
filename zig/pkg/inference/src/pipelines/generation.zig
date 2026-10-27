@@ -13282,6 +13282,43 @@ pub const NativeGenerationPipeline = struct {
         return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = rest, .max_query_seq_len = 1 };
     }
 
+    fn tryLightOnCudaTokenBurst(
+        self: *NativeGenerationPipeline,
+        claimed: []const runtime.scheduler.native_generate.StepItem,
+        items: []MixedBatchDecodeItem,
+        input_ids: []const i64,
+        first_context: *gpt_arch.DecodeContext,
+    ) !?StepForwardResult {
+        if (!self.gpu_token_burst_lighton_decode or self.execution_lock == null) return null;
+
+        var steps: usize = std.math.clamp(@as(usize, self.gpu_token_burst_width), 2, max_gpu_token_burst_width);
+        const eligible = eligible: {
+            for (claimed) |item| {
+                const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                const sequence = work.sequence orelse break :eligible false;
+                if (sequence.generated >= sequence.max_tokens or sequence.max_tokens - sequence.generated < 2 or
+                    sequence.seq_len.* > sequence.token_ids.len or sequence.token_ids.len - sequence.seq_len.* < 2) break :eligible false;
+                steps = @min(steps, @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*));
+            }
+            break :eligible true;
+        };
+        if (eligible) {
+            const embedding = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+            defer self.cb.free(embedding);
+            const head = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
+            defer self.cb.free(head);
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.beginLightOnTokenBurst(&self.cb, embedding, claimed.len, steps, self.gpt_config.hidden_size, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds())) |prepared| {
+                var burst = prepared;
+                defer burst.deinit();
+                // No fallback is permitted after this first forward
+                // has changed any independent recurrent/KV state.
+                return try self.finishLightOnCudaTokenBurst(claimed, items, input_ids, first_context, head, &burst);
+            }
+        }
+
+        return null;
+    }
+
     /// Queue a bounded chain of dependent CUDA tokens without a host read
     /// between forwards. Existing publication handles EOS, cancellation and
     /// the reserved KV count only after the entire claimed chain has drained.
@@ -13305,9 +13342,30 @@ pub const NativeGenerationPipeline = struct {
         errdefer self.allocator.free(first);
         const rest = try self.allocator.alloc(u32, (burst.steps - 1) * claimed.len);
         errdefer self.allocator.free(rest);
+        const wide = claimed.len > 64;
+        var recurrent_groups: usize = 0;
+        var recurrent_rows: usize = 0;
+        var attention_groups: usize = 0;
+        var attention_rows: usize = 0;
+        const original_recurrent_groups = first_context.packed_recurrent_groups;
+        const original_recurrent_rows = first_context.packed_recurrent_rows;
+        const original_attention_groups = first_context.packed_attention_groups;
+        const original_attention_rows = first_context.packed_attention_rows;
+        if (wide) {
+            first_context.packed_recurrent_groups = &recurrent_groups;
+            first_context.packed_recurrent_rows = &recurrent_rows;
+            first_context.packed_attention_groups = &attention_groups;
+            first_context.packed_attention_rows = &attention_rows;
+        }
+        defer {
+            first_context.packed_recurrent_groups = original_recurrent_groups;
+            first_context.packed_recurrent_rows = original_recurrent_rows;
+            first_context.packed_attention_groups = original_attention_groups;
+            first_context.packed_attention_rows = original_attention_rows;
+        }
         try self.cb.checkExecutionControl();
         {
-            const hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(&self.cb, self.allocator, self.gpt_config, input_ids, claimed.len, 1, first_context, "gpt.cuda_token_burst");
+            const hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(&self.cb, self.allocator, self.gpt_config, input_ids, if (wide) 1 else claimed.len, if (wide) claimed.len else 1, first_context, "gpt.cuda_token_burst");
             defer self.cb.free(hidden);
             const logits = try self.cb.linearNoBias(hidden, head, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
             defer self.cb.free(logits);
@@ -13325,25 +13383,41 @@ pub const NativeGenerationPipeline = struct {
                 item.kv_sequence_len = context.kv_sequence_len;
                 item.kv_position_offset = context.kv_position_offset;
             }
-            const metadata_bytes = 64 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
+            const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
             var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&metadata);
-            var context = try buildOwnedMixedBatchDecodeContext(fba.allocator(), items);
+            const lengths: [128]usize = @splat(1);
+            var context = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), items, lengths[0..items.len]);
             defer context.deinit();
             context.context.prepared_lighton_decode = true;
+            if (wide) {
+                context.context.packed_recurrent_groups = &recurrent_groups;
+                context.context.packed_recurrent_rows = &recurrent_rows;
+                context.context.packed_attention_groups = &attention_groups;
+                context.context.packed_attention_rows = &attention_rows;
+            }
             const embedded = try burst.embedding(step - 1);
-            const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(&self.cb, self.allocator, self.gpt_config, embedded, .{}, claimed.len, 1, &context.context, null);
+            const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(&self.cb, self.allocator, self.gpt_config, embedded, .{}, if (wide) 1 else claimed.len, if (wide) claimed.len else 1, &context.context, null);
             defer self.cb.free(hidden.hidden);
             const logits = try self.cb.linearNoBias(hidden.hidden, head, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
             defer self.cb.free(logits);
             try burst.argmax(logits, step);
         }
-        var host: [max_gpu_token_burst_width * 64]u32 = undefined;
+        var host: [max_gpu_token_burst_width * 128]u32 = undefined;
         try burst.read(host[0 .. burst.steps * claimed.len]);
         try self.cb.checkExecutionControl();
         @memcpy(first, host[0..claimed.len]);
         @memcpy(rest, host[claimed.len .. burst.steps * claimed.len]);
         burst.noteCompleted();
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+            std.debug.print("LIGHTONOCR3 cuda_token_burst_rows={d} steps={d}\n", .{ claimed.len, burst.steps });
+            if (wide) {
+                std.debug.print("LIGHTONOCR3 packed_step_prefill_items=0 packed_step_decode_items={d} packed_step_query_rows={d}\n", .{ claimed.len, claimed.len });
+                std.debug.print("LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows={d}\n", .{self.prepared_qwen_prefill_chunk_rows});
+                std.debug.print("LIGHTONOCR3 packed_recurrent_groups={d} packed_recurrent_rows={d}\n", .{ recurrent_groups, recurrent_rows });
+                std.debug.print("LIGHTONOCR3 packed_attention_groups={d} packed_attention_rows={d}\n", .{ attention_groups, attention_rows });
+            }
+        }
         return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = rest, .max_query_seq_len = 1 };
     }
 
@@ -13689,6 +13763,7 @@ pub const NativeGenerationPipeline = struct {
                 context.context.prepared_lighton_decode = true;
                 if (try self.tryLightOnCudaDecodeGraph(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context.context)) |result| return result;
                 @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraph(&self.cb);
+                if (try self.tryLightOnCudaTokenBurst(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context.context)) |result| return result;
             }
         }
         // The combined CPU logits and independent result copies coexist during
@@ -14013,32 +14088,7 @@ pub const NativeGenerationPipeline = struct {
                     if (try self.tryLightOnCudaDecodeGraph(claimed, items, input_ids, &owned_ctx.context)) |result| return result;
                     @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraph(&self.cb);
                 }
-                if (cuda_lighton and self.gpu_token_burst_lighton_decode and self.execution_lock != null) {
-                    var steps: usize = std.math.clamp(@as(usize, self.gpu_token_burst_width), 2, max_gpu_token_burst_width);
-                    const eligible = eligible: {
-                        for (claimed) |item| {
-                            const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                            const sequence = work.sequence orelse break :eligible false;
-                            if (sequence.generated >= sequence.max_tokens or sequence.max_tokens - sequence.generated < 2 or
-                                sequence.seq_len.* > sequence.token_ids.len or sequence.token_ids.len - sequence.seq_len.* < 2) break :eligible false;
-                            steps = @min(steps, @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*));
-                        }
-                        break :eligible true;
-                    };
-                    if (eligible) {
-                        const embedding = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
-                        defer self.cb.free(embedding);
-                        const head = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
-                        defer self.cb.free(head);
-                        if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.beginLightOnTokenBurst(&self.cb, embedding, claimed.len, steps, self.gpt_config.hidden_size, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds())) |prepared| {
-                            var burst = prepared;
-                            defer burst.deinit();
-                            // No fallback is permitted after this first forward
-                            // has changed any independent recurrent/KV state.
-                            return self.finishLightOnCudaTokenBurst(claimed, items, input_ids, &owned_ctx.context, head, &burst);
-                        }
-                    }
-                }
+                if (cuda_lighton) if (try self.tryLightOnCudaTokenBurst(claimed, items, input_ids, &owned_ctx.context)) |result| return result;
             }
             if (comptime build_options.enable_metal) {
                 const M = @import("../ops/metal_compute.zig").MetalCompute;

@@ -2663,7 +2663,7 @@ pub const CudaCompute = struct {
         if (self.capability_profile != .lightonocr3 or self.lazy_host_store != null or self.resident_training_cache or
             self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
             self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
-            rows == 0 or rows > 64 or steps < 2 or steps > 8 or (hidden != 1024 and hidden != 2560) or
+            rows == 0 or rows > 128 or steps < 2 or steps > 8 or (hidden != 1024 and hidden != 2560) or
             vocab == 0 or vocab > std.math.maxInt(i32) or
             self.kernels.embedding_lookup_i32_bf16_weight_f32 == null or
             (if (suppress_ids.len == 0) self.kernels.argmax_rows_f32 == null else self.kernels.argmax_rows_suppress_f32 == null)) return null;
@@ -34325,7 +34325,7 @@ test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves s
         try compute.ctx.synchronize();
         const weight = try cb.getWeight(tensor.name);
         defer cb.free(weight);
-        for ([_]usize{ 1, 7, 32, 64 }) |rows| {
+        for ([_]usize{ 1, 7, 32, 64, 65, 66, 96, 128 }) |rows| {
             for ([_]usize{ 2, 4, 8 }) |steps| {
                 for ([_]bool{ false, true }) |suppress| {
                     const ids: []const i32 = if (suppress) &[_]i32{ 5, 16 } else &[_]i32{};
@@ -34384,6 +34384,7 @@ test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves s
             }
         }
         const launches = compute.ctx.stats.kernel_launches;
+        try std.testing.expect((try CudaCompute.beginLightOnTokenBurst(&cb, weight, 129, 2, hidden, vocab, &.{})) == null);
         compute.resident_training_cache = true;
         try std.testing.expect((try CudaCompute.beginLightOnTokenBurst(&cb, weight, 1, 2, hidden, vocab, &.{})) == null);
         compute.resident_training_cache = false;
@@ -34391,7 +34392,7 @@ test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves s
         try std.testing.expect((try CudaCompute.beginLightOnTokenBurst(&cb, weight, 1, 2, hidden, vocab, &.{})) == null);
         compute.debug_cuda_graph_capture_active = false;
         try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
-        try std.testing.expectEqual(@as(u64, 24), compute.lighton_cuda_burst_calls);
+        try std.testing.expectEqual(@as(u64, 48), compute.lighton_cuda_burst_calls);
         try std.testing.expectEqual(@as(u64, 8), compute.lighton_cuda_burst_max_width);
         // Exceptional/canceled consumers can retire a live bank without a
         // readback: deinit drains its producer before recycling any storage.

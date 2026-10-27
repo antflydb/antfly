@@ -156,6 +156,18 @@ pub fn Features(comptime Hooks: type) type {
             return result;
         }
 
+        /// Explicit CUDA token chaining uses the existing bounded operator
+        /// switch; the selected profile stays unchanged when it is disabled.
+        pub fn withCudaTokenBurstOverride(self: @This(), enabled: bool, width_text: ?[]const u8) @This() {
+            if (!self.prepared) return self;
+            var result = self;
+            result.gpu_token_burst = enabled;
+            if (width_text) |text| if (std.fmt.parseInt(u8, text, 10)) |width| {
+                if (width >= 2 and width <= 8) result.gpu_token_burst_width = width;
+            } else |_| {};
+            return result;
+        }
+
         pub fn fromEnvironment() @This() {
             // Without a model and backend there is no qualified epoch profile.
             return .{};
@@ -178,6 +190,7 @@ pub fn Features(comptime Hooks: type) type {
                 return forProfile(.conservative, cfg, 1);
             var result = forProfile(profile, cfg, Hooks.effectiveLightOnReadRows());
             if (backend == .cuda) {
+                result = result.withCudaTokenBurstOverride(platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"), platform.env.getenv("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"));
                 result = result.withDecodeStreakOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK"));
                 result = result.withPreparedPrefillChunkOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS"));
                 const wide = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES");
@@ -351,4 +364,18 @@ test "LightOnOCR3 CUDA prefill fairness limit preserves selected defaults and op
     for ([_][]const u8{ "", "-1", "17", "256", "junk" }) |text| try std.testing.expectEqualDeep(selected, selected.withDecodeStreakOverride(text));
     const fallback = F.forProfile(.conservative, .{}, 1);
     try std.testing.expectEqualDeep(fallback, fallback.withDecodeStreakOverride("8"));
+}
+
+test "LightOnOCR3 CUDA token chaining opt in shares bounded admission configuration" {
+    const F = Features(struct {});
+    const selected = F.forProfile(.cuda_lighton4b, .{}, 128);
+    try std.testing.expectEqualDeep(selected, selected.withCudaTokenBurstOverride(false, null));
+    const burst = selected.withCudaTokenBurstOverride(true, "8");
+    try std.testing.expect(burst.gpu_token_burst);
+    try std.testing.expectEqual(@as(u8, 8), burst.gpu_token_burst_width);
+    try std.testing.expect(burst.auxiliaryAmounts().backend_scratch_bytes > selected.auxiliaryAmounts().backend_scratch_bytes);
+    try std.testing.expect(burst.auxiliaryAmounts().host_scratch_bytes > selected.auxiliaryAmounts().host_scratch_bytes);
+    for ([_][]const u8{ "", "-1", "1", "9", "256", "junk" }) |text| try std.testing.expectEqualDeep(selected.withCudaTokenBurstOverride(true, null), selected.withCudaTokenBurstOverride(true, text));
+    const fallback = F.forProfile(.conservative, .{}, 1);
+    try std.testing.expectEqualDeep(fallback, fallback.withCudaTokenBurstOverride(true, "8"));
 }

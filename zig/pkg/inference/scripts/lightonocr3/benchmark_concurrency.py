@@ -984,6 +984,33 @@ def run(args, model, label, mode, concurrency, output):
                         result["status"] = "missing_timed_phase_parking"
                     if args.executor_tail and not sample["executor_tail_steps"]:
                         result["status"] = "missing_timed_executor_tail"
+                    cuda_bursts = [
+                        (int(rows), int(steps))
+                        for rows, steps in re.findall(
+                            r"LIGHTONOCR3 cuda_token_burst_rows=(\d+) steps=(\d+)",
+                            section,
+                        )
+                    ]
+                    sample["cuda_token_burst_cohort_rows"] = sorted(
+                        {rows for rows, _ in cuda_bursts}
+                    )
+                    sample["cuda_token_burst_widths"] = sorted(
+                        {steps for _, steps in cuda_bursts}
+                    )
+                    if args.require_cuda_token_burst:
+                        if not cuda_bursts:
+                            result["status"] = "missing_timed_cuda_token_burst"
+                        elif args.physical128 and not any(
+                            rows > 64 for rows, _ in cuda_bursts
+                        ):
+                            result["status"] = "missing_timed_wide_cuda_token_burst"
+                        elif (
+                            max(steps for _, steps in cuda_bursts)
+                            < args.gpu_token_burst_width
+                        ):
+                            result["status"] = (
+                                "missing_timed_requested_cuda_burst_width"
+                            )
                     sample["packed_core_rows_observed"] = sorted(
                         {
                             int(row)
