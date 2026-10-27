@@ -1324,7 +1324,36 @@ const LocalStandaloneMetadata = struct {
 
     const RestorePersistence = antfly.public_api.restore_jobs.ReplicatedPersistence;
     fn restorePersistence(self: *LocalStandaloneMetadata) RestorePersistence {
-        return RestorePersistence.fromLocal(self, .{ .load = restoreJobsLoad, .get = restoreJobsGet, .put = restoreJobsPut, .create = restoreJobsCreate, .create_with_staging = restoreJobsCreateWithStaging, .delete = restoreJobsDelete, .delete_many = restoreJobsDeleteMany, .delete_matching = restoreJobsDeleteMatching });
+        return RestorePersistence.fromLocal(self, .{ .job_state = .{ .get = jobStateGet, .scan = jobStateScan, .cas = jobStateCas }, .load = restoreJobsLoad, .get = restoreJobsGet, .put = restoreJobsPut, .create = restoreJobsCreate, .create_with_staging = restoreJobsCreateWithStaging, .delete = restoreJobsDelete, .delete_many = restoreJobsDeleteMany, .delete_matching = restoreJobsDeleteMatching });
+    }
+    fn jobStateGet(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8) !?[]u8 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).getJobState(a, group_ids.main_metadata_group_id, key);
+    }
+    fn jobStateScan(ptr: *anyopaque, a: std.mem.Allocator, after: ?[]const u8) ![]u8 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).scanJobState(a, group_ids.main_metadata_group_id, after);
+    }
+    fn jobStateCas(ptr: *anyopaque, key: []const u8, expected: ?[]const u8, value: []const u8, term: u64) !bool {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        var locked = try self.lockMutation();
+        defer locked.deinit();
+        try self.requireRestoreJobTermLocked(term);
+        if (expected == null and std.mem.startsWith(u8, key, "documents/")) {
+            var parsed = try std.json.parseFromSlice(struct { owner: []const u8, state: enum { queued, running, succeeded, failed, cancelled } }, self.alloc, value, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const existing = try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key);
+            defer if (existing) |bytes| self.alloc.free(bytes);
+            if (existing == null and (parsed.value.state == .queued or parsed.value.state == .running) and try self.lifecycle_store.?.getJobOwnerCount(self.alloc, group_ids.main_metadata_group_id, parsed.value.owner) >= 16) return error.TooManyActiveJobs;
+        }
+        try self.applyJobCommandLocked(.{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected orelse "", .value = value } });
+        const current = (try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key)) orelse return false;
+        defer self.alloc.free(current);
+        return std.mem.eql(u8, current, value);
     }
     fn migrateRestoreJobs(self: *LocalStandaloneMetadata, legacy: *antfly.storage_backend_erased.Store) !void {
         const store = self.lifecycle_store orelse return;
@@ -15486,4 +15515,72 @@ test "system catalog native memory ownership provisions privately and survives s
     try std.testing.expectEqual(system_catalog.ServiceOwner.memory, definitions.value.tables[0].?.query_definition.?.native_service.?);
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }}, .include_query_definitions = true } }));
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .table, .name = "memory_team", .new_name = "public_copy" } } }));
+}
+
+test "standalone shared document state follows metadata HA replay and fenced ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    defer a.free(path);
+    const checkpoint = try std.fmt.allocPrint(a, "{s}/metadata.checkpoint", .{root});
+    defer a.free(checkpoint);
+    const log = try std.fmt.allocPrintSentinel(a, "{s}/primary-log", .{root}, 0);
+    defer a.free(log);
+    const slots = try std.fmt.allocPrintSentinel(a, "{s}/primary-slots", .{root}, 0);
+    defer a.free(slots);
+    var primary = try antfly.hot_standby.primary.Primary.open(a, log, slots, .{ .cluster_id = 77, .timeline_id = 1, .epoch = 1 }, .{});
+    defer primary.close();
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    defer metadata.deinit();
+    const baseline = try metadata.lifecycle_store.?.exportHotStandbyCheckpoint(std.testing.io, checkpoint);
+    var barrier: antfly.db.MutationBarrier = .{};
+    var transition_mutex: std.atomic.Mutex = .unlocked;
+    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .mutation_barrier = &barrier, .transition_mutex = &transition_mutex }));
+    const capability = metadata.restorePersistence().job_state;
+    const queued = "{\"owner\":\"alice\",\"state\":\"queued\",\"checkpoint\":\"immutable-source\"}";
+    const running = "{\"owner\":\"alice\",\"state\":\"running\",\"checkpoint\":\"accepted-page\"}";
+    try std.testing.expect(try capability.compareExchange("documents/ha-run", null, queued, 1));
+    var queued_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(queued, &queued_hash, .{});
+    try std.testing.expect(try capability.compareExchange("documents/ha-run", &queued_hash, running, 1));
+    try std.testing.expectError(error.NotLeader, capability.compareExchange("documents/ha-run", null, queued, 2));
+    const standby_root = try std.fmt.allocPrint(a, "{s}/standby", .{root});
+    defer a.free(standby_root);
+    var standby = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = standby_root });
+    defer standby.deinit();
+    try standby.importHotStandbyCheckpoint(std.testing.io, checkpoint, baseline.size_bytes);
+    const entries = try primary.log.iterateFrom(a, 1);
+    defer antfly.hot_standby.replication_log.freeEntries(a, entries);
+    var count: usize = 0;
+    for (entries) |entry| if (entry.record.kind == .metadata_mutation and entry.record.table_id == 0 and entry.record.shard_id == 0) {
+        try standby.applyHotStandbyRecord(entry.record);
+        count += 1;
+    };
+    try std.testing.expect(count >= 2);
+    const mirrored = (try standby.getJobState(a, group_ids.main_metadata_group_id, "documents/ha-run")).?;
+    defer a.free(mirrored);
+    try std.testing.expectEqualStrings(running, mirrored);
+    try std.testing.expectEqual(@as(u64, 1), try standby.getJobOwnerCount(a, group_ids.main_metadata_group_id, "alice"));
+    // Migrating terminal history must remain possible at the active-job limit.
+    for (0..15) |index| {
+        var key: [64]u8 = undefined;
+        try std.testing.expect(try capability.compareExchange(try std.fmt.bufPrint(&key, "documents/quota-{d}", .{index}), null, queued, 1));
+    }
+    try std.testing.expectError(error.TooManyActiveJobs, capability.compareExchange("documents/over-quota", null, queued, 1));
+    try std.testing.expect(try capability.compareExchange("documents/terminal-history", null, "{\"owner\":\"alice\",\"state\":\"succeeded\"}", 1));
+    try std.testing.expectEqual(@as(u64, 16), try metadata.lifecycle_store.?.getJobOwnerCount(a, group_ids.main_metadata_group_id, "alice"));
+    // The existing HA write gate is the external fencing authority. Once it
+    // denies the old primary, even a previously retained job capability fails.
+    const Denied = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.NotLeader;
+        }
+    };
+    metadata.hot_standby_gate = .{ .borrowed = .{ .ptr = &metadata, .check_fn = Denied.check } };
+    try std.testing.expectError(error.NotLeader, capability.compareExchange("documents/ha-run", &queued_hash, queued, 1));
 }
