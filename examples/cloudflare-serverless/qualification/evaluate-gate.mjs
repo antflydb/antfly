@@ -17,6 +17,7 @@ import{readFile,writeFile}from'node:fs/promises';
 import{resolve}from'node:path';
 import{validatedEvidence}from'./validated-evidence.mjs';
 import{evaluateGate}from'./gate-policy.mjs';
+import{verifyDiagnosticArtifacts}from'./live-diagnostics.mjs';
 import{verifySealedRun,verifyReportedRun}from'./gate-provenance.mjs';
 const gate=JSON.parse(await readFile(process.argv[2])),reports=[];let evidence;
 try{evidence=JSON.parse(await readFile(resolve(gate.dir,'evidence.json')));}catch{}
@@ -24,6 +25,7 @@ for(const pair of gate.trials){
  let report;try{report=JSON.parse(await readFile(resolve(gate.dir,'trial-'+pair.trial+'.json')));}catch{report={schema:1,trial:pair.trial,fatal:'hour-long trial report unavailable'};}
  const base=JSON.parse(await readFile(pair.baseline)),candidate=JSON.parse(await readFile(pair.candidate));
  for(const[name,run]of[['baseline',base],['candidate',candidate]])if(report[name])report[name].provenance_errors=[...verifyReportedRun(report[name],run),...await verifySealedRun(run)];
+ if(!await verifyDiagnosticArtifacts(report.diagnostics,[base,candidate],report.execution_id,gate.dir))report.diagnostics={...report.diagnostics,passed:false};
  Object.assign(report,await validatedEvidence(evidence,report,base,candidate));
  reports.push(report);
 }

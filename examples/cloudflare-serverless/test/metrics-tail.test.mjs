@@ -40,3 +40,15 @@ test('live diagnostic coverage preserves connection gaps and requires all eight 
  const cpu=new DiagnosticCoverage([{id:'baseline'},{id:'candidate'}]);for(const run of['baseline','candidate'])for(const role of['app','writer','reader','builder'])cpu.connected(run,role);cpu.observe('candidate','builder',{outcome:'exceededCpu'});assert.equal(cpu.report().passed,false);
  const truncated=sanitizeTailEvent({outcome:'ok',logs:Array.from({length:257},(_,i)=>({message:[i===256?'SQLITE_NOMEM':'ordinary output']}))});assert.equal(truncated.truncated,true);const lost=new DiagnosticCoverage([{id:'baseline'},{id:'candidate'}]);for(const run of['baseline','candidate'])for(const role of['app','writer','reader','builder'])lost.connected(run,role);lost.observe('candidate','app',truncated);assert.equal(lost.report().passed,false);
 });
+
+test('completed live diagnostic evidence rejects altered missing or substituted journals',async()=>{
+ const{verifyDiagnosticArtifacts}=await import('../qualification/live-diagnostics.mjs'),{mkdtemp,mkdir,writeFile,rm}=await import('node:fs/promises'),{resolve}=await import('node:path'),{createHash}=await import('node:crypto');
+ const dir=await mkdtemp(resolve('dist','diagnostic-evidence-')),id=crypto.randomUUID(),runs=[{id:'baseline'},{id:'candidate'}],bytes=Buffer.from('{"outcome":"ok"}\n'),artifacts=[];
+ try{await mkdir(resolve(dir,'diagnostics-'+id));for(const run of runs)for(const role of['app','writer','reader','builder']){const path=resolve(dir,'diagnostics-'+id,run.id+'-'+role+'.jsonl');await writeFile(path,bytes);artifacts.push({path,bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')});}
+  const proof={artifacts};assert.equal(await verifyDiagnosticArtifacts(proof,runs,id,dir),true);
+  assert.equal(await verifyDiagnosticArtifacts({artifacts:artifacts.slice(1)},runs,id,dir),false);assert.equal(await verifyDiagnosticArtifacts({artifacts:[artifacts[0],...artifacts.slice(0,7)]},runs,id,dir),false);
+  assert.equal(await verifyDiagnosticArtifacts({artifacts:artifacts.map((a,i)=>i? a:{...a,path:resolve(dir,'substituted.jsonl')})},runs,id,dir),false);
+  await writeFile(artifacts[0].path,'{"outcome":"exceededMemory"}\n');assert.equal(await verifyDiagnosticArtifacts(proof,runs,id,dir),false);
+  await rm(artifacts[0].path);assert.equal(await verifyDiagnosticArtifacts(proof,runs,id,dir),false);
+ }finally{await rm(dir,{recursive:true,force:true});}
+});

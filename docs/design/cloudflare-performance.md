@@ -1188,3 +1188,20 @@ Finalization closes and deletes only its own temporary tail sessions and hashes
 the completed sanitized journals. The final gate also rejects diagnostic failure.
 This covers observed late errors; it is not an assertion about unreported
 provider events, complete platform isolate eviction or absolute memory peaks.
+
+
+Review reproduced two native pin-capsule edge cases. Generic ordered-tree keys
+may exceed the capsule's 1,024-byte key limit; those keys now stay in the tree
+without becoming a selected inline pin. A delete's ignored payload cannot become
+a cached pin value: native deletion semantics apply to both representations.
+The existing actual-storage capsule regression now covers both cases, including
+reopening the resulting root and reading the oversized pin through the tree.
+The failed reproductions remain separate from the corrected passing evidence.
+
+
+Diagnostic journals also carry an explicit truncation flag when bounded event
+extraction would omit logs. The live population treats that as a coverage gap.
+The independent final evaluator streams and verifies the eight completed
+journals' canonical execution paths, exact lengths and SHA-256 digests. Missing,
+changed, duplicate or substituted artifacts fail closed. Journal finalization and
+verification use bounded chunks and a 256 MiB per-stream size ceiling.

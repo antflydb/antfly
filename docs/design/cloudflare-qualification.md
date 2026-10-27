@@ -1777,3 +1777,26 @@ streams, rejecting gaps and resource failures before recovery. The implementatio
 passes 239 Node tests and 18 persisted Worker tests. A separate read-only live
 probe connected all eight streams and closed its exact temporary sessions.
 The first capsule live comparison is still a diagnostic, not a gate pass.
+
+
+The capsule smoke execution `4f7b6188-704c-4649-bc39-b77cf7fc22e6` completes its
+five-minute offered workload. The candidate passes all 2,052 body/count checks
+and eight receipt replays with zero final/resource errors. Its full-population
+read/write p95 is 2,439/3,628 ms versus control 6,073/7,386 ms; startup samples
+are included and no gate pass is claimed. Control exact verification fails two
+reads with `ManifestReadLeaseExpired`, which the common client had not recognized
+as recoverable. The narrowly scoped warm retry is described in the gate design.
+
+Before cold qualification, native review reproduces and fixes oversized selected
+pin keys and delete payload coherence. Paired trials 2 and 3 are gracefully
+interrupted during setup, preserving their failed reports and sanitized journals;
+no measured workload or cold actor is consumed there. All pairs are paused for
+new native binaries, refreshed evidence and fresh paired corpora.
+
+
+Corrected pin binaries pass 18 persisted Worker tests, including both collectors,
+reindex and platform-storage-erasure recovery. The common-client and diagnostic
+suite now contains 241 tests. Final diagnostic evaluation independently checks
+all eight journal paths, byte counts and hashes; truncated or substituted
+journals cannot qualify. Hashing streams bounded chunks, with a 256 MiB ceiling
+per journal. The native regression logs preserve both pre-fix failures separately.

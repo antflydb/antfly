@@ -146,7 +146,7 @@ const Root = struct {
             for (rows.exact) |*record| if (std.mem.eql(u8, key, record.key)) {
                 record.value = value;
             };
-            if (rows.prefix) |prefix| if (std.mem.startsWith(u8, key, prefix)) {
+            if (rows.prefix) |prefix| if (key.len <= 1024 and std.mem.startsWith(u8, key, prefix)) {
                 if (value != null or rows.selected != null and std.mem.eql(u8, rows.selected.?.key, key)) rows.selected = .{ .key = key, .value = value };
             };
         }
@@ -163,8 +163,8 @@ const Root = struct {
             if (self.read_rows) |prior| if (prior.prefix != null and std.mem.eql(u8, prefix, prior.prefix.?)) {
                 selected = prior.selected;
             };
-            for (commands) |command| if (std.mem.startsWith(u8, command.key, prefix)) {
-                if (command.kind == .put or selected != null and std.mem.eql(u8, command.key, selected.?.key)) selected = .{ .key = command.key, .value = command.value };
+            for (commands) |command| if (command.key.len <= 1024 and std.mem.startsWith(u8, command.key, prefix)) {
+                if (command.kind == .put or selected != null and std.mem.eql(u8, command.key, selected.?.key)) selected = .{ .key = command.key, .value = if (command.kind == .put) command.value else null };
             };
         }
         self.read_rows = .{ .exact = exact.items, .prefix = rules.prefix, .selected = selected };
@@ -461,6 +461,23 @@ test "object-native inline read capsules preserve ordered authority through upda
     try std.testing.expectEqual(@as(usize, 4), rows[0].len);
     try std.testing.expectEqualStrings("cold", rows[0][0].key);
     try std.testing.expectEqualStrings("clock-1", rows[1][0].value);
+    // Deleting a pin ignores its payload in both the tree and its capsule.
+    const deleted = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = state, .inline_read_set = .{ .keys = &.{"head"}, .prefix = "pins/" }, .commands = &.{.{ .kind = .delete, .key = "pins/2", .value = "ignored-delete-payload" }} });
+    defer a.free(deleted);
+    state = (try std.json.parseFromSlice(Header, m, deleted, .{ .ignore_unknown_fields = true })).value.state;
+    const absent = try cached.execute(.{ .action = .read, .owner = state.owner, .state = state, .commands = &.{.{ .kind = .get, .key = "pins/2" }} });
+    defer a.free(absent);
+    try std.testing.expectEqual(@as(usize, 0), (try std.json.parseFromSlice(struct { results: [][]Row }, m, absent, .{})).value.results[0].len);
+    // Generic tree keys may exceed the capsule key budget.
+    const long_key = try m.alloc(u8, 1100);
+    @memset(long_key, 'x');
+    @memcpy(long_key[0..5], "pins/");
+    const extended = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = state, .inline_read_set = .{ .keys = &.{"head"}, .prefix = "pins/" }, .commands = &.{.{ .kind = .put, .key = long_key, .value = "ordered-long-pin" }} });
+    defer a.free(extended);
+    state = (try std.json.parseFromSlice(Header, m, extended, .{ .ignore_unknown_fields = true })).value.state;
+    const long_pin = try ctx.execute(.{ .action = .read, .owner = state.owner, .state = state, .commands = &.{.{ .kind = .get, .key = long_key }} });
+    defer a.free(long_pin);
+    try std.testing.expectEqualStrings("ordered-long-pin", (try std.json.parseFromSlice(struct { results: [][]Row }, m, long_pin, .{})).value.results[0][0].value);
 }
 
 test "object-native inline read capsule budgets fall back to complete ordered values" {

@@ -17,7 +17,8 @@
 // Raw events and session URLs remain transient; only sanitized JSON is saved.
 import WebSocket from 'ws';
 import{spawn}from'node:child_process';
-import{mkdir,open,readFile,writeFile}from'node:fs/promises';
+import{mkdir,open,writeFile}from'node:fs/promises';
+import{createReadStream}from'node:fs';
 import{resolve}from'node:path';
 import{createHash}from'node:crypto';
 import{sanitizeTailEvent}from'./metrics-tail.mjs';
@@ -88,6 +89,21 @@ export async function startLiveDiagnostics(runs,executionId,dir){
  }catch(error){await close().catch(()=>{});throw error;}
  return{
   report:()=>coverage.report(),assertClean:()=>coverage.assertClean(),
-  async finish(){await close();const artifacts=[];for(const s of sessions){const bytes=await readFile(s.path);artifacts.push({path:s.path,bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')});}const report={...coverage.report(),artifacts};await writeFile(resolve(directory,'audit.json'),JSON.stringify(report,null,2));return report;},
+  async finish(){await close();const artifacts=[];for(const s of sessions){const hash=createHash('sha256');let bytes=0;for await(const chunk of createReadStream(s.path)){bytes+=chunk.length;if(bytes>256*1024*1024)throw Error('DiagnosticJournalExceeded');hash.update(chunk);}artifacts.push({path:s.path,bytes,sha256:hash.digest('hex')});}const report={...coverage.report(),artifacts};await writeFile(resolve(directory,'audit.json'),JSON.stringify(report,null,2));return report;},
  };
+}
+
+// Final evaluation verifies completed journals independently of the live process.
+export async function verifyDiagnosticArtifacts(diagnostics,runs,executionId,dir){
+ try{
+  if(!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(executionId??'')||diagnostics?.artifacts?.length!==8||runs.length!==2)return false;
+  const expected=runs.flatMap(run=>roles.map(role=>resolve(dir,'diagnostics-'+executionId,run.id+'-'+role+'.jsonl'))),seen=new Set();
+  for(const artifact of diagnostics.artifacts){
+   if(!expected.includes(artifact.path)||seen.has(artifact.path)||!/^[a-f0-9]{64}$/.test(artifact.sha256??'')||!Number.isSafeInteger(artifact.bytes)||artifact.bytes<0||artifact.bytes>256*1024*1024)return false;
+   seen.add(artifact.path);const hash=createHash('sha256');let bytes=0;
+   for await(const chunk of createReadStream(artifact.path)){bytes+=chunk.length;if(bytes>artifact.bytes)return false;hash.update(chunk);}
+   if(bytes!==artifact.bytes||hash.digest('hex')!==artifact.sha256)return false;
+  }
+  return true;
+ }catch{return false;}
 }

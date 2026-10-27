@@ -459,3 +459,12 @@ locally; session URLs and credentials are never saved. The [performance
 design](cloudflare-performance.md#resource-failures-after-a-deadline) describes
 limits and late-settlement coverage. Historical reports without these diagnostics
 remain preserved and cannot qualify under the updated evaluator.
+
+
+The common client recognizes the exact `ManifestReadLeaseExpired` HTTP 409 as
+recoverable only for stable, idempotent warm requests. Re-entry acquires fresh
+read admission while retaining the identical visibility fence, request body and
+operation identity. The original sixty-second/twenty-attempt limits and elapsed
+latency measurement remain unchanged. Cold requests, unsafe mutations,
+compaction and resource-bearing or unknown messages do not gain this retry.
+This corrects the client classification without changing the frozen control.

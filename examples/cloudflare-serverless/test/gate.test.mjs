@@ -266,3 +266,14 @@ test('stopped qualification clients cancel active transport and never start anot
 test('gate rejects missing gapped duplicate or resource-failed live diagnostics',()=>{
  for(const change of[r=>delete r.diagnostics,r=>r.diagnostics.streams.pop(),r=>r.diagnostics.streams[0].gap=true,r=>r.diagnostics.streams[0].resource_failures=1,r=>r.diagnostics.streams[0]=r.diagnostics.streams[1]]){const r=report();change(r);assert.equal(evaluateWarmPrerequisites(r).passed,false);assert.equal(evaluateTrial(r).passed,false);}
 });
+
+test('expired read admission retries only stable warm identities within the original budget',async()=>{
+ const version='01234567-0123-4567-89ab-0123456789ab';
+ for(const input of[{op:'lookup',doc_id:'same-document',required_visibility:'same-fence'},{op:'mutate',operation_id:'same-operation',mutations:[]}]){
+  const bodies=[],client=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async(url,request)=>{bodies.push(request.body);return bodies.length===1?Response.json({error:'ManifestReadLeaseExpired'},{status:409}):Response.json({ok:true},{headers:{'X-Antfly-Version':version}});}});
+  const{sample}=await client.call('a',input,'verify',{scheduled:Date.now()-40});assert.equal(sample.attempts,2);assert.ok(sample.ms>=280);assert.deepEqual(bodies,[JSON.stringify(input),JSON.stringify(input)]);assert.equal(client.errors.length,0);
+ }
+ for(const[input,phase,error]of[[{op:'lookup'},'cold','ManifestReadLeaseExpired'],[{op:'mutate'},'write','ManifestReadLeaseExpired'],[{op:'compact'},'compact','ManifestReadLeaseExpired'],[{op:'count'},'read','ManifestReadLeaseExpired OutOfMemory']]){
+  let calls=0;const client=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async()=>{calls++;return Response.json({error},{status:409});}});await assert.rejects(client.call('a',input,phase),/HTTP 409/);assert.equal(calls,1);assert.equal(client.resourceErrors.length,error.includes('OutOfMemory')?1:0);
+ }
+});
