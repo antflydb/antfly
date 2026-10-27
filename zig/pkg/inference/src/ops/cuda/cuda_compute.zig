@@ -4805,6 +4805,7 @@ pub const CudaCompute = struct {
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_gdn_decode_calls={d} cuda_fused_gdn_decode_pages={d}\n", .{ self.lighton_recurrent.fused_decode_calls, self.lighton_recurrent.fused_decode_pages });
         if (self.lighton_recurrent.bf16_prefill) |prefill| {
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) if (prefill.attention) |fast| std.debug.print("LIGHTONOCR3 cuda_native_prefill_attention_calls={d} plans={d} metadata_slots={d} slot_reuses={d}\n", .{ fast.calls, fast.plans, @import("lighton_prefill_attention.zig").metadata_slots, fast.slot_reuses });
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
                 std.debug.print("LIGHTONOCR3 cuda_bf16_recurrent_prefill_calls={d} workspace_peak={d}\n", .{ prefill.calls, prefill.workspace_peak });
         }
@@ -24931,6 +24932,31 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
             return createTensor(self, device, shape, q_count);
         }
     }
+    // Optional mixed-precision library only. Retain the original default,
+    // decode kernels, and unsupported storage/layout routes. KV suffixes have
+    // already been appended exactly once; failures here fail the claim.
+    if (self.capability_profile == .lightonocr3 and batch == 1 and
+        attention.query_sequence_len >= 2 and attention.query_sequence_len <= 4096 and
+        attention.kv_sequence_len <= 4096 and attention.total_sequence_len == attention.kv_sequence_len and
+        attention.kv_position_offset == 0 and attention.sliding_window == 0 and
+        mask_len == 0 and bias_mode == 0 and head_dim == 256 and
+        ((num_heads == 8 and num_kv_heads == 2) or (num_heads == 16 and num_kv_heads == 4)) and
+        paged.page_size_tokens == 16 and paged.format == cuda_kv_format_f16 and
+        layer.value_format == cuda_kv_value_format_f16 and
+        paged.key_row_bytes == h_kv * 2 and paged.base_key_row_bytes == h_kv * 2 and paged.v_row_stride == h_kv * 2 and
+        !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
+    {
+        if (self.lighton_recurrent.bf16_prefill) |*prefill| if (prefill.attention) |*fast| {
+            try fast.reserve(&self.ctx);
+            try self.kernels.launchF32ToF16(&self.ctx, fast.query(), q_tensor.buffer, q_count);
+            const block_count = (attention.kv_sequence_len + 15) / 16;
+            if (logical_blocks.len < block_count) return error.InvalidPagedKvState;
+            try fast.run(&self.ctx, device, layer.k, layer.v, attention.query_sequence_len, attention.kv_sequence_len, num_heads, num_kv_heads, logical_blocks[0..block_count], layer.k.len / (16 * h_kv * 2));
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_fast += 1;
+            return createTensor(self, device, shape, q_count);
+        };
+    }
     const launch_result = try self.kernels.launchGqaAttentionDecodeTurboquantF32(
         &self.ctx,
         device,
@@ -34775,4 +34801,76 @@ test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and 
     try output.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
     try compute.ctx.synchronize();
     for (actual) |value| try std.testing.expectEqual(@as(f32, 1), value);
+}
+
+test "LightOnOCR3 CUDA optional paged prefill owner admits host and GPU bytes before allocating and drains on clear" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const memory = @import("../../runtime/tier/memory.zig");
+    const module = @import("lighton_prefill_attention.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const NoPlan = struct {
+        fn drop(value: ?*anyopaque) callconv(.c) void {
+            std.debug.assert(value == null);
+        }
+    };
+    var owner = module.Module{ .make_plan = undefined, .execute = undefined, .drop = NoPlan.drop };
+    defer owner.clear(&compute.ctx) catch {};
+    var controller = memory.AdmissionController{};
+    const gpu_bytes = 64 * 1024 * 1024 + 128 * 1024 + 4096 * 16 * 256 * 2 + 4096;
+    const host_bytes = 64 * (128 * 1024 + 4096) + 64 * 1024;
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
+        .backend_limit_bytes = gpu_bytes - 1,
+        .host_limit_bytes = host_bytes,
+        .scratch_limit_bytes = gpu_bytes + host_bytes,
+    }, .check_live_memory = false };
+    const before = compute.ctx.device_allocations.snapshot().live;
+    try std.testing.expectError(error.ResourceLimitExceeded, owner.reserve(&compute.ctx));
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = gpu_bytes;
+    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = host_bytes - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, owner.reserve(&compute.ctx));
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = host_bytes;
+    try owner.reserve(&compute.ctx);
+    const first = owner.device.ptr;
+    try owner.reserve(&compute.ctx);
+    try std.testing.expectEqual(first, owner.device.ptr);
+    try std.testing.expectEqual(before + gpu_bytes, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, gpu_bytes), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, host_bytes), controller.snapshot().host_scratch_bytes);
+    // Reuse every pinned slot repeatedly while GPU readers remain queued.
+    // Independent D2D snapshots catch overwrites of an earlier DMA source.
+    const turns = 3 * module.metadata_slots + 5;
+    var audit = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, (turns + 4) * 4);
+    defer audit.free(&compute.ctx);
+    const sentinels: [turns + 4]u32 = @splat(0x5a5a5a5a);
+    try audit.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&sentinels));
+    for (0..turns) |turn| {
+        const slot = try owner.acquireSlot(&compute.ctx);
+        try std.testing.expectEqual(turn % module.metadata_slots, slot);
+        try std.testing.expectError(error.InvalidExecutionPlan, owner.acquireSlot(&compute.ctx));
+        const host = owner.hostSlot(slot)[0..4];
+        std.mem.writeInt(u32, host[0..4], @intCast(turn + 1), .little);
+        try owner.device.copyFromHost(&compute.ctx, host);
+        try owner.finishSlotCopy(&compute.ctx, slot);
+        try std.testing.expectError(error.InvalidExecutionPlan, owner.finishSlotCopy(&compute.ctx, slot));
+        const result = compute.ctx.driver.fns.cuMemcpyDtoDAsync(audit.ptr + turn * 4, owner.device.ptr, 4, compute.ctx.stream);
+        try compute.ctx.driver.check(result);
+    }
+    var actual: [turns + 4]u32 = undefined;
+    try audit.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try compute.ctx.synchronize();
+    for (0..turns) |turn| try std.testing.expectEqual(@as(u32, @intCast(turn + 1)), actual[turn]);
+    for (actual[turns..]) |guard| try std.testing.expectEqual(@as(u32, 0x5a5a5a5a), guard);
+    try std.testing.expectEqual(@as(usize, turns - module.metadata_slots), owner.slot_reuses);
+    try owner.clear(&compute.ctx);
+    audit.free(&compute.ctx);
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.device.ptr);
+    for (owner.copy_pending) |pending| try std.testing.expect(!pending);
 }

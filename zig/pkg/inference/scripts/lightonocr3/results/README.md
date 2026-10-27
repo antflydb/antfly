@@ -81,6 +81,14 @@ the user guide. Build a ReleaseFast inference test executable with Zig 0.17 and
   `check_cuda_bf16_prefill.py` checks its output/state against the independent
   FlashInfer wrapper, short-prefix histories, read-only inputs, canaries and
   insufficient scratch. Default F32 checks retain their original tolerances.
+- `build_cuda_prefill_attention.py` builds the optional SM12.1 F16-query,
+  F32-output paged prefill extension beside a selected recurrent library.
+  `check_cuda_prefill_attention.cpp` includes its native-only build command and
+  independently checks causal addressing, permuted physical pages, plan reuse,
+  overwritten CPU metadata, workspace bounds and input/output canaries. These
+  constructed checks do not constitute a general accuracy evaluation.
+- `verify_cuda_florence.sh --schedule-stress` adds the F64 cross-attention oracle
+  with delayed warp scheduling, preserving the original numerical tolerance.
 - `verify_cuda_{recurrent,attention,activations,vision,florence}.sh` reproduce the
   independent numerical, state, read-only and allocation-canary checks.
 - `check_metal_{projections,vision,prefill_attention}.m` retain independent Metal
