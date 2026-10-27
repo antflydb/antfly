@@ -1,7 +1,7 @@
 # Lite import qualification for issue 1304
 
 The branch started at `origin/main` commit `031742c340` and was rebased onto
-`6647f3ce7b` while the fixes were being qualified. The issue and both
+`8106b9cb72` while the fixes were being qualified. The issue and both
 comments describe several different generations of the importer and database.
 
 ## Findings and ownership
@@ -83,11 +83,12 @@ databases are not repository fixtures.
 The allocator/reclamation gate passes 73 tests, including cross-process certificate
 reuse, changed recovery headers, altered ownership counters and interrupted
 certificate writes. The targeted proof and lease gate
-passes seven tests, including corrupt values, incorrect positive reference counts
+passes eight tests, including corrupt values, incorrect positive reference counts
 and denied optional read-window admission. The new owner-detach gate passes all
 six lease tests, including active reads against a retired inode after Store close.
-The initial C ABI gate passed all 170 tests, including three focused SQL/maintenance
-contracts; the final close-path changes are also exercised by a repeated C ABI run.
+The final C ABI gate passes all 89 unit tests and five focused contracts: detached
+proof gates, lazy large-value SQL upserts, cross-process certified reuse, foreground
+reuse during captured maintenance, and orphan-sweep progress across replay snapshots.
 
 The supplied `55d97ce423` library imported the frozen original-rollout case in
 34.364 seconds including startup/shutdown (33.7 seconds reported by the importer).

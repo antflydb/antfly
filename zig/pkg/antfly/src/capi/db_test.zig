@@ -6814,7 +6814,7 @@ test "capi native close certifies allocator before the next process opens source
             const guard = public.enterHandle(handle, .exclusive).?;
             defer guard.leave();
             const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
-            if (process != 0) try std.testing.expect(file.free_pages_verified);
+            if (process == 0) try file.completeAllocatorVerification() else try std.testing.expect(file.free_pages_verified);
             const reused = (try file.allocatorStats()).?.reused_pages;
             const large: [32768]u8 = @splat('x');
             for (0..12) |_| try file.putCatalogRecord("test/free-pool", &large);
@@ -6822,6 +6822,7 @@ test "capi native close certifies allocator before the next process opens source
             _ = try file.reclaimPages(4096);
             if (process != 0) try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
             try std.testing.expect((try file.check()).valid);
+            try std.testing.expect(file.free_pages_verified);
         }
         antfly_db_close(handle);
         handle = null;
