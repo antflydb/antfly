@@ -1007,3 +1007,17 @@ coalesced into another owner's group close their unused batch permits on
 settlement. The workerd regression reproduces the original context leak and
 checks the corrected admission, while a native-backed Node fixture suspends the
 surviving commit and proves that the failed owner has not returned early.
+
+Mutation grouping uses the same continuation rule. Each queued caller registers
+its own admission; a selected owner starts its two-ms coalescing timer in that
+caller's context. Noncoalesced groups never inherit a completed group's timer.
+Expired selected owners hand off before returning an error. Accounting and the
+next admission finish before committed results can end the owning RPC. Metadata
+batches likewise return settlements to their admission runner, which completes
+queue handoff before answering any owner. Existing group sizes, native deadlines,
+rollback rules and memory reservations remain unchanged.
+
+A workerd mutation-group regression reproduced contexts `a, a, a` for separately
+admitted callers `a, b, c`; the candidate records `a, b, c`. A separate test checks
+that metadata handoff precedes the completed owner's response. These changes
+apply only to the candidate; the approved control remains `8a61f42df8`.

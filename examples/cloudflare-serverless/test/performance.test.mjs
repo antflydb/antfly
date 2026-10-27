@@ -690,3 +690,9 @@ test('a failed transaction owner stays pending through the surviving group commi
  try{assert.equal(rejected,false);}finally{block=false;release();}
  await Promise.all([failed,survivor]);assert.equal(rejected,true);assert.equal(await store.transaction(tx=>tx.get('rolled-back')),undefined);assert.equal(await store.transaction(tx=>tx.get('survivor')),true);
 });
+
+test('transaction queue hands off ownership before exposing a completed owner response',async()=>{
+ const events=[],traceA=crypto.randomUUID(),traceB=crypto.randomUUID();let entered,release;const started=new Promise(r=>entered=r),held=new Promise(r=>release=r);
+ class Store extends R2CoordinatorStore{async native(input){const state=this.state??{epoch:Array(16).fill(1),owner:this.owner,revision:1,next:1,root:''};if(input.action==='begin'){events.push('begin:'+(this.trace.id===traceA?'a':'b'));if(this.trace.id===traceA){entered();await held;}return{state,has_more:false,base:'base',page_prefix:'page'};}if(input.action==='commit')return{state:{...state,revision:state.revision+1,next:state.next+1}};throw Error('unexpected native action');}}
+ const store=new Store(module,new Bucket(),'ownership-before-response');const first=store.transaction(tx=>tx.put('a',1),{priority:'maintenance',traceId:traceA}).then(()=>events.push('response:a'));await started;const second=store.transaction(tx=>tx.put('b',2),{traceId:traceB});release();await Promise.all([first,second]);assert.ok(events.indexOf('begin:b')<events.indexOf('response:a'),JSON.stringify(events));assert.equal(store.pending.length,0);assert.equal(store.running,false);
+});

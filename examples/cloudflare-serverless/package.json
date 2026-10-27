@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test test/host.test.mjs test/collection.test.mjs test/batch.test.mjs test/r2-coordinator.test.mjs test/performance.test.mjs test/publication-protocol.test.mjs test/gate.test.mjs test/exact-search.test.mjs",
+    "test": "node --test test/host.test.mjs test/collection.test.mjs test/batch.test.mjs test/r2-coordinator.test.mjs test/performance.test.mjs test/publication-protocol.test.mjs test/gate.test.mjs test/exact-search.test.mjs test/metrics-tail.test.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "deploy:r2": "wrangler deploy --config wrangler.r2.jsonc",

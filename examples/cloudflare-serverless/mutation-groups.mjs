@@ -25,20 +25,27 @@ export class MutationGroups {
     if(this.pending>=16||this.bytes+bytes>4*1024*1024)throw new Error("CoordinatorCommitBusy");
     const release=reserveInput(bytes);
     this.pending++;this.bytes+=bytes;
-    return new Promise((resolve,reject)=>{this.queue.push({input,bytes,resolve,reject,release,deadline:this.clock()+30000});this.schedule();});
+    return new Promise((resolve,reject)=>{
+      let admit;const ready=new Promise(start=>admit=start);
+      ready.then(async owner=>{if(!owner)return;await new Promise(start=>setTimeout(start,2));await this.drain();});
+      this.queue.push({input,bytes,resolve:value=>{admit(false);resolve(value);},reject:error=>{admit(false);reject(error);},startGroup:()=>admit(true),release,deadline:this.clock()+30000});this.schedule();
+    });
   }
-  schedule(){if(!this.running){this.running=true;setTimeout(()=>this.drain(),2);}}
+  schedule(){if(!this.running&&this.queue.length){this.running=true;this.queue[0].startGroup();}}
   async drain(){
-    const group=[];let bytes=0,records=0;
-    while(this.queue.length&&group.length<16){const next=this.queue[0];if(this.clock()>=next.deadline){this.queue.shift();this.pending--;this.bytes-=next.bytes;next.release();next.reject(new Error("DeadlineExceeded"));continue;}const count=next.input.mutations?.length??0;if(group.length&&(bytes+next.bytes>768*1024||records+count>1024))break;group.push(this.queue.shift());bytes+=next.bytes;records+=count;}
-    if(!group.length){this.running=false;if(this.queue.length)this.schedule();return;}
+    const group=[],expired=[];let bytes=0,records=0;
+    while(this.queue.length&&group.length<16){const next=this.queue[0];if(this.clock()>=next.deadline){expired.push(this.queue.shift());if(!group.length)break;continue;}const count=next.input.mutations?.length??0;if(group.length&&(bytes+next.bytes>768*1024||records+count>1024))break;group.push(this.queue.shift());bytes+=next.bytes;records+=count;}
+    const expire=()=>{for(const item of expired){this.pending--;this.bytes-=item.bytes;item.release();item.reject(new Error("DeadlineExceeded"));}};
+    if(!group.length){this.running=false;this.schedule();expire();return;}
     const settle=async items=>{
       try{const results=await this.commit(items.map(item=>item.input),Math.min(...items.map(item=>item.deadline)));if(results.length!==items.length)throw new Error("InvalidMutationGroupResults");return results.map(value=>({value}));}
       catch(error){if(items.length>1&&/WalIdempotencyConflict|InvalidDocumentMutation|InvalidWalOperationId|InvalidWalBatch|WalRecordTooLarge|GraphPageRecordTooLarge|SyntaxError|UnexpectedToken|UnexpectedEndOfInput|InvalidCharacter|InvalidNumber|MissingField|UnknownField|Overflow/.test(String(error))){const results=[];for(const item of items)results.push(...await settle([item]));return results;}return items.map(()=>({error}));}
     };
     const results=await settle(group);
     this.pending-=group.length;this.bytes-=bytes;this.running=false;
+    // Handoff and accounting finish before answering the owner RPC. Future
+    // groups run through their own submitter, not this timer's old context.
+    this.schedule();expire();
     group.forEach((item,i)=>{item.release();results[i].error?item.reject(results[i].error):item.resolve(results[i].value);});
-    if(this.queue.length)this.schedule();
   }
 }

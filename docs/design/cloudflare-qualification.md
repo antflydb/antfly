@@ -1612,3 +1612,32 @@ proposal with unchanged original native artifacts passes its 90 original Node
 checks; see [the transaction control proposal](cloudflare-control-transactions.md).
 These local correctness results do not qualify live latency or retroactively
 repair the failed control comparisons.
+
+The user explicitly approved corrected control `8a61f42df8`. All prior control
+bundles/reports were archived before deployment, and the three pairs received
+fresh corpora. Both original control WASM hashes remain unchanged. Post-deploy
+recovery replayed three remaining control-2 jobs and one control-3 job to their
+original Queues before exact-lease ACK; both DLQs were empty on the subsequent
+pull audit and temporary HTTP consumers were removed.
+
+The first new pair-1 comparison failed before measurement: the control
+acknowledged 32 seed batches, while the candidate acknowledged 30 before one
+tenant exhausted the unchanged sixty-second transport deadline. No workload or
+cold recovery ran. A separate actual-workerd reproduction identified a
+candidate mutation-group continuation defect. The candidate now hands both
+mutation groups and metadata response settlement to their owning admissions.
+It passes 222 Node checks and 14 persisted Worker checks. The approved control
+is unchanged. These tests establish the correction, not that every transport
+timeout had this cause or that the live latency gate has passed.
+
+Qualification phases now cancel and await a failed phase's peer before closing
+its report, preventing continued setup I/O after a fatal snapshot. Transport
+exhaustion retains the last exception as its cause, without copying credentials;
+actual HTTP attempts are counted. Stopping during retry backoff sends no further
+request. The offered load, successful-run deadlines and retry limits are unchanged.
+
+Live diagnostic capture now uses a tested streaming whitelist. It persists only
+finite numeric metrics, fixed operation labels, UUID trace IDs and recognized
+error codes. HTTP events, headers, bodies, arbitrary strings and raw CLI stderr
+are discarded before writing. This replaces raw log capture rejected by automatic
+approval review and introduces no credential upload or new approval requirement.

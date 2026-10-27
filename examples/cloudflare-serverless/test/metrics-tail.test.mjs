@@ -1,0 +1,23 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import{test}from'node:test';import assert from'node:assert/strict';import{sanitizeTailEvent,tailFrames}from'../qualification/metrics-tail.mjs';
+test('streaming metrics discard HTTP credentials bodies and arbitrary text before persistence',()=>{
+ const secret='Bearer do-not-persist',event={outcome:'exception',event:{request:{headers:{authorization:secret},url:secret}},exceptions:[{name:'Error',message:'unexpected '+secret}],logs:[{timestamp:42,message:[secret,JSON.stringify({event:'antfly.operation',op:'lookup',elapsed_ms:5,body:secret,token:secret,unknown:secret,physical:{calls:2,headers:{authorization:secret},name:'do-not-persist',event:'do-not-persist'},failure_code:'Error: WorkLeaseLost '+secret})]}]};
+ const safe=sanitizeTailEvent(event);assert.ok(!JSON.stringify(safe).includes('do-not-persist'));const value=JSON.parse(safe.logs[0].message[0]);assert.equal(value.elapsed_ms,5);assert.equal(value.physical.calls,2);assert.equal(value.failure_code,'WorkLeaseLost');assert.equal(safe.exceptions[0].message,'RedactedError');assert.equal(value.token,undefined);
+});
+test('tail framing bounds buffers and handles fragmented quoted objects',()=>{
+ const out=[],parse=tailFrames(v=>out.push(v),{maxBytes:256});parse('CLI banner\n'+JSON.stringify({event:{body:'x'.repeat(512)}}));const raw=JSON.stringify({outcome:'ok',logs:[{timestamp:1,message:[JSON.stringify({event:'antfly.trace',scope:'http',elapsed_ms:5})]}]});for(let i=0;i<raw.length;i+=3)parse(raw.slice(i,i+3));assert.equal(out.length,1);assert.equal(out[0].outcome,'ok');assert.equal(JSON.parse(out[0].logs[0].message[0]).scope,'http');
+});

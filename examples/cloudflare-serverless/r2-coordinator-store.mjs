@@ -188,9 +188,13 @@ export class R2CoordinatorStore {
       // drain loop must not keep later groups in an already answered RPC.
       ready.then(async owner=>{
         if(!owner)return;
-        try{await this.batch();}
-        catch(error){for(const item of this.pending.splice(0))item.reject(error);}
-        finally{this.running=false;this.drain();}
+        let completed;
+        try{completed=await this.batch();}
+        catch(error){completed=this.pending.splice(0).map(item=>({...item,batchError:error}));}
+        // No native I/O or queue ownership remains in a caller's continuation
+        // after its result can end the RPC. Admit the next owner first.
+        this.running=false;this.drain();
+        for(const item of completed)item.callbackFailed?item.reject(item.callbackError):item.batchError?item.reject(item.batchError):item.resolve(item.result);
       });
       this.pending.push({...input,queuedAt:performance.now(),startBatch:()=>admit(true),resolve:value=>{admit(false);resolve(value);},reject:error=>{admit(false);reject(error);}});
       this.drain();
@@ -230,7 +234,7 @@ export class R2CoordinatorStore {
         const committed=await this.trace.span("wal_commit",()=>this.native({action:"commit_wal",wal_commit:item.commit}));
         commitMs=performance.now()-commitStarted;
         this.state=committed.state;this.rows.clear();this.rowBytes=0;this.rowRevision=this.state.revision;
-        item.resolve(committed);return;
+        item.result=committed;return completed;
       }
       const overlay = new Map();
       const tx = {
@@ -295,16 +299,16 @@ export class R2CoordinatorStore {
         for(const [key,value]of overlay)this.remember(key,value);
         this.rowRevision=this.state.revision;
       }
-      for(const item of completed) item.callbackFailed?item.reject(item.callbackError):item.resolve(item.result);
     } catch(error) {
-      for(const item of completed) item.reject(item.callbackFailed?item.callbackError:error);
+      for(const item of completed)item.batchError=error;
       // Recovery advances a bounded cursor before returning backpressure.
       // Reject queued callers rather than retaining an unbounded request set.
-      if (!completed.length) for(const item of this.pending.splice(0,16)) item.reject(error);
+      if (!completed.length)for(const item of this.pending.splice(0,16))completed.push({...item,batchError:error});
     } finally {
       try{this.onMetrics?.({event:"antfly.coordinator_group",operations:this.usedOperations,transferred_bytes:this.usedBytes,elapsed_ms:performance.now()-started,physical_r2:{...this.physical},trace:this.trace.report(),prefetch_reserved_bytes:this.prefetchReservedBytes,begin_ms:beginMs,commit_ms:commitMs,native_cpu_ms:this.nativeCpuMs,queue_wait_max_ms:maxQueueMs,row_cache_bytes:this.rowBytes,callbacks:completed.length,trace_ids:completed.map(item=>item.traceId).filter(Boolean)});}catch{}
       this.deadline = null;
       this.idleCheckpoint?.schedule();
     }
+    return completed;
   }
 }

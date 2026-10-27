@@ -21,6 +21,7 @@ import{GateClient,resumeSeedExecution}from'./gate-client.mjs';
 import{evaluateTrial,evaluateWarmPrerequisites}from'./gate-policy.mjs';
 import{validatedEvidence}from'./validated-evidence.mjs';
 import{runOfferedWorkload}from'./offered-workload.mjs';
+import{runPairedPhase}from'./paired-phase.mjs';
 import{assertUnusedRecovery,verifyReportedRun,verifySealedRun}from'./gate-provenance.mjs';
 const path=process.argv[2],trial=Number(process.argv[3]??1),seconds=Number(process.argv.find(v=>v.startsWith('--seconds='))?.slice(10)??3600),documents=512,period=30000;
 if(!Number.isInteger(seconds)||seconds<60||seconds>7200)throw Error('seconds must be 60..7200');
@@ -46,10 +47,10 @@ async function lifecycle(action,id){await new Promise((resolve,reject)=>{const c
 try{
  for(const side of[baseline,candidate])if(side.run.paused)await lifecycle('resume',side.run.id);
  await markPhase('setup');
- console.log('seeding',trial);await Promise.all([baseline.seed(documents,{executionId:resumedSeedExecutionId??executionId}),candidate.seed(documents,{executionId:resumedSeedExecutionId??executionId})]);console.log('seeded',trial);
+ console.log('seeding',trial);await runPairedPhase([baseline,candidate],side=>side.seed(documents,{executionId:resumedSeedExecutionId??executionId}));console.log('seeded',trial);
  await markPhase('workload');
  workload=await runOfferedWorkload({sides:[baseline,candidate],seconds,period,documents,orderOffset:trial,onProgress:async state=>{console.log('minute',trial,state.minute,'pending rounds',state.pending_rounds);await save();}});
- offered=seconds*1000;await Promise.all([baseline.converge(),candidate.converge()]);await Promise.all([baseline.verify(documents),candidate.verify(documents)]);await save();
+ offered=seconds*1000;await runPairedPhase([baseline,candidate],side=>side.converge());await runPairedPhase([baseline,candidate],side=>side.verify(documents));await save();
  if(seconds>=3600||process.argv.includes('--cold')){
   let evidence;try{evidence=JSON.parse(await readFile(resolve(gate.dir,'evidence.json')));}catch{}
   evidenceSummary=await validatedEvidence(evidence,report(),baseline.run,candidate.run);

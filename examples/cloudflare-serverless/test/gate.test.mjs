@@ -232,3 +232,15 @@ test('Queue metrics overload uses bounded logical retries while unknown failures
  env.MAINTENANCE.metrics=async()=>{throw Error('OutOfMemory');};await assert.rejects(qualificationQueueMetrics(env),/OutOfMemory/);
  env.MAINTENANCE.metrics=async()=>{throw Error('unrecognized platform failure');};await assert.rejects(qualificationQueueMetrics(env),/unrecognized platform failure/);
 });
+
+
+test('paired phase cancels and settles peer I/O before returning the original failure',async()=>{
+ const{runPairedPhase}=await import('../qualification/paired-phase.mjs');let release,settled=false;const held=new Promise((_,reject)=>release=reject),failure=Error('original failure');
+ const a={stop(){}},b={stop(reason){release(reason);}};await assert.rejects(runPairedPhase([a,b],async side=>{if(side===a)throw failure;try{await held;}finally{settled=true;}}),error=>error===failure);assert.equal(settled,true);
+});
+test('stopped qualification clients cancel active transport and never start another request',async()=>{
+ let started,calls=0;const entered=new Promise(r=>started=r),client=new GateClient({id:'test',origin:'https://stopped.invalid',version:'v'},'do-not-log',{fetch:(_url,options)=>{calls++;started();return new Promise((_,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));}});
+ const pending=client.call('a',{op:'status'},'seed');await entered;client.stop(Error('PeerPhaseCancelled'));await assert.rejects(pending,/PeerPhaseCancelled/);await assert.rejects(client.call('a',{op:'status'},'seed'),/PeerPhaseCancelled/);assert.equal(calls,1);assert.equal(client.samples.length,0);assert.ok(!JSON.stringify(client.errors).includes('do-not-log'));
+ let retries=0,backoff;backoff=new GateClient({id:'test',origin:'https://stopped.invalid',version:'v'},'test',{fetch:async()=>{retries++;queueMicrotask(()=>backoff.stop(Error('PeerPhaseCancelled')));return Response.json({error:'CoordinatorRecovering'},{status:503});}});
+ await assert.rejects(backoff.call('a',{op:'status'},'seed'),/PeerPhaseCancelled/);assert.equal(retries,1);assert.equal(backoff.errors[0].attempts,1);
+});
