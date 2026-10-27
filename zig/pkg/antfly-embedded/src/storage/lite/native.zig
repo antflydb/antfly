@@ -17602,33 +17602,7 @@ test "lite sorted initial ingest bounds heap independently of input length" {
             const last = (try file.getDocumentAlloc(a, batch[count - 1].key)).?;
             defer a.free(last);
             try std.testing.expectEqualStrings("v", last);
-            if (count == 16384) {
-                try std.testing.expect((try file.check()).valid);
-            } else {
-                // Retain the eightfold input growth and the same heap bound.
-                // Check every large-case key/value in a bounded scan; full-file
-                // proof maps above already cover structural integrity and are
-                // unrelated to the initial-ingest working-set assertion.
-                var cursor = DocumentIndexCursor.init(&file, file.activeCheckpoint());
-                defer cursor.deinit();
-                var records = RecordPageReader{};
-                defer records.deinit(file.allocator);
-                var current = try cursor.first();
-                var ordinal: usize = 0;
-                while (current) |entry| {
-                    var owned = entry;
-                    defer owned.deinit(file.allocator);
-                    try std.testing.expect(ordinal < batch.len);
-                    try std.testing.expectEqualSlices(u8, batch[ordinal].key, entry.key);
-                    const payload = try records.read(&file, file.allocator, file.activeCheckpoint(), entry.document_page_id, .document);
-                    const document = try decodeDocumentEntry(payload);
-                    try std.testing.expectEqualSlices(u8, entry.key, document.key);
-                    try std.testing.expectEqualStrings("v", document.value);
-                    ordinal += 1;
-                    current = try cursor.next();
-                }
-                try std.testing.expectEqual(count, ordinal);
-            }
+            try std.testing.expect((try file.check()).valid);
         }
     }
 }
