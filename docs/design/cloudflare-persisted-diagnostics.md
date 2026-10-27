@@ -143,7 +143,7 @@ and [telemetry query API](https://developers.cloudflare.com/api/resources/worker
 ## Physical attempts and invocation accounting
 
 The common driver now records each physical HTTP attempt, including admission
-retries and transport failures, in a bounded 20,000-entry ledger. A unique UUID
+retries and transport failures, in a bounded 20,000-entry ledger. A unique base36-encoded UUID
 query parameter identifies each attempt without changing the frozen control's
 source or request body. Reports retain timestamps, status, deployment UUID and a
 SHA-256 digest of the normalized response Ray ID; they retain no raw Ray IDs,
@@ -205,3 +205,14 @@ an invocation never delivered to the exporter. Validate those boundaries with a
 small canary and independently counted injected failures before connecting a
 new transport to gate evaluation. Keep the frozen control, original failures,
 thresholds, and all recovery epochs intact until that prerequisite succeeds.
+
+
+The fresh source confirms URL redaction replaces raw UUID query values with
+`REDACTED`. The driver now encodes the same 128-bit UUID as a fixed-length,
+lowercase base36 value with a non-hex prefix; this avoids the documented hex and
+mixed-case base64 redaction shapes without requesting unredacted headers. The
+decoder validates range and canonical encoding before producing the same hashed
+UUID identity. Old failed UUID-tagged reports remain unchanged. See Cloudflare's
+[redaction rules](https://developers.cloudflare.com/workers/runtime-apis/handlers/tail/#tailrequest).
+Repeated provider event IDs remain fatal, including repeats within one complete
+page; count agreement cannot make an ambiguous event identity acceptable.

@@ -18,7 +18,7 @@ import{resourceFailureCode}from'../performance.mjs';
 import{assertGateRun}from'./gate-scope.mjs';
 import{verifySealedRun}from'./gate-provenance.mjs';
 import {readFile} from 'node:fs/promises';
-import {InvocationLedger} from './invocation-accounting.mjs';
+import {InvocationLedger,attemptParameter} from './invocation-accounting.mjs';
 // Keep connections across the fixed 30-second arrivals, identically for both sides.
 const transportPolicy=Object.freeze({keep_alive_ms:60000,max_connections:128,constructor_reset_replay:'idempotent-warm-only',read_lease_replay:'idempotent-warm-only'});
 const constructorReset='A call to blockConcurrencyWhile() in a Durable Object waited for too long. The call was canceled and the Durable Object was reset.';
@@ -50,7 +50,7 @@ export class GateClient {
   try{this.abortController.signal.throwIfAborted();for(;attempts<20&&Date.now()-scheduled<60000;attempts++){
    this.abortController.signal.throwIfAborted();
    const invocation=this.invocations.begin({phase,op:input.op,tenant});
-   const url=new URL(path,this.run.origin);if(invocation)url.searchParams.set('__antfly_qualification_attempt',invocation.id);
+   const url=new URL(path,this.run.origin);if(invocation)url.searchParams.set('__antfly_qualification_attempt',attemptParameter(invocation.id));
    let response,body;try{transportAttempts++;response=await this.fetch(url,{method:'POST',headers:{Authorization:'Bearer '+this.token,'Content-Type':'application/json','X-Antfly-Tenant':tenant,'X-Antfly-Physical-Epoch':String(epoch)},body:JSON.stringify(input),signal:AbortSignal.any([this.abortController.signal,AbortSignal.timeout(Math.max(1,Math.min(35000,scheduled+60000-Date.now())))])});
    this.invocations.response(invocation,response);body=await response.text();this.invocations.finish(invocation);}catch(error){this.invocations.finish(invocation,{transportError:true});lastTransportError=error;if(!this.abortController.signal.aborted&&phase!=="cold"&&idempotent&&networkFailure(error)){await new Promise(r=>setTimeout(r,250));continue;}throw error;}let value;try{value=JSON.parse(body);}catch{throw Error('non-JSON response: '+response.status);}
    last=value;if(resourceFailureCode(value.error))this.resourceErrors.push({phase,error:value.error});
@@ -119,5 +119,5 @@ export class GateClient {
   for(const outcome of outcomes)if(outcome.status==='rejected')throw outcome.reason;
   this.verification={passed:true,bodies,receipts};
  }
- report(){return{invocation_ledger:this.invocations.report(),source_versions:structuredClone(this.run.versions??{}),source_revision:this.run.revision,original_control_revision:this.run.original_control_revision,control_correctness_patch_sha256:this.run.control_correctness_patch_sha256,corpus:this.run.corpus??null,execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,runtime_placement:this.run.runtime_placement??null,invocation_policy:{schema:1,identity:"unique UUID query parameter per physical HTTP attempt",parameter:"__antfly_qualification_attempt",response_identity:"SHA256 of normalized CF-Ray",limits:{attempts:20000},control_source_modified:false},transport_policy:transportPolicy,setup_policy:setupPolicy,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
+ report(){return{invocation_ledger:this.invocations.report(),source_versions:structuredClone(this.run.versions??{}),source_revision:this.run.revision,original_control_revision:this.run.original_control_revision,control_correctness_patch_sha256:this.run.control_correctness_patch_sha256,corpus:this.run.corpus??null,execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,runtime_placement:this.run.runtime_placement??null,invocation_policy:{schema:1,identity:"unique base36-encoded UUID query parameter per physical HTTP attempt",parameter:"__antfly_qualification_attempt",response_identity:"SHA256 of normalized CF-Ray",limits:{attempts:20000},control_source_modified:false},transport_policy:transportPolicy,setup_policy:setupPolicy,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
 }
