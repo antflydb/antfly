@@ -4141,7 +4141,7 @@ fn attachSessionRunAdmission(
         resident.backend_weight_bytes,
     ) catch std.math.maxInt(usize);
     const qwen_cfg = if (backend_runtime.backend == .metal and
-        metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
+        metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
         session_factory.getGptConfig(session.*)
     else
         null;

@@ -3544,6 +3544,22 @@ pub const ReplayStageStats = struct {
     error_count: u64 = 0,
 };
 
+/// Selective replay proof; no unrelated index or maintenance health is read.
+pub const ResolverReplayObservation = struct {
+    backfill_pending: bool = false,
+    empty: bool = false,
+    resolution: ReplayStageStats = .{},
+    promotion: ReplayStageStats = .{},
+    pub fn applied(self: @This(), promote: bool) bool {
+        const curation = @import("resolver_curation.zig");
+        return !self.backfill_pending and curation.stageApplied(self.resolution, self.empty) and (!promote or curation.stageApplied(self.promotion, self.empty));
+    }
+    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        a.free(self.resolution.blocked_reason);
+        a.free(self.promotion.blocked_reason);
+    }
+};
+
 pub const ResolverReplayDiagnostic = struct {
     name: []const u8 = "",
     config_generation: u64 = 0,

@@ -245,9 +245,13 @@ class BuildFailureEvidence(unittest.TestCase):
         first_cache = None
         first_global = None
 
-        def fake_build(command, cwd, *, progress, env):
+        def fake_build(
+            command, cwd, *, progress, env, timeout_seconds, compiler_timeout_seconds
+        ):
             nonlocal first_cache, first_global
             label, rebuilt = expected[len(seen)]
+            self.assertEqual(timeout_seconds, 3600 if label.endswith("cold") else 1800)
+            self.assertEqual(compiler_timeout_seconds, 1800)
             local_cache = Path(command[command.index("--cache-dir") + 1])
             self.assertNotIn("--global-cache-dir", command)
             self.assertIn("-Dstrip=true", command)
@@ -453,6 +457,29 @@ class BuildFailureEvidence(unittest.TestCase):
         diagnostics.assert_called_once()
         self.assertEqual(measured["active_processes"][0]["cpu_time"], "29:59")
         self.assertGreater(measured["wall_seconds"], 0)
+
+    def test_compiler_watchdog_allows_a_later_unit_without_extending_a_stuck_one(self):
+        watchdog = measurement.CompilerWatchdog(1800, 0)
+        first = {"pid": 1, "executable": "zig", "elapsed": "29:59"}
+        self.assertFalse(watchdog.expired(1799, [first]))
+        later = {"pid": 2, "executable": "zig", "elapsed": "00:14"}
+        self.assertFalse(watchdog.expired(1814, [later]))
+        # Another compiler's progress cannot hide an overlong concurrent unit.
+        first["elapsed"] = "30:01"
+        self.assertTrue(watchdog.expired(1815, [first, later]))
+
+    def test_compiler_watchdog_bounds_idle_orchestration_and_unknown_clocks(self):
+        watchdog = measurement.CompilerWatchdog(10, 0)
+        self.assertFalse(watchdog.expired(9, [{"executable": "maker"}]))
+        self.assertTrue(watchdog.expired(10, [{"executable": "maker"}]))
+        unknown = {"pid": 1, "executable": "zig", "elapsed": "unknown"}
+        self.assertFalse(watchdog.expired(11, [unknown]))
+        self.assertTrue(watchdog.expired(21, [unknown]))
+        self.assertTrue(
+            watchdog.expired(
+                22, [{"pid": 2, "executable": "zig", "elapsed": "1-00:00:01"}]
+            )
+        )
 
     def test_report_replaces_previous_running_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

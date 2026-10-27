@@ -238,6 +238,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     });
     wasm_resolver_mod.addImport("antfly_matcher", wasm_matcher_mod);
+    wasm_resolver_mod.addImport("antfly_hash", wasm_hash_mod);
+    wasm_resolver_mod.addImport("antfly_platform", wasm_platform_mod);
     embedded_support_wasm_mod.addImport("antfly_resolver", wasm_resolver_mod);
     embedded_support_wasm_mod.addImport("antfly_matcher", wasm_matcher_mod);
     const wasm_data_uri_mod = b.createModule(.{

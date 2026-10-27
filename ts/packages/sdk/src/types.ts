@@ -782,3 +782,6 @@ export type ResolverSuppressionRequest = components["schemas"]["ResolverSuppress
 export type ResolverUnmergeRequest = components["schemas"]["ResolverUnmergeRequest"];
 
 export type ResolverWait = components["schemas"]["ResolverWait"];
+
+export type EntityConsumerProgressPage = components["schemas"]["EntityConsumerProgressPage"];
+export type EntityNamespaceOutcome = components["schemas"]["EntityNamespaceOutcome"];

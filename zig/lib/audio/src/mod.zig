@@ -308,7 +308,9 @@ pub const DecodeOptions = struct {
     file_name_hint: ?[]const u8 = null,
 };
 
-fn detectFormatWithOptions(audio_bytes: []const u8, options: DecodeOptions) ?EncodedFormat {
+/// Resolve the encoded format using the same hint precedence as decoding.
+/// Header-only admission must use this before interpreting format-specific data.
+pub fn detectFormatWithOptions(audio_bytes: []const u8, options: DecodeOptions) ?EncodedFormat {
     if (options.format_hint) |format| return format;
     if (options.mime_hint) |mime| {
         if (detectFormatFromMime(mime)) |format| return format;
@@ -1893,6 +1895,22 @@ test "file name hint overrides ambiguous sync-word sniffing for flac" {
     try std.testing.expectEqual(EncodedFormat.flac, detectFormatWithOptions(ambiguous_sync[0..], .{
         .file_name_hint = "raw-frame.flac",
     }).?);
+}
+
+test "hinted MP3 with leading padding keeps inspection and bounded decoding consistent" {
+    const bytes = "\x00" ++ tone_mp3_bytes;
+    try std.testing.expectEqual(@as(?EncodedFormat, null), detectFormat(bytes));
+    const hints = [_]DecodeOptions{
+        .{ .format_hint = .mp3 },
+        .{ .mime_hint = "audio/mpeg" },
+        .{ .file_name_hint = "padded.mp3" },
+    };
+    for (hints) |options| {
+        try std.testing.expectEqual(EncodedFormat.mp3, detectFormatWithOptions(bytes, options).?);
+        var decoded = try decodeBounded(std.testing.allocator, bytes, options, default_decode_working_bytes);
+        defer decoded.deinit();
+        try std.testing.expect(decoded.samples.len > 0);
+    }
 }
 
 test "decode dispatch handles wav fixture" {

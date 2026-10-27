@@ -1445,7 +1445,11 @@ pub const IndexManager = struct {
     vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     resolver_namespace_lookup: ?ResolverNamespaceLookup = null,
     test_resolver_catalog_publications: u64 = 0,
+    test_resolver_lookup_builds: usize = 0,
+    test_resolver_query_proof_builds: usize = 0,
+    test_resolver_reservation_visits: usize = 0,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
+    artifact_semantic_cache: @import("../artifact_inventory.zig").SemanticDigestCache = .{},
     /// Serialize local receipt counter preparation through its physical commit.
     /// Acquire after primary/graph/index guards; never acquire an index guard
     /// while holding this mutex. Provider execution happens before acquisition.
@@ -12274,6 +12278,7 @@ pub const IndexManager = struct {
 
     pub fn requireResolverNotReplacing(self: *const IndexManager, name: []const u8) !void {
         for (self.resolvers.items) |cfg| {
+            if (comptime @import("builtin").is_test) @constCast(self).test_resolver_reservation_visits += 1;
             if (std.mem.eql(u8, cfg.replacement_resolver, name) or
                 (cfg.replacement_index.len > 0 and std.mem.eql(u8, cfg.name, name))) return error.IndexReplacementPending;
         }
@@ -12941,30 +12946,67 @@ pub const IndexManager = struct {
     /// Import immutable policy once into this owner's allocator. Transient
     /// metadata arenas never lend their lifetime to persistent catalog slots.
     const ResolverSlot = struct { retired: bool, index: usize };
-    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)) };
+    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), routing: std.StringHashMapUnmanaged(std.ArrayList(usize)), declarations: std.AutoHashMapUnmanaged(usize, *QueryDeclaration) = .empty, declaration_generation: u64 = 0, profiles: std.StringHashMapUnmanaged([]const u8) = .empty, query_proofs: std.AutoHashMapUnmanaged([32]u8, [32]u8) = .empty, query_proof_generation: u64 = 0, reserved: std.StringHashMapUnmanaged(void) };
     fn invalidateResolverNamespaceLookup(self: *IndexManager) void {
-        if (self.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
+        if (self.resolver_namespace_lookup) |*lookup| {
+            var owners = lookup.declarations.valueIterator();
+            while (owners.next()) |owner| owner.*.release();
+            lookup.arena.deinit();
+        }
         self.resolver_namespace_lookup = null;
     }
-    fn resolverNamespaceSlots(self: *IndexManager, table: []const u8, template: []const u8) ![]const ResolverSlot {
+    fn ensureResolverLookup(self: *IndexManager) !void {
         if (self.resolver_namespace_lookup == null) {
+            if (comptime @import("builtin").is_test) self.test_resolver_lookup_builds += 1;
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             errdefer arena.deinit();
             const a = arena.allocator();
             var slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)) = .empty;
+            var names: std.StringHashMapUnmanaged(ResolverSlot) = .empty;
+            var routing: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
+            var reserved: std.StringHashMapUnmanaged(void) = .empty;
             for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }, 0..) |definitions, retired| for (definitions, 0..) |cfg, index| {
+                try names.put(a, try a.dupe(u8, cfg.name), .{ .retired = retired != 0, .index = index });
+                if (retired == 0) {
+                    const route = try std.json.Stringify.valueAlloc(a, .{ cfg.source_artifact, cfg.replacement_index }, .{});
+                    const group = try routing.getOrPut(a, route);
+                    if (!group.found_existing) group.value_ptr.* = .empty;
+                    try group.value_ptr.append(a, index);
+                    if (cfg.replacement_resolver.len > 0) try reserved.put(a, try a.dupe(u8, cfg.replacement_resolver), {});
+                    if (cfg.replacement_index.len > 0) try reserved.put(a, try a.dupe(u8, cfg.name), {});
+                }
                 if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) continue;
                 const identity = try std.json.Stringify.valueAlloc(a, .{ cfg.table, cfg.key_template }, .{});
                 const entry = try slots.getOrPut(a, identity);
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
                 try entry.value_ptr.append(a, .{ .retired = retired != 0, .index = index });
             };
-            self.resolver_namespace_lookup = .{ .arena = arena, .slots = slots };
+            self.resolver_namespace_lookup = .{ .arena = arena, .slots = slots, .names = names, .routing = routing, .reserved = reserved };
         }
+    }
+    fn resolverNamespaceSlots(self: *IndexManager, table: []const u8, template: []const u8) ![]const ResolverSlot {
+        try self.ensureResolverLookup();
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const identity = try std.json.Stringify.valueAlloc(scratch.allocator(), .{ table, template }, .{});
         return if (self.resolver_namespace_lookup.?.slots.get(identity)) |slots| slots.items else &.{};
+    }
+    pub fn resolverNamespaceAdmissionIdentities(self: *IndexManager, a: Allocator, table: []const u8, template: []const u8) ![]ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slots = try self.resolverNamespaceSlots(table, template);
+        var result: std.ArrayList(ResolverConfig) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(a);
+            result.deinit(a);
+        }
+        for (slots) |slot| {
+            if (slot.retired) continue;
+            var cfg = try self.cloneResolverAdmissionIdentity(a, self.resolvers.items[slot.index]);
+            errdefer cfg.deinit(a);
+            try result.append(a, cfg);
+        }
+        return result.toOwnedSlice(a);
     }
     pub fn resolverNamespaceObservation(self: *IndexManager, a: Allocator, table: []const u8, template: []const u8) !?resolver_catalog.ResolverObservation {
         self.catalog_mutex.lockExclusive();
@@ -13232,7 +13274,7 @@ pub const IndexManager = struct {
         };
         for (try self.resolverNamespaceSlots(table, namespace.key_template)) |slot| {
             const entry = if (slot.retired) &self.retired_resolvers.items[slot.index] else &self.resolvers.items[slot.index];
-            try self.requireResolverNotReplacing(entry.name);
+            if (self.resolver_namespace_lookup.?.reserved.contains(entry.name)) return error.IndexReplacementPending;
             if (entry.namespace_curation_table_id == table_id and entry.namespace_curation_generation == namespace.revision and entry.namespace_curation_missing == !namespace.record_store) continue;
             var next = entry.*;
             next.merges = namespace.merges;
@@ -13279,7 +13321,7 @@ pub const IndexManager = struct {
         try txn.put(try durable.key(arena.allocator(), table, namespace.key_template), try std.json.Stringify.valueAlloc(arena.allocator(), durable.Record{ .table = table, .table_id = table_id, .namespace = namespace, .bindings = bindings }, .{}));
         const epoch = if (txn.get(durable.epoch_key)) |raw| try std.fmt.parseInt(u64, raw, 10) else |err| if (err == error.NotFound) @as(u64, 0) else return err;
         try txn.put(durable.epoch_key, try std.fmt.allocPrint(arena.allocator(), "{d}", .{try std.math.add(u64, epoch, 1)}));
-        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_delta_reader_version));
+        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_pin_index_reader_version));
         try txn.put(resolver_catalog.reresolve_resume_key, "");
         try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
         if (completion) |work| {
@@ -13287,7 +13329,7 @@ pub const IndexManager = struct {
             try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
         }
         try txn.commit();
-        self.minimum_reader_version.store(resolver_catalog.resolver_projection_delta_reader_version, .release);
+        self.minimum_reader_version.store(resolver_catalog.resolver_pin_index_reader_version, .release);
         self.invalidateWritePlanSnapshot();
         published = true;
         return true;
@@ -13322,6 +13364,12 @@ pub const IndexManager = struct {
     /// Admission needs static policy and generation identities, never a copy of
     /// every destination-owned correction or its receipts.
     pub fn listResolverStaticDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        return self.listResolverDescriptors(alloc, false);
+    }
+    pub fn listResolverAdmissionDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        return self.listResolverDescriptors(alloc, true);
+    }
+    fn listResolverDescriptors(self: *IndexManager, alloc: Allocator, admission_only: bool) ![]ResolverConfig {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         const definitions = try self.resolverDefinitionsAlloc(alloc);
@@ -13336,79 +13384,308 @@ pub const IndexManager = struct {
             var cfg = definition;
             cfg.merges = &.{};
             cfg.curation_json = "{}";
-            try result.append(alloc, try ResolverConfig.clone(alloc, cfg));
+            try result.append(alloc, if (admission_only) try resolver_catalog.ResolverAdmission.cloneConfig(alloc, cfg, true) else try ResolverConfig.clone(alloc, cfg));
         }
         return result.toOwnedSlice(alloc);
     }
 
-    /// One catalog pass for a batch of replay observations. Policy, providers,
-    /// aliases and extraction config never enter a wait-loop snapshot.
     pub fn resolverObservationDescriptors(self: *IndexManager, alloc: Allocator, names: []const []const u8) ![]resolver_catalog.ResolverObservation {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        var wanted: std.StringHashMapUnmanaged(void) = .empty;
-        defer wanted.deinit(alloc);
-        for (names) |name| try wanted.put(alloc, name, {});
+        return self.resolverScalarDescriptors(alloc, names, false);
+    }
+    /// null requests all public active identities; explicit names also acknowledge
+    /// retained retired identities. An empty set requests none.
+    pub fn resolverProgressDescriptors(self: *IndexManager, alloc: Allocator, names: ?[]const []const u8) ![]resolver_catalog.ResolverObservation {
+        return self.resolverScalarDescriptors(alloc, names, true);
+    }
+    fn resolverScalarDescriptors(self: *IndexManager, alloc: Allocator, names: ?[]const []const u8, public_only: bool) ![]resolver_catalog.ResolverObservation {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
         var result: std.ArrayList(resolver_catalog.ResolverObservation) = .empty;
         errdefer {
             for (result.items) |*cfg| cfg.deinit(alloc);
             result.deinit(alloc);
         }
-        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
-            if (!wanted.contains(definition.name)) continue;
-            const owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, definition);
-            errdefer {
-                var cleanup = owned;
-                cleanup.deinit(alloc);
+        if (names) |selected| {
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(alloc);
+            for (selected) |name| {
+                if ((try seen.getOrPut(alloc, name)).found_existing) continue;
+                const slot = self.resolver_namespace_lookup.?.names.get(name) orelse continue;
+                const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+                if (public_only and cfg.replacement_index.len > 0) continue;
+                var owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, cfg);
+                errdefer owned.deinit(alloc);
+                try result.append(alloc, owned);
             }
-            try result.append(alloc, owned);
-        };
+        } else {
+            for (self.resolvers.items) |cfg| {
+                if (public_only and cfg.replacement_index.len > 0) continue;
+                var owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, cfg);
+                errdefer owned.deinit(alloc);
+                try result.append(alloc, owned);
+            }
+        }
         return result.toOwnedSlice(alloc);
     }
 
-    /// Match listResolvers' active/staged routing selection without copying
-    /// destination-owned projected policy for unrelated resolver siblings.
-    pub fn listResolverRoutingDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+    /// A final query fence reads only a scalar proof on warm immutable
+    /// catalogs. The namespace lookup owns its lifetime and is invalidated
+    /// with structural catalog publication. No grant or model state is cached.
+    pub fn resolverQueryDeclarationsFingerprint(self: *IndexManager, selected: ResolverConfig) ![32]u8 {
+        const Hash = @import("antfly_hash").Sha256;
+        var buffer: [256]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(Hash) = .init(&buffer);
+        try std.json.Stringify.value(.{ selected.name, selected.source_artifact, selected.source_artifact_kind, selected.retired, selected.replacement_index }, .{}, &writer.writer);
+        try writer.writer.flush();
+        var key: [32]u8 = undefined;
+        writer.hasher.final(&key);
         self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        const result = try alloc.alloc(ResolverConfig, self.resolvers.items.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (result[0..initialized]) |*cfg| cfg.deinit(alloc);
-            alloc.free(result);
+        if (self.resolver_namespace_lookup) |lookup| if (lookup.query_proof_generation == self.writePlanGeneration()) if (lookup.query_proofs.get(key)) |proof| {
+            self.catalog_mutex.unlockShared();
+            return proof;
+        };
+        self.catalog_mutex.unlockShared();
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const lookup = &self.resolver_namespace_lookup.?;
+        const generation = self.writePlanGeneration();
+        if (lookup.query_proof_generation != generation) {
+            lookup.query_proofs.clearRetainingCapacity();
+            lookup.query_proof_generation = generation;
         }
-        for (self.resolvers.items, result) |definition, *output| {
-            var cfg = definition;
-            cfg.merges = &.{};
-            cfg.curation_json = "{}";
-            output.* = try ResolverConfig.clone(alloc, cfg);
-            initialized += 1;
+        if (lookup.query_proofs.get(key)) |proof| return proof;
+        if (comptime @import("builtin").is_test) self.test_resolver_query_proof_builds += 1;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var hash = Hash.init(.{});
+        for (self.resolvers.items, 0..) |cfg, index| {
+            if (cfg.replacement_index.len != 0 and !std.mem.eql(u8, cfg.replacement_index, selected.replacement_index)) continue;
+            if (std.mem.eql(u8, cfg.name, selected.name) or (selected.sharesRoutingDomain(cfg) and std.mem.eql(u8, selected.source_artifact, cfg.source_artifact) and cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) {
+                if (lookup.declaration_generation == generation) if (lookup.declarations.get(index)) |owner| if (owner.prepared.load(.acquire)) {
+                    hash.update(&owner.fingerprint);
+                    continue;
+                };
+                hash.update(&try cfg.queryDefinitionFingerprint(arena.allocator()));
+            }
         }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        // Only current named scopes are retained. Stale in-flight declarations
+        // still get an exact proof, without growing a history of cache keys.
+        if (lookup.names.get(selected.name)) |slot| if (!slot.retired) {
+            const cfg = self.resolvers.items[slot.index];
+            if (cfg.retired == selected.retired and cfg.source_artifact_kind == selected.source_artifact_kind and std.mem.eql(u8, cfg.source_artifact, selected.source_artifact) and std.mem.eql(u8, cfg.replacement_index, selected.replacement_index)) try lookup.query_proofs.put(lookup.arena.allocator(), key, result);
+        };
         return result;
     }
 
-    /// Legacy point reads need only the selected definition's policy, never
-    /// copies of every sibling's projected namespace.
-    pub fn resolverIdentityAlloc(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+    /// Declaration bodies belong to one catalog generation. Active admissions
+    /// retain their own references across DDL, inference and cache eviction.
+    const QueryDeclaration = struct {
+        alloc: Allocator,
+        references: std.atomic.Value(usize) = .init(1),
+        mutex: std.atomic.Mutex = .unlocked,
+        config: ResolverConfig,
+        prepared: std.atomic.Value(bool) = .init(false),
+        fingerprint: [32]u8 = undefined,
+        profile: [64]u8 = undefined,
+        fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) == 1) {
+                const alloc = self.alloc;
+                self.config.deinit(alloc);
+                alloc.destroy(self);
+            }
+        }
+        fn prepare(self: *@This()) !void {
+            if (self.prepared.load(.acquire)) return;
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.prepared.load(.acquire)) return;
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            self.fingerprint = try self.config.queryDefinitionFingerprint(a);
+            @memcpy(&self.profile, try (@import("../resolver_static_profiles.zig").Definition{ .key_template = self.config.key_template, .aliases = self.config.aliases, .suppress_json = self.config.suppress_json }).identity(a));
+            self.prepared.store(true, .release);
+        }
+    };
+    pub const QueryAdmission = struct {
+        alloc: Allocator,
+        configs: []ResolverConfig,
+        owners: []*QueryDeclaration,
+        fingerprint: [32]u8 = undefined,
+        pub fn deinit(self: @This()) void {
+            for (self.owners) |owner| owner.release();
+            self.alloc.free(self.owners);
+            self.alloc.free(self.configs);
+        }
+        fn prepare(self: *@This()) !void {
+            var hash = @import("antfly_hash").Sha256.init(.{});
+            for (self.owners) |owner| {
+                try owner.prepare();
+                hash.update(&owner.fingerprint);
+            }
+            hash.final(&self.fingerprint);
+        }
+        pub fn profile(self: @This(), index: usize) []const u8 {
+            return &self.owners[index].profile;
+        }
+    };
+    pub fn resolverQueryAdmission(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool) !QueryAdmission {
         self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
-            if (std.mem.eql(u8, definition.name, name)) return try ResolverConfig.clone(alloc, definition);
+        const warm = self.acquireQueryAdmissionLocked(alloc, name, public_only, false) catch |err| {
+            self.catalog_mutex.unlockShared();
+            return err;
         };
-        return null;
+        self.catalog_mutex.unlockShared();
+        var result = warm orelse cold: {
+            self.catalog_mutex.lockExclusive();
+            defer self.catalog_mutex.unlockExclusive();
+            try self.ensureResolverLookup();
+            break :cold (try self.acquireQueryAdmissionLocked(alloc, name, public_only, true)).?;
+        };
+        errdefer result.deinit();
+        // Hashing happens once per declaration, outside the catalog lock.
+        try result.prepare();
+        return result;
+    }
+    fn acquireQueryAdmissionLocked(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool, create: bool) !?QueryAdmission {
+        if (self.resolver_namespace_lookup == null) return null;
+        const lookup = &self.resolver_namespace_lookup.?;
+        if (lookup.declaration_generation != self.writePlanGeneration()) {
+            if (!create) return null;
+            var old = lookup.declarations.valueIterator();
+            while (old.next()) |owner| owner.*.release();
+            lookup.declarations.clearRetainingCapacity();
+            lookup.declaration_generation = self.writePlanGeneration();
+        }
+        var configs: std.ArrayList(ResolverConfig) = .empty;
+        var owners: std.ArrayList(*QueryDeclaration) = .empty;
+        var transferred = false;
+        defer if (!transferred) {
+            for (owners.items) |owner| owner.release();
+            owners.deinit(alloc);
+            configs.deinit(alloc);
+        };
+        const slot = lookup.names.get(name);
+        if (slot != null and !slot.?.retired) {
+            const selected = self.resolvers.items[slot.?.index];
+            if (!public_only or selected.replacement_index.len == 0) {
+                const route = try std.json.Stringify.valueAlloc(alloc, .{ selected.source_artifact, selected.replacement_index }, .{});
+                defer alloc.free(route);
+                const group = lookup.routing.get(route) orelse unreachable;
+                for (group.items) |index| {
+                    var cfg = self.resolvers.items[index];
+                    if (index != slot.?.index and (!selected.sharesRoutingDomain(cfg) or !cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) continue;
+                    var owner = lookup.declarations.get(index);
+                    if (owner == null) {
+                        if (!create) return null;
+                        cfg.merges = &.{};
+                        cfg.curation_json = "{}";
+                        const entry = try self.alloc.create(QueryDeclaration);
+                        errdefer self.alloc.destroy(entry);
+                        var owned = try ResolverConfig.clone(self.alloc, cfg);
+                        errdefer owned.deinit(self.alloc);
+                        entry.* = .{ .alloc = self.alloc, .config = owned };
+                        try lookup.declarations.put(lookup.arena.allocator(), index, entry);
+                        owner = entry;
+                    }
+                    try owners.ensureUnusedCapacity(alloc, 1);
+                    try configs.append(alloc, owner.?.config);
+                    _ = owner.?.references.fetchAdd(1, .monotonic);
+                    owners.appendAssumeCapacity(owner.?);
+                }
+            }
+        }
+        const owned_configs = try configs.toOwnedSlice(alloc);
+        errdefer alloc.free(owned_configs);
+        const owned_owners = try owners.toOwnedSlice(alloc);
+        transferred = true;
+        return .{ .alloc = alloc, .configs = owned_configs, .owners = owned_owners };
     }
 
-    pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
-            if (!std.mem.eql(u8, definition.name, name)) continue;
-            var cfg = definition;
+    /// Caller-owned snapshot of one identity. Lookup is shared with namespace
+    /// routing and rebuilt only after structural catalog publication.
+    pub fn resolverDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8, static_only: bool) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        var cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        if (static_only) {
             cfg.merges = &.{};
             cfg.curation_json = "{}";
-            return try ResolverConfig.clone(alloc, cfg);
-        };
-        return null;
+        }
+        return try ResolverConfig.clone(alloc, cfg);
+    }
+    pub fn resolverIdentityAlloc(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        return self.resolverDescriptor(alloc, name, false);
+    }
+    pub fn resolverAdmissionDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8, namespace_owned: bool) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        return try resolver_catalog.ResolverAdmission.cloneConfig(alloc, cfg, namespace_owned);
+    }
+    /// Cold adoption/inspection reads only legacy curated state. Static
+    /// declarations come from the immutable profile directory independently.
+    pub fn resolverLegacyPolicyDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        var descriptor = resolver_catalog.ResolverAdmission.fromConfig(cfg, false);
+        descriptor.aliases = &.{};
+        descriptor.suppress_json = "";
+        return try ResolverConfig.clone(alloc, descriptor.config());
+    }
+    /// Indexed consumers need source clocks and suppression, not the complete
+    /// alias universe. The physical static-profile directory supplies adjacency.
+    pub fn resolverAdmissionIdentity(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        return try self.cloneResolverAdmissionIdentity(alloc, cfg);
+    }
+    fn cloneResolverAdmissionIdentity(self: *IndexManager, alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
+        var descriptor = resolver_catalog.ResolverAdmission.fromConfig(cfg, true);
+        // Namespace projection clocks advance independently of static source
+        // definitions. Cache content identity until catalog publication, never
+        // fence static adjacency on a projected resolution-generation clock.
+        const lookup = &self.resolver_namespace_lookup.?;
+        const profile = try lookup.profiles.getOrPut(lookup.arena.allocator(), cfg.name);
+        if (!profile.found_existing) {
+            errdefer _ = lookup.profiles.remove(cfg.name);
+            const definition: @import("../resolver_static_profiles.zig").Definition = .{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json };
+            profile.key_ptr.* = try lookup.arena.allocator().dupe(u8, cfg.name);
+            profile.value_ptr.* = try definition.identity(lookup.arena.allocator());
+        }
+        descriptor.admission_profile = profile.value_ptr.*;
+        descriptor.aliases = &.{};
+        descriptor.suppress_json = "";
+        return try ResolverConfig.clone(alloc, descriptor.config());
+    }
+    /// One public active execution definition, with visibility checked before
+    /// cloning any policy. Reviews must never select a retired/private stream.
+    pub fn resolverPublicDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        if (slot.retired) return null;
+        const cfg = self.resolvers.items[slot.index];
+        if (cfg.replacement_index.len > 0) return null;
+        return try ResolverConfig.clone(alloc, cfg);
+    }
+    pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        return self.resolverDescriptor(alloc, name, true);
     }
 
     /// Trusted admission rollback restores ownership as well as configuration.
@@ -50314,6 +50591,71 @@ test "capi resolver reservation removal preserves independently raised native ep
     defer read.abort();
     try std.testing.expectEqual(required, try resolver_catalog.readMinimumReaderVersion(&read, required));
     try std.testing.expectEqual(required, try resolver_catalog.catalogReaderVersion(a, try read.get(resolver_catalog_key)));
+}
+
+test "resolver curation query admission retains large immutable declarations across generation changes" {
+    const a = std.testing.allocator;
+    var inputs = std.heap.ArenaAllocator.init(a);
+    defer inputs.deinit();
+    const aliases = try inputs.allocator().alloc(@import("antfly_resolver").KeyAlias, 100000);
+    for (aliases, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(inputs.allocator(), "entity/alias-{d}", .{i}), .target = "entity/root" };
+    var manager: IndexManager = undefined;
+    manager.alloc = a;
+    manager.catalog_mutex = .{};
+    manager.resolvers = .empty;
+    defer manager.resolvers.deinit(a);
+    manager.retired_resolvers = .empty;
+    manager.resolver_namespace_lookup = null;
+    manager.test_resolver_lookup_builds = 0;
+    manager.test_resolver_query_proof_builds = 0;
+    manager.write_plan_generation = .init(1);
+    defer manager.invalidateResolverNamespaceLookup();
+    try manager.resolvers.append(a, .{ .name = "selected", .table = "entities", .key_template = "entity/{{_entity.text}}", .source_artifact = "kg", .resolution_artifact = "out", .aliases = aliases });
+    const captured = try manager.resolverQueryAdmission(a, "selected", true);
+    defer captured.deinit();
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const admission = try manager.resolverQueryAdmission(scratch.allocator(), "selected", true);
+        defer admission.deinit();
+        try std.testing.expectEqual(captured.configs[0].aliases.ptr, admission.configs[0].aliases.ptr);
+        try std.testing.expectEqualSlices(u8, &captured.fingerprint, &admission.fingerprint);
+        try std.testing.expectEqualStrings(captured.profile(0), admission.profile(0));
+        try std.testing.expect(scratch.queryCapacity() < 4096);
+    }
+    // Retiring the owner must leave in-flight snapshots valid, while the next
+    // admission and final declaration fence observe the replacement.
+    manager.resolvers.items[0].aliases = &.{.{ .key = "entity/alias-0", .target = "entity/new-root" }};
+    manager.invalidateWritePlanSnapshot();
+    manager.invalidateResolverNamespaceLookup();
+    const changed = try manager.resolverQueryAdmission(a, "selected", true);
+    defer changed.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &captured.fingerprint, &changed.fingerprint));
+    try std.testing.expectEqualStrings("entity/root", captured.configs[0].aliases[0].target);
+    try std.testing.expectEqualStrings("entity/new-root", changed.configs[0].aliases[0].target);
+    try std.testing.expectEqualSlices(u8, &changed.fingerprint, &try manager.resolverQueryDeclarationsFingerprint(changed.configs[0]));
+    std.debug.print("LEASED ADMISSION aliases=100000 warm_requests=10 arena_bytes_per_request<4096 copied_aliases=0\n", .{});
+}
+
+test "resolver curation query admission unwinds allocation failures" {
+    const Scenario = struct {
+        fn run(a: Allocator) !void {
+            var manager: IndexManager = undefined;
+            manager.alloc = a;
+            manager.catalog_mutex = .{};
+            manager.resolvers = .empty;
+            defer manager.resolvers.deinit(a);
+            manager.retired_resolvers = .empty;
+            manager.resolver_namespace_lookup = null;
+            manager.test_resolver_lookup_builds = 0;
+            manager.write_plan_generation = .init(1);
+            defer manager.invalidateResolverNamespaceLookup();
+            try manager.resolvers.append(a, .{ .name = "selected", .table = "entities", .key_template = "entity/{{_entity.text}}", .source_artifact = "kg", .resolution_artifact = "out", .aliases = &.{.{ .key = "a", .target = "b" }} });
+            const admission = try manager.resolverQueryAdmission(a, "selected", true);
+            defer admission.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
 
 test "logical query dynamic template projection upgrades only exact affected witnesses" {

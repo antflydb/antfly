@@ -722,6 +722,9 @@ pub const RaftApplyStore = struct {
         defer alloc.free(bytes);
         return self.projectionWithAllocator(bool, alloc, .{ .kind = .resolver_projection_valid, .group_id = group_id, .key = .fromSlice(bytes) });
     }
+    pub fn pendingResolverNamespaceWork(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, standalone: bool) !?@import("../metadata/resolver_authority.zig").ReplayWork {
+        return self.projectionWithAllocator(?@import("../metadata/resolver_authority.zig").ReplayWork, alloc, .{ .kind = .resolver_namespace_work, .group_id = group_id, .arg0 = 3, .arg1 = @intFromBool(standalone) });
+    }
     pub fn pendingResolverNamespaceTable(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?metadata.TableRecord {
         return self.projectionWithAllocator(?metadata.TableRecord, alloc, .{ .kind = .resolver_namespace_work, .group_id = group_id });
     }
