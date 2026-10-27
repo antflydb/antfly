@@ -10171,7 +10171,26 @@ test "capi native memory temporal dependencies preserve history and reconciliati
         const inspected = try std.json.parseFromSliceLeaky(memory.types.Inspection, alloc, try nativeMemoryTestCall(id, alloc, "alice", .inspect, .{}, "", ""), .{});
         try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), inspected.state.config.retention_ms);
         if (maintain) {
-            for (0..24) |step| _ = try nativeMemoryTestCall(id, alloc, "alice", .advance, .{}, try std.fmt.allocPrint(alloc, "maintenance-{d}", .{step}), "");
+            // Exercise actual maintenance, then stop at the durable scheduler's
+            // idle boundary rather than committing 24 mostly empty receipts.
+            // Keep the bound: unfinished work must fail instead of being hidden
+            // by the historical reads below.
+            for (0..24) |step| {
+                _ = try nativeMemoryTestCall(id, alloc, "alice", .advance, .{}, try std.fmt.allocPrint(alloc, "maintenance-{d}", .{step}), "");
+                const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+                defer guard.leave();
+                try std.testing.expect(guard.entry_error == null);
+                const owner = guard.handle.parent_handle orelse guard.handle;
+                const now: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+                var adapter: @import("../memory/engine.zig").Native(db_mod.DB) = .{
+                    .db = try @import("tables.zig").get(owner, "memory_personal"),
+                    .context = .{ .space = "personal", .principal = "alice", .admin = true, .now_ms = now },
+                };
+                const backend = adapter.backend();
+                const control = (try backend.get(backend.ptr, alloc, "control")) orelse return error.TestUnexpectedResult;
+                const state = try std.json.parseFromSliceLeaky(memory.types.State, alloc, control.json, .{});
+                if (try @import("../memory/scheduling.zig").maintenanceKind(backend, alloc, now, state) == .idle) break;
+            } else return error.TestUnexpectedResult;
             antfly_db_close(id);
             id = null;
             try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
