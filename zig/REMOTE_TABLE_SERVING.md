@@ -1751,14 +1751,16 @@ row ordinal and a domain-separated SHA-256 witness of the complete logical tuple
 key. The witness hashes the logical key length and both prefix/suffix pieces;
 it is independent of page compression. A covering gather verifies its requested
 source, snapshot, identity version and physical coordinate before using this map.
-The cover's identity stripe must match the same witness. Full-key equality is
+The cover's identity stripe must match both the requested physical coordinate
+and the same witness. Full-key equality is
 replaced by an authenticated hash equality proof, never omitted. Old publications
 can use their complete-key path until a new publication builds the compact map.
 
 A cover batch stores two objects: a small authenticated directory and one pack.
 The directory commits contiguous, nonoverlapping ranges and a SHA-256 digest for
 an identity stripe and every typed value column. The identity stripe stores
-fixed-size key witnesses rather than complete tuple strings. Value stripes keep
+physical coordinates and fixed-size key witnesses rather than complete tuple
+strings. Value stripes keep
 native SQL types, SQL-null flags, numeric payloads and row ordinals. Every loaded
 stripe must agree with the directory's row count and identity ordinals. Packs
 and directories share the publication domain and are retained as dependencies.

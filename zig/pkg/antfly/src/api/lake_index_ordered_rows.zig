@@ -1376,7 +1376,7 @@ pub const Reader = struct {
         }
         return result;
     }
-    pub const CoverEntry = struct { cover: Cover, witness: [32]u8 };
+    pub const CoverEntry = struct { cover: Cover, physical: [16]u8, witness: [32]u8 };
     /// Fixed physical keys return one compact identity witness and cover locator.
     /// Old publications retain their full-key proof until a new map is built.
     pub fn coversAtPhysical(self: *Reader, a: A, refs: []const rows.RowRef) ![]?CoverEntry {
@@ -1403,7 +1403,7 @@ pub const Reader = struct {
             const found = try tree.lookupMany(sa, self.pages.store(), root, keys);
             for (found, coords, result) |entry, physical, *out| if (entry) |record| {
                 if (record.value.len != 102 or !std.mem.eql(u8, record.key, &physical) or !std.mem.eql(u8, record.value[0..16], &physical)) return error.InvalidNativeLakeRowIndex;
-                out.* = .{ .cover = (try coverReference(a, self.root.domain, record.value[0..70])).?, .witness = record.value[70..102].* };
+                out.* = .{ .cover = (try coverReference(a, self.root.domain, record.value[0..70])).?, .physical = physical, .witness = record.value[70..102].* };
             };
         } else {
             var scratch = std.heap.ArenaAllocator.init(a);
@@ -1411,7 +1411,7 @@ pub const Reader = struct {
             const found = try self.entriesAtPhysical(scratch.allocator(), refs);
             for (found, result) |entry, *out| if (entry) |record| if (record.cover) |cover| {
                 const id = try a.dupe(u8, cover.block.artifact_id);
-                out.* = .{ .cover = .{ .block = .{ .artifact_id = id, .checksum = id[7..71], .byte_len = cover.block.byte_len }, .row = cover.row, .striped = cover.striped }, .witness = cover_columns.witness(self.root.domain, record.key) };
+                out.* = .{ .cover = .{ .block = .{ .artifact_id = id, .checksum = id[7..71], .byte_len = cover.block.byte_len }, .row = cover.row, .striped = cover.striped }, .physical = record.key[record.key.len - 16 ..][0..16].*, .witness = cover_columns.witness(self.root.domain, record.key) };
             };
         }
         return result;
@@ -2793,6 +2793,7 @@ test "external lake bounded window profiles compact cover map avoids wide tuple 
     }
     for (covered, keys) |entry, key| {
         try std.testing.expect(entry != null and entry.?.cover.striped);
+        try std.testing.expectEqualSlices(u8, key[key.len - 16 ..], &entry.?.physical);
         try std.testing.expectEqualSlices(u8, &cover_columns.witness(root.domain, &key), &entry.?.witness);
     }
     try std.testing.expect(budget.peak <= budget.limit);
@@ -2813,6 +2814,6 @@ test "external lake bounded window profiles compact cover map avoids wide tuple 
     var reads: u64 = 4 * 1024 * 1024;
     var loaded = try cover_columns.load(a, store, covered[0].?.cover.block, true, &.{0}, 1, .none, null, 256 * 1024, &reads, null);
     defer loaded.deinit();
-    try loaded.verify(root.domain, covered[0].?.cover.row, covered[0].?.witness);
+    try loaded.verify(root.domain, covered[0].?.cover.row, covered[0].?.physical, covered[0].?.witness);
     try std.testing.expectEqual(@as(i64, 0), (try loaded.block.cell(covered[0].?.cover.row, 0)).value.integer);
 }

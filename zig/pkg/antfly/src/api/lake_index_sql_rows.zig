@@ -369,13 +369,13 @@ const Owner = struct {
             }
             self.cover_columns_lease = try cover_columns.load(a, self.artifacts, cover.block, cover.striped, projected_columns.items, self.reader.root.cover.len, self.reader.pages.cancellation, self.reader.cached, 64 * 1024 * 1024, &self.reader.remaining_reads, null);
             const block = self.cover_columns_lease.?.block;
-            if (block.values.len != self.reader.root.cover.len or block.keys.len != 1) return error.InvalidNativeLakeRowIndex;
+            if (block.values.len != self.reader.root.cover.len) return error.InvalidNativeLakeRowIndex;
             const covered = try a.alloc(@typeInfo(@TypeOf(self.covered_blocks)).pointer.child, self.covered_entries.len);
             for (self.covered_entries, covered) |entry, *position| {
                 const candidate = entry.cover.?;
                 if (candidate.block.byte_len != cover.block.byte_len or candidate.row >= block.count()) return error.InvalidNativeLakeRowIndex;
                 if (candidate.striped != cover.striped) return error.InvalidNativeLakeRowIndex;
-                try self.cover_columns_lease.?.verify(self.reader.root.domain, candidate.row, cover_columns.witness(self.reader.root.domain, entry.key));
+                try self.cover_columns_lease.?.verify(self.reader.root.domain, candidate.row, entry.key[entry.key.len - 16 ..][0..16].*, cover_columns.witness(self.reader.root.domain, entry.key));
                 position.* = .{ .block = block, .row = candidate.row };
             }
             self.covered_blocks = covered;
@@ -949,8 +949,8 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
                     try owner.read_context.ensureActive();
                     _ = row_arena.reset(.retain_capacity);
                     const row = item.entry.cover.row;
-                    if (block.keys.len != 1 or row >= block.count()) return error.InvalidNativeLakeRowIndex;
-                    try loaded.verify(root.domain, row, item.entry.witness);
+                    if (row >= block.count()) return error.InvalidNativeLakeRowIndex;
+                    try loaded.verify(root.domain, row, item.entry.physical, item.entry.witness);
                     result[item.position] = try coveringSource(out, row_arena.allocator(), table, root, block, row, refs_[item.position], fields);
                 }
             }

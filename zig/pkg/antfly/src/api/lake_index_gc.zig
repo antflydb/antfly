@@ -962,7 +962,7 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     var cover_reads: u64 = 4 * 1024 * 1024;
     var loaded = try @import("lake_index_cover_columns.zig").load(a, store, cover.block, cover.striped, &.{0}, 1, .none, null, 16 * 1024 * 1024, &cover_reads, null);
     defer loaded.deinit();
-    try loaded.verify(row_reader.root.domain, cover.row, @import("lake_index_cover_columns.zig").witness(row_reader.root.domain, entries[0].key));
+    try loaded.verify(row_reader.root.domain, cover.row, entries[0].key[entries[0].key.len - 16 ..][0..16].*, @import("lake_index_cover_columns.zig").witness(row_reader.root.domain, entries[0].key));
     try std.testing.expectEqual(@as(i64, 9007199254740993), (try loaded.block.cell(cover.row, 0)).value.integer);
     const foreign_bytes = try store.getAlloc(foreign.artifact_id);
     defer a.free(foreign_bytes);

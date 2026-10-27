@@ -82,13 +82,15 @@ fn publishScratch(a: A, store: stores.ArtifactStore, scope: stores.UploadScope, 
     if (rows.len == 0 or rows.len > 256 or rows[0].values.len == 0 or rows[0].values.len > 1024) return error.InvalidNativeLakeRowIndex;
     const width = rows[0].values.len;
     const hashes = try a.alloc([32]u8, rows.len);
-    const keys = try a.alloc([1]local.sql_scalar.Datum, rows.len);
+    const keys = try a.alloc([2]local.sql_scalar.Datum, rows.len);
     const values = try a.alloc([1]local.sql_scalar.Datum, rows.len);
     const batch = try a.alloc(local.sql_operators.Row, rows.len);
     for (rows, hashes, keys, batch) |row, *hash, *key, *out| {
-        if (row.values.len != width or row.keys.len != 1 or row.keys[0].sql_null or row.keys[0].value != .string) return error.InvalidNativeLakeRowIndex;
+        if (row.values.len != width or row.keys.len != 1 or row.keys[0].sql_null or row.keys[0].value != .string or row.keys[0].value.string.len < 16) return error.InvalidNativeLakeRowIndex;
         hash.* = witness(scope.domain, row.keys[0].value.string);
         key[0] = local.sql_scalar.Datum.fromJson(.{ .string = hash });
+        const tuple = row.keys[0].value.string;
+        key[1] = local.sql_scalar.Datum.fromJson(.{ .string = tuple[tuple.len - 16 ..] });
         out.* = .{ .keys = key, .values = &.{}, .ordinal = row.ordinal };
     }
     var pack: std.ArrayList(u8) = .empty;
@@ -159,14 +161,20 @@ pub const Loaded = struct {
         if (self.budget) |budget| self.backing.?.destroy(budget);
         self.* = undefined;
     }
-    pub fn verify(self: Loaded, domain: [32]u8, row: usize, expected: [32]u8) !void {
-        if (self.block.keys.len != 1 or row >= self.block.count()) return error.InvalidNativeLakeRowIndex;
+    pub fn verify(self: Loaded, domain: [32]u8, row: usize, physical: [16]u8, expected: [32]u8) !void {
+        if (self.block.keys.len != @as(usize, if (self.hashed) 2 else 1) or row >= self.block.count()) return error.InvalidNativeLakeRowIndex;
         const key = try self.block.keyCell(row, 0);
         if (key.sql_null or key.value != .string) return error.InvalidNativeLakeRowIndex;
         const actual = if (self.hashed) blk: {
             if (key.value.string.len != 32) return error.InvalidNativeLakeRowIndex;
+            const coordinate = try self.block.keyCell(row, 1);
+            if (coordinate.sql_null or coordinate.value != .string or !std.mem.eql(u8, coordinate.value.string, &physical)) return error.InvalidNativeLakeRowIndex;
             break :blk key.value.string[0..32].*;
-        } else witness(domain, key.value.string);
+        } else blk: {
+            const tuple = key.value.string;
+            if (tuple.len < 16 or !std.mem.eql(u8, tuple[tuple.len - 16 ..], &physical)) return error.InvalidNativeLakeRowIndex;
+            break :blk witness(domain, tuple);
+        };
         if (!std.mem.eql(u8, &actual, &expected)) return error.InvalidNativeLakeRowIndex;
     }
 };
@@ -265,7 +273,7 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
         } else try Loader.decode(a, store, reference, token, null, section);
         if (block.count() != directory.rows) return error.InvalidNativeLakeRowIndex;
         if (index == 0) {
-            if (block.values.len != 0 or block.keys.len != 1) return error.InvalidNativeLakeRowIndex;
+            if (block.values.len != 0 or block.keys.len != 2) return error.InvalidNativeLakeRowIndex;
             ordinals = block.ordinals;
             identity_keys = block.keys;
         } else {
@@ -296,7 +304,7 @@ test "external lake bounded window profiles covering stripes prune wide columns 
     var keys: [count][1]local.sql_scalar.Datum = undefined;
     var values: [count][3]local.sql_scalar.Datum = undefined;
     for (&rows, &keys, &values, 0..) |*row, *key, *value, i| {
-        const id = try std.fmt.allocPrint(ia, "row-{d}", .{i});
+        const id = try std.fmt.allocPrint(ia, "row-with-physical-{d:0>16}", .{i});
         key[0] = local.sql_scalar.Datum.fromJson(.{ .string = id });
         value.* = .{ local.sql_scalar.Datum.fromJson(.{ .integer = @intCast(i) }), local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 }), local.sql_scalar.Datum.fromJson(.{ .string = try std.fmt.allocPrint(ia, "{s}{d}", .{ payload, i }) }) };
         row.* = .{ .keys = key, .values = value, .ordinal = i };
@@ -314,11 +322,12 @@ test "external lake bounded window profiles covering stripes prune wide columns 
                 try std.testing.expectEqual(@as(i64, @intCast(i)), (try loaded.block.cell(i, 0)).value.integer);
                 try std.testing.expectEqual(@as(i64, 9007199254740993), (try loaded.block.cell(i, 1)).value.integer);
                 try std.testing.expect((try loaded.block.cell(i, 2)).sql_null);
-                var key: [32]u8 = undefined;
-                const id = try std.fmt.bufPrint(&key, "row-{d}", .{i});
-                try loaded.verify(@splat(7), i, witness(@splat(7), id));
+                var key: [64]u8 = undefined;
+                const id = try std.fmt.bufPrint(&key, "row-with-physical-{d:0>16}", .{i});
+                try loaded.verify(@splat(7), i, id[id.len - 16 ..][0..16].*, witness(@splat(7), id));
+                try std.testing.expectError(error.InvalidNativeLakeRowIndex, loaded.verify(@splat(7), i, @splat(0), witness(@splat(7), id)));
+                try std.testing.expectError(error.InvalidNativeLakeRowIndex, loaded.verify(@splat(7), i, id[id.len - 16 ..][0..16].*, @splat(0)));
             }
-            try std.testing.expectError(error.InvalidNativeLakeRowIndex, loaded.verify(@splat(7), 0, @splat(0)));
         }
     };
     try Load.run(a, store, ref);
