@@ -187,7 +187,7 @@ def main():
                     "lighton_attention_chunks128"
                     if args.chunk128
                     else "lighton_attention_chunks",
-                    (h, b * chunks),
+                    (kh, b * chunks),
                     p,
                 )
                 launch(d, "lighton_attention_combine", (b * h, 1), p)
@@ -225,7 +225,7 @@ def main():
                     "lighton_attention_chunks128"
                     if args.chunk128
                     else "lighton_attention_chunks",
-                    (h, b * chunks),
+                    (kh, b * chunks),
                     p,
                 )
                 launch(d, "lighton_attention_combine", (b * h, 1), p)

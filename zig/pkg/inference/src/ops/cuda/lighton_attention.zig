@@ -81,7 +81,7 @@ pub const Module = struct {
     }
     pub fn run(self: *Module, ctx: *context.CudaContext, params: *Params, chunk128: bool) !void {
         var args = [_]?*anyopaque{@ptrCast(params)};
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[if (chunk128) 3 else 0], params.heads, params.items * params.chunks, 1, 128, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[if (chunk128) 3 else 0], params.kv_heads, params.items * params.chunks, 1, 128, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[1], params.items * params.heads, 1, 1, 128, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();

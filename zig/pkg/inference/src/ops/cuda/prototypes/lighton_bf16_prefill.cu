@@ -52,6 +52,8 @@ static_assert(sizeof(Ragged) == 2408, "native packet ABI");
 struct Claim {
   Ragged p;
   int count = 0, rows = 0, indices[16]{}, offsets[17]{};
+  uintptr_t state_view = 0;
+  int64_t state_pointers[16]{};
 };
 static bool claim(const Ragged *p, Claim &c) {
   if (!p || p->base.items < 1 || p->base.items > 64 ||
@@ -74,12 +76,26 @@ static bool claim(const Ragged *p, Claim &c) {
     }
   }
   c.offsets[c.count] = c.rows;
+  if (c.count) {
+    // Every table entry names an independently owned native K,V state. The
+    // one-page DLTensor supplies only the common layout; the CuTe kernel uses
+    // the selected page pointer directly, never an offset across allocations.
+    for (int i = 0; i < c.count; ++i) {
+      uintptr_t state =
+          reinterpret_cast<uintptr_t>(p->base.pages[c.indices[i]].state);
+      if (!state || (state & 255))
+        return false;
+      c.state_pointers[i] = static_cast<int64_t>(state);
+    }
+    c.state_view = static_cast<uintptr_t>(c.state_pointers[0]);
+  }
   return p->base.conv && p->base.out && p->base.core;
 }
 static size_t aligned(size_t n) { return (n + 255) & ~size_t(255); }
 struct Scratch {
   __nv_bfloat16 *q, *k, *v, *o;
-  float *alpha, *beta, *initial, *state;
+  float *alpha, *beta;
+  int64_t *slots;
   int64_t *cu;
   uint8_t *tm;
   size_t size;
@@ -97,8 +113,7 @@ struct Scratch {
     o = static_cast<__nv_bfloat16 *>(take(size_t(rows) * h * 128 * 2));
     alpha = static_cast<float *>(take(size_t(rows) * h * 4));
     beta = static_cast<float *>(take(size_t(rows) * h * 4));
-    initial = static_cast<float *>(take(size_t(b) * h * 128 * 128 * 4));
-    state = static_cast<float *>(take(size_t(b) * h * 128 * 128 * 4));
+    slots = static_cast<int64_t *>(take(size_t(b) * 8));
     cu = static_cast<int64_t *>(take(size_t(b + 1) * 8));
     tm = static_cast<uint8_t *>(take(256 * 128));
     size = offset;
@@ -170,43 +185,16 @@ __global__ void conv_pack(const __grid_constant__ Claim c, Scratch s) {
     s.beta[row * h + head] =
         1.f / (1.f + expf(-c.p.base.beta[source * h + head]));
   }
-  if (row == 0 && head == 0 && d <= c.count)
-    s.cu[d] = c.offsets[d];
-}
-__global__ void gather_state(const __grid_constant__ Claim c, Scratch s) {
-  __shared__ float tile[32][33];
-  int h = c.p.base.value_heads, seq = blockIdx.z / h, head = blockIdx.z % h,
-      page = c.indices[seq];
-  int tx = threadIdx.x, ty = threadIdx.y, k0 = blockIdx.x * 32,
-      v0 = blockIdx.y * 32;
-#pragma unroll
-  for (int j = 0; j < 32; j += 8)
-    tile[ty + j][tx] =
-        c.p.initialized[page]
-            ? c.p.base.pages[page]
-                  .state[(head * 128 + k0 + ty + j) * 128 + v0 + tx]
-            : 0.f;
-  __syncthreads();
-#pragma unroll
-  for (int j = 0; j < 32; j += 8)
-    s.initial[((seq * h + head) * 128 + v0 + ty + j) * 128 + k0 + tx] =
-        tile[tx][ty + j];
-}
-__global__ void scatter_state(const __grid_constant__ Claim c, Scratch s) {
-  __shared__ float tile[32][33];
-  int h = c.p.base.value_heads, seq = blockIdx.z / h, head = blockIdx.z % h,
-      page = c.indices[seq];
-  int tx = threadIdx.x, ty = threadIdx.y, k0 = blockIdx.x * 32,
-      v0 = blockIdx.y * 32;
-#pragma unroll
-  for (int j = 0; j < 32; j += 8)
-    tile[ty + j][tx] =
-        s.state[((seq * h + head) * 128 + v0 + ty + j) * 128 + k0 + tx];
-  __syncthreads();
-#pragma unroll
-  for (int j = 0; j < 32; j += 8)
-    c.p.base.pages[page].state[(head * 128 + k0 + ty + j) * 128 + v0 + tx] =
-        tile[tx][ty + j];
+  if (t == 0 && head < h && !init) {
+    for (int i = d; i < 128 * 128; i += 128)
+      c.p.base.pages[page].state[head * 128 * 128 + i] = 0.f;
+  }
+  if (row == 0 && head == 0) {
+    if (d <= c.count)
+      s.cu[d] = c.offsets[d];
+    if (d < c.count)
+      s.slots[d] = c.state_pointers[d];
+  }
 }
 __global__ void scatter_output(const __grid_constant__ Claim c, Scratch s) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -266,10 +254,11 @@ static int prefill_run(const Ragged *p, void *scratch, size_t bytes, int device,
       o(s.o, {d, rows, h}, {1, h * d, d}, kDLBfloat, 16, device);
   Tensor alpha(s.alpha, {rows * h}, {1}, kDLFloat, 32, device),
       beta(s.beta, {rows * h}, {1}, kDLFloat, 32, device),
-      state(s.state, {b, h, d, d}, {h * d * d, d * d, d, 1}, kDLFloat, 32,
-            device),
-      initial(s.initial, {b, h, d, d}, {h * d * d, d * d, d, 1}, kDLFloat, 32,
-              device),
+      state(reinterpret_cast<void *>(c.state_view), {1, h, d, d},
+            {h * d * d, d * d, 1, d}, kDLFloat, 32, device),
+      initial(reinterpret_cast<void *>(c.state_view), {1, h, d, d},
+              {h * d * d, d * d, 1, d}, kDLFloat, 32, device),
+      slots(s.slots, {b}, {1}, kDLInt, 64, device),
       tm(s.tm, {256 * 128}, {1}, kDLUInt, 8, device),
       cu(s.cu, {b + 1}, {1}, kDLInt, 64, device);
   auto tensor = [&](int i, Tensor &t) {
@@ -288,6 +277,7 @@ static int prefill_run(const Ragged *p, void *scratch, size_t bytes, int device,
   tensor(5, beta);
   tensor(6, state);
   tensor(7, initial);
+  tensor(8, slots);
   tensor(11, tm);
   tensor(12, cu);
   args[13].type_index = kTVMFFIFloat;
@@ -306,14 +296,12 @@ static int prefill_run(const Ragged *p, void *scratch, size_t bytes, int device,
   if (TVMFFIEnvSetStream(kDLCUDA, device, stream, &previous))
     return 5;
   conv_pack<<<dim3(32 + h, rows), 128, 0, stream>>>(c, s);
-  gather_state<<<dim3(4, 4, b * h), dim3(32, 8), 0, stream>>>(c, s);
   int rc = static_cast<int>(cudaGetLastError());
   if (!rc)
     rc = __tvm_ffi_antfly_lighton_prefill(nullptr, args, 23, &result);
   int restore = TVMFFIEnvSetStream(kDLCUDA, device, previous, nullptr);
   if (rc || restore)
     return 6;
-  scatter_state<<<dim3(4, 4, b * h), dim3(32, 8), 0, stream>>>(c, s);
   scatter_output<<<(rows * h * d + 255) / 256, 256, 0, stream>>>(c, s);
   return cudaGetLastError() == cudaSuccess ? 0 : 7;
 }

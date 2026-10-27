@@ -190,7 +190,9 @@ python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 \
 ```
 
 Python is needed for building and qualification; serving loads the native shared
-library. Its extra workspace has an independent memory reservation and does not
+library. The build manifest records the pinned source, the native page-pointer
+layout patch and generated artifacts. The kernel updates each owned F32 state
+directly. Its extra workspace has an independent memory reservation and does not
 increase operator limits. These modes remain experimental. CUDA LightOn
 throughput is below the installed vLLM reference; the Florence canonical GEMM
 option remains opt-in while an older rare output mismatch is investigated.

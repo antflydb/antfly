@@ -23,6 +23,8 @@ runtime loads the resulting shared library and supplies all device scratch.
 import argparse
 import hashlib
 import importlib.metadata
+import importlib.util
+import sys
 import json
 import subprocess
 from pathlib import Path
@@ -57,6 +59,39 @@ def main():
         )
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
+    # Interpret the index tensor as a table of native per-page pointers.
+    # The F32 arithmetic and K,V layout remain unchanged; all slot addressing
+    # uses pointers validated by the native caller before state mutation.
+    patched_source = out / "delta_rule_sm120_pointers.py"
+    original = Path(sm.__file__).read_text()
+    replacements = {
+        "state_idx = cutlass.Int32(g_state_indices[work_desc.seq_idx])": "state_idx = cutlass.Int32(0)",
+        "        mState = cute.make_tensor(g_state.iterator, state_layout)": """        state_iterator = g_state.iterator
+        if cutlass.const_expr(self.use_state_indices):
+            state_iterator = cute.make_ptr(
+                cutlass.Float32, cutlass.Int64(g_state_indices[work_desc.seq_idx]),
+                cute.AddressSpace.gmem, assumed_align=16)
+        mState = cute.make_tensor(state_iterator, state_layout)""",
+        "            mInitState = cute.make_tensor(g_init_state.iterator, init_state_layout)": """            initial_iterator = g_init_state.iterator
+            if cutlass.const_expr(self.use_state_indices):
+                initial_iterator = state_iterator
+            mInitState = cute.make_tensor(initial_iterator, init_state_layout)""",
+    }
+    patched = original
+    for old, new in replacements.items():
+        if patched.count(old) != 1:
+            raise RuntimeError("Pinned state-pointer patch no longer applies: " + old)
+        patched = patched.replace(old, new)
+    patched_source.write_text(patched)
+    name = (
+        "flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_sm120_antfly_"
+        + digest(patched_source)[:16]
+    )
+    spec = importlib.util.spec_from_file_location(name, patched_source)
+    native = importlib.util.module_from_spec(spec)
+    sys.modules[name] = native
+    spec.loader.exec_module(native)
+    sm = native
     obj = out / "lighton_prefill.o"
     compile_original = sm.cached_compile
     exports = []
@@ -81,12 +116,32 @@ def main():
             v = (torch.randn(rows, heads, 128, device="cuda") * 0.1).bfloat16()
             alpha = torch.exp(-torch.rand(rows, heads, device="cuda") * 0.1)
             beta = torch.sigmoid(torch.randn(rows, heads, device="cuda"))
-            initial = torch.randn(2, heads, 128, 128, device="cuda") * 0.01
             output = torch.empty_like(v)
-            state = torch.empty_like(initial)
+            # Native state has K,V storage, viewed as V,K by the CuTe core.
+            # Initial and final F32 state alias; selected page pointers carry
+            # sequence ownership rather than an artificial contiguous pool.
+            state = (torch.randn(2, heads, 128, 128, device="cuda") * 0.01).transpose(
+                -1, -2
+            )
+            initial = state
+            indices = torch.tensor(
+                [state[i].data_ptr() for i in range(2)],
+                dtype=torch.int64,
+                device="cuda",
+            )
             cu = torch.tensor([0, 64, rows], dtype=torch.int64, device="cuda")
             sm.delta_rule_prefill_dsl(
-                output, state, q, k, v, initial, alpha, beta, cu, 1.0
+                output,
+                state,
+                q,
+                k,
+                v,
+                initial,
+                alpha,
+                beta,
+                cu,
+                1.0,
+                state_indices=indices,
             )
             torch.cuda.synchronize()
             if not torch.isfinite(output).all() or not torch.isfinite(state).all():
@@ -127,6 +182,8 @@ def main():
         "packet_bytes": 2408,
         "architecture": "sm_121",
         "flashinfer_source_sha256": SOURCE_SHA256,
+        "patched_flashinfer_source_sha256": digest(patched_source),
+        "state_index_patch": "Native page-pointer table, in-place F32 state; state arithmetic unchanged",
         "shim_sha256": digest(args.source),
         "object_sha256": digest(obj),
         "library_sha256": digest(library),
