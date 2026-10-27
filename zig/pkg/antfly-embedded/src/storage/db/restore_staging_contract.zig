@@ -612,6 +612,11 @@ pub const Progress = struct {
             std.mem.writeInt(u64, &pages, cursor.pages, .little);
             hash.update(&pages);
             hash.update(&.{@intFromBool(cursor.sealed)});
+            if (cursor.source_rows) |source_rows| {
+                var total: [8]u8 = undefined;
+                std.mem.writeInt(u64, &total, source_rows, .little);
+                hash.update(&total);
+            }
         }
         if (self.rewrite) |rewrite| {
             var sequence: [8]u8 = undefined;

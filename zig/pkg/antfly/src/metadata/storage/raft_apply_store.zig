@@ -13929,11 +13929,11 @@ test "relational integrity metadata topology admission persists rollout floor an
     try std.testing.expect(try admitSchemaAndTopologyStoreTxn(&txn, group_id, legacy));
     try txn.commit();
     open = false;
-    try std.testing.expectEqual(capable.relational_topology_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group_id));
+    try std.testing.expectEqual(metadata_table_manager.coordinated_integrity_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group_id));
     store.active_outcome = null;
     store.deinit();
     store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
-    try std.testing.expectEqual(capable.relational_topology_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group_id));
+    try std.testing.expectEqual(metadata_table_manager.coordinated_integrity_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group_id));
     try @import("../relational_topology_admission.zig").requireStores(&.{capable});
 }
 
@@ -32803,6 +32803,10 @@ pub const RaftApplyStore = struct {
                 for (parent.ranges) |range| if (try stagingGet(txn, try restore_staging.identityKey(&key_buf, group_id, .parent_group, range.group_id)) != null) return;
             }
             if (!try self.restoreIncomingDependenciesClosedTxn(txn, group_id, plan)) return;
+            const query_population = for (plan.targets) |target| {
+                if (target.population != null) break true;
+            } else false;
+            if (query_population and !try self.activateDataTopologyFloorTxn(txn, group_id, metadata_table_manager.query_population_protocol_version)) return;
             const initial_state: restore_staging.State = if (plan.preparing_sources) .preparing_sources else .importing;
             const job: restore_staging.Job = .{ .plan = plan, .plan_digest = try plan.digest(self.alloc), .state = initial_state };
             const value = try std.json.Stringify.valueAlloc(self.alloc, job, .{});
@@ -36656,6 +36660,10 @@ pub const RaftApplyStore = struct {
     }
 
     fn relationalTopologyStoresCapableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64) !bool {
+        return self.relationalTopologyStoresAtLeastTxn(txn, group_id, metadata_table_manager.coordinated_integrity_protocol_version);
+    }
+
+    fn relationalTopologyStoresAtLeastTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, required: u16) !bool {
         var prefix_buf: [128]u8 = undefined;
         const prefix = try storePrefixForGroup(&prefix_buf, group_id);
         var cursor = try txn.openCursor();
@@ -36673,14 +36681,17 @@ pub const RaftApplyStore = struct {
             defer metadata_table_manager.freeStore(self.alloc, record);
             if (!metadata_table_manager.storeServesTableData(record.role)) continue;
             found = true;
-            if (record.reporter_incarnation == 0 or record.relational_topology_protocol_version != metadata_table_manager.relational_topology_protocol_version) return false;
+            if (record.reporter_incarnation == 0 or record.relational_topology_protocol_version < required) return false;
         }
         return found;
     }
 
     fn activateRelationalTopologyProtocolTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, contract: metadata.TransitionTableContract) !bool {
         if (contract.integrity_protocol == .none) return true;
-        if (!try self.relationalTopologyStoresCapableTxn(txn, group_id)) return false;
+        return self.activateDataTopologyFloorTxn(txn, group_id, metadata_table_manager.coordinated_integrity_protocol_version);
+    }
+
+    fn activateDataTopologyFloorTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, required: u16) !bool {
         var key_buf: [160]u8 = undefined;
         const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
         const raw = txn.get(key) catch |err| switch (err) {
@@ -36688,8 +36699,11 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         var incarnation = try decodeMetadataIncarnationRecord(raw);
-        if (incarnation.relational_topology_protocol_activated_version == metadata_table_manager.relational_topology_protocol_version) return true;
-        incarnation.relational_topology_protocol_activated_version = metadata_table_manager.relational_topology_protocol_version;
+        // Registration, sparse reports and root replacement enforce the
+        // activated floor. Repeated admissions need no store inventory scan.
+        if (incarnation.relational_topology_protocol_activated_version >= required) return true;
+        if (!try self.relationalTopologyStoresAtLeastTxn(txn, group_id, required)) return false;
+        incarnation.relational_topology_protocol_activated_version = required;
         try writeMetadataIncarnationRecordTxn(txn, group_id, incarnation);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{ .kind = .metadata_incarnation, .metadata_group_id = group_id });
@@ -55680,4 +55694,91 @@ test "metadata durable job state snapshot retains scheduling quotas and group is
     defer page.deinit();
     try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
     try std.testing.expectEqualStrings("documents/finished", page.value.rows[0].key);
+}
+
+test "relational integrity restore staging population atomically raises data owner floor only with accepted reservation and survives restart" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/query-owner-admission", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    var live = true;
+    defer if (live) store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const incarnation: metadata.MetadataClusterIncarnation = "01010101010101010101010101010101".*;
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+    _ = try adoptLiveRelationWriterForTest(&store, a, group);
+    const local = @import("antfly_local_sources");
+    var compiled = try local.sql_compiler.compile(a, "CREATE TABLE populated(n BIGINT)", .{});
+    defer compiled.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+    defer a.free(schema);
+    const target: restore_staging.Target = .{
+        .source_table_id = 0,
+        .population = .{ .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = try restore_staging.runtimeSchemaDigestForTable(a, schema), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 7 },
+        .table = .{ .table_id = 11, .name = "population_storage", .schema_json = schema },
+        .catalog_binding = .{ .kind = .table, .id = 11, .parent_id = system_catalog.default_namespace_id, .name = "populated", .storage_name = "population_storage" },
+        .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }},
+    };
+    const plan: restore_staging.Plan = .{ .id = @splat(7), .cohort_digest = @splat(9), .targets = &.{target} };
+    try plan.validate(a);
+    var key_buf: [512]u8 = undefined;
+    const job_key = try a.dupe(u8, try restore_staging.jobKey(&key_buf, group, plan.id));
+    defer a.free(job_key);
+    const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_population_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(activation);
+    var data: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .relational_topology_protocol_version = metadata_table_manager.coordinated_integrity_protocol_version };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&key_buf, group), activation);
+        _ = try store.writeStoreComponentsTxn(&txn, group, data.store_id, data, false, null, null);
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        try std.testing.expectError(error.NotFound, txn.get(job_key));
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(u16, 0), try store.getRelationalTopologyProtocolActivationVersion(group));
+    data.relational_topology_protocol_version = metadata_table_manager.query_population_protocol_version;
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try store.writeStoreComponentsTxn(&txn, group, data.store_id, data, false, null, null);
+        // A rejected identity collision must not independently activate the
+        // newer runtime floor, nor reserve any name/group/job prefix.
+        const table_key = try tableKeyForGroup(&key_buf, group, target.table.table_id);
+        const encoded = try encodeTableRecord(a, target.table);
+        defer a.free(encoded);
+        try txn.put(table_key, encoded);
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        try std.testing.expectError(error.NotFound, txn.get(job_key));
+        try txn.delete(try tableKeyForGroup(&key_buf, group, target.table.table_id));
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(u16, 0), try store.getRelationalTopologyProtocolActivationVersion(group));
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        _ = try txn.get(job_key);
+        try txn.commit();
+    }
+    try std.testing.expectEqual(metadata_table_manager.query_population_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group));
+    store.deinit();
+    live = false;
+    store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    live = true;
+    try std.testing.expectEqual(metadata_table_manager.query_population_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group));
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        _ = try txn.get(job_key);
+        data.relational_topology_protocol_version = metadata_table_manager.coordinated_integrity_protocol_version;
+        try std.testing.expect(!try admitSchemaAndTopologyStoreTxn(&txn, group, data));
+        data.role = "metadata";
+        try std.testing.expect(try admitSchemaAndTopologyStoreTxn(&txn, group, data));
+        data.role = "data";
+        data.relational_topology_protocol_version = metadata_table_manager.query_population_protocol_version;
+        try std.testing.expect(try admitSchemaAndTopologyStoreTxn(&txn, group, data));
+    }
 }

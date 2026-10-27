@@ -317,7 +317,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
         target.rewrite_tail_cache.clear();
         target.rewrite_tail_cache.mutex.unlock(env.io);
-        if (phase == .published or phase == .canceled) try releaseSource(alloc, env, input.scope);
+        if (phase == .published or phase == .canceled) if (input.scope.population == null) try releaseSource(alloc, env, input.scope);
         return .{ .phase = phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population };
     };
     if (before.value.phase == .canceled or before.value.phase == .published) return error.RestoreStagingScopeChanged;
@@ -505,7 +505,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
         target.rewrite_tail_cache.clear();
         target.rewrite_tail_cache.mutex.unlock(env.io);
-        try releaseSource(alloc, env, input.scope);
+        if (input.scope.population == null) try releaseSource(alloc, env, input.scope);
     }
     const admission_receipt = if (input.action == .install_generation_admissions) try target.restoreGenerationAdmissionReceipt() else null;
     return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .population = after.value.population, .generation_admission_receipt = if (admission_receipt) |receipt| receipt.logical_digest else null, .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
@@ -1120,7 +1120,7 @@ test "restore owner SQL population commits bounded typed rows and completion thr
     while (offset < 257) {
         const count: usize = @intCast(@min(128, 257 - offset));
         const rows = try owned.alloc(population.Row, count);
-        for (rows, 0..) |*row, index| row.* = .{ .document = try std.fmt.allocPrint(owned, "{{\"n\":{d},\"j\":null}}", .{offset + index}), .json_null_fields = if ((offset + index) % 2 == 0) &.{"j"} else &.{} };
+        for (rows, 0..) |*row, index| row.* = .{ .ordinal = offset + index, .document = try std.fmt.allocPrint(owned, "{{\"n\":{d},\"j\":null}}", .{offset + index}), .json_null_fields = if ((offset + index) % 2 == 0) &.{"j"} else &.{} };
         const cursor = response.population.?;
         const page: population.Page = .{ .binding = cursor.binding, .sequence = cursor.pages, .first_row = cursor.rows, .previous = cursor.chain, .rows = rows };
         const request: Request = .{ .scope = scope, .action = .import_page, .population_page = page };
@@ -1164,7 +1164,7 @@ test "restore owner SQL population commits bounded typed rows and completion thr
     response = try executeResident(a, &target, env, .{ .scope = scope, .action = .publish }, .{});
     try std.testing.expectEqual(staging.Phase.published, response.phase);
     for (0..257) |ordinal| {
-        const value = (try target.get(a, &population.rowKey(binding.partition, ordinal))) orelse return error.MissingPopulationRow;
+        const value = (try target.get(a, &population.rowKey(binding.capture_id, ordinal))) orelse return error.MissingPopulationRow;
         defer a.free(value);
         var row = try std.json.parseFromSlice(std.json.Value, a, value, .{});
         defer row.deinit();
@@ -1341,7 +1341,7 @@ test "restore owner SQL population query delivery resolves lost ACKs and refuses
             _ = try executeResident(a, &target, receiver.environment(), .{ .scope = scope, .action = .validate }, .{});
             _ = try executeResident(a, &target, receiver.environment(), .{ .scope = scope, .action = .publish }, .{});
             for (0..257) |ordinal| {
-                const bytes = (try target.get(a, &population.rowKey(32, ordinal))) orelse return error.MissingPopulationRow;
+                const bytes = (try target.get(a, &population.rowKey(binding.capture_id, ordinal))) orelse return error.MissingPopulationRow;
                 defer a.free(bytes);
                 var row = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
                 defer row.deinit();
@@ -1363,4 +1363,9 @@ test "restore owner SQL population query delivery resolves lost ACKs and refuses
             try std.testing.expectEqual(@as(usize, 257), count);
         }
     }
+}
+
+test {
+    _ = @import("../api/sql_population_delivery.zig");
+    _ = @import("sql_population_cohort_test.zig");
 }

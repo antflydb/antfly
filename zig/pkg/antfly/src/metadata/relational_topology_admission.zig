@@ -25,12 +25,16 @@ pub fn coordinated(alloc: std.mem.Allocator, schema: []const u8) !bool {
 }
 
 pub fn requireStores(stores: []const tables.StoreRecord) !void {
+    return requireStoresAtLeast(tables.coordinated_integrity_protocol_version, stores);
+}
+
+pub fn requireStoresAtLeast(required: u16, stores: []const tables.StoreRecord) !void {
     if (stores.len > 4096) return error.RelationalTopologyProtocolUpgradeRequired;
     var found = false;
     for (stores) |store| {
         if (!tables.storeServesTableData(store.role)) continue;
         found = true;
-        if (store.reporter_incarnation == 0 or store.relational_topology_protocol_version != tables.relational_topology_protocol_version) return error.RelationalTopologyProtocolUpgradeRequired;
+        if (store.reporter_incarnation == 0 or store.relational_topology_protocol_version < required) return error.RelationalTopologyProtocolUpgradeRequired;
     }
     if (!found) return error.RelationalTopologyProtocolUpgradeRequired;
 }
@@ -71,4 +75,18 @@ test "relational topology admission requires complete distributed rollout and pi
     var different = contract;
     different.read_schema_json = "{\"version\":1}";
     try std.testing.expect(!contract.eql(different));
+}
+
+test "relational integrity restore staging population data capability does not upgrade ordinary coordinated operations" {
+    var legacy: tables.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .relational_topology_protocol_version = tables.coordinated_integrity_protocol_version };
+    try requireStores(&.{legacy});
+    try std.testing.expectError(error.RelationalTopologyProtocolUpgradeRequired, requireStoresAtLeast(tables.query_population_protocol_version, &.{legacy}));
+    legacy.relational_topology_protocol_version = tables.query_population_protocol_version;
+    try requireStoresAtLeast(tables.query_population_protocol_version, &.{legacy});
+    var old = legacy;
+    old.relational_topology_protocol_version = tables.coordinated_integrity_protocol_version;
+    try std.testing.expectError(error.RelationalTopologyProtocolUpgradeRequired, requireStoresAtLeast(tables.query_population_protocol_version, &.{ legacy, old }));
+    try std.testing.expectError(error.RelationalTopologyProtocolUpgradeRequired, requireStoreAtFloor(tables.query_population_protocol_version, old));
+    old.role = "metadata";
+    try requireStoreAtFloor(tables.query_population_protocol_version, old);
 }

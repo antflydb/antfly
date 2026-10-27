@@ -4853,15 +4853,20 @@ test "system catalog schema reader admission rejects incomplete unknown and unfe
 
 test "relational topology admission JSON preserves capability in registrations and heartbeats" {
     const alloc = std.testing.allocator;
-    const json = "{\"store_id\":20,\"node_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":2}";
-    const registration = try parseStoreRecord(alloc, json);
-    defer metadata_table_manager.freeStore(alloc, registration);
-    try std.testing.expectEqual(metadata_table_manager.relational_topology_protocol_version, registration.relational_topology_protocol_version);
-    const heartbeat = try parseStoreStatusReport(alloc, json);
-    defer freeStoreStatusReport(alloc, heartbeat);
-    try std.testing.expectEqual(metadata_table_manager.relational_topology_protocol_version, heartbeat.relational_topology_protocol_version);
+    for ([_]u16{ metadata_table_manager.coordinated_integrity_protocol_version, metadata_table_manager.query_population_protocol_version }) |version| {
+        const json = try std.fmt.allocPrint(alloc, "{{\"store_id\":20,\"node_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":{d}}}", .{version});
+        defer alloc.free(json);
+        const registration = try parseStoreRecord(alloc, json);
+        defer metadata_table_manager.freeStore(alloc, registration);
+        try std.testing.expectEqual(version, registration.relational_topology_protocol_version);
+        const heartbeat = try parseStoreStatusReport(alloc, json);
+        defer freeStoreStatusReport(alloc, heartbeat);
+        try std.testing.expectEqual(version, heartbeat.relational_topology_protocol_version);
+    }
     try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, "{\"store_id\":20,\"node_id\":20,\"relational_topology_protocol_version\":2}"));
-    try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreStatusReport(alloc, "{\"store_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":3}"));
+    const future = try std.fmt.allocPrint(alloc, "{{\"store_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":{d}}}", .{metadata_table_manager.relational_topology_protocol_version + 1});
+    defer alloc.free(future);
+    try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreStatusReport(alloc, future));
 }
 
 test "store registration preserves physical replica root identity" {

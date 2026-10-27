@@ -19,7 +19,11 @@ pub const artifact_sources_protocol_version: u16 = 1;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
-pub const relational_topology_protocol_version: u16 = 2;
+/// Version 2 is the deployed coordinated-integrity contract. Version 3 also
+/// executes captured query output, global row ordinals and sealed completion.
+pub const coordinated_integrity_protocol_version: u16 = 2;
+pub const query_population_protocol_version: u16 = 3;
+pub const relational_topology_protocol_version: u16 = query_population_protocol_version;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("antfly_local_sources").common_group_ids;
 const topology_records = @import("antfly_local_sources").common_topology_records;

@@ -43,6 +43,7 @@ pub const Source = struct {
     stream: ?*reads.Stream = null,
     pending: ?reads.BatchPage = null,
     pending_index: usize = 0,
+    emitted: u64 = 0,
     underlying_end: bool = false,
     exhausted: bool = false,
     failed: bool = false,
@@ -166,15 +167,23 @@ pub const Source = struct {
                 }
             }
             const page = &self.pending.?;
-            var object: std.json.ObjectMap = .empty;
+            const cells = try a.alloc(StorageCell, self.columns.len);
             var nulls: std.ArrayList([]const u8) = .empty;
-            for (self.columns, 0..) |column, ordinal| {
+            for (self.columns, cells, 0..) |column, *cell, ordinal| {
+                // Identity JSON projections retain verified encoded payloads.
+                // Keep them encoded until the destination's ordinary typed-row
+                // preparation, rather than decoding/cloning a sender DOM.
+                if (column.type == .json) if (try page.values.encodedJson(self.pending_index, ordinal)) |encoded| {
+                    cell.* = .{ .encoded = encoded };
+                    if (std.mem.eql(u8, std.mem.trim(u8, encoded, " \t\r\n"), "null")) try nulls.append(a, column.name);
+                    continue;
+                };
                 const datum = try page.values.cell(a, self.pending_index, ordinal);
                 const value = try runtime.encodeStorageDatum(a, datum, column, self.limits.retained_bytes);
                 if (column.type == .json and value == .null and !datum.sql_null) try nulls.append(a, column.name);
-                try column.assignStorageValue(a, &object, value, datum.sql_null);
+                cell.* = .{ .value = value };
             }
-            const document = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = object }, .{});
+            const document = try std.json.Stringify.valueAlloc(a, StorageRow{ .columns = self.columns, .cells = cells }, .{});
             bytes = std.math.add(usize, bytes, document.len) catch return error.RelationPopulationPageTooLarge;
             if (bytes > delivery.max_page_bytes) return error.RelationPopulationPageTooLarge;
             std.mem.sort([]const u8, nulls.items, {}, struct {
@@ -182,7 +191,9 @@ pub const Source = struct {
                     return std.mem.order(u8, left, right) == .lt;
                 }
             }.less);
-            try rows.append(a, .{ .document = document, .json_null_fields = nulls.items });
+            if (self.emitted == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
+            try rows.append(a, .{ .ordinal = self.emitted, .document = document, .json_null_fields = nulls.items });
+            self.emitted += 1;
             self.pending_index += 1;
             if (self.pending_index == page.values.len()) {
                 page.deinit();
@@ -191,6 +202,27 @@ pub const Source = struct {
         }
         if (rows.items.len == 0) return null;
         return rows.items;
+    }
+};
+
+const StorageCell = union(enum) { value: std.json.Value, encoded: []const u8 };
+const StorageRow = struct {
+    columns: []const catalog.Column,
+    cells: []const StorageCell,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        for (self.columns, self.cells) |column, cell| {
+            try writer.objectField(column.path);
+            switch (cell) {
+                .value => |value| try writer.write(value),
+                .encoded => |encoded| {
+                    try writer.beginWriteRaw();
+                    try writer.writer.writeAll(encoded);
+                    writer.endWriteRaw();
+                },
+            }
+        }
+        try writer.endObject();
     }
 };
 
@@ -514,4 +546,84 @@ test "SQL relation population conditional completion skips evaluation and report
         try std.testing.expectEqual(@as(usize, 0), fixture.population_pages);
         try std.testing.expectEqual(@as(u64, 0), result.output.rows_affected);
     }
+}
+
+test "SQL relation population encoded JSON remains lazy and preserves exact tokens and SQL null provenance" {
+    const Encoded = struct {
+        offset: usize = 0,
+        materialized: usize = 0,
+        closed: bool = false,
+        fn resolve(_: *anyopaque, _: A, name: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "j", .path = "j", .type = .json }} };
+        }
+        fn scan(_: *anyopaque, _: A, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedRowScan;
+        }
+        fn mutate(_: *anyopaque, _: A, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn open(raw: *anyopaque, _: A, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = raw, .next = nextRows, .next_columns = nextColumns, .close = close };
+        }
+        fn nextRows(_: *anyopaque, _: A, _: u32) !catalog.Page {
+            return error.UnexpectedRowScan;
+        }
+        fn cell(raw: *anyopaque, _: A, index: usize, _: usize) !@import("scalar.zig").Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (index % 3 == 2) return .{};
+            self.materialized += 1;
+            return error.UnexpectedScalarMaterialization;
+        }
+        fn json(_: *anyopaque, index: usize, _: usize) !?[]const u8 {
+            return switch (index % 3) {
+                0 => "{\"exact\":9007199254740993.1250}",
+                1 => " null ",
+                else => null,
+            };
+        }
+        fn nextColumns(raw: *anyopaque, a: A, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const count = @min(limit, 19 - self.offset);
+            const indices = try a.alloc(usize, count);
+            for (indices, 0..) |*index, i| index.* = self.offset + i;
+            self.offset += count;
+            const values = try a.create(@import("execution_batch.zig").Batch);
+            values.* = .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .count = 19, .width = 1 } };
+            return .{ .native = .{ .values = values, .names = &.{"j"} }, .selection = indices, .after = if (self.offset == 19) null else "more" };
+        }
+        fn close(raw: *anyopaque) void {
+            @as(*@This(), @ptrCast(@alignCast(raw))).closed = true;
+        }
+        fn ddl(_: *anyopaque, _: catalog.DdlAllocators, _: catalog.Ddl) !catalog.DdlOutcome {
+            return error.UnexpectedMutation;
+        }
+    };
+    const a = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    var compiled = try compiler.compile(a, "CREATE TABLE dst AS SELECT j FROM src", .{});
+    defer compiled.deinit();
+    var fixture: Encoded = .{};
+    const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Encoded.resolve, .scan = Encoded.scan, .open_scan = Encoded.open, .mutate = Encoded.mutate, .checkpoint = Encoded.checkpoint, .ddl = Encoded.ddl } };
+    const source = try Source.init(arena.allocator(), backend, &compiled, compiled.statement.catalog_ddl.population.?, &.{}, .{ .execution_batch_rows = 7 });
+    const producer = source.iface();
+    var count: usize = 0;
+    while (try producer.next(producer.ptr, 5)) |rows| for (rows) |row| {
+        try std.testing.expectEqual(@as(u64, @intCast(count)), row.ordinal);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, row.document, .{ .parse_numbers = false });
+        defer doc.deinit();
+        if (count % 3 == 0) {
+            try std.testing.expectEqualStrings("9007199254740993.1250", doc.value.object.get("j").?.object.get("exact").?.number_string);
+        } else {
+            try std.testing.expect(doc.value.object.get("j").? == .null);
+        }
+        try std.testing.expectEqual(@as(usize, @intFromBool(count % 3 == 1)), row.json_null_fields.len);
+        count += 1;
+    };
+    try producer.finish(producer.ptr);
+    source.deinit();
+    try std.testing.expectEqual(@as(usize, 19), count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.materialized);
+    try std.testing.expect(fixture.closed);
 }

@@ -57,12 +57,16 @@ pub fn prepare(alloc: std.mem.Allocator, target: anytype, scope: staging.Scope, 
             }
             writes = try a.alloc(types.BatchWrite, page.rows.len);
             timestamps = try a.alloc(staging.Timestamp, page.rows.len);
-            for (page.rows, writes, timestamps, 0..) |row, *write, *timestamp, ordinal| {
-                const key = try a.dupe(u8, &contract.rowKey(binding.partition, page.first_row + ordinal));
+            const ordinals = try a.alloc(u64, page.rows.len);
+            const range = target.getRange();
+            for (page.rows, writes, timestamps, ordinals) |row, *write, *timestamp, *source_ordinal| {
+                const key = try a.dupe(u8, &contract.rowKey(binding.capture_id, row.ordinal));
+                if (!range.contains(key)) return error.KeyOutOfRange;
+                source_ordinal.* = row.ordinal;
                 write.* = .{ .key = key, .value = row.document, .json_null_fields = row.json_null_fields };
                 timestamp.* = .{ .key = key, .timestamp = binding.write_version };
             }
-            break :page .{ .page = .{ .sequence = page.sequence, .first_row = page.first_row, .previous = page.previous } };
+            break :page .{ .page = .{ .sequence = page.sequence, .first_row = page.first_row, .previous = page.previous, .ordinals = ordinals } };
         },
         .complete => |receipt| complete: {
             after.population = try cursor.seal(receipt);
@@ -95,11 +99,12 @@ pub fn validate(before: staging.Progress, after: staging.Progress, delivery: con
         return error.InvalidRelationPopulation;
     const expected: contract.Cursor = switch (delivery) {
         .page => |header| page: {
+            if (header.ordinals.len != writes.len) return error.InvalidRelationPopulation;
             var rows: [contract.max_page_rows]contract.Row = undefined;
-            for (writes, rows[0..writes.len], 0..) |write, *row, ordinal| {
-                const key = contract.rowKey(before.scope.population.?.partition, std.math.add(u64, header.first_row, ordinal) catch return error.InvalidRelationPopulation);
+            for (writes, rows[0..writes.len], header.ordinals) |write, *row, ordinal| {
+                const key = contract.rowKey(before.scope.population.?.capture_id, ordinal);
                 if (!std.mem.eql(u8, write.key, &key)) return error.InvalidRelationPopulation;
-                row.* = .{ .document = write.value, .json_null_fields = write.json_null_fields };
+                row.* = .{ .ordinal = ordinal, .document = write.value, .json_null_fields = write.json_null_fields };
             }
             const page: contract.Page = .{ .binding = cursor.binding, .sequence = header.sequence, .first_row = header.first_row, .previous = header.previous, .rows = rows[0..writes.len] };
             break :page switch (try cursor.admit(page)) {

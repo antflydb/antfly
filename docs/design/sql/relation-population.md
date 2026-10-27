@@ -40,9 +40,20 @@ the query again. An importing owner, including one with zero rows, does not
 prove that evaluation never started. A fresh producer is refused for that
 state. Its coordinator must retire incomplete output through cancellation.
 
+One producer routes globally numbered rows through a complete, disjoint owner
+range map. Capture-bound row keys do not depend on page boundaries or owner-local
+counts. Bounded per-owner buffers coalesce small input pages; encoded JSON stays
+encoded until native normalization. Each owner enforces its key range at commit.
+All seals bind the same global source count, and their local counts must sum to
+that count before the delivery cohort is complete. Cold-reopen tests exercise
+lost page and seal replies across two native LSM owners.
+
 The metadata decoder floor is separate from native owner qualification. New
-population plans require the exact metadata-voter capability before reservation.
-Ordinary restore plans retain their previous optional-field encoding and digest.
+population plans require the metadata-voter capability before reservation and
+atomically raise the durable data-owner capability floor with accepted admission.
+Incapable stores and destination collisions cannot reserve a job or raise that
+floor. Ordinary coordinated operations retain their v2 admission semantics;
+ordinary restore plans retain their previous optional-field encoding and digest.
 
 ## Activation still required
 
@@ -50,13 +61,10 @@ The public catalog adapter deliberately rejects population commands until the
 complete lifecycle is integrated. Parser and component coverage do not close
 original parity cases. In particular, the following are unfinished:
 
-- Atomic job/name admission, data-owner capability and placement checks,
+- Public job/name admission and placement checks,
   request-owned producer admission, and durable expiry/cancellation of
   interrupted producers. Recovery must never reconstruct a query from a row
   count and run it against a fresh snapshot.
-- Multi-owner routing of one producer. The current per-owner delivery primitive
-  is not a partitioner. Global row identities must remain stable when pages are
-  grouped by destination; owner-local page counts cannot choose routing keys.
 - Materialized definitions, bound dependencies and owner authority in the
   existing view catalog; atomic backing-generation publication and retirement;
   unpopulated-read errors; refresh isolation, MAINTAIN checks and concurrent

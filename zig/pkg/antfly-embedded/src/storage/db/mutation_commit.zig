@@ -898,9 +898,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (S.ownerField(self, "local_execution").*.restore_staging_required.load(.acquire) or opts.restore_staging != null or effective_req.restore_staging_scope != null) {
                 var restore_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer restore_read.abort();
-                if (opts.restore_staging) |admission|
-                    try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len, req.writes)
-                else if (opts.transaction_resolution == null) {
+                if (opts.restore_staging) |admission| {
+                    if (admission.population != null) for (req.writes) |write| {
+                        if (!S.ownerField(self, "core").*.index_manager.byte_range.contains(write.key)) return error.KeyOutOfRange;
+                    };
+                    try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len, req.writes);
+                } else if (opts.transaction_resolution == null) {
                     if (opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null) {
                         try @import("restore_staging.zig").requireMutableScope(preparation_alloc, &restore_read, effective_req.restore_staging_scope);
                         try self.validateRestoreStagingReplicationEffects(preparation_alloc, &restore_read, effective_req);
