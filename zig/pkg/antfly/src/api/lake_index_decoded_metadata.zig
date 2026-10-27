@@ -86,6 +86,11 @@ pub fn acquireInterpreted(comptime T: type, cached: artifacts.CachedRead, store:
 pub fn acquireInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T) !Owned(T) {
     return acquireInterpretedBoundedInner(T, cached, store, ref, cancellation, interpretation, arguments, load, limit, fallback, null);
 }
+/// Required bounded interpretations distinguish a deterministic decode-budget
+/// decline from backing allocator failure, including on repeated cache hits.
+pub fn acquireRequiredInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize) !Owned(T) {
+    return acquireInterpretedBoundedInner(T, cached, store, ref, cancellation, interpretation, arguments, load, limit, null, error.SqlMemoryLimitExceeded);
+}
 fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T, decline_error: ?anyerror) !Owned(T) {
     try cached.context.ensureActive();
     try cancellation.check();

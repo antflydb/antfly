@@ -51,8 +51,16 @@ pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellati
 /// Range cache identities bind the pack, offset, length and page digest. A cold
 /// seek reads only that page; it never downloads the whole navigation pack.
 pub fn readPageRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+    return readBoundedRange(a, store, ref, offset, length, digest, cancellation, cached, @import("../serverless/graph_segment/page_tree.zig").max_page_bytes);
+}
+/// Typed cover stripes share the verified range/cache machinery while retaining
+/// their own 4 MiB block bound. Navigation pages keep their narrower hard cap.
+pub fn readColumnRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+    return readBoundedRange(a, store, ref, offset, length, digest, cancellation, cached, max_block_bytes);
+}
+fn readBoundedRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead, maximum: usize) ![]u8 {
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
-    if (offset > ref.byte_len or length > ref.byte_len - offset or length > @import("../serverless/graph_segment/page_tree.zig").max_page_bytes) return error.InvalidGraphPage;
+    if (offset > ref.byte_len or length > ref.byte_len - offset or length > maximum) return error.InvalidGraphPage;
     if (offset == 0 and length == ref.byte_len) {
         const object_digest = try stores.sha256DigestFromChecksum(ref.checksum);
         if (!std.mem.eql(u8, &object_digest, &digest)) return error.ArtifactIntegrityMismatch;

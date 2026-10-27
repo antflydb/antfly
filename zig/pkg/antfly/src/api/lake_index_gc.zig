@@ -29,7 +29,7 @@ pub const Collector = struct {
     // Artifact membership and dependency expansion have independent lifetimes.
     // Keep expansion bits beside the owned reference, within max_marked.
     const Marked = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, expanded: u16 = 0 };
-    const Expansion = enum(u4) { directory, maintenance, manifest, seekable_manifest, text_root, artifact, ordered_page, native_page, page, contribution_page, generation_page, chunk_page };
+    const Expansion = enum(u4) { directory, maintenance, manifest, seekable_manifest, text_root, artifact, ordered_page, native_page, page, contribution_page, generation_page, chunk_page, cover_directory };
 
     a: A,
     table: u64,
@@ -462,6 +462,7 @@ pub const Collector = struct {
                 try self.markPages(a, root.domain, root.page, true);
                 for (root.build_runs) |build_run| try self.markPages(a, root.domain, build_run.page, true);
                 try self.markPages(a, root.domain, root.reverse, false);
+                try self.markPages(a, root.domain, root.covering, false);
                 try self.markPages(a, root.domain, root.ties, false);
                 try self.markPages(a, root.domain, root.predicates, false);
                 if (root.file_dictionary) |dictionary| {
@@ -588,6 +589,17 @@ pub const Collector = struct {
                 if (try @import("lake_index_ordered_rows.zig").coverReference(w.a, w.domain, value)) |cover| {
                     defer w.a.free(cover.block.artifact_id);
                     _ = try w.collector.mark(cover.block);
+                    if (cover.striped) {
+                        if (w.collector.progress) |progress| {
+                            try progress.enqueue(.{ .cover_directory = cover.block });
+                        } else if (try w.collector.expand(cover.block, .cover_directory, "cover-directory-v1")) {
+                            try stores.chargeReadBudget(&w.collector.remaining_reads, cover.block.byte_len);
+                            var arena = std.heap.ArenaAllocator.init(w.a);
+                            defer arena.deinit();
+                            const directory = try @import("lake_index_cover_columns.zig").readDirectory(arena.allocator(), w.collector.store, cover.block, w.collector.cancellation());
+                            _ = try w.collector.mark(directory.pack);
+                        }
+                    }
                 }
             }
             pub fn skip(w: *@This(), child: tree.Ref) !bool {
@@ -947,10 +959,11 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     defer row_reader.deinit();
     const entries = try row_reader.nextEntries(ca, 1);
     const cover = entries[0].cover.?;
-    const cover_bytes = try store.getVerifiedAllocWithCancellation(cover.block.artifact_id, cover.block.byte_len, cover.block.checksum, .none);
-    defer a.free(cover_bytes);
-    const block = try local.sql_spill.decodeColumnarBlockInArena(ca, cover_bytes, artifacts.max_block_bytes);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), (try block.cell(cover.row, 0)).value.integer);
+    var cover_reads: u64 = 4 * 1024 * 1024;
+    var loaded = try @import("lake_index_cover_columns.zig").load(a, store, cover.block, cover.striped, &.{0}, 1, .none, null, 16 * 1024 * 1024, &cover_reads, null);
+    defer loaded.deinit();
+    try loaded.verify(row_reader.root.domain, cover.row, @import("lake_index_cover_columns.zig").witness(row_reader.root.domain, entries[0].key));
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try loaded.block.cell(cover.row, 0)).value.integer);
     const foreign_bytes = try store.getAlloc(foreign.artifact_id);
     defer a.free(foreign_bytes);
     try std.testing.expectEqualStrings("another cluster's abandoned artifact", foreign_bytes);

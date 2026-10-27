@@ -1771,3 +1771,139 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
                 unavailable.rename(original)
         finally:
             client.session.close()
+
+
+def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
+    tmp_path, monkeypatch
+):
+    """A narrow covered result needs neither wide tuples nor original Parquet."""
+    import importlib.util
+
+    import conftest as harness
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location(
+        "covering_projection_regression", root / "tools" / "benchmark_lake_archive.py"
+    )
+    bench = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench
+    spec.loader.exec_module(bench)
+    count = 64
+    archive = tmp_path / "wide.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": list(range(count)),
+                "bucket": [i // 32 for i in range(count)],
+                "wide": ["w" * 131000 + str(i).zfill(4) for i in range(count)],
+                "body": ["control quasar"] * count,
+            }
+        ),
+        archive,
+        row_group_size=32,
+        use_dictionary=False,
+        data_page_size=256 * 1024,
+        write_batch_size=1,
+    )
+    fixture = bench.import_fixture(tmp_path / "fixture", [archive], "covering-wide")
+    properties = {
+        name: {
+            "type": "integer",
+            "x-antfly-field": {"type": "number", "sortable": True},
+        }
+        for name in ("id", "bucket")
+    }
+    properties["wide"] = {
+        "type": "string",
+        "x-antfly-field": {"type": "text", "index": False},
+    }
+    properties["body"] = {"type": "string", "x-antfly-field": {"type": "text"}}
+    definition = {
+        "schema": {
+            "storage_mode": "relational",
+            "default_type": "row",
+            "base_source": {
+                "kind": "external",
+                "format": "parquet",
+                "table_id": "covering-wide",
+                "object_mutability": "immutable",
+                "uri": fixture["manifest_uri"],
+                "row_identity": {"key_columns": ["id"]},
+            },
+            "document_schemas": {
+                "row": {"schema": {"type": "object", "properties": properties}}
+            },
+            "index_sort": [{"field": field} for field in ("id", "_id")],
+            "relational_indexes": [
+                {
+                    "name": "covered",
+                    "keys": [{"column": field} for field in ("bucket", "wide", "id")],
+                }
+            ],
+        },
+        "indexes": {"text": {"type": "full_text", "store_source": False}},
+    }
+    config = _write_remote_content_e2e_config(tmp_path)
+    monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY", "1")
+    output = tmp_path / "server"
+    output.mkdir()
+    with bench.managed_server(
+        harness.StandaloneAntflyServer,
+        binary,
+        config,
+        output,
+        api_root=harness.ANTFLY_PUBLIC_API_ROOT,
+    ) as server:
+        client = bench.Client(server, 120)
+        try:
+            client.call("POST", f"/tables/{bench.TABLE}", definition)
+            client.ready(bench.readiness_indexes({"definition": definition}))
+            original = tmp_path / "fixture/buckets/antfly/objects/import-0.parquet"
+            unavailable = original.with_suffix(".unavailable")
+            for restarted in (False, True):
+                if restarted:
+                    server.restart()
+                client.ready(bench.readiness_indexes({"definition": definition}))
+                original.rename(unavailable)
+                try:
+                    for descending in (False, True):
+                        response = client.query(
+                            {
+                                "request": {
+                                    "full_text_search": {
+                                        "match": "quasar",
+                                        "field": "body",
+                                    },
+                                    "fields": ["id", "bucket"],
+                                    "order_by": [{"field": "id", "desc": descending}],
+                                    "limit": 32,
+                                }
+                            }
+                        )
+                        expected = (
+                            list(range(63, 31, -1)) if descending else list(range(32))
+                        )
+                        assert [
+                            hit["_source"]["id"] for hit in response["hits"]["hits"]
+                        ] == expected
+                        assert all(
+                            set(hit["_source"]) == {"id", "bucket"}
+                            for hit in response["hits"]["hits"]
+                        )
+                    sql = client.call(
+                        "POST",
+                        "/sql",
+                        {
+                            "statement": f"SELECT id, bucket FROM {bench.TABLE} WHERE bucket = 0 ORDER BY wide, id LIMIT 32"
+                        },
+                    )
+                    assert sql["rows"] == [[str(i), "0"] for i in range(32)]
+                finally:
+                    unavailable.rename(original)
+        finally:
+            client.session.close()

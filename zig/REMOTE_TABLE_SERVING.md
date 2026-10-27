@@ -1742,3 +1742,39 @@ occupancy repair cannot merge compressed siblings whose combined expanded
 shape would exceed that cap. New builds and rewritten pages benefit without
 forcing unchanged publications to rebuild. The page format and publication
 recipes remain unchanged.
+
+### Projection-pruned covering delivery
+
+Ordered row publications add a compact physical-coordinate tree for covering
+reads. Each entry binds the 16-byte physical coordinate, immutable cover locator,
+row ordinal and a domain-separated SHA-256 witness of the complete logical tuple
+key. The witness hashes the logical key length and both prefix/suffix pieces;
+it is independent of page compression. A covering gather verifies its requested
+source, snapshot, identity version and physical coordinate before using this map.
+The cover's identity stripe must match the same witness. Full-key equality is
+replaced by an authenticated hash equality proof, never omitted. Old publications
+can use their complete-key path until a new publication builds the compact map.
+
+A cover batch stores two objects: a small authenticated directory and one pack.
+The directory commits contiguous, nonoverlapping ranges and a SHA-256 digest for
+an identity stripe and every typed value column. The identity stripe stores
+fixed-size key witnesses rather than complete tuple strings. Value stripes keep
+native SQL types, SQL-null flags, numeric payloads and row ordinals. Every loaded
+stripe must agree with the directory's row count and identity ordinals. Packs
+and directories share the publication domain and are retained as dependencies.
+
+SQL windows load projection and predicate dependencies; already-ranked gathers
+load only requested columns. Selected stripes retain decoded cache leases and
+row identity while preserving caller rank. Independent blocks use joined I/O
+waves with bounded workspace and exact selected-range read admission. Unrequested
+stripes are not fetched or decoded. The small result view has null placeholders
+for omitted columns and is consumed only under the supplied projection plan.
+
+Incremental publication changes the forward, reverse and physical-cover roots
+atomically. Retirement removes the physical map entries for retired coordinates;
+updates install new immutable cover locators and witnesses. Retained readers keep
+the prior root and cover packs. Reuse validation includes pack retention proofs,
+and resumable GC expands each directory once before marking its pack. Ordered
+metadata versions 11/12 and native reader protocol 90 fence older workers from
+interpreting the new layout. Existing unchanged cover blocks remain readable;
+no duplicate serialized source row is introduced.

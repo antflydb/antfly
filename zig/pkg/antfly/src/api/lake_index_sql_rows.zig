@@ -16,6 +16,7 @@
 //! Leased native row-index consumption. Seek candidates in bounded windows,
 //! hydrate physical vectors, then apply deletes and residuals before delivery.
 const std = @import("std");
+const cover_columns = @import("lake_index_cover_columns.zig");
 const local = @import("antfly_local_sources");
 const catalog = local.sql_catalog;
 const operation = local.api_operation;
@@ -73,6 +74,7 @@ const Owner = struct {
     probe_done: bool = true,
     probe_cache: ?tree.Cache = null,
     covered: bool = false,
+    cover_columns_lease: ?cover_columns.Loaded = null,
     covered_entries: []const ordered.Reader.Entry = &.{},
     covered_blocks: []const struct { block: local.sql_spill.ColumnarBlock, row: u16 } = &.{},
     covered_selection: []const usize = &.{},
@@ -91,6 +93,7 @@ const Owner = struct {
         if (self.lease) |lease| lease.deinit();
         if (self.ordered_store) |*store| store.deinit();
         self.window.deinit();
+        if (self.cover_columns_lease) |*loaded| loaded.deinit();
         if (self.cover_lease) |owned| owned.release();
         self.cover_arena.deinit();
         self.arena.deinit();
@@ -342,6 +345,8 @@ const Owner = struct {
                 self.cover_candidate_offset = 0;
                 if (self.cover_candidates.len == 0) return .{ .selection = &.{} };
             }
+            if (self.cover_columns_lease) |*loaded| loaded.deinit();
+            self.cover_columns_lease = null;
             if (self.cover_lease) |owned| owned.release();
             self.cover_lease = null;
             _ = self.cover_arena.reset(.retain_capacity);
@@ -355,22 +360,22 @@ const Owner = struct {
             }
             self.covered_entries = self.cover_candidates[begin..end];
             self.cover_candidate_offset = end;
-            try @import("../serverless/artifacts/store.zig").chargeReadBudget(&self.reader.remaining_reads, cover.block.byte_len);
-            const block = if (self.reader.cached) |cached| cached_block: {
-                const owned = try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, self.artifacts, cover.block, self.reader.pages.cancellation);
-                self.cover_lease = owned;
-                break :cached_block owned.value.*;
-            } else uncached: {
-                const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, null);
-                break :uncached try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
-            };
+            var projected_columns: std.ArrayList(usize) = .empty;
+            for (self.reader.root.cover, 0..) |name, i| {
+                const required = covers(self.request.fields, name) or for (self.request.conditions) |condition| {
+                    if (std.mem.eql(u8, condition.column, name)) break true;
+                } else false;
+                if (required) try projected_columns.append(a, i);
+            }
+            self.cover_columns_lease = try cover_columns.load(a, self.artifacts, cover.block, cover.striped, projected_columns.items, self.reader.root.cover.len, self.reader.pages.cancellation, self.reader.cached, 64 * 1024 * 1024, &self.reader.remaining_reads, null);
+            const block = self.cover_columns_lease.?.block;
             if (block.values.len != self.reader.root.cover.len or block.keys.len != 1) return error.InvalidNativeLakeRowIndex;
             const covered = try a.alloc(@typeInfo(@TypeOf(self.covered_blocks)).pointer.child, self.covered_entries.len);
             for (self.covered_entries, covered) |entry, *position| {
                 const candidate = entry.cover.?;
                 if (candidate.block.byte_len != cover.block.byte_len or candidate.row >= block.count()) return error.InvalidNativeLakeRowIndex;
-                const key = try block.keyCell(candidate.row, 0);
-                if (key.sql_null or key.value != .string or !std.mem.eql(u8, key.value.string, entry.key)) return error.InvalidNativeLakeRowIndex;
+                if (candidate.striped != cover.striped) return error.InvalidNativeLakeRowIndex;
+                try self.cover_columns_lease.?.verify(self.reader.root.domain, candidate.row, cover_columns.witness(self.reader.root.domain, entry.key));
                 position.* = .{ .block = block, .row = candidate.row };
             }
             self.covered_blocks = covered;
@@ -787,35 +792,51 @@ pub fn tryOpenPredicateWithContext(a: A, server: *server_api.ApiHttpServer, tabl
 /// Decoded leases remain admitted until the caller consumes this wave. Each
 /// 16 MiB lane fits the default 32 MiB I/O allowance; saturation runs inline.
 const CoveringWave = struct {
-    const lane_bytes = 16 * 1024 * 1024;
-    const Metadata = @import("lake_index_decoded_metadata.zig");
-    const Block = Metadata.Owned(local.sql_spill.ColumnarBlock);
     const Job = struct {
+        a: A,
         cached: @import("lake_index_aggregate_artifact.zig").CachedRead,
         store: @import("../serverless/artifacts/store.zig").ArtifactStore,
-        ref: @import("lake_index_aggregate_artifact.zig").ChunkRef,
+        cover: ordered.Reader.Cover,
+        columns: []const usize,
+        width: usize,
         token: @import("antfly_cancellation").CancellationToken,
-        block: ?Block = null,
+        prepared: cover_columns.Prepared,
+        limit: usize,
+        block: ?cover_columns.Loaded = null,
         fn run(self: *@This()) anyerror!void {
-            self.block = try Metadata.acquireColumnBlockBounded(self.cached, self.store, self.ref, self.token, lane_bytes);
+            var reads = self.prepared.bytes;
+            self.block = try cover_columns.load(self.a, self.store, self.cover.block, self.cover.striped, self.columns, self.width, self.token, self.cached, self.limit, &reads, self.prepared);
         }
     };
     jobs: [4]Job = undefined,
     count: usize = 0,
     retained: usize = 0,
     fn deinit(self: *CoveringWave) void {
-        for (self.jobs[0..self.count]) |job| if (job.block) |block| block.release();
+        for (self.jobs[0..self.count]) |*job| if (job.block) |*block| block.deinit();
         if (self.retained != 0) local.sql_parallel_scheduler.global().releasePull(0, self.retained);
         self.* = .{};
     }
-    fn read(self: *CoveringWave, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, store: @import("../serverless/artifacts/store.zig").ArtifactStore, refs: []const @import("lake_index_aggregate_artifact.zig").ChunkRef, token: @import("antfly_cancellation").CancellationToken) !void {
+    fn read(self: *CoveringWave, a: A, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, store: @import("../serverless/artifacts/store.zig").ArtifactStore, refs: []const ordered.Reader.Cover, columns: []const usize, width: usize, token: @import("antfly_cancellation").CancellationToken, reads: *u64) !void {
         if (refs.len > self.jobs.len or self.count != 0) return error.InvalidNativeLakeRowIndex;
         const scheduler = local.sql_parallel_scheduler;
-        const retained = lane_bytes * refs.len;
-        if (!scheduler.global().reservePull(0, retained)) return error.SqlMemoryLimitExceeded;
-        self.retained = retained;
-        for (refs, self.jobs[0..refs.len]) |ref, *job| job.* = .{ .cached = cached, .store = store, .ref = ref, .token = token };
+        // A is shared between jobs only through this locked owner. All jobs
+        // join before it leaves scope; loaded arenas keep the backing A below.
+        var allocations: scheduler.LockedAllocator = .{ .backing = a };
+        var reservation: usize = 0;
+        for (refs, self.jobs[0..refs.len]) |ref, *job| {
+            const prepared = try cover_columns.prepare(a, store, ref.block, ref.striped, columns, width, token, cached, reads);
+            const limit: usize = @intCast(@min(16 * 1024 * 1024, prepared.bytes *| 4 +| 256 * 1024));
+            job.* = .{ .a = allocations.allocator(), .cached = cached, .store = store, .cover = ref, .columns = columns, .width = width, .token = token, .prepared = prepared, .limit = limit };
+            reservation += limit;
+        }
+        if (!scheduler.global().reservePull(0, reservation)) return error.SqlMemoryLimitExceeded;
+        self.retained = reservation;
         self.count = refs.len;
+        defer for (self.jobs[0..self.count]) |*job| if (job.block) |*block| if (block.scratch_owner) |arena| {
+            _ = arena;
+            block.budget.?.backing = a;
+            block.backing = a;
+        };
         var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
         defer if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
             held.cancel(io) catch {};
@@ -824,7 +845,7 @@ const CoveringWave = struct {
         for (self.jobs[0..self.count], 0..) |*job, i| {
             if (failure != null) break;
             if (cached.context.io) |io| if (self.count > 1) {
-                tasks[i] = scheduler.global().submitIo(io, lane_bytes, Job.run, .{job});
+                tasks[i] = scheduler.global().submitIo(io, job.limit, Job.run, .{job});
             };
             if (tasks[i] == null) job.run() catch |err| {
                 failure = err;
@@ -881,21 +902,20 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
             for (result) |value| if (value) |row| row.deinit();
             out.free(result);
         };
-        const Pending = struct { entry: ordered.Reader.Entry, position: usize };
+        const Pending = struct { entry: ordered.Reader.CoverEntry, position: usize };
         const pending = try scratch.allocator().alloc(Pending, refs_.len);
         // Sort the bounded gather by block identity: one lease, decode and
         // read-budget charge per block, while preserving ranked output order.
         const index_refs = try owner.mapToIndex(scratch.allocator(), refs_);
-        const entries = try owner.reader.entriesAtPhysical(scratch.allocator(), index_refs);
+        const entries = try owner.reader.coversAtPhysical(scratch.allocator(), index_refs);
         for (entries, pending, 0..) |found, *item, position| {
             try owner.read_context.ensureActive();
             const entry = found orelse return null;
-            if (entry.cover == null) return null;
             item.* = .{ .entry = entry, .position = position };
         }
         std.mem.sort(Pending, pending, {}, struct {
             fn less(_: void, left: Pending, right: Pending) bool {
-                return std.mem.order(u8, left.entry.cover.?.block.artifact_id, right.entry.cover.?.block.artifact_id) == .lt;
+                return std.mem.order(u8, left.entry.cover.block.artifact_id, right.entry.cover.block.artifact_id) == .lt;
             }
         }.less);
         var row_arena = std.heap.ArenaAllocator.init(a);
@@ -904,33 +924,34 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
         while (begin < pending.len) {
             var wave: CoveringWave = .{};
             defer wave.deinit();
-            var block_refs: [4]@import("lake_index_aggregate_artifact.zig").ChunkRef = undefined;
+            var block_refs: [4]ordered.Reader.Cover = undefined;
             var groups: [4]struct { begin: usize, end: usize } = undefined;
             var count: usize = 0;
             while (count < block_refs.len and begin < pending.len) {
-                const reference = pending[begin].entry.cover.?;
+                const reference = pending[begin].entry.cover;
                 var end = begin + 1;
-                while (end < pending.len and std.mem.eql(u8, pending[end].entry.cover.?.block.artifact_id, reference.block.artifact_id)) : (end += 1) {
-                    const same = pending[end].entry.cover.?.block;
-                    if (same.byte_len != reference.block.byte_len or !std.mem.eql(u8, same.checksum, reference.block.checksum)) return error.InvalidNativeLakeRowIndex;
+                while (end < pending.len and std.mem.eql(u8, pending[end].entry.cover.block.artifact_id, reference.block.artifact_id)) : (end += 1) {
+                    const same = pending[end].entry.cover.block;
+                    if (pending[end].entry.cover.striped != reference.striped or same.byte_len != reference.block.byte_len or !std.mem.eql(u8, same.checksum, reference.block.checksum)) return error.InvalidNativeLakeRowIndex;
                 }
-                try @import("../serverless/artifacts/store.zig").chargeReadBudget(&owner.reader.remaining_reads, reference.block.byte_len);
-                block_refs[count] = reference.block;
+                block_refs[count] = reference;
                 groups[count] = .{ .begin = begin, .end = end };
                 count += 1;
                 begin = end;
             }
-            try wave.read(.{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, owner.artifacts, block_refs[0..count], owner.reader.pages.cancellation);
+            var selected: std.ArrayList(usize) = .empty;
+            for (root.cover, 0..) |name, i| if (covers(fields, name)) try selected.append(a, i);
+            try wave.read(a, .{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, owner.artifacts, block_refs[0..count], selected.items, root.cover.len, owner.reader.pages.cancellation, &owner.reader.remaining_reads);
             for (wave.jobs[0..count], groups[0..count]) |job, group| {
-                const block = job.block.?;
+                const loaded = job.block.?;
+                const block = loaded.block;
                 for (pending[group.begin..group.end]) |item| {
                     try owner.read_context.ensureActive();
                     _ = row_arena.reset(.retain_capacity);
-                    const row = item.entry.cover.?.row;
-                    if (block.value.keys.len != 1 or row >= block.value.count()) return error.InvalidNativeLakeRowIndex;
-                    const key = try block.value.keyCell(row, 0);
-                    if (key.sql_null or key.value != .string or !std.mem.eql(u8, key.value.string, item.entry.key)) return error.InvalidNativeLakeRowIndex;
-                    result[item.position] = try coveringSource(out, row_arena.allocator(), table, root, block.value.*, row, refs_[item.position], fields);
+                    const row = item.entry.cover.row;
+                    if (block.keys.len != 1 or row >= block.count()) return error.InvalidNativeLakeRowIndex;
+                    try loaded.verify(root.domain, row, item.entry.witness);
+                    result[item.position] = try coveringSource(out, row_arena.allocator(), table, root, block, row, refs_[item.position], fields);
                 }
             }
         }
