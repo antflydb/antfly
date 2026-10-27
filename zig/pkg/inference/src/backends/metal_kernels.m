@@ -41691,7 +41691,7 @@ static void termite_metal_initialize_lighton_prefill_ffn(termite_metal_decode_ru
     if (@available(macOS 26.1, *)) {
         MTLCompileOptions *options = [MTLCompileOptions new];
         options.languageVersion = TERMITE_METAL_LANGUAGE_VERSION_4_0;
-            options.mathMode = MTLMathModeSafe;
+        options.mathMode = MTLMathModeSafe;
         NSError *error = nil;
         id<MTLLibrary> library = [r->device newLibraryWithSource:termite_metal_lighton_prefill_ffn_source()
                                                        options:options error:&error];
