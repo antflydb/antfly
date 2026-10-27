@@ -145,8 +145,10 @@ const std = @import("std");
 /// Version 104 additionally combines main's indexed resolver replay and published
 /// tag 80; the private SQL delivery command uses the unallocated tag 90.
 /// Version 105 admits typed callable overloads and shared catalog outcomes.
-pub const current_version: u16 = 106;
-pub const sql_routine_version: u16 = 106;
+/// Version 107 decodes identity-fenced callable annotations on the retained
+/// catalog outcome lane without advancing executable generations.
+pub const current_version: u16 = 107;
+pub const sql_routine_version: u16 = 107;
 pub const sql_materialized_refresh_version: u16 = 103;
 pub const sql_materialized_view_version: u16 = 102;
 pub const sql_population_version: u16 = 101;

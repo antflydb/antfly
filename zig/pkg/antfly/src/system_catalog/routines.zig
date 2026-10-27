@@ -26,6 +26,8 @@ pub const Outcome = outcomes.Outcome;
 pub const SnapshotRequest = struct {
     targets: []const domain.Target,
     expected_revision: ?u64 = null,
+    /// Presentation metadata is excluded from hot-path execution capture.
+    include_description: bool = false,
     signature: ?[]const u8 = null,
     arguments: ?[]const records.Input = null,
     pub fn validate(self: @This()) !void {
@@ -40,7 +42,7 @@ pub const SnapshotRequest = struct {
 };
 pub const Snapshot = struct {
     pub const Scope = struct { target: domain.Target, namespace_id: ?u64, database_exists: bool };
-    pub const Found = struct { scope: usize, record: records.Record };
+    pub const Found = struct { scope: usize, record: records.Record, description: ?[]const u8 = null };
     revision: u64,
     next_id: u64,
     head: u64,
@@ -69,6 +71,7 @@ pub const Mutation = struct {
     operation: union(enum) {
         publish: struct { kind: records.Kind = .function, definition: records.Definition, replace: bool = false, expected: ?Identity = null },
         drop: struct { kind: records.Kind = .function, signature: []const u8, expected: ?Identity, if_exists: bool = false, cascade: bool = false },
+        comment: struct { kind: records.Kind, signature: []const u8, expected: Identity, description: ?[]const u8 },
     },
     pub fn validate(self: @This()) !void {
         try self.admission.validate();
@@ -79,6 +82,14 @@ pub const Mutation = struct {
                 try (records.Record{ .kind = value.kind, .id = 1, .generation = 1, .definition = value.definition }).validate();
                 if (value.expected) |expected| try expected.validate();
                 if (!value.replace and value.expected != null) return error.InvalidCatalogMutation;
+            },
+            .comment => |value| {
+                try value.expected.validate();
+                if (value.signature.len > 4096 or std.mem.indexOfScalar(u8, value.signature, 0) != null) return error.InvalidCatalogMutation;
+                if (value.description) |text| {
+                    if (text.len > 64 * 1024) return error.CatalogCommandTooLarge;
+                    if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidCatalogMutation;
+                }
             },
             .drop => |value| {
                 if (value.signature.len > 4096 or std.mem.indexOfScalar(u8, value.signature, 0) != null or (!value.if_exists and value.expected == null)) return error.InvalidCatalogMutation;
@@ -125,11 +136,22 @@ pub fn observation(a: std.mem.Allocator, request: Mutation) !OutcomeRequest {
     return .{ .kind = switch (request.operation) {
         .publish => |value| value.kind,
         .drop => |value| value.kind,
+        .comment => |value| value.kind,
     }, .admission = request.admission, .target = request.target, .namespace_id = request.namespace_id, .incarnation = request.incarnation, .digest = try digest(a, request), .operation = switch (request.operation) {
         .publish => |value| if (value.replace) .alter else .create,
         .drop => .drop,
+        .comment => .alter,
     } };
 }
 pub fn command(request: Mutation) @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand {
-    return .{ .version = 4, .expected_revision = 0, .mutation = .{ .kind = .routine, .action = if (request.operation == .publish) .create else .drop, .database = request.target.database, .namespace = request.target.namespace, .name = request.target.table }, .sql_routine = request };
+    return .{ .version = 4, .expected_revision = 0, .mutation = .{ .kind = .routine, .action = commandAction(request), .database = request.target.database, .namespace = request.target.namespace, .name = request.target.table }, .sql_routine = request };
+}
+
+/// One authoritative envelope mapping shared by producers and native apply.
+pub fn commandAction(request: Mutation) domain.Action {
+    return switch (request.operation) {
+        .publish => .create,
+        .drop => .drop,
+        .comment => .comment,
+    };
 }

@@ -37020,7 +37020,7 @@ pub const RaftApplyStore = struct {
             if (record.value.id != header.id or !std.mem.eql(u8, resource.value.signature orelse return error.InvalidCatalogRecord, signature) or !std.mem.eql(u8, signature, header.signature)) return error.InvalidCatalogRecord;
             for (candidates.items, owners.items) |candidate, owner| if (candidate.id == header.id) {
                 if (resource.value.parent_id != scopes[owner].namespace_id or !std.mem.eql(u8, resource.value.name, scopes[owner].target.table)) return error.InvalidCatalogRecord;
-                found = .{ .scope = owner, .record = record.value };
+                found = .{ .scope = owner, .record = record.value, .description = if (request.include_description) resource.value.description else null };
                 break;
             };
         }
@@ -37035,7 +37035,7 @@ pub const RaftApplyStore = struct {
         try request.validate();
         if (command.version != 4 or command.expected_revision != 0 or command.sql_view != null or command.sql_sequence != null or command.column_sequences.len != 0 or
             command.topology != null or command.placement_update != null or command.constraint_name_admission != null or command.mutation.kind != .routine or
-            command.mutation.action != (if (request.operation == .publish) system_catalog.Action.create else .drop) or
+            command.mutation.action != sql_routines.commandAction(request) or
             !std.mem.eql(u8, command.mutation.database, request.target.database) or !std.mem.eql(u8, command.mutation.namespace, request.target.namespace) or !std.mem.eql(u8, command.mutation.name, request.target.table) or
             command.mutation.new_name != null or command.mutation.tablespace != null or command.mutation.native_service != null or command.mutation.description != null or
             command.mutation.table_id != 0 or command.mutation.storage_name.len != 0 or !std.mem.eql(u8, command.mutation.source_json, "null") or !std.mem.eql(u8, command.mutation.location_json, "null")) return error.InvalidCatalogMutation;
@@ -37054,10 +37054,12 @@ pub const RaftApplyStore = struct {
         const signature = switch (request.operation) {
             .publish => |value| try value.definition.signatureAlloc(a),
             .drop => |value| value.signature,
+            .comment => |value| value.signature,
         };
         const previous = try system_catalog_storage.findFunction(a, txn, group, namespace.id, request.target.table, signature);
         const prior = if (previous) |resource| (try sql_routines.records.Record.decode(a, resource.value.source_json)).value else null;
         var next: ?sql_routines.records.Record = null;
+        var description: ?[]const u8 = if (previous) |resource| resource.value.description else null;
         var next_id = meta.next_id;
         switch (request.operation) {
             .publish => |value| {
@@ -37089,6 +37091,15 @@ pub const RaftApplyStore = struct {
                     return err;
                 };
             },
+            .comment => |value| {
+                const old = prior orelse return if (value.kind == .procedure) error.SqlUndefinedProcedure else error.SqlUndefinedFunction;
+                if (old.kind != value.kind) return error.SqlWrongObjectType;
+                if (value.expected.id != old.id or value.expected.generation != old.generation) return error.CatalogGenerationChanged;
+                // Presentation metadata never recompiles a body or invalidates
+                // its executable identity. Replacements preserve this field.
+                next = old;
+                description = if (value.description) |text| if (text.len == 0) null else text else null;
+            },
             .drop => |value| {
                 if (prior) |old| {
                     if (old.kind != value.kind) return error.SqlWrongObjectType;
@@ -37105,7 +37116,7 @@ pub const RaftApplyStore = struct {
         const result: sql_routines.Result = .{ .revision = revision, .identity = if (next) |value| .{ .id = value.id, .generation = value.generation } else null, .removed = @intFromBool(next == null) };
         if (!apply) return result;
         var upserts: [1]system_catalog.Resource = undefined;
-        if (next) |value| upserts[0] = .{ .kind = .routine, .id = value.id, .parent_id = namespace.id, .name = request.target.table, .signature = signature, .source_json = try value.encode(a) };
+        if (next) |value| upserts[0] = .{ .kind = .routine, .id = value.id, .parent_id = namespace.id, .name = request.target.table, .signature = signature, .source_json = try value.encode(a), .description = description };
         var removes: [1]system_catalog.Resource = undefined;
         if (next == null) removes[0] = previous.?.value;
         const delta: system_catalog.Delta = .{ .upserts = if (next != null) &upserts else &.{}, .removes = if (next == null) &removes else &.{}, .next_id = next_id };
@@ -59302,7 +59313,7 @@ test "SQL routine catalog overloads replacements and bounded outcomes survive na
     const group: u64 = group_ids.main_metadata_group_id;
     const T = struct {
         fn snapshot(store: *RaftApplyStore, allocator: std.mem.Allocator, argument: sql_routines.records.Type) !sql_routines.Snapshot {
-            const bytes = try store.sqlRoutineSnapshot(allocator, group, .{ .targets = &.{.{ .table = "f" }}, .arguments = &.{.{ .type = argument }} }, .{});
+            const bytes = try store.sqlRoutineSnapshot(allocator, group, .{ .targets = &.{.{ .table = "f" }}, .include_description = true, .arguments = &.{.{ .type = argument }} }, .{});
             return std.json.parseFromSliceLeaky(sql_routines.Snapshot, allocator, bytes, .{});
         }
         fn apply(store: *RaftApplyStore, allocator: std.mem.Allocator, request: sql_routines.Mutation) !sql_routines.Outcome {
@@ -59325,10 +59336,18 @@ test "SQL routine catalog overloads replacements and bounded outcomes survive na
             const incarnation = "01010101010101010101010101010101".*;
             try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
             const activation = try std.json.Stringify.valueAlloc(temporary, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
-            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+            const predecessor = try std.json.Stringify.valueAlloc(temporary, topology_protocol.Activation{ .version = topology_protocol.sql_routine_version - 1, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = predecessor });
             const initial = try T.snapshot(&store, temporary, .{ .scalar = .text });
             try std.testing.expect(initial.found == null);
             first = .{ .admission = .{ .nonce = @splat(1), .head = initial.head }, .target = .{ .table = "f" }, .namespace_id = 2, .incarnation = initial.incarnation, .operation = .{ .publish = .{ .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .text } }}, .result = .{ .scalar = .text }, .body = "SELECT lower($1)", .owner = .auth_disabled } } } };
+            // A predecessor voter cannot admit the new routine command lane.
+            try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.prepareSystemCatalogResult(temporary, group, sql_routines.command(first)));
+            const fenced = try T.snapshot(&store, temporary, .{ .scalar = .text });
+            try std.testing.expectEqual(initial.head, fenced.head);
+            try std.testing.expectEqual(initial.next_id, fenced.next_id);
+            try std.testing.expect(fenced.found == null);
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
             const created = try T.apply(&store, temporary, first);
             identity = created.success.identity.?;
             var wrong_target = try sql_routines.observation(temporary, first);
@@ -59380,15 +59399,35 @@ test "SQL routine catalog overloads replacements and bounded outcomes survive na
             const created_procedure = try T.apply(&store, temporary, procedure);
             try std.testing.expect(created_procedure.success.identity != null);
             try std.testing.expectEqualDeep(created_procedure, try T.apply(&store, temporary, procedure));
+            var comment = first;
+            comment.admission = .{ .nonce = @splat(7), .head = (try T.snapshot(&store, temporary, .{ .scalar = .text })).head };
+            comment.operation = .{ .comment = .{ .kind = .function, .signature = "text", .expected = identity, .description = "durable function annotation" } };
+            const annotated = try T.apply(&store, temporary, comment);
+            try std.testing.expectEqualDeep(identity, annotated.success.identity.?);
+            try std.testing.expectEqualDeep(annotated, try T.apply(&store, temporary, comment));
+            var preserve = replacement;
+            preserve.admission = .{ .nonce = @splat(8), .head = (try T.snapshot(&store, temporary, .{ .scalar = .text })).head };
+            preserve.operation.publish.expected = identity;
+            identity = (try T.apply(&store, temporary, preserve)).success.identity.?;
+            var procedure_comment = procedure;
+            procedure_comment.admission = .{ .nonce = @splat(9), .head = (try T.snapshot(&store, temporary, .{ .scalar = .text })).head };
+            procedure_comment.operation = .{ .comment = .{ .kind = .procedure, .signature = "", .expected = created_procedure.success.identity.?, .description = "durable procedure annotation" } };
+            _ = try (try T.apply(&store, temporary, procedure_comment)).result();
+            comment.admission = .{ .nonce = @splat(10), .head = (try T.snapshot(&store, temporary, .{ .scalar = .text })).head };
+            const stale = try T.apply(&store, temporary, comment);
+            try std.testing.expectEqual(.CatalogGenerationChanged, stale.rejected);
+            try std.testing.expectEqualDeep(stale, try T.apply(&store, temporary, comment));
         } else {
             const selected = try T.snapshot(&store, temporary, .{ .scalar = .text });
             try std.testing.expectEqual(identity.id, selected.found.?.record.id);
-            try std.testing.expectEqual(@as(u32, 2), selected.found.?.record.generation);
+            try std.testing.expectEqual(@as(u32, 3), selected.found.?.record.generation);
             try std.testing.expectEqualStrings("SELECT upper($1)", selected.found.?.record.definition.body);
-            try std.testing.expectEqual(@as(u64, 6), selected.head);
-            const procedure_json = try store.sqlRoutineSnapshot(temporary, group, .{ .targets = &.{.{ .table = "p" }}, .arguments = &.{} }, .{});
+            try std.testing.expectEqual(@as(u64, 10), selected.head);
+            try std.testing.expectEqualStrings("durable function annotation", selected.found.?.description.?);
+            const procedure_json = try store.sqlRoutineSnapshot(temporary, group, .{ .targets = &.{.{ .table = "p" }}, .include_description = true, .arguments = &.{} }, .{});
             const procedure_cut = try std.json.parseFromSliceLeaky(sql_routines.Snapshot, temporary, procedure_json, .{});
             try std.testing.expectEqual(.procedure, procedure_cut.found.?.record.kind);
+            try std.testing.expectEqualStrings("durable procedure annotation", procedure_cut.found.?.description.?);
             try std.testing.expect(procedure_cut.found.?.record.definition.result == null);
             try std.testing.expectEqualDeep(identity.id, (try T.apply(&store, temporary, first)).success.identity.?.id);
             try std.testing.expectEqual(@as(usize, 0), (try store.listTables(temporary, group)).len);

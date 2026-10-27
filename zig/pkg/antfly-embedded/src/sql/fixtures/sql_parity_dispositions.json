@@ -3593,6 +3593,57 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-procedure-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-procedure-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-procedure-kernel-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Doptimize=Debug",
+        "-j1",
+        "-Dtest-filter=SQL procedure"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-procedure-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_procedure_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_procedure_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-callable-comment-kernel-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Doptimize=Debug",
+        "-j1",
+        "-Dtest-filter=SQL callable comments"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -5476,13 +5527,47 @@
     },
     {
       "id": "sql-0151",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COMMENT targets a real native callable overload through an authorized, identity-fenced metadata transaction. PostgreSQL and mounted native tests compare exact command tags, missing/wrong-kind SQLSTATEs and persisted descriptions. Comments preserve complete executable records, IDs and generations; replacement preserves descriptions; NULL/empty removes them; dropped/recreated names do not inherit annotations. Cold owners, unauthorized callers and exact lost-ACK recovery are exercised without row/schema/index work.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL callable comments retain exact overload identity without parsing annotation text",
+          "gate": "sql-callable-comment-kernel-debug"
+        }
+      ]
     },
     {
       "id": "sql-0152",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COMMENT targets a real native callable overload through an authorized, identity-fenced metadata transaction. PostgreSQL and mounted native tests compare exact command tags, missing/wrong-kind SQLSTATEs and persisted descriptions. Comments preserve complete executable records, IDs and generations; replacement preserves descriptions; NULL/empty removes them; dropped/recreated names do not inherit annotations. Cold owners, unauthorized callers and exact lost-ACK recovery are exercised without row/schema/index work.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL callable comments retain exact overload identity without parsing annotation text",
+          "gate": "sql-callable-comment-kernel-debug"
+        }
+      ]
     },
     {
       "id": "sql-0153",
@@ -10193,13 +10278,37 @@
     },
     {
       "id": "sql-0411",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged DROP FUNCTION signature retires a real native SQL callable overload, including conditional CASCADE and missing-object replay. The mounted PostgreSQL-backed lifecycle campaign verifies command tags, exact missing-function SQLSTATEs, notices and independent overload retirement after cold recovery. This credits callable catalog retirement, not PL/pgSQL trigger-body or trigger execution support.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0412",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged DROP FUNCTION signature retires a real native SQL callable overload, including conditional CASCADE and missing-object replay. The mounted PostgreSQL-backed lifecycle campaign verifies command tags, exact missing-function SQLSTATEs, notices and independent overload retirement after cold recovery. This credits callable catalog retirement, not PL/pgSQL trigger-body or trigger execution support.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0413",
@@ -10220,38 +10329,192 @@
     },
     {
       "id": "sql-0414",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through native procedure catalog publication and the typed CALL pipeline. PostgreSQL and mounted native campaigns compare command tags, demanded PERFORM execution, notice/error ordering, named and positional argument frames, overload kind checks, session/savepoint state, exact lost-ACK observation and cold owner recovery. The bounded procedural IR shares the scalar VM and existing catalog outcome journal; unsupported procedural features are not credited.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL procedure syntax retains complete original blocks without executing or resolving PERFORM",
+          "gate": "sql-procedure-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0415",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through native procedure catalog publication and the typed CALL pipeline. PostgreSQL and mounted native campaigns compare command tags, demanded PERFORM execution, notice/error ordering, named and positional argument frames, overload kind checks, session/savepoint state, exact lost-ACK observation and cold owner recovery. The bounded procedural IR shares the scalar VM and existing catalog outcome journal; unsupported procedural features are not credited.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL procedure syntax retains complete original blocks without executing or resolving PERFORM",
+          "gate": "sql-procedure-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0416",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through native procedure catalog publication and the typed CALL pipeline. PostgreSQL and mounted native campaigns compare command tags, demanded PERFORM execution, notice/error ordering, named and positional argument frames, overload kind checks, session/savepoint state, exact lost-ACK observation and cold owner recovery. The bounded procedural IR shares the scalar VM and existing catalog outcome journal; unsupported procedural features are not credited.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL procedure syntax retains complete original blocks without executing or resolving PERFORM",
+          "gate": "sql-procedure-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0417",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through native procedure catalog publication and the typed CALL pipeline. PostgreSQL and mounted native campaigns compare command tags, demanded PERFORM execution, notice/error ordering, named and positional argument frames, overload kind checks, session/savepoint state, exact lost-ACK observation and cold owner recovery. The bounded procedural IR shares the scalar VM and existing catalog outcome journal; unsupported procedural features are not credited.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL procedure syntax retains complete original blocks without executing or resolving PERFORM",
+          "gate": "sql-procedure-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0418",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through native procedure catalog publication and the typed CALL pipeline. PostgreSQL and mounted native campaigns compare command tags, demanded PERFORM execution, notice/error ordering, named and positional argument frames, overload kind checks, session/savepoint state, exact lost-ACK observation and cold owner recovery. The bounded procedural IR shares the scalar VM and existing catalog outcome journal; unsupported procedural features are not credited.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL procedure syntax retains complete original blocks without executing or resolving PERFORM",
+          "gate": "sql-procedure-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0419",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through native procedure catalog publication and the typed CALL pipeline. PostgreSQL and mounted native campaigns compare command tags, demanded PERFORM execution, notice/error ordering, named and positional argument frames, overload kind checks, session/savepoint state, exact lost-ACK observation and cold owner recovery. The bounded procedural IR shares the scalar VM and existing catalog outcome journal; unsupported procedural features are not credited.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL procedure syntax retains complete original blocks without executing or resolving PERFORM",
+          "gate": "sql-procedure-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0420",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through native procedure catalog publication and the typed CALL pipeline. PostgreSQL and mounted native campaigns compare command tags, demanded PERFORM execution, notice/error ordering, named and positional argument frames, overload kind checks, session/savepoint state, exact lost-ACK observation and cold owner recovery. The bounded procedural IR shares the scalar VM and existing catalog outcome journal; unsupported procedural features are not credited.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog overloads replacements and bounded outcomes survive native cold reopen",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL procedure syntax retains complete original blocks without executing or resolving PERFORM",
+          "gate": "sql-procedure-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_procedure_lifecycle_integration_test.zig",
+          "test": "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
+          "gate": "sql-procedure-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0421",

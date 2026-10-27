@@ -19,12 +19,34 @@ const local = @import("antfly_local_sources");
 const fixture = @import("sql_owner_test_fixture.zig");
 const client = @import("sql_owner_test_client.zig");
 const wire = @import("antfly_metadata_openapi").types;
-const Step = struct { id: ?[]const u8 = null, sql: []const u8, command_tag: ?[]const u8 = null, sqlstate: ?[]const u8 = null, notices: []const struct { code: []const u8, message: []const u8 } };
-const Reference = struct { entries: []const Step, calls: []const Step, cold: []const Step, teardown: []const Step };
+const Step = struct { id: ?[]const u8 = null, sql: []const u8, command_tag: ?[]const u8 = null, sqlstate: ?[]const u8 = null, notices: []const struct { code: []const u8, message: []const u8 }, inspect_annotations: bool = false, function_description: ?[]const u8 = null, procedure_description: ?[]const u8 = null };
+const Reference = struct { entries: []const Step, calls: []const Step, annotations: []const Step, annotation_teardown: []const Step, cold: []const Step, teardown: []const Step };
+fn annotationCut(ctx: *fixture.Context, a: std.mem.Allocator, procedure: bool) !@import("../system_catalog/routines.zig").Snapshot {
+    const native = @import("../system_catalog/routines.zig");
+    const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const request: native.SnapshotRequest = .{ .include_description = true, .targets = &.{.{ .table = if (procedure) "rotate_usage" else "normalize_status" }}, .signature = if (procedure) "" else "text;int32" };
+    const bytes = try source.systemCatalog(a, .{ .setting_admin = true }, .{ .sql_routine_snapshot = request });
+    const result = try std.json.parseFromSliceLeaky(native.Snapshot, a, bytes, .{});
+    try result.validate(request);
+    return result;
+}
+fn checkAnnotations(ctx: *fixture.Context, step: Step) !void {
+    var arena: std.heap.ArenaAllocator = .init(ctx.alloc);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |procedure| {
+        const cut = try annotationCut(ctx, arena.allocator(), procedure);
+        const expected = if (procedure) step.procedure_description else step.function_description;
+        const found = cut.found orelse return error.MissingAnnotatedCallable;
+        if (expected) |text| try std.testing.expectEqualStrings(text, found.description orelse return error.MissingCallableDescription) else try std.testing.expect(found.description == null);
+    }
+}
 fn observe(ctx: *fixture.Context, step: Step) !void {
     var region: std.heap.ArenaAllocator = .init(ctx.alloc);
     defer region.deinit();
     const a = region.allocator();
+    const comment = std.mem.startsWith(u8, step.sql, "COMMENT ON");
+    const prior_function = if (comment) try annotationCut(ctx, a, false) else null;
+    const prior_procedure = if (comment) try annotationCut(ctx, a, true) else null;
     var authenticated = ctx.*;
     authenticated.headers = ctx.admin_headers;
     var response = try client.execute(&authenticated, step.sql, .write_admission);
@@ -47,6 +69,16 @@ fn observe(ctx: *fixture.Context, step: Step) !void {
     for (step.notices, notices) |expected, actual| {
         try std.testing.expectEqualStrings(expected.code, actual.code);
         try std.testing.expectEqualStrings(expected.message, actual.message);
+    }
+    if (step.inspect_annotations) try checkAnnotations(ctx, step);
+    if (comment) {
+        const after_function = try annotationCut(ctx, a, false);
+        const after_procedure = try annotationCut(ctx, a, true);
+        // Comments and rejected annotations do not replace executable records.
+        for ([_]@import("../system_catalog/routines.zig").Snapshot{ prior_function.?, prior_procedure.? }, [_]@import("../system_catalog/routines.zig").Snapshot{ after_function, after_procedure }) |before, after| {
+            try std.testing.expectEqualDeep(before.found.?.record, after.found.?.record);
+            try std.testing.expectEqual(before.next_id, after.next_id);
+        }
     }
 }
 fn transactions(ctx: *fixture.Context) !void {
@@ -114,11 +146,21 @@ const Campaign = struct {
         try self.credentials.activateWithCatalog(ctx, true);
         for (self.reference.entries) |step| try observe(ctx, step);
         for (self.reference.calls) |step| try observe(ctx, step);
+        for (self.reference.annotations) |step| try observe(ctx, step);
+        var reader = ctx.*;
+        reader.headers = ctx.reader_headers;
+        var denied = try client.execute(&reader, "COMMENT ON PROCEDURE rotate_usage() IS 'unauthorized'", .write_admission);
+        defer denied.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 403), denied.status);
+        try checkAnnotations(ctx, self.reference.annotations[self.reference.annotations.len - 1]);
         try transactions(ctx);
         try @import("sql_routine_lifecycle_integration_test.zig").lostAck(ctx, true);
+        try @import("sql_routine_lifecycle_integration_test.zig").lostCommentAck(ctx);
     }
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try checkAnnotations(ctx, self.reference.annotations[self.reference.annotations.len - 1]);
         for (self.reference.cold) |step| try observe(ctx, step);
+        for (self.reference.annotation_teardown) |step| try observe(ctx, step);
         for (self.reference.teardown) |step| try observe(ctx, step);
     }
 };
@@ -128,9 +170,9 @@ test "mounted SQL original procedures preserve demanded calls notices errors and
     defer reference.deinit();
     var corpus = try local.sql_parity_fixtures.Corpus.init(a);
     defer corpus.deinit();
-    const originals = [_][]const u8{ "sql-0414", "sql-0415", "sql-0416", "sql-0418", "sql-0417", "sql-0419", "sql-0420" };
+    const originals = [_][]const u8{ "sql-0414", "sql-0415", "sql-0416", "sql-0418", "sql-0417", "sql-0151", "sql-0152", "sql-0411", "sql-0412", "sql-0419", "sql-0420" };
     var checked: usize = 0;
-    for ([_][]const Step{ reference.value.entries, reference.value.teardown }) |steps| for (steps) |step| if (step.id) |id| {
+    for ([_][]const Step{ reference.value.entries, reference.value.annotations, reference.value.annotation_teardown, reference.value.teardown }) |steps| for (steps) |step| if (step.id) |id| {
         try std.testing.expectEqualStrings(originals[checked], id);
         try std.testing.expectEqualStrings((try corpus.get(id)).sql, step.sql);
         checked += 1;

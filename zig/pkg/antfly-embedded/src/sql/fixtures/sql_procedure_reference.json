@@ -145,6 +145,172 @@
       "notices": []
     }
   ],
+  "annotations": [
+    {
+      "sql": "CREATE FUNCTION normalize_status(text,integer) RETURNS text LANGUAGE sql AS $$SELECT lower($1)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    },
+    {
+      "sql": "CREATE FUNCTION audit_changes() RETURNS integer LANGUAGE sql AS $$SELECT 1$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    },
+    {
+      "sql": "CREATE FUNCTION audit_changes(text) RETURNS text LANGUAGE sql AS $$SELECT lower($1)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    },
+    {
+      "sql": "COMMENT ON FUNCTION normalize_status(text, integer) IS 'normalizes status';",
+      "command_tag": "COMMENT",
+      "notices": [],
+      "id": "sql-0151",
+      "source_entry_sha256": "a6c47bcd87a6c558b9062bf2bd73108b51758ac1ea524e68bbff480062fb05d5",
+      "inspect_annotations": true,
+      "function_description": "normalizes status",
+      "procedure_description": null
+    },
+    {
+      "sql": "COMMENT ON PROCEDURE rotate_usage() IS 'rotates usage partitions';",
+      "command_tag": "COMMENT",
+      "notices": [],
+      "id": "sql-0152",
+      "source_entry_sha256": "6dc841e156e8fa9020eb5bb41b9ec4e50343a2768a9c24dbbddae591f5e90cd0",
+      "inspect_annotations": true,
+      "function_description": "normalizes status",
+      "procedure_description": "rotates usage partitions"
+    },
+    {
+      "sql": "CREATE OR REPLACE FUNCTION normalize_status(text,integer) RETURNS text LANGUAGE sql AS $$SELECT upper($1)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": "normalizes status",
+      "procedure_description": "rotates usage partitions"
+    },
+    {
+      "sql": "COMMENT ON FUNCTION normalize_status(integer) IS 'missing'",
+      "sqlstate": "42883",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": "normalizes status",
+      "procedure_description": "rotates usage partitions"
+    },
+    {
+      "sql": "COMMENT ON FUNCTION rotate_usage() IS 'wrong kind'",
+      "sqlstate": "42809",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": "normalizes status",
+      "procedure_description": "rotates usage partitions"
+    },
+    {
+      "sql": "COMMENT ON PROCEDURE normalize_status(text,integer) IS 'wrong kind'",
+      "sqlstate": "42809",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": "normalizes status",
+      "procedure_description": "rotates usage partitions"
+    }
+  ],
+  "annotation_teardown": [
+    {
+      "sql": "COMMENT ON FUNCTION normalize_status(text,integer) IS NULL",
+      "command_tag": "COMMENT",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": "rotates usage partitions"
+    },
+    {
+      "sql": "COMMENT ON PROCEDURE rotate_usage() IS ''",
+      "command_tag": "COMMENT",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    },
+    {
+      "sql": "COMMENT ON FUNCTION normalize_status(text,integer) IS 'discarded with object'",
+      "command_tag": "COMMENT",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": "discarded with object",
+      "procedure_description": null
+    },
+    {
+      "sql": "DROP FUNCTION normalize_status(text,integer)",
+      "command_tag": "DROP FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION normalize_status(text,integer) RETURNS text LANGUAGE sql AS $$SELECT lower($1)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    },
+    {
+      "sql": "DROP FUNCTION audit_changes()",
+      "command_tag": "DROP FUNCTION",
+      "notices": [],
+      "id": "sql-0411",
+      "source_entry_sha256": "3beac9462fbf87245c95bdd03bd3864c53154c2530eae00a329f564b024ba921",
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    },
+    {
+      "sql": "SELECT audit_changes()",
+      "sqlstate": "42883",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    },
+    {
+      "sql": "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE",
+      "command_tag": "DROP FUNCTION",
+      "notices": [],
+      "id": "sql-0412",
+      "source_entry_sha256": "6496e1d1c2931a42dcf6fb07d24487f3909ce6301a55a5aac8e7c342e24ac5c2",
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    },
+    {
+      "sql": "SELECT audit_changes('missing')",
+      "sqlstate": "42883",
+      "notices": [],
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    },
+    {
+      "sql": "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE",
+      "command_tag": "DROP FUNCTION",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "function audit_changes(text) does not exist, skipping"
+        }
+      ],
+      "inspect_annotations": true,
+      "function_description": null,
+      "procedure_description": null
+    }
+  ],
   "cold": [
     {
       "sql": "CALL rotate_usage()",

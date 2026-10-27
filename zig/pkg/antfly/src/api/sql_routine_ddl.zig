@@ -27,7 +27,7 @@ const common = @import("sql_catalog_recovery.zig");
 const A = std.mem.Allocator;
 
 pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl: ast.CatalogDdl) !catalog.DdlOutcome {
-    if ((ddl.kind != .function and ddl.kind != .procedure) or (ddl.action != .create and ddl.action != .drop)) return error.UnsupportedSqlExecution;
+    if ((ddl.kind != .function and ddl.kind != .procedure) or (ddl.action != .create and ddl.action != .drop and ddl.action != .comment)) return error.UnsupportedSqlExecution;
     if (root.active_transaction != null or !root.server.source.vtable.supports_sql_routines) return error.UnsupportedSqlExecution;
     try root.context.ensureActive();
     var region: std.heap.ArenaAllocator = .init(allocators.scratch);
@@ -77,10 +77,11 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
         }
         try catalog.routines.validateBody(a, .{ .kind = routine_kind, .id = if (prior) |record| record.id else cut.next_id, .generation = if (prior) |record| record.generation else 1, .definition = definition });
     }
+    if (prior) |before| if (before.kind != routine_kind) return error.SqlWrongObjectType;
     const io = root.server.embedding_provider_runtime.io;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
-    const request: routines.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head }, .target = target, .namespace_id = cut.scopes[index].namespace_id.?, .incarnation = cut.incarnation, .operation = if (declared) |definition| .{ .publish = .{ .kind = routine_kind, .definition = definition, .replace = ddl.routine.?.replace, .expected = expected } } else .{ .drop = .{ .kind = routine_kind, .signature = signature orelse try prior.?.definition.signatureAlloc(a), .expected = expected, .if_exists = ddl.conditional, .cascade = ddl.cascade } } };
+    const request: routines.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head }, .target = target, .namespace_id = cut.scopes[index].namespace_id.?, .incarnation = cut.incarnation, .operation = if (declared) |definition| .{ .publish = .{ .kind = routine_kind, .definition = definition, .replace = ddl.routine.?.replace, .expected = expected } } else if (ddl.action == .comment) .{ .comment = .{ .kind = routine_kind, .signature = signature orelse try prior.?.definition.signatureAlloc(a), .expected = expected.?, .description = ddl.comment_value } } else .{ .drop = .{ .kind = routine_kind, .signature = signature orelse try prior.?.definition.signatureAlloc(a), .expected = expected, .if_exists = ddl.conditional, .cascade = ddl.cascade } } };
     try request.validate();
     const observation = try routines.observation(a, request);
     var receipt = try recovery.newReceipt(allocators.result, a, observation, cut.revision);

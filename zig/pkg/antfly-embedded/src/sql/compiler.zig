@@ -3305,7 +3305,11 @@ const Parser = struct {
     /// Validate the supported declaration grammar to its end before reporting
     /// a missing body. Never publish a definition or execute a valid prefix.
     fn routineDrop(self: *Parser, procedure: bool) Error!ast.CatalogDdl {
-        const conditional = self.keyword(.@"if");
+        return self.routineReference(procedure, false);
+    }
+
+    fn routineReference(self: *Parser, procedure: bool, annotation: bool) Error!ast.CatalogDdl {
+        const conditional = !annotation and self.keyword(.@"if");
         if (conditional) try self.expectKeyword(.exists);
         const name_value = try self.name();
         var signature: ?[]const ast.RoutineDefinition.Type = null;
@@ -3321,8 +3325,8 @@ const Parser = struct {
             };
             signature = try types.toOwnedSlice(self.alloc);
         }
-        const cascade = self.ddlWord("CASCADE");
-        if (!cascade) _ = self.ddlWord("RESTRICT");
+        const cascade = !annotation and self.ddlWord("CASCADE");
+        if (!annotation and !cascade) _ = self.ddlWord("RESTRICT");
         return .{ .kind = if (procedure) .procedure else .function, .action = .drop, .name = name_value, .routine_signature = signature, .conditional = conditional, .cascade = cascade };
     }
 
@@ -3450,7 +3454,7 @@ const Parser = struct {
             if (body == null) return self.fail(error.SqlInvalidFunctionDefinition, "no function body specified");
         };
         if (supported and language != null and body != null and (std.mem.eql(u8, language.?, "sql") or (procedure and std.mem.eql(u8, language.?, "plpgsql"))))
-            return .{ .catalog_ddl = .{ .kind = if (procedure) .procedure else .function, .action = .create, .name = name_value, .routine = .{ .arguments = try arguments.toOwnedSlice(self.alloc), .result = result, .language = if (std.mem.eql(u8, language.?, "sql")) .sql else .plpgsql, .body = body.?, .replace = replace, .strict = strict, .volatility = volatility } } };
+            return .{ .catalog_ddl = .{ .kind = if (procedure) .procedure else .function, .action = .create, .name = name_value, .routine = .{ .arguments = try arguments.toOwnedSlice(self.alloc), .result = result, .language = if (std.mem.eql(u8, language.?, "sql")) .sql else .plpgsql, .body = try self.alloc.dupe(u8, body.?), .replace = replace, .strict = strict, .volatility = volatility } } };
         return self.fail(error.UnsupportedSqlShape, "routine language or execution options are not supported");
     }
 
@@ -3982,6 +3986,17 @@ const Parser = struct {
         if (self.keyword(.merge)) return .{ .merge = try self.merge() };
         if (self.ddlWord("COMMENT")) {
             try self.expectKeyword(.on);
+            if (self.ddlWord("FUNCTION") or self.ddlWord("PROCEDURE")) {
+                const procedure = std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "PROCEDURE");
+                var ddl = try self.routineReference(procedure, true);
+                if (ddl.conditional or ddl.cascade) return self.fail(error.InvalidSqlSyntax, "COMMENT does not accept conditional or dependency options");
+                ddl.action = .comment;
+                try self.expectKeyword(.is);
+                if (!self.peek(.string) and !(self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.null))) return self.fail(error.InvalidSqlSyntax, "COMMENT requires a string literal or NULL");
+                const annotation_text = try self.value();
+                ddl.comment_value = if (annotation_text == .string) annotation_text.string else null;
+                return .{ .catalog_ddl = ddl };
+            }
             const column_comment = self.keyword(.column);
             const kind: @FieldType(ast.CatalogDdl, "kind") = if (column_comment or self.keyword(.table)) .table else if (self.keyword(.schema)) .namespace else if (self.keyword(.database)) .database else return self.fail(error.UnsupportedSqlShape, "this comment target requires catalog annotation support");
             var comment_column: ?[]const u8 = null;
@@ -5586,4 +5601,23 @@ test "SQL routine original declarations retain typed signatures names bodies and
     try std.testing.expect(definition.replace and definition.strict);
     try std.testing.expectEqualStrings("public", replacement.statement.catalog_ddl.name.namespace.?);
     try std.testing.expectError(error.UnsupportedSqlShape, compile(a, "CREATE FUNCTION f(x bigint) RETURNS bigint LANGUAGE sql SECURITY DEFINER AS $$SELECT x$$", .{}));
+}
+
+test "compiler SQL callable comments retain exact overload identity without parsing annotation text" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "sql-0151", "sql-0152" }) |id| {
+        var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+        defer corpus.deinit();
+        var compiled = try compile(a, (try corpus.get(id)).sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(.comment, compiled.statement.catalog_ddl.action);
+        try std.testing.expect(compiled.statement.catalog_ddl.routine_signature != null);
+        try std.testing.expect(compiled.statement.catalog_ddl.comment_value != null);
+    }
+    var quoted = try compile(a, "COMMENT ON FUNCTION db.ns.\"f.x\"(numeric,text[]) IS 'a ''quoted'' Ω; -- payload'", .{});
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("f.x", quoted.statement.catalog_ddl.name.table);
+    try std.testing.expectEqual(@as(usize, 2), quoted.statement.catalog_ddl.routine_signature.?.len);
+    try std.testing.expectEqualStrings("a 'quoted' Ω; -- payload", quoted.statement.catalog_ddl.comment_value.?);
+    for ([_][]const u8{ "COMMENT ON FUNCTION IF EXISTS f() IS 'x'", "COMMENT ON PROCEDURE p() CASCADE IS 'x'", "COMMENT ON FUNCTION f() RESTRICT IS 'x'", "COMMENT ON FUNCTION f() IS 12", "COMMENT ON FUNCTION f() IS $1" }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(a, sql, .{}));
 }
