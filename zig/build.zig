@@ -663,6 +663,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .imports = production_antfly_imports,
         .optimize = optimize,
     });
+    b.step("lib-pdf-unit-test", "Run shared PDF unit tests without OCR integration").dependOn(&run_lib_pdf_tests.step);
     const pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
     pdf_test_step.dependOn(&run_lib_pdf_tests.step);
     pdf_test_step.dependOn(&pdf_integration.run.step);

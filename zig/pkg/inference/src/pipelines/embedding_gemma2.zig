@@ -389,6 +389,8 @@ pub const Options = struct {
     video_encoded: ?*@import("embedding_gemma2_video.zig").Encoded = null,
     /// Request-owned storage allocated outside a recyclable embedding stage.
     video_composition: ?*VideoComposition = null,
+    audio_decode_options: @import("audio.zig").DecodeOptions = .{},
+    max_audio_decode_working_bytes: usize = 64 * 1024 * 1024,
     task_type: []const u8 = "RETRIEVAL_DOCUMENT",
     dimensions: usize = 768,
     /// Expanded input limit, including prompts, wrappers, and media tokens.
@@ -2208,9 +2210,9 @@ fn cudaGroupRequest(group: Group, options: Options) !@import("../backends/sessio
                 tower = @max(tower, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
             },
             .audio => |bytes| {
-                const audio_tokens = try projector.embeddingGemma2EncodedAudioSequenceBound(bytes);
+                const audio_tokens = try projector.embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes, options.audio_decode_options);
                 tokens = try std.math.add(usize, tokens, audio_tokens);
-                host = @max(host, 64 * 1024 * 1024 + audio_tokens * 32 * 1024);
+                host = @max(host, try std.math.add(usize, options.max_audio_decode_working_bytes, 64 * 1024 * 1024 + audio_tokens * 32 * 1024));
                 tower = @max(tower, 512 * 1024 * 1024);
             },
             else => return error.BatchIncompatible,
@@ -2228,7 +2230,7 @@ fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, 
     for (group.content, parts) |part, *dest| dest.* = switch (part) {
         .text => |text| .{ .text = text },
         .image => |image| .{ .image = image },
-        .audio => |audio| .{ .audio = .{ .bytes = audio } },
+        .audio => |audio| .{ .audio = .{ .bytes = audio, .decode_options = options.audio_decode_options } },
         .raster, .video, .sampled_video, .pcm => return error.UnsupportedInput,
     };
     const prefix = if (group.title) |title| try std.fmt.allocPrint(a, "title: {s} | text: ", .{title}) else try a.dupe(u8, try encoder.taskPrefix(options.task_type));
@@ -2252,7 +2254,7 @@ fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, 
     defer permit.deinit();
     const before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, before, options);
-    var prepared = try @import("embedding_gemma2_content.zig").prepareResident(&managed.backend, a, tokenizer, prefix, parts, options.max_tokens, 64 * 1024 * 1024, control);
+    var prepared = try @import("embedding_gemma2_content.zig").prepareResident(&managed.backend, a, tokenizer, prefix, parts, options.max_tokens, options.max_audio_decode_working_bytes, control);
     defer prepared.deinit();
     try permit.retainForRun(.{ .batch = 1, .sequence = prepared.sequence, .input_bytes = input_bytes, .host_preprocess_bytes = prepared.sequence * 2 * @sizeOf(i64), .workspace_bytes = try cudaEncoderWorkspace(prepared.sequence, 1), .preprocessing_complete = true, .output_bytes = options.dimensions * @sizeOf(f32) });
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
@@ -4894,6 +4896,53 @@ test "embeddinggemma2 CUDA header admission scales text instead of reserving max
     try std.testing.expect(short.workspace_bytes < long.workspace_bytes);
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), short.host_preprocess_bytes);
     try std.testing.expect(short.workspace_bytes < 1536 * 1024 * 1024);
+}
+
+test "embeddinggemma2 CUDA one second WAV stays within production scratch admission" {
+    const a = std.testing.allocator;
+    const samples: [16000]f32 = @splat(0);
+    const wav = try @import("audio.zig").wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    defer a.free(wav);
+    const request = try cudaGroupRequest(.{ .content = &.{.{ .audio = wav }} }, .{ .max_audio_decode_working_bytes = @import("audio.zig").default_decode_working_bytes });
+    try std.testing.expect(request.sequence < 512);
+    try std.testing.expect(request.workspace_bytes < 768 * 1024 * 1024);
+    // Resident weights plus this request also fit the 4608 MiB device bucket.
+    try std.testing.expect(3195 * 1024 * 1024 + request.workspace_bytes < 4608 * 1024 * 1024);
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const limits = memory.Limits{ .backend_limit_bytes = 4608 * 1024 * 1024, .combined_limit_bytes = 6144 * 1024 * 1024, .scratch_limit_bytes = 768 * 1024 * 1024 };
+    var weights = try controller.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 3195 * 1024 * 1024 }, false);
+    defer weights.release();
+    var dummy: u8 = 0;
+    const session = Session{ .ptr = &dummy, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 512 * 1024 * 1024, .model_profile = .{ .hidden_size = 512, .embedding_gemma2_cuda = true }, .check_live_memory = false } };
+    var permit = try session.admit(request);
+    defer permit.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admit(.{ .batch = 1, .sequence = 8192, .workspace_bytes = 1536 * 1024 * 1024 }));
+}
+
+test "embeddinggemma2 CUDA audio admission preserves decode hint precedence" {
+    // MP3 decoders can scan past leading padding; admission cannot require a
+    // byte-zero signature when the caller supplies the encoded format.
+    const padded = "\x00\xff\xfb\x90\x00";
+    const group = Group{ .content = &.{.{ .audio = padded }} };
+    try std.testing.expectError(error.UnsupportedAudioFormat, cudaGroupRequest(group, .{}));
+    const hints = [_]@import("audio.zig").DecodeOptions{
+        .{ .format_hint = .mp3 },
+        .{ .mime_hint = "audio/mpeg" },
+        .{ .file_name_hint = "padded.mp3" },
+    };
+    for (hints) |hint| {
+        const request = try cudaGroupRequest(group, .{ .audio_decode_options = hint });
+        // Unknown duration keeps the full sequence and tower envelope.
+        try std.testing.expectEqual(@as(usize, 8192), request.sequence);
+        try std.testing.expect(request.workspace_bytes >= 512 * 1024 * 1024);
+    }
+    // A format hint must also override a misleading signature. Parsing this
+    // as WAV would fail before the hinted MP3 decoder could inspect it.
+    const misleading = Group{ .content = &.{.{ .audio = "RIFFxxxxWAVE" }} };
+    const request = try cudaGroupRequest(misleading, .{ .audio_decode_options = .{ .format_hint = .mp3 } });
+    try std.testing.expectEqual(@as(usize, 8192), request.sequence);
 }
 
 test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and retry after cancellation" {

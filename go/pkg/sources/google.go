@@ -102,11 +102,6 @@ func googleFileID(s string) bool {
 	return true
 }
 
-type GoogleHTTPError struct{ Status int }
-
-func (e *GoogleHTTPError) Error() string {
-	return fmt.Sprintf("Google source returned HTTP %d", e.Status)
-}
 func (c *GoogleConnector) get(ctx context.Context, client *http.Client, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base()+path, nil)
 	if err != nil {
@@ -114,11 +109,11 @@ func (c *GoogleConnector) get(ctx context.Context, client *http.Client, path str
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return googleRequestError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return &GoogleHTTPError{resp.StatusCode}
+		return googleResponseError(resp)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20+1))
 	if err != nil {
@@ -349,6 +344,12 @@ func (c *GoogleConnector) enumerateDrive(ctx context.Context, client *http.Clien
 	return nil
 }
 func (c *GoogleConnector) read(ctx context.Context, client *http.Client, r Request, o Item) ([]byte, error) {
+	return c.readWithin(ctx, client, r, o, maxImportSourceObjectBytes)
+}
+func (c *GoogleConnector) readWithin(ctx context.Context, client *http.Client, r Request, o Item, limit int) ([]byte, error) {
+	if limit < 0 || limit > maxImportSourceObjectBytes {
+		return nil, ErrInvalidInput
+	}
 	config, _ := decodeSourceConfig[GoogleConfig](r.Config)
 	if configString(o.Metadata, "mime_type") == "application/vnd.google-apps.spreadsheet" {
 		return nil, fmt.Errorf("%w: whole-workbook extraction is not supported; first-sheet CSV must not be presented as a complete workbook", ErrInvalidInput)
@@ -378,20 +379,20 @@ func (c *GoogleConnector) read(ctx context.Context, client *http.Client, r Reque
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, googleRequestError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, &GoogleHTTPError{resp.StatusCode}
+		return nil, googleResponseError(resp)
 	}
 	if c.ProviderName == ProviderGCS && resp.Header.Get("X-Goog-Generation") != o.Revision {
 		return nil, &RevisionChangedError{Expected: o.Revision, Actual: resp.Header.Get("X-Goog-Generation")}
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImportSourceObjectBytes+1))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > maxImportSourceObjectBytes {
+	if len(data) > limit {
 		return nil, fmt.Errorf("%w: source exceeds byte limit", ErrInvalidInput)
 	}
 	if c.ProviderName == ProviderGCS && int64(len(data)) != o.Size {
@@ -449,7 +450,11 @@ func (c *GoogleConnector) ValidateCachedSnapshot(ctx context.Context, r Request,
 	if c.ProviderName == ProviderGCS {
 		return c.get(ctx, client, "/b/"+url.PathEscape(config.Bucket)+"/o?maxResults=1&prefix="+url.QueryEscape(config.Prefix), &response)
 	}
-	return c.get(ctx, client, "/files/"+url.PathEscape(config.FolderID)+"?fields=id&supportsAllDrives=true", &response)
+	pinned, _, err := driveContentClient(client)
+	if err != nil {
+		return err
+	}
+	return c.get(ctx, pinned, "/files/"+url.PathEscape(config.FolderID)+"?fields=id&supportsAllDrives=true", &response)
 }
 func (c *GoogleConnector) OpenSource(ctx context.Context, r Request, o Item) (io.ReadCloser, error) {
 	client, err := c.client(ctx, r)
@@ -468,16 +473,8 @@ func (c *GoogleConnector) ValidateStagedSource(ctx context.Context, r Request, o
 		return err
 	}
 	if c.ProviderName == ProviderGoogleDrive {
-		var access struct {
-			Capabilities struct {
-				CanDownload bool `json:"canDownload"`
-			} `json:"capabilities"`
-		}
-		if err := c.get(ctx, client, "/files/"+url.PathEscape(configString(o.Metadata, "file_id"))+"?fields=id,capabilities&supportsAllDrives=true", &access); err != nil {
-			return err
-		}
-		if !access.Capabilities.CanDownload {
-			return fmt.Errorf("%w: Drive content access cannot be established for cached export", ErrInvalidInput)
+		if err := c.checkDriveContentAccess(ctx, client, configString(o.Metadata, "file_id"), ""); err != nil {
+			return fmt.Errorf("Drive content access cannot be established for cached export: %w", err)
 		}
 		return nil
 	}
@@ -509,7 +506,7 @@ func (*GoogleConnector) RuntimeAccess(context.Context, Request) (string, error) 
 func (*GoogleConnector) IsRetryable(err error) bool {
 	var e *GoogleHTTPError
 	if errors.As(err, &e) {
-		return e.Status == 429 || e.Status >= 500
+		return e.Retryable()
 	}
 	return false
 }
@@ -545,4 +542,37 @@ func (c *GoogleConnector) Read(ctx context.Context, r Request, o Item) ([]byte, 
 }
 func (c *GoogleConnector) CheckAccess(ctx context.Context, r Request, o Item) error {
 	return c.ValidateStagedSource(ctx, r, o)
+}
+
+// Resource capabilities express user permissions; OAuth scopes separately limit
+// the app. drive.file additionally requires this file to be authorized to the app.
+func (c *GoogleConnector) checkDriveContentAccess(ctx context.Context, client *http.Client, id, revision string) error {
+	if !googleFileID(id) {
+		return ErrInvalidInput
+	}
+	pinned, grant, err := driveContentClient(client)
+	if err != nil {
+		return err
+	}
+	var file struct {
+		ID            string `json:"id"`
+		Version       string `json:"version"`
+		AppAuthorized bool   `json:"isAppAuthorized"`
+		Capabilities  struct {
+			CanDownload bool `json:"canDownload"`
+		} `json:"capabilities"`
+	}
+	if err := c.get(ctx, pinned, "/files/"+url.PathEscape(id)+"?fields=id,version,isAppAuthorized,capabilities(canDownload)&supportsAllDrives=true", &file); err != nil {
+		return err
+	}
+	if file.ID != id || !file.Capabilities.CanDownload {
+		return fmt.Errorf("%w: Drive content download access revoked", ErrInvalidInput)
+	}
+	if !grant.allFiles && !file.AppAuthorized {
+		return &GoogleHTTPError{Status: 403, Reason: "file_not_authorized"}
+	}
+	if revision != "" && file.Version != revision {
+		return &RevisionChangedError{Expected: revision, Actual: file.Version}
+	}
+	return nil
 }
