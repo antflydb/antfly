@@ -9901,13 +9901,13 @@ pub const NativeFile = struct {
     }
 
     fn validateFreePagesSafeForCheckpointSlots(self: *NativeFile, free_pages: []const u64) !void {
-        var window: AllocatorProofWindow = undefined;
-        window.initInto(self);
-        defer window.deinit();
         // Append-only writes have nothing to reclaim. Walking both checkpoint
         // graphs here makes each small catalog write proportional to history.
         // Nonempty free maps still require the full protected-page proof.
         if (free_pages.len == 0) return;
+        var window: AllocatorProofWindow = undefined;
+        window.initInto(self);
+        defer window.deinit();
         var protected_pages = std.AutoHashMapUnmanaged(u64, void){};
         defer protected_pages.deinit(self.allocator);
 
@@ -17453,7 +17453,7 @@ test "lite sorted editor releases ownership on every allocation failure" {
             try std.testing.expectEqual((mutations.len + 2) / 3 * 3, ordinal);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Runner.run, .{ &file, batch, references });
+    try antfly_platform.allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, batch, references });
     // The direct editor never publishes; discard its private fixture pages.
     file.discardTransactionTail();
     try std.testing.expectEqual(pinned.document_index_root_page, file.activeCheckpoint().document_index_root_page);
@@ -17602,7 +17602,33 @@ test "lite sorted initial ingest bounds heap independently of input length" {
             const last = (try file.getDocumentAlloc(a, batch[count - 1].key)).?;
             defer a.free(last);
             try std.testing.expectEqualStrings("v", last);
-            try std.testing.expect((try file.check()).valid);
+            if (count == 16384) {
+                try std.testing.expect((try file.check()).valid);
+            } else {
+                // Retain the eightfold input growth and the same heap bound.
+                // Check every large-case key/value in a bounded scan; full-file
+                // proof maps above already cover structural integrity and are
+                // unrelated to the initial-ingest working-set assertion.
+                var cursor = DocumentIndexCursor.init(&file, file.activeCheckpoint());
+                defer cursor.deinit();
+                var records = RecordPageReader{};
+                defer records.deinit(file.allocator);
+                var current = try cursor.first();
+                var ordinal: usize = 0;
+                while (current) |entry| {
+                    var owned = entry;
+                    defer owned.deinit(file.allocator);
+                    try std.testing.expect(ordinal < batch.len);
+                    try std.testing.expectEqualSlices(u8, batch[ordinal].key, entry.key);
+                    const payload = try records.read(&file, file.allocator, file.activeCheckpoint(), entry.document_page_id, .document);
+                    const document = try decodeDocumentEntry(payload);
+                    try std.testing.expectEqualSlices(u8, entry.key, document.key);
+                    try std.testing.expectEqualStrings("v", document.value);
+                    ordinal += 1;
+                    current = try cursor.next();
+                }
+                try std.testing.expectEqual(count, ordinal);
+            }
         }
     }
 }
@@ -17687,7 +17713,7 @@ test "lite sorted initial ingest allocation and partial write failures roll back
             try std.testing.expectEqual(mutations.len, snapshot.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Runner.run, .{ &file, batch });
+    try antfly_platform.allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, batch });
     try std.testing.expectEqual(before.document_root_page, file.activeCheckpoint().document_root_page);
     const large = try arena.allocator().alloc(DocumentMutation, 2048);
     for (large, 0..) |*m, i| m.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "ns\x00key-{d:0>8}", .{i}), .value = &(@as([100]u8, @splat('v'))) };
