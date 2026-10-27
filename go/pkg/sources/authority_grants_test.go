@@ -98,7 +98,7 @@ func TestPermissionGrantDiscordModeratorCanEnumerateUnjoinedPrivateThread(t *tes
 			return 200, map[string]any{"flags": uint64(1 << 19)}
 		case "/guilds/1/threads/active":
 			return 200, map[string]any{"threads": []any{map[string]any{"id": "10", "guild_id": "1", "parent_id": "2", "type": 12}}}
-		case "/channels/2/threads/archived/public", "/channels/2/users/@me/threads/archived/private":
+		case "/channels/2/threads/archived/public", "/channels/2/threads/archived/private":
 			return 200, map[string]any{"threads": []any{}, "has_more": false}
 		case "/channels/2/messages":
 			return 200, []any{}

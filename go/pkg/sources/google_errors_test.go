@@ -151,6 +151,8 @@ func TestWorkspaceQuotaAuditsResumeSuccessfulScopeChecks(t *testing.T) {
 					}
 					var value any
 					switch r.URL.Path {
+					case "/messages":
+						value = map[string]any{}
 					case "/profile":
 						value = map[string]any{"emailAddress": "alice@example.com"}
 					case "/labels/INBOX":

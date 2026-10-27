@@ -62,9 +62,7 @@ func (c *CollaborationConnector) discordPreviewRefs(ctx context.Context, config 
 		}
 		return channel, &collaborationRef{Resource: ProviderDiscord, Container: id, ID: messages[0].ID}, nil
 	}
-	var active struct {
-		Threads []discordChannel `json:"threads"`
-	}
+	var active []discordChannel
 	activeLoaded := false
 	truncated := false
 	for _, id := range config.ChannelIDs {
@@ -79,12 +77,14 @@ func (c *CollaborationConnector) discordPreviewRefs(ctx context.Context, config 
 			continue
 		}
 		if !activeLoaded {
-			if err := c.get(ctx, ProviderDiscord, "/guilds/"+config.GuildID+"/threads/active", &active); err != nil {
+			var err error
+			active, err = c.discordActive(ctx, config.GuildID)
+			if err != nil {
 				return nil, err
 			}
 			activeLoaded = true
 		}
-		for _, thread := range active.Threads {
+		for _, thread := range active {
 			if thread.ParentID != id {
 				continue
 			}
@@ -96,7 +96,11 @@ func (c *CollaborationConnector) discordPreviewRefs(ctx context.Context, config 
 				return []collaborationRef{*ref}, nil
 			}
 		}
-		for _, suffix := range discordArchivePaths(channel.Type) {
+		paths, err := c.discordArchivePaths(ctx, config.GuildID, channel)
+		if err != nil {
+			return nil, err
+		}
+		for _, suffix := range paths {
 			var page struct {
 				Threads []discordChannel `json:"threads"`
 				HasMore bool             `json:"has_more"`

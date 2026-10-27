@@ -52,6 +52,7 @@ type CollaborationConfig struct {
 // tenant credentials; the standalone runner supplies environment-backed clients.
 // API base overrides are trusted application/test settings, never source config.
 type CollaborationConnector struct {
+	discordPass                                 *discordReadPass
 	Baseline                                    *Inventory
 	Cache                                       AcquisitionCache
 	ContentStore                                AcquisitionContentStore
@@ -84,11 +85,14 @@ type collaborationRef struct {
 	Thread     string `json:"thread,omitempty"`
 }
 type collaborationFile struct {
-	ID, Name, MIME, URL string
-	CanonicalURL        string
-	Revision            string
-	Data                []byte
-	driveFile           bool
+	ID, Name, MIME, URL               string
+	CanonicalURL                      string
+	Revision                          string
+	Data                              []byte
+	driveFile                         bool
+	gmailMessageID, gmailAttachmentID string
+	encodedData                       string
+	size                              int64
 }
 type collaborationMaterial struct {
 	Text       []byte
@@ -500,6 +504,13 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 				}
 			}
 			data := file.Data
+			if file.gmailMessageID != "" {
+				var err error
+				data, err = c.readGmailAttachment(ctx, file, remaining)
+				if err != nil {
+					return nil, err
+				}
+			}
 			if file.URL != "" {
 				var err error
 				data, err = c.downloadAttachment(ctx, file.URL)
@@ -513,6 +524,10 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 			extract := c.Extractor
 			if extract == nil {
 				extract = ExtractAttachmentText
+			}
+			if file.gmailMessageID != "" && file.MIME == "text/calendar" {
+				metadata["calendar_invitation"] = true
+				metadata["calendar_uids"] = calendarInvitationUIDs(data)
 			}
 			text, err := extract(ctx, file.Name, file.MIME, data)
 			if err != nil {
@@ -543,6 +558,8 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 			items = append(items, input)
 		}
 	}
+	// Lazy Gmail invitations contribute relationship metadata after acquisition.
+	items[0] = makeInput(ref, m.Text, metadata)
 	return items, nil
 }
 func (c *CollaborationConnector) load(ctx context.Context, config CollaborationConfig, ref collaborationRef) (collaborationMaterial, error) {
@@ -637,6 +654,7 @@ func (c *CollaborationConnector) CheckAccess(ctx context.Context, r Request, ite
 	return err
 }
 func (c *CollaborationConnector) ValidateInventory(ctx context.Context, r Request, inventory Inventory) error {
+	defer c.beginDiscordReadPass()()
 	c.scopeChecks = nil
 	c.calendarRoles = nil
 	if err := c.Validate(ctx, r); err != nil {
@@ -679,6 +697,9 @@ func (c *CollaborationConnector) ValidateInventory(ctx context.Context, r Reques
 		}
 	case ProviderGoogleWorkspace:
 		if config.Resource == "gmail" {
+			if err := c.checkGmailContentAccess(ctx); err != nil {
+				return err
+			}
 			_, err := c.gmailAccount(ctx)
 			if err != nil {
 				return err

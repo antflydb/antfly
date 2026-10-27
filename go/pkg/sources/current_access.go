@@ -69,6 +69,7 @@ func (c *CollaborationConnector) AuthorizeInventory(ctx context.Context, r Reque
 	c.scopeChecks = map[string]time.Time{}
 	c.calendarRoles = nil
 	c.observedScopes = nil
+	defer c.beginDiscordReadPass()()
 	c.accessAuditWindow = time.Duration(policy.TTL) * time.Second
 	defer func() { c.accessAuditWindow = 0 }()
 	started := time.Now()
@@ -173,6 +174,9 @@ func (c *CollaborationConnector) authorizeInventoryOnce(ctx context.Context, r R
 		}
 	case ProviderGoogleWorkspace:
 		if config.Resource == "gmail" {
+			if err := c.checkGmailContentAccess(ctx); err != nil {
+				return err
+			}
 			if err := c.checkedAuthority("gmail-account", func() error { _, err := c.gmailAccount(ctx); return err }); err != nil {
 				return err
 			}
@@ -193,6 +197,9 @@ func (c *CollaborationConnector) authorizeInventoryOnce(ctx context.Context, r R
 }
 
 func (c *CollaborationConnector) checkedAuthority(key string, check func() error) error {
+	if c.scopeChecks == nil {
+		c.scopeChecks = map[string]time.Time{}
+	}
 	if time.Since(c.scopeChecks[key]) <= c.accessCheckWindow() {
 		return nil
 	}
@@ -201,4 +208,21 @@ func (c *CollaborationConnector) checkedAuthority(key string, check func() error
 	}
 	c.scopeChecks[key] = time.Now()
 	return nil
+}
+
+// Gmail search is unavailable to gmail.metadata credentials. A one-result,
+// ID-only query proves content scope even for an empty mailbox, without reading
+// message bodies or trusting persisted consent/token metadata. Never cache the
+// HTTP response; share only successful proof within this bounded operation.
+func (c *CollaborationConnector) checkGmailContentAccess(ctx context.Context) error {
+	return c.checkedAuthority("gmail-content", func() error {
+		live := *c
+		live.Cache = nil
+		var result struct {
+			Messages []struct {
+				ID string `json:"id"`
+			} `json:"messages"`
+		}
+		return live.get(ctx, "gmail", "/messages?"+url.Values{"q": {"in:anywhere"}, "maxResults": {"1"}, "fields": {"messages/id"}, "includeSpamTrash": {"true"}}.Encode(), &result)
+	})
 }

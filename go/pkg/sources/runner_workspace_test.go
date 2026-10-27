@@ -46,6 +46,9 @@ func newWorkspaceRunnerFixture(t *testing.T) *workspaceRunnerFixture {
 		case "/gmail/labels/INBOX":
 			return 200, map[string]any{"id": "INBOX"}
 		case "/gmail/messages":
+			if r.URL.Query().Get("q") != "" {
+				return 200, map[string]any{}
+			}
 			f.listings++
 			return 200, map[string]any{"messages": []any{map[string]any{"id": "message1"}}}
 		case "/gmail/history":

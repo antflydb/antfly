@@ -22,7 +22,51 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// Each acquisition/audit owns its authority cache. Successful metadata is
+// shared only within that operation and its access-check window; a later audit
+// always starts fresh. This avoids guild calls per message, thread or channel.
+type discordReadPass struct {
+	authorities map[string]*discordAuthority
+	channels    map[string]discordCachedChannel
+	active      map[string]discordActiveThreads
+}
+type discordCachedChannel struct {
+	channel   discordChannel
+	checkedAt time.Time
+}
+type discordActiveThreads struct {
+	threads   []discordChannel
+	checkedAt time.Time
+}
+
+func (c *CollaborationConnector) beginDiscordReadPass() func() {
+	if c.ProviderName != ProviderDiscord || c.discordPass != nil {
+		return func() {}
+	}
+	c.discordPass = &discordReadPass{authorities: map[string]*discordAuthority{}, channels: map[string]discordCachedChannel{}, active: map[string]discordActiveThreads{}}
+	return func() { c.discordPass = nil }
+}
+func (c *CollaborationConnector) discordActive(ctx context.Context, guild string) ([]discordChannel, error) {
+	if c.discordPass != nil {
+		if entry, ok := c.discordPass.active[guild]; ok && time.Since(entry.checkedAt) < c.accessCheckWindow() {
+			return entry.threads, nil
+		}
+	}
+	started := time.Now()
+	var result struct {
+		Threads []discordChannel `json:"threads"`
+	}
+	if err := c.get(ctx, ProviderDiscord, "/guilds/"+guild+"/threads/active", &result); err != nil {
+		return nil, err
+	}
+	if c.discordPass != nil {
+		c.discordPass.active[guild] = discordActiveThreads{result.Threads, started}
+	}
+	return result.Threads, nil
+}
 
 type discordChannel struct {
 	Name       string `json:"name"`
@@ -42,10 +86,19 @@ type discordChannel struct {
 }
 
 func (c *CollaborationConnector) discordChannel(ctx context.Context, id string) (discordChannel, error) {
+	if c.discordPass != nil {
+		if entry, ok := c.discordPass.channels[id]; ok && time.Since(entry.checkedAt) < c.accessCheckWindow() {
+			return entry.channel, nil
+		}
+	}
+	started := time.Now()
 	var channel discordChannel
 	err := c.get(ctx, ProviderDiscord, "/channels/"+url.PathEscape(id), &channel)
 	if err == nil && channel.ID != id {
 		err = fmt.Errorf("Discord channel identity changed")
+	}
+	if err == nil && c.discordPass != nil {
+		c.discordPass.channels[id] = discordCachedChannel{channel, started}
 	}
 	return channel, err
 }
@@ -107,11 +160,18 @@ type discordAuthority struct {
 	roles          map[string]bool
 	permissions    uint64
 	messageContent bool
+	checkedAt      time.Time
 }
 
 // Guild identity, role membership and application flags are shared by every
 // channel in a resource page. Channel overwrites are evaluated locally.
 func (c *CollaborationConnector) discordAuthority(ctx context.Context, guild string) (*discordAuthority, error) {
+	if c.discordPass != nil {
+		if authority := c.discordPass.authorities[guild]; authority != nil && time.Since(authority.checkedAt) < c.accessCheckWindow() {
+			return authority, nil
+		}
+	}
+	started := time.Now()
 	var me struct {
 		ID string `json:"id"`
 	}
@@ -155,7 +215,11 @@ func (c *CollaborationConnector) discordAuthority(ctx context.Context, guild str
 		return nil, err
 	}
 
-	return &discordAuthority{guild: guild, botID: me.ID, roles: memberRoles, permissions: permissions, messageContent: app.Flags&((1<<18)|(1<<19)) != 0}, nil
+	authority := &discordAuthority{guild: guild, botID: me.ID, roles: memberRoles, permissions: permissions, messageContent: app.Flags&((1<<18)|(1<<19)) != 0, checkedAt: started}
+	if c.discordPass != nil {
+		c.discordPass.authorities[guild] = authority
+	}
+	return authority, nil
 }
 
 func (authority *discordAuthority) check(channel discordChannel) error {
@@ -218,29 +282,44 @@ func (authority *discordAuthority) checkedPermissions(channel discordChannel) (u
 	return permissions, nil
 }
 
-func discordArchivePaths(channelType int) []string {
+func (c *CollaborationConnector) discordArchivePaths(ctx context.Context, guild string, parent discordChannel) ([]string, error) {
 	paths := []string{"threads/archived/public"}
 	// Private threads exist only under guild text channels, not forums, media,
 	// or announcement channels.
-	if channelType == 0 {
-		paths = append(paths, "users/@me/threads/archived/private")
+	if parent.Type == 0 {
+		authority, err := c.discordAuthority(ctx, guild)
+		if err != nil {
+			return nil, err
+		}
+		permissions, err := authority.checkedPermissions(parent)
+		if err != nil {
+			return nil, err
+		}
+		if permissions&(8|1<<34) != 0 {
+			paths = append(paths, "threads/archived/private")
+		} else {
+			paths = append(paths, "users/@me/threads/archived/private")
+		}
 	}
-	return paths
+	return paths, nil
 }
 func (c *CollaborationConnector) discordThreads(ctx context.Context, config CollaborationConfig, parent discordChannel) ([]string, error) {
+	defer c.beginDiscordReadPass()()
 	ids := []string{}
-	var active struct {
-		Threads []discordChannel `json:"threads"`
-	}
-	if err := c.get(ctx, ProviderDiscord, "/guilds/"+config.GuildID+"/threads/active", &active); err != nil {
+	active, err := c.discordActive(ctx, config.GuildID)
+	if err != nil {
 		return nil, err
 	}
-	for _, thread := range active.Threads {
+	for _, thread := range active {
 		if thread.ParentID == parent.ID {
 			ids = append(ids, thread.ID)
 		}
 	}
-	for _, suffix := range discordArchivePaths(parent.Type) {
+	paths, err := c.discordArchivePaths(ctx, config.GuildID, parent)
+	if err != nil {
+		return nil, err
+	}
+	for _, suffix := range paths {
 		before := ""
 		seen := map[string]bool{}
 		for {
@@ -286,6 +365,7 @@ func (c *CollaborationConnector) discordThreads(ctx context.Context, config Coll
 	return ids, nil
 }
 func (c *CollaborationConnector) discordRefs(ctx context.Context, config CollaborationConfig) ([]collaborationRef, error) {
+	defer c.beginDiscordReadPass()()
 	if config.preview {
 		return c.discordPreviewRefs(ctx, config)
 	}

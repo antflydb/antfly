@@ -428,3 +428,24 @@ Discord private-thread checks evaluate effective parent-channel permissions firs
 administrators and MANAGE_THREADS moderators need no membership lookup; ordinary
 readers still require explicit membership. Channel overwrites can remove moderator
 rights, and ordinary history/message-content requirements still apply.
+
+Live Gmail body authority is checked with one `messages.list` search request,
+`q=in:anywhere`, `maxResults=1`, and `fields=messages/id`. Google excludes the
+`gmail.metadata` grant from search, so successful profile and label reads alone
+cannot renew email body access. The response contains no bodies or headers, works
+for an empty mailbox, bypasses acquisition caches, and is shared only for the
+current bounded permission pass. Later audits always repeat the proof. Provider
+429/503 failures retain their retry contract without extending a published lease.
+See https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list.
+
+Gmail attachment materialization defers bytes until after preview selection and
+remaining parent budgets. Full synchronization retains all selected attachments,
+and invitation UID relationships remain part of canonical metadata. Known sizes
+and base64 decoded sizes are checked before download/allocation respectively.
+
+Discord acquisition and audits use operation-scoped authority/channel/active-thread
+caches, bounded by the existing access-check window. No cached authority survives
+the operation. Effective MANAGE_THREADS or administrator access selects the full
+private archive endpoint and timestamp cursor; ordinary readers retain joined-only
+archives and snowflake cursors. Both normal enumeration and deletion reconciliation
+use the same selection, preserving moderator-readable messages after archiving.

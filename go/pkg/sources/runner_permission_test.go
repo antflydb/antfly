@@ -66,6 +66,9 @@ func TestStandalonePermissionLeaseUsesAuditStartAndBudget(t *testing.T) {
 						}
 						return 200, map[string]any{"id": "INBOX"}
 					case "/gmail/messages":
+						if r.URL.Query().Get("q") != "" {
+							return 200, map[string]any{}
+						}
 						listings++
 						return 200, map[string]any{"messages": []any{}}
 					default:

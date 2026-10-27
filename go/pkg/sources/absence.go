@@ -47,6 +47,7 @@ func (c *CollaborationConnector) ValidateAbsentSources(ctx context.Context, r Re
 	fresh := *c
 	fresh.Cache = ScopedAcquisitionCache(c.Cache, "absences/v1/"+c.hydrationSelection(r)+"/"+acquisitionKey(string(encoded)))
 	fresh.Baseline = nil
+	fresh.discordPass = nil
 	fresh.scopeChecks = nil
 	fresh.observedScopes = nil
 	var refs []collaborationRef

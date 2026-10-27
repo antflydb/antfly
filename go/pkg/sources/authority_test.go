@@ -248,6 +248,9 @@ func TestWorkspacePermissionAuditResumesLabelChecksAfterRateLimit(t *testing.T) 
 	calls := map[string]int{}
 	c := &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, Services: []string{"gmail"}, GmailBase: "https://fixture.test"}
 	c.HTTPClient = fixtureClient(t, func(r *http.Request) (int, any) {
+		if r.URL.Path == "/messages" && r.URL.Query().Get("q") != "" {
+			return 200, map[string]any{}
+		}
 		calls[r.URL.Path]++
 		if strings.HasSuffix(r.URL.Path, "/profile") {
 			return 200, map[string]any{"emailAddress": "alice@example.com"}

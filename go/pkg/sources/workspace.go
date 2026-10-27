@@ -238,6 +238,23 @@ func (c *CollaborationConnector) gmailLoad(ctx context.Context, config Collabora
 		if attachment && !config.Attachments && part.MIME != "text/calendar" {
 			return nil
 		}
+		if attachment && config.Attachments {
+			if config.preview && len(files) >= PreviewItemLimit-1 {
+				return nil
+			}
+			if len(files) >= 1000 {
+				return fmt.Errorf("Gmail attachment count exceeds limit")
+			}
+			id := part.PartID
+			if id == "" {
+				id = part.Body.AttachmentID
+			}
+			if id == "" {
+				return fmt.Errorf("Gmail attachment identity missing")
+			}
+			files = append(files, collaborationFile{ID: id, Name: part.Filename, MIME: part.MIME, gmailMessageID: ref.ID, gmailAttachmentID: part.Body.AttachmentID, encodedData: part.Body.Data, size: part.Body.Size})
+			return nil
+		}
 		data := []byte{}
 		if part.Body.Size > maxImportSourceObjectBytes {
 			return fmt.Errorf("Gmail MIME part exceeds byte limit")
@@ -273,16 +290,7 @@ func (c *CollaborationConnector) gmailLoad(ctx context.Context, config Collabora
 			meta["calendar_invitation"] = true
 			meta["calendar_uids"] = calendarInvitationUIDs(data)
 		}
-		if attachment && config.Attachments {
-			id := part.PartID
-			if id == "" {
-				id = part.Body.AttachmentID
-			}
-			if id == "" {
-				return fmt.Errorf("Gmail attachment identity missing")
-			}
-			files = append(files, collaborationFile{ID: id, Name: part.Filename, MIME: part.MIME, Data: data})
-		} else if !attachment && (part.MIME == "text/plain" || part.MIME == "text/html" || part.MIME == "text/calendar") {
+		if !attachment && (part.MIME == "text/plain" || part.MIME == "text/html" || part.MIME == "text/calendar") {
 			for _, header := range part.Headers {
 				if strings.EqualFold(header.Name, "Content-Type") {
 					_, params, err := mime.ParseMediaType(header.Value)
@@ -544,4 +552,32 @@ func (c *CollaborationConnector) validateRef(ctx context.Context, config Collabo
 		}
 	}
 	return fmt.Errorf("resource is outside selected source scope")
+}
+
+// Attachment identity selection is separate from bytes. Known sizes are checked
+// before provider reads; base64 expansion is checked before allocating decoded
+// bytes, and the caller accounts for extraction against the same parent budget.
+func (c *CollaborationConnector) readGmailAttachment(ctx context.Context, file collaborationFile, limit int) ([]byte, error) {
+	if file.size < 0 || file.size > int64(limit) {
+		return nil, fmt.Errorf("%w: Gmail attachment exceeds remaining byte budget", ErrInvalidInput)
+	}
+	encoded := file.encodedData
+	if file.gmailAttachmentID != "" {
+		var body struct {
+			Data string `json:"data"`
+			Size int64  `json:"size"`
+		}
+		if err := c.get(ctx, "gmail", "/messages/"+url.PathEscape(file.gmailMessageID)+"/attachments/"+url.PathEscape(file.gmailAttachmentID), &body); err != nil {
+			return nil, err
+		}
+		if body.Size < 0 || body.Size > int64(limit) {
+			return nil, fmt.Errorf("%w: Gmail attachment exceeds remaining byte budget", ErrInvalidInput)
+		}
+		encoded = body.Data
+	}
+	encoded = strings.TrimRight(encoded, "=")
+	if base64.RawURLEncoding.DecodedLen(len(encoded)) > limit {
+		return nil, fmt.Errorf("%w: Gmail attachment exceeds remaining byte budget", ErrInvalidInput)
+	}
+	return base64.RawURLEncoding.DecodeString(encoded)
 }

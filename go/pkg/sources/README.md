@@ -276,3 +276,20 @@ renew a lease. Slack bot tokens require include_threads:false for channel source
 Calendar confidential visibility is private. Extractor v3 invalidates older
 visibility metadata. Discord moderators use effective parent-channel permissions;
 ordinary private-thread readers still require explicit membership.
+
+Gmail permission audits prove current body-reading authority through one live,
+one-result, ID-only search request. Gmail forbids search queries for metadata-only
+credentials, so a profile/label grant cannot renew retained bodies. Proof responses
+are never persisted, even with acquisition caching enabled. Successful proof is
+shared only within the current bounded audit, including empty mailboxes.
+
+Gmail attachment bytes are acquired lazily after preview selection and remaining
+parent byte limits. Previews read at most eight attachments; full sync retains all
+selected attachments and Calendar invitation relationships. Known oversized parts
+fail before download, and base64 size limits apply before decoded allocation.
+
+Discord acquisition and audits share guild authority, channel metadata and active
+threads only within the current operation and access-check window. New audits
+always recheck live grants. Moderators use the complete private archive endpoint;
+ordinary readers use joined private archives. Complete archive pagination and
+absence reconciliation retain accessible messages after a thread is archived.

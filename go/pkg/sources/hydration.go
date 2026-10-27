@@ -252,6 +252,12 @@ func (c *CollaborationConnector) authorizeRetained(ctx context.Context, config C
 	return c.authorizeCurrent(ctx, config, ref, item, true)
 }
 func (c *CollaborationConnector) authorizeCurrent(ctx context.Context, config CollaborationConfig, ref collaborationRef, item Item, pinRevision bool) error {
+	defer c.beginDiscordReadPass()()
+	if ref.Resource == "gmail" {
+		if err := c.checkGmailContentAccess(ctx); err != nil {
+			return err
+		}
+	}
 	key := refKey(ref.Resource, ref.Container, "")
 	if c.scopeChecks == nil {
 		c.scopeChecks = map[string]time.Time{}
