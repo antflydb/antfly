@@ -2831,7 +2831,7 @@ portable state validation and final readiness without scratch exhaustion. Lite
 owner tests exercise static materialization, curation, reopen and unmerge.
 
 The incremental single-pin regression adds one pair with 1,000 and 6,000 unrelated
-pins. Both cases complete in one owner turn with nine writes and 13 scans;
+pins. Both cases complete in one owner turn with nine writes and 11 scans;
 the previous whole-profile repair needed 2,025/12,142 writes and 24/141 turns.
 A separate full-composition reference checks 1,536 seed queries during 48
 interleaved routing edits and partial owner turns. It also exercises a missed
