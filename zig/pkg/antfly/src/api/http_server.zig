@@ -21328,6 +21328,7 @@ pub const ApiHttpServer = struct {
         join: ?distributed_join.ParsedSupportedJoinRequest,
         dispatch: BoundQueryDispatch,
         revision: ?u64 = null,
+        bound_body: ?[]const u8 = null,
 
         pub fn deinit(self: *@This()) void {
             self.arena.deinit();
@@ -21400,7 +21401,11 @@ pub const ApiHttpServer = struct {
             if (definition.storage_engine != .object) break :bound null;
             break :bound .{ .table_id = definition.table_id, .generation = definition.object_storage_generation };
         } else null;
-        return .{ .arena = arena, .physical = physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context, .incarnation = incarnation }, .revision = result.revision };
+        // Graph readers compare physical identities. Bind only this proved
+        // full primary target; never infer a foreign route from its basename.
+        const primary_names: []const []const u8 = if (target.isDefault()) &.{ primary_key, target.table } else &.{primary_key};
+        const bound_body = if (primary_foreign or parsed_request.value.graph_queries == null) null else try @import("graph_primary_table_binding.zig").bind(a, body, primary_names, physical);
+        return .{ .arena = arena, .physical = physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context, .incarnation = incarnation }, .revision = result.revision, .bound_body = bound_body };
     }
 
     /// Select borrowed physical records before collecting per-table status or
@@ -22359,7 +22364,7 @@ pub const ApiHttpServer = struct {
         var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
         if (bridge) |*value| value.table_name = binding.physical;
-        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
+        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, binding.bound_body orelse body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
     }
 
     /// The native catalog is the authority for existence and incarnation. This
@@ -22616,10 +22621,10 @@ pub const ApiHttpServer = struct {
                     const policy = try resolveEffectiveRowFilterJson(a, identity, binding.physical);
                     defer if (policy) |filter| a.free(filter);
                     if (runner.overlay and policy != null) return error.UnsupportedQueryRequest;
-                    var native_query = leaf_query;
+                    var native_query = binding.bound_body orelse leaf_query;
                     const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(scratch, bound.schema_json);
                     if (bound.storage.engine != .object and external == null) {
-                        var request = try std.json.parseFromSliceLeaky(std.json.Value, scratch, leaf_query, .{});
+                        var request = try std.json.parseFromSliceLeaky(std.json.Value, scratch, native_query, .{ .parse_numbers = false });
                         if (!request.object.contains("remote_snapshot")) {
                             var store = try @import("lake_index_store.zig").Store.openNative(scratch, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                             defer store.deinit();
@@ -22966,7 +22971,7 @@ pub const ApiHttpServer = struct {
 
             const line_label = response_label orelse binding.label;
             const line_join = if (binding.join) |*value| value else bound_join;
-            var query_response: query_api.QueryResponse = if (self.tryObjectTableQuery(table_name, line, line_identity, cancellation, line_label, line_join, &catalog_resolver, binding.dispatch) catch |err| return self.publicQueryOperationErrorResponse(table_name, line, err)) |value| object: {
+            var query_response: query_api.QueryResponse = if (self.tryObjectTableQuery(table_name, binding.bound_body orelse line, line_identity, cancellation, line_label, line_join, &catalog_resolver, binding.dispatch) catch |err| return self.publicQueryOperationErrorResponse(table_name, line, err)) |value| object: {
                 var response = value;
                 if (response.status != 200) return response;
                 defer response.deinit(self.alloc);
@@ -22979,7 +22984,7 @@ pub const ApiHttpServer = struct {
                     self.alloc,
                     source,
                     table_name,
-                    line,
+                    binding.bound_body orelse line,
                     row_filter_json,
                     line_identity,
                     if (cancellation) |value| value.token() else null,
@@ -58254,6 +58259,57 @@ test "system catalog restore listing shares one projection and honors legacy ren
     defer denied_json.deinit();
     try std.testing.expectEqual(@as(usize, 0), denied_json.value.object.get("jobs").?.array.items.len);
     try std.testing.expectEqual(@as(usize, 2), fake.snapshots);
+}
+
+test "system catalog graph primary qualifiers bind full target without namespace collisions" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        expected: system_catalog.Target,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(input == .resolve_many);
+            try std.testing.expectEqual(@as(usize, 1), input.resolve_many.targets.len);
+            const target = input.resolve_many.targets[0];
+            try std.testing.expectEqualStrings(self.expected.database, target.database);
+            try std.testing.expectEqualStrings(self.expected.namespace, target.namespace);
+            try std.testing.expectEqualStrings(self.expected.table, target.table);
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 10, .name = "table:primary" }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 7, .tables = &tables }, .{});
+        }
+    };
+    for ([_]system_catalog.Target{ .{ .table = "docs" }, .{ .database = "tenant", .namespace = "blue", .table = "docs" } }) |primary| {
+        var fake = Fake{ .expected = primary };
+        var server = ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, null, null);
+        defer server.deinit();
+        const key = try primary.resourceNameAlloc(a);
+        defer a.free(key);
+        const foreign = try (system_catalog.Target{ .database = "tenant", .namespace = "red", .table = "docs" }).resourceNameAlloc(a);
+        defer a.free(foreign);
+        const body = try std.json.Stringify.valueAlloc(a, .{ .graph_queries = .{ .q = .{
+            .index = "graph",
+            .match = .{
+                .anchor = "a",
+                .nodes = .{ .a = .{ .table = key }, .b = .{ .table = foreign }, .c = .{ .table = "docs" }, .d = .{ .table = "table:primary" }, .e = struct {}{} },
+                .edges = &[_]struct { from: []const u8, to: []const u8 }{ .{ .from = "a", .to = "b" }, .{ .from = "a", .to = "c" }, .{ .from = "a", .to = "d" }, .{ .from = "a", .to = "e" } },
+            },
+            .@"return" = .{ .bindings = &[_][]const u8{"a"} },
+        } } }, .{});
+        defer a.free(body);
+        var identity: ?AuthenticatedIdentity = null;
+        var bound = try server.bindCatalogQuery(a, .{}, key, body, &identity, null);
+        defer bound.deinit();
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bound.bound_body.?, .{});
+        defer parsed.deinit();
+        const nodes = parsed.value.object.get("graph_queries").?.object.get("q").?.object.get("match").?.object.get("nodes").?.object;
+        try std.testing.expectEqualStrings("table:primary", nodes.get("a").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings(foreign, nodes.get("b").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings(if (primary.isDefault()) "table:primary" else "docs", nodes.get("c").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings("table:primary", nodes.get("d").?.object.get("table").?.string);
+        try std.testing.expect(!nodes.get("e").?.object.contains("table"));
+    }
 }
 
 test "system catalog binds primary and nested joins once without conflating literal names" {
