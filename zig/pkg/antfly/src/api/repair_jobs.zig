@@ -465,8 +465,15 @@ pub const Store = struct {
         total.missing_source_docs +|= pass.missing_source_docs;
         total.failed +|= pass.failed;
         total.unsupported +|= pass.unsupported;
-        total.unresolved +|= pass.unresolved;
-        total.in_progress +|= pass.in_progress;
+        if (std.mem.eql(u8, previous.target, "index") and previous.index != null) {
+            // Polling one rebuild observes the same debt until publication.
+            // These are current-state gauges, not repeated units of work.
+            total.unresolved = pass.unresolved;
+            total.in_progress = pass.in_progress;
+        } else {
+            total.unresolved +|= pass.unresolved;
+            total.in_progress +|= pass.in_progress;
+        }
         total.indexes_rebuilt +|= pass.indexes_rebuilt;
         // These are job-level state gauges for the one named index, not work
         // counters. A bounded retry may observe the same index repeatedly;
@@ -1107,17 +1114,10 @@ pub const Store = struct {
 };
 
 const running_lease_timeout_ms: u64 = 300_000;
-const retry_base_ms: u64 = 250;
-const retry_max_ms: u64 = 30 * std.time.ms_per_s;
 const pending_maintenance_scan_limit: usize = 64;
 
 fn retryDelayMs(job_id: u64, attempt_id: u64) u64 {
-    const shift: u6 = @intCast(@min(attempt_id, 16));
-    const exponential = @min(retry_max_ms, retry_base_ms *| (@as(u64, 1) << shift));
-    var hasher = std.hash.Wyhash.init(job_id);
-    hasher.update(std.mem.asBytes(&attempt_id));
-    const jitter_span = @max(@as(u64, 1), exponential / 4);
-    return @min(retry_max_ms, exponential +| (hasher.final() % jitter_span));
+    return @import("job_retry.zig").retryDelayMs(job_id, attempt_id);
 }
 
 fn jobStateTransitionTokenMatches(current: JobState, expected: JobState) bool {
@@ -1447,6 +1447,8 @@ test "index repair job keeps degradation gauges as snapshots across retries" {
     try std.testing.expectEqualStrings("succeeded", terminal.value.phase);
     try std.testing.expectEqual(@as(u64, 1), terminal.value.result.indexes_degraded_before);
     try std.testing.expectEqual(@as(u64, 0), terminal.value.result.indexes_degraded_after);
+    try std.testing.expectEqual(@as(u64, 0), terminal.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), terminal.value.result.unresolved);
 }
 
 test "durable cancellation retries transient failures with backoff" {

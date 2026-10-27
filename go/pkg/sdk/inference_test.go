@@ -1101,6 +1101,65 @@ func TestClient_Generate_Speculation(t *testing.T) {
 	assert.Nil(t, withoutSpeculation.Speculation)
 }
 
+func TestClient_PrepareChatContext_ForwardsPolicyAndParsesDiagnostics(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/ai/v1/generate/context/prepare", r.URL.Path)
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		assert.Equal(t, "inspect", body["mode"])
+		assert.Equal(t, "none", body["tool_choice"])
+		assert.Equal(t, map[string]any{"enable_thinking": false}, body["chat_template_kwargs"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"messages":[],"context":{"policy":"inspect","applied":false,"original_input_tokens":0,"effective_input_tokens":0,"target_input_tokens":128,"reserved_output_tokens":16,"dropped_messages":0,"retained_messages":0,"retained_from_message":0,"checkpoint_applied":false,"windowed":false,"compacted":false},"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	toolChoice := oapi.InferenceToolChoice{}
+	require.NoError(t, toolChoice.FromInferenceToolChoice0(oapi.InferenceToolChoice0None))
+	enableThinking := false
+	response, err := client.PrepareChatContext(context.Background(), oapi.InferenceContextPrepareRequest{
+		Model:              "gemma",
+		Mode:               oapi.InferenceContextPrepareRequestModeInspect,
+		ToolChoice:         toolChoice,
+		ChatTemplateKwargs: oapi.InferenceGenerateChatTemplateKwargs{EnableThinking: &enableThinking},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 128, response.Context.TargetInputTokens)
+}
+
+func TestClient_Generate_FailsClosedWithoutManagedPolicyAttestation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"legacy","object":"chat.completion","created":1,"model":"gemma","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	_, err = client.Generate(context.Background(), "gemma", []oapi.InferenceChatMessage{NewUserMessage("hello")}, &GenerateConfig{
+		ContextManagement: &oapi.InferenceContextManagement{Mode: oapi.InferenceContextManagementModeReject},
+	})
+	require.ErrorContains(t, err, "did not attest the requested context policy")
+}
+
+func TestInferenceRequests_PreserveDeveloperInstructions(t *testing.T) {
+	messages := []oapi.InferenceChatMessage{NewChatMessage(oapi.InferenceRoleDeveloper, "Preserve these instructions."), NewUserMessage("hello")}
+	for _, request := range []any{
+		oapi.InferenceGenerateRequest{Model: "gemma", Messages: messages},
+		oapi.InferenceContextPrepareRequest{Model: "gemma", Messages: messages},
+	} {
+		encoded, err := json.Marshal(request)
+		require.NoError(t, err)
+		var decoded struct {
+			Messages []oapi.InferenceChatMessage `json:"messages"`
+		}
+		require.NoError(t, json.Unmarshal(encoded, &decoded))
+		require.Equal(t, oapi.InferenceRoleDeveloper, decoded.Messages[0].Role)
+	}
+}
+
 func TestInferenceGenerateRequest_OmitsSamplingAndSpeculationDefaults(t *testing.T) {
 	encoded, err := json.Marshal(oapi.InferenceGenerateRequest{
 		Model:    "target",
@@ -1405,4 +1464,37 @@ func TestGeneratedDecisionsPreserveMultimodalEvidence(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestContextToolResultOutcomesDistinguishFirstMessageFromArchivedEvidence(t *testing.T) {
+	// Reused IDs need provenance: index zero is a real input message, while
+	// omitted index means evidence from the earlier checkpoint.
+	wire := `{"tool_results":[{"tool_call_id":"reused","disposition":"retained","message_index":0},{"tool_call_id":"reused","disposition":"summarized"}]}`
+	var diagnostics oapi.InferenceContextDiagnostics
+	require.NoError(t, json.Unmarshal([]byte(wire), &diagnostics))
+	require.Len(t, diagnostics.ToolResults, 2)
+	require.NotNil(t, diagnostics.ToolResults[0].MessageIndex)
+	assert.Equal(t, 0, *diagnostics.ToolResults[0].MessageIndex)
+	assert.Nil(t, diagnostics.ToolResults[1].MessageIndex)
+	encoded, err := json.Marshal(diagnostics.ToolResults)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[{"tool_call_id":"reused","disposition":"retained","message_index":0},{"tool_call_id":"reused","disposition":"summarized"}]`, string(encoded))
+}
+
+func TestAnthropicGeneratorPreservesWorkspaceAndImageBudget(t *testing.T) {
+	original := `{"provider":"anthropic","model":"future-claude","workspace_id":"workspace","max_image_input_tokens":8192}`
+	var config oapi.GeneratorConfig
+	require.NoError(t, json.Unmarshal([]byte(original), &config))
+	encoded, err := json.Marshal(config)
+	require.NoError(t, err)
+	require.JSONEq(t, original, string(encoded))
+}
+
+func TestGenerationStreamPreservesNativeThinkingMetadata(t *testing.T) {
+	original := `{"extra_content":{"anthropic":{"event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"native-signature"}}}}}`
+	var delta oapi.InferenceGenerateDelta
+	require.NoError(t, json.Unmarshal([]byte(original), &delta))
+	encoded, err := json.Marshal(delta)
+	require.NoError(t, err)
+	require.JSONEq(t, original, string(encoded))
 }

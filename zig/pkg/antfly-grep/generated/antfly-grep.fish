@@ -18,6 +18,8 @@ complete -c antfly-grep -l cache-ttl -r
 complete -c antfly-grep -l cached-only
 complete -c antfly-grep -l case-sensitive
 complete -c antfly-grep -l chunk-lines -r
+complete -c antfly-grep -l cloud
+complete -c antfly-grep -l cloud-cli -r
 complete -c antfly-grep -l color -r -f -a 'auto always never ansi'
 complete -c antfly-grep -l colors -r
 complete -c antfly-grep -l column
@@ -165,6 +167,11 @@ complete -c antfly-grep -l smart-case
 complete -c antfly-grep -l sort -r -f -a 'none path modified accessed created'
 complete -c antfly-grep -l sort-files
 complete -c antfly-grep -l sortr -r -f -a 'none path modified accessed created'
+complete -c antfly-grep -l source -r
+complete -c antfly-grep -l source-catalog -r
+complete -c antfly-grep -l source-endpoint -r
+complete -c antfly-grep -l source-principal -r
+complete -c antfly-grep -l source-table -r
 complete -c antfly-grep -l stats
 complete -c antfly-grep -l stdin
 complete -c antfly-grep -l stop-on-nonmatch

@@ -217,6 +217,77 @@ describe("InferenceClient with mock fetch", () => {
     vi.stubGlobal("fetch", originalFetch);
   });
 
+  it("forwards direct document reads and preserves source page identities", async () => {
+    const request = {
+      model: "antfly/document-balanced",
+      retain_artifact: true,
+      documents: [
+        {
+          id: "receipt",
+          media_type: "application/pdf" as const,
+          url: "data:application/pdf;base64,cGRm",
+          pages: [2],
+        },
+      ],
+    };
+    const result = {
+      object: "list",
+      model: request.model,
+      data: [
+        {
+          object: "read",
+          index: 0,
+          source_id: "receipt",
+          number: 2,
+          text: "Total 12.00",
+          status: "complete",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      document: { artifact_id: "a".repeat(64), status: "complete" },
+    };
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } })
+    );
+    const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+    expect(await client.read(request)).toEqual(result);
+    expect(await lastFetchJSONBody()).toEqual(request);
+  });
+
+  it("extracts from documents or retained readings without inventing an empty input batch", async () => {
+    const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+    const response = {
+      object: "extraction",
+      model: "extractor",
+      schema_version: 2,
+      data: [{ id: "receipt", structures: {} }],
+    };
+    for (const source of [
+      {
+        documents: [
+          {
+            id: "receipt",
+            media_type: "application/pdf" as const,
+            url: "data:application/pdf;base64,cGRm",
+          },
+        ],
+      },
+      { read_artifact: "a".repeat(64) },
+    ]) {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify(response), { headers: { "Content-Type": "application/json" } })
+      );
+      const request = {
+        model: "extractor",
+        schema_version: 2 as const,
+        schema: { structures: { receipt: { fields: { total: "str" } } } },
+        ...source,
+      };
+      expect(await client.extractRaw(request)).toEqual(response);
+      expect(await lastFetchJSONBody()).toEqual(request);
+    }
+  });
+
   async function lastFetchJSONBody(): Promise<Record<string, unknown>> {
     const [input, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
     if (input instanceof Request) {
@@ -233,6 +304,53 @@ describe("InferenceClient with mock fetch", () => {
       model: "gemma",
       messages: [{ role: "user" as const, content: "hello" }],
     };
+
+    it("forwards developer instructions during context preparation and returns diagnostics", async () => {
+      const messages = [
+        { role: "developer" as const, content: "Preserve these instructions." },
+        ...request.messages,
+      ];
+      const prepared = {
+        messages,
+        context: {
+          policy: "inspect" as const,
+          applied: false,
+          original_input_tokens: 4,
+          effective_input_tokens: 4,
+          target_input_tokens: 128,
+          reserved_output_tokens: 16,
+          dropped_messages: 0,
+          retained_messages: messages.length,
+          retained_from_message: 0,
+          checkpoint_applied: false,
+          windowed: false,
+          compacted: false,
+        },
+        usage: { prompt_tokens: 4, completion_tokens: 0, total_tokens: 4 },
+      };
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify(prepared), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      const prepareRequest = {
+        ...request,
+        messages,
+        max_tokens: 16,
+        mode: "inspect" as const,
+        tool_choice: "none" as const,
+        chat_template_kwargs: { enable_thinking: false },
+      };
+      await expect(client.prepareChatContext(prepareRequest)).resolves.toEqual(prepared);
+      expect(await lastFetchJSONBody()).toEqual(prepareRequest);
+      const [input] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
+      expect(input instanceof Request ? input.url : input).toBe(
+        "http://localhost:8080/ai/v1/generate/context/prepare"
+      );
+    });
 
     it("supports JSON and framed SSE generation without exposing the generated parser gap", async () => {
       const completion = {
@@ -289,6 +407,57 @@ describe("InferenceClient with mock fetch", () => {
       const [, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
       expect(init?.signal).toBe(controller.signal);
       expect((init?.headers as Record<string, string>).Accept).toBe("text/event-stream");
+    });
+
+    it("fails closed when a server does not attest a managed generation policy", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "legacy",
+            object: "chat.completion",
+            created: 1,
+            model: "gemma",
+            choices: [],
+            usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.generate({ ...request, context_management: { mode: "reject" } })
+      ).rejects.toThrow("did not attest the requested context policy");
+
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "wrong-policy",
+            object: "chat.completion",
+            created: 1,
+            model: "gemma",
+            choices: [],
+            context: {
+              policy: "window",
+              applied: false,
+              original_input_tokens: 1,
+              effective_input_tokens: 1,
+              target_input_tokens: 8,
+              reserved_output_tokens: 1,
+              dropped_messages: 0,
+              retained_messages: 1,
+              retained_from_message: 0,
+              checkpoint_applied: false,
+              windowed: false,
+              compacted: false,
+            },
+            usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      await expect(
+        client.generate({ ...request, context_management: { mode: "reject" } })
+      ).rejects.toThrow("attested a different context policy");
     });
 
     it("normalizes repeated trailing slashes and an explicit inference prefix", async () => {

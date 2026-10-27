@@ -619,6 +619,7 @@ pub const ArtifactSourceRef = struct {
     kind: ArtifactKind,
     name: []u8,
     chunk_id: ?u32 = null,
+    window_index: ?u32 = null,
     unit_id: ?[]u8 = null,
 
     pub fn clone(self: ArtifactSourceRef, alloc: Allocator) !ArtifactSourceRef {
@@ -628,6 +629,7 @@ pub const ArtifactSourceRef = struct {
             .kind = self.kind,
             .name = name,
             .chunk_id = self.chunk_id,
+            .window_index = self.window_index,
             .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
         };
     }
@@ -644,6 +646,7 @@ pub const ArtifactRef = struct {
     name: []u8,
     kind: ArtifactKind,
     chunk_id: ?u32 = null,
+    window_index: ?u32 = null,
     unit_id: ?[]u8 = null,
     source: ?ArtifactSourceRef = null,
 
@@ -659,6 +662,7 @@ pub const ArtifactRef = struct {
             .name = name,
             .kind = self.kind,
             .chunk_id = self.chunk_id,
+            .window_index = self.window_index,
             .unit_id = unit_id,
             .source = if (self.source) |source| try source.clone(alloc) else null,
         };
@@ -1856,21 +1860,34 @@ pub const GraphQueryTransport = struct {
 };
 
 pub const document_authority = @import("query/document_authority.zig");
+/// Exact query-owned native IDs for a pinned dense index. Empty include is an
+/// empty result; null include is unconstrained. Partial plans retain residuals.
+pub const DenseIdSelection = struct {
+    include: ?[]const u64 = null,
+    exclude: []const u64 = &.{},
+    residual: bool = true,
+    pub fn deinit(self: @This(), a: Allocator) void {
+        if (self.include) |ids| a.free(ids);
+        a.free(self.exclude);
+    }
+};
 pub const NativeKeyPredicate = struct {
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
 
     ptr: *anyopaque,
     allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+    allows_many: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
+    select_dense: ?*const fn (*anyopaque, Allocator) anyerror!?DenseIdSelection = null,
     /// Changes only when exact query-owned constraints become materialized.
     constraint_revision: ?*const fn (*anyopaque) u64 = null,
     select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
     select_range: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup, u32, u32) anyerror!?SparseOrdinalSelection = null,
     select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
-    const NativeCallbacks = struct { allows: @FieldType(NativeKeyPredicate, "allows"), select_constraints: @FieldType(NativeKeyPredicate, "select_constraints"), select_range: @FieldType(NativeKeyPredicate, "select_range"), select_ordinals: @FieldType(NativeKeyPredicate, "select_ordinals") };
+    const NativeCallbacks = struct { allows_many: @FieldType(NativeKeyPredicate, "allows_many"), allows: @FieldType(NativeKeyPredicate, "allows"), select_dense: @FieldType(NativeKeyPredicate, "select_dense"), select_constraints: @FieldType(NativeKeyPredicate, "select_constraints"), select_range: @FieldType(NativeKeyPredicate, "select_range"), select_ordinals: @FieldType(NativeKeyPredicate, "select_ordinals") };
     const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
     /// The proxy is synchronous and must never escape the storage call.
     pub fn receiver(self: *const NativeKeyPredicate) NativeKeyPredicate {
-        return .{ .ptr = @ptrCast(@constCast(self)), .allows = receivedAllows, .constraint_revision = if (self.constraint_revision != null) receivedRevision else null, .select_constraints = if (self.select_constraints != null) receivedConstraints else null, .select_range = if (self.select_range != null) receivedRange else null, .select_ordinals = if (self.select_ordinals != null) receivedOrdinals else null };
+        return .{ .ptr = @ptrCast(@constCast(self)), .allows = receivedAllows, .allows_many = if (self.allows_many != null) receivedMany else null, .select_dense = if (self.select_dense != null) receivedDense else null, .constraint_revision = if (self.constraint_revision != null) receivedRevision else null, .select_constraints = if (self.select_constraints != null) receivedConstraints else null, .select_range = if (self.select_range != null) receivedRange else null, .select_ordinals = if (self.select_ordinals != null) receivedOrdinals else null };
     }
     fn source(ptr: *anyopaque) *const NativeKeyPredicate {
         return @ptrCast(@alignCast(ptr));
@@ -1878,6 +1895,14 @@ pub const NativeKeyPredicate = struct {
     fn receivedAllows(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self = source(ptr);
         return NativeBoundary.call("allows", self.callback_dispatch, self.allows, .{ self.ptr, key });
+    }
+    fn receivedMany(ptr: *anyopaque, keys: []const []const u8, output: []bool) anyerror!void {
+        const self = source(ptr);
+        return NativeBoundary.call("allows_many", self.callback_dispatch, self.allows_many.?, .{ self.ptr, keys, output });
+    }
+    fn receivedDense(ptr: *anyopaque, alloc: Allocator) anyerror!?DenseIdSelection {
+        const self = source(ptr);
+        return NativeBoundary.call("select_dense", self.callback_dispatch, self.select_dense.?, .{ self.ptr, alloc });
     }
     fn receivedRevision(ptr: *anyopaque) u64 {
         const self = source(ptr);
@@ -1974,6 +1999,10 @@ pub const SearchRequest = struct {
     /// Strict score pruning only: equal scores retain their global tie chance.
     /// Never populated from public JSON or forwarded to count-only execution.
     minimum_competitive_score: ?f32 = null,
+    /// Borrowed coordinator winners in this request's sort domain. Native
+    /// ordered producers prune strictly worse primary tuples, retaining public
+    /// identity ties and exact bitmap totals. Never accepted from public JSON.
+    competitive_sort_boundary: []const std.json.Value = &.{},
     lake_read: ?struct {
         visibility: enum { accepted, published } = .accepted,
         through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
@@ -2209,6 +2238,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
     "minimum_competitive_score",
+    "competitive_sort_boundary",
     "text_navigation_plan",
     "text_pattern_programs",
     "text_pattern_membership",
@@ -3420,6 +3450,8 @@ pub const EnrichmentActiveModel = InlineStatusText(256);
 pub const EnrichmentActiveBackend = InlineStatusText(32);
 
 pub const EnrichmentStats = struct {
+    output_counts: @import("enrichment/media_output_counts.zig").Counts = .{},
+    output_counts_available: bool = true,
     last_error_code: RuntimeErrorName = .{},
     enabled: bool = false,
     lease_owned: bool = true,
@@ -3552,6 +3584,9 @@ pub const ResolverReplayDiagnostic = struct {
     config_generation: u64 = 0,
     effective_generation: u64 = 0,
     curation_revision: u64 = 0,
+    namespace_curation_generation: u64 = 0,
+    namespace_curation_table_id: u64 = 0,
+    namespace_curation_missing: bool = false,
     table: []const u8 = "",
     source_artifact: []const u8 = "",
     resolution_artifact: []const u8 = "",

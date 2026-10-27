@@ -924,7 +924,17 @@ const RemoteContentSnapshot = struct {
     }
 };
 
-fn acquireRemoteContent(raw: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
+fn acquireRemoteContent(raw: *anyopaque, output: *scraping.RemoteContentConfig.Snapshot) callconv(.c) scraping.RemoteContentConfig.RemoteContentRuntime.AcquireStatus {
+    output.* = acquireRemoteContentImpl(raw) catch |err| return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.Timeout => .timeout,
+        error.Canceled => .canceled,
+        else => .unavailable,
+    };
+    return .ok;
+}
+
+fn acquireRemoteContentImpl(raw: *anyopaque) !scraping.RemoteContentConfig.Snapshot {
     const owner: *StorageOwnerContext = @ptrCast(@alignCast(raw));
     const source = owner.remote_content_source.?;
     var bytes: kernel_owner_abi.OwnedBytes = .{};
@@ -1759,6 +1769,21 @@ pub fn metadataApplyStoreProjection(
             handle.store.migrateStandaloneRestoreJobs(rows.value) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
+        .job_owner_count => blk: {
+            const count = handle.store.getJobOwnerCount(alloc, request.group_id, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, count);
+        },
+        .job_state => blk: {
+            const value = handle.store.getJobState(alloc, request.group_id, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .job_state_scan => blk: {
+            if (request.arg1 > 1) break :blk .invalid_argument;
+            const value = handle.store.scanJobState(alloc, request.group_id, if (request.arg1 == 0) null else request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .backup_cohort => blk: {
             const value = handle.store.getBackupCohort(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
@@ -1882,6 +1907,11 @@ pub fn metadataApplyStoreProjection(
                 },
                 .catalog_export => {
                     const value = handle.store.exportSystemCatalog(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_export_standalone_portable => {
+                    if (group_id != @import("antfly_local_sources").common_group_ids.main_metadata_group_id) break :blk .invalid_argument;
+                    const value = handle.store.exportStandalonePortableCatalog(a) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_list_tables => |input| {

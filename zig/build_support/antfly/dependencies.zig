@@ -72,6 +72,7 @@ pub const Shared = struct {
     antfly_bin_name: []const u8,
     inference_enable_metal: bool,
     inference_enable_cuda: bool,
+    native_cpu_debug_test_profile: bool,
     antfly_version: []const u8,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
     platform_test_step: *std.Build.Step,
@@ -314,7 +315,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // transitive tests require different owner roots. Select the SQL and
     // row-policy contract namespaces at compile time, while allowing explicit
     // caller filters.
-    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
+    const sql_tests = b.addTest(.{ .name = "sql-tests", .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
     // Use the same exact-filter runner as extracted SQL owners. Besides
     // consistent failure/leak attribution, this keeps compile-only anonymous
     // reachability anchors out of runtime selection.
@@ -626,11 +627,14 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     jsonschema_mod.addImport("antfly_platform", platform_mod);
     const structured_mod = b.addModule("antfly_structured", .{ .root_source_file = b.path("lib/structured/root.zig") });
     structured_mod.addImport("antfly_jsonschema", jsonschema_mod);
+    const cloudflare_config_mod = b.modules.get("antfly_cloudflare_config") orelse b.addModule("antfly_cloudflare_config", .{ .root_source_file = b.path("lib/cloudflare/routing.zig") });
+    cloudflare_config_mod.addAnonymousImport("cloudflare_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig") });
     const generating_mod = b.createModule(.{
         .root_source_file = b.path("lib/generating/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
+    generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     generating_mod.addImport("antfly-json", json_mod);
     generating_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     const chunking_mod = b.createModule(.{
@@ -646,6 +650,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    embeddings_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     embeddings_mod.addImport("antfly-json", json_mod);
     embeddings_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     const scraping_mod = b.createModule(.{
@@ -666,6 +671,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    reranking_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     reranking_mod.addImport("antfly-json", json_mod);
     reranking_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
     const extracting_mod = b.createModule(.{
@@ -682,6 +688,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
 
     const image_mod = image_build.createModule(b, b.path("lib/image"), target, optimize, hash_mod);
     structured_mod.addImport("antfly_image", image_mod);
+    extracting_mod.addImport("antfly_image", image_mod);
     const pdf_standard_fonts_mod = @import("fonts.zig").create(b, target, optimize);
     const font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
@@ -750,10 +757,14 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     runtime_abi_mod.addImport("httpx", httpx_mod);
     runtime_abi_mod.addImport("antfly_platform", platform_mod);
     const inference_api_source = inference_runtime_build.addInferenceApiOverride(b, openapi_build, b.path("../scripts"), openapi_codegen);
+    // Model kernels have a serving-latency contract independently of Debug
+    // storage/API validation. CI can qualify that mixed product without
+    // optimizing the much larger database and server ownership graph.
+    const inference_optimize = b.option(std.lang.Optimize, "inference-optimize", "Optimization mode for the model execution graph (defaults to the product mode)") orelse optimize;
     const inference_config: inference_runtime_build.Config = .{
         .b = b,
         .target = target,
-        .optimize = optimize,
+        .optimize = inference_optimize,
         .paths = .{
             .inference_root = "pkg/inference",
             .shared_lib_root = "",
@@ -842,11 +853,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
 
     const transcribing_mod = inference_graph.transcribing_mod;
     const reader_config_mod = inference_graph.reader_config_mod;
-    const readers_mod = b.createModule(.{
-        .root_source_file = b.path("lib/readers/src/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const readers_mod = inference_graph.inference_mod.import_table.get("antfly_readers").?;
     readers_mod.addImport("httpx", httpx_mod);
     readers_mod.addImport("inference_api", inference_api_mod);
     readers_mod.addImport("antfly_google", google_mod);
@@ -863,6 +870,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     synthesizing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     synthesizing_mod.addImport("httpx", httpx_mod);
+    synthesizing_mod.addImport("antfly_cloudflare", b.modules.get("antfly_cloudflare").?);
     synthesizing_mod.addImport("antfly_google", google_mod);
 
     const inference_workflow = @import("../../pkg/inference/build/context.zig").Context{
@@ -1033,6 +1041,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     inference_bedrock_mod.addImport("antfly_cancellation", cancellation_mod);
     inference_bedrock_mod.addImport("httpx", httpx_mod);
+    inference_bedrock_mod.addImport("antfly_hash", hash_mod);
     inference_bedrock_mod.addImport("antfly_inference_types", inference_types_mod);
     inference_bedrock_mod.addImport("antfly_inference_work", inference_work_mod);
     inference_bedrock_mod.addImport("antfly_credentials", credentials_mod);
@@ -1083,6 +1092,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    inference_execution_control_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     inference_execution_control_mod.addImport("antfly_platform", platform_mod);
     inference_execution_control_mod.addImport("antfly_cancellation", cancellation_mod);
     const inference_execution_context_mod = b.createModule(.{
@@ -1160,6 +1170,15 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const darwin_shared_storage_sdk27 = darwin_release_profile and shared_inference_core and
         @import("antfly_platform").macosSdkMatchesVersion(b, target, "27.0");
     const darwin_release_memory = darwin_shared_storage_sdk27;
+    const native_cpu_debug_test_profile = optimize == .debug and !strip and !sanitize_thread and link_libc and
+        lmdb_backend == .zig and !lmdb_evented_async_io and !with_tla and
+        inference_optimize == .fast and inference_enable_system_blas and
+        !inference_enable_metal and !inference_enable_cuda and !inference_enable_pjrt and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        target.result.os.tag == .macos and target.result.cpu.arch == .aarch64 and
+        target.result.cpu.model == baseline_cpu.model and target.result.cpu.features.eql(baseline_cpu.features) and
+        @import("antfly_platform").macosSdkMatchesVersion(b, target, "27.0");
     const engine_options = b.addOptions();
     engine_options.addOption(bool, "shared_inference_core", shared_inference_core);
     const inference_engine_mod = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine.zig"), .target = target, .optimize = optimize });
@@ -1383,6 +1402,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .antfly_bin_name = antfly_bin_name,
         .inference_enable_metal = inference_enable_metal,
         .inference_enable_cuda = inference_enable_cuda,
+        .native_cpu_debug_test_profile = native_cpu_debug_test_profile,
         .build_info = build_info,
         .antfly_version = antfly_version,
         .platform_test_step = platform_test_step,

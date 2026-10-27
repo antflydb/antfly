@@ -619,6 +619,19 @@ components:
           enum: [1, 2]
           readOnly: true
           description: Server-assigned public row identity version, fixed when the source is attached and preserved across index creation and schema updates.
+        row_identity:
+          type: object
+          additionalProperties: false
+          required: [key_columns]
+          description: Optional verified stable identity for external rewrites. Keys must be non-null and unique in each published snapshot. Uses native typed equality; an unchanged key alone never authorizes index reuse.
+          properties:
+            key_columns:
+              type: array
+              minItems: 1
+              maxItems: 32
+              items:
+                type: string
+                minLength: 1
         schema_fingerprint:
           type: string
           default: auto
@@ -676,7 +689,7 @@ components:
         ref:
           type: string
           minLength: 1
-          description: Name of a configured external_io connection with lake_read capability.
+          description: Name of a configured external_io connection with lake.read capability.
         scope:
           type: string
           description: Allowed object prefix relative to the configured bucket or filesystem root.
@@ -894,12 +907,14 @@ components:
             sorting; users should not configure doc_values directly.
         missing_null_policy:
           type: string
-          enum: [missing_rejected]
+          enum: [missing_rejected, nulls_ordered]
           default: missing_rejected
           description: |
-            Missing/null sort policy for this mapped field. The current production
-            policy rejects missing or null native sort values so sorted cursors
-            remain replayable JSON scalar tuples.
+            Missing/null sort policy for this mapped field. The default missing_rejected
+            rejects missing or null native sort values. Opt in to nulls_ordered
+            to sort missing/null values first ascending and last descending,
+            with JSON null in replayable sort cursor tuples. Native sorting
+            requires a complete producer proof for nullable physical layouts.
 
     DocumentSubfieldMapping:
       type: object
@@ -934,11 +949,13 @@ components:
             derives the required typed doc values when enabled.
         missing_null_policy:
           type: string
-          enum: [missing_rejected]
+          enum: [missing_rejected, nulls_ordered]
           default: missing_rejected
           description: >-
-            Missing/null sort policy. The current production policy rejects
-            missing or null native sort values.
+            Missing/null sort policy. The default missing_rejected rejects missing
+            or null native sort values. Opt in to nulls_ordered for nulls first
+            ascending and last descending, with JSON null cursor components.
+            Nullable native layouts require a complete producer proof.
 
     DocumentFieldMapping:
       type: object
@@ -983,11 +1000,13 @@ components:
             required typed doc values when enabled.
         missing_null_policy:
           type: string
-          enum: [missing_rejected]
+          enum: [missing_rejected, nulls_ordered]
           default: missing_rejected
           description: >-
-            Missing/null sort policy. The current production policy rejects
-            missing or null native sort values.
+            Missing/null sort policy. The default missing_rejected rejects missing
+            or null native sort values. Opt in to nulls_ordered for nulls first
+            ascending and last descending, with JSON null cursor components.
+            Nullable native layouts require a complete producer proof.
         fields:
           type: object
           description: >-

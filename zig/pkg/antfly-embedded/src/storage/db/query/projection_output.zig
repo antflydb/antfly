@@ -1114,18 +1114,21 @@ fn differentialScenario(a: Allocator) !void {
     try std.testing.expectEqualStrings("{\"n\":[1.00,1e2],\"s\":\"ab\"}", native);
 }
 test "public graph metric borrowed wire streaming projection preserves ordered copy on write and numeric contracts" {
-    try differentialScenario(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, differentialScenario, .{});
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
+    try differentialScenario(a);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, differentialScenario, .{});
+    var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var view = View.init(arena.allocator(), "{\"dup\":1,\"d\\u0075p\":2}");
     const value = Output{ .borrowed = .{ .span = .{ .view = &view, .node = &view.root } } };
-    try std.testing.expectError(error.DuplicateField, value.serialize(arena.allocator(), std.testing.allocator));
+    try std.testing.expectError(error.DuplicateField, value.serialize(arena.allocator(), a));
     for ([_][]const u8{ "", "[1,]", "{\"x\":}", "1 2" }) |invalid| {
         var invalid_view = View.init(arena.allocator(), invalid);
         const invalid_value = Output{ .borrowed = .{ .span = .{ .view = &invalid_view, .node = &invalid_view.root } } };
-        if (invalid_value.serialize(arena.allocator(), std.testing.allocator)) |bytes| {
-            std.testing.allocator.free(bytes);
+        if (invalid_value.serialize(arena.allocator(), a)) |bytes| {
+            a.free(bytes);
             return error.TestExpectedError;
         } else |_| {}
     }
@@ -1314,8 +1317,11 @@ fn fanoutOrderingScenario(a: Allocator) !void {
 }
 
 test "public graph metric borrowed wire streaming fanout preserves ordered arrays and allocation failure ownership" {
-    try fanoutOrderingScenario(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, fanoutOrderingScenario, .{});
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
+    try fanoutOrderingScenario(a);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, fanoutOrderingScenario, .{});
 }
 
 test "public graph metric borrowed wire streaming fanout bounds navigation maps and terminal scanner scratch" {

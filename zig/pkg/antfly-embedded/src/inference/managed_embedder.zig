@@ -72,6 +72,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 }
 
 pub const ProviderKind = enum {
+    cloudflare,
     openai,
     openrouter,
     ollama,
@@ -206,6 +207,14 @@ pub const AntflyProvider = struct {
         config: chunking_types.Config,
         context: execution_context.RequestContext,
     ) anyerror![]inference_chunker.Chunk = null,
+    chunk_page_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        input: inference_chunker.Input,
+        config: chunking_types.Config,
+        context: execution_context.RequestContext,
+    ) anyerror!inference_chunker.types.ChunkPage = null,
     /// The result slice and every returned string are owned by `alloc`.
     rewrite_texts: ?*const fn (
         ptr: *anyopaque,
@@ -364,6 +373,8 @@ pub const AntflyProvider = struct {
         context: ?RequestContext,
     ) anyerror![]u8 = null,
 
+    document_json: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, bool, RequestContext) anyerror![]u8 = null,
+
     pub fn decideJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
         const callback = self.decide_json orelse return error.UnsupportedDecisionProvider;
         return AntflyProviderBoundary.call("decide_json", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, context });
@@ -448,6 +459,8 @@ pub const ProviderRuntime = struct {
     bedrock_credentials: BedrockCredentialPool,
     http_mutex: std.atomic.Mutex = .unlocked,
     http_client: std.atomic.Value(?*httpx.Client) = .init(null),
+    generation_http_client: std.atomic.Value(?*httpx.Client) = .init(null),
+    asset_http_client: std.atomic.Value(?*httpx.Client) = .init(null),
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) ProviderRuntime {
         return .{
@@ -458,33 +471,63 @@ pub const ProviderRuntime = struct {
         };
     }
 
+    pub fn bedrockCredentialsForRegion(self: *ProviderRuntime, region: []const u8) !*bedrock_provider.CredentialCache {
+        return self.bedrock_credentials.cacheForRegion(region);
+    }
+
     /// Lazily publish one service-scoped transport. Provider request objects
     /// retain per-request URLs, authentication, cancellation, and deadlines;
     /// the client owns only reusable DNS/TLS/connection state.
     pub fn httpClient(self: *ProviderRuntime) !*httpx.Client {
-        if (self.http_client.load(.acquire)) |client| return client;
+        return self.pooledHttpClient(&self.http_client, .{ .response_limit = remote_embedding_max_response_bytes, .io_timeout_ms = max_embedding_request_timeout_ms });
+    }
+
+    /// A client's response ceiling is a hard transport cap, even when a caller
+    /// supplies a larger request limit. Generation therefore has its own
+    /// reusable pool, while embedding retains its smaller family safeguards.
+    pub fn generationHttpClient(self: *ProviderRuntime) !*httpx.Client {
+        return self.pooledHttpClient(&self.generation_http_client, .{ .response_limit = httpx.types.default_max_body_size, .io_timeout_ms = 300_000, .cancel_on_shutdown = true });
+    }
+
+    /// Media/task adapters apply their own operation ceilings within this
+    /// stable outer envelope. Keep large audio/read responses out of the
+    /// smaller embedding and ordinary generation pools.
+    pub fn assetHttpClient(self: *ProviderRuntime) !*httpx.Client {
+        return self.pooledHttpClient(&self.asset_http_client, .{ .response_limit = 64 << 20, .io_timeout_ms = 300_000, .request_timeout_ms = 300_000, .cancel_on_shutdown = true });
+    }
+
+    const HttpPolicy = struct {
+        response_limit: usize,
+        io_timeout_ms: u64,
+        request_timeout_ms: u64 = 0,
+        cancel_on_shutdown: bool = false,
+    };
+
+    fn pooledHttpClient(self: *ProviderRuntime, slot: *std.atomic.Value(?*httpx.Client), policy: HttpPolicy) !*httpx.Client {
+        if (slot.load(.acquire)) |client| return client;
         lockAtomic(&self.http_mutex);
         defer self.http_mutex.unlock();
-        if (self.http_client.load(.acquire)) |client| return client;
+        if (slot.load(.acquire)) |client| return client;
         const client = try self.alloc.create(httpx.Client);
         errdefer self.alloc.destroy(client);
-        // Request-local URL/header/response allocations happen concurrently;
-        // keep them off a possibly arena-backed service owner allocator.
+        var timeouts = httpx.Timeouts.uniform(policy.io_timeout_ms);
+        timeouts.request_ms = policy.request_timeout_ms;
         client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, self.io, .{
             .keep_alive = true,
             .cookies_enabled = false,
-            .max_response_size = remote_embedding_max_response_bytes,
-            .timeouts = httpx.Timeouts.uniform(max_embedding_request_timeout_ms),
+            .max_response_size = policy.response_limit,
+            .timeouts = timeouts,
+            .cancel_in_flight_on_shutdown = policy.cancel_on_shutdown,
         });
-        self.http_client.store(client, .release);
+        slot.store(client, .release);
         return client;
     }
 
     pub fn deinit(self: *ProviderRuntime) void {
-        if (self.http_client.swap(null, .acq_rel)) |client| {
+        inline for (.{ &self.asset_http_client, &self.generation_http_client, &self.http_client }) |slot| if (slot.swap(null, .acq_rel)) |client| {
             client.deinit();
             self.alloc.destroy(client);
-        }
+        };
         self.bedrock_credentials.deinit();
         self.google_credentials.deinit();
         self.* = undefined;
@@ -557,12 +600,20 @@ const max_embedding_request_timeout_ns: u64 = max_embedding_request_timeout_ms *
 const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
 
+// Advance logical operation time in timeout regressions without sleeping
+// through production-sized budgets. Test artifacts run cases serially; the
+// atomic also lets a real HTTP listener advance time from its worker thread.
+const TestClock = if (builtin.is_test) struct {
+    var offset_ns: std.atomic.Value(u64) = .init(0);
+} else struct {};
+
 fn monotonicNowNs() u64 {
     var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
-        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
-        else => return 0,
-    }
+    const now: u64 = switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => 0,
+    };
+    return if (builtin.is_test) now +| TestClock.offset_ns.load(.monotonic) else now;
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -586,12 +637,16 @@ pub const ManagedEmbeddingEntry = struct {
     provider: ProviderKind,
     model: []u8,
     base_url: []u8,
+    gateway_id: ?[]const u8 = null,
     source_table: []u8 = "",
     region: []u8 = "",
     project_id: []u8 = "",
     location: []u8 = "",
     credentials_path: []u8 = "",
     bedrock_request_format: bedrock_provider.RequestFormat = .auto,
+    google_request_format: vertex_provider.RequestFormat = .predict,
+    google_task_encoding: vertex_provider.TaskEncoding = .task_type,
+    google_batch_size: ?u32 = null,
     input_type: []u8 = "",
     /// Advanced provider overrides. When omitted, Antfly derives these from
     /// whether it is embedding an indexed document or a search query.
@@ -599,6 +654,7 @@ pub const ManagedEmbeddingEntry = struct {
     document_input_type: []u8 = "",
     query_instruction: []u8 = "",
     model_identity: []u8 = "",
+    planned_text_lease: ?inference_work.CapabilityLease = null,
     truncate: []u8 = "",
     /// Borrowed from the service ProviderRuntime, or from the owning
     /// ManagedEmbedder's standalone fallback. Service-scoped managers keep
@@ -695,6 +751,7 @@ pub const ManagedEmbeddingEntry = struct {
         if (self.lookup_aliases.len > 0) alloc.free(self.lookup_aliases);
         alloc.free(self.model);
         alloc.free(self.base_url);
+        if (self.gateway_id) |id| alloc.free(id);
         if (self.source_table.len > 0) alloc.free(self.source_table);
         if (self.region.len > 0) alloc.free(self.region);
         if (self.project_id.len > 0) alloc.free(self.project_id);
@@ -755,6 +812,7 @@ fn managedEmbeddingEndpointIdentity(entry: *const ManagedEmbeddingEntry) provide
         .region = entry.region,
         .project = entry.project_id,
         .location = entry.location,
+        .gateway_id = entry.gateway_id orelse "",
         .credentials = managedEmbeddingCredentialSourceIdentity(entry),
     };
 }
@@ -764,7 +822,7 @@ fn managedEmbeddingCredentialSourceIdentity(
 ) credential_source_identity.CredentialSourceIdentity {
     const Identity = credential_source_identity.CredentialSourceIdentity;
     return switch (entry.provider) {
-        .openai, .openrouter, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
+        .cloudflare, .openai, .openrouter, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
         .vertex => Identity.googleAdc(if (entry.credentials_path.len > 0) entry.credentials_path else null),
         // Managed Bedrock currently exposes the process-wide AWS default
         // chain. Profile and web-identity constructors live in the shared
@@ -794,6 +852,9 @@ fn managedEmbeddingEntriesEquivalentForLookup(
         std.mem.eql(u8, lhs.project_id, rhs.project_id) and
         std.mem.eql(u8, lhs.location, rhs.location) and
         lhs.bedrock_request_format == rhs.bedrock_request_format and
+        lhs.google_request_format == rhs.google_request_format and
+        lhs.google_task_encoding == rhs.google_task_encoding and
+        lhs.google_batch_size == rhs.google_batch_size and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
         std.mem.eql(u8, lhs.query_input_type, rhs.query_input_type) and
         std.mem.eql(u8, lhs.document_input_type, rhs.document_input_type) and
@@ -819,6 +880,8 @@ fn managedEmbeddingEntriesSemanticallyEquivalent(
         std.mem.eql(u8, lhs.project_id, rhs.project_id) and
         std.mem.eql(u8, lhs.location, rhs.location) and
         lhs.bedrock_request_format == rhs.bedrock_request_format and
+        lhs.google_request_format == rhs.google_request_format and
+        lhs.google_task_encoding == rhs.google_task_encoding and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
         std.mem.eql(u8, lhs.query_input_type, rhs.query_input_type) and
         std.mem.eql(u8, lhs.document_input_type, rhs.document_input_type) and
@@ -1259,6 +1322,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_fn = embedDense,
             .computation_key_fn = documentComputationKey,
             .dense_embed_batch_fn = embedDenseBatch,
+            .dense_embed_batch_planned_fn = embedDenseBatchPlanned,
             .dense_embed_parts_fn = embedDenseParts,
             .dense_embed_part_items_fn = embedDensePartItems,
             .dense_embed_raster_items_fn = embedDenseRasterItems,
@@ -1397,6 +1461,13 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntryForTask(alloc, entry, text, entry.dimensions, .retrieval_query);
     }
 
+    /// Role-aware query batching uses the same provider limits, instructions,
+    /// retry policy and admission as scalar query embeddings.
+    pub fn embedQueries(self: *const ManagedEmbedder, alloc: std.mem.Allocator, index_name: []const u8, texts: []const []const u8) ![]const []const f32 {
+        const entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        return embedBatchWithEntryForTask(alloc, entry, texts, entry.dimensions, .retrieval_query);
+    }
+
     pub fn embedQueryWithCancellation(
         self: *const ManagedEmbedder,
         alloc: std.mem.Allocator,
@@ -1440,6 +1511,8 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, security_scope);
         endpoint.updateHash(&hasher);
         hashQueryCacheField(&hasher, @tagName(entry.bedrock_request_format));
+        hashQueryCacheField(&hasher, @tagName(entry.google_request_format));
+        hashQueryCacheField(&hasher, @tagName(entry.google_task_encoding));
         hashQueryCacheField(&hasher, entry.input_type);
         hashQueryCacheField(&hasher, entry.query_input_type);
         hashQueryCacheField(&hasher, entry.document_input_type);
@@ -1576,6 +1649,8 @@ pub const ManagedEmbedder = struct {
             entry.model_identity,
             entry.truncate,
             @tagName(entry.bedrock_request_format),
+            @tagName(entry.google_request_format),
+            @tagName(entry.google_task_encoding),
             entry.dimensions,
             EmbeddingTaskType.retrieval_document.canonical(),
         });
@@ -1663,13 +1738,44 @@ pub const ManagedEmbedder = struct {
         context: RequestContext,
     ) ![]const []const f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        return self.embedTaskBatchUnchecked(alloc, embedding_name, texts, dims, .retrieval_document, context);
+    }
+
+    /// Explicit task execution shares the same provider, quota, credentials,
+    /// deadlines and sanitization as indexing, without imposing a retrieval role.
+    pub fn embedTaskBatchWithContext(self: *ManagedEmbedder, alloc: std.mem.Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType, context: RequestContext) ![]const []const f32 {
+        try context.check();
+        var sanitized = try db_embedder.sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
+        defer sanitized.deinit(alloc);
+        const vectors = try self.embedTaskBatchUnchecked(alloc, embedding_name, sanitized.texts(), dims, task_type, context);
+        errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+        try context.check();
+        return vectors;
+    }
+
+    fn embedTaskBatchUnchecked(self: *ManagedEmbedder, alloc: std.mem.Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType, context: RequestContext) ![]const []const f32 {
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (configured.sparse) return error.UnsupportedEmbeddingProvider;
         var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
         var entry = configured.requestOverlay(alloc);
         defer entry.auth_header_cache.deinit(alloc);
         applyRequestContext(&entry, context, &cancellation);
-        return try embedBatchWithEntry(alloc, &entry, texts, dims);
+        return try embedBatchWithEntryForTask(alloc, &entry, texts, dims, task_type);
+    }
+
+    fn embedDenseBatchPlanned(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&entry, value, &cancellation);
+        }
+        entry.planned_text_lease = lease;
+        return embedBatchWithEntry(alloc, &entry, texts, dims);
     }
 
     fn embedDenseParts(
@@ -2043,18 +2149,7 @@ pub const ManagedEmbedder = struct {
                 header_count += 1;
             }
             const headers = header_storage[0..header_count];
-            const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
-            const discovered: ?remote_capabilities.CapabilityLease = cache.getOrDiscoverLeaseWithContext(
-                http,
-                entry.base_url,
-                entry.model,
-                .embed,
-                headers,
-                .{
-                    .deadline_ns = embeddingOperationDeadline(entry),
-                    .cancellation = entry.cancellation orelse .none,
-                },
-            ) catch |err| switch (err) {
+            const discovered: ?remote_capabilities.CapabilityLease = discoverRemoteEmbeddingLease(entry, http, headers) catch |err| switch (err) {
                 error.OutOfMemory, error.Canceled, error.Timeout => return err,
                 else => null,
             };
@@ -2240,6 +2335,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: Embed
         },
         .task_type = task_type,
         .model_identity = if (entry.model_identity.len > 0) entry.model_identity else null,
+        .model_revision = if (entry.planned_text_lease) |lease| if (lease.capabilities) |caps| caps.model_revision else null else null,
         .dimensions = if (entry.dimensions > 0) entry.dimensions else null,
         .instruction = if (task_type == .retrieval_query and entry.query_instruction.len > 0) entry.query_instruction else null,
     };
@@ -2703,6 +2799,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         try alloc.dupe(u8, "");
     defer alloc.free(project_id);
     const endpoint = switch (provider) {
+        .cloudflare => try embeddings_types.cloudflare.baseUrl(alloc, embedder_cfg.account_id, if (embedder_cfg.url.len > 0) embedder_cfg.url else null),
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
         .openrouter => try resolveOpenRouterBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
@@ -2726,6 +2823,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         region: []const u8,
         project_id: ?[]const u8 = null,
         request_format: []const u8,
+        task_encoding: ?[]const u8 = null,
         sparse: bool,
         input_type: []const u8,
         truncate: []const u8,
@@ -2741,6 +2839,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         .region = region,
         .project_id = if (project_id.len > 0) project_id else null,
         .request_format = embedder_cfg.request_format,
+        .task_encoding = if (embedder_cfg.task_encoding.len > 0) embedder_cfg.task_encoding else null,
         .sparse = cfg.sparse orelse false,
         .input_type = embedder_cfg.input_type,
         .truncate = embedder_cfg.truncate,
@@ -3278,6 +3377,45 @@ pub fn normalizeAdmittedEmbeddingsIndexDimensionJsonForCatalogWithOptions(
     );
 }
 
+/// Resolve defaults only at public admission. Catalog reloads and artifact
+/// identities must never inherit new semantic defaults after an upgrade.
+fn normalizeGoogleEmbeddingDefaultsJson(alloc: std.mem.Allocator, value: std.json.Value) !?[]u8 {
+    if (value != .object or value.object.contains("semantic_producer")) return null;
+    const kind = value.object.get("type") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "embeddings")) return null;
+    const embedder = value.object.get("embedder") orelse return null;
+    if (embedder != .object) return null;
+    const provider = embedder.object.get("provider") orelse return null;
+    if (provider != .string or (!std.mem.eql(u8, provider.string, "vertex") and !std.mem.eql(u8, provider.string, "gemini"))) return null;
+    const raw = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const arena = parsed.arena.allocator();
+    const config = &parsed.value.object.getPtr("embedder").?.object;
+    var changed = false;
+    const setDefault = struct {
+        fn put(a: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, text: []const u8) !bool {
+            if (object.get(key)) |existing| {
+                if (existing != .string or existing.string.len > 0) return false;
+            }
+            try object.put(a, key, .{ .string = text });
+            return true;
+        }
+    }.put;
+    changed = try setDefault(arena, config, "model", "gemini-embedding-2") or changed;
+    changed = try setDefault(arena, config, "request_format", "embed_content") or changed;
+    const format = config.get("request_format").?;
+    if (format != .string) return error.InvalidEmbedderConfig;
+    changed = try setDefault(arena, config, "task_encoding", if (std.mem.eql(u8, format.string, "embed_content")) "prompt" else "task_type") or changed;
+    if (std.mem.eql(u8, provider.string, "vertex") and std.mem.eql(u8, format.string, "embed_content")) {
+        const location: []const u8 = if (resolveOptionalEnv(arena, "GOOGLE_CLOUD_LOCATION")) |configured| configured else "global";
+        changed = try setDefault(arena, config, "location", location) or changed;
+    }
+    if (!changed) return null;
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
 fn normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(
     alloc: std.mem.Allocator,
     index_name: []const u8,
@@ -3286,6 +3424,18 @@ fn normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(
     options: InitOptions,
     owner_already_admitted: bool,
 ) !?[]u8 {
+    if (!owner_already_admitted) {
+        if (try normalizeGoogleEmbeddingDefaultsJson(alloc, value)) |raw| {
+            errdefer alloc.free(raw);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+            defer parsed.deinit();
+            if (try normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(alloc, index_name, parsed.value, catalog_root, options, false)) |normalized| {
+                alloc.free(raw);
+                return normalized;
+            }
+            return raw;
+        }
+    }
     if (try normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(
         alloc,
         index_name,
@@ -3496,6 +3646,7 @@ fn semanticProducerComparisonConfigJsonAlloc(
             std.mem.eql(u8, field.key_ptr.*, "region") or
             std.mem.eql(u8, field.key_ptr.*, "project_id") or
             std.mem.eql(u8, field.key_ptr.*, "request_format") or
+            std.mem.eql(u8, field.key_ptr.*, "task_encoding") or
             std.mem.eql(u8, field.key_ptr.*, "sparse") or
             // Identities written before input types were derived from
             // capabilities carry this; it no longer affects identity.
@@ -3531,8 +3682,10 @@ fn semanticProducerComparisonConfigJsonAlloc(
         model: []const u8,
         url: ?[]const u8,
         region: ?[]const u8 = null,
+        location: ?[]const u8 = null,
         project_id: ?[]const u8 = null,
         request_format: ?[]const u8 = null,
+        task_encoding: ?[]const u8 = null,
         input_type: ?[]const u8 = null,
         truncate: ?[]const u8 = null,
         query_input_type: ?[]const u8 = null,
@@ -3550,13 +3703,20 @@ fn semanticProducerComparisonConfigJsonAlloc(
     if (object.get(legacy_identity_multimodal_field)) |field| {
         if (field != .bool) return error.InvalidEmbeddingArtifactProducer;
     }
+    // The identity uses a provider-neutral region field; execution uses the
+    // provider's own configuration spelling. Never re-resolve a pinned Vertex
+    // location from the comparison process's environment.
+    const pinned_region = try optionalString(object, "region");
+    const vertex = std.mem.eql(u8, provider.string, "vertex");
     return try std.json.Stringify.valueAlloc(alloc, SemanticExecutionConfig{
         .provider = provider.string,
         .model = model.string,
         .url = if (embedded) null else endpoint.string,
-        .region = try optionalString(object, "region"),
+        .region = if (vertex) null else pinned_region,
+        .location = if (vertex) pinned_region else null,
         .project_id = try optionalString(object, "project_id"),
         .request_format = try optionalString(object, "request_format"),
+        .task_encoding = try optionalString(object, "task_encoding"),
         .input_type = try optionalString(object, "input_type"),
         .truncate = try optionalString(object, "truncate"),
         .query_input_type = try optionalString(object, "query_input_type"),
@@ -3879,6 +4039,7 @@ fn validateCatalogOwnerSemanticIdentity(
     if (!std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "provider"), @tagName(provider)) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "model"), embedder_cfg.model) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "request_format"), embedder_cfg.request_format) or
+        !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "task_encoding"), embedder_cfg.task_encoding) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "input_type"), embedder_cfg.input_type) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "truncate"), embedder_cfg.truncate) or
         !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "query_input_type"), configured_query_input_type) or
@@ -3912,6 +4073,7 @@ fn validateCatalogOwnerSemanticIdentity(
     // deployment endpoint and later metadata validation must not re-resolve it.
     if (embedder_cfg.url.len > 0) {
         const endpoint = switch (provider) {
+            .cloudflare => try embeddings_types.cloudflare.baseUrl(alloc, embedder_cfg.account_id, if (embedder_cfg.url.len > 0) embedder_cfg.url else null),
             .openai, .ollama => try appendPathIfMissing(alloc, embedder_cfg.url, "/v1"),
             .openrouter => try normalizeOpenRouterBaseUrl(alloc, embedder_cfg.url),
             .cohere => try appendPathIfMissing(alloc, embedder_cfg.url, "/v2"),
@@ -4058,6 +4220,7 @@ fn semanticIdentityDefaultField(name: []const u8) ?std.json.Value {
     if (std.mem.eql(u8, name, "region") or
         std.mem.eql(u8, name, "project_id") or
         std.mem.eql(u8, name, "request_format") or
+        std.mem.eql(u8, name, "task_encoding") or
         std.mem.eql(u8, name, "input_type") or
         std.mem.eql(u8, name, "truncate") or
         std.mem.eql(u8, name, "query_input_type") or
@@ -4730,6 +4893,7 @@ fn buildManagedEmbeddingEntry(
     const base_url = if (semantic_binding) |binding|
         try alloc.dupe(u8, if (binding.embedded) "" else binding.endpoint)
     else switch (provider) {
+        .cloudflare => try embeddings_types.cloudflare.baseUrl(alloc, embedder_cfg.account_id, if (embedder_cfg.url.len > 0) embedder_cfg.url else null),
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
         .openrouter => try resolveOpenRouterBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
@@ -4743,6 +4907,8 @@ fn buildManagedEmbeddingEntry(
             try resolveAntflyInferenceBaseUrl(alloc, embedder_cfg, options),
     };
     errdefer alloc.free(base_url);
+    const gateway_id = if (embedder_cfg.gateway_id) |id| try alloc.dupe(u8, id) else null;
+    errdefer if (gateway_id) |id| alloc.free(id);
     const input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else @constCast("");
     errdefer if (input_type.len > 0) alloc.free(input_type);
     const query_input_type = if (embedder_cfg.query_input_type.len > 0) try alloc.dupe(u8, embedder_cfg.query_input_type) else @constCast("");
@@ -4758,7 +4924,8 @@ fn buildManagedEmbeddingEntry(
     else
         @constCast("");
     errdefer if (source_table.len > 0) alloc.free(source_table);
-    const api_key = switch (provider) {
+    var api_key = switch (provider) {
+        .cloudflare => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "CLOUDFLARE_API_TOKEN"),
         .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
         .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
         .cohere => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
@@ -4786,12 +4953,16 @@ fn buildManagedEmbeddingEntry(
         .model = owned_model,
         .model_identity = model_identity,
         .base_url = base_url,
+        .gateway_id = gateway_id,
         .source_table = source_table,
         .region = provider_region,
         .project_id = project_id,
         .location = location,
         .credentials_path = credentials_path,
         .bedrock_request_format = bedrock_request_format,
+        .google_request_format = if (provider == .vertex or provider == .gemini) try vertex_provider.requestFormat(@tagName(provider), embedder_cfg.request_format) else .predict,
+        .google_task_encoding = if (provider == .vertex or provider == .gemini) try vertex_provider.taskEncoding(try vertex_provider.requestFormat(@tagName(provider), embedder_cfg.request_format), embedder_cfg.task_encoding) else .task_type,
+        .google_batch_size = embedder_cfg.batch_size,
         .input_type = input_type,
         .query_input_type = query_input_type,
         .document_input_type = document_input_type,
@@ -4828,6 +4999,7 @@ fn resolveDeclaredEmbeddingDimensions(cfg: indexes_openapi.EmbeddingsIndexConfig
     }
     if (cfg.embedder) |embedder| {
         const declared = switch (embedder) {
+            .cloudflare_embedder_config => |value| value.dimensions orelse value.dimension,
             .ollama_embedder_config => null,
             .open_ai_embedder_config => |value| value.dimensions,
             .open_router_embedder_config => |value| value.dimensions,
@@ -4854,6 +5026,22 @@ fn parseDimensionProbeValidation(root: std.json.ObjectMap) !DimensionProbeValida
     if (std.mem.eql(u8, value.string, "strict")) return .strict;
     if (std.mem.eql(u8, value.string, "defer_probe")) return .defer_probe;
     return error.InvalidCreateTableRequest;
+}
+
+/// Inspect a dense provider without constructing an index or executing a
+/// dimension probe. Returned capabilities contain only allocator-independent
+/// bounded values; owned transport and entry state are released here.
+pub fn denseModelCapabilities(
+    alloc: std.mem.Allocator,
+    embedder: std.json.Value,
+    supplied_options: InitOptions,
+) !inference_work.InferenceCapabilities {
+    var options = supplied_options;
+    const owned_io = try bindOwnedHttpIoIfNeeded(alloc, &options);
+    defer deinitOwnedHttpIo(alloc, owned_io);
+    var entry = try buildManagedEmbeddingEntry(alloc, "memory", .{}, embedder, options, 0, null);
+    defer entry.deinit(alloc);
+    return ManagedEmbedder.denseCapabilitiesForEntry(&entry, alloc);
 }
 
 fn resolveEmbeddingDimensionsForManagedConfig(
@@ -5056,6 +5244,7 @@ fn parseEmbeddingsIndexConfigFromValue(
 
 fn parseEmbedderProvider(embedder: embeddings_types.Config) !ProviderKind {
     return switch (embedder.provider) {
+        .cloudflare => .cloudflare,
         .openai => .openai,
         .openrouter => .openrouter,
         .ollama => .ollama,
@@ -5113,6 +5302,7 @@ fn envOptionalU32(name: [:0]const u8) ?u32 {
 
 fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
+        .cloudflare => "ANTFLY_CLOUDFLARE_EMBED_REQUESTS_PER_MINUTE",
         .openai => "ANTFLY_OPENAI_EMBED_REQUESTS_PER_MINUTE",
         .openrouter => "ANTFLY_OPENROUTER_EMBED_REQUESTS_PER_MINUTE",
         .ollama => "ANTFLY_OLLAMA_EMBED_REQUESTS_PER_MINUTE",
@@ -5126,6 +5316,7 @@ fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
 
 fn providerBurstEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
+        .cloudflare => "ANTFLY_CLOUDFLARE_EMBED_BURST",
         .openai => "ANTFLY_OPENAI_EMBED_BURST",
         .openrouter => "ANTFLY_OPENROUTER_EMBED_BURST",
         .ollama => "ANTFLY_OLLAMA_EMBED_BURST",
@@ -5554,7 +5745,6 @@ fn bindRemoteEmbeddingLease(
     http: *httpx.Client,
     provider: *antfly_provider_mod.Provider,
     headers: []const [2][]const u8,
-    operation_deadline_ns: u64,
     shape: inference_work.InvocationShape,
 ) !remote_capabilities.CapabilityLease {
     const lease = try acquireRemoteEmbeddingLease(
@@ -5562,10 +5752,20 @@ fn bindRemoteEmbeddingLease(
         http,
         provider,
         headers,
-        operation_deadline_ns,
     );
     if (lease.capabilities) |capabilities| try capabilities.validateInvocation(.embed, shape);
     return lease;
+}
+
+// Capability preparation has a bounded activation budget of its own. Only a
+// real caller deadline can shorten it; the 30-second inference clock starts
+// after the lease is ready. Every planner/executor/query lookup shares this path.
+fn discoverRemoteEmbeddingLease(entry: *const ManagedEmbeddingEntry, http: *httpx.Client, headers: []const [2][]const u8) !remote_capabilities.CapabilityLease {
+    const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
+    return cache.getOrDiscoverLeaseWithContext(http, entry.base_url, entry.model, .embed, headers, .{
+        .deadline_ns = entry.deadline_ns,
+        .cancellation = entry.cancellation orelse .none,
+    });
 }
 
 fn acquireRemoteEmbeddingLease(
@@ -5573,20 +5773,21 @@ fn acquireRemoteEmbeddingLease(
     http: *httpx.Client,
     provider: *antfly_provider_mod.Provider,
     headers: []const [2][]const u8,
-    operation_deadline_ns: u64,
 ) !remote_capabilities.CapabilityLease {
-    const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
-    const lease = try cache.getOrDiscoverLeaseWithContext(
-        http,
-        entry.base_url,
-        entry.model,
-        .embed,
-        headers,
-        .{
-            .deadline_ns = operation_deadline_ns,
-            .cancellation = entry.cancellation orelse .none,
-        },
-    );
+    if (entry.planned_text_lease) |planned| {
+        if (planned.scope_digest) |scope| {
+            const actual = try remote_capabilities.scopeDigest(provider.allocator, entry.base_url, entry.model, .embed, headers);
+            if (!std.mem.eql(u8, &scope, &actual)) return error.InferenceCapabilitiesStale;
+        }
+        // Keep the coordinator's route and descriptor through every retry.
+        // Discovering another lease here could stamp its vectors with the old
+        // generation captured before execution.
+        provider.setFramedAttachments(if (planned.capabilities) |caps| caps.framed_attachments else false);
+        if (planned.routing_token) |token| try provider.setCapabilityToken(token.slice());
+        if (planned.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
+        return planned;
+    }
+    const lease = try discoverRemoteEmbeddingLease(entry, http, headers);
     // Providers are reused across invocations, but transport support belongs
     // to this concrete lease. Reset first so a legacy or downgraded route can
     // never inherit framed mode from an earlier endpoint.
@@ -5605,7 +5806,6 @@ fn bindRemoteEmbeddingPartsLease(
     http: *httpx.Client,
     provider: *antfly_provider_mod.Provider,
     headers: []const [2][]const u8,
-    operation_deadline_ns: u64,
     parts: []const template_mod.ContentPart,
     independently_addressable: bool,
 ) !remote_capabilities.CapabilityLease {
@@ -5614,7 +5814,6 @@ fn bindRemoteEmbeddingPartsLease(
         http,
         provider,
         headers,
-        operation_deadline_ns,
     );
     if (lease.capabilities) |capabilities| {
         const transport: inference_work.AttachmentTransport = if (capabilities.framed_attachments)
@@ -5727,7 +5926,6 @@ fn embedWithEntryPartsForTaskOnce(
             return error.UnsupportedEmbeddingProvider;
         }
         try checkEntryDispatchDeadline(entry);
-        const operation_deadline_ns = embeddingOperationDeadline(entry);
         var fallback_http: ?httpx.Client = null;
         defer if (fallback_http) |*client| client.deinit();
         const http = try entry.httpClient(alloc, &fallback_http);
@@ -5753,10 +5951,10 @@ fn embedWithEntryPartsForTaskOnce(
             http,
             &provider,
             capability_headers,
-            operation_deadline_ns,
             parts,
             false,
         );
+        const operation_deadline_ns = embeddingOperationDeadline(entry);
         try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
 
         var result = provider.embedPartsWithTask(
@@ -6215,7 +6413,6 @@ fn embedPartItemsWithEntry(
     }
 
     try checkEntryDispatchDeadline(entry);
-    const operation_deadline_ns = embeddingOperationDeadline(entry);
     var fallback_http: ?httpx.Client = null;
     defer if (fallback_http) |*client| client.deinit();
     const http = try entry.httpClient(alloc, &fallback_http);
@@ -6261,10 +6458,10 @@ fn embedPartItemsWithEntry(
         http,
         &provider,
         capability_headers,
-        operation_deadline_ns,
         items,
         true,
     );
+    const operation_deadline_ns = embeddingOperationDeadline(entry);
     try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
     if (provider.numeric_dense_dimensions != null) provider.setMaxResponseBytes(try numericDenseResponseLimit(items.len, dims));
 
@@ -6327,7 +6524,6 @@ fn embedSparseBatchWithEntry(
                 return embeddings;
             }
             try checkEntryDispatchDeadline(entry);
-            const operation_deadline_ns = embeddingOperationDeadline(entry);
             var fallback_http: ?httpx.Client = null;
             defer if (fallback_http) |*client| client.deinit();
             const http = try entry.httpClient(alloc, &fallback_http);
@@ -6352,9 +6548,9 @@ fn embedSparseBatchWithEntry(
                 http,
                 &provider,
                 capability_headers,
-                operation_deadline_ns,
                 try textEmbeddingInvocationShape(texts),
             );
+            const operation_deadline_ns = embeddingOperationDeadline(entry);
             try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
 
             var result = provider.embedSparse(alloc, entry.model, texts) catch |err| {
@@ -6393,7 +6589,7 @@ fn embedSparseBatchWithEntry(
             try validateSparseBatch(embeddings, texts.len);
             return embeddings;
         },
-        .openai, .openrouter, .ollama, .bedrock, .cohere, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
+        .cloudflare, .openai, .openrouter, .ollama, .bedrock, .cohere, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
     }
 }
 
@@ -6616,9 +6812,13 @@ fn embedBatchWithEntry(
 }
 
 fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) []const u8 {
+    // Retrieval overrides must not change an explicitly requested routing task.
+    if (task_type == .clustering) return "clustering";
+    if (task_type == .classification) return "classification";
     const role_override = switch (task_type) {
         .retrieval_query => entry.query_input_type,
         .retrieval_document => entry.document_input_type,
+        else => unreachable,
     };
     if (role_override.len > 0) return role_override;
     // Backward-compatible expert override: the legacy field applies to both
@@ -6627,6 +6827,7 @@ fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingT
     return switch (task_type) {
         .retrieval_query => "search_query",
         .retrieval_document => "search_document",
+        else => unreachable,
     };
 }
 
@@ -6649,6 +6850,13 @@ pub fn testEmbeddingTaskRouting() !void {
     try std.testing.expectEqualStrings("search_document", effectiveInputType(&entry, .retrieval_document));
     try std.testing.expect(effectiveInstruction(&entry, .retrieval_query) == null);
     try std.testing.expect(effectiveInstruction(&entry, .retrieval_document) == null);
+    var overridden = entry;
+    overridden.input_type = @constCast("search_document");
+    overridden.document_input_type = @constCast("custom_document");
+    try std.testing.expectEqualStrings("clustering", effectiveInputType(&overridden, .clustering));
+    try std.testing.expectEqualStrings("classification", effectiveInputType(&overridden, .classification));
+    try std.testing.expectEqualStrings("CLUSTERING", effectiveProviderTaskType(&overridden, .clustering));
+    try std.testing.expectEqualStrings("CLASSIFICATION", effectiveProviderTaskType(&overridden, .classification));
 
     const query_context = embeddingRequestContext(&entry, .retrieval_query);
     try std.testing.expectEqual(EmbeddingTaskType.retrieval_query, query_context.task_type);
@@ -6690,11 +6898,27 @@ fn embedBatchWithEntryForTask(
     return withQueryEmbeddingRetry([]const []const f32, alloc, entry, embedBatchWithEntryForTaskOnce, .{ texts, dims, task_type }, task_type);
 }
 
+// A query retry budget covers inference, not scale-from-zero preparation.
+// Reuse the normal capability cache before establishing the default query clock.
+fn prepareRemoteQueryEmbedding(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) !void {
+    if (!isAntflyProvider(entry.provider) or entry.antfly_provider != null or entry.planned_text_lease != null) return;
+    var fallback_http: ?httpx.Client = null;
+    defer if (fallback_http) |*client| client.deinit();
+    const http = try entry.httpClient(alloc, &fallback_http);
+    var auth: ?[]u8 = null;
+    defer if (auth) |value| alloc.free(value);
+    if (entry.api_key) |*key| auth = try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, key);
+    var storage: [2][2][]const u8 = undefined;
+    const headers = remoteEmbeddingHeaders(entry, auth, &storage);
+    _ = try discoverRemoteEmbeddingLease(entry, http, headers);
+}
+
 fn withQueryEmbeddingRetry(comptime Result: type, alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, comptime invoke: anytype, args: anytype, task_type: EmbeddingTaskType) !Result {
     if (task_type != .retrieval_query) return @call(.auto, invoke, .{ alloc, entry } ++ args);
     // A foreground query shares inference capacity with backfill. Keep one
     // deadline across retries, and yield the executor during bounded waits.
     var attempt: usize = 0;
+    try prepareRemoteQueryEmbedding(alloc, entry);
     const deadline = embeddingOperationDeadline(entry);
     var bounded = entry.requestOverlay(alloc);
     bounded.deadline_ns = deadline;
@@ -6748,6 +6972,7 @@ fn embedBatchWithEntryForTaskOnce(
         @tagName(entry.provider),
     );
     switch (entry.provider) {
+        .cloudflare => return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims, task_type),
         .openai, .openrouter, .ollama => {
             if (entry.requests_per_minute > 0 and texts.len > entry.burst) {
                 return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims, task_type);
@@ -6765,7 +6990,8 @@ fn embedBatchWithEntryForTaskOnce(
                 try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, task_type);
                 try context.check();
-                if (context.model_identity != null and local.embed_dense_texts_with_context == null) return error.InvalidEmbeddingIdentity;
+                if ((task_type == .clustering or task_type == .classification) and local.embed_dense_texts_with_context == null) return error.UnsupportedEmbeddingTaskType;
+                if ((context.model_identity != null or context.model_revision != null) and local.embed_dense_texts_with_context == null) return error.InvalidEmbeddingIdentity;
                 if (trace_batch) provider_started = monotonicNowNs();
                 const vectors = (if (local.embed_dense_texts_with_context) |embed_with_context|
                     AntflyProviderBoundary.call("embed_dense_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
@@ -6784,7 +7010,6 @@ fn embedBatchWithEntryForTaskOnce(
                 return vectors;
             }
             try checkEntryDispatchDeadline(entry);
-            const operation_deadline_ns = embeddingOperationDeadline(entry);
             var fallback_http: ?httpx.Client = null;
             defer if (fallback_http) |*client| client.deinit();
             const http = try entry.httpClient(alloc, &fallback_http);
@@ -6809,9 +7034,9 @@ fn embedBatchWithEntryForTaskOnce(
                 http,
                 &provider,
                 capability_headers,
-                operation_deadline_ns,
                 try textEmbeddingInvocationShape(texts),
             );
+            const operation_deadline_ns = embeddingOperationDeadline(entry);
             try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
 
             var result = provider.embedWithTask(
@@ -6843,6 +7068,7 @@ fn effectiveProviderTaskType(entry: *const ManagedEmbeddingEntry, task_type: Emb
     const role_override = switch (task_type) {
         .retrieval_query => entry.query_input_type,
         .retrieval_document => entry.document_input_type,
+        .clustering, .classification => "",
     };
     return if (role_override.len > 0) role_override else task_type.canonical();
 }
@@ -6869,7 +7095,11 @@ fn embedBatchWithGemini(
     provider.attempt_observer = embeddingAttemptObserver(entry);
     var result = try provider.embedText(alloc, entry.model, texts, .{
         .task_type = effectiveProviderTaskType(entry, task_type),
+        .request_format = entry.google_request_format,
+        .task_encoding = entry.google_task_encoding,
+        .batch_size = entry.google_batch_size,
         .dimensions = if (dims > 0) dims else null,
+        .timeout_ms = if (entry.bounded_http_request) try embeddingRemainingTimeoutMs(embeddingOperationDeadline(entry)) else null,
         .cancellation = embeddingHttpCancellation(entry),
     });
     errdefer result.deinit();
@@ -6921,13 +7151,16 @@ fn embedBatchWithVertex(
         out.deinit(alloc);
     }
 
-    const max_batch = provider_defaults.vertexMaxEmbeddingBatchSize(entry.model);
+    const max_batch = vertex_provider.maxEmbeddingBatchSize(entry.google_request_format, entry.model, entry.google_batch_size);
     var offset: usize = 0;
     while (offset < texts.len) {
         const end = cappedEmbeddingBatchEnd(offset, texts.len, max_batch);
         try checkEntryDispatchDeadline(entry);
         var result = try provider.embedTextRequest(alloc, entry.model, texts[offset..end], .{
             .task_type = effectiveProviderTaskType(entry, task_type),
+            .request_format = entry.google_request_format,
+            .task_encoding = entry.google_task_encoding,
+            .batch_size = entry.google_batch_size,
             .dimensions = if (dims > 0) dims else null,
             .timeout_ms = if (entry.bounded_http_request) try embeddingRemainingTimeoutMs(embeddingOperationDeadline(entry)) else null,
             .cancellation = embeddingHttpCancellation(entry),
@@ -7100,7 +7333,7 @@ fn embedBatchWithOpenAiCompatiblePacedChunks(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    const chunk_size = @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
+    const chunk_size = if (entry.provider == .cloudflare) @min(@as(usize, 100), if (entry.requests_per_minute > 0) @max(@as(usize, 1), @as(usize, entry.burst)) else 100) else @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
     var out = std.ArrayListUnmanaged([]const f32).empty;
     errdefer {
         for (out.items) |vector| alloc.free(vector);
@@ -7132,6 +7365,7 @@ fn embedBatchWithOpenAiCompatible(
     const Response = struct {
         data: []const struct {
             embedding: []const f32,
+            index: ?usize = null,
         },
     };
 
@@ -7144,7 +7378,7 @@ fn embedBatchWithOpenAiCompatible(
     const json_body = try httpx.json.Json.stringify(alloc, Request{
         .model = .{ .string = entry.model },
         .input = .{ .array = input_array },
-        .dimensions = if (dims > 0) dims else null,
+        .dimensions = if (entry.provider != .cloudflare and dims > 0) dims else null,
     });
     defer alloc.free(json_body);
 
@@ -7154,13 +7388,17 @@ fn embedBatchWithOpenAiCompatible(
         null;
     defer if (auth_header) |value| alloc.free(value);
 
-    var headers_buf: [2][2][]const u8 = undefined;
+    var headers_buf: [3][2][]const u8 = undefined;
     headers_buf[0] = .{ "content-type", "application/json" };
-    const header_count: usize = if (auth_header != null) 2 else 1;
+    var header_count: usize = if (auth_header != null) 2 else 1;
     if (auth_header) |value| {
         headers_buf[1] = .{ "authorization", value };
     }
 
+    if (entry.gateway_id) |id| {
+        headers_buf[header_count] = .{ "cf-aig-gateway-id", id };
+        header_count += 1;
+    }
     try checkEntryDispatchDeadline(entry);
 
     var fallback_http: ?httpx.Client = null;
@@ -7188,15 +7426,16 @@ fn embedBatchWithOpenAiCompatible(
     if (parsed.value.data.len != texts.len) return error.InvalidEmbeddingResponse;
 
     const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
-    var initialized: usize = 0;
+    @memset(vectors, &.{});
     errdefer {
-        for (vectors[0..initialized]) |vector| alloc.free(@constCast(vector));
+        for (vectors) |vector| if (vector.len > 0) alloc.free(vector);
         alloc.free(vectors);
     }
     for (parsed.value.data, 0..) |item, i| {
+        const index = item.index orelse if (entry.provider == .cloudflare) return error.InvalidEmbeddingResponse else i;
+        if (index >= vectors.len or vectors[index].len != 0) return error.InvalidEmbeddingResponse;
         try validateDenseVector(item.embedding, dims);
-        vectors[i] = try alloc.dupe(f32, item.embedding);
-        initialized += 1;
+        vectors[index] = try alloc.dupe(f32, item.embedding);
     }
     return vectors;
 }
@@ -7217,6 +7456,7 @@ fn optionalBearerAuthHeaderOwned(
 
 fn mapEmbedStatus(status: u16) anyerror {
     return switch (status) {
+        401, 403 => error.InferenceEndpointAccessDenied,
         429 => error.EmbedRateLimited,
         408,
         502,
@@ -10544,4 +10784,368 @@ pub fn testSparseCacheRevision() !void {
     try std.testing.expectEqual(@as([32]u8, @splat(7)), revision);
     const dense = managed.denseInterface();
     try std.testing.expect((try dense.cache_revision_fn.?(dense.ptr, std.testing.allocator, "semantic_idx")) == null);
+}
+
+test "managed embedder endpoint access denial survives HTTP probing and runtime transport" {
+    const a = std.testing.allocator;
+    const Denied = struct {
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return .{ .status = 403, .content_type = try alloc.dupe(u8, "application/json"), .body = try alloc.dupe(u8, "{\"error\":\"forbidden\"}") };
+        }
+    };
+    var marker: u8 = 0;
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &marker, .vtable = &.{ .execute = Denied.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(a);
+    defer a.free(base_uri);
+    for ([_][]const u8{ "openai", "antfly" }) |provider| {
+        const raw = try std.fmt.allocPrint(a, "{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{{\"provider\":\"{s}\",\"model\":\"model\",\"api_url\":\"{s}\"}}}}", .{ provider, base_uri });
+        defer a.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InferenceEndpointAccessDenied, normalizeEmbeddingsIndexDimensionJsonWithOptions(a, "semantic", parsed.value, .{}));
+    }
+    const abi = @import("antfly_runtime_abi").error_abi;
+    try std.testing.expectEqual(error.InferenceEndpointAccessDenied, abi.errorFromStatus(abi.statusFromError(error.InferenceEndpointAccessDenied)));
+}
+
+test "managed embedder Cloudflare compatibility preserves indexed results without resizing" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expect(!parsed.value.object.contains("dimensions"));
+            try std.testing.expectEqualStrings("gateway", req.header("cf-aig-gateway-id").?);
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/embeddings", .assert_request = Check.request, .respond = .{ .body = "{\"data\":[{\"index\":1,\"embedding\":[0,1]},{\"index\":0,\"embedding\":[1,0]}]}" } }});
+    defer server.deinit();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(alloc: std.mem.Allocator, http: *httpx.Client, url: []const u8, out: *?anyerror) std.Io.Cancelable!void {
+            var entry = ManagedEmbeddingEntry{ .alloc = alloc, .index_name = @constCast("test"), .provider = .cloudflare, .model = @constCast("@cf/test/embedding"), .base_url = @constCast(url), .gateway_id = "gateway", .dimensions = 2, .shared_http_client = http };
+            defer entry.auth_header_cache.deinit(alloc);
+            const vectors = embedBatchWithOpenAiCompatible(alloc, &entry, &.{ "first", "second" }, 2, .retrieval_document) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+            std.testing.expectEqualSlices(f32, &.{ 1, 0 }, vectors[0]) catch |err| {
+                out.* = err;
+            };
+            std.testing.expectEqualSlices(f32, &.{ 0, 1 }, vectors[1]) catch |err| {
+                out.* = err;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &failure }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (failure) |err| return err;
+}
+
+test "managed embedder Cloudflare configuration survives every allocation failure" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var cfg = try embeddings_types.parseConfigFromSlice(a,
+                \\{"provider":"cloudflare","account_id":"account","gateway_id":"gateway","model":"@cf/baai/bge-base-en-v1.5","dimensions":768,"api_key":"fixture"}
+            );
+            defer cfg.deinit(a);
+            var copy = try cfg.clone(a);
+            defer copy.deinit(a);
+            try std.testing.expectEqualStrings("account", copy.account_id.?);
+            try std.testing.expect(copy.account_id.?.ptr != cfg.account_id.?.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "managed embedder Cloudflare index declarations retain fixed dimensions" {
+    for ([_]bool{ true, false }) |alias| {
+        const config = indexes_openapi.EmbeddingsIndexConfig{ .embedder = .{ .cloudflare_embedder_config = .{
+            .provider = "cloudflare",
+            .account_id = "account",
+            .model = "@cf/baai/bge-base-en-v1.5",
+            .dimensions = if (alias) null else 768,
+            .dimension = if (alias) 768 else null,
+        } } };
+        try std.testing.expectEqual(@as(?u32, 768), try resolveDeclaredEmbeddingDimensions(config));
+    }
+}
+
+test "new Google admission pins defaults and preserves explicit legacy execution" {
+    const alloc = std.testing.allocator;
+    var input = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":3072,"field":"body","embedder":{"provider":"vertex","project_id":"project"}}
+    , .{});
+    defer input.deinit();
+    const normalized = (try normalizeGoogleEmbeddingDefaultsJson(alloc, input.value)).?;
+    defer alloc.free(normalized);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("embedder").?.object;
+    try std.testing.expectEqualStrings("gemini-embedding-2", config.get("model").?.string);
+    try std.testing.expectEqualStrings("embed_content", config.get("request_format").?.string);
+    try std.testing.expectEqualStrings("prompt", config.get("task_encoding").?.string);
+    try std.testing.expectEqualStrings("global", config.get("location").?.string);
+    try std.testing.expectEqual(@as(?[]u8, null), try normalizeGoogleEmbeddingDefaultsJson(alloc, parsed.value));
+    var legacy = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","project_id":"project","model":"gemini-embedding-001","request_format":"predict"}}
+    , .{});
+    defer legacy.deinit();
+    const legacy_raw = (try normalizeGoogleEmbeddingDefaultsJson(alloc, legacy.value)).?;
+    defer alloc.free(legacy_raw);
+    var pinned = try std.json.parseFromSlice(std.json.Value, alloc, legacy_raw, .{});
+    defer pinned.deinit();
+    try std.testing.expectEqualStrings("task_type", pinned.value.object.get("embedder").?.object.get("task_encoding").?.string);
+    const identity = try embeddingSemanticProducerJsonAlloc(alloc, parsed.value);
+    defer alloc.free(identity);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "\"task_encoding\":\"prompt\"") != null);
+    try parsed.value.object.put(parsed.arena.allocator(), "semantic_producer", .{ .string = identity });
+    try std.testing.expectEqual(@as(?[]u8, null), try normalizeGoogleEmbeddingDefaultsJson(alloc, parsed.value));
+}
+
+test "admitted legacy Google catalogs keep absent protocol and task fields on migration" {
+    const alloc = std.testing.allocator;
+    var input = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":3072,"field":"body","embedder":{"provider":"vertex","project_id":"project","location":"us-central1","model":"gemini-embedding-001"}}
+    , .{});
+    defer input.deinit();
+    const raw = (try normalizeAdmittedEmbeddingsIndexDimensionJsonForCatalogWithOptions(alloc, "dense", input.value, input.value, .{})).?;
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("embedder").?.object;
+    try std.testing.expect(config.get("request_format") == null);
+    try std.testing.expect(config.get("task_encoding") == null);
+    const identity = parsed.value.object.get("semantic_producer").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, identity, "\"request_format\":\"\"") != null);
+}
+
+test "Google transport and task encoding bind execution and distinguish semantic identity" {
+    const alloc = std.testing.allocator;
+    var modern = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"vertex","project_id":"project","location":"global","model":"future-model","request_format":"embed_content","task_encoding":"prompt","batch_size":1}}}
+    );
+    defer modern.deinit();
+    try std.testing.expectEqual(vertex_provider.RequestFormat.embed_content, modern.entries[0].google_request_format);
+    try std.testing.expectEqual(vertex_provider.TaskEncoding.prompt, modern.entries[0].google_task_encoding);
+    var legacy = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"vertex","project_id":"project","location":"global","model":"future-model"}}}
+    );
+    defer legacy.deinit();
+    try std.testing.expectEqual(vertex_provider.RequestFormat.predict, legacy.entries[0].google_request_format);
+    try std.testing.expectEqual(vertex_provider.TaskEncoding.task_type, legacy.entries[0].google_task_encoding);
+    try std.testing.expect(!managedEmbeddingEntriesSemanticallyEquivalent(&modern.entries[0], &legacy.entries[0]));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"vertex","project_id":"project","location":"global","model":"future-model","request_format":"embed_content","task_encoding":"prompt"}}
+    , .{});
+    defer parsed.deinit();
+    const identity = try embeddingSemanticProducerJsonAlloc(alloc, parsed.value);
+    defer alloc.free(identity);
+    try parsed.value.object.put(parsed.arena.allocator(), "semantic_producer", .{ .string = identity });
+    const stored = try embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, parsed.value, .{});
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(identity, stored);
+    try parsed.value.object.getPtr("embedder").?.object.put(parsed.arena.allocator(), "task_encoding", .{ .string = "none" });
+    try std.testing.expectError(error.InvalidEmbeddingArtifactProducer, embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, parsed.value, .{}));
+}
+
+test "Google public admission resolves missing model before probing and persists modern defaults" {
+    const alloc = std.testing.allocator;
+    var input = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":3,"field":"body","validation":"defer_probe","embedder":{"provider":"gemini","api_key":"test-key","url":"http://127.0.0.1:1"}}
+    , .{});
+    defer input.deinit();
+    const raw = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, "dense", input.value, .{})).?;
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("embedder").?.object;
+    try std.testing.expectEqualStrings("gemini-embedding-2", config.get("model").?.string);
+    try std.testing.expectEqualStrings("embed_content", config.get("request_format").?.string);
+    try std.testing.expectEqualStrings("prompt", config.get("task_encoding").?.string);
+    const identity = try embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, parsed.value, .{});
+    defer alloc.free(identity);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "test-key") == null);
+    const replayed = try normalizeAdmittedEmbeddingsIndexDimensionJsonForCatalogWithOptions(alloc, "dense", parsed.value, parsed.value, .{});
+    defer if (replayed) |value| alloc.free(value);
+    try std.testing.expect(replayed == null);
+}
+
+pub fn testRetainedTextGenerationLease() !void {
+    const a = std.testing.allocator;
+    const Local = struct {
+        revision: u8 = 7,
+        calls: usize = 0,
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+        fn capabilities(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, task: inference_work.Task) anyerror!inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .task = task, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .item, .output = .embedding, .model_revision = @as([32]u8, @splat(self.revision)) };
+        }
+        fn controlled(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: EmbeddingRequestContext) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as([32]u8, @splat(7)), context.model_revision.?);
+            try std.testing.expect(context.model_identity == null);
+            try std.testing.expectEqual(EmbeddingTaskType.retrieval_document, context.task_type);
+            try std.testing.expectEqual(@as(?u32, 1), context.dimensions);
+            try std.testing.expectEqualStrings("hello", texts[0]);
+            if (self.revision != 7) return error.InferenceCapabilitiesStale;
+            const rows = try alloc.alloc([]f32, 1);
+            errdefer alloc.free(rows);
+            rows[0] = try alloc.dupe(f32, &.{7});
+            self.calls += 1;
+            self.revision = 9;
+            return rows;
+        }
+    };
+    var local: Local = .{};
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(a, "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":1,\"embedder\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}}", .{ .ptr = &local, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse, .embed_dense_texts_with_context = Local.controlled, .model_capabilities = Local.capabilities });
+    defer managed.deinit();
+    const provider = managed.denseInterface();
+    const generation = try provider.captureTextGeneration(a, "semantic_idx");
+    const leased = provider.withTextGeneration(generation);
+    const vectors = try leased.embedDenseBatch(a, "semantic_idx", &.{"hello"}, 1);
+    defer db_embedder.freeDenseEmbeddingBatch(a, vectors);
+    try std.testing.expectEqual(@as(f32, 7), vectors[0][0]);
+    try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(a, "semantic_idx", generation));
+    try std.testing.expectError(error.InferenceCapabilitiesStale, leased.embedDenseBatch(a, "semantic_idx", &.{"hello"}, 1));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "Google canonical Vertex artifact identities retain their pinned execution location" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "global", "us", "eu", "us-central1" }) |location| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a,
+            \\{"owner":{"type":"embeddings","field":"body","dimension":3072,"embedding_name":"dense","embedder":{"provider":"vertex","model":"gemini-embedding-2","project_id":"project","location":"global","request_format":"embed_content","task_encoding":"prompt"}},"enrichments":[{"name":"dense","kind":"embedding","field":"body","expected_dims":3072}]}
+        , .{});
+        defer parsed.deinit();
+        const owner = parsed.value.object.getPtr("owner").?;
+        try owner.object.getPtr("embedder").?.object.put(parsed.arena.allocator(), "location", .{ .string = location });
+        if (std.mem.eql(u8, location, "us-central1")) {
+            const config = &owner.object.getPtr("embedder").?.object;
+            try config.put(parsed.arena.allocator(), "model", .{ .string = "gemini-embedding-001" });
+            try config.put(parsed.arena.allocator(), "request_format", .{ .string = "predict" });
+            try config.put(parsed.arena.allocator(), "task_encoding", .{ .string = "task_type" });
+        }
+        const identity = try embeddingSemanticProducerJsonAlloc(a, owner.*);
+        defer a.free(identity);
+        try owner.object.put(parsed.arena.allocator(), "semantic_producer", .{ .string = identity });
+        try parsed.value.object.getPtr("enrichments").?.array.items[0].object.put(parsed.arena.allocator(), "producer_json", .{ .string = identity });
+        const raw = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+        defer a.free(raw);
+        var managed = try ManagedEmbedder.initFromIndexesJson(a, raw);
+        defer managed.deinit();
+        try std.testing.expectEqualStrings(location, managed.entries[0].location);
+        var producer = try std.json.parseFromSlice(std.json.Value, a, identity, .{});
+        defer producer.deinit();
+        const comparison = (try semanticProducerComparisonConfigJsonAlloc(a, producer.value)).?;
+        defer a.free(comparison);
+        var config = try embeddings_types.parseConfigFromSlice(a, comparison);
+        defer config.deinit(a);
+        try std.testing.expectEqualStrings(location, config.location);
+    }
+}
+
+test "managed embedder cold activation precedes default probe and query inference budgets" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    TestClock.offset_ns.store(0, .monotonic);
+    defer TestClock.offset_ns.store(0, .monotonic);
+    const Service = struct {
+        loaded: bool = false,
+        delay: u64 = 31 * std.time.ns_per_s,
+        activations: std.atomic.Value(u32) = .init(0),
+        embeddings: std.atomic.Value(u32) = .init(0),
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const body: []const u8 = if (std.mem.indexOf(u8, request.uri, "/models/instances") != null) loading: {
+                try std.testing.expectEqual(http_common.Method.POST, request.method);
+                const load = try std.json.parseFromSlice(struct { model: []const u8, task: []const u8 }, alloc, request.body, .{});
+                defer load.deinit();
+                try std.testing.expectEqualStrings("cold", load.value.model);
+                try std.testing.expectEqualStrings("embedder", load.value.task);
+                // Cross the real inference-only default in logical time.
+                // Keep real HTTP framing and the unchanged production budget.
+                _ = TestClock.offset_ns.fetchAdd(self.delay, .monotonic);
+                self.loaded = true;
+                _ = self.activations.fetchAdd(1, .monotonic);
+                break :loading "{\"state\":\"loaded\"}";
+            } else if (std.mem.indexOf(u8, request.uri, "/models") != null)
+                (if (self.loaded) "{\"embedders\":{\"cold\":{\"inputs\":[\"text\"]}}}" else "{\"embedders\":{}}")
+            else embedding: {
+                try std.testing.expect(std.mem.endsWith(u8, request.uri, "/embed"));
+                _ = self.embeddings.fetchAdd(1, .monotonic);
+                break :embedding "{\"model\":\"cold\",\"data\":[{\"embedding\":[1,0,0]}]}";
+            };
+            var response = http_common.HttpResponse{ .status = 200, .body = try alloc.dupe(u8, body) };
+            errdefer response.deinit(alloc);
+            const name = try alloc.dupe(u8, remote_capabilities.model_activation_header);
+            errdefer alloc.free(name);
+            const value = try alloc.dupe(u8, "supported");
+            errdefer alloc.free(value);
+            response.headers = try alloc.alloc(http_common.Header, 1);
+            response.headers[0] = .{ .name = name, .value = value };
+            return response;
+        }
+    };
+    for ([_]struct { query: bool, bounded: bool }{
+        .{ .query = false, .bounded = false }, .{ .query = true, .bounded = false },
+        .{ .query = false, .bounded = true },  .{ .query = true, .bounded = true },
+    }) |case| {
+        var service = Service{ .delay = if (case.bounded) 100 * std.time.ns_per_ms else 31 * std.time.ns_per_s };
+        var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &service, .vtable = &.{ .execute = Service.execute } });
+        defer listener.deinit();
+        try listener.start();
+        const root = try listener.baseUri(a);
+        defer a.free(root);
+        const index = try std.fmt.allocPrint(a, "{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{{\"provider\":\"antfly\",\"model\":\"cold\",\"api_url\":\"{s}/ai/v1\"}}}}", .{root});
+        defer a.free(index);
+        const options = InitOptions{
+            .io = io,
+            .bounded_http_request = true,
+            .deadline_ns = if (case.bounded) monotonicNowNs() + 20 * std.time.ns_per_ms else null,
+        };
+        if (case.query) {
+            const indexes = try std.fmt.allocPrint(a, "{{\"semantic\":{s}}}", .{index});
+            defer a.free(indexes);
+            var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, options);
+            defer managed.deinit();
+            const result = managed.embedQuery(a, "semantic", "test");
+            if (case.bounded) {
+                try std.testing.expectError(error.Timeout, result);
+            } else {
+                const vector = try result;
+                defer a.free(vector);
+                try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, vector);
+            }
+        } else {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, index, .{});
+            defer parsed.deinit();
+            const result = normalizeEmbeddingsIndexDimensionJsonWithOptions(a, "semantic", parsed.value, options);
+            if (case.bounded) {
+                try std.testing.expectError(error.EmbeddingProbeUnavailable, result);
+            } else {
+                const normalized = try result;
+                defer if (normalized) |value| a.free(value);
+            }
+        }
+        if (!case.bounded) try std.testing.expectEqual(@as(u32, 1), service.activations.load(.monotonic));
+        try std.testing.expectEqual(@as(u32, if (case.bounded) 0 else 1), service.embeddings.load(.monotonic));
+    }
 }

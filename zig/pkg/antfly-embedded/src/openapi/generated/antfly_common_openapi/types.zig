@@ -351,8 +351,8 @@ pub const Config = struct {
     predictors: ?std.json.ArrayHashMap(RuntimeTaskBinding) = null,
     /// Named extraction targets served by existing inference connections.
     extractors: ?std.json.ArrayHashMap(RuntimeTaskBinding) = null,
-    /// Named rewriting targets served by existing inference connections.
-    rewriters: ?std.json.ArrayHashMap(RuntimeTaskBinding) = null,
+    /// Named rewriting targets using an inference connection or any named generator.
+    rewriters: ?std.json.ArrayHashMap(RewriterConfig) = null,
     /// Named decision providers for ai_decide and convenience functions.
     deciders: ?std.json.ArrayHashMap(DeciderConfig) = null,
     /// Named reranker configurations for search result reranking. Define named rerankers that can be referenced by indexes, search queries, and API calls. The first reranker defined becomes the default when no reranker name is specified. **Example:** ```json { "rerankers": { "cohere-english": { "provider": "cohere", "model": "rerank-english-v3.0" }, "antfly-local": { "provider": "antfly", "model": "mxbai-rerank-base-v1", "url": "http://localhost:8080" } } } ```
@@ -740,11 +740,17 @@ pub const DeciderConfig = struct {
     output: ?antfly_generating_openapi.ConstrainedOutput = null,
     probabilities: ?antfly_generating_openapi.ConstrainedProbabilities = null,
     batch: ?antfly_generating_openapi.ConstrainedGenerationBatch = null,
-    /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
+    /// Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
     model: ?[]const u8 = null,
+    /// Required with the cloudflare provider; Workers AI account identifier.
+    account_id: ?[]const u8 = null,
+    /// Optional Cloudflare AI Gateway identifier.
+    gateway_id: ?[]const u8 = null,
     /// Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
     model_identity: ?[]const u8 = null,
-    /// EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
+    /// Named dense embedder for provider-neutral embedding_similarity routing. Specify matching embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes use explicit thresholds and estimated token admission.
+    embedder: ?[]const u8 = null,
+    /// Geometry and acceptance defaults for embedding_similarity decisions. Named embedders require dimensions matching their configured dense output. Direct Antfly model routes support EmbeddingGemma 2 dimensions and fitted calibrations. Acceptance is serialized onto each question and can be overridden per question. Raw cosine similarities never represent probabilities.
     embedding_options: ?std.json.Value = null,
     /// Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
     url: ?[]const u8 = null,
@@ -767,7 +773,10 @@ pub const DeciderConfig = struct {
         .{ "probabilities", "probabilities", false },
         .{ "batch", "batch", false },
         .{ "model", "model", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "model_identity", "model_identity", true },
+        .{ "embedder", "embedder", true },
         .{ "embedding_options", "embedding_options", true },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
@@ -832,8 +841,20 @@ pub const DeciderConfig = struct {
             try jw.objectField("model");
             try jw.write(value);
         }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
         if (self.model_identity) |value| {
             try jw.objectField("model_identity");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
             try jw.write(value);
         }
         if (self.embedding_options) |value| {
@@ -1673,6 +1694,8 @@ pub const InferenceConnectionConfig = struct {
     project_id: ?[]const u8 = null,
     /// Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     location: ?[]const u8 = null,
+    /// Anthropic workspace for an API key that is not workspace-scoped.
+    workspace_id: ?[]const u8 = null,
     /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     credentials_path: ?[]const u8 = null,
     /// Per-image input token upper bound for hosted decisions. Required to enable images; must cover every admitted decision model on this connection. Named deciders can specify tighter per-model bounds.
@@ -1690,6 +1713,7 @@ pub const InferenceConnectionConfig = struct {
         .{ "region", "region", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
+        .{ "workspace_id", "workspace_id", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "names", "names", true },
@@ -1726,6 +1750,10 @@ pub const InferenceConnectionConfig = struct {
         }
         if (self.location) |value| {
             try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.workspace_id) |value| {
+            try jw.objectField("workspace_id");
             try jw.write(value);
         }
         if (self.credentials_path) |value| {
@@ -2366,6 +2394,8 @@ pub const QueryAdmissionConfig = struct {
         try jw.endObject();
     }
 };
+
+pub const RewriterConfig = std.json.Value;
 
 pub const RuntimeTaskBinding = struct {
     /// Backend model identity, including any owner prefix.

@@ -44,13 +44,29 @@ components:
           minLength: 1
           default: local-inference
           description: Existing inference connection identity; credentials remain on the connection.
+    RewriterConfig:
+      oneOf:
+        - $ref: '#/components/schemas/RuntimeTaskBinding'
+        - type: object
+          additionalProperties: false
+          required: [generator]
+          properties:
+            generator:
+              type: string
+              minLength: 1
+              description: Existing named generator. Uses its provider, credentials, quotas and request deadline.
+            instructions:
+              type: string
+              maxLength: 65536
+              description: Rewriting task instructions. Input text remains untrusted user content.
+
     DeciderConfig:
       type: object
       additionalProperties: false
       properties:
         provider:
           type: string
-          enum: [antfly, jev, openai]
+          enum: [antfly, jev, openai, cloudflare]
         decision_method:
           type: string
           enum: [typed, embedding_similarity, generated]
@@ -70,15 +86,25 @@ components:
           $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch'
         model:
           type: string
-          description: Required for Antfly and OpenAI; Jev defaults to jev-latest.
+          description: Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
+        account_id:
+          type: string
+          description: Required with the cloudflare provider; Workers AI account identifier.
+        gateway_id:
+          type: string
+          description: Optional Cloudflare AI Gateway identifier.
         model_identity:
           type: string
           pattern: '^[0-9a-f]{64}$'
           description: Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
+        embedder:
+          type: string
+          minLength: 1
+          description: Named dense embedder for provider-neutral embedding_similarity routing. Specify matching embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes use explicit thresholds and estimated token admission.
         embedding_options:
           type: object
           additionalProperties: false
-          description: EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
+          description: Geometry and acceptance defaults for embedding_similarity decisions. Named embedders require dimensions matching their configured dense output. Direct Antfly model routes support EmbeddingGemma 2 dimensions and fitted calibrations. Acceptance is serialized onto each question and can be overridden per question. Raw cosine similarities never represent probabilities.
           properties:
             calibration_id:
               type: string
@@ -90,8 +116,10 @@ components:
               default: CLUSTERING
             dimensions:
               type: integer
-              enum: [768, 512, 256, 128]
+              minimum: 1
+              maximum: 65535
               default: 768
+              description: Must match the named embedder's configured dimensions. Without embedder, the direct EmbeddingGemma 2 route accepts only 768, 512, 256 or 128.
             min_similarity:
               type: number
               minimum: -1
@@ -299,6 +327,18 @@ components:
               type: boolean
               default: false
               description: Allow public inference execution, including named targets, direct connection invocation, batches, and sessions. Disabled by default for this release; deployments must explicitly opt in. Discovery remains available and reports this policy.
+            default_timeout_ms:
+              type: integer
+              minimum: 1
+              maximum: 3600000
+              default: 120000
+              description: Total public inference budget in milliseconds when the caller omits X-Antfly-Inference-Timeout-Ms. Includes admission, queueing, retries and execution. Must not exceed max_timeout_ms.
+            max_timeout_ms:
+              type: integer
+              minimum: 1
+              maximum: 3600000
+              default: 3600000
+              description: Maximum permitted caller budget. Invalid, duplicate, zero or excessive X-Antfly-Inference-Timeout-Ms headers fail before dispatch.
         inference:
           $ref: "../inference/config.yaml#/components/schemas/RuntimeConfig"
         tls:
@@ -587,8 +627,8 @@ components:
         rewriters:
           type: object
           additionalProperties:
-            $ref: "#/components/schemas/RuntimeTaskBinding"
-          description: Named rewriting targets served by existing inference connections.
+            $ref: "#/components/schemas/RewriterConfig"
+          description: Named rewriting targets using an inference connection or any named generator.
         deciders:
           type: object
           additionalProperties:
@@ -778,6 +818,9 @@ components:
         location:
           type: string
           description: Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        workspace_id:
+          type: string
+          description: Anthropic workspace for an API key that is not workspace-scoped.
         credentials_path:
           type: string
           description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.

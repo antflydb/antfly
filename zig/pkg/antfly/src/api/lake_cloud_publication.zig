@@ -30,7 +30,7 @@ fn digestRoot(id: []const u8) [32]u8 {
     return result;
 }
 pub fn certificateBinding(a: A, publication: catalog.Publication, certificate: catalog.CloudRetentionCertificate) ![32]u8 {
-    const encoded = if (publication.source_navigation == null) try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v1", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v2", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .source_navigation = publication.source_navigation, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{});
+    const encoded = if (publication.row_identity != null) try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v3", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .source_navigation = publication.source_navigation, .row_identity = publication.row_identity, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{}) else if (publication.source_navigation == null) try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v1", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v2", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .source_navigation = publication.source_navigation, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{});
     defer a.free(encoded);
     return digestRoot(encoded);
 }
@@ -141,6 +141,7 @@ pub fn finish(a: A, writer: *maps.Writer, object: *Object, publication: *catalog
     defer roots.deinit(a);
     try roots.append(a, digestRoot(publication.inventory.artifact_id));
     if (publication.source_navigation) |navigation| try roots.append(a, digestRoot(navigation.artifact_id));
+    if (publication.row_identity) |row_identity| try roots.append(a, digestRoot(row_identity.artifact_id));
     if (publication.directory) |directory| try roots.append(a, digestRoot(directory.artifact_id));
     for (declarations) |declaration| try roots.append(a, digestRoot(declaration.artifact.artifact_id));
     // Keep optional inline proof evidence comfortably inside the catalog and
@@ -230,7 +231,35 @@ test "external lake global frontier cloud certificates bind publications restart
     var artifacts = object.artifactStore();
     var inventory = try artifacts.putScoped(scope, "inventory", .none);
     defer inventory.deinit(a);
+    // Bind a multi-level packed navigation forest into the same durable
+    // publication proof; a fresh reader must resolve the retained pack version.
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    const PageStore = @import("../serverless/graph_segment/page_store.zig").PageStore;
+    var page_reads: u64 = 16 * 1024 * 1024;
+    var page_writes: u64 = 16 * 1024 * 1024;
+    var pages: PageStore = .{ .domain = domain, .attempt = scope.attempt, .artifacts = &artifacts, .remaining_read_bytes = &page_reads, .remaining_write_bytes = &page_writes, .pack_pages = true };
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store(), .target_bytes = 512 };
+    defer builder.deinit();
+    for (0..32) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        try builder.add(&key, &@as([64]u8, @splat(17)));
+    }
+    const page_root = (try builder.finish()).?;
+    var leaf_ref = page_root;
+    while (leaf_ref.height > 0) {
+        var page = try tree.readPage(a, pages.store(), leaf_ref);
+        defer page.deinit(a);
+        leaf_ref = page.entries[0].child.?.*;
+    }
+    try std.testing.expect(leaf_ref.pack != null);
+    const navigation: @import("lake_source_navigation.zig").Root = .{ .domain = domain, .source = "source", .schema = "schema", .snapshot = "snapshot", .count = 32, .files = page_root, .public = page_root, .private = page_root };
+    const nav_bytes = try std.json.Stringify.valueAlloc(a, navigation, .{});
+    defer a.free(nav_bytes);
+    var nav = try artifacts.putScoped(scope, nav_bytes, .none);
+    defer nav.deinit(a);
     var publication: catalog.Publication = .{ .reader_protocol = catalog.native_reader_protocol, .namespace = namespace, .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = identity }, .published_at_ms = 101, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len } };
+    publication.source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = nav.artifact_id, .checksum = nav.checksum, .byte_len = nav.byte_len };
     try finish(a, &writer, &object, &publication, &.{}, table_id, identity, .{ .io = std.testing.io }, .none, false);
     const cloud = publication.cloud_generations.?;
     {
@@ -273,9 +302,25 @@ test "external lake global frontier cloud certificates bind publications restart
     const bytes = try reads.getVerifiedAllocWithCancellation(inventory.artifact_id, inventory.byte_len, inventory.checksum, .none);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("inventory", bytes);
+    const pack_id = try PageStore.identity(domain, leaf_ref);
+    const pack_suffix = try stores.storageSuffixAlloc(a, &pack_id);
+    defer a.free(pack_suffix);
+    const pack_path = try std.fmt.allocPrint(a, "native/{s}", .{pack_suffix});
+    defer a.free(pack_path);
+    var changed_pack = try current.putObject("bucket", pack_path, "corrupt live pack name", .{});
+    changed_pack.deinit(a);
+    pages.artifacts = &reads;
+    var retained_page = try tree.readPage(a, pages.store(), leaf_ref);
+    defer retained_page.deinit(a);
+    try std.testing.expectEqual(@as(u8, 17), retained_page.entries[0].value[0]);
     const before = provider.stats;
     try std.testing.expect(try reads.retainedClosure(inventory.artifact_id, .none));
     try std.testing.expectEqual(before, provider.stats);
+    var remapped = publication;
+    remapped.row_identity = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len };
+    const before_identity = try certificateBinding(a, publication, cloud.certificate.?);
+    const after_identity = try certificateBinding(a, remapped, cloud.certificate.?);
+    try std.testing.expect(!std.mem.eql(u8, &before_identity, &after_identity));
     var tampered = publication;
     tampered.cloud_generations.?.certificate.?.binding[0] ^= 1;
     try std.testing.expectError(error.InvalidCloudRetentionCertificate, Binding.init(a, &reopened, tampered, .none));

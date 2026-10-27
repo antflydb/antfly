@@ -669,11 +669,12 @@ const ReplayChunkBuilder = struct {
     }
 
     fn artifactMatches(key: []const u8, kind: ?db_types.IndexKind) bool {
-        return if (kind) |selected| if (selected == .graph)
-            internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or
-                internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isResolutionArtifactKey(key)
-        else
-            internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key) else true;
+        return if (kind) |selected| switch (selected) {
+            .graph => internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or
+                internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isResolutionArtifactKey(key),
+            .full_text, .algebraic => internal_keys.isAssetArtifactKey(key),
+            .dense_vector, .sparse_vector => internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key) or internal_keys.isAssetArtifactKey(key),
+        } else true;
     }
 
     fn reserveKeyMetadata(self: *@This(), list: *std.ArrayListUnmanaged([]const u8), seen: anytype, keys: []const []const u8, kind: ?db_types.IndexKind) !void {
@@ -732,6 +733,7 @@ const ReplayChunkBuilder = struct {
                 try self.appendKeys(&self.changed_doc_keys, &self.seen_changed_docs, record.changed_doc_keys, null);
                 try self.appendKeys(&self.deleted_doc_keys, &self.seen_deleted_docs, record.deleted_doc_keys, null);
                 try self.appendKeys(&self.overwritten_doc_keys, &self.seen_overwritten_docs, record.overwritten_doc_keys, null);
+                if (self.index_ref.kind == .full_text) try self.appendKeys(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, .full_text);
             },
             .dense_vector, .sparse_vector => {
                 // Each record is atomic: a later artifact mutation cancels an
@@ -839,7 +841,7 @@ const ReplayChunkBuilder = struct {
         if (self.index_ref.kind != .graph) {
             bytes +|= keyAdmissionBytes(&self.overwritten_doc_keys, &self.seen_overwritten_docs, record.overwritten_doc_keys, 0, null, &key_space);
         }
-        if (self.index_ref.kind == .graph or self.index_ref.kind == .dense_vector or self.index_ref.kind == .sparse_vector)
+        if (self.index_ref.kind != .algebraic)
             bytes +|= keyAdmissionBytes(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, 0, self.index_ref.kind, &key_space);
         if (self.index_ref.kind == .dense_vector)
             bytes +|= @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) *| self.estimatedDenseVectorBytes();
@@ -933,7 +935,8 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
         const record = change_journal_mod.decodeBinaryRecordBorrowedScratchSelected(builder.scratch_alloc, payload, builder.decode_scratch, .{
             .changed_doc_keys = builder.index_ref.kind != .graph,
             .overwritten_doc_keys = builder.index_ref.kind != .graph,
-            .changed_artifact_keys = builder.index_ref.kind != .full_text and builder.index_ref.kind != .algebraic,
+            .changed_artifact_keys = builder.index_ref.kind != .algebraic,
+            .asset_roots_only = builder.index_ref.kind == .full_text,
         }) catch |err| {
             if (err == error.OutOfMemory) {
                 if (builder.scratch_budget) |budget| {
@@ -984,10 +987,19 @@ fn recordEstimatedBytesForIndex(record: change_journal_mod.Record, kind: db_type
 
 fn recordItemCountForIndex(record: change_journal_mod.Record, kind: db_types.IndexKind) usize {
     return switch (kind) {
-        .full_text, .algebraic => record.changed_doc_keys.len + record.deleted_doc_keys.len + record.overwritten_doc_keys.len,
-        .dense_vector, .sparse_vector => record.changed_doc_keys.len + record.deleted_doc_keys.len + record.overwritten_doc_keys.len + countEmbeddingArtifactKeys(record.changed_artifact_keys),
+        .full_text => record.changed_doc_keys.len + record.deleted_doc_keys.len + record.overwritten_doc_keys.len + countAssetArtifactKeys(record.changed_artifact_keys),
+        .algebraic => record.changed_doc_keys.len + record.deleted_doc_keys.len + record.overwritten_doc_keys.len,
+        .dense_vector, .sparse_vector => record.changed_doc_keys.len + record.deleted_doc_keys.len + record.overwritten_doc_keys.len + countEmbeddingArtifactKeys(record.changed_artifact_keys) + countAssetArtifactKeys(record.changed_artifact_keys),
         .graph => record.deleted_doc_keys.len + countGraphArtifactKeys(record.changed_artifact_keys),
     };
+}
+
+fn countAssetArtifactKeys(keys: []const []const u8) usize {
+    var count: usize = 0;
+    for (keys) |key| if (internal_keys.isAssetArtifactKey(key)) {
+        count += 1;
+    };
+    return count;
 }
 
 fn countEmbeddingArtifactKeys(keys: []const []const u8) usize {
@@ -2523,5 +2535,32 @@ test "vector replay coalescing cancels and revives artifact tombstones without g
             try std.testing.expectEqual(@as(usize, 0), batch.deleted_keys.len);
             try std.testing.expectEqual(@as(usize, 1), batch.changed_artifact_keys.len);
         }
+    }
+}
+
+test "catchUpIndex delivers root-only asset repair metadata to serving consumers" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/asset-metadata-journal", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var journal = try change_journal_mod.Journal.open(path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    const root = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
+    defer a.free(root);
+    var record = try change_journal_mod.recordFromDerivedBatch(a, .{ .sequence = 1, .changed_artifact_keys = &.{root} }, 1);
+    defer change_journal_mod.deinitRecord(a, &record);
+    try appendChangeJournalRecord(&journal, a, record);
+    for ([_]db_types.IndexKind{ .full_text, .dense_vector, .sparse_vector, .graph }) |kind| {
+        var capture: TestApplyCapture = .{ .alloc = a };
+        defer capture.deinit();
+        const stats = try catchUpIndex(a, replay_source_mod.Source.fromJournal(&journal), .{ .name = "consumer", .kind = kind }, 0, null, &capture, testApplyCapture, null, null);
+        try std.testing.expectEqual(@as(u64, 1), stats.last_sequence);
+        try std.testing.expectEqual(@as(usize, 1), capture.call_count);
+        try std.testing.expectEqual(@as(usize, 0), capture.applied_documents);
+        try std.testing.expectEqual(@as(usize, 1), capture.applied_changed_artifact_keys);
+        try std.testing.expectEqualStrings(root, capture.last_batch.?.changed_artifact_keys[0]);
     }
 }

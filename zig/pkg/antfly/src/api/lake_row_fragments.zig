@@ -1,0 +1,2828 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Durable logical fragments reuse native per-file mutation/contribution paths.
+//! Radix boundaries split under pressure and never depend on source file layout.
+const std = @import("std");
+const local = @import("antfly_local_sources");
+const identity = @import("lake_row_identity.zig");
+const navigation = @import("lake_source_navigation.zig");
+const tree = @import("../serverless/graph_segment/page_tree.zig");
+const Pages = @import("../serverless/graph_segment/page_store.zig").PageStore;
+const stores = @import("../serverless/artifacts/store.zig");
+const Provider = @import("lake_index_row_source.zig").Provider;
+const rows = local.storage_rowsource_types;
+const A = std.mem.Allocator;
+const Token = @import("antfly_cancellation").CancellationToken;
+const commitments = @import("lake_row_input_commitment.zig");
+const max_rows = 8192;
+const max_fragments = 16384;
+const Fragment = struct { prefix: [32]u8, bits: u16, name: []const u8, count: u64, digest: [32]u8, dirty: bool = false, membership_dirty: bool = true, incremental: bool = false, order_tag: ?[]const u8 = null };
+
+pub const Build = struct {
+    a: A,
+    arena: std.heap.ArenaAllocator,
+    physical: *local.serverless_query_lake_serving.ServingSource,
+    source: local.serverless_query_lake_serving.ServingSource = undefined,
+    provider: Provider = undefined,
+    root: identity.Root,
+    space: identity.Space = undefined,
+    prior_navigation: ?navigation.Root = null,
+    fragments: []Fragment = &.{},
+    slots: []const u32 = &.{},
+    spool: ?*Spool = null,
+    order_capture: ?*@import("lake_row_payloads.zig").Capture = null,
+    census_rows_hashed: u64 = 0,
+    input_rows_hashed: u64 = 0,
+    ordering_rows_fetched: u64 = 0,
+    ordering_payload_decodes: u64 = 0,
+    ordering_keys_reused: u64 = 0,
+    ordering_keys_captured: u64 = 0,
+    ordering_input_cohort: ?[32]u8 = null,
+    prior_ordering_keys: ?tree.Ref = null,
+    ordering_edits: ?*@import("lake_index_page_mutations.zig").Mutations = null,
+    store: stores.ArtifactStore,
+    schemas: @import("sql_schema_cache.zig").Cache,
+    table: local.sql_catalog.Table = undefined,
+    context: local.serverless_query_lake_read_context.Context,
+    token: Token,
+    initialized: bool = false,
+    pub fn deinit(self: *Build) void {
+        if (self.spool) |spool| spool.deinit();
+        if (self.initialized) self.source.closeParallelView(self.physical);
+        self.schemas.deinit();
+        self.arena.deinit();
+        self.a.destroy(self);
+    }
+    fn check(raw: *anyopaque) !void {
+        const self: *Build = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
+        try self.token.check();
+    }
+    fn pageStore(self: *Build, reads: *u64, writes: *u64) Pages {
+        return .{ .domain = self.root.domain, .attempt = self.store.upload_scope.?.attempt, .artifacts = &self.store, .remaining_read_bytes = reads, .remaining_write_bytes = writes, .streaming = true, .cancellation = self.token };
+    }
+    fn replayable(raw: *anyopaque, binding: local.serverless_segment_source_binding.Binding) bool {
+        const self: *Build = @ptrCast(@alignCast(raw));
+        const spool = self.spool orelse return false;
+        for (binding.column_bindings) |name| {
+            const covered = for (spool.columns) |candidate| {
+                if (std.mem.eql(u8, name, candidate)) break true;
+            } else false;
+            if (!covered) return false;
+        }
+        return true;
+    }
+    fn open(raw: *anyopaque, a: A, binding: local.serverless_segment_source_binding.Binding, file: ?usize, token: Token, phase: ?*const stores.IoPhase) !rows.Source {
+        const self: *Build = @ptrCast(@alignCast(raw));
+        if (self.spool) |spool| return spool.open(a, binding, file, token, phase);
+        return openGather(raw, a, binding, file, token, phase);
+    }
+    fn openSelected(raw: *anyopaque, a: A, binding: local.serverless_segment_source_binding.Binding, file: usize, ordinals: []const u64, token: Token, phase: ?*const stores.IoPhase) !rows.Source {
+        const self: *Build = @ptrCast(@alignCast(raw));
+        if (file >= self.fragments.len) return error.InvalidLogicalRowIdentity;
+        for (ordinals, 0..) |row, i| if (row >= self.fragments[file].count or (i != 0 and row <= ordinals[i - 1])) return error.InvalidLogicalRowIdentity;
+        const source = try openGather(raw, a, binding, file, token, phase);
+        const cursor: *Gather = @ptrCast(@alignCast(source.ctx));
+        cursor.selected_rows = ordinals;
+        return source;
+    }
+    fn openGather(raw: *anyopaque, a: A, binding: local.serverless_segment_source_binding.Binding, file: ?usize, token: Token, phase: ?*const stores.IoPhase) !rows.Source {
+        const self: *Build = @ptrCast(@alignCast(raw));
+        const columns = try a.dupe([]const u8, binding.column_bindings);
+        errdefer a.free(columns);
+        var physical = try self.physical.parallelView(a);
+        errdefer physical.closeParallelView(self.physical);
+        const cursor = try a.create(Gather);
+        cursor.* = .{ .a = a, .owner = self, .arena = .init(a), .page_arena = .init(a), .binding = binding, .file = file, .token = token, .store = self.store, .physical = physical };
+        cursor.binding.column_bindings = columns;
+        cursor.store.io_phase = phase;
+        return .{ .kind = if (self.source.inventory.format == .iceberg) .external_iceberg else .external_parquet, .ctx = cursor, .next_batch = Gather.next, .deinit_fn = Gather.close, .retain_columns = Gather.retain };
+    }
+};
+
+pub fn prepare(a: A, store: *stores.ArtifactStore, table: local.common_topology_records.TableRecord, physical: *local.serverless_query_lake_serving.ServingSource, provider: *Provider, root: identity.Root, previous: ?identity.Root) !?*Build {
+    return prepareWithCapture(a, store, table, physical, provider, root, previous, null);
+}
+pub fn prepareWithCapture(a: A, store: *stores.ArtifactStore, table: local.common_topology_records.TableRecord, physical: *local.serverless_query_lake_serving.ServingSource, provider: *Provider, root: identity.Root, previous: ?identity.Root, capture: ?*@import("lake_row_payloads.zig").Capture) !?*Build {
+    if (provider.identity_spill_bytes == 0 or root.current.rows == 0) return null;
+    const self = try a.create(Build);
+    self.* = .{ .a = a, .arena = .init(a), .physical = physical, .root = root, .order_capture = capture, .store = store.*, .schemas = .init(a), .context = provider.context, .token = .{ .ptr = provider, .is_cancelled_fn = canceled } };
+    var owned = true;
+    defer if (owned) self.deinit();
+    const scheduler = local.sql_parallel_scheduler.global();
+    const retained = scheduler.reservePullUpTo(1, 1024 * 1024, 64 * 1024 * 1024) orelse return null;
+    defer scheduler.releasePull(1, retained);
+    const cpu = scheduler.cpuWorkspaceBudget(@min(retained, 8 * 1024 * 1024));
+    if (cpu < 1024 * 1024) return null;
+    const io = provider.context.io orelse return error.InvalidLogicalRowIdentity;
+    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = scheduler, .bytes = cpu, .checkpoint = .{ .ptr = self, .check = Build.check } };
+    defer execution.pause();
+    try execution.enter(io);
+    var phase: stores.ExecutionIo = .{ .execution = &execution, .io = io };
+    self.store.io_phase = phase.capability();
+    defer self.store.io_phase = store.io_phase;
+    var workspace: local.sql_memory_budget = .{ .backing = a, .limit = retained };
+    prepareInner(self, workspace.allocator(), table, provider, previous) catch |err| {
+        if (err == error.LogicalRowIdentityAdmissionDeclined or err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and workspace.isLocallyExhausted())) return null;
+        return err;
+    };
+    owned = false;
+    return self;
+}
+fn canceled(raw: *const anyopaque) bool {
+    const provider: *const Provider = @ptrCast(@alignCast(raw));
+    provider.context.ensureActive() catch return true;
+    return false;
+}
+fn upperBound(prefix: [32]u8, bits: u16) ?[32]u8 {
+    if (bits == 0) return null;
+    var upper = prefix;
+    var bit = bits;
+    while (bit != 0) {
+        bit -= 1;
+        const mask = @as(u8, 128) >> @as(u3, @intCast(bit % 8));
+        const byte = bit / 8;
+        if (upper[byte] & mask == 0) {
+            upper[byte] |= mask;
+            return upper;
+        }
+        upper[byte] &= ~mask;
+    }
+    return null;
+}
+fn parseName(name: []const u8) !struct { prefix: [32]u8, bits: u16 } {
+    var pieces = std.mem.splitScalar(u8, name, '-');
+    if (!std.mem.eql(u8, pieces.next() orelse return error.InvalidLogicalRowIdentity, "lf1")) return error.InvalidLogicalRowIdentity;
+    const bits = std.fmt.parseInt(u16, pieces.next() orelse return error.InvalidLogicalRowIdentity, 10) catch return error.InvalidLogicalRowIdentity;
+    const hex = pieces.next() orelse return error.InvalidLogicalRowIdentity;
+    if (bits < 4 or bits > 255 or hex.len != 64 or pieces.next() != null) return error.InvalidLogicalRowIdentity;
+    var prefix: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&prefix, hex) catch return error.InvalidLogicalRowIdentity;
+    for (bits..256) |bit| if (prefix[bit / 8] & (@as(u8, 128) >> @as(u3, @intCast(bit % 8))) != 0) return error.InvalidLogicalRowIdentity;
+    return .{ .prefix = prefix, .bits = bits };
+}
+fn planRange(self: *Build, a: A, pages: *Pages, prefix: [32]u8, bits: u16, fragments: *std.ArrayList(Fragment)) anyerror!void {
+    try Build.check(self);
+    const upper = upperBound(prefix, bits);
+    var cursor = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &prefix, if (upper) |*value| value else null);
+    defer cursor.deinit();
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("native-lake-logical-fragment-v1");
+    hash.update(&self.root.namespace);
+    hash.update(&self.root.values_recipe);
+    var count: u64 = 0;
+    while (try cursor.next()) |record| {
+        try Build.check(self);
+        const resolved = try identity.decodeState(self.root.current, record.key, record.value);
+        self.census_rows_hashed += 1;
+        hash.update(record.key);
+        hash.update(&resolved.state.values);
+        count += 1;
+        if (count > max_rows) break;
+    }
+    if (count > max_rows) {
+        if (bits == 255) return error.LogicalRowIdentityAdmissionDeclined;
+        try planRange(self, a, pages, prefix, bits + 1, fragments);
+        var right = prefix;
+        right[bits / 8] |= @as(u8, 128) >> @as(u3, @intCast(bits % 8));
+        try planRange(self, a, pages, right, bits + 1, fragments);
+        return;
+    }
+    if (fragments.items.len == max_fragments) return error.LogicalRowIdentityAdmissionDeclined;
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    const name = try std.fmt.allocPrint(self.arena.allocator(), "lf1-{d}-{s}", .{ bits, std.fmt.bytesToHex(&prefix, .lower) });
+    try fragments.append(self.arena.allocator(), .{ .prefix = prefix, .bits = bits, .name = name, .count = count, .digest = digest });
+}
+fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRecord, provider: *Provider, previous: ?identity.Root) !void {
+    const out = self.arena.allocator();
+    self.table = try self.schemas.resolve(self.context.io.?, out, table.schema_json, table.table_id, table.name);
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages = self.pageStore(&reads, &writes);
+    pages.admitPublication();
+    var parsed_schema = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+    defer parsed_schema.deinit(a);
+    const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed_schema);
+    defer local.storage_schema.freeSchema(a, runtime);
+    const order = try local.storage_db_document_mapper.indexSortFieldsForSchemaAlloc(a, runtime);
+    defer a.free(order);
+    const order_recipe: ?[32]u8 = if (order.len != 0) recipe: {
+        const bytes = try std.json.Stringify.valueAlloc(a, order, .{});
+        defer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("native-logical-physical-order-v2-nullable");
+        hash.update(bytes);
+        hash.final(&digest);
+        break :recipe digest;
+    } else null;
+    const prior = if (previous) |old| if (std.mem.eql(u8, &old.namespace, &self.root.namespace) and std.mem.eql(u8, &old.values_recipe, &self.root.values_recipe)) old.native_space else null else null;
+    var fragments: std.ArrayList(Fragment) = .empty;
+    const prior_navigation = if (prior) |space| try navigation.load(out, self.store, space.navigation orelse return error.InvalidLogicalRowIdentity, self.token, null) else null;
+    self.prior_navigation = prior_navigation;
+    if (prior_navigation) |nav| {
+        const old_fragments = try readFragments(a, out, &pages, nav);
+        const Changes = struct {
+            owner: *Build,
+            fragments: []Fragment,
+            pub fn change(self_: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
+                try Build.check(self_.owner);
+                const before = if (left) |row| try identity.decodeState(self_.owner.root.current, row.key, row.value) else null;
+                const after = if (right) |row| try identity.decodeState(self_.owner.root.current, row.key, row.value) else null;
+                if (before != null and after != null and before.?.state.unchanged(after.?.state)) return;
+                const id = (right orelse left.?).key;
+                const fragment = &self_.fragments[try fragmentFor(self_.fragments, id)];
+                fragment.dirty = true;
+                if (before == null or after == null) fragment.membership_dirty = true;
+            }
+        };
+        var changed: Changes = .{ .owner = self, .fragments = old_fragments };
+        try tree.visitDifferences(a, pages.store(), previous.?.current.by_id, self.root.current.by_id, &changed);
+        // Compact identity maps omit values. Only the dedicated ordering
+        // cohort can invalidate the coordinate layout on a payload-only edit.
+        if (order.len != 0) {
+            const InputChanges = struct {
+                owner: *Build,
+                fragments: []Fragment,
+                ordering_digest: ?[32]u8,
+                pub fn change(v: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
+                    try Build.check(v.owner);
+                    const key = (right orelse left.?).key;
+                    if (key.len != 64) return error.InvalidLogicalRowIdentity;
+                    const digest = v.ordering_digest orelse return;
+                    if (std.mem.eql(u8, key[0..32], &digest)) v.fragments[try fragmentFor(v.fragments, key[32..64])].dirty = true;
+                }
+            };
+            var input_changes: InputChanges = .{ .owner = self, .fragments = old_fragments, .ordering_digest = @import("lake_row_input_recipes.zig").orderingDigest(self.root.current.input_recipes) };
+            try tree.visitDifferences(a, pages.store(), previous.?.current.input_versions, self.root.current.input_versions, &input_changes);
+        }
+
+        for (old_fragments) |fragment| {
+            if (fragment.dirty) {
+                const first = fragments.items.len;
+                try planRange(self, a, &pages, fragment.prefix, fragment.bits, &fragments);
+                for (fragments.items[first..]) |*replacement| replacement.dirty = true;
+                if (fragments.items.len == first + 1 and std.mem.eql(u8, fragments.items[first].name, fragment.name)) {
+                    fragments.items[first].membership_dirty = fragment.membership_dirty;
+                    fragments.items[first].order_tag = fragment.order_tag;
+                }
+            } else try fragments.append(out, fragment);
+        }
+    } else for (0..16) |i| {
+        var prefix: [32]u8 = @splat(0);
+        prefix[0] = @as(u8, @intCast(i)) << 4;
+        try planRange(self, a, &pages, prefix, 4, &fragments);
+    }
+    // Prior file slots are sparse and need not be in radix order.
+    std.mem.sort(Fragment, fragments.items, {}, struct {
+        fn less(_: void, left: Fragment, right: Fragment) bool {
+            return std.mem.order(u8, &left.prefix, &right.prefix) == .lt;
+        }
+    }.less);
+    var boundary: ?[32]u8 = @splat(0);
+    for (fragments.items) |fragment| {
+        if (boundary == null or !std.mem.eql(u8, &boundary.?, &fragment.prefix)) return error.InvalidLogicalRowIdentity;
+        boundary = upperBound(fragment.prefix, fragment.bits);
+    }
+    if (boundary != null) return error.InvalidLogicalRowIdentity;
+    self.fragments = fragments.items;
+    const files = try out.alloc(local.serverless_external_source_types.FileEntry, fragments.items.len);
+    const names = try out.alloc([]const u8, files.len);
+    for (self.fragments, files, names) |fragment, *file, *name| {
+        name.* = fragment.name;
+        file.* = .{ .file_id = @constCast(fragment.name), .object_uri = try std.fmt.allocPrint(out, "file:///antfly-native-fragments/{s}", .{fragment.name}), .version_id = try out.dupe(u8, &std.fmt.bytesToHex(&fragment.digest, .lower)), .byte_len = @max(1, fragment.count), .row_count = fragment.count, .row_groups = &.{} };
+    }
+    var inventory = self.physical.inventory;
+    inventory.files = files;
+    inventory.deleted_row_groups = &.{};
+    self.source = .{ .alloc = self.a, .store = self.physical.store, .scanner = self.physical.scanner, .inventory = inventory, .inventory_owned = false };
+    self.source.scanner.iceberg_delete_plan = null;
+    self.source.scanner.shared_reader = null;
+    self.initialized = true;
+    self.provider = provider.*;
+    self.provider.source = &self.source;
+    self.provider.previous_inventory = null;
+    self.provider.native_delta = null;
+    self.provider.replay = null;
+    self.provider.statistics = null;
+    self.provider.skip_indexes = &.{};
+    self.provider.expected_delete_objects = null;
+    self.provider.fragment_rows = .{ .ptr = self, .open = Build.open, .replayable = Build.replayable, .open_selected = Build.openSelected };
+    const layout_changed = try a.alloc(bool, self.fragments.len);
+    defer a.free(layout_changed);
+    for (self.fragments, layout_changed) |fragment, *changed| changed.* = prior == null or fragment.membership_dirty or !orderTagMatches(fragment.order_tag, order_recipe) or
+        (fragment.dirty and (order_recipe == null or !self.root.current.compact));
+    self.provider.replay_recommended = true;
+    var old_root = self.root;
+    old_root.current = prior orelse self.root.current;
+    old_root.native_space = null;
+    old_root.indexes = null;
+    old_root.reused = &.{};
+    old_root.certificate = null;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io orelse return error.InvalidLogicalRowIdentity, .context = self, .checkpoint = Build.check, .max_bytes = provider.identity_spill_bytes };
+    defer manager.deinit();
+    self.ordering_input_cohort = @import("lake_row_input_recipes.zig").orderingDigest(self.root.current.input_recipes);
+    const key_recipe = orderingKeyRecipe(self.ordering_input_cohort, order);
+    if (prior) |space| {
+        if (std.meta.eql(space.ordering_cohort, key_recipe)) self.prior_ordering_keys = space.ordering_keys;
+    }
+    var ordering_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
+    ordering_edits.private_pages.phase = self.store.io_phase;
+    defer ordering_edits.deinit();
+    self.ordering_edits = &ordering_edits;
+    defer self.ordering_edits = null;
+    if (self.prior_ordering_keys != null) {
+        const Removed = struct {
+            edits: *@import("lake_index_page_mutations.zig").Mutations,
+            pub fn change(v: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
+                if (right == null) try v.edits.addRecord(left.?.key, null);
+            }
+        };
+        var removed: Removed = .{ .edits = &ordering_edits };
+        try tree.visitDifferences(a, pages.store(), previous.?.current.by_id, self.root.current.by_id, &removed);
+    }
+    const builder = try @import("lake_row_identity_delta.zig").Builder.createWithScan(a, &manager, &pages, names, if (prior != null) old_root else null, null, &.{}, inventory.source_id, inventory.snapshot_id, self.root.current.compact, layout_changed);
+    defer builder.deinit();
+    for (self.fragments, files, builder.slots, 0..) |*fragment, *file, slot, file_index| {
+        if (builder.scan[file_index] or fragment.dirty) {
+            var region = std.heap.ArenaAllocator.init(a);
+            defer region.deinit();
+            const fa = region.allocator();
+            if (order_recipe) |recipe| {
+                const sorted = try orderFragment(self, fa, &pages, fragment.*, runtime, order);
+                if (sorted) |ordered| {
+                    var hash = std.crypto.hash.Blake3.init(.{});
+                    hash.update("native-logical-ordered-members-v1");
+                    for (ordered.indices) |index| hash.update(&ordered.states[index].id);
+                    var digest: [32]u8 = undefined;
+                    hash.final(&digest);
+                    const tag = try std.fmt.allocPrint(out, "so1-{s}-{s}", .{ std.fmt.bytesToHex(&recipe, .lower), std.fmt.bytesToHex(&digest, .lower) });
+                    if (!builder.scan[file_index] and (fragment.order_tag == null or !std.mem.eql(u8, fragment.order_tag.?, tag))) try builder.rescanFile(file_index);
+                    fragment.order_tag = tag;
+                    if (builder.scan[file_index]) for (ordered.indices, 0..) |index, row| {
+                        try builder.add(ordered.states[index], .{ .file = slot, .group = 0, .row = row });
+                    };
+                } else {
+                    const tag = try std.fmt.allocPrint(out, "su1-{s}", .{std.fmt.bytesToHex(&recipe, .lower)});
+                    if (!builder.scan[file_index] and (fragment.order_tag == null or !std.mem.eql(u8, fragment.order_tag.?, tag))) try builder.rescanFile(file_index);
+                    fragment.order_tag = tag;
+                    if (builder.scan[file_index]) try addCanonicalFragment(self, a, &pages, fragment.*, builder, slot);
+                }
+            } else {
+                fragment.order_tag = null;
+                try addCanonicalFragment(self, a, &pages, fragment.*, builder, slot);
+            }
+        }
+        file.etag = if (fragment.order_tag) |tag| @constCast(tag) else &.{};
+    }
+    self.slots = try out.dupe(u32, builder.slots);
+    self.space = (try builder.finish(self.root.namespace, self.root.values_recipe, self.root.cut)).current;
+    self.space.ordering_keys = try ordering_edits.finish(self.prior_ordering_keys);
+    self.space.ordering_cohort = if (self.space.ordering_keys != null) key_recipe else null;
+    const nav = try navigation.build(a, out, &self.store, &self.provider, prior_navigation, self.token);
+    self.provider.native_delta = nav.delta;
+    self.space.navigation = nav.ref;
+    if (self.space.rows != self.root.current.rows) return error.InvalidLogicalRowIdentity;
+    try prepareInputs(self, a, &pages, previous, table.indexes_json);
+    // Admit the complete fresh binding set before reading source payloads or
+    // building native artifacts. A later mixed-space overflow still takes the
+    // explicit physical fallback at the publication owner.
+    var prospective = self.root;
+    prospective.version = identity.metadata_version;
+    prospective.native_space = self.space;
+    const consumer_recipes = try @import("lake_row_input_recipes.zig").consumers(a, self.root.current.input_recipes);
+    defer a.free(consumer_recipes);
+    const bindings = try a.alloc(identity.ReusedIndex, consumer_recipes.len);
+    defer a.free(bindings);
+    for (bindings, consumer_recipes) |*binding, recipe| binding.* = .{ .name = recipe.name, .space = indexSpace(self, recipe.name), .translation = if (self.space.by_id) |ref| .{ .forward = ref, .reverse = ref, .ranked = false } else null };
+    prospective.reused = bindings;
+    prospective.certificate = @splat(255);
+    const encoded = try std.json.Stringify.valueAlloc(a, prospective, .{});
+    defer a.free(encoded);
+    if (encoded.len +| 4096 > identity.max_root_bytes) return error.LogicalRowIdentityAdmissionDeclined;
+}
+
+// Input cohorts sort/deduplicate source columns and intentionally omit layout.
+// Cached tuples additionally bind emitted field positions: changing (a,b) to
+// (b,a), or selecting another alias of the same input, cannot reinterpret keys.
+// Direction is absent because reversing an order preserves the typed values.
+fn orderingKeyRecipe(input: ?[32]u8, fields: []const local.segment.SegmentIndexSortField) ?[32]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("native-lake-typed-ordering-keys-v1");
+    hash.update(&(input orelse return null));
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, field.field.len, .big);
+        hash.update(&length);
+        hash.update(field.field);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn orderTagMatches(tag: ?[]const u8, recipe: ?[32]u8) bool {
+    const wanted = recipe orelse return tag == null;
+    const value = tag orelse return false;
+    if (!((value.len == 133 and std.mem.startsWith(u8, value, "so1-")) or
+        (value.len == 68 and std.mem.startsWith(u8, value, "su1-")))) return false;
+    return std.mem.eql(u8, value[4..68], &std.fmt.bytesToHex(&wanted, .lower));
+}
+
+fn addCanonicalFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, builder: *@import("lake_row_identity_delta.zig").Builder, slot: u32) !void {
+    const upper = upperBound(fragment.prefix, fragment.bits);
+    var cursor = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &fragment.prefix, if (upper) |*value| value else null);
+    defer cursor.deinit();
+    var row: u64 = 0;
+    while (try cursor.next()) |record| {
+        try Build.check(self);
+        const resolved = try identity.decodeState(self.root.current, record.key, record.value);
+        try builder.add(resolved.state, .{ .file = slot, .group = 0, .row = row });
+        row += 1;
+    }
+    if (row != fragment.count) return error.InvalidLogicalRowIdentity;
+}
+
+const OrderedFragment = struct { states: []identity.logical.State, indices: []u32 };
+/// Coordinates are assigned in index order before any producer consumes them.
+/// Existing by-ID/by-location maps authenticate the permutation and its inverse;
+/// readers, maintenance and GC keep their existing publication-bound closure.
+fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?OrderedFragment {
+    // Native private IDs encode the assigned coordinate. They can close a
+    // key tuple ascending, but cannot lead it or reverse it without a separate
+    // segment permutation. Keep those declarations on the exact fallback.
+    for (fields, 0..) |field, i| if (std.mem.eql(u8, field.field, "_id") and (field.desc or i + 1 != fields.len)) return null;
+    const capture = self.order_capture orelse return orderProjectedFragment(self, a, pages, fragment, schema, fields);
+    if (!capture.complete or capture.rows != self.root.current.rows or fragment.count > max_rows) return error.InvalidLogicalRowIdentity;
+    const previous_phase = capture.routes.phase;
+    capture.routes.phase = self.store.io_phase;
+    defer capture.routes.phase = previous_phase;
+    const count: usize = @intCast(fragment.count);
+    const states = try a.alloc(identity.logical.State, count);
+    const docs = try a.alloc(local.introducer.TextDocument, count);
+    var reader: Spool = .{ .a = a, .owner = self, .budget = .{ .backing = a, .limit = Spool.workspace_bytes }, .captured = capture, .columns = capture.columns, .specs = capture.specs, .manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = Build.check } };
+    defer self.ordering_payload_decodes += reader.payload_decodes;
+    defer while (reader.evictPayload()) {};
+    var page: ?*local.storage_db_types.ColumnSourcePage = null;
+    defer if (page) |value| value.release();
+    var offset: ?u64 = null;
+    const upper = upperBound(fragment.prefix, fragment.bits);
+    var logical = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &fragment.prefix, if (upper) |*value| value else null);
+    defer logical.deinit();
+    var payload = try tree.Cursor.init(a, capture.route_store, capture.route_root, &fragment.prefix, if (upper) |*value| value else null);
+    defer payload.deinit();
+    var captured_keys = if (capture.ordering_root) |key_root| try tree.Cursor.init(a, capture.route_store, key_root, &fragment.prefix, if (upper) |*value| value else null) else null;
+    defer if (captured_keys) |*cursor| cursor.deinit();
+    var retained = try OrderKeys.init(self, a, pages, fragment);
+    defer retained.deinit();
+    const Missing = struct { row: usize, offset: u64, index: usize, version: ?[32]u8 };
+    var missing: std.ArrayList(Missing) = .empty;
+    var row: usize = 0;
+    while (try logical.next()) |record| {
+        try Build.check(self);
+        if (row == count) return error.InvalidLogicalRowIdentity;
+        const route = (try payload.next()) orelse return error.InvalidLogicalRowIdentity;
+        if (route.value.len != 24 or !std.mem.eql(u8, record.key, route.key)) return error.InvalidLogicalRowIdentity;
+        states[row] = (try identity.decodeState(self.root.current, record.key, record.value)).state;
+        const version = try retained.version(states[row].id);
+        if (try retained.restore(a, states[row].id, version, fields)) |doc| {
+            docs[row] = doc;
+            self.ordering_keys_reused += 1;
+        } else if (captured_keys) |*cursor| {
+            try cursor.seekForward(&states[row].id);
+            const entry = (try cursor.next()) orelse return null;
+            if (!std.mem.eql(u8, entry.key, &states[row].id)) return null;
+            const tuple = try @import("lake_ordering_keys.zig").decodeIntoArena(a, entry.value);
+            docs[row] = try orderingDocFromTuple(a, states[row].id, fields, tuple.keys);
+            try retained.remember(a, states[row].id, version, docs[row]);
+            self.ordering_keys_captured += 1;
+        } else try missing.append(a, .{ .row = row, .offset = std.mem.readInt(u64, route.value[0..8], .big), .index = @intCast(std.mem.readInt(u64, route.value[8..16], .big)), .version = version });
+        row += 1;
+    }
+    if (row != count or (try payload.next()) != null) return error.InvalidLogicalRowIdentity;
+    // Logical hash order scatters neighboring rows across payload blocks. Read
+    // each missing block once, independently of the optional eight-page cache.
+    std.mem.sort(Missing, missing.items, {}, struct {
+        fn less(_: void, left: Missing, right: Missing) bool {
+            return left.offset < right.offset;
+        }
+    }.less);
+    var ordering_batch: ?OrderingBatch = null;
+    for (missing.items) |item| {
+        try Build.check(self);
+        if (offset == null or offset.? != item.offset) {
+            if (page) |held| held.release();
+            page = null;
+            var phase = try self.store.beginIo(1);
+            defer phase.abort();
+            page = reader.readPayload(item.offset) catch |err| return phase.failed(err);
+            try phase.finish();
+            offset = item.offset;
+            ordering_batch = (try OrderingBatch.bind(a, page.?.columns, schema, fields)) orelse return null;
+        }
+        if (item.index >= page.?.len) return error.InvalidLogicalRowIdentity;
+        docs[item.row] = (try ordering_batch.?.document(a, item.index, &states[item.row])) orelse return null;
+        self.ordering_rows_fetched += 1;
+        try retained.remember(a, states[item.row].id, item.version, docs[item.row]);
+    }
+    const indices = local.introducer.sortedTextDocumentIndicesAlloc(a, docs, fields) catch |err| switch (err) {
+        error.InvalidSegment, error.UnsupportedTypedDocValues => return null,
+        else => return err,
+    };
+    return .{ .states = states, .indices = indices };
+}
+
+fn orderingDocFromTuple(a: A, id: [32]u8, fields: []const local.segment.SegmentIndexSortField, keys: []const local.segment.SegmentIndexSortBoundValue) !local.introducer.TextDocument {
+    var values: std.ArrayList(local.introducer.NamedSortValue) = .empty;
+    var index: usize = 0;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        if (index >= keys.len or keys[index] == .id) return error.InvalidLogicalRowIdentity;
+        try values.append(a, .{ .field_name = field.field, .value = keys[index] });
+        index += 1;
+    }
+    if (index != keys.len) return error.InvalidLogicalRowIdentity;
+    return .{ .id = try a.dupe(u8, &id), .stored_data = "", .text_fields = &.{}, .index_sort_values = values.items };
+}
+
+/// A batch borrows schema and column storage only while that batch is live.
+/// Resolve virtual fields, literal dotted names and nested paths once; flat
+/// scalar kernels avoid the JSON adapter and mapped-value allocation per row.
+pub const OrderingBatch = struct {
+    const Entry = struct {
+        field: []const u8,
+        mapping: local.storage_schema.FieldMapping,
+        column: ?usize,
+        tail: []const u8 = "",
+    };
+    entries: []const Entry,
+    columns: []const rows.ColumnVector,
+    pub fn bind(a: A, columns: []const rows.ColumnVector, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?OrderingBatch {
+        var entries: std.ArrayList(Entry) = .empty;
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.field, "_id")) continue;
+            const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
+            const source = for (schema.exact_fields) |mapped| {
+                if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+            } else field.field;
+            var entry: Entry = .{ .field = field.field, .mapping = resolved.mapping, .column = null };
+            for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, source)) {
+                entry.column = index;
+                break;
+            };
+            if (entry.column == null) if (std.mem.indexOfScalar(u8, source, '.')) |dot| {
+                for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, source[0..dot])) {
+                    entry.column = index;
+                    entry.tail = source[dot + 1 ..];
+                    break;
+                };
+            };
+            try entries.append(a, entry);
+        }
+        return .{ .entries = try entries.toOwnedSlice(a), .columns = columns };
+    }
+    fn value(self: OrderingBatch, a: A, entry: Entry, row: usize, own_bytes: bool) !?local.segment.SegmentIndexSortBoundValue {
+        const index = entry.column orelse return .null_value;
+        const column = self.columns[index];
+        if (column.nulls.isNull(row)) return .null_value;
+        if (entry.tail.len == 0) switch (entry.mapping.field_type) {
+            .numeric => switch (column.values) {
+                .i64 => |values| return .{ .i64_val = values[row] },
+                .dictionary_i64 => |values| return .{ .i64_val = values.at(row) },
+                .f64 => |values| return if (std.math.isFinite(values[row])) .{ .f64_val = values[row] } else null,
+                .dictionary_f64 => |values| return if (std.math.isFinite(values.at(row))) .{ .f64_val = values.at(row) } else null,
+                else => {},
+            },
+            .boolean => switch (column.values) {
+                .bool => |values| return .{ .bool_val = values[row] },
+                else => {},
+            },
+            .keyword, .link => switch (column.values) {
+                .bytes => |values| return .{ .bytes_val = if (own_bytes) try a.dupe(u8, values[row]) else values[row] },
+                .dictionary_bytes => |values| return .{ .bytes_val = if (own_bytes) try a.dupe(u8, values.at(row)) else values.at(row) },
+                else => {},
+            },
+            else => {},
+        };
+        var raw = try column.values.jsonAt(a, row);
+        if (entry.tail.len != 0) {
+            var parts = std.mem.splitScalar(u8, entry.tail, '.');
+            while (parts.next()) |part| {
+                if (raw != .object) return .null_value;
+                raw = raw.object.get(part) orelse return .null_value;
+            }
+        }
+        if (raw == .null) return .null_value;
+        const typed = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, entry.mapping, raw)) orelse return null;
+        return switch (typed) {
+            .numeric_val => |number| switch (number) {
+                inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+            },
+            inline .datetime_ns, .u64_val, .i64_val, .f64_val, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+            else => null,
+        };
+    }
+    /// Capture consumes this tuple before releasing the source batch. Flat
+    /// byte keys may borrow columns until the encoder copies their bytes.
+    pub fn tupleInto(self: OrderingBatch, a: A, row: usize, output: []local.segment.SegmentIndexSortBoundValue) !bool {
+        if (output.len != self.entries.len) return error.InvalidLogicalRowIdentity;
+        for (self.entries, output) |entry, *value_| value_.* = (try self.value(a, entry, row, false)) orelse return false;
+        return true;
+    }
+    pub fn document(self: OrderingBatch, a: A, row: usize, state: *const identity.logical.State) !?local.introducer.TextDocument {
+        const values = try a.alloc(local.introducer.NamedSortValue, self.entries.len);
+        for (self.entries, values) |entry, *target| target.* = .{ .field_name = entry.field, .value = (try self.value(a, entry, row, true)) orelse return null };
+        return .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .index_sort_values = values };
+    }
+};
+
+pub fn orderingDocument(a: A, columns: []const rows.ColumnVector, row: usize, state: *const identity.logical.State, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
+    const batch = (try OrderingBatch.bind(a, columns, schema, fields)) orelse return null;
+    return batch.document(a, row, state);
+}
+
+/// Incremental verification may retain no complete payload capture. Gather only
+/// the declared ordering columns at this changed fragment's authenticated
+/// physical coordinates; unrelated rows and source bodies never enter the sort.
+fn orderProjectedFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?OrderedFragment {
+    const count: usize = @intCast(fragment.count);
+    if (count > max_rows) return error.InvalidLogicalRowIdentity;
+    const states = try a.alloc(identity.logical.State, count);
+    const docs = try a.alloc(local.introducer.TextDocument, count);
+    const refs = try a.alloc(rows.RowRef, count);
+    var retained = try OrderKeys.init(self, a, pages, fragment);
+    defer retained.deinit();
+    const versions = try a.alloc(?[32]u8, count);
+    var requested: usize = 0;
+    const seen = try a.alloc(bool, count);
+    @memset(seen, false);
+    var positions: std.StringHashMapUnmanaged(usize) = .empty;
+    var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store(), .max_bytes = 1024 * 1024 };
+    defer cache.deinit();
+    var reader: identity.Reader = .{ .root = self.root, .pages = pages, .cache = &cache };
+    const upper = upperBound(fragment.prefix, fragment.bits);
+    var logical = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &fragment.prefix, if (upper) |*value| value else null);
+    defer logical.deinit();
+    var row: usize = 0;
+    while (try logical.next()) |record| {
+        try Build.check(self);
+        if (row == count) return error.InvalidLogicalRowIdentity;
+        const resolved = try identity.decodeState(self.root.current, record.key, record.value);
+        states[row] = resolved.state;
+        versions[row] = try retained.version(states[row].id);
+        if (try retained.restore(a, states[row].id, versions[row], fields)) |doc| {
+            docs[row] = doc;
+            seen[row] = true;
+            self.ordering_keys_reused += 1;
+            row += 1;
+            continue;
+        }
+        refs[requested] = try reader.reference(a, self.root.current, resolved);
+        refs[requested].external.identity_version = self.physical.inventory.row_identity_version;
+        const key = try local.storage_rowsource_identity.allocId(a, refs[requested]);
+        const entry = try positions.getOrPut(a, key);
+        if (entry.found_existing) return error.InvalidLogicalRowIdentity;
+        entry.value_ptr.* = row;
+        requested += 1;
+        row += 1;
+    }
+    if (row != count) return error.InvalidLogicalRowIdentity;
+    var columns: std.StringHashMapUnmanaged(void) = .empty;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
+        const source = for (schema.exact_fields) |mapped| {
+            if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+        } else field.field;
+        try columns.put(a, source, {});
+    }
+    if (columns.count() == 0 or count == 0) {
+        for (states, docs) |*state, *doc| doc.* = .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .typed_fields = &.{} };
+    } else if (requested != 0) {
+        const paths = try a.alloc([]const u8, columns.count());
+        var names = columns.keyIterator();
+        for (paths) |*path| path.* = names.next().?.*;
+        var physical = try self.physical.parallelView(a);
+        defer physical.closeParallelView(self.physical);
+        const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = paths, .row_refs = refs[0..requested], .limit = @intCast(requested) }, .{ .deadline_ns = self.context.deadline_ns, .cancellation = self.token }, &physical);
+        defer cursor.close(cursor.ptr);
+        const next = cursor.next_columns orelse return error.UnsupportedSqlExecution;
+        var found: usize = 0;
+        while (true) {
+            try Build.check(self);
+            var phase = try self.store.beginIo(1);
+            defer phase.abort();
+            const page = next(cursor.ptr, a, 256) catch |err| return phase.failed(err);
+            try phase.finish();
+            if (page.selection.len == 0) break;
+            const projected = try a.dupe(rows.ColumnVector, page.batch.columns);
+            for (projected) |*column| for (self.table.columns) |definition| {
+                if (std.mem.eql(u8, column.name, definition.name)) column.name = definition.path;
+            };
+            const ordering_batch = (try OrderingBatch.bind(a, projected, schema, fields)) orelse return null;
+            for (page.selection) |selected| {
+                var ref = page.batch.rowRef(selected);
+                ref.external.identity_version = self.physical.inventory.row_identity_version;
+                const key = try local.storage_rowsource_identity.allocId(a, ref);
+                const position = positions.get(key) orelse return error.InvalidLogicalRowIdentity;
+                if (seen[position]) return error.InvalidLogicalRowIdentity;
+                seen[position] = true;
+                docs[position] = (try ordering_batch.document(a, selected, &states[position])) orelse return null;
+                self.ordering_rows_fetched += 1;
+                try retained.remember(a, states[position].id, versions[position], docs[position]);
+                found += 1;
+            }
+        }
+        if (found != requested) return error.InvalidLogicalRowIdentity;
+    }
+    const indices = local.introducer.sortedTextDocumentIndicesAlloc(a, docs, fields) catch |err| switch (err) {
+        error.InvalidSegment, error.UnsupportedTypedDocValues => return null,
+        else => return err,
+    };
+    return .{ .states = states, .indices = indices };
+}
+
+const OrderKeys = struct {
+    const codec = @import("lake_ordering_keys.zig");
+    owner: *Build,
+    inputs: ?tree.Cursor = null,
+    cached: ?tree.Cursor = null,
+    candidate: ?tree.Cursor.Record = null,
+    cohort: ?[32]u8,
+    fn init(owner: *Build, a: A, pages: *Pages, fragment: Fragment) !OrderKeys {
+        var result: OrderKeys = .{ .owner = owner, .cohort = owner.ordering_input_cohort };
+        errdefer result.deinit();
+        if (result.cohort) |cohort| {
+            const lower = cohort ++ fragment.prefix;
+            result.inputs = try tree.Cursor.init(a, pages.store(), owner.root.current.input_versions, &lower, null);
+            if (owner.prior_ordering_keys != null) result.cached = try tree.Cursor.init(a, pages.store(), owner.prior_ordering_keys, &fragment.prefix, null);
+        }
+        return result;
+    }
+    fn deinit(self: *@This()) void {
+        if (self.inputs) |*cursor| cursor.deinit();
+        if (self.cached) |*cursor| cursor.deinit();
+    }
+    fn version(self: *@This(), id: [32]u8) !?[32]u8 {
+        const cohort = self.cohort orelse return null;
+        const key = cohort ++ id;
+        const cursor = &self.inputs.?;
+        try cursor.seekForward(&key);
+        const row = (try cursor.next()) orelse return error.InvalidLogicalRowIdentity;
+        if (!std.mem.eql(u8, row.key, &key) or row.value.len != 32) return error.InvalidLogicalRowIdentity;
+        return row.value[0..32].*;
+    }
+    fn restore(self: *@This(), a: A, id: [32]u8, version_: ?[32]u8, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
+        const expected = version_ orelse return null;
+        const cursor = if (self.cached) |*value| value else return null;
+        if (self.candidate == null or std.mem.order(u8, self.candidate.?.key, &id) == .lt) {
+            try cursor.seekForward(&id);
+            self.candidate = try cursor.next();
+        }
+        const entry = self.candidate orelse return null;
+        if (!std.mem.eql(u8, entry.key, &id)) return null;
+        const cached = try codec.decodeIntoArena(a, entry.value);
+        if (!std.mem.eql(u8, &cached.version, &expected)) return null;
+        return try orderingDocFromTuple(a, id, fields, cached.keys);
+    }
+
+    fn remember(self: *@This(), a: A, id: [32]u8, version_: ?[32]u8, doc: local.introducer.TextDocument) !void {
+        const version_held = version_ orelse return;
+        const values = doc.index_sort_values;
+        if (values.len == 0 or values.len > 32) return;
+        var keys: [32]local.segment.SegmentIndexSortBoundValue = undefined;
+        for (keys[0..values.len], values) |*key, value| key.* = value.value;
+        const bytes = (try codec.encode(a, version_held, keys[0..values.len])) orelse return;
+        try self.owner.ordering_edits.?.addRecord(&id, bytes);
+    }
+};
+
+fn orderingValue(a: A, columns: []const rows.ColumnVector, row: usize, path: []const u8) !std.json.Value {
+    for (columns) |column| if (std.mem.eql(u8, column.name, path)) {
+        if (column.nulls.isNull(row)) return .null;
+        return column.values.jsonAt(a, row);
+    };
+    var parts = std.mem.splitScalar(u8, path, '.');
+    const first = parts.next() orelse return .null;
+    var value = for (columns) |column| {
+        if (!std.mem.eql(u8, column.name, first)) continue;
+        if (column.nulls.isNull(row)) return .null;
+        break try column.values.jsonAt(a, row);
+    } else return .null;
+    while (parts.next()) |part| {
+        if (value != .object) return .null;
+        value = value.object.get(part) orelse return .null;
+    }
+    return value;
+}
+
+fn fragmentFor(fragments: []const Fragment, id: []const u8) !usize {
+    if (id.len != 32 or fragments.len == 0) return error.InvalidLogicalRowIdentity;
+    var lo: usize = 0;
+    var hi = fragments.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (std.mem.order(u8, &fragments[mid].prefix, id) != .gt) lo = mid + 1 else hi = mid;
+    }
+    if (lo == 0) return error.InvalidLogicalRowIdentity;
+    return lo - 1;
+}
+fn lowerId(ids: []const [32]u8, boundary: [32]u8) usize {
+    var lo: usize = 0;
+    var hi = ids.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (std.mem.order(u8, &ids[mid], &boundary) == .lt) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+fn readFragments(a: A, out: A, pages: *Pages, nav: navigation.Root) ![]Fragment {
+    var fragments: std.ArrayList(Fragment) = .empty;
+    var cursor = try tree.Cursor.init(a, pages.store(), nav.files, "", null);
+    defer cursor.deinit();
+    while (try cursor.next()) |record| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const file = (try std.json.parseFromSliceLeaky(navigation.Record, arena.allocator(), record.value, .{})).file;
+        const prefix = try parseName(file.file_id);
+        const version = if (std.mem.startsWith(u8, file.version_id, "iv1-") or std.mem.startsWith(u8, file.version_id, "iv2-") or std.mem.startsWith(u8, file.version_id, "iv3-") or std.mem.startsWith(u8, file.version_id, "iv4-") or std.mem.startsWith(u8, file.version_id, "iv5-")) file.version_id[4..] else file.version_id;
+        if (version.len != 64) return error.InvalidLogicalRowIdentity;
+        var digest: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, version) catch return error.InvalidLogicalRowIdentity;
+        try fragments.append(out, .{ .name = try out.dupe(u8, file.file_id), .prefix = prefix.prefix, .bits = prefix.bits, .count = file.row_count, .digest = digest, .membership_dirty = false, .order_tag = if (file.etag.len != 0) try out.dupe(u8, file.etag) else null });
+    }
+    std.mem.sort(Fragment, fragments.items, {}, struct {
+        fn less(_: void, left: Fragment, right: Fragment) bool {
+            return std.mem.lessThan(u8, &left.prefix, &right.prefix);
+        }
+    }.less);
+    return fragments.items;
+}
+fn sameColumns(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |l, r| if (!std.mem.eql(u8, l, r)) return false;
+    return true;
+}
+/// Input-version trees have no physical coordinates. COW differences identify
+/// exactly the input cohorts and radix leaves whose payload fingerprints changed.
+fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, indexes_json: []const u8) !void {
+    var configs = try std.json.parseFromSlice(std.json.Value, a, indexes_json, .{});
+    defer configs.deinit();
+    const out = self.arena.allocator();
+    const recipes = try @import("lake_row_input_recipes.zig").consumers(out, self.root.current.input_recipes);
+    const prior_commitments = if (self.prior_navigation != null and previous != null and previous.?.native_space != null) previous.?.native_space.?.input_commitments else null;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = Build.check, .max_bytes = self.provider.identity_spill_bytes };
+    defer manager.deinit();
+    var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
+    defer edits.deinit();
+    edits.private_pages.phase = self.store.io_phase;
+    const views = try out.alloc(Provider.FragmentView, recipes.len);
+    const owners = try a.alloc(usize, recipes.len);
+    defer a.free(owners);
+    const dirty = try a.alloc([]bool, recipes.len);
+    defer a.free(dirty);
+    var initialized: usize = 0;
+    defer for (dirty[0..initialized]) |mask| a.free(mask);
+    const changed_ids = try a.alloc(std.ArrayList([32]u8), recipes.len);
+    defer a.free(changed_ids);
+    for (changed_ids) |*ids| ids.* = .empty;
+    defer for (changed_ids) |*ids| ids.deinit(a);
+    const overflow = try a.alloc(bool, recipes.len);
+    defer a.free(overflow);
+    @memset(overflow, false);
+    for (recipes, 0..) |recipe, i| {
+        owners[i] = i;
+        for (recipes[0..i], 0..) |candidate, j| if (sameColumns(recipe.columns, candidate.columns) and vectorRecipe(configs.value, recipe.name) == vectorRecipe(configs.value, candidate.name)) {
+            owners[i] = owners[j];
+            break;
+        };
+        dirty[i] = try a.alloc(bool, self.fragments.len);
+        initialized += 1;
+        @memset(dirty[i], previous == null or self.prior_navigation == null);
+    }
+    if (previous != null and self.prior_navigation != null) {
+        const Changes = struct {
+            owner: *Build,
+            recipes: []const @import("lake_row_input_recipes.zig").Recipe,
+            owners: []const usize,
+            dirty: [][]bool,
+            changed_ids: []std.ArrayList([32]u8),
+            overflow: []bool,
+            a: A,
+            pub fn change(self_: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
+                try Build.check(self_.owner);
+                if (left != null and right != null and std.mem.eql(u8, left.?.value, right.?.value)) return;
+                const row = right orelse left.?;
+                if (row.key.len != 64 or row.value.len != 32) return error.InvalidLogicalRowIdentity;
+                for (self_.recipes, 0..) |recipe, i| if (self_.owners[i] == i and std.mem.eql(u8, &recipe.digest, row.key[0..32])) {
+                    const owner = self_.owners[i];
+                    self_.dirty[owner][try fragmentFor(self_.owner.fragments, row.key[32..64])] = true;
+                    if (!self_.overflow[owner]) {
+                        if (self_.changed_ids[owner].items.len == 32768) {
+                            self_.overflow[owner] = true;
+                            self_.changed_ids[owner].clearAndFree(self_.a);
+                        } else try self_.changed_ids[owner].append(self_.a, row.key[32..64].*);
+                    }
+                };
+            }
+        };
+        var changed: Changes = .{ .owner = self, .recipes = recipes, .owners = owners, .dirty = dirty, .changed_ids = changed_ids, .overflow = overflow, .a = a };
+        try tree.visitDifferences(a, pages.store(), previous.?.current.input_versions, self.root.current.input_versions, &changed);
+    }
+    for (changed_ids) |*ids| std.mem.sort([32]u8, ids.items, {}, struct {
+        fn less(_: void, left: [32]u8, right: [32]u8) bool {
+            return std.mem.order(u8, &left, &right) == .lt;
+        }
+    }.less);
+    for (recipes, views, 0..) |recipe, *view, i| {
+        if (owners[i] != i) {
+            view.* = views[owners[i]];
+            view.name = recipe.name;
+            continue;
+        }
+        var old: ?navigation.Root = null;
+        var versions: std.StringHashMapUnmanaged(Fragment) = .empty;
+        defer versions.deinit(a);
+        if (previous) |prior| if (self.prior_navigation != null) {
+            const prior_name = for (prior.current.input_recipes) |candidate| {
+                if (@import("lake_row_input_recipes.zig").isOrdering(candidate)) continue;
+                if (std.mem.eql(u8, &candidate.digest, &recipe.digest) and vectorRecipe(configs.value, candidate.name) == vectorRecipe(configs.value, recipe.name)) break candidate.name;
+            } else recipe.name;
+            const space = prior.spaceForIndex(prior_name);
+            if (space.navigation) |ref| {
+                old = try navigation.load(out, self.store, ref, self.token, null);
+                // Legacy global versions lack the input-specific domain marker.
+                var records = try tree.Cursor.init(a, pages.store(), old.?.files, "", null);
+                defer records.deinit();
+                while (try records.next()) |record| {
+                    var arena = std.heap.ArenaAllocator.init(a);
+                    defer arena.deinit();
+                    const file = (try std.json.parseFromSliceLeaky(navigation.Record, arena.allocator(), record.value, .{})).file;
+                    if (!std.mem.startsWith(u8, file.version_id, "iv1-") and !std.mem.startsWith(u8, file.version_id, "iv2-") and !std.mem.startsWith(u8, file.version_id, "iv3-") and !std.mem.startsWith(u8, file.version_id, "iv4-") and !std.mem.startsWith(u8, file.version_id, "iv5-")) continue;
+                    const prefix = try parseName(file.file_id);
+                    var digest: [32]u8 = undefined;
+                    _ = std.fmt.hexToBytes(&digest, file.version_id[4..]) catch return error.InvalidLogicalRowIdentity;
+                    try versions.put(a, try out.dupe(u8, file.file_id), .{ .prefix = prefix.prefix, .bits = prefix.bits, .name = "", .count = file.row_count, .digest = digest, .incremental = std.mem.startsWith(u8, file.version_id, "iv4-") or std.mem.startsWith(u8, file.version_id, "iv5-") });
+                }
+            }
+        };
+        const row_changes = try changedRows(self, a, pages, previous, recipe, if (overflow[i]) null else changed_ids[i].items);
+        const key_digests = try out.alloc([32]u8, if (stableKeysRecipe(configs.value, recipe.name)) self.fragments.len else 0);
+        for (self.fragments[0..key_digests.len], key_digests) |fragment, *digest| {
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("native-lake-logical-coordinate-file-v1");
+            hash.update(&self.root.namespace);
+            hash.update(fragment.name);
+            if (fragment.order_tag) |tag| hash.update(tag);
+            hash.final(digest);
+        }
+        const files = try out.dupe(local.serverless_external_source_types.FileEntry, self.source.inventory.files);
+        for (self.fragments, files, dirty[i], 0..) |fragment, *file, changed, file_ordinal| {
+            const cached = versions.get(fragment.name);
+            const reusable = cached != null and cached.?.incremental and prior_commitments != null and cached.?.count == fragment.count;
+            // XOR-era inputs cannot seed row mutations: rebuild their native
+            // fragment before trusting the new collision-resistant version.
+            if (!reusable) row_changes[file_ordinal] = null;
+            const digest = if (!changed and reusable) cached.?.digest else hash: {
+                const key = commitments.key(recipe.digest, fragment.prefix, fragment.bits);
+                var prior_state: ?commitments.State = null;
+                if (reusable and row_changes[file_ordinal] != null) {
+                    var cursor = try tree.Cursor.init(a, pages.store(), prior_commitments, &key, null);
+                    defer cursor.deinit();
+                    if (try cursor.next()) |record| if (std.mem.eql(u8, record.key, &key)) {
+                        const state = try commitments.State.decode(record.value);
+                        const root = try state.root(self.root.namespace, recipe.digest, fragment.prefix, fragment.bits, fragment.count);
+                        if (!std.mem.eql(u8, &root, &cached.?.digest)) return error.InvalidLogicalRowIdentity;
+                        prior_state = state;
+                    };
+                }
+                const ids = changed_ids[i].items;
+                const first = lowerId(ids, fragment.prefix);
+                const end = if (upperBound(fragment.prefix, fragment.bits)) |bound| lowerId(ids, bound) else ids.len;
+                const state = try commitments.build(a, pages.store(), self.root.current.input_versions, recipe.digest, fragment.prefix, fragment.bits, prior_state, if (overflow[i]) null else ids[first..end], &self.input_rows_hashed);
+                var encoded: [commitments.State.bytes]u8 = undefined;
+                state.encode(&encoded);
+                try edits.addRecord(&key, &encoded);
+                break :hash try state.root(self.root.namespace, recipe.digest, fragment.prefix, fragment.bits, fragment.count);
+            };
+            file.version_id = try std.fmt.allocPrint(out, "{s}-{s}", .{ if (key_digests.len == 0) "iv4" else "iv5", std.fmt.bytesToHex(&digest, .lower) });
+        }
+        var source = self.source;
+        source.inventory.files = files;
+        var provider = self.provider;
+        provider.source = &source;
+        // The parent census describes the union of inputs. Recompute native
+        // identities from this cohort's version descriptors.
+        provider.native_delta = null;
+        provider.key_digests = key_digests;
+        const nav = try navigation.build(a, out, &self.store, &provider, old, self.token);
+        view.* = .{ .name = recipe.name, .files = files, .delta = nav.delta, .navigation = nav.ref, .changed_rows = row_changes, .key_digests = key_digests };
+    }
+    // Retire commitments only when cohort membership or radix layout changes;
+    // ordinary sparse refreshes never replay this metadata census.
+    const prune = if (previous) |prior| prior.native_space != null and (prior.native_space.?.liveFiles() != self.fragments.len or for (prior.current.input_recipes) |old_recipe| {
+        if (@import("lake_row_input_recipes.zig").isOrdering(old_recipe)) continue;
+        if (for (recipes) |recipe| {
+            if (std.mem.eql(u8, &recipe.digest, &old_recipe.digest)) break false;
+        } else true) break true;
+    } else false) else false;
+    if (prune) {
+        var cursor = try tree.Cursor.init(a, pages.store(), prior_commitments, "", null);
+        defer cursor.deinit();
+        while (try cursor.next()) |record| {
+            if (record.key.len != 66) return error.InvalidLogicalRowIdentity;
+            const cohort = record.key[0..32];
+            const active = for (recipes) |recipe| {
+                if (std.mem.eql(u8, cohort, &recipe.digest)) break true;
+            } else false;
+            const index = try fragmentFor(self.fragments, record.key[34..66]);
+            const fragment = self.fragments[index];
+            if (!active or fragment.bits != std.mem.readInt(u16, record.key[32..34], .big) or !std.mem.eql(u8, &fragment.prefix, record.key[34..66])) try edits.addRecord(record.key, null);
+        }
+    }
+    self.space.input_commitments = try edits.finish(prior_commitments);
+    self.provider.fragment_views = views;
+}
+fn stableKeysRecipe(configs: std.json.Value, name: []const u8) bool {
+    if (vectorRecipe(configs, name)) return true;
+    const config = configs.object.get(name) orelse return false;
+    const kind = config.object.get("type") orelse return false;
+    return kind == .string and std.mem.eql(u8, kind.string, "full_text");
+}
+fn vectorRecipe(configs: std.json.Value, name: []const u8) bool {
+    if (configs != .object) return false;
+    const config = configs.object.get(name) orelse return false;
+    if (config != .object) return false;
+    const kind = config.object.get("type") orelse return false;
+    return kind == .string and std.mem.eql(u8, kind.string, "embeddings");
+}
+/// Optional bounded row deltas. A null file entry means rebuild that fragment.
+/// Membership changes, incompatible retained coordinates and new input cohorts
+/// cannot reuse row addresses and deliberately keep the fragment path.
+fn changedRows(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, recipe: @import("lake_row_input_recipes.zig").Recipe, ids: ?[]const [32]u8) ![]?[]const u64 {
+    const out = self.arena.allocator();
+    const result = try out.alloc(?[]const u64, self.fragments.len);
+    @memset(result, null);
+    const prior = previous orelse return result;
+    const changes = ids orelse return result;
+    const old_native = prior.native_space orelse return result;
+    const old = prior.spaceForIndex(recipe.name);
+    if (!std.meta.eql(old.files, old_native.files) or !std.meta.eql(old.by_id, old_native.by_id)) return result;
+    if (for (prior.current.input_recipes) |candidate| {
+        if (std.mem.eql(u8, &candidate.digest, &recipe.digest)) break false;
+    } else true) return result;
+    const moved = try a.alloc(bool, self.fragments.len);
+    defer a.free(moved);
+    @memset(moved, false);
+    const positions = try a.alloc(std.ArrayList(u64), self.fragments.len);
+    defer a.free(positions);
+    for (positions) |*list| list.* = .empty;
+    defer for (positions) |*list| list.deinit(a);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var reader: identity.Reader = .{ .root = self.root, .pages = pages };
+    for (changes) |id| {
+        const file = try fragmentFor(self.fragments, &id);
+        if (self.fragments[file].membership_dirty) continue;
+        _ = scratch.reset(.retain_capacity);
+        const before = (try reader.byId(scratch.allocator(), old, id)) orelse return error.InvalidLogicalRowIdentity;
+        const after = (try reader.byId(scratch.allocator(), self.space, id)) orelse return error.InvalidLogicalRowIdentity;
+        if (after.coordinate.file != self.slots[file] or after.coordinate.group != 0) return error.InvalidLogicalRowIdentity;
+        if (!std.meta.eql(before.coordinate, after.coordinate)) {
+            // A changed sort key legitimately moves coordinates. Rebuild the
+            // complete run rather than patching any retained row address.
+            moved[file] = true;
+            continue;
+        }
+        try positions[file].append(a, after.coordinate.row);
+    }
+    for (positions, 0..) |*list, file| if (!moved[file] and list.items.len != 0) {
+        std.mem.sort(u64, list.items, {}, std.sort.asc(u64));
+        result[file] = try out.dupe(u64, list.items);
+    };
+    return result;
+}
+pub fn indexSpace(self: *const Build, name: []const u8) identity.Space {
+    var space = self.space;
+    // Query coordinate views never own the shared input proof census or
+    // ordering-key cache. The current native space retains refresh evidence.
+    space.input_commitments = null;
+    space.ordering_keys = null;
+    space.ordering_cohort = null;
+    for (self.provider.fragment_views) |view| if (std.mem.eql(u8, view.name, name)) {
+        space.navigation = view.navigation;
+        break;
+    };
+    return space;
+}
+
+/// Broad rebuilds partition references over one typed projected source pass.
+/// Payload pages are written once; only compact row references are externally
+/// sorted. Selective rebuilds keep the physical gather path.
+const Spool = struct {
+    const spill = local.sql_spill;
+    const Page = local.storage_db_types.ColumnSourcePage;
+    const workspace_bytes = 64 * 1024 * 1024;
+    const CachedPayload = struct { offset: u64, page: *Page, used: u64 };
+    const Spec = @import("lake_row_payloads.zig").Spec;
+    a: A,
+    owner: *Build,
+    budget: local.sql_memory_budget,
+    manager: spill.Manager = undefined,
+    payloads: spill.JoinPayloads = undefined,
+    routes: @import("../serverless/graph_segment/page_store.zig").PrivatePages = undefined,
+    route_store: tree.Store = undefined,
+    route_root: ?tree.Ref = null,
+    arena: std.heap.ArenaAllocator = undefined,
+    columns: []const []const u8 = &.{},
+    specs: []Spec = &.{},
+    needed: []const bool = &.{},
+    positions: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+    mutex: std.Io.Mutex = .init,
+    initialized: bool = false,
+    source_passes: u64 = 0,
+    adoption_rows: u64 = 0,
+    payload_decodes: u64 = 0,
+    captured: ?*@import("lake_row_payloads.zig").Capture = null,
+    decoded: [8]?CachedPayload = @splat(null),
+    decoded_bytes: usize = 0,
+    decoded_clock: u64 = 0,
+    payload_cache_hits: u64 = 0,
+    fn evictPayload(self: *Spool) bool {
+        var oldest: ?usize = null;
+        for (self.decoded, 0..) |entry, i| if (entry) |value| {
+            if (oldest == null or value.used < self.decoded[oldest.?].?.used) oldest = i;
+        };
+        const i = oldest orelse return false;
+        const page = self.decoded[i].?.page;
+        self.decoded_bytes -= page.retainedBytes();
+        self.decoded[i] = null;
+        page.release();
+        return true;
+    }
+    fn releaseBlock(raw: *anyopaque) void {
+        @as(*spill.Sequential.OwnedBlock, @ptrCast(@alignCast(raw))).release();
+    }
+    fn decodePayload(self: *Spool, offset: u64) !*Page {
+        const a = self.budget.allocator();
+        const payloads = if (self.captured) |capture| &capture.payloads else &self.payloads;
+        const block = try payloads.read(offset);
+        var owns = true;
+        defer if (owns) block.release();
+        const page = try a.create(Page);
+        page.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = block.count(), .owner = .{ .ptr = block, .release_fn = releaseBlock, .retained_bytes = block.retainedBytes() } };
+        owns = false;
+        errdefer page.release();
+        const pa = page.arena.allocator();
+        const columns = try pa.alloc(rows.ColumnVector, self.columns.len);
+        for (self.columns, self.specs, columns, 0..) |name, spec, *column, ordinal| {
+            column.* = try block.columnVector(pa, ordinal, if (spec.kind == .decimal128) .bytes else spec.kind);
+            column.name = try pa.dupe(u8, name);
+            if (spec.kind == .decimal128) {
+                const values = try pa.alloc(i128, block.count());
+                for (values, 0..) |*value, row| value.* = if (column.nulls.isNull(row)) 0 else blk: {
+                    const bytes = try column.bytesAt(row);
+                    if (bytes.len != 16) return error.InvalidSqlSpill;
+                    break :blk std.mem.readInt(i128, bytes[0..16], .big);
+                };
+                column.values = .{ .decimal128 = .{ .values = values, .precision = spec.precision, .scale = spec.scale } };
+            }
+        }
+        page.columns = columns;
+        self.payload_decodes += 1;
+        return page;
+    }
+    fn readPayload(self: *Spool, offset: u64) !*Page {
+        try self.mutex.lock(self.manager.io);
+        defer self.mutex.unlock(self.manager.io);
+        self.decoded_clock +|= 1;
+        for (&self.decoded) |*entry| if (entry.*) |*value| if (value.offset == offset) {
+            value.used = self.decoded_clock;
+            self.payload_cache_hits += 1;
+            value.page.retain();
+            return value.page;
+        };
+        const page = self.decodePayload(offset) catch |err| retry: {
+            const exhausted = self.budget.isExhausted() or (if (self.captured) |capture| capture.budget.isExhausted() else false);
+            if (err != error.OutOfMemory or !exhausted) return err;
+            // Optional residency cannot take memory from a required decode.
+            while (self.evictPayload()) {}
+            break :retry try self.decodePayload(offset);
+        };
+        const cost = page.retainedBytes();
+        if (cost <= 8 * 1024 * 1024) {
+            while (self.decoded_bytes + cost > 8 * 1024 * 1024) if (!self.evictPayload()) break;
+            while (true) {
+                for (&self.decoded) |*entry| if (entry.* == null) {
+                    page.retain();
+                    entry.* = .{ .offset = offset, .page = page, .used = self.decoded_clock };
+                    self.decoded_bytes += cost;
+                    return page;
+                };
+                if (!self.evictPayload()) break;
+            }
+        }
+        return page;
+    }
+    fn deinit(self: *Spool) void {
+        while (self.evictPayload()) {}
+        if (self.initialized) {
+            self.routes.deinit();
+            self.payloads.close();
+        }
+        self.positions.deinit(self.budget.allocator());
+        self.arena.deinit();
+        if (self.captured) |capture| capture.deinit();
+        self.manager.deinit();
+        std.debug.assert(self.budget.live == 0);
+        local.sql_parallel_scheduler.global().releasePull(0, workspace_bytes);
+        self.a.destroy(self);
+    }
+    fn storage(self: *Spool) tree.Store {
+        return .{ .domain = self.owner.root.domain, .ptr = self, .get = getPage, .put = noWrite, .check = check };
+    }
+    fn check(raw: *anyopaque) !void {
+        try Build.check(@as(*Spool, @ptrCast(@alignCast(raw))).owner);
+    }
+    fn noWrite(_: *anyopaque, _: tree.Ref, _: []const u8) !void {
+        return error.InvalidSqlSpill;
+    }
+    fn getPage(raw: *anyopaque, a: A, ref: tree.Ref) ![]u8 {
+        const self: *Spool = @ptrCast(@alignCast(raw));
+        try self.mutex.lock(self.manager.io);
+        defer self.mutex.unlock(self.manager.io);
+        const store = self.routes.store();
+        return store.get(store.ptr, a, ref);
+    }
+    fn scanCapture(self: *Spool, provider: *Provider, store: *stores.ArtifactStore) !void {
+        const a = self.budget.allocator();
+        const out = self.arena.allocator();
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(a);
+        for (self.owner.root.current.input_recipes) |recipe| for (recipe.columns) |name| try names.put(a, name, {});
+        const columns = try out.alloc([]const u8, names.count());
+        var it = names.keyIterator();
+        for (columns) |*name| name.* = it.next().?.*;
+        if (columns.len == 0) return error.UnsupportedExternalLakeIndex;
+        self.columns = columns;
+        self.specs = try out.alloc(Spec, columns.len);
+        for (self.owner.slots, 0..) |slot, ordinal| try self.positions.put(a, slot, ordinal);
+        var input = provider.*;
+        input.fragment_rows = null;
+        input.fragment_views = &.{};
+        input.replay = null;
+        input.replay_consumer = null;
+        input.only_file = null;
+        input.only_files = null;
+        input.only_plan = null;
+        input.io_phase = store.io_phase;
+        var phase = try store.beginIo(1);
+        defer phase.abort();
+        const source = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, .{ .source_kind = if (self.owner.physical.inventory.format == .iceberg) .external_iceberg else .external_parquet, .row_ref_kind = .external, .source_id = self.owner.physical.inventory.source_id, .snapshot_id = self.owner.physical.inventory.snapshot_id, .schema_fingerprint = self.owner.physical.inventory.schema_fingerprint, .sidecar_kind = .text, .index_config_hash = "logical-fragment-spool-v1", .column_bindings = columns }, self.owner.token) catch |err| return phase.failed(err);
+        defer {
+            if (store.io_phase) |io| if (io.park) |park| park(io.ptr);
+            source.deinit(a);
+        }
+        try phase.finish();
+        self.source_passes += 1;
+        self.route_store = try @import("../serverless/graph_segment/page_store.zig").PrivatePages.beginRun(&self.routes);
+        var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
+        defer edits.deinit();
+        edits.private_pages.phase = store.io_phase;
+        var read_bytes: u64 = 0;
+        var write_bytes: u64 = 0;
+        var pages = self.owner.pageStore(&read_bytes, &write_bytes);
+        pages.artifacts = store;
+        var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store(), .max_bytes = 2 * 1024 * 1024 };
+        defer cache.deinit();
+        var root = self.owner.root;
+        root.indexes = self.owner.space;
+        root.reused = &.{};
+        var resolver: identity.Reader = .{ .root = root, .pages = &pages, .cache = &cache };
+        var cluster = @import("lake_row_payloads.zig").Cluster.init(a, &self.manager, columns.len);
+        defer cluster.deinit();
+        var bound = false;
+        while (true) {
+            var reading = try store.beginIo(1);
+            defer reading.abort();
+            const next = source.next(a) catch |err| return reading.failed(err);
+            try reading.finish();
+            const batch = next orelse break;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const pa = arena.allocator();
+            const sizing = try @import("lake_row_payloads.zig").Sizer.bind(pa, batch);
+            defer sizing.deinit();
+            const vectors = try @import("lake_row_payloads.zig").vectors(pa, batch, columns, self.specs, bound);
+            bound = true;
+            var begin: usize = 0;
+            while (begin < batch.rowCount()) {
+                const end = @min(batch.rowCount(), begin + 256);
+                var tile = std.heap.ArenaAllocator.init(a);
+                defer tile.deinit();
+                const ta = tile.allocator();
+                var translating = try store.beginIo(1);
+                defer translating.abort();
+                const references = try ta.alloc(rows.RowRef, end - begin);
+                for (references, begin..) |*ref, row| ref.* = batch.rowRef(row);
+                const logical = resolver.translateMany(ta, references, false) catch |err| return translating.failed(err);
+                try translating.finish();
+                var selected: [256]usize = undefined;
+                var coordinates: [256]identity.logical.Coordinate = undefined;
+                var count: usize = 0;
+                for (logical, begin..) |row, physical| {
+                    const file = self.positions.get(row.coordinate.file) orelse return error.InvalidLogicalRowIdentity;
+                    if (!self.needed[file]) continue;
+                    selected[count] = physical;
+                    coordinates[count] = row.coordinate;
+                    count += 1;
+                }
+                const keys = try ta.alloc([]const u8, count);
+                const encoded = try ta.alloc([16]u8, count);
+                for (coordinates[0..count], encoded, keys) |coordinate, *bytes, *key| {
+                    bytes.* = coordinate.encode();
+                    key.* = bytes;
+                }
+                var writing = try store.beginIo(1);
+                defer writing.abort();
+                cluster.add(ta, vectors, keys, selected[0..count], sizing) catch |err| return writing.failed(err);
+                try writing.finish();
+                begin = end;
+            }
+        }
+        try cluster.finish(&self.payloads, &edits);
+        self.route_root = try edits.finish(null);
+        self.routes.phase = null;
+    }
+    /// Merge the verified ID stream with captured offsets; sort only final routes.
+    /// Typed payload pages were clustered by verified ID before adoption.
+    fn adopt(self: *Spool, capture: *@import("lake_row_payloads.zig").Capture, store: *stores.ArtifactStore) !void {
+        if (!capture.complete or capture.rows != self.owner.root.current.rows) return error.InvalidLogicalRowIdentity;
+        const a = self.budget.allocator();
+        capture.routes.phase = store.io_phase;
+        defer capture.routes.phase = null;
+        self.columns = capture.columns;
+        self.specs = capture.specs;
+        capture.retain();
+        self.captured = capture;
+        for (self.owner.slots, 0..) |slot, ordinal| try self.positions.put(a, slot, ordinal);
+        self.route_store = try @import("../serverless/graph_segment/page_store.zig").PrivatePages.beginRun(&self.routes);
+        var reads: u64 = 0;
+        var writes: u64 = 0;
+        var pages = self.owner.pageStore(&reads, &writes);
+        pages.artifacts = store;
+        pages.read_phase = store.io_phase;
+        // Both streams are keyed by verified logical ID. No physical census,
+        // physical-to-logical sort, or source payload reread is needed.
+        var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
+        defer edits.deinit();
+        edits.private_pages.phase = store.io_phase;
+        // Verification already certified the complete capture ID census. Join
+        // only selected radix ranges, coalescing adjacent dirty leaves.
+        var first: usize = 0;
+        while (first < self.needed.len) {
+            if (!self.needed[first]) {
+                first += 1;
+                continue;
+            }
+            var end = first;
+            var expected: u64 = 0;
+            while (end < self.needed.len and self.needed[end]) : (end += 1) expected += self.owner.fragments[end].count;
+            const upper = upperBound(self.owner.fragments[end - 1].prefix, self.owner.fragments[end - 1].bits);
+            const lower = &self.owner.fragments[first].prefix;
+            var logical = try tree.Cursor.init(a, pages.store(), self.owner.space.by_id, lower, if (upper) |*value| value else null);
+            defer logical.deinit();
+            var payload = try tree.Cursor.init(a, capture.route_store, capture.route_root, lower, if (upper) |*value| value else null);
+            defer payload.deinit();
+            var count: u64 = 0;
+            while (try logical.next()) |row| {
+                try Build.check(self.owner);
+                const captured = (try payload.next()) orelse return error.InvalidLogicalRowIdentity;
+                const resolved = try identity.decodeState(self.owner.space, row.key, row.value);
+                if (captured.value.len != 24 or !std.mem.eql(u8, row.key, captured.key)) return error.InvalidLogicalRowIdentity;
+                const file = self.positions.get(resolved.coordinate.file) orelse return error.InvalidLogicalRowIdentity;
+                if (file < first or file >= end) return error.InvalidLogicalRowIdentity;
+                try edits.addRecord(row.value[0..16], captured.value);
+                count += 1;
+            }
+            if (count != expected or (try payload.next()) != null) return error.InvalidLogicalRowIdentity;
+            self.adoption_rows += count;
+            first = end;
+        }
+        self.route_root = try edits.finish(null);
+        self.routes.phase = null;
+    }
+    fn open(self: *Spool, a: A, binding: local.serverless_segment_source_binding.Binding, file: ?usize, token: Token, phase: ?*const stores.IoPhase) !rows.Source {
+        const cursor = try a.create(Cursor);
+        errdefer a.destroy(cursor);
+        cursor.* = .{ .a = a, .owner = self, .binding = binding, .file = file, .token = token, .store = self.owner.store };
+        cursor.binding.column_bindings = try a.dupe([]const u8, binding.column_bindings);
+        cursor.store.io_phase = phase;
+        return .{ .kind = if (self.owner.physical.inventory.format == .iceberg) .external_iceberg else .external_parquet, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.close, .retain_columns = Cursor.retain };
+    }
+    const Cursor = struct {
+        const Item = struct { coordinate: identity.logical.Coordinate, offset: u64, row: usize, bytes: u64, position: usize = 0 };
+        a: A,
+        owner: *Spool,
+        binding: local.serverless_segment_source_binding.Binding,
+        file: ?usize,
+        token: Token,
+        store: stores.ArtifactStore,
+        cursor: ?tree.Cursor = null,
+        page: ?*Page = null,
+        pending: ?Item = null,
+        exhausted: bool = false,
+        fn item(self: *Cursor) !?Item {
+            if (self.pending) |value| {
+                self.pending = null;
+                return value;
+            }
+            const record = (try self.cursor.?.next()) orelse return null;
+            if (record.key.len != 16 or record.value.len != 24) return error.InvalidSqlSpill;
+            const coordinate = try identity.logical.Coordinate.decode(record.key);
+            if (self.file) |file| if (coordinate.file != self.owner.owner.slots[file]) return null;
+            return .{ .coordinate = coordinate, .offset = std.mem.readInt(u64, record.value[0..8], .big), .row = @intCast(std.mem.readInt(u64, record.value[8..16], .big)), .bytes = std.mem.readInt(u64, record.value[16..24], .big) };
+        }
+        fn next(raw: *anyopaque, a: A) !?rows.ColumnBatch {
+            const self: *Cursor = @ptrCast(@alignCast(raw));
+            try self.token.check();
+            try Build.check(self.owner.owner);
+            if (self.page) |page| page.release();
+            self.page = null;
+            if (self.exhausted) return null;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const ta = arena.allocator();
+            var phase = try self.store.beginIo(1);
+            defer phase.abort();
+            if (self.cursor == null) {
+                var lower: [4]u8 = undefined;
+                if (self.file) |file| std.mem.writeInt(u32, &lower, self.owner.owner.slots[file], .big);
+                self.cursor = tree.Cursor.init(a, self.owner.storage(), self.owner.route_root, if (self.file != null) &lower else "", null) catch |err| return phase.failed(err);
+            }
+            var items: [256]Item = undefined;
+            var count: usize = 0;
+            var bytes: u64 = 0;
+            while (count < items.len) {
+                var value = (self.item() catch |err| return phase.failed(err)) orelse {
+                    self.exhausted = true;
+                    break;
+                };
+                if (count != 0 and bytes +| value.bytes > 8 * 1024 * 1024) {
+                    self.pending = value;
+                    break;
+                }
+                value.position = count;
+                items[count] = value;
+                count += 1;
+                bytes +|= value.bytes;
+            }
+            if (count == 0) {
+                try phase.finish();
+                return null;
+            }
+            const refs = try ta.alloc(rows.RowRef, count);
+            for (items[0..count], refs) |value, *ref| {
+                const file = self.owner.positions.get(value.coordinate.file) orelse return error.InvalidSqlSpill;
+                ref.* = .{ .external = .{ .source_id = self.binding.source_id, .snapshot_id = self.binding.snapshot_id, .identity_version = self.owner.owner.source.inventory.row_identity_version, .file_id = self.owner.owner.fragments[file].name, .row_group_ordinal = 0, .row_ordinal = value.coordinate.row } };
+            }
+            std.mem.sort(Item, items[0..count], {}, struct {
+                fn less(_: void, left: Item, right: Item) bool {
+                    return left.offset < right.offset;
+                }
+            }.less);
+            var positions: [256]Page.Position = undefined;
+            var chunks: std.ArrayList(*Page) = .empty;
+            defer {
+                for (chunks.items) |chunk| chunk.release();
+                chunks.deinit(a);
+            }
+            var begin: usize = 0;
+            while (begin < count) {
+                var end = begin + 1;
+                while (end < count and items[end].offset == items[begin].offset) end += 1;
+                const page = self.owner.readPayload(items[begin].offset) catch |err| return phase.failed(err);
+                chunks.append(a, page) catch |err| {
+                    page.release();
+                    return err;
+                };
+                for (items[begin..end]) |value| positions[value.position] = .{ .page = page, .row = value.row };
+                begin = end;
+            }
+            try phase.finish();
+            const projected = try ta.alloc(usize, self.binding.column_bindings.len);
+            for (self.binding.column_bindings, projected) |name, *ordinal| ordinal.* = for (self.owner.columns, 0..) |candidate, ci| {
+                if (std.mem.eql(u8, name, candidate)) break ci;
+            } else return error.RowSourceColumnKindMismatch;
+            const page = try Page.gatherProjectedPositions(a, positions[0..count], projected);
+            errdefer page.release();
+            const owned_refs = try page.arena.allocator().dupe(rows.RowRef, refs);
+            for (owned_refs) |*ref| ref.external.file_id = try page.arena.allocator().dupe(u8, ref.external.file_id);
+            self.page = page;
+            return .{ .snapshot = .{ .table_id = self.binding.source_id, .snapshot_id = self.binding.snapshot_id }, .row_refs = owned_refs, .columns = page.columns };
+        }
+        fn retain(raw: *anyopaque, _: A) !?rows.ColumnOwner {
+            const self: *Cursor = @ptrCast(@alignCast(raw));
+            const page = self.page orelse return null;
+            page.retain();
+            return .{ .ptr = page, .release_fn = Gather.release, .retained_bytes = page.retainedBytes() };
+        }
+        fn close(raw: *anyopaque, a: A) void {
+            const self: *Cursor = @ptrCast(@alignCast(raw));
+            if (self.page) |page| page.release();
+            if (self.cursor) |*cursor| cursor.deinit();
+            a.free(self.binding.column_bindings);
+            a.destroy(self);
+        }
+    };
+};
+pub fn prepareSpool(self: *Build, provider: *Provider, store: *stores.ArtifactStore) !void {
+    return prepareCapturedSpool(self, provider, store, null);
+}
+pub fn prepareCapturedSpool(self: *Build, provider: *Provider, store: *stores.ArtifactStore, capture: ?*@import("lake_row_payloads.zig").Capture) !void {
+    if ((capture == null and self.root.current.rows < 128) or self.provider.fragment_views.len == 0) return;
+    const needed = try self.a.alloc(bool, self.fragments.len);
+    defer self.a.free(needed);
+    @memset(needed, false);
+    for (self.provider.fragment_views) |view| if (provider.wantsIndex(view.name)) {
+        for (needed, 0..) |*flag, i| flag.* = flag.* or view.delta.isChanged(i);
+    };
+    var rows_needed: u64 = 0;
+    for (needed, self.fragments) |flag, fragment| if (flag) {
+        rows_needed += fragment.count;
+    };
+    if (rows_needed == 0 or (capture == null and rows_needed < self.root.current.rows / 8)) return;
+    const scheduler = local.sql_parallel_scheduler.global();
+    if (!scheduler.reservePull(0, Spool.workspace_bytes)) return;
+    const spool = self.a.create(Spool) catch |err| {
+        scheduler.releasePull(0, Spool.workspace_bytes);
+        return err;
+    };
+    spool.* = .{ .a = self.a, .owner = self, .budget = .{ .backing = self.a, .limit = Spool.workspace_bytes } };
+    const a = spool.budget.allocator();
+    spool.manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = Build.check, .max_bytes = provider.identity_spill_bytes, .async_writes = false };
+    if (capture) |value| spool.manager.max_bytes -|= value.manager.live_bytes;
+    spool.arena = .init(a);
+    defer if (self.spool == null) spool.deinit();
+    spool.needed = try spool.arena.allocator().dupe(bool, needed);
+    spool.routes = .{ .manager = &spool.manager, .domain = self.root.domain, .attempt = self.store.upload_scope.?.attempt };
+    spool.payloads = try Spool.spill.JoinPayloads.init(&spool.manager);
+    spool.initialized = true;
+    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = scheduler, .bytes = 8 * 1024 * 1024, .checkpoint = .{ .ptr = self, .check = Build.check } };
+    defer execution.pause();
+    try execution.enter(self.context.io.?);
+    var io: stores.ExecutionIo = .{ .execution = &execution, .io = self.context.io.? };
+    var backend = store.*;
+    backend.io_phase = io.capability();
+    spool.routes.phase = backend.io_phase;
+    const captured: anyerror!void = if (capture) |value| spool.adopt(value, &backend) else spool.scanCapture(provider, &backend);
+    captured catch |err| {
+        if (err == error.SqlProgramLimitExceeded or err == error.UnsupportedExternalLakeIndex or (err == error.OutOfMemory and spool.budget.isLocallyExhausted())) return;
+        return err;
+    };
+    self.spool = spool;
+}
+
+/// A per-consumer gather cursor. Shared publication replay spools a projected
+/// fragment once across native families; no builder rescans the archive.
+const Gather = struct {
+    a: A,
+    owner: *Build,
+    arena: std.heap.ArenaAllocator,
+    page_arena: std.heap.ArenaAllocator,
+    physical: local.serverless_query_lake_serving.ServingSource,
+    binding: local.serverless_segment_source_binding.Binding,
+    file: ?usize,
+    token: Token,
+    store: stores.ArtifactStore,
+    position: usize = 0,
+    row: u64 = 0,
+    tile_rows: usize = 256,
+    selected_rows: ?[]const u64 = null,
+    active: ?local.sql_catalog.Cursor = null,
+    page: ?*local.storage_db_types.ColumnSourcePage = null,
+    refs: []const rows.RowRef = &.{},
+    current: []const rows.RowRef = &.{},
+    fn selectedBytes(batch: rows.ColumnBatch, selection: []const usize) !usize {
+        return @import("lake_row_payloads.zig").selectedBytes(batch, selection);
+    }
+    fn canceled(raw: *const anyopaque) bool {
+        const self: *const Gather = @ptrCast(@alignCast(raw));
+        self.token.check() catch return true;
+        Build.check(self.owner) catch return true;
+        return false;
+    }
+    fn clear(self: *Gather) void {
+        if (self.active) |cursor| cursor.close(cursor.ptr);
+        self.active = null;
+        _ = self.arena.reset(.retain_capacity);
+    }
+    fn same(left: rows.RowRef, right: rows.RowRef) bool {
+        return left == .external and right == .external and left.external.row_group_ordinal == right.external.row_group_ordinal and left.external.row_ordinal == right.external.row_ordinal and std.mem.eql(u8, left.external.file_id, right.external.file_id);
+    }
+    fn next(raw: *anyopaque, a: A) !?rows.ColumnBatch {
+        const self: *Gather = @ptrCast(@alignCast(raw));
+        if (self.page) |page| page.release();
+        self.page = null;
+        _ = self.page_arena.reset(.retain_capacity);
+        tiles: while (true) {
+            try self.token.check();
+            try Build.check(self.owner);
+            if (self.active) |cursor| {
+                const Page = local.storage_db_types.ColumnSourcePage;
+                var positions: [256]Page.Position = undefined;
+                var seen: [256]bool = @splat(false);
+                var payload_bytes: usize = 0;
+                var chunks: std.ArrayList(*Page) = .empty;
+                defer {
+                    for (chunks.items) |chunk| chunk.release();
+                    chunks.deinit(a);
+                }
+                while (true) {
+                    try self.token.check();
+                    var phase = try self.store.beginIo(1);
+                    defer phase.abort();
+                    const page = cursor.next_columns.?(cursor.ptr, self.page_arena.allocator(), 256) catch |err| return phase.failed(err);
+                    try phase.finish();
+                    if (page.selection.len == 0) break;
+                    payload_bytes +|= try selectedBytes(page.batch, page.selection);
+                    // Source pages already obey decoder admission. Bound the
+                    // extra scatter independently, and retry smaller selections
+                    // before copying payloads from multiple physical pages.
+                    if (payload_bytes > 8 * 1024 * 1024 and self.current.len > 1) {
+                        self.tile_rows = @max(1, self.current.len / 2);
+                        self.row -= self.current.len;
+                        self.clear();
+                        _ = self.page_arena.reset(.retain_capacity);
+                        continue :tiles;
+                    }
+                    const copied = try Page.copy(a, page.batch, page.selection);
+                    chunks.append(a, copied) catch |err| {
+                        copied.release();
+                        return err;
+                    };
+                    for (page.selection, 0..) |selected, row| {
+                        const current = page.batch.rowRef(selected);
+                        const found = for (self.current, 0..) |candidate, i| {
+                            if (same(candidate, current)) break i;
+                        } else return error.InvalidLogicalRowIdentity;
+                        if (seen[found]) return error.InvalidLogicalRowIdentity;
+                        seen[found] = true;
+                        positions[found] = .{ .page = copied, .row = row };
+                    }
+                    _ = self.page_arena.reset(.retain_capacity);
+                }
+                for (seen[0..self.refs.len]) |present| if (!present) return error.InvalidLogicalRowIdentity;
+                const copied = try Page.gatherPositions(a, positions[0..self.refs.len]);
+                errdefer copied.release();
+                for (@constCast(copied.columns)) |*column| for (self.owner.table.columns) |definition| {
+                    if (std.mem.eql(u8, column.name, definition.name)) {
+                        column.name = try copied.arena.allocator().dupe(u8, definition.path);
+                        break;
+                    }
+                };
+                const refs = try copied.arena.allocator().dupe(rows.RowRef, self.refs);
+                // clear releases the tile's lookup arena, so retain identities
+                // in the output page before opening the next physical gather.
+                for (refs) |*ref| {
+                    ref.external.file_id = try copied.arena.allocator().dupe(u8, ref.external.file_id);
+                }
+                self.clear();
+                self.page = copied;
+                return .{ .snapshot = .{ .table_id = self.binding.source_id, .snapshot_id = self.binding.snapshot_id }, .row_refs = refs, .columns = copied.columns };
+            }
+            const index = self.file orelse self.position;
+            if (index >= self.owner.fragments.len) return null;
+            const fragment = self.owner.fragments[index];
+            const total = if (self.selected_rows) |selected| selected.len else fragment.count;
+            if (self.row == total) {
+                if (self.file != null) return null;
+                self.position += 1;
+                self.row = 0;
+                continue;
+            }
+            const count: usize = @intCast(@min(self.tile_rows, total - self.row));
+            const sa = self.arena.allocator();
+            const refs = try sa.alloc(rows.RowRef, count);
+            for (refs, self.row..) |*ref, row| ref.* = .{ .external = .{ .identity_version = self.owner.source.inventory.row_identity_version, .source_id = self.binding.source_id, .snapshot_id = self.binding.snapshot_id, .file_id = fragment.name, .row_group_ordinal = 0, .row_ordinal = if (self.selected_rows) |selected| selected[@intCast(row)] else row } };
+            var reads: u64 = 0;
+            var writes: u64 = 0;
+            var pages = self.owner.pageStore(&reads, &writes);
+            pages.artifacts = &self.store;
+            pages.cancellation = .{ .ptr = self, .is_cancelled_fn = Gather.canceled };
+            var root = self.owner.root;
+            root.indexes = self.owner.space;
+            root.reused = &.{};
+            var cache: tree.Cache = .{ .alloc = sa, .underlying = pages.store(), .max_bytes = 1024 * 1024 };
+            defer cache.deinit();
+            var reader: identity.Reader = .{ .root = root, .pages = &pages, .cache = &cache };
+            var phase = try self.store.beginIo(1);
+            defer phase.abort();
+            const resolved = reader.translateMany(sa, refs, true) catch |err| return phase.failed(err);
+            const current = try sa.alloc(rows.RowRef, count);
+            for (resolved, current) |value, *ref| {
+                ref.* = reader.reference(sa, root.current, value) catch |err| return phase.failed(err);
+                ref.external.identity_version = self.owner.physical.inventory.row_identity_version;
+            }
+            try phase.finish();
+            self.refs = refs;
+            self.current = current;
+            self.active = try local.sql_lake_cursor.openPinned(self.a, self.owner.table, .{ .fields = self.binding.column_bindings, .row_refs = current, .limit = @intCast(count) }, .{ .deadline_ns = self.owner.context.deadline_ns, .cancellation = .{ .ptr = self, .is_cancelled_fn = Gather.canceled } }, &self.physical);
+            if (self.active.?.next_columns == null) return error.UnsupportedSqlExecution;
+            self.row += count;
+        }
+    }
+    fn release(raw: *anyopaque) void {
+        const page: *local.storage_db_types.ColumnSourcePage = @ptrCast(@alignCast(raw));
+        page.release();
+    }
+    fn retain(raw: *anyopaque, _: A) !?rows.ColumnOwner {
+        const self: *Gather = @ptrCast(@alignCast(raw));
+        const page = self.page orelse return null;
+        page.retain();
+        return .{ .ptr = page, .release_fn = release, .retained_bytes = page.retainedBytes() };
+    }
+    fn close(raw: *anyopaque, a: A) void {
+        const self: *Gather = @ptrCast(@alignCast(raw));
+        if (self.page) |page| page.release();
+        self.clear();
+        self.arena.deinit();
+        self.page_arena.deinit();
+        self.physical.closeParallelView(self.owner.physical);
+        a.free(self.binding.column_bindings);
+        a.destroy(self);
+    }
+};
+
+test "external lake logical fragments retain boundaries and isolate append removal mutations" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-census");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(77), 1, std.testing.io);
+    var physical: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .scanner = undefined, .inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("one"), .schema_fingerprint = @constCast("schema"), .files = &.{} } };
+    physical.scanner.iceberg_delete_plan = null;
+    physical.scanner.shared_reader = null;
+    var provider: Provider = .{ .source = &physical, .context = .{ .io = std.testing.io } };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "source", .indexes_json = "{}", .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","base_source":{"kind":"external","table_id":"source","format":"parquet","uri":"file:///source","schema_fingerprint":"schema","row_identity":{"key_columns":["id"]}},"document_schemas":{"row":{"schema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"integer"}}}}}}
+    };
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    var previous: ?identity.Root = null;
+    var translation: ?identity.Translation = null;
+    var last: ?*Build = null;
+    defer if (last) |value| value.deinit();
+    for (0..4) |step| {
+        const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{"physical"}, null, null, &.{}, "source", "one");
+        defer builder.deinit();
+        for (0..(if (step == 0) @as(usize, 128) else 129)) |row| {
+            if (step >= 2 and row == 17) continue;
+            var id: [32]u8 = @splat(3);
+            id[0] = @intCast((row % 16) << 4);
+            std.mem.writeInt(u64, id[24..32], row, .big);
+            try builder.add(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = row });
+        }
+        var root = try builder.finish(@splat(1), @splat(2), @splat(3));
+        root.values_format = 2;
+        const next = (try prepare(a, &store, table, &physical, &provider, root, previous)).?;
+        try std.testing.expectEqual(@as(u64, if (step == 1) 129 else 128), next.space.rows);
+        try std.testing.expectEqual(@as(u32, 16), next.space.file_count);
+        try std.testing.expect(next.census_rows_hashed <= if (step == 0) @as(u64, 128) else if (step == 3) @as(u64, 0) else 9);
+        var changed: usize = 0;
+        const delta = next.provider.native_delta.?;
+        for (0..delta.count()) |i| if (delta.isChanged(i)) {
+            changed += 1;
+        };
+        try std.testing.expectEqual(@as(usize, if (step == 0) 16 else if (step == 3) 0 else 1), changed);
+        translation = (try @import("lake_row_translation_delta.zig").buildWithOriginal(a, &pages, next.space, root.current, if (previous) |old| old.current else null, if (previous) |old| old.native_space else null, translation, .{ .io = std.testing.io }, 1024 * 1024)).?;
+        try std.testing.expectEqual(next.space.rows, translation.?.forward.records);
+        var reader: identity.Reader = .{ .root = root, .pages = &pages };
+        for ([_]u64{ 0, 16, 17, 128 }) |row| {
+            if ((step == 0 and row == 128) or (step >= 2 and row == 17)) continue;
+            var id: [32]u8 = @splat(3);
+            id[0] = @intCast((row % 16) << 4);
+            std.mem.writeInt(u64, id[24..32], row, .big);
+            const original = (try reader.byId(a, next.space, id)).?;
+            // byId returns value-owned coordinates; its temporary lookup bytes
+            // are freed by Reader, so no caller arena is required here.
+            const physical_row = try reader.translateAt(a, translation.?, original.coordinate, true);
+            try std.testing.expectEqual(row, physical_row.coordinate.row);
+            const reverse = try reader.translateAt(a, translation.?, physical_row.coordinate, false);
+            try std.testing.expectEqual(original.coordinate, reverse.coordinate);
+        }
+        root.native_space = next.space;
+        root.artifacts = @splat(9);
+        try root.reseal(a);
+        try root.validate(a);
+        // The same iterators feed reader leases, GC, warming and cloud closure.
+        var dependencies = identity.dependencies(root);
+        var found_native_ids = false;
+        while (dependencies.next()) |ref| if (ref.eql(next.space.by_id.?)) {
+            found_native_ids = true;
+        };
+        try std.testing.expect(found_native_ids);
+        var navigations = identity.navigationDependencies(root);
+        var found_native_navigation = false;
+        while (navigations.next()) |ref| if (std.meta.eql(ref, next.space.navigation.?)) {
+            found_native_navigation = true;
+        };
+        try std.testing.expect(found_native_navigation);
+        // Keep prior metadata alive while the next COW census is prepared.
+        if (last) |value| value.deinit();
+        last = next;
+        previous = root;
+    }
+}
+
+test "external lake logical fragments split oversized radix leaves without physical reads" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-split");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(78), 1, std.testing.io);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    var builder = try identity.Builder.init(a, &manager, &.{"physical"}, 64 * 1024, .{ .source = "source", .snapshot = "one" });
+    defer builder.deinit();
+    for (0..max_rows + 1) |row| {
+        var id: [32]u8 = @splat(3);
+        id[0] = @intCast((row % 2) << 3);
+        std.mem.writeInt(u64, id[24..32], row, .big);
+        try builder.add(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = row });
+    }
+    const root = try builder.finish(&pages, "source", "one", @splat(1), @splat(2), @splat(3));
+    var self: Build = .{ .a = a, .arena = .init(a), .physical = undefined, .store = store, .root = root, .schemas = .init(a), .context = .{ .io = std.testing.io }, .token = .none };
+    defer self.arena.deinit();
+    defer self.schemas.deinit();
+    var fragments: std.ArrayList(Fragment) = .empty;
+    try planRange(&self, a, &pages, @splat(0), 4, &fragments);
+    try std.testing.expectEqual(@as(usize, 2), fragments.items.len);
+    try std.testing.expectEqual(@as(u64, max_rows + 1), fragments.items[0].count + fragments.items[1].count);
+    for (fragments.items) |fragment| {
+        try std.testing.expectEqual(@as(u16, 5), fragment.bits);
+        try std.testing.expect(fragment.count <= max_rows);
+        const parsed = try parseName(fragment.name);
+        try std.testing.expectEqual(fragment.prefix, parsed.prefix);
+        try std.testing.expectEqual(fragment.bits, parsed.bits);
+    }
+}
+
+test "external lake logical fragments gather typed physical pages into logical order" {
+    const a = std.testing.allocator;
+    const Page = local.storage_db_types.ColumnSourcePage;
+    const refs: []const rows.RowRef = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" } };
+    const batch: rows.ColumnBatch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = refs, .columns = &.{
+        .{ .name = "name", .values = .{ .dictionary_bytes = .{ .values = &.{"alpha"}, .indices = &.{ 0, 123 } } }, .nulls = .{ .bytes = &.{ 0, 1 } } },
+        .{ .name = "id", .values = .{ .i64 = &.{ 9007199254740993, 9007199254740995 } } },
+        .{ .name = "price", .values = .{ .decimal128 = .{ .values = &.{ 3, 9 }, .precision = 4, .scale = -1 } } },
+    } };
+    const first = try Page.copy(a, batch, &.{ 0, 1 });
+    defer first.release();
+    var other = batch;
+    other.columns = &.{
+        .{ .name = "name", .values = .{ .bytes = &.{ "charlie", "delta" } } },
+        .{ .name = "id", .values = .{ .dictionary_i64 = .{ .values = &.{9007199254740997}, .indices = &.{ 0, 0 } } } },
+        .{ .name = "price", .values = .{ .decimal128 = .{ .values = &.{ 7, 8 }, .precision = 4, .scale = -1 } } },
+    };
+    const second = try Page.copy(a, other, &.{0});
+    defer second.release();
+    const positions: []const Page.Position = &.{ .{ .page = second, .row = 0 }, .{ .page = first, .row = 1 }, .{ .page = first, .row = 0 } };
+    const gathered = try Page.gatherPositions(a, positions);
+    defer gathered.release();
+    try std.testing.expectEqualStrings("charlie", try gathered.columns[0].bytesAt(0));
+    try std.testing.expect(gathered.columns[0].nulls.isNull(1));
+    try std.testing.expectEqualStrings("alpha", try gathered.columns[0].bytesAt(2));
+    try std.testing.expectEqual(@as(i64, 9007199254740997), try gathered.columns[1].integerAt(0));
+    try std.testing.expectEqualSlices(i128, &.{ 7, 9, 3 }, gathered.columns[2].values.decimal128.values);
+    try std.testing.expectEqual(@as(i32, -1), gathered.columns[2].values.decimal128.scale);
+    const Failure = struct {
+        fn run(alloc: A, selected: []const Page.Position) !void {
+            const page = try Page.gatherPositions(alloc, selected);
+            defer page.release();
+            try std.testing.expectEqual(@as(usize, 3), page.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{positions});
+}
+
+test "external lake logical fragments shrink wide Parquet gathers before copying tiles" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-wide");
+    defer directory.cleanup();
+    var storage = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer storage.deinit();
+    var client = storage.client();
+    try client.makeBucket("antfly");
+    const payload = try a.alloc(u8, 128 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    var ids: [65]i64 = undefined;
+    var bodies: [65][]const u8 = undefined;
+    for (&ids, &bodies, 0..) |*id, *body, i| {
+        id.* = @intCast(i);
+        body.* = payload;
+    }
+    const bytes = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "id", .field_id = 1, .values = &ids }}, &.{.{ .column_id = "body", .field_id = 2, .converted_type = 0, .values = &bodies }});
+    defer a.free(bytes);
+    var uploaded = try client.putObject("antfly", "wide.parquet", bytes, .{});
+    uploaded.deinit(a);
+    const schema = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"source","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","additionalProperties":false,"properties":{{"id":{{"type":"integer"}},"body":{{"type":"string"}}}}}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer binding.deinit(a);
+    var physical = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer physical.deinit();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(79), 1, std.testing.io);
+    var provider: Provider = .{ .source = &physical, .context = .{ .io = std.testing.io } };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "source", .indexes_json = "{}", .schema_json = schema };
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, &.{}, physical.inventory.source_id, physical.inventory.snapshot_id);
+    defer builder.deinit();
+    for (0..65) |row| {
+        var id: [32]u8 = @splat(3);
+        id[0] = 0;
+        std.mem.writeInt(u64, id[24..32], row, .big);
+        try builder.add(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = row });
+    }
+    const root = try builder.finish(@splat(1), @splat(2), @splat(3));
+    const native = (try prepare(a, &store, table, &physical, &provider, root, null)).?;
+    defer native.deinit();
+    const input = try Build.open(native, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .column_bindings = &.{ "id", "body" }, .index_config_hash = "test" }, 0, .none, null);
+    defer input.deinit(a);
+    var count: usize = 0;
+    while (try input.next(a)) |batch| {
+        try std.testing.expect(batch.rowCount() <= 32);
+        for (0..batch.rowCount()) |row| {
+            try std.testing.expectEqual(@as(i64, @intCast(count)), try batch.findColumn("id").?.integerAt(row));
+            try std.testing.expectEqual(payload.len, (try batch.findColumn("body").?.bytesAt(row)).len);
+            try std.testing.expectEqual(@as(u64, @intCast(count)), batch.rowRef(row).external.row_ordinal);
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 65), count);
+}
+
+test "external lake logical fragments route broad Parquet rebuilds through one projected typed spill pass" {
+    try broadSpoolScenario(false, false, false, false);
+}
+test "external lake logical fragments reuse verification payloads without another Parquet scan" {
+    try broadSpoolScenario(true, false, false, false);
+}
+test "external lake logical fragments reuse captured payloads for selective changed fragments" {
+    try broadSpoolScenario(true, true, false, false);
+}
+test "external lake logical fragments sort captured typed keys and preserve physical hydration" {
+    try broadSpoolScenario(true, false, false, true);
+}
+test "external lake logical fragments sort projected keys without verification capture" {
+    try broadSpoolScenario(false, false, false, true);
+}
+fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime hashed: bool, comptime ordered: bool) !void {
+    const a = std.testing.allocator;
+    const row_count = if (hashed) 8193 else 257;
+    var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-spool");
+    defer directory.cleanup();
+    var storage = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer storage.deinit();
+    var client = storage.client();
+    try client.makeBucket("antfly");
+    const payload = try a.alloc(u8, 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    var ids: [row_count]i64 = undefined;
+    var prices: [row_count]i64 = undefined;
+    var bodies: [row_count][]const u8 = undefined;
+    for (&ids, &bodies, 0..) |*id, *body, i| {
+        id.* = @intCast(i);
+        body.* = payload;
+        prices[i] = 9007199254740993 - @as(i64, @intCast(i));
+    }
+    const bytes = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{ .{ .column_id = "id", .field_id = 1, .values = &ids }, .{ .column_id = "price", .field_id = 3, .converted_type = 5, .decimal_precision = 18, .decimal_scale = 2, .values = &prices } }, &.{.{ .column_id = "body", .field_id = 2, .converted_type = 0, .values = &bodies }});
+    defer a.free(bytes);
+    var uploaded = try client.putObject("antfly", "wide.parquet", bytes, .{});
+    uploaded.deinit(a);
+    const raw_schema = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"source","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","additionalProperties":false,"properties":{{"id":{{"type":"integer","x-antfly-field":{{"type":"number","sortable":true}}}},"body":{{"type":"string"}},"price":{{"type":"number","x-antfly-sql-type":"numeric"}}}}}}}}}}}}
+    , .{directory.path()});
+    defer a.free(raw_schema);
+    const schema = if (ordered) try std.mem.concat(a, u8, &.{ "{\"index_sort\":[{\"field\":\"id\",\"order\":\"asc\"},{\"field\":\"_id\",\"order\":\"asc\"}],", raw_schema[1..] }) else try a.dupe(u8, raw_schema);
+    defer a.free(schema);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer binding.deinit(a);
+    var physical = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer physical.deinit();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(79), 1, std.testing.io);
+    var provider: Provider = .{ .source = &physical, .context = .{ .io = std.testing.io } };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "source", .indexes_json = "{}", .schema_json = schema };
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    const recipes: []const @import("lake_row_input_recipes.zig").Recipe = if (ordered) &.{
+        .{ .name = "text", .digest = @splat(8), .columns = &.{ "id", "body", "price" } },
+        .{ .name = @import("lake_row_input_recipes.zig").ordering_name, .digest = @splat(9), .columns = &.{"id"} },
+    } else &.{.{ .name = "text", .digest = @splat(8), .columns = &.{ "id", "body", "price" } }};
+    const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, recipes, physical.inventory.source_id, physical.inventory.snapshot_id);
+    defer builder.deinit();
+    for (0..row_count) |row| {
+        var id: [32]u8 = @splat(3);
+        if (hashed) std.crypto.hash.Blake3.hash(std.mem.asBytes(&row), &id, .{}) else {
+            id[0] = if (selective) @intCast((row % 16) << 4) else 0;
+            std.mem.writeInt(u64, id[24..32], row, .big);
+        }
+        try builder.addWithInputs(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, if (ordered) &.{ @splat(5), @splat(5) } else &.{@splat(5)});
+    }
+    const root = try builder.finish(@splat(1), @splat(2), @splat(3));
+    var captured: ?*@import("lake_row_payloads.zig").Capture = null;
+    defer if (captured) |value| value.deinit();
+    if (fused) {
+        captured = (try @import("lake_row_payloads.zig").Capture.start(a, &provider, &store, &.{ "id", "body", "price" })).?;
+        if (ordered) {
+            var parsed = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+            defer parsed.deinit(a);
+            const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+            defer local.storage_schema.freeSchema(a, runtime);
+            try captured.?.configureOrdering(runtime, &store);
+        }
+        const opening = provider.provider();
+        const source = try opening.open_with_cancellation_fn.?(opening.ptr, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .index_config_hash = "test", .column_bindings = &.{ "id", "body", "price" } }, .none);
+        defer source.deinit(a);
+        while (try source.next(a)) |batch| {
+            const keys = try a.alloc([32]u8, batch.rowCount());
+            defer a.free(keys);
+            for (keys, 0..) |*id, row| {
+                const ordinal: usize = @intCast(row_count - 1 - batch.rowRef(row).external.row_ordinal);
+                id.* = @splat(3);
+                if (hashed) std.crypto.hash.Blake3.hash(std.mem.asBytes(&ordinal), id, .{}) else {
+                    id[0] = if (selective) @intCast((ordinal % 16) << 4) else 0;
+                    std.mem.writeInt(u64, id[24..32], ordinal, .big);
+                }
+            }
+            try captured.?.add(batch, keys, &store);
+        }
+        try captured.?.finish(root.current.rows);
+    }
+    const native = (try prepareWithCapture(a, &store, table, &physical, &provider, root, null, captured)).?;
+    defer native.deinit();
+    var selection_arena = std.heap.ArenaAllocator.init(a);
+    defer selection_arena.deinit();
+    if (selective) for (@constCast(native.provider.fragment_views)) |*view| {
+        const files = try selection_arena.allocator().alloc(@import("lake_index_native_state.zig").File, view.files.len);
+        const changed = try selection_arena.allocator().alloc(bool, view.files.len);
+        for (files, changed, 0..) |*file, *flag, i| {
+            file.* = try view.delta.file(i);
+            flag.* = i == 0;
+        }
+        view.delta.selection = null;
+        view.delta.files = files;
+        view.delta.changed = changed;
+    };
+    provider.identity_spill_bytes = 1;
+    try prepareSpool(native, &provider, &store);
+    try std.testing.expect(native.spool == null);
+    provider.identity_spill_bytes = 1024 * 1024 * 1024;
+    if (ordered) try std.testing.expect(std.mem.startsWith(u8, native.fragments[0].order_tag.?, "so1-"));
+    try prepareCapturedSpool(native, &provider, &store, captured);
+    try std.testing.expect(native.spool != null);
+    if (fused) try std.testing.expectEqual(@as(u64, if (selective) 17 else row_count), native.spool.?.adoption_rows);
+    try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
+    {
+        const Replay = @import("lake_index_build_replay.zig").Replay;
+        var replay = Replay.init(a, &native.provider, &.{"body"});
+        defer replay.deinit();
+        replay.max_spill_bytes = 1;
+        const bound: local.serverless_segment_source_binding.Binding = .{ .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = native.source.inventory.source_id, .snapshot_id = native.source.inventory.snapshot_id, .schema_fingerprint = native.source.inventory.schema_fingerprint, .sidecar_kind = .text, .index_config_hash = "direct-replay", .column_bindings = &.{"body"} };
+        const file = for (native.fragments, 0..) |fragment, i| {
+            if (fragment.count != 0 and native.spool.?.needed[i]) break i;
+        } else return error.TestUnexpectedResult;
+        const first = (try replay.open(a, bound, file, .none)).?;
+        const second = (try replay.open(a, bound, file, .none)).?;
+        defer second.deinit(a);
+        const left = (try first.next(a)).?;
+        const held = (try first.retainColumns(a)).?;
+        defer held.release();
+        first.deinit(a);
+        const right = (try second.next(a)).?;
+        try std.testing.expectEqual(left.rowCount(), right.rowCount());
+        for (0..left.rowCount()) |row| try std.testing.expectEqualStrings(try left.columns[0].bytesAt(row), try right.columns[0].bytesAt(row));
+        try std.testing.expect(replay.direct and replay.run == null);
+        try std.testing.expectEqual(@as(u64, 0), replay.manager.live_bytes);
+        try std.testing.expectEqual(@as(usize, 1), replay.direct_replays);
+    }
+    // Two independent configurations reuse the same decoded first tile even
+    // when their projections differ. Closing either cursor cannot invalidate
+    // the other's borrowed vectors or cached dependencies.
+    {
+        const bound: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .column_bindings = &.{ "id", "body", "price" }, .index_config_hash = "shared-tile-test" };
+        const first = try Build.open(native, a, bound, if (hashed) null else 0, .none, null);
+        defer first.deinit(a);
+        const first_batch = (try first.next(a)).?;
+        var projected = bound;
+        projected.column_bindings = &.{ "price", "id" };
+        const second = try Build.open(native, a, projected, if (hashed) null else 0, .none, null);
+        defer second.deinit(a);
+        const before = native.spool.?.payload_decodes;
+        const hits = native.spool.?.payload_cache_hits;
+        const second_batch = (try second.next(a)).?;
+        try std.testing.expectEqual(first_batch.rowCount(), second_batch.rowCount());
+        // Random identities combined with physical sorting can make this tile
+        // span more than eight payload blocks. Residency is optional; retained
+        // vectors and exact row identity must survive those evictions too.
+        if (!(hashed and ordered)) {
+            try std.testing.expectEqual(before, native.spool.?.payload_decodes);
+            try std.testing.expect(native.spool.?.payload_cache_hits > hits);
+        }
+        try std.testing.expectEqual(@as(usize, 2), second_batch.columns.len);
+        try std.testing.expectEqual(try first_batch.findColumn("id").?.integerAt(0), try second_batch.findColumn("id").?.integerAt(0));
+    }
+    if (hashed) {
+        const spool = native.spool.?;
+        var routes = try tree.Cursor.init(a, spool.storage(), spool.route_root, "", null);
+        defer routes.deinit();
+        const offset = while (try routes.next()) |record| {
+            const candidate = std.mem.readInt(u64, record.value[0..8], .big);
+            const resident = for (spool.decoded) |entry| {
+                if (entry != null and entry.?.offset == candidate) break true;
+            } else false;
+            if (!resident) break candidate;
+        } else return error.TestUnexpectedResult;
+        // Deny the next decode until optional residency is released. Capture
+        // blocks use their original allocator; standalone spools use their own.
+        const budget = if (captured) |capture| &capture.budget else &spool.budget;
+        const limit = budget.limit;
+        budget.limit = budget.live;
+        defer budget.limit = limit;
+        const page = try spool.readPayload(offset);
+        defer page.release();
+        try std.testing.expect(page.len != 0);
+    }
+    for (0..2) |_| {
+        native.spool.?.payload_decodes = 0;
+        const input = try Build.open(native, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .column_bindings = &.{ "id", "body", "price" }, .index_config_hash = "test" }, if (hashed) null else 0, .none, null);
+        defer input.deinit(a);
+        var count: usize = 0;
+        while (try input.next(a)) |batch| {
+            try std.testing.expect(batch.rowCount() <= 256);
+            for (0..batch.rowCount()) |row| {
+                const physical_id = try batch.findColumn("id").?.integerAt(row);
+                if (!hashed) try std.testing.expectEqual(@as(i64, @intCast(if (ordered) count else row_count - 1 - count * @as(usize, if (selective) 16 else 1))), physical_id);
+                try std.testing.expectEqual(payload.len, (try batch.findColumn("body").?.bytesAt(row)).len);
+                const price = batch.findColumn("price").?.values.decimal128;
+                try std.testing.expectEqual(@as(i32, 18), price.precision);
+                try std.testing.expectEqual(@as(i32, 2), price.scale);
+                try std.testing.expectEqual(@as(i128, prices[@intCast(physical_id)]), price.values[row]);
+                if (!hashed) try std.testing.expectEqual(@as(u64, @intCast(count)), batch.rowRef(row).external.row_ordinal);
+                count += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (selective) 17 else row_count), count);
+        if (hashed) {
+            const encoded = if (captured) |capture| capture.payloads.encoded_pages else native.spool.?.payloads.encoded_pages;
+            // Random stable IDs defeated physical-order captures by >27x.
+            // Allow page/window and fragment boundary overlap, independent of N.
+            try std.testing.expect(native.spool.?.payload_decodes <= encoded * 4);
+            try std.testing.expect(encoded <= row_count / 32 + 32);
+        }
+    }
+    try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
+    if (ordered and hashed) {
+        const encoded = captured.?.payloads.encoded_pages;
+        try std.testing.expectEqual(@as(u64, 0), native.ordering_rows_fetched);
+        try std.testing.expectEqual(@as(u64, row_count), native.ordering_keys_captured);
+        try std.testing.expectEqual(@as(u64, 0), native.ordering_payload_decodes);
+        std.debug.print("CAPTURED_ORDERING rows={d} blocks={d} fragments={d} decodes={d}\n", .{ row_count, encoded, native.fragments.len, native.ordering_payload_decodes });
+    }
+    if (ordered and !hashed) {
+        try std.testing.expectEqual(@as(u64, if (fused) 0 else row_count), native.ordering_rows_fetched);
+        try std.testing.expect(native.space.ordering_keys != null);
+        try std.testing.expect(indexSpace(native, "unused").ordering_keys == null);
+        var prior = root;
+        prior.native_space = native.space;
+        // Recreate the released JSON cache as the predecessor, then verify
+        // unchanged entries and new binary entries coexist through refresh.
+        var legacy_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
+        defer legacy_edits.deinit();
+        {
+            var prior_keys = try tree.Cursor.init(a, pages.store(), native.space.ordering_keys, "", null);
+            defer prior_keys.deinit();
+            while (try prior_keys.next()) |record| {
+                const codec = @import("lake_ordering_keys.zig");
+                const decoded = try codec.decodeIntoArena(selection_arena.allocator(), record.value);
+                const legacy = try selection_arena.allocator().alloc(@import("lake_index_sort_bounds.zig").Bound.Value, decoded.keys.len);
+                for (legacy, decoded.keys) |*key, value| key.* = try @import("lake_index_sort_bounds.zig").Bound.Value.from(selection_arena.allocator(), value);
+                const legacy_record = try std.json.Stringify.valueAlloc(selection_arena.allocator(), .{ .version = decoded.version, .keys = legacy }, .{});
+                try legacy_edits.addRecord(record.key, legacy_record);
+            }
+        }
+        prior.native_space.?.ordering_keys = try legacy_edits.finish(null);
+        for (0..4) |step| {
+            const active_recipes = try selection_arena.allocator().dupe(@import("lake_row_input_recipes.zig").Recipe, recipes);
+            if (step >= 2) active_recipes[1].digest = @splat(10);
+            if (step == 3) {
+                prior.native_space.?.ordering_keys = null;
+                prior.native_space.?.ordering_cohort = null;
+            }
+            const refreshed = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, active_recipes, physical.inventory.source_id, physical.inventory.snapshot_id);
+            defer refreshed.deinit();
+            for (0..row_count) |row| {
+                if (step >= 1 and row == 1) continue;
+                var id: [32]u8 = @splat(3);
+                id[0] = 0;
+                std.mem.writeInt(u64, id[24..32], row, .big);
+                try refreshed.addWithInputs(.{ .id = id, .values = @splat(if (row == 0) @as(u8, if (step == 3) 8 else 7) else 4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, &.{ @splat(if (row == 0) @as(u8, 6) else 5), @splat(if (row == 0) @as(u8, if (step == 3) 7 else 6) else 5) });
+            }
+            const updated = try refreshed.finish(@splat(1), @splat(2), @splat(3));
+            const next = (try prepareWithCapture(a, &store, table, &physical, &provider, updated, prior, if (fused and step == 0) captured else null)).?;
+            defer next.deinit();
+            try std.testing.expectEqual(@as(u64, if (step == 0) @as(u64, if (fused) 0 else 1) else if (step == 1) 0 else row_count - 1), next.ordering_rows_fetched);
+            try std.testing.expectEqual(@as(u64, if (step < 2) row_count - 1 else 0), next.ordering_keys_reused);
+            try std.testing.expectEqual(@as(u64, row_count - @as(usize, @min(step, 1))), next.space.ordering_keys.?.records);
+            var retained = updated;
+            retained.native_space = next.space;
+            var dependencies: identity.PageDependencies = .{ .spaces = .{ .root = retained } };
+            var cache_retained = false;
+            while (dependencies.next()) |ref| if (ref.eql(next.space.ordering_keys.?)) {
+                cache_retained = true;
+            };
+            try std.testing.expect(cache_retained);
+            std.debug.print("Ordering refresh: step={d} gathered={d} reused={d} rows={d}\n", .{ step, next.ordering_rows_fetched, next.ordering_keys_reused, next.space.rows });
+            var cursor = try tree.Cursor.init(a, pages.store(), next.space.ordering_keys, "", null);
+            defer cursor.deinit();
+            var seen: usize = 0;
+            while (try cursor.next()) |record| {
+                const ordinal = std.mem.readInt(u64, record.key[24..32], .big);
+                try std.testing.expect(step == 0 or ordinal != 1);
+                seen += 1;
+            }
+            try std.testing.expectEqual(row_count - @as(usize, @min(step, 1)), seen);
+            // Copy durable metadata before closing this build's arena.
+            const encoded = try std.json.Stringify.valueAlloc(selection_arena.allocator(), next.space, .{});
+            prior = updated;
+            prior.native_space = try std.json.parseFromSliceLeaky(identity.Space, selection_arena.allocator(), encoded, .{ .allocate = .alloc_always });
+        }
+    }
+}
+
+test "external lake logical fragments skip unchanged input cohorts and hash only changed leaves" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("logical-input-census");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(77), 1, std.testing.io);
+    var physical: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .scanner = undefined, .inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("one"), .schema_fingerprint = @constCast("schema"), .files = &.{} } };
+    physical.scanner.iceberg_delete_plan = null;
+    physical.scanner.shared_reader = null;
+    var provider: Provider = .{ .source = &physical, .context = .{ .io = std.testing.io } };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "source", .indexes_json = "{}", .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","base_source":{"kind":"external","table_id":"source","format":"parquet","uri":"file:///source","schema_fingerprint":"schema","row_identity":{"key_columns":["id"]}},"document_schemas":{"row":{"schema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"integer"}}}}}}
+    };
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    var previous: ?identity.Root = null;
+    var last: ?*Build = null;
+    defer if (last) |value| value.deinit();
+    var metadata = std.heap.ArenaAllocator.init(a);
+    defer metadata.deinit();
+    for (0..3) |step| {
+        const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{"physical"}, null, null, &.{
+            .{ .name = "dense", .digest = @splat(8), .columns = &.{"dense"} },
+            .{ .name = "text", .digest = @splat(9), .columns = &.{"body"} },
+        }, "source", "one");
+        defer builder.deinit();
+        for (0..128) |row| {
+            var id: [32]u8 = @splat(3);
+            id[0] = @intCast((row % 16) << 4);
+            std.mem.writeInt(u64, id[24..32], row, .big);
+            try builder.addWithInputs(.{ .id = id, .values = @splat(if (step != 0 and row == 0) @as(u8, 7) else 6) }, .{ .file = 0, .group = 0, .row = if (step == 2) 127 - row else row }, &.{ @splat(4), @splat(if (step != 0 and row == 0) @as(u8, 6) else 5) });
+        }
+        var root = try builder.finish(@splat(1), @splat(2), @splat(3));
+        root.values_format = 2;
+        const next = (try prepare(a, &store, table, &physical, &provider, root, previous)).?;
+        const views = next.provider.fragment_views;
+        try std.testing.expectEqual(@as(usize, 2), views.len);
+        try std.testing.expect(next.space.input_commitments != null);
+        for (views, 0..) |view, index| {
+            try std.testing.expect(indexSpace(next, view.name).input_commitments == null);
+            var count: usize = 0;
+            for (0..view.delta.count()) |i| if (view.delta.isChanged(i)) {
+                count += 1;
+            };
+            try std.testing.expectEqual(@as(usize, if (step == 0) 16 else if (step == 1 and index == 1) 1 else 0), count);
+        }
+        if (step == 1) {
+            var changed_count: usize = 0;
+            for (views[1].changed_rows) |selected| if (selected) |ordinals| {
+                changed_count += ordinals.len;
+                try std.testing.expectEqualSlices(u64, &.{0}, ordinals);
+            };
+            try std.testing.expectEqual(@as(usize, 1), changed_count);
+        }
+        // Selecting a cohort must preserve a file-major reached frontier.
+        var partial_source = next.source;
+        partial_source.inventory.files = partial_source.inventory.files[0..3];
+        var append_work: Provider.ResumeWork = .{ .file = 0, .end = 3 };
+        var partial = next.provider;
+        partial.resume_work = &append_work;
+        var selected = partial.forIndex(&partial_source, views[0].name);
+        try std.testing.expect(selected.native_delta == null);
+        var order = @import("lake_index_native_state.zig").ScanOrder.init(&selected);
+        for (0..3) |ordinal| try std.testing.expectEqual(@as(?usize, ordinal), try order.next());
+        try std.testing.expectEqual(@as(?usize, null), try order.next());
+        try std.testing.expectEqualSlices(u8, &(try views[0].delta.file(0)).digest, &try @import("lake_index_native_state.zig").identity(a, &selected, partial_source.inventory.files[0]));
+        try std.testing.expectEqual(@as(u64, if (step == 0) 256 else if (step == 1) 8 else 0), next.input_rows_hashed);
+        try std.testing.expectEqual(@as(u64, if (step == 0) 128 else if (step == 1) 8 else 0), next.census_rows_hashed);
+        root.native_space = next.space;
+        const bindings = try metadata.allocator().alloc(identity.ReusedIndex, 2);
+        for (bindings, views) |*binding, view| binding.* = .{ .name = view.name, .space = indexSpace(next, view.name) };
+        root.reused = bindings;
+        root.artifacts = @splat(7);
+        try root.reseal(a);
+        try root.validate(a);
+        if (last) |value| value.deinit();
+        last = next;
+        previous = root;
+    }
+}
+
+test "external lake hashed payload capture clusters spilled pages for repeated consumers" {
+    try broadSpoolScenario(true, false, true, false);
+}
+test "external lake broad typed spool clusters random coordinates without verification capture" {
+    try broadSpoolScenario(false, false, true, false);
+}
+
+test "external lake borrowed fragment leases report complete retained ownership" {
+    const a = std.testing.allocator;
+    const Page = local.storage_db_types.ColumnSourcePage;
+    const parent = try a.create(Page);
+    parent.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = 4 };
+    defer parent.release();
+    const wide = try parent.arena.allocator().alloc(u8, 5 * 1024 * 1024);
+    @memset(wide, 'x');
+    const columns = try parent.arena.allocator().alloc(rows.ColumnVector, 2);
+    columns[0] = .{ .name = "body", .values = .{ .bytes = &.{ "a", "b", "c", "d" } } };
+    const wide_values = try parent.arena.allocator().alloc([]const u8, 4);
+    @memset(wide_values, wide);
+    columns[1] = .{ .name = "wide", .values = .{ .bytes = wide_values } };
+    parent.columns = columns;
+    const selected = try Page.gatherProjectedPositions(a, &.{ .{ .page = parent, .row = 0 }, .{ .page = parent, .row = 1 } }, &.{0});
+    defer selected.release();
+    try std.testing.expect(selected.owner != null);
+    var cursor: Spool.Cursor = .{ .a = a, .owner = undefined, .binding = undefined, .file = null, .token = .none, .store = undefined, .page = selected };
+    const lease = (try Spool.Cursor.retain(&cursor, a)).?;
+    defer lease.release();
+    try std.testing.expect(lease.retained_bytes >= selected.retainedBytes());
+}
+
+test "external lake Merkle fragment commitments reject algebraically cancelling row updates" {
+    try cancellingUpdatesScenario(false);
+}
+test "external lake Merkle migration rebuilds legacy fragments before row deltas" {
+    try cancellingUpdatesScenario(true);
+}
+fn cancellingUpdatesScenario(legacy: bool) !void {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("logical-input-census");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(77), 1, std.testing.io);
+    var physical: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .scanner = undefined, .inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("one"), .schema_fingerprint = @constCast("schema"), .files = &.{} } };
+    physical.scanner.iceberg_delete_plan = null;
+    physical.scanner.shared_reader = null;
+    var provider: Provider = .{ .source = &physical, .context = .{ .io = std.testing.io } };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "source", .indexes_json = "{}", .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","base_source":{"kind":"external","table_id":"source","format":"parquet","uri":"file:///source","schema_fingerprint":"schema","row_identity":{"key_columns":["id"]}},"document_schemas":{"row":{"schema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"integer"}}}}}}
+    };
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+
+    var basis: [256][32]u8 = @splat(@splat(0));
+    var combinations: [256][5]u64 = @splat(@splat(0));
+    var selected: [5]u64 = @splat(0);
+    var found = false;
+    var ids: [257][32]u8 = @splat(@splat(3));
+    var old_inputs: [257][32]u8 = @splat(@splat(0));
+    var new_inputs = old_inputs;
+    const Legacy = struct {
+        fn xor(hash_: *[32]u8, id: [32]u8, input: [32]u8) void {
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("native-lake-logical-input-row-v2");
+            hash.update(&id);
+            hash.update(&input);
+            var row: [32]u8 = undefined;
+            hash.final(&row);
+            for (hash_, row) |*x, y| x.* ^= y;
+        }
+    };
+    for (0..257) |i| {
+        ids[i][0] = @intCast((i % 256) / 16);
+        ids[i][1] = @as(u8, @intCast(i % 16)) << 4;
+        std.mem.writeInt(u64, ids[i][24..32], i, .big);
+        std.mem.writeInt(u64, old_inputs[i][24..32], i, .big);
+        std.mem.writeInt(u64, new_inputs[i][24..32], i + 1000, .big);
+        if (found) continue;
+        var vector: [32]u8 = @splat(0);
+        Legacy.xor(&vector, ids[i], old_inputs[i]);
+        Legacy.xor(&vector, ids[i], new_inputs[i]);
+        var combination: [5]u64 = @splat(0);
+        combination[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+        var inserted = false;
+        for (0..256) |bit| {
+            if (vector[bit / 8] & (@as(u8, 1) << @intCast(bit % 8)) == 0) continue;
+            if (std.mem.allEqual(u8, &basis[bit], 0)) {
+                basis[bit] = vector;
+                combinations[bit] = combination;
+                inserted = true;
+                break;
+            }
+            for (&vector, basis[bit]) |*x, y| x.* ^= y;
+            for (&combination, combinations[bit]) |*x, y| x.* ^= y;
+        }
+        if (!inserted) {
+            selected = combination;
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+    var previous: ?identity.Root = null;
+    var last: ?*Build = null;
+    defer if (last) |value| value.deinit();
+    var metadata = std.heap.ArenaAllocator.init(a);
+    defer metadata.deinit();
+    var changed: usize = 0;
+    var legacy_delta: [32]u8 = @splat(0);
+    for (0..2) |step| {
+        const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{"physical"}, null, null, &.{.{ .name = "text", .digest = @splat(9), .columns = &.{"body"} }}, "source", if (step == 0) "one" else "two");
+        defer builder.deinit();
+        for (ids, old_inputs, new_inputs, 0..) |id, before, after, row| {
+            const edited = step != 0 and selected[row / 64] & (@as(u64, 1) << @intCast(row % 64)) != 0;
+            if (edited) {
+                changed += 1;
+                Legacy.xor(&legacy_delta, id, before);
+                Legacy.xor(&legacy_delta, id, after);
+            }
+            try builder.addWithInputs(.{ .id = id, .values = @splat(if (edited) @as(u8, 7) else 6) }, .{ .file = 0, .group = 0, .row = row }, &.{if (edited) after else before});
+        }
+        var root = try builder.finish(@splat(1), @splat(2), @splat(3));
+        root.values_format = 2;
+        const next = (try prepare(a, &store, table, &physical, &provider, root, previous)).?;
+        if (step == 1) {
+            try std.testing.expect(changed != 0);
+            try std.testing.expectEqual(@as([32]u8, @splat(0)), legacy_delta);
+            var changed_fragments: usize = 0;
+            var detected_rows: usize = 0;
+            for (0..next.provider.fragment_views[0].delta.count()) |i| if (next.provider.fragment_views[0].delta.isChanged(i)) {
+                changed_fragments += 1;
+            };
+            for (next.provider.fragment_views[0].changed_rows) |rows_| if (rows_) |values| {
+                detected_rows += values.len;
+            };
+            try std.testing.expectEqual(if (legacy) @as(usize, 0) else changed, detected_rows);
+            try std.testing.expectEqual(if (legacy) next.fragments.len else @as(usize, 1), changed_fragments);
+            if (legacy) {
+                for (next.provider.fragment_views[0].changed_rows) |rows_| try std.testing.expect(rows_ == null);
+                try std.testing.expectEqual(@as(u64, ids.len), next.input_rows_hashed);
+            } else try std.testing.expect(next.input_rows_hashed <= changed * 2);
+        }
+        root.native_space = next.space;
+        const bindings = try metadata.allocator().alloc(identity.ReusedIndex, 1);
+        bindings[0] = .{ .name = "text", .space = indexSpace(next, "text") };
+        if (legacy and step == 0) {
+            const old_files = try metadata.allocator().dupe(local.serverless_external_source_types.FileEntry, next.provider.fragment_views[0].files);
+            for (old_files) |*file| file.version_id = try std.fmt.allocPrint(metadata.allocator(), "iv2-{s}", .{file.version_id[4..]});
+            var old_source = next.source;
+            old_source.inventory.files = old_files;
+            var old_provider = next.provider;
+            old_provider.source = &old_source;
+            old_provider.native_delta = null;
+            const old_navigation = try navigation.build(a, metadata.allocator(), &store, &old_provider, null, .none);
+            bindings[0].space.navigation = old_navigation.ref;
+            root.native_space.?.input_commitments = null;
+        }
+        root.reused = bindings;
+        root.artifacts = @splat(7);
+        try root.reseal(a);
+        try root.validate(a);
+        if (last) |value| value.deinit();
+        last = next;
+        previous = root;
+    }
+}
+
+test "external lake logical fragments retain coordinate pages until a layout actually moves" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("logical-layout-retention");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(81), 1, std.testing.io);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    const Builder = @import("lake_row_identity_delta.zig").Builder;
+    const first = try Builder.createWithScan(a, &manager, &pages, &.{ "a", "b" }, null, null, &.{}, "source", "one", true, null);
+    defer first.deinit();
+    try first.add(.{ .id = @splat(1), .values = @splat(1) }, .{ .file = first.slots[0], .group = 0, .row = 0 });
+    try first.add(.{ .id = @splat(2), .values = @splat(2) }, .{ .file = first.slots[1], .group = 0, .row = 0 });
+    var prior = try first.finish(@splat(1), @splat(2), @splat(3));
+    for (0..3) |step| {
+        const next = try Builder.createWithScan(a, &manager, &pages, &.{ "a", "b" }, prior, null, &.{}, "source", "next", true, &.{ false, false });
+        defer next.deinit();
+        if (step != 0) {
+            try next.rescanFile(0);
+            try next.add(.{ .id = @splat(1), .values = @splat(1) }, .{ .file = next.slots[0], .group = 0, .row = step });
+            if (step == 2) {
+                try next.rescanFile(1);
+                try next.add(.{ .id = @splat(2), .values = @splat(2) }, .{ .file = next.slots[1], .group = 0, .row = step });
+            }
+        }
+        const before = writes;
+        const root = try next.finish(@splat(1), @splat(2), @splat(3));
+        if (step == 0) {
+            try std.testing.expectEqual(before, writes);
+            try std.testing.expectEqual(prior.current.by_id, root.current.by_id);
+        }
+        try std.testing.expectEqual(@as(u64, 2), root.current.rows);
+        var reader: identity.Reader = .{ .root = root, .pages = &pages };
+        const first_row = (try reader.byId(a, root.current, @splat(1))).?;
+        const second_row = (try reader.byId(a, root.current, @splat(2))).?;
+        try std.testing.expectEqual(@as(u64, step), first_row.coordinate.row);
+        try std.testing.expectEqual(@as(u64, if (step == 2) 2 else 0), second_row.coordinate.row);
+        prior = root;
+    }
+}
+
+test "external lake logical fragments bind cached field positions while reusing reversed keys" {
+    const fields = [_]local.segment.SegmentIndexSortField{ .{ .field = "a" }, .{ .field = "b" }, .{ .field = "_id" } };
+    const swapped = [_]local.segment.SegmentIndexSortField{ .{ .field = "b" }, .{ .field = "a" }, .{ .field = "_id" } };
+    const reversed = [_]local.segment.SegmentIndexSortField{ .{ .field = "a", .desc = true }, .{ .field = "b", .desc = true }, .{ .field = "_id" } };
+    const cohort: [32]u8 = @splat(8);
+    try std.testing.expect(!std.meta.eql(orderingKeyRecipe(cohort, &fields), orderingKeyRecipe(cohort, &swapped)));
+    try std.testing.expect(std.meta.eql(orderingKeyRecipe(cohort, &fields), orderingKeyRecipe(cohort, &reversed)));
+    try std.testing.expect(!std.meta.eql(orderingKeyRecipe(cohort, &fields), orderingKeyRecipe(@splat(9), &fields)));
+    try std.testing.expect(orderingKeyRecipe(null, &fields) == null);
+}
+
+test "external lake logical fragments group captured ordering misses across random identities" {
+    try broadSpoolScenario(true, false, true, true);
+}
+
+test "external lake logical fragments bound ordering kernels preserve typed and nested mapping semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema: local.storage_schema.TableSchema = .{ .version = 1, .exact_fields = &.{
+        .{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "title.keyword", .source_field = "title", .mapping = .{ .field_type = .keyword, .doc_values = true } },
+        .{ .field = "enabled", .source_field = "enabled", .mapping = .{ .field_type = .boolean, .doc_values = true } },
+        .{ .field = "nested", .source_field = "payload.rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "literal", .source_field = "literal.rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "at", .source_field = "at", .mapping = .{ .field_type = .datetime, .doc_values = true } },
+    } };
+    const fields = [_]local.segment.SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "title.keyword" }, .{ .field = "enabled" }, .{ .field = "nested" }, .{ .field = "literal" }, .{ .field = "at" }, .{ .field = "_id" } };
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "title", .values = .{ .dictionary_bytes = .{ .values = &.{ "z", "a" }, .indices = &.{ 1, 0 } } } },
+        .{ .name = "rank", .values = .{ .dictionary_i64 = .{ .values = &.{ std.math.minInt(i64), std.math.maxInt(i64) }, .indices = &.{ 1, 0 } } }, .nulls = .{ .bytes = &.{ 0, 1 } } },
+        .{ .name = "enabled", .values = .{ .bool = &.{ true, false } } },
+        .{ .name = "payload", .values = .{ .json = &.{ "{\"rank\":9007199254740993}", "{}" } } },
+        .{ .name = "literal.rank", .values = .{ .i64 = &.{ 7, 8 } } },
+        .{ .name = "at", .values = .{ .bytes = &.{ "1969-12-31T23:59:59.999999999Z", "1970-01-01T00:00:00.000000001Z" } } },
+    };
+    const sorted = try a.dupe(local.storage_schema.ExactField, schema.exact_fields);
+    std.mem.sort(local.storage_schema.ExactField, sorted, {}, struct {
+        fn less(_: void, l: local.storage_schema.ExactField, r: local.storage_schema.ExactField) bool {
+            return std.mem.order(u8, l.field, r.field) == .lt;
+        }
+    }.less);
+    schema.exact_fields = sorted;
+    const batch = (try OrderingBatch.bind(a, &columns, schema, &fields)).?;
+    const state: identity.logical.State = .{ .id = @splat(3), .values = @splat(3) };
+    for (0..2) |row| {
+        const document = (try batch.document(a, row, &state)).?;
+        for (batch.entries, document.index_sort_values) |entry, actual| {
+            const source = for (schema.exact_fields) |field| {
+                if (std.mem.eql(u8, field.field, entry.field)) break field.source_field;
+            } else unreachable;
+            const raw = try orderingValue(a, &columns, row, source);
+            if (raw == .null) {
+                try std.testing.expect(actual.value == .null_value);
+                continue;
+            }
+            const expected = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, entry.mapping, raw)).?;
+            const bound: local.segment.SegmentIndexSortBoundValue = switch (expected) {
+                .numeric_val => |n| switch (n) {
+                    inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+                },
+                inline .datetime_ns, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+                else => unreachable,
+            };
+            try std.testing.expectEqualDeep(bound, actual.value);
+        }
+    }
+}
+
+test "external lake logical fragments bound ordering kernel comparison" {
+    const a = std.testing.allocator;
+    const count = 16384;
+    const keys = 8;
+    var schema: local.storage_schema.TableSchema = .{ .version = 1 };
+    var exact: [keys]local.storage_schema.ExactField = undefined;
+    var fields: [keys]local.segment.SegmentIndexSortField = undefined;
+    var names: [32][8]u8 = undefined;
+    var columns: [32]rows.ColumnVector = undefined;
+    const integers = try a.alloc(i64, count);
+    defer a.free(integers);
+    for (integers, 0..) |*integer, i| integer.* = @intCast(i);
+    for (&columns, &names, 0..) |*column, *name, i| {
+        const text = try std.fmt.bufPrint(name, "col{d}", .{i});
+        column.* = .{ .name = text, .values = .{ .i64 = integers } };
+        if (i >= columns.len - keys) {
+            const k = i - (columns.len - keys);
+            fields[k] = .{ .field = text };
+            exact[k] = .{ .field = text, .source_field = text, .mapping = .{ .field_type = .numeric, .doc_values = true } };
+        }
+    }
+    schema.exact_fields = &exact;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var checksums: [2]u64 = @splat(0);
+    var times: [2]u64 = undefined;
+    const state: identity.logical.State = .{ .id = @splat(3), .values = @splat(3) };
+    for (0..2) |mode| {
+        const started = @import("antfly_platform").time.monotonicNs();
+        if (mode == 0) {
+            for (0..count) |row| {
+                _ = region.reset(.retain_capacity);
+                for (fields) |field| {
+                    const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field).?;
+                    const source = for (schema.exact_fields) |mapped| {
+                        if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+                    } else field.field;
+                    const raw = try orderingValue(scratch, &columns, row, source);
+                    const value = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(scratch, resolved.mapping, raw)).?;
+                    checksums[mode] += @intCast(value.numeric_val.i64_val);
+                }
+            }
+        } else {
+            var bindings = std.heap.ArenaAllocator.init(a);
+            defer bindings.deinit();
+            const batch = (try OrderingBatch.bind(bindings.allocator(), &columns, schema, &fields)).?;
+            for (0..count) |row| {
+                _ = region.reset(.retain_capacity);
+                const document = (try batch.document(scratch, row, &state)).?;
+                for (document.index_sort_values) |value| checksums[mode] += @intCast(value.value.i64_val);
+            }
+        }
+        times[mode] = @import("antfly_platform").time.monotonicNs() - started;
+    }
+    try std.testing.expectEqual(checksums[0], checksums[1]);
+    std.debug.print("ORDERING_BIND rows={d} keys={d} columns=32 row_adapter_ns={d} bound_kernel_ns={d} checksum={d}\n", .{ count, keys, times[0], times[1], checksums[0] });
+}
+
+test "external lake logical fragments capture tuples borrow only until encoding" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var title = "owned".*;
+    const columns = [_]rows.ColumnVector{.{ .name = "title", .values = .{ .bytes = &.{&title} } }};
+    const schema: local.storage_schema.TableSchema = .{ .version = 1, .exact_fields = &.{.{ .field = "title", .source_field = "title", .mapping = .{ .field_type = .keyword, .doc_values = true } }} };
+    const batch = (try OrderingBatch.bind(arena.allocator(), &columns, schema, &.{.{ .field = "title" }})).?;
+    var tuple: [1]local.segment.SegmentIndexSortBoundValue = undefined;
+    try std.testing.expect(try batch.tupleInto(arena.allocator(), 0, &tuple));
+    try std.testing.expectEqual(@intFromPtr(&title), @intFromPtr(tuple[0].bytes_val.ptr));
+    const encoded = (try @import("lake_ordering_keys.zig").encode(arena.allocator(), @splat(0), &tuple)).?;
+    @memset(&title, 'x');
+    const decoded = try @import("lake_ordering_keys.zig").decodeIntoArena(arena.allocator(), encoded);
+    try std.testing.expectEqualStrings("owned", decoded.keys[0].bytes_val);
+    try std.testing.expectError(error.InvalidLogicalRowIdentity, batch.tupleInto(arena.allocator(), 0, &.{}));
+}
+
+test "external lake logical fragments capture reuses scratch and encodes identical tuples" {
+    const a = std.testing.allocator;
+    const count = 4096;
+    var bindings = std.heap.ArenaAllocator.init(a);
+    defer bindings.deinit();
+    const integers = try a.alloc(i64, count);
+    defer a.free(integers);
+    for (integers, 0..) |*value_, i| value_.* = @intCast(i);
+    const text = try a.alloc([]const u8, count);
+    defer a.free(text);
+    @memset(text, "capture-key-with-a-long-enough-string-to-observe-copy-cost");
+    const columns = [_]rows.ColumnVector{ .{ .name = "rank", .values = .{ .i64 = integers } }, .{ .name = "title", .values = .{ .bytes = text } } };
+    const schema: local.storage_schema.TableSchema = .{ .version = 1, .exact_fields = &.{
+        .{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "title", .source_field = "title", .mapping = .{ .field_type = .keyword, .doc_values = true } },
+    } };
+    const batch = (try OrderingBatch.bind(bindings.allocator(), &columns, schema, &.{ .{ .field = "rank" }, .{ .field = "title" } })).?;
+    var hashes = [_]std.hash.Wyhash{ .init(0), .init(0) };
+    var capacity: [2]usize = @splat(0);
+    var times: [2]u64 = undefined;
+    const state: identity.logical.State = .{ .id = @splat(3), .values = @splat(3) };
+    for (0..2) |mode| {
+        const started = @import("antfly_platform").time.monotonicNs();
+        var reused = std.heap.ArenaAllocator.init(a);
+        defer reused.deinit();
+        for (0..count) |row| {
+            var per_row = std.heap.ArenaAllocator.init(a);
+            defer per_row.deinit();
+            _ = reused.reset(.retain_capacity);
+            const scratch = if (mode == 0) per_row.allocator() else reused.allocator();
+            var tuple: [2]local.segment.SegmentIndexSortBoundValue = undefined;
+            if (mode == 0) {
+                const doc = (try batch.document(scratch, row, &state)).?;
+                var values: std.ArrayList(local.segment.SegmentIndexSortBoundValue) = .empty;
+                for (doc.index_sort_values) |value_| try values.append(scratch, value_.value);
+                @memcpy(&tuple, values.items);
+            } else try std.testing.expect(try batch.tupleInto(scratch, row, &tuple));
+            const bytes = (try @import("lake_ordering_keys.zig").encode(scratch, @splat(0), &tuple)).?;
+            hashes[mode].update(bytes);
+            if (mode == 0) capacity[mode] += per_row.queryCapacity();
+        }
+        if (mode == 1) capacity[mode] = reused.queryCapacity();
+        times[mode] = @import("antfly_platform").time.monotonicNs() - started;
+    }
+    try std.testing.expectEqual(hashes[0].final(), hashes[1].final());
+    try std.testing.expect(capacity[1] * 100 < capacity[0]);
+    std.debug.print("CAPTURE_TUPLES rows={d} prior_arena_bytes={d} reusable_arena_bytes={d} prior_ns={d} direct_ns={d} checksum={d}\n", .{ count, capacity[0], capacity[1], times[0], times[1], hashes[0].final() });
+}

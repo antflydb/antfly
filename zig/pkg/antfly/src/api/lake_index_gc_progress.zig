@@ -143,6 +143,24 @@ pub const Progress = struct {
                         for (@import("lake_source_navigation.zig").dependencies(navigation)) |root| if (root) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
                     }
                 }
+                if (publication.row_identity) |ref| {
+                    if (try self.expand(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, "row-identity")) {
+                        try stores.chargeReadBudget(&collector.remaining_reads, ref.byte_len);
+                        const identity = try @import("lake_row_identity.zig").load(a, collector.store, ref, collector.cancellation(), null);
+                        if (!std.mem.eql(u8, &identity.domain, &self.value.domain)) return error.InvalidNativeLakeGcReference;
+                        var identity_pages = @import("lake_row_identity.zig").dependencies(identity);
+                        while (identity_pages.next()) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
+                        var identity_navigation = @import("lake_row_identity.zig").navigationDependencies(identity);
+                        while (identity_navigation.next()) |ref_| {
+                            if (try self.expand(.{ .artifact_id = ref_.artifact_id, .checksum = ref_.checksum, .byte_len = ref_.byte_len }, "source-navigation")) {
+                                try stores.chargeReadBudget(&collector.remaining_reads, ref_.byte_len);
+                                const navigation = try @import("lake_source_navigation.zig").load(a, collector.store, ref_, collector.cancellation(), null);
+                                if (!std.mem.eql(u8, &navigation.domain, &self.value.domain)) return error.InvalidNativeLakeGcReference;
+                                for (@import("lake_source_navigation.zig").dependencies(navigation)) |root| if (root) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
+                            }
+                        }
+                    }
+                }
                 var hydrated = publication;
                 if (publication.directory) |directory| {
                     if (!try self.expand(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, "directory")) return;
@@ -158,7 +176,10 @@ pub const Progress = struct {
             },
             .page => |job_page| {
                 const page = job_page.ref;
-                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.text_files) |files| (if (files.maintenance_only) "text-maintenance-file-page" else "text-serving-file-page") else if (job_page.native_generation) "native-generation-files" else if (job_page.native_chunks) "native-generation-chunks" else if (job_page.native_files) "native-file-state-page" else if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
+                const id = try page_store.PageStore.identity(self.value.domain, page);
+                const kind = if (job_page.text_files) |files| (if (files.maintenance_only) "text-maintenance-file-page" else "text-serving-file-page") else if (job_page.native_generation) "native-generation-files" else if (job_page.native_chunks) "native-generation-chunks" else if (job_page.native_files) "native-file-state-page" else if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page";
+                const interpretation = if (page.pack != null) try std.fmt.allocPrint(a, "{s}:{x}:{s}", .{ kind, page.offset(), std.fmt.bytesToHex(&page.digest, .lower) }) else kind;
+                if (!try self.expand(.{ .artifact_id = &id, .checksum = id[7..71], .byte_len = page.artifactBytes() }, interpretation)) return;
                 var write_bytes: u64 = 0;
                 var pages: page_store.PageStore = .{ .domain = self.value.domain, .artifacts = &collector.store, .cancellation = collector.cancellation(), .remaining_read_bytes = &collector.remaining_reads, .remaining_write_bytes = &write_bytes };
                 const Visitor = struct {
@@ -580,4 +601,65 @@ test "external lake global frontier resumable GC retains delete-version and nati
     try harness.collect(store, identity, @splat(8));
     try std.testing.expectError(error.FileNotFound, store.getAlloc(&selector_id));
     try std.testing.expectError(error.FileNotFound, store.getAlloc(document.artifact_id));
+}
+
+test "external lake global frontier packed navigation GC expands every sibling and persists logical page marks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("packed-navigation-gc");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(43);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(1, identity, null);
+    const scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    store.upload_scope = scope;
+    var reads: u64 = 64 * 1024 * 1024;
+    var writes: u64 = 64 * 1024 * 1024;
+    var pages: page_store.PageStore = .{ .domain = domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .pack_pages = true };
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store(), .target_bytes = 512 };
+    defer builder.deinit();
+    var children: [24]artifacts.ChunkRef = undefined;
+    for (&children, 0..) |*child, i| {
+        const bytes = try std.fmt.allocPrint(ca, "unique packed child {d}", .{i});
+        var uploaded = try store.put(bytes);
+        defer uploaded.deinit(a);
+        child.* = .{ .artifact_id = try ca.dupe(u8, uploaded.artifact_id), .checksum = try ca.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        try builder.add(&key, try std.json.Stringify.valueAlloc(ca, child.*, .{}));
+    }
+    const root = (try builder.finish()).?;
+    try std.testing.expect(root.height > 1);
+    var collector: gc.Collector = .{ .a = ca, .table = 1, .authority = undefined, .store = store, .identity = identity, .context = .{ .io = std.testing.io }, .token = @splat(1), .audit_only = true, .remaining_reads = 64 * 1024 * 1024 };
+    // The synchronous certificate walk must expand all siblings in each pack.
+    try collector.markGenerationPage(a, domain, root, true);
+    for (children) |child| try std.testing.expect(collector.marked.contains(child.artifact_id));
+    var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store() };
+    defer cache.deinit();
+    var progress: Progress = .{ .collector = &collector, .a = ca, .work_a = a, .pages = &pages, .page_cache = &cache, .old_end = 0, .value = .{ .domain = domain, .floor = 0, .attempt = scope.attempt, .cutoff = 2 } };
+    collector.progress = &progress;
+    try progress.enqueue(.{ .page = .{ .ref = root, .ordered_rows = false, .native_chunks = true } });
+    var at: usize = 0;
+    while (at < progress.queued.items.len) : (at += 1) {
+        const job = try std.json.parseFromSliceLeaky(Job, ca, progress.queued.items[at].value.?, .{});
+        try progress.process(job);
+    }
+    for (children) |child| try std.testing.expect(progress.marked.contains(child.artifact_id));
+    const saved = try progress.persist();
+    defer a.free(saved.artifact_id);
+    defer a.free(saved.checksum);
+    const encoded = try store.getAlloc(saved.artifact_id);
+    defer a.free(encoded);
+    const checkpoint = try std.json.parseFromSliceLeaky(Checkpoint, ca, encoded, .{});
+    // After a restart, expansion markers remain in the durable marks tree;
+    // repeating the root schedules no more child work.
+    var resumed: Progress = .{ .collector = &collector, .a = ca, .work_a = a, .pages = &pages, .page_cache = &cache, .old_end = checkpoint.end, .value = checkpoint };
+    collector.progress = &resumed;
+    try resumed.process(.{ .page = .{ .ref = root, .ordered_rows = false, .native_chunks = true } });
+    try std.testing.expectEqual(@as(usize, 0), resumed.queued.items.len);
+    for (children) |child| try std.testing.expect(try resumed.contains(child.artifact_id));
 }

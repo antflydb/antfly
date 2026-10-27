@@ -270,6 +270,17 @@ pub const RaftApplyStore = struct {
         _ = try self.projection(bool, .{ .kind = .migrate_standalone_restore_jobs, .key = .fromSlice(encoded.written()) });
     }
 
+    pub fn getJobOwnerCount(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner: []const u8) !u64 {
+        return self.projectionWithAllocator(u64, alloc, .{ .kind = .job_owner_count, .group_id = group_id, .key = .fromSlice(owner) });
+    }
+
+    pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .job_state, .group_id = group_id, .key = .fromSlice(key) });
+    }
+    pub fn scanJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8) ![]u8 {
+        return self.projectionWithAllocator([]u8, alloc, .{ .kind = .job_state_scan, .group_id = group_id, .key = .fromSlice(after orelse ""), .arg1 = @intFromBool(after != null) });
+    }
+
     pub fn getBackupCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .backup_cohort, .group_id = group_id, .arg0 = job_id });
     }
@@ -327,6 +338,9 @@ pub const RaftApplyStore = struct {
     }
     pub fn loadStandaloneCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .standalone_catalog, .arg0 = 1 });
+    }
+    pub fn exportStandalonePortableCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator) ![]u8 {
+        return self.catalogProjection([]u8, alloc, @import("antfly_local_sources").common_group_ids.main_metadata_group_id, .{ .catalog_export_standalone_portable = {} });
     }
     pub fn standaloneRevision(self: *RaftApplyStore) !u64 {
         return self.projection(u64, .{ .kind = .standalone_revision });

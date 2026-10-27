@@ -19,12 +19,22 @@ const std = @import("std");
 const tree = @import("../serverless/graph_segment/page_tree.zig");
 const A = std.mem.Allocator;
 pub const Run = struct { page: tree.Ref, level: u8 };
-pub const Policy = enum { sum, contribution, latest };
+pub const Policy = enum { sum, contribution, latest, addition_first };
 pub const Forest = struct {
     a: A,
     store: tree.Store,
     policy: Policy,
     levels: [32]?tree.Ref = @splat(null),
+    /// Private forests own whole immutable runs. Begin gives each output a
+    /// separate namespace; retain retires consumed runs only after commit.
+    runs: ?struct {
+        ptr: *anyopaque,
+        begin: *const fn (*anyopaque) anyerror!tree.Store,
+        retain: *const fn (*anyopaque, []const ?tree.Ref) anyerror!void,
+    } = null,
+    fn beginRun(self: *Forest) !void {
+        if (self.runs) |runs| self.store = try runs.begin(runs.ptr);
+    }
     pub fn restore(self: *Forest, runs: []const Run) !void {
         if (runs.len > self.levels.len) return error.InvalidNativeLakeDeltaRun;
         for (runs) |run| {
@@ -44,6 +54,7 @@ pub const Forest = struct {
         return true;
     }
     pub fn add(self: *Forest, source: anytype) !void {
+        try self.beginRun();
         var incoming = try tree.buildSorted(self.a, self.store, source);
         var level: usize = 0;
         // Commit the new directory only after every page is durable. Failure
@@ -59,6 +70,7 @@ pub const Forest = struct {
             next[level] = null;
         }
         self.levels = next;
+        if (self.runs) |runs| try runs.retain(runs.ptr, &self.levels);
     }
     pub fn finish(self: *Forest) !?tree.Ref {
         var result: ?tree.Ref = null;
@@ -68,9 +80,15 @@ pub const Forest = struct {
             level -= 1;
             if (self.levels[level]) |page| result = if (result) |old| try self.merge(old, page) else page;
         }
+        if (self.runs) |runs| {
+            self.levels = @splat(null);
+            self.levels[0] = result;
+            try runs.retain(runs.ptr, &self.levels);
+        }
         return result;
     }
     fn merge(self: *Forest, old: tree.Ref, fresh: tree.Ref) !?tree.Ref {
+        try self.beginRun();
         var left = try tree.Cursor.init(self.a, self.store, old, "", null);
         defer left.deinit();
         var right = try tree.Cursor.init(self.a, self.store, fresh, "", null);
@@ -96,6 +114,10 @@ pub const Forest = struct {
                     self_.advance_right = order != .lt;
                     if (order != .eq) return if (order == .lt) self_.l else self_.r;
                     if (self_.policy == .latest) return self_.r;
+                    if (self_.policy == .addition_first) {
+                        if (self_.l.?.value.len == 0 or self_.r.?.value.len == 0) return error.InvalidNativeLakeDeltaRun;
+                        return if (self_.l.?.value[0] > self_.r.?.value[0]) self_.l else self_.r;
+                    }
                     const l = self_.l.?;
                     const r = self_.r.?;
                     if (l.value.len < 8 or r.value.len < 8) return error.InvalidNativeLakeDeltaRun;

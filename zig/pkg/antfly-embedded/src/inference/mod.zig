@@ -74,6 +74,9 @@ test "remote capability invalidation fences active discovery" {
 
 test "bedrock provider request helpers" {
     try managed_embedder.testBedrockCredentialTrafficBypassesModelQuota();
+    try bedrock.testConverseWire();
+    try bedrock.testConverseSignedRequest();
+    try bedrock.testConverseStream();
     try bedrock.testBedrockSigningClockUsesUnixWallTime();
     try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
@@ -182,4 +185,8 @@ test "query embedding cache owns results and coalesces misses" {
 
 test "query embedding cache keys isolate security domains" {
     try managed_embedder.testQueryEmbeddingCacheKeys();
+}
+
+test "model aware media retained text pins its producing revision through managed execution" {
+    try managed_embedder.testRetainedTextGenerationLease();
 }

@@ -60,7 +60,58 @@ pub fn fieldProjectionStorageEligible(req: db_mod.types.SearchRequest) bool {
     return field_projection.storageEligible(req);
 }
 
+/// Local producer receipts cannot cross the worker wire. Re-establish them
+/// only for this hydration request's validated execution outputs. They never
+/// replace the revision-bound document authorization checked by the caller.
+pub fn finalizeHydratedProjectionSources(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hits: []db_mod.types.SearchHit) !void {
+    if (!field_projection.hydrationEligible(req)) return;
+    var plan = try field_projection.decode(a, req.field_projection_json);
+    defer plan.deinit();
+    try finalizeCompletedProjectionSources(a, req, hits, &plan);
+}
+
+fn finalizeCompletedProjectionSources(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hits: []db_mod.types.SearchHit, plan: *const field_projection.Plan) !void {
+    if (!field_projection.storageEligible(req) and !field_projection.hydrationEligible(req)) return;
+    for (hits) |*hit| {
+        if (hasFinalizedPublicSource(hit.*)) continue;
+        if (hit.source_value != null or hit.column_source != null) continue;
+        const stored = hit.stored_data orelse continue;
+        if (hit.computed_json) |bytes| if (try plan.wireOutput(a, bytes, true) != null) {
+            hit.finalized_source = .{ .bytes = stored };
+        };
+    }
+}
+
 pub const testing = if (builtin.is_test) struct {
+    pub fn expectNativeScalarArraySource() !void {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
+        defer a.free(path);
+        var db = try db_mod.DB.open(a, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const padding = try a.alloc(u8, 32768);
+        defer a.free(padding);
+        @memset(padding, 'x');
+        const json = try std.fmt.allocPrint(a, "{{\"arr\":[{{\"n\":1}},{{\"n\":2}}],\"padding\":\"{s}\"}}", .{padding});
+        defer a.free(json);
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = json }}, .sync_level = .full_index });
+        const req: db_mod.types.SearchRequest = .{ .query = .{ .match_all = {} }, .fields = &.{"arr.1.n"}, .include_all_fields = false, .defer_stored_projection = true, .field_projection_json = "{\"fields\":[\"arr.1.n\",{\"name\":\"constant\",\"expression\":{\"literal\":1}}]}" };
+        var result = try db.search(a, req);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("{\"arr\":[{\"n\":2}]}", result.hits[0].stored_data.?);
+        try std.testing.expect(result.hits[0].finalized_source.?.matches(result.hits[0].stored_data.?));
+        // A decoded local/remote wire result has no pointer receipt.
+        result.hits[0].finalized_source = null;
+        var response = try encodeQueryResponses(a, "docs", req, .{}, result);
+        defer response.deinit(a);
+        var decoded = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+        defer decoded.deinit();
+        const source = decoded.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object.get("_source").?;
+        try std.testing.expectEqual(@as(i64, 2), source.object.get("arr").?.array.items[0].object.get("n").?.integer);
+    }
     pub fn expectConditionalSourceProjection() !void {
         const a = std.testing.allocator;
         var owned = try parseQueryRequest(a, null, "docs",
@@ -72,9 +123,10 @@ pub const testing = if (builtin.is_test) struct {
         defer arena.deinit();
         const cold = try toOpenApiHit(arena.allocator(), owned.req, .{ .id = @constCast("a"), .stored_data = @constCast("{}") });
         try std.testing.expect(cold._computed != null);
-        try std.testing.expectEqualStrings("a", cold._computed.?.map.get("id").?.string);
-        try std.testing.expect(cold._computed.?.map.get("value").? == .null);
-        try std.testing.expect(!cold._computed.?.map.contains(field_projection.marker));
+        const computed = try ant_json.parseFromSliceLeaky(std.json.Value, arena.allocator(), cold._computed.?.bytes, .{});
+        try std.testing.expectEqualStrings("a", computed.object.get("id").?.string);
+        try std.testing.expect(computed.object.get("value").? == .null);
+        try std.testing.expect(!computed.object.contains(field_projection.marker));
     }
     pub fn expectConditionalSourceWireSpans() !void {
         const a = std.testing.allocator;
@@ -2911,7 +2963,7 @@ pub fn parseQueryRequestWithDeadline(
             var control = try std.json.parseFromValue(struct { mode: db_mod.types.document_authority.Mode, group: u64, defer_stored_projection: bool = false }, alloc, value, .{});
             defer control.deinit();
             if (control.value.mode == .none or control.value.group == 0) return error.InvalidQueryRequest;
-            owned.req.include_stored = false;
+            owned.req.include_stored = control.value.mode == .lookup;
             owned.req.document_authority_mode = control.value.mode;
             owned.req.document_authority_group = control.value.group;
             owned.req.defer_stored_projection = control.value.defer_stored_projection;
@@ -3903,12 +3955,22 @@ fn hasColumnSources(hits: []const db_mod.types.SearchHit) bool {
 // with the same strict selector engine instead of materializing another DOM.
 fn canStreamFinalizedSource(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, _: ?*field_projection.Plan) bool {
     if (!req.include_stored or req.document_authority_mode != .none) return false;
+    return hasFinalizedPublicSource(hit);
+}
+fn hasFinalizedPublicSource(hit: db_mod.types.SearchHit) bool {
     return hit.finalized_source != null and hit.finalized_source.?.matches(hit.stored_data orelse return false) and hit.source_value == null and hit.column_source == null;
 }
-fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*field_projection.Plan) !metadata_openapi.QueryHit {
-    // Skip only source conversion. Hierarchy/mention metadata can also depend
-    // on stored_data, so every other converter must receive the complete hit.
-    return toOpenApiHitPreparedSource(a, req, hit, projection, canStreamFinalizedSource(req, hit, projection));
+fn preparedComputedOutput(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*field_projection.Plan) !?ant_json.RawObject {
+    return if (projection) |plan| (if (hit.computed_json) |bytes| try plan.wireOutput(a, bytes, req.field_projection_transport) else null) else null;
+}
+fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: *db_mod.types.SearchHit, projection: ?*field_projection.Plan) !metadata_openapi.QueryHit {
+    const ready = try preparedComputedOutput(a, req, hit.*, projection);
+    if (ready != null and (field_projection.storageEligible(req) or field_projection.hydrationEligible(req)) and hit.source_value == null and hit.column_source == null) {
+        if (hit.stored_data) |bytes| hit.finalized_source = .{ .bytes = bytes };
+    }
+    // Rebind normalized response receipts before choosing raw source delivery.
+    // Reuse the validated output, rather than scanning large payloads twice.
+    return toOpenApiHitPreparedSource(a, req, hit.*, projection, canStreamFinalizedSource(req, hit.*, projection), ready);
 }
 fn hasFinalizedWireSources(req: db_mod.types.SearchRequest, hits: []const db_mod.types.SearchHit, projection: ?*field_projection.Plan) bool {
     for (hits) |hit| if (canStreamFinalizedSource(req, hit, projection)) return true;
@@ -4121,9 +4183,9 @@ fn ColumnWireResult(comptime T: type) type {
                                 return error.WriteFailed;
                             };
                         };
-                        const hit = self.hits[hit_index];
+                        var hit = self.hits[hit_index];
                         _ = hit_arena.reset(.retain_capacity);
-                        const api_hit = if (hydrator != null) toOpenApiHitForWire(hit_arena.allocator(), self.req, hit, self.projection) catch |err| {
+                        const api_hit = if (hydrator != null) toOpenApiHitForWire(hit_arena.allocator(), self.req, &hit, self.projection) catch |err| {
                             self.failure.* = err;
                             return error.WriteFailed;
                         } else base_hit;
@@ -4292,7 +4354,7 @@ pub fn encodeQueryResponsesWithDelivery(
     const projection = try prepareFieldProjection(arena, req);
     defer if (projection) |plan| plan.deinit();
     const hits = try arena.alloc(metadata_openapi.QueryHit, emitted_hits.len);
-    for (emitted_hits, 0..) |hit, i| {
+    for (emitted_hits, 0..) |*hit, i| {
         hits[i] = try toOpenApiHitForWire(arena, req, hit, projection);
     }
 
@@ -4400,13 +4462,20 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
     return toOpenApiHitPrepared(alloc, req, hit, projection);
 }
 fn toOpenApiHitPrepared(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*field_projection.Plan) !metadata_openapi.QueryHit {
-    return toOpenApiHitPreparedSource(alloc, req, hit, projection, false);
+    return toOpenApiHitPreparedSource(alloc, req, hit, projection, false, try preparedComputedOutput(alloc, req, hit, projection));
 }
-fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*field_projection.Plan, skip_source: bool) !metadata_openapi.QueryHit {
+fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*field_projection.Plan, skip_source: bool, ready_computed: ?ant_json.RawObject) !metadata_openapi.QueryHit {
     try validateOpenApiHitSortTuple(req, hit);
 
+    // A normalized worker/local query response may have crossed an ownership
+    // boundary that deliberately retires pointer receipts. Validate completed
+    // outputs before touching source: eligible producers already applied the
+    // source mask, so applying numeric array selections again loses positions.
+    const projected_source = hasFinalizedPublicSource(hit) or
+        (ready_computed != null and field_projection.storageEligible(req) and hit.stored_data != null and hit.source_value == null and hit.column_source == null);
+
     var api_hit: metadata_openapi.QueryHit = .{
-        ._computed = if (hit.computed_json) |data| try takeOpenApiObjectMap(alloc, try ant_json.parseFromSliceLeaky(std.json.Value, alloc, data, .{})) else null,
+        ._computed = if (projection == null) (if (hit.computed_json) |data| try ant_json.RawObject.init(data) else null) else null,
         ._id = hit.id,
         ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
         ._score_details = toOpenApiScoreDetails(hit.score_details),
@@ -4430,7 +4499,7 @@ fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.Search
                 // coordinator revision envelope. Projecting it by public unit
                 // fields would turn it into `{}` and defeat revision binding.
                 try parseInternalGroupedUnitRevisionEnvelopeValue(alloc, stored_data)
-            else if (req.defer_stored_projection)
+            else if (req.defer_stored_projection and !projected_source)
                 try projectPublicStoredSourceValue(alloc, stored_data, .{
                     .fields = req.fields,
                     .include_all_fields = req.include_all_fields,
@@ -4443,20 +4512,18 @@ fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.Search
         ._highlights = try highlightsJsonValue(alloc, hit.highlights),
     };
     if (projection) |plan| {
-        const previous = if (hit.computed_json) |bytes| try ant_json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{}) else null;
-        if (plan.hasOutputs(previous)) {
-            api_hit._computed = try takeOpenApiObjectMap(alloc, previous.?);
-        } else {
-            var row_arena = std.heap.ArenaAllocator.init(alloc);
-            defer row_arena.deinit();
-            var source: ProjectionWireSource = .{ .hit = hit, .arena = &row_arena };
-            const value = try plan.evaluate(alloc, .{ .context = &source, .read = ProjectionWireSource.read }, previous, field_projection.requestLimits(&req));
-            // The produced JSON may borrow the row's temporary column view.
-            // Promote only the chosen output before retiring that view.
-            const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
-            api_hit._computed = try takeOpenApiObjectMap(alloc, try ant_json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{}));
+        if (ready_computed) |ready| {
+            api_hit._computed = ready;
+            return api_hit;
         }
-        if (!req.field_projection_transport) _ = api_hit._computed.?.map.orderedRemove(field_projection.marker);
+        const previous = if (hit.computed_json) |bytes| try ant_json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{}) else null;
+        var row_arena = std.heap.ArenaAllocator.init(alloc);
+        defer row_arena.deinit();
+        var source: ProjectionWireSource = .{ .hit = hit, .arena = &row_arena };
+        var value = try plan.evaluate(alloc, .{ .context = &source, .read = ProjectionWireSource.read }, previous, field_projection.requestLimits(&req));
+        if (!req.field_projection_transport) _ = value.object.orderedRemove(field_projection.marker);
+        // Encode chosen values once while their temporary source view is alive.
+        api_hit._computed = .{ .bytes = try std.json.Stringify.valueAlloc(alloc, value, .{}) };
     }
     return api_hit;
 }
@@ -4559,7 +4626,7 @@ fn openApiSortValueIsCursorReplayable(value: std.json.Value) bool {
         .float => |v| std.math.isFinite(v),
         .number_string => |text| openApiSortNumberStringIsCursorReplayable(text),
         .bool, .integer, .string => true,
-        .null => false,
+        .null => true,
         .array, .object => false,
     };
 }
@@ -13836,13 +13903,14 @@ fn consumerTests() type {
                 .sort_values = null_sort_values,
             };
             db_mod.resetLastSortRejectionDiagnostic();
-            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+            // The wire boundary validates replayable scalar shape; mapped
+            // admission has already enforced the field's explicit null policy.
+            var null_response = try encodeQueryResponses(alloc, "docs", .{
                 .order_by = &order_by,
-            }, .{}, null_sort));
-            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqualStrings("created_at", diagnostic.field);
-            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+            }, .{}, null_sort);
+            defer null_response.deinit(alloc);
+            try std.testing.expect(std.mem.indexOf(u8, null_response.json, "\"_sort\":[null,\"doc:a\"]") != null);
+            try std.testing.expect(db_mod.peekLastSortRejectionDiagnostic() == null);
 
             var non_finite = db_mod.types.SearchResult{
                 .alloc = alloc,
@@ -18242,17 +18310,16 @@ fn consumerTests() type {
             const alloc = std.testing.allocator;
 
             db_mod.resetLastSortRejectionDiagnostic();
-            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+            var nullable = try parseQueryRequest(alloc, null, "docs",
                 \\{
                 \\  "full_text_search": {"match":"raft","field":"body"},
                 \\  "order_by": [{"field":"created_at","desc":true}],
                 \\  "search_after": [null, "doc-9"]
                 \\}
-            ));
-            var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqualStrings("created_at", diagnostic.field);
-            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+            );
+            defer nullable.deinit(alloc);
+            try std.testing.expect(nullable.req.search_after[0] == .null);
+            try std.testing.expect(db_mod.peekLastSortRejectionDiagnostic() == null);
 
             try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
                 \\{
@@ -18270,7 +18337,7 @@ fn consumerTests() type {
                 \\  "search_after": ["high", "doc-9"]
                 \\}
             ));
-            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
             try std.testing.expectEqualStrings("_score", diagnostic.field);
             try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
             try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
@@ -20078,4 +20145,27 @@ test "api query contract select worker roundtrip preserves masks params and rece
         defer second.deinit();
         try std.testing.expectEqualStrings(&first.fingerprint, &second.fingerprint);
     }
+}
+
+test "api query contract worker projection receipt preserves compacted array source" {
+    const a = std.testing.allocator;
+    var request = try parseQueryRequest(a, null, "docs", "{\"fields\":[\"arr.1.n\"],\"select\":{\"constant\":{\"literal\":1}}}");
+    defer request.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    var plan = try field_projection.decode(a, request.req.field_projection_json);
+    defer plan.deinit();
+    var source: field_projection.JsonSource = .{ .id = "a", .root = .null };
+    const computed = try plan.evaluate(temp, source.source(), null, .{});
+    var hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("a"), .stored_data = @constCast("{\"arr\":[{\"n\":2}]}"), .computed_json = try std.json.Stringify.valueAlloc(temp, computed, .{}) }};
+    request.req.document_authority_mode = .hydrate;
+    try finalizeHydratedProjectionSources(temp, request.req, &hits);
+    try std.testing.expect(hits[0].finalized_source.?.matches(hits[0].stored_data.?));
+    request.req.document_authority_mode = .none;
+    request.req.defer_stored_projection = true;
+    // Encoded query responses deliberately retire the local pointer receipt.
+    hits[0].finalized_source = null;
+    const wire = try toOpenApiHit(temp, request.req, hits[0]);
+    try std.testing.expectEqual(@as(i64, 2), wire._source.?.map.get("arr").?.array.items[0].object.get("n").?.integer);
 }

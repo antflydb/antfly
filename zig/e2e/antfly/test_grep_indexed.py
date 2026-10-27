@@ -2870,3 +2870,86 @@ def test_select_never_evaluates_discarded_output_rows(stateful_api, num_shards):
     assert result["status"] == 200, result
     assert [hit["_id"] for hit in result["hits"]["hits"]] == ["b"]
     assert result["hits"]["hits"][0]["_computed"]["answer"] == 4
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_array_paths_and_source_mask_applied_once(stateful_api, num_shards):
+    table = "select_arrays_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    docs = {
+        "small": {"arr": [{"n": 1}, {"n": 2}], "metadata": {"_type": "image"}},
+        "large": {
+            "arr": [{"n": 3}, {"n": 4}],
+            "metadata": {"_type": "text"},
+            "padding": "x" * 32768,
+        },
+    }
+    stateful_api.batch_write(table, inserts=docs, sync_level="full_index")
+    for selected in [
+        {"constant": {"literal": 1}},
+        {
+            "n": {"field": "arr.1.n"},
+            "all": {"field": "arr.n"},
+            "kind": {"field": "metadata._type"},
+            "missing": {"call": "is_missing", "args": [{"field": "arr.1.n"}]},
+        },
+    ]:
+        response = requests.post(
+            stateful_api.url + f"/tables/{table}/query",
+            json={
+                "query": {"match_all": {}},
+                "fields": ["arr.1.n"],
+                "select": selected,
+            },
+            timeout=60,
+        )
+        assert response.status_code == 200, response.text
+        hits = response.json()["responses"][0]["hits"]["hits"]
+        assert len(hits) == 2
+        for hit in hits:
+            expected = docs[hit["_id"]]["arr"][1]["n"]
+            assert hit["_source"] == {"arr": [{"n": expected}]}, hit
+            if "n" in selected:
+                assert hit["_computed"] == {
+                    "n": expected,
+                    "all": [item["n"] for item in docs[hit["_id"]]["arr"]],
+                    "kind": docs[hit["_id"]]["metadata"]["_type"],
+                    "missing": False,
+                }, hit
+            else:
+                assert hit["_computed"] == {"constant": 1}, hit
+
+
+def test_select_alias_depth_rejected_without_losing_server(stateful_api):
+    table = "select_depth_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": 1})
+    stateful_api.batch_write(table, inserts={"a": {"n": 1}}, sync_level="full_index")
+    selected = {}
+    for i in range(64):
+        expr = {"ref": f"x{i + 1}"} if i < 63 else {"literal": 1}
+        for _ in range(40):
+            expr = {"case": [{"when": {"literal": True}, "then": expr}]}
+        selected[f"x{i}"] = expr
+    url = stateful_api.url + f"/tables/{table}/query"
+    response = requests.post(
+        url,
+        json={"query": {"match_all": {}}, "fields": [], "select": selected},
+        timeout=30,
+    )
+    assert response.status_code in (400, 422), response.text
+    healthy = requests.post(url, json={"query": {"match_all": {}}}, timeout=30)
+    assert healthy.status_code == 200, healthy.text
+
+    # A legal maximum-length chain must still run on the HTTP worker stack.
+    chain = {
+        f"x{i}": {"ref": f"x{i + 1}"} if i < 63 else {"literal": 1} for i in range(64)
+    }
+    valid = requests.post(
+        url,
+        json={"query": {"match_all": {}}, "fields": [], "select": chain},
+        timeout=30,
+    )
+    assert valid.status_code == 200, valid.text
+    assert set(
+        valid.json()["responses"][0]["hits"]["hits"][0]["_computed"].values()
+    ) == {1}

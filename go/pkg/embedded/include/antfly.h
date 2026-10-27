@@ -463,6 +463,10 @@ antfly_error_code antfly_db_render_resolver_key_json(antfly_db *db, antfly_slice
  * mention embeddings, ANN candidates and scoring. Returns {extraction,resolution}
  * with canonical doc_refs and decisions. Does not write documents or artifacts.
  * Requires an asset-scoped resolver; text requires an extractor producer. */
+/** Execute the native memory/v1 contract on a named space. Request includes
+ * action, body and idempotency_key for mutations. The embedded database owner
+ * is the authority; principal is local attribution, never a remote identity. */
+antfly_error_code antfly_db_memory_json(antfly_db *db, antfly_slice space, antfly_slice request_json, antfly_buffer *out_json);
 antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json, antfly_buffer *out_json);
 /** Merge fully rendered keys: {"key":"concept/old","target":"concept/new"}.
  * Durable and idempotent. Cycles/redirect replacement are rejected. Drain with
@@ -517,6 +521,9 @@ antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_sl
  * approximately 100 ms. Retry the identical request with bounded backoff.
  * replaces registers a hidden resumable shadow and returns; the old graph
  * serves until background activation. Identical requests are idempotent.
+ * This preserves the old generation's indexed contents; it does not turn an
+ * earlier write-only batch receipt into an index-visibility guarantee. Use
+ * sync_level:"full_index" when a subsequent graph read must see that batch.
  * Acts as add when the old index is absent. Optional wait:{timeout_ms:N}
  * waits for activation; deadline BUSY leaves the accepted shadow running.
  * Waiting releases admission between work quanta and remains bound to the

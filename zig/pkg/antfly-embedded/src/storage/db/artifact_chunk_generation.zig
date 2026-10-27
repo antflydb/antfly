@@ -13,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Immutable staged output sets. This storage primitive is not an activation
-//! entrypoint: ordered command authorization, admission, receipts, recovery,
-//! and all semantic readers must be integrated before enabling head publication.
+//! Immutable staged output sets. Production activation is authorized by
+//! artifact_chunk_staging and the ordered publication writer; these storage
+//! primitives alone do not grant publication authority.
 const std = @import("std");
 const keys = @import("../internal_keys.zig");
 const publication = @import("artifact_publication.zig");
@@ -414,6 +414,46 @@ pub fn readMember(alloc: std.mem.Allocator, txn: anytype, logical_key: []const u
     return input.value;
 }
 
+/// Override a physical batch lookup with its selected immutable member. The
+/// sorted batch shares one head lookup per contiguous producer scope.
+pub const MemberReader = struct {
+    arena: std.heap.ArenaAllocator,
+    scope: ?[]const u8 = null,
+    prefix: ?[]const u8 = null,
+    count: u32 = 0,
+    pub fn init(a: std.mem.Allocator) MemberReader {
+        return .{ .arena = .init(a) };
+    }
+    pub fn deinit(self: *MemberReader) void {
+        self.arena.deinit();
+    }
+    pub fn override(self: *MemberReader, txn: anytype, logical: []const u8, physical_value: ?[]const u8) !?[]const u8 {
+        const a = self.arena.allocator();
+        if (keys.mediaWindowIndex(logical)) |index| {
+            const parent = (try readMember(a, txn, logical)) orelse return null;
+            return try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(a, parent, index);
+        }
+        const scope = (try chunks.keyForMemberAlloc(a, logical)) orelse return physical_value;
+        if (self.scope == null or !std.mem.eql(u8, scope, self.scope.?)) {
+            self.scope = scope;
+            self.prefix = null;
+            const head_key = try physicalKey(a, scope, keys.producer_generation_head_kind, null);
+            if (txn.get(head_key) catch |err| if (err == error.NotFound) null else return err) |head| {
+                var plan = try Plan.init(a, scope, try Spec.decode(head));
+                defer plan.deinit();
+                self.prefix = try a.dupe(u8, plan.row_prefix);
+                self.count = plan.spec.output.count;
+            }
+        }
+        const prefix = self.prefix orelse return physical_value;
+        if (std.mem.readInt(u32, logical[logical.len - 4 ..][0..4], .big) >= self.count) return null;
+        const member = try a.alloc(u8, prefix.len + 4);
+        @memcpy(member[0..prefix.len], prefix);
+        @memcpy(member[prefix.len..], logical[logical.len - 4 ..]);
+        return txn.get(member) catch |err| if (err == error.NotFound) return error.ArtifactCatalogCorrupt else return err;
+    }
+};
+
 /// One snapshot's logical value and visibility witness. Payloads are borrowed
 /// from the transaction; only the head key is owned. A selected generation's
 /// provenance certifies the whole immutable set, not a stale legacy member.
@@ -421,15 +461,17 @@ pub const Input = struct {
     alloc: std.mem.Allocator,
     /// Unit absence must be a certified deletion, never an incomplete upload.
     require_absence_proof: bool = false,
+    logical_override: ?[]u8 = null,
     head_key: ?[]u8 = null,
     head_value: ?[]const u8 = null,
     value: ?[]const u8 = null,
     pub fn deinit(self: *Input) void {
+        if (self.logical_override) |key| self.alloc.free(key);
         if (self.head_key) |key| self.alloc.free(key);
         self.* = undefined;
     }
     pub fn proofKey(self: Input, logical: []const u8) []const u8 {
-        return if (self.head_value != null) self.head_key.? else logical;
+        return if (self.head_value != null) self.head_key.? else self.logical_override orelse logical;
     }
     pub fn proofValue(self: Input) ?[]const u8 {
         return self.head_value orelse self.value;
@@ -438,13 +480,15 @@ pub const Input = struct {
         if (self.head_key) |key| try token.observe(key, self.head_value, try publication.artifactRevision(txn, token.namespace, key));
         // The immutable generation rows are covered by the head proof. Legacy
         // members additionally require their physical read-set witness.
-        if (self.head_value == null) try token.observe(logical, self.value, try publication.artifactRevision(txn, token.namespace, logical));
+        if (self.head_value == null) try token.observe(self.logical_override orelse logical, self.value, try publication.artifactRevision(txn, token.namespace, self.logical_override orelse logical));
     }
 };
 
-pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, logical: []const u8) !Input {
+pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, supplied: []const u8) !Input {
+    const logical = keys.mediaWindowParent(supplied);
     var input: Input = .{ .alloc = alloc };
     errdefer input.deinit();
+    if (logical.len != supplied.len) input.logical_override = try alloc.dupe(u8, logical);
     const scope = (try chunks.keyForMemberAlloc(alloc, logical)) orelse {
         input.value = txn.get(logical) catch |err| if (err == error.NotFound) null else return err;
         return input;
@@ -464,6 +508,22 @@ pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, logical: []const u8)
             input.value = txn.get(key) catch |err| if (err == error.NotFound) return error.ArtifactCatalogCorrupt else return err;
         }
     } else input.value = txn.get(logical) catch |err| if (err == error.NotFound) null else return err;
+    if (keys.mediaWindowIndex(supplied)) |index| if (input.value) |raw| {
+        const metadata = try @import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, raw);
+        defer if (metadata) |value| value.deinit(alloc);
+        const encoded = if (metadata) |value| value.outputs_json else null;
+        var found = false;
+        var windows: usize = 0;
+        if (encoded) |bytes| {
+            var results = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, alloc, bytes, .{});
+            defer results.deinit();
+            for (results.value) |result| if (result.kind == .embedding and std.mem.eql(u8, result.name, "embedding")) {
+                windows += 1;
+                if (result.sub_index == index and result.status == .complete) found = true;
+            };
+        }
+        if (!found or windows <= 1) input.value = null;
+    };
     return input;
 }
 
@@ -528,4 +588,43 @@ pub fn View(comptime Txn: type) type {
             return self.txn.get(key) catch |err| if (err == error.NotFound) error.ArtifactCatalogCorrupt else err;
         }
     };
+}
+
+test "model aware media member batch reads replace legacy rows and hide tails with one selected-head lookup" {
+    const a = std.testing.allocator;
+    const scope = try chunks.keyAlloc(a, "doc", "chunks");
+    defer a.free(scope);
+    var builder = chunks.Builder.init();
+    try builder.append(0, "accepted");
+    const spec = try Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), builder.finish(), 1);
+    var plan = try Plan.init(a, scope, spec);
+    defer plan.deinit();
+    const Fake = struct {
+        head: []const u8,
+        prefix: []const u8,
+        encoded: [252]u8,
+        heads: usize = 0,
+        missing: bool = false,
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key, self.head)) {
+                self.heads += 1;
+                return &self.encoded;
+            }
+            if (!self.missing and std.mem.startsWith(u8, key, self.prefix) and std.mem.allEqual(u8, key[self.prefix.len..], 0)) return "accepted";
+            return error.NotFound;
+        }
+    };
+    var read: Fake = .{ .head = plan.head_key, .prefix = plan.row_prefix, .encoded = spec.encode() };
+    var members = MemberReader.init(a);
+    defer members.deinit();
+    const zero = try keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 0);
+    defer a.free(zero);
+    const tail = try keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 1);
+    defer a.free(tail);
+    try std.testing.expectEqualStrings("accepted", (try members.override(&read, zero, "stale legacy row")).?);
+    try std.testing.expect((try members.override(&read, tail, "stale legacy tail")) == null);
+    try std.testing.expectEqualStrings("ordinary", (try members.override(&read, "base-document", "ordinary")).?);
+    try std.testing.expectEqual(@as(usize, 1), read.heads);
+    read.missing = true;
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, members.override(&read, zero, null));
 }

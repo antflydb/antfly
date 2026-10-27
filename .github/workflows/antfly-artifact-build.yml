@@ -45,6 +45,7 @@ jobs:
     outputs:
       matrix: ${{ steps.platforms.outputs.matrix }}
       build_contract_schema: ${{ steps.source-contract.outputs.build_contract_schema }}
+      embedded_zig_source: ${{ steps.source-contract.outputs.embedded_zig_source }}
       runtime_products: ${{ steps.source-contract.outputs.runtime_products }}
       channel: ${{ steps.channel.outputs.channel }}
       build_controller_commit: ${{ steps.controller.outputs.commit }}
@@ -123,6 +124,13 @@ jobs:
     name: Build Zig archive (${{ matrix.artifact_name }})
     needs: release-plan
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Preparation and both product builds must use the same package cache.
+      ANTFLY_ZIG_CACHE_ROOT: ${{ github.workspace }}/.zig-cache/release-dependencies
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/release-dependencies/global
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.release-plan.outputs.matrix) }}
@@ -131,6 +139,18 @@ jobs:
         with:
           ref: ${{ inputs.source_commit }}
           submodules: true
+
+      - name: Check out pinned dependency preparation tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.build_controller_commit }}
+          path: release-controller
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
 
       - name: Install Linux build dependencies
         if: ${{ matrix.os == 'linux' }}
@@ -180,6 +200,11 @@ jobs:
 
       - name: Test reproducible archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
+
+      - name: Prepare verified release dependencies
+        uses: ./release-controller/.github/actions/prepare-zig-dependencies
+        with:
+          mirror-only: 'true'
 
       - name: Build source-declared runtime archives
         env:
@@ -254,6 +279,33 @@ jobs:
           bash scripts/packaging/test_homebrew_install.sh \
             dist/antfly.rb dist/release-archives "$version"
 
+      - name: Qualify in-place upgrade from released v0.2.5 data
+        if: ${{ inputs.release_line == '0.3' || inputs.release_line == 'nightly' }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/v02-upgrade"
+          mkdir -p "$stage/old" "$stage/new"
+          curl --fail --location --retry 3 \
+            https://github.com/antflydb/antfly/releases/download/v0.2.5/antfly_0.2.5_Darwin_arm64.tar.gz \
+            -o "$stage/old.tar.gz"
+          echo "4fc5a948be9e14cefc8393de22ce1ea6e35b927aa79cc35b7d80bef55b712ac8  $stage/old.tar.gz" | shasum -a 256 --check --strict
+          tar -xzf "$stage/old.tar.gz" -C "$stage/old"
+          tar -xzf "dist/release-archives/antfly_${RELEASE_TAG#v}_Darwin_arm64.tar.gz" -C "$stage/new"
+          python3 scripts/ci/qualify-v02-server-upgrade.py \
+            --old-bin "v0.2.5=$stage/old/antfly" \
+            --new-bin "$stage/new/antfly" \
+            --work-dir "$stage/evidence"
+
+      - name: Upload in-place upgrade evidence
+        if: ${{ always() && (inputs.release_line == '0.3' || inputs.release_line == 'nightly') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-v02-upgrade-evidence
+          path: ${{ runner.temp }}/v02-upgrade/evidence
+          if-no-files-found: warn
+
   package-cli-artifacts:
     name: Build immutable CLI package snapshot
     needs:
@@ -280,7 +332,7 @@ jobs:
       python_build: ${{ needs.release-plan.outputs.python_build }}
 
   package-embedded-zig-source:
-    if: ${{ needs.release-plan.outputs.build_contract_schema == '5' }}
+    if: ${{ needs.release-plan.outputs.embedded_zig_source == 'true' }}
     name: Package independently fetchable Apache Zig sources
     needs: release-plan
     runs-on: ubuntu-latest

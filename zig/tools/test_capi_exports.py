@@ -165,6 +165,8 @@ else:
         (self.root / "lib").symlink_to(zig_root / "lib", target_is_directory=True)
         for relative in (
             "build_test_filters.zig",
+            "pkg/antfly/build/runtime_memory.zig",
+            "pkg/antfly/build/test_owner_names.zig",
             "pkg/inference/build/decision_modules.zig",
             "tools/build_support.zig",
             "tools/capi_exports.py",
@@ -223,6 +225,100 @@ pub fn build(b: *std.Build) void {
                 for name in ("metadata-first", "metadata-second"):
                     library = self.root / target / f"lib/lib{name}.so"
                     self.assertEqual(library.read_bytes()[:4], b"\x7fELF")
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and shutil.which("zig"),
+        "native Mach-O Zig compiler required",
+    )
+    def test_source_less_macho_images_own_metadata_and_keep_bundled_objects_unique(
+        self,
+    ):
+        self.copy_native_build_support()
+        header = self.root / "pkg/antfly-embedded/include/antfly.h"
+        header.parent.mkdir(parents=True)
+        shutil.copyfile(self.header, header)
+        (self.root / "api.zig").write_text("""
+extern fn bundled_value() c_int;
+extern fn bundled_static_value() c_int;
+extern fn final_static_value() c_int;
+export fn antfly_first() c_int {
+    return bundled_value() + bundled_static_value() + final_static_value() + @as(c_int, @intCast(@import("build_info").version().len));
+}
+export fn antfly_second(_: c_int) void {}
+""")
+        (self.root / "bundled.zig").write_text(
+            "export fn bundled_value() c_int { return 40; }\n"
+        )
+        for name, value in (("bundled", 5), ("final", 7)):
+            source = self.root / f"{name}-static.c"
+            source.write_text(f"int {name}_static_value(void) {{ return {value}; }}\n")
+            subprocess.run(
+                [
+                    "xcrun",
+                    "clang",
+                    "-fPIC",
+                    "-c",
+                    str(source),
+                    "-o",
+                    str(source.with_suffix(".o")),
+                ],
+                check=True,
+            )
+        (self.root / "build.zig").write_text("""
+const std = @import("std");
+const library = @import("build_support/embedded/shared_library.zig");
+const metadata = @import("lib/build_info/build_support.zig");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const sdk = b.option([]const u8, "sdk", "Native SDK") orelse @panic("SDK required");
+    b.addNamedLazyPath("antfly_macos_sdk_root", .{ .cwd_relative = sdk });
+    const declaration = b.createModule(.{ .root_source_file = b.path("lib/build_info/src/root.zig") });
+    const bundled_module = b.createModule(.{ .root_source_file = b.path("bundled.zig"), .target = target, .optimize = .fast, .pic = true });
+    const bundled = b.addObject(.{ .name = "bundled", .root_module = bundled_module });
+    const api = b.createModule(.{ .root_source_file = b.path("api.zig"), .target = target, .optimize = .fast, .pic = true, .link_libc = true });
+    api.addImport("build_info", declaration);
+    api.addObject(bundled);
+    api.addObjectFile(b.path("bundled-static.o"));
+    const owner = library.addProviderArchive(b, api, "api-owner", 512 * 1024 * 1024);
+    for ([_][]const u8{ "aa", "bbbb" }) |version| {
+        const info = metadata.create(b, .{ .root = b.path("lib/build_info"), .target = target, .optimize = .fast, .version = version });
+        const facade = b.createModule(.{ .target = target, .optimize = .fast, .pic = true, .link_libc = true });
+        info.link(facade);
+        info.link(facade);
+        // This same object is already part of the owner; the final facade
+        // must not link another copy alongside its private metadata object.
+        facade.addObject(bundled);
+        facade.addObjectFile(b.path("bundled-static.o"));
+        facade.addObjectFile(b.path("final-static.o"));
+        facade.addObjectFile(b.path("final-static.o"));
+        const image = library.addWithStorageOwner(b, facade, &.{}, owner);
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(image.binary, .lib, b.fmt("{s}/libantfly.dylib", .{version})).step);
+    }
+}
+""")
+        sdk = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
+        result = run_fixture_build(
+            [shutil.which("zig"), "build", f"-Dsdk={sdk}", "-j2"], self.root
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # Real process loading checks that each image resolves its own version,
+        # while the export checker also rejects leaking the metadata symbol.
+        for version in ("aa", "bbbb"):
+            image = self.root / "zig-out/lib" / version / "libantfly.dylib"
+            exports.check(header, image, "macho")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import ctypes,sys; lib=ctypes.CDLL(sys.argv[1]); assert lib.antfly_first()==int(sys.argv[2])",
+                    str(image),
+                    str(52 + len(version)),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     @unittest.skipUnless(shutil.which("zig"), "Zig compiler required")
     def test_private_engine_final_links_are_target_and_image_scoped(self):
@@ -488,7 +584,8 @@ antfly_error_code antfly_open_options_init(antfly_open_options *);
         source = self.root / "api.c"
         source.write_text("""
 #include "antfly.h"
-uint32_t antfly_abi_version(void) { return 1; }
+extern uint32_t release_value(void);
+uint32_t antfly_abi_version(void) { return release_value(); }
 int antfly_open_options_init(antfly_open_options *options) { options->size = sizeof(*options); return 0; }
 int antfly_private(void) { return 7; }
 int termite_metal_buffer_alloc(void) { return 8; }
@@ -497,6 +594,16 @@ int termite_metal_buffer_alloc(void) { return 8; }
         cc = shutil.which("clang") or shutil.which("cc")
         subprocess.run(
             [cc, "-fPIC", "-c", str(source), "-o", str(object_file)], check=True
+        )
+        # This final-image object is absent from the provider archive.
+        metadata_source = self.root / "metadata.c"
+        metadata_source.write_text(
+            "#include <stdint.h>\nuint32_t release_value(void) { return 1; }\n"
+        )
+        metadata_object = self.root / "metadata.o"
+        subprocess.run(
+            [cc, "-fPIC", "-c", str(metadata_source), "-o", str(metadata_object)],
+            check=True,
         )
         macho = platform.system() == "Darwin"
         fmt = "macho" if macho else "elf"
@@ -523,7 +630,8 @@ int termite_metal_buffer_alloc(void) { return 8; }
                     output=library,
                     map=self.root / "library.map",
                     archive=archive,
-                    link_args=[str(object_file)],
+                    objects=[metadata_object],
+                    link_args=[str(object_file), str(metadata_object)],
                 )
             )
             self.assertIn(
@@ -536,6 +644,7 @@ int termite_metal_buffer_alloc(void) { return 8; }
                     cc,
                     "-shared",
                     str(object_file),
+                    str(metadata_object),
                     "-Xlinker",
                     "--version-script",
                     "-Xlinker",

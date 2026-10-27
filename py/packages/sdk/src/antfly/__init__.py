@@ -136,12 +136,14 @@ from .index_config import (
     graph_index_sources,
     validate_create_index_request_relationships,
 )
+from .native_kv import NativeKvCheckpoint
 
 __version__ = "0.2.0"
 
 from .read_requirements import read_after_write
 
 __all__ = [
+    "NativeKvCheckpoint",
     "CurationOriginOrigin",
     "CurationProposalAction",
     "CurationProposalState",
@@ -317,3 +319,7 @@ __all__ += [
     "CurationProposalOperations",
     "EntityOperations",
 ]
+
+from .provenance import resource_reference, trace_event
+
+__all__ += ["resource_reference", "trace_event"]

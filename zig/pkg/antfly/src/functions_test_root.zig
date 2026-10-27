@@ -17,6 +17,8 @@ pub const storage_backend_erased = @import("antfly_local_sources").storage_backe
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 pub const antfly_sources = @import("source_owner_physical.zig");
 test {
+    _ = @import("antfly_local_sources").search_query_string;
+    _ = @import("antfly_local_sources").api_public_query_string;
     // Value-only filters must reach their helpers without compiling DB query
     // fixtures merely to discover their private test dependencies.
     _ = @import("antfly_local_sources").storage_db_query_search_exec;
@@ -183,4 +185,12 @@ test "api query contract conditional source projection preserves authorization-s
 
 test "api query contract conditional source spans preserve strict public wire semantics" {
     try @import("antfly_local_sources").api_query_contract.testing.expectConditionalSourceWireSpans();
+}
+
+test "decision provider shared Cloudflare extraction preserves exact numbers and measured usage" {
+    try @import("antfly_extracting").testCloudflareExtraction();
+}
+
+test "api query contract native scalar indexed array source receipt" {
+    try @import("antfly_local_sources").api_query_contract.testing.expectNativeScalarArraySource();
 }

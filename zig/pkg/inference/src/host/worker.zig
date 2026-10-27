@@ -20,6 +20,7 @@ const rpc = @import("antfly_inference_worker_rpc");
 pub const wire = @import("antfly_inference_worker_wire");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
+const document_abi = @import("antfly_runtime_abi").document_abi;
 const host = @import("host.zig");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
@@ -33,6 +34,34 @@ const ForwardControl = struct {
     stream: http.StreamSink = .{},
     stream_started: bool = false,
     body_source: http.RequestBodySource = .{},
+    borrowed_body: ?[]const u8 = null,
+    body_offset: usize = 0,
+    stream_body: bool = false,
+
+    fn readNativeBody(raw: ?*anyopaque, destination: []u8) !usize {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try check(self);
+        if (!self.stream_body) return error.BodySourceUnavailable;
+        if (destination.len == 0) return 0;
+        // Permit one extra byte only to distinguish EOF from an over-limit
+        // source. The request-scoped reader is joined before its owner exits.
+        const capacity = @min(destination.len, wire.native_checkpoint_upload_limit - self.body_offset + 1);
+        const count = if (self.borrowed_body) |body| borrowed: {
+            const n = @min(capacity, body.len - self.body_offset);
+            @memcpy(destination[0..n], body[self.body_offset..][0..n]);
+            break :borrowed n;
+        } else streamed: {
+            const read = self.body_source.read orelse break :streamed @as(usize, 0);
+            var n: usize = 0;
+            try callbackResult(read(self.body_source.context, destination.ptr, capacity, &n));
+            break :streamed n;
+        };
+        if (count > capacity) return error.InvalidBodyReadCount;
+        if (count > wire.native_checkpoint_upload_limit - self.body_offset) return error.BodyTooLarge;
+        self.body_offset += count;
+        try check(self);
+        return count;
+    }
 
     fn check(raw: ?*anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -72,7 +101,7 @@ const ForwardControl = struct {
         return count;
     }
     fn view(self: *@This()) rpc.Control {
-        return .{ .ptr = self, .check = check, .event = event, .read_body = if (self.body_source.read != null) readBody else null };
+        return .{ .ptr = self, .check = check, .event = event, .read_body = if (self.stream_body) readNativeBody else if (self.body_source.read != null) readBody else null };
     }
 };
 
@@ -103,7 +132,10 @@ pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeCont
         .progress = context.progress,
     };
     try ForwardControl.check(&control);
-    const input = try wire.ProviderInput.init(arena.allocator(), context);
+    const document_key = try client.registerDocumentStore(context.document_store);
+    defer if (document_key) |key| client.unregisterDocumentStore(key);
+    var input = try wire.ProviderInput.init(arena.allocator(), context);
+    input.options.document_store = document_key;
     const data = try std.json.Stringify.valueAlloc(arena.allocator(), input.options, .{});
     const response = try client.invokePayload(.provider, data, .{ .body_segments = input.body.segments }, control.view());
     defer response.deinit();
@@ -126,11 +158,20 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
     // than retaining every decoded frame in the request arena.
     var control = ForwardControl{ .alloc = client.alloc, .cancellation = context.cancellation, .stream = context.stream, .body_source = context.body_source };
     try ForwardControl.check(&control);
+    const stream_body = wire.nativeCheckpointResume(context.request.method, route) and
+        wire.nativeCheckpointResume(context.request.method, context.request.path.slice());
     var body = context.request.body;
     const streaming_body = context.body_source.streaming != 0 and context.body_source.read != null and
         std.mem.endsWith(u8, context.request.path.slice(), "/stream") and
         std.mem.indexOf(u8, context.request.path.slice(), "/transcription/sessions/") != null;
-    if (!streaming_body and body.slice() == null) if (context.body_source.read_all) |read| {
+    if (stream_body) {
+        if (body.slice() == null and context.body_source.read == null and context.body_source.read_all != null)
+            return error.StreamingUnavailable;
+        control.stream_body = true;
+        control.body_source = context.body_source;
+        control.borrowed_body = body.slice();
+        body = .{};
+    } else if (!streaming_body and body.slice() == null) if (context.body_source.read_all) |read| {
         try callbackResult(read(context.body_source.context, &body));
     };
     const headers = try alloc.alloc(wire.Header, context.request.headers_len);
@@ -139,7 +180,10 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
     const params = try alloc.alloc(wire.Header, context.request.params_len);
     const source_params = if (context.request.params_ptr) |ptr| ptr[0..context.request.params_len] else &.{};
     for (source_params, params) |param, *out| out.* = .{ .name = param.name.slice(), .value = param.value.slice() };
+    const document_key = try client.registerDocumentStore(context.document_store);
+    defer if (document_key) |key| client.unregisterDocumentStore(key);
     const data = try std.json.Stringify.valueAlloc(alloc, wire.Http{
+        .document_store = document_key,
         .route = route,
         .method = context.request.method,
         .path = context.request.path.slice(),
@@ -147,6 +191,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
         .headers = headers,
         .params = params,
         .has_body = body.slice() != null,
+        .stream_body = stream_body,
         .streaming_body = streaming_body,
     }, .{});
     const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
@@ -199,6 +244,37 @@ pub const Client = struct {
     active: usize = 0,
     generation: u64 = 0,
     budget: ?bridge.ResourceBudget = null,
+    document_mutex: std.Io.Mutex = .init,
+    document_bindings: std.AutoHashMapUnmanaged([16]u8, bridge.DocumentStoreView) = .empty,
+
+    fn registerDocumentStore(self: *Client, view: bridge.DocumentStoreView) !?[16]u8 {
+        if (view.context == null) return null;
+        try view.retain();
+        errdefer view.release();
+        self.document_mutex.lockUncancelable(self.io);
+        defer self.document_mutex.unlock(self.io);
+        if (self.document_bindings.count() >= 128) return error.ResourceLimitExceeded;
+        var key: [16]u8 = undefined;
+        while (true) {
+            try self.io.randomSecure(&key);
+            if (!self.document_bindings.contains(key)) break;
+        }
+        try self.document_bindings.put(self.alloc, key, view);
+        return key;
+    }
+    fn unregisterDocumentStore(self: *Client, key: [16]u8) void {
+        self.document_mutex.lockUncancelable(self.io);
+        const entry = self.document_bindings.fetchRemove(key);
+        self.document_mutex.unlock(self.io);
+        if (entry) |removed| removed.value.release();
+    }
+    fn borrowDocumentStore(self: *Client, key: [16]u8) !bridge.DocumentStoreView {
+        self.document_mutex.lockUncancelable(self.io);
+        defer self.document_mutex.unlock(self.io);
+        const view = self.document_bindings.get(key) orelse return error.DocumentRunLeaseLost;
+        try view.retain();
+        return view;
+    }
 
     pub fn create(alloc: std.mem.Allocator, io: std.Io, context: *const bridge.CreateContext) !*Client {
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -231,6 +307,8 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         std.debug.assert(self.active == 0);
+        std.debug.assert(self.document_bindings.count() == 0);
+        self.document_bindings.deinit(self.alloc);
         if (self.worker) |worker| worker.destroy();
         if (self.budget) |budget| budget.release_context(budget.context);
         self.alloc.free(self.create_json);
@@ -273,7 +351,7 @@ pub const Client = struct {
                 .input = child.stdout.?,
                 .output = child.stdin.?,
                 .context = worker,
-                .handler = Worker.rejectRequest,
+                .handler = Worker.documentRequest,
                 .resource_handler = Worker.resourceRequest,
                 .on_closed = Worker.closed,
                 .next_id = 1,
@@ -494,8 +572,19 @@ const Worker = struct {
         self.observations = .empty;
     }
 
-    fn rejectRequest(_: *anyopaque, _: *rpc.Request) !rpc.OwnedPayload {
-        return error.UnsupportedOperation;
+    fn documentRequest(raw: *anyopaque, request: *rpc.Request) !rpc.OwnedPayload {
+        const self: *Worker = @ptrCast(@alignCast(raw));
+        var arena = std.heap.ArenaAllocator.init(self.owner.alloc);
+        defer arena.deinit();
+        const envelope = try requestEnvelope(arena.allocator(), request);
+        if (envelope.operation != .document_store) return error.UnsupportedOperation;
+        const incoming = try std.json.parseFromSliceLeaky(wire.DocumentStoreRequest, arena.allocator(), envelope.options, .{});
+        const view = self.owner.borrowDocumentStore(incoming.capability) catch |err| return reply(&self.endpoint, bridge.statusFromError(err), "", "");
+        defer view.release();
+        var result: document_abi.Response = .{};
+        const status = view.invoke.?(view.context.?, .init(incoming.metadata), .init(envelope.data), &result);
+        defer view.destroy(result);
+        return reply(&self.endpoint, status, result.metadata.slice(), result.body.slice());
     }
 
     fn resourceRequest(raw: *anyopaque, bytes: []const u8) !rpc.ResourceReply {
@@ -571,6 +660,44 @@ const Worker = struct {
             else => return error.UnsupportedOperation,
         }
         return 0;
+    }
+};
+
+const NativeHttpBody = struct {
+    request: *rpc.Request,
+    buffer: [rpc.max_frame_bytes]u8 = undefined,
+    offset: usize = 0,
+    len: usize = 0,
+    received: usize = 0,
+    failed: ?http.CallbackStatus = null,
+
+    fn read(raw: ?*anyopaque, destination: [*]u8, capacity: usize, out_count: *usize) callconv(.c) http.CallbackStatus {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
+        out_count.* = 0;
+        if (self.failed) |failure| return failure;
+        if (self.request.cancelled.load(.acquire)) return .canceled;
+        if (capacity == 0) return .ok;
+        if (self.offset == self.len) {
+            self.len = self.request.readBody(&self.buffer) catch |err| {
+                self.failed = switch (err) {
+                    error.Cancelled, error.Canceled => .canceled,
+                    error.Timeout => .timeout,
+                    else => .failed,
+                };
+                return self.failed.?;
+            };
+            self.offset = 0;
+            if (self.len > wire.native_checkpoint_upload_limit - self.received) {
+                self.failed = .body_too_large;
+                return .body_too_large;
+            }
+            self.received += self.len;
+        }
+        const count = @min(capacity, self.len - self.offset);
+        @memcpy(destination[0..count], self.buffer[self.offset..][0..count]);
+        self.offset += count;
+        out_count.* = count;
+        return .ok;
     }
 };
 
@@ -667,6 +794,8 @@ const Child = struct {
                     if (source.attachment_index >= payloads.len) return error.InvalidInput;
                     ref.* = .{ .attachment_index = source.attachment_index, .item_index = source.item_index, .item_id = .init(source.item_id), .source_fingerprint = .init(source.source_fingerprint), .page_number = source.page_number orelse 0, .has_page_number = @intFromBool(source.page_number != null) };
                 }
+                const documents = if (provider.document_store) |key| try ForwardDocuments.create(self, key) else null;
+                defer if (documents) |binding| binding.view().release();
                 var response_handle: ?*anyopaque = null;
                 var response: bridge.String = undefined;
                 var numeric: bridge.NumericResult = .{};
@@ -687,6 +816,7 @@ const Child = struct {
                     .attachment_refs_len = refs.len,
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
                     .progress = .{ .context = request, .update_progress = progress },
+                    .document_store = if (documents) |binding| binding.view() else .{},
                 });
                 if (numeric.kind != .absent) {
                     const output = try wire.ProviderOutput.encode(arena, numeric);
@@ -696,6 +826,10 @@ const Child = struct {
             },
             .http => {
                 const incoming = try std.json.parseFromSliceLeaky(wire.Http, arena, envelope.options, .{});
+                if (incoming.stream_body and (incoming.has_body or envelope.data.len != 0 or
+                    !wire.nativeCheckpointResume(incoming.method, incoming.route) or
+                    !wire.nativeCheckpointResume(incoming.method, incoming.path))) return error.InvalidInput;
+                var streamed_body: NativeHttpBody = .{ .request = request };
                 // Route identity, not an ordinal: replacing the executable
                 // must never redirect a request to a different handler.
                 const route_handle = found: {
@@ -720,6 +854,8 @@ const Child = struct {
                     .params_len = params.len,
                     .body = .init(body),
                 };
+                const documents = if (incoming.document_store) |key| try ForwardDocuments.create(self, key) else null;
+                defer if (documents) |binding| binding.view().release();
                 var response_handle: ?*anyopaque = null;
                 var response: http.HttpResponseView = undefined;
                 defer if (response_handle) |handle| host.linkedInferenceDestroyHttpResponse(handle);
@@ -727,8 +863,9 @@ const Child = struct {
                     .abi_version = bridge.abi_version,
                     .route_handle = route_handle,
                     .request = &view,
+                    .document_store = if (documents) |binding| binding.view() else .{},
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
-                    .body_source = if (incoming.streaming_body) .{ .context = request, .streaming = 1, .read = readBody, .read_all = readAllBody } else .{},
+                    .body_source = if (incoming.stream_body) .{ .context = &streamed_body, .read = NativeHttpBody.read, .streaming = 1 } else if (incoming.streaming_body) .{ .context = request, .streaming = 1, .read = readBody, .read_all = readAllBody } else .{},
                     .stream = .{ .context = request, .start = streamStart, .write = streamWrite, .close = streamClose },
                     .out_response_handle = &response_handle,
                     .out_response = &response,
@@ -994,7 +1131,7 @@ test "inference worker retains reservations until reaped cleanup and owns partia
     var worker: Worker = .{
         .owner = &client,
         .child = undefined,
-        .endpoint = .{ .alloc = alloc, .io = std.testing.io, .input = undefined, .output = undefined, .context = undefined, .handler = Worker.rejectRequest, .resource_handler = Worker.resourceRequest, .on_closed = Worker.closed, .next_id = 1 },
+        .endpoint = .{ .alloc = alloc, .io = std.testing.io, .input = undefined, .output = undefined, .context = undefined, .handler = Worker.documentRequest, .resource_handler = Worker.resourceRequest, .on_closed = Worker.closed, .next_id = 1 },
     };
     defer worker.releaseResources();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1119,4 +1256,227 @@ test "inference worker resource replies distinguish denials from ownership uncer
     try std.testing.expectError(error.InvalidResourceReply, validateResourceReply(.retain, .{ .detail = 999 }));
     const failure = bridge.statusFromError(error.OutOfMemory);
     try std.testing.expectError(error.InvalidResourceReply, validateResourceReply(.reserve, .{ .code = failure.code, .detail = failure.detail }));
+}
+
+/// No borrowed root-request pointer enters this retained forwarding context.
+/// Structured inference work drains before the root call returns; cancellation
+/// may invalidate its parent capability while an already-borrowed call finishes.
+const ForwardDocuments = struct {
+    child: *Child,
+    key: [16]u8,
+    references: std.atomic.Value(usize) = .init(1),
+    fn create(child: *Child, key: [16]u8) !*ForwardDocuments {
+        const self = try child.alloc.create(ForwardDocuments);
+        self.* = .{ .child = child, .key = key };
+        return self;
+    }
+    fn view(self: *ForwardDocuments) bridge.DocumentStoreView {
+        return .{ .context = self, .retain_context = retain, .release_context = release, .invoke = invoke, .destroy_response = destroyResponse };
+    }
+    fn retain(raw: *anyopaque) callconv(.c) u8 {
+        const self: *ForwardDocuments = @ptrCast(@alignCast(raw));
+        _ = self.references.fetchAdd(1, .monotonic);
+        return 1;
+    }
+    fn release(raw: *anyopaque) callconv(.c) void {
+        const self: *ForwardDocuments = @ptrCast(@alignCast(raw));
+        if (self.references.fetchSub(1, .acq_rel) == 1) self.child.alloc.destroy(self);
+    }
+    const Response = struct { payload: rpc.OwnedPayload, parsed: std.json.Parsed(wire.Reply) };
+    fn invoke(raw: *anyopaque, metadata: http.Bytes, body: http.Bytes, out: *document_abi.Response) callconv(.c) bridge.Status {
+        const self: *ForwardDocuments = @ptrCast(@alignCast(raw));
+        out.* = .{};
+        self.call(metadata.slice(), body.slice(), out) catch |err| return bridge.statusFromErrorWithFallback(err, error.InferenceWorkerUnavailable);
+        return .ok;
+    }
+    fn call(self: *ForwardDocuments, metadata: []const u8, body: []const u8, out: *document_abi.Response) !void {
+        const a = self.child.alloc;
+        const options = try std.json.Stringify.valueAlloc(a, wire.DocumentStoreRequest{ .capability = self.key, .metadata = metadata }, .{});
+        defer a.free(options);
+        const payload = try callSegments(&self.child.endpoint, .document_store, options, .{ .body = body }, .{});
+        errdefer payload.deinit();
+        var parsed = try std.json.parseFromSlice(wire.Reply, a, payload.view().metadata, .{});
+        errdefer parsed.deinit();
+        const response = try a.create(Response);
+        response.* = .{ .payload = payload, .parsed = parsed };
+        _ = retain(self);
+        out.* = .{ .handle = response, .metadata = .init(parsed.value.options), .body = .init(payload.view().body) };
+    }
+    fn destroyResponse(raw: *anyopaque, handle: *anyopaque) callconv(.c) void {
+        const self: *ForwardDocuments = @ptrCast(@alignCast(raw));
+        const response: *Response = @ptrCast(@alignCast(handle));
+        response.parsed.deinit();
+        response.payload.deinit();
+        self.child.alloc.destroy(response);
+        release(raw);
+    }
+};
+
+test "inference worker document capabilities revoke new borrows while preserving in-flight ownership" {
+    const Owner = struct {
+        references: usize = 1,
+        fn retain(raw: *anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return 1;
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn invoke(_: *anyopaque, metadata: http.Bytes, body: http.Bytes, out: *document_abi.Response) callconv(.c) bridge.Status {
+            out.* = .{ .metadata = metadata, .body = body };
+            return .ok;
+        }
+        fn destroy(_: *anyopaque, _: *anyopaque) callconv(.c) void {}
+    };
+    var owner = Owner{};
+    var client = Client{ .alloc = std.testing.allocator, .io = std.testing.io, .create_json = undefined, .environment = undefined };
+    defer client.document_bindings.deinit(std.testing.allocator);
+    const view: bridge.DocumentStoreView = .{ .context = &owner, .retain_context = Owner.retain, .release_context = Owner.release, .invoke = Owner.invoke, .destroy_response = Owner.destroy };
+    const token = (try client.registerDocumentStore(view)).?;
+    const active = try client.borrowDocumentStore(token);
+    try std.testing.expectEqual(@as(usize, 3), owner.references);
+    client.unregisterDocumentStore(token);
+    try std.testing.expectError(error.DocumentRunLeaseLost, client.borrowDocumentStore(token));
+    try std.testing.expectEqual(@as(usize, 2), owner.references);
+    var response: document_abi.Response = .{};
+    const status = active.invoke.?(active.context.?, .init("metadata"), .init("raw checkpoint bytes"), &response);
+    try std.testing.expect(status.isOk());
+    try std.testing.expectEqualStrings("raw checkpoint bytes", response.body.slice());
+    active.destroy(response);
+    active.release();
+    try std.testing.expectEqual(@as(usize, 1), owner.references);
+    Owner.release(&owner);
+    try std.testing.expectEqual(@as(usize, 0), owner.references);
+}
+
+test "native checkpoint worker upload honors cancellation counts and cumulative ceiling" {
+    const Source = struct {
+        calls: usize = 0,
+        fail: http.CallbackStatus = .ok,
+        oversized: bool = false,
+        fn read(raw: ?*anyopaque, destination: [*]u8, capacity: usize, count: *usize) callconv(.c) http.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.fail != .ok) return self.fail;
+            count.* = if (self.oversized) capacity + 1 else @min(capacity, 7);
+            if (!self.oversized) @memset(destination[0..count.*], 42);
+            return .ok;
+        }
+        fn canceled(_: ?*const anyopaque) callconv(.c) u8 {
+            return 1;
+        }
+    };
+    var source: Source = .{};
+    var control: ForwardControl = .{ .alloc = std.testing.allocator, .cancellation = .{}, .stream_body = true, .body_source = .{ .context = &source, .read = Source.read, .streaming = 1 } };
+    var buffer: [10]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 7), try control.view().read_body.?(&control, &buffer));
+    source.oversized = true;
+    try std.testing.expectError(error.InvalidBodyReadCount, control.view().read_body.?(&control, &buffer));
+    try std.testing.expectEqual(@as(usize, 7), control.body_offset);
+    source.oversized = false;
+    control.body_offset = wire.native_checkpoint_upload_limit;
+    try std.testing.expectError(error.BodyTooLarge, control.view().read_body.?(&control, &buffer));
+    control.body_offset = 0;
+    source.fail = .timeout;
+    try std.testing.expectError(error.Timeout, control.view().read_body.?(&control, &buffer));
+    control.cancellation = .{ .is_cancelled = Source.canceled };
+    const calls = source.calls;
+    try std.testing.expectError(error.Cancelled, control.view().read_body.?(&control, &buffer));
+    try std.testing.expectEqual(calls, source.calls);
+    control.cancellation = .{};
+    control.borrowed_body = "checkpoint";
+    try std.testing.expectEqual(@as(usize, 10), try control.view().read_body.?(&control, &buffer));
+    try std.testing.expectEqualStrings("checkpoint", &buffer);
+    try std.testing.expectEqual(@as(usize, 0), try control.view().read_body.?(&control, &buffer));
+    try std.testing.expectEqual(calls, source.calls);
+}
+
+test "inference worker checkpoint upload feeds incremental HTTP reads and recovers after cancellation" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const Fixture = struct {
+        parent: rpc.Endpoint = undefined,
+        child: rpc.Endpoint = undefined,
+        files: [4]std.Io.File = undefined,
+        remaining: usize = 0,
+        sent: usize = 0,
+        calls: usize = 0,
+        cancel_after: usize = std.math.maxInt(usize),
+        fn closed(_: *anyopaque) void {}
+        fn reject(_: *anyopaque, _: *rpc.Request) !rpc.OwnedPayload {
+            return error.UnexpectedRequest;
+        }
+        fn read(raw: ?*anyopaque, destination: [*]u8, capacity: usize, count: *usize) callconv(.c) http.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.calls >= self.cancel_after) return .canceled;
+            self.calls += 1;
+            const n = @min(self.remaining, capacity, if (self.calls == 2) @as(usize, 7) else capacity);
+            for (destination[0..n], 0..) |*byte, index| byte.* = @truncate((self.sent + index) *% 31);
+            count.* = n;
+            self.remaining -= n;
+            self.sent += n;
+            return .ok;
+        }
+        fn consume(_: *anyopaque, request: *rpc.Request) !rpc.OwnedPayload {
+            var body: NativeHttpBody = .{ .request = request };
+            var buffer: [4093]u8 = undefined;
+            var total: usize = 0;
+            while (true) {
+                const capacity: usize = if (total == 0) 1 else if (total == 1) 3 else buffer.len;
+                var n: usize = 0;
+                try callbackResult(NativeHttpBody.read(&body, &buffer, capacity, &n));
+                if (n == 0) break;
+                if (n > capacity) return error.InvalidBodyReadCount;
+                for (buffer[0..n], 0..) |byte, index|
+                    if (byte != @as(u8, @truncate((total + index) *% 31))) return error.BodyContentMismatch;
+                total += n;
+            }
+            var eof_count: usize = 99;
+            try callbackResult(NativeHttpBody.read(&body, &buffer, buffer.len, &eof_count));
+            if (eof_count != 0) return error.BodyContentAfterEof;
+            var result: [8]u8 = undefined;
+            std.mem.writeInt(u64, &result, total, .little);
+            return request.endpoint.copyPayload(.{ .body = &result });
+        }
+        fn reset(self: *@This(), bytes: usize, cancel_after: usize) void {
+            self.remaining = bytes;
+            self.sent = 0;
+            self.calls = 0;
+            self.cancel_after = cancel_after;
+        }
+        fn run(self: *@This()) !rpc.OwnedPayload {
+            var control: ForwardControl = .{
+                .alloc = std.testing.allocator,
+                .cancellation = .{},
+                .stream_body = true,
+                .body_source = .{ .context = self, .read = read, .streaming = 1 },
+            };
+            return self.parent.call(.{}, control.view());
+        }
+    };
+    var fixture: Fixture = .{};
+    const up = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    const down = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    for (up ++ down, &fixture.files) |fd, *file| file.* = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    defer for (fixture.files) |file| file.close(std.testing.io);
+    fixture.parent = .{ .alloc = std.testing.allocator, .io = std.testing.io, .input = fixture.files[0], .output = fixture.files[3], .context = &fixture, .handler = Fixture.reject, .on_closed = Fixture.closed, .next_id = 1 };
+    fixture.child = .{ .alloc = std.testing.allocator, .io = std.testing.io, .input = fixture.files[2], .output = fixture.files[1], .context = &fixture, .handler = Fixture.consume, .on_closed = Fixture.closed, .next_id = 2 };
+    try fixture.parent.start();
+    defer fixture.parent.deinit();
+    try fixture.child.start();
+    defer fixture.child.deinit();
+    fixture.reset(rpc.max_body_bytes + 19, std.math.maxInt(usize));
+    const large = try fixture.run();
+    defer large.deinit();
+    try std.testing.expectEqual(@as(u64, rpc.max_body_bytes + 19), std.mem.readInt(u64, large.view().body[0..8], .little));
+    try std.testing.expect(fixture.calls > 1024);
+    fixture.reset(1024 * 1024, 2);
+    try std.testing.expectError(error.Cancelled, fixture.run());
+    fixture.reset(100123, std.math.maxInt(usize));
+    const recovery = try fixture.run();
+    defer recovery.deinit();
+    try std.testing.expectEqual(@as(u64, 100123), std.mem.readInt(u64, recovery.view().body[0..8], .little));
+    try std.testing.expect(!fixture.parent.closed.load(.acquire));
+    try std.testing.expect(!fixture.child.closed.load(.acquire));
 }

@@ -49,7 +49,8 @@ pub fn isInteractiveGeneratePath(path: []const u8) bool {
         if (std.mem.eql(u8, suffix, "/decisions") or
             std.mem.eql(u8, suffix, "/generate") or
             std.mem.eql(u8, suffix, "/generate/batch") or
-            std.mem.eql(u8, suffix, "/chat/completions")) return true;
+            std.mem.eql(u8, suffix, "/chat/completions") or
+            std.mem.eql(u8, suffix, "/generate/context/prepare")) return true;
     }
     return false;
 }
@@ -547,10 +548,12 @@ pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) i
         .model_capabilities_with_context = inferenceProviderModelCapabilitiesWithContext,
         .chunk_input = inferenceProviderChunkInput,
         .chunk_input_with_context = inferenceProviderChunkInputWithContext,
+        .chunk_page_with_context = inferenceProviderChunkPageWithContext,
         .rewrite_texts = inferenceProviderRewriteTexts,
         .classify_texts = inferenceProviderClassifyTexts,
         .generate_json = inferenceProviderGenerateJson,
         .decide_json = inferenceProviderDecideJson,
+        .document_json = inferenceProviderDocumentJson,
         .read_images = inferenceProviderReadImages,
         .read_images_with_context = inferenceProviderReadImagesWithContext,
         .read_encoded_images = inferenceProviderReadEncodedImages,
@@ -678,6 +681,7 @@ pub fn invokeInferenceProviderWithBinaryContext(
             .{ .context = &request_context, .is_cancelled = RequestCancellation.requested }
         else
             .{},
+        .document_store = if (request_context) |active| active.document_store else .{},
         .progress = if (request_context != null and request_context.?.progress != null)
             .{ .context = @constCast(&request_context), .update_progress = RequestProgress.update }
         else
@@ -709,6 +713,9 @@ pub fn invokeInferenceProviderWithBinaryContext(
                 return rows[0];
             }
         }
+    }
+    if (comptime Result == []u8) {
+        if (operation == .document_read or operation == .document_extract) return alloc.dupe(u8, response_json.slice());
     }
     return try std.json.parseFromSliceLeaky(Result, alloc, response_json.slice(), .{
         .allocate = .alloc_always,
@@ -871,6 +878,7 @@ fn invokeLocalInferenceRoute(
         .request = &request,
         .cancellation = lifetime.cancellation(),
         .body_source = context.body_source,
+        .document_store = context.document_store,
         .stream = context.stream,
         .out_response_handle = &response_handle,
         .out_response = &response_view,
@@ -981,6 +989,7 @@ pub fn inferenceProviderEmbedDenseTextsWithContext(
         .texts = texts,
         .task_type = context.task_type.canonical(),
         .model_identity = context.model_identity,
+        .model_revision = context.model_revision,
         .dimensions = context.dimensions,
         .instruction = context.instruction,
     }, context.request.deadline_ns, context.request.cancellation orelse .none);
@@ -1496,8 +1505,36 @@ pub fn inferenceProviderChunkInputControlled(
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) anyerror![]inference_chunker.Chunk {
+    return inferenceProviderChunkControlled([]inference_chunker.Chunk, handle, alloc, model, input, config, deadline_ns, cancellation);
+}
+
+pub fn inferenceProviderChunkPageWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    context: inference.execution_context.RequestContext,
+) anyerror!inference_chunker.types.ChunkPage {
+    try context.check();
+    var result = try inferenceProviderChunkControlled(inference_chunker.types.ChunkPage, handle, alloc, model, input, config, context.deadline_ns, context.cancellation orelse .none);
+    errdefer result.deinit(alloc);
+    try context.check();
+    return result;
+}
+
+fn inferenceProviderChunkControlled(
+    comptime Result: type,
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    deadline_ns: ?u64,
+    cancellation: CancellationToken,
+) anyerror!Result {
     return switch (input) {
-        .text, .source => try invokeInferenceProviderControlled([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
+        .text, .source => try invokeInferenceProviderControlled(Result, alloc, handle, .chunk_input, .{
             .model = model,
             .input = input,
             .config = config,
@@ -1510,7 +1547,7 @@ pub fn inferenceProviderChunkInputControlled(
             }};
             const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0, .item_index = 0 }};
             break :blk try invokeInferenceProviderWithBinaryControlled(
-                []inference_chunker.Chunk,
+                Result,
                 alloc,
                 handle,
                 .chunk_input,
@@ -1973,4 +2010,14 @@ pub fn inferenceProviderListModelsJson(
     alloc: std.mem.Allocator,
 ) anyerror![]u8 {
     return try invokeInferenceProvider([]u8, alloc, handle, .list_models_json, .{}, null);
+}
+
+fn inferenceProviderDocumentJson(ptr: *anyopaque, a: std.mem.Allocator, bytes: []const u8, extract: bool, context: inference.RequestContext) ![]u8 {
+    const Raw = struct {
+        bytes: []const u8,
+        pub fn jsonStringify(self: @This(), stream: anytype) !void {
+            try stream.print("{s}", .{self.bytes});
+        }
+    };
+    return invokeInferenceProvider([]u8, a, ptr, if (extract) .document_extract else .document_read, Raw{ .bytes = bytes }, context);
 }

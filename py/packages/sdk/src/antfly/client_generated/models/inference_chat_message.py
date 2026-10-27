@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.image_url_content_part import ImageURLContentPart
+    from ..models.inference_chat_message_extra_content import InferenceChatMessageExtraContent
     from ..models.media_content_part import MediaContentPart
     from ..models.text_content_part import TextContentPart
     from ..models.tool_call import ToolCall
@@ -23,7 +24,9 @@ T = TypeVar("T", bound="InferenceChatMessage")
 class InferenceChatMessage:
     """
     Attributes:
-        role (InferenceRole): Role of the message sender in a generation/chat conversation
+        role (InferenceRole): Chat message role, including developer instructions preserved by context management.
+        extra_content (InferenceChatMessageExtraContent | Unset): Opaque provider message metadata. Preserve unchanged
+            when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset): Message content.
             Supports two formats:
             - Simple string: "Hello, how are you?"
@@ -33,6 +36,7 @@ class InferenceChatMessage:
     """
 
     role: InferenceRole
+    extra_content: InferenceChatMessageExtraContent | Unset = UNSET
     content: list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset = UNSET
     tool_calls: list[ToolCall] | Unset = UNSET
     tool_call_id: str | Unset = UNSET
@@ -43,6 +47,10 @@ class InferenceChatMessage:
         from ..models.text_content_part import TextContentPart
 
         role = self.role.value
+
+        extra_content: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.extra_content, Unset):
+            extra_content = self.extra_content.to_dict()
 
         content: list[dict[str, Any]] | str | Unset
         if isinstance(self.content, Unset):
@@ -85,6 +93,8 @@ class InferenceChatMessage:
                 "role": role,
             }
         )
+        if extra_content is not UNSET:
+            field_dict["extra_content"] = extra_content
         if content is not UNSET:
             field_dict["content"] = content
         if tool_calls is not UNSET:
@@ -97,12 +107,20 @@ class InferenceChatMessage:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.inference_chat_message_extra_content import InferenceChatMessageExtraContent
         from ..models.media_content_part import MediaContentPart
         from ..models.text_content_part import TextContentPart
         from ..models.tool_call import ToolCall
 
         d = dict(src_dict)
         role = InferenceRole(d.pop("role"))
+
+        _extra_content = d.pop("extra_content", UNSET)
+        extra_content: InferenceChatMessageExtraContent | Unset
+        if isinstance(_extra_content, Unset):
+            extra_content = UNSET
+        else:
+            extra_content = InferenceChatMessageExtraContent.from_dict(_extra_content)
 
         def _parse_content(
             data: object,
@@ -173,6 +191,7 @@ class InferenceChatMessage:
 
         inference_chat_message = cls(
             role=role,
+            extra_content=extra_content,
             content=content,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,

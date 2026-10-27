@@ -11,9 +11,15 @@ from antfly.client_generated.models import (
     ChunkEmbeddingObject,
     ChunkEmbeddingResponse,
     InferenceChatMessage,
+    InferenceContextDiagnostics,
+    InferenceContextManagement,
+    InferenceContextManagementMode,
+    InferenceContextPrepareRequest,
     InferenceGenerateChatTemplateKwargs,
     InferenceGenerateRequest,
     InferenceRole,
+    InferenceTextRegion,
+    InferenceToolChoiceType0,
 )
 
 
@@ -43,6 +49,63 @@ def test_generate_request_preserves_explicit_thinking_false() -> None:
     request = generation_request()
     request.chat_template_kwargs = InferenceGenerateChatTemplateKwargs(enable_thinking=False)
     assert request.to_dict()["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_context_and_generation_requests_preserve_developer_role() -> None:
+    wire = {
+        "model": "gemma",
+        "messages": [
+            {"role": "developer", "content": "Preserve these instructions."},
+            {"role": "user", "content": "hello"},
+        ],
+    }
+    for request_type in (InferenceContextPrepareRequest, InferenceGenerateRequest):
+        request = request_type.from_dict(wire)
+        assert request.messages[0].role == InferenceRole.DEVELOPER
+        assert request.to_dict()["messages"] == wire["messages"]
+
+
+def test_prepare_chat_context_forwards_typed_request_and_parses_diagnostics() -> None:
+    captured: list[dict[str, object]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.read()))
+        return httpx.Response(
+            200,
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "context": {
+                    "policy": "inspect",
+                    "applied": False,
+                    "original_input_tokens": 4,
+                    "effective_input_tokens": 4,
+                    "target_input_tokens": 128,
+                    "reserved_output_tokens": 16,
+                    "dropped_messages": 0,
+                    "retained_messages": 1,
+                    "retained_from_message": 0,
+                    "checkpoint_applied": False,
+                    "windowed": False,
+                    "compacted": False,
+                    "tool_results": [],
+                },
+                "usage": {"prompt_tokens": 4, "completion_tokens": 0, "total_tokens": 4},
+            },
+        )
+
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(handle))
+    request = InferenceContextPrepareRequest(
+        model="gemma",
+        messages=generation_request().messages,
+        max_tokens=16,
+        tool_choice=InferenceToolChoiceType0.NONE,
+        chat_template_kwargs=InferenceGenerateChatTemplateKwargs(enable_thinking=False),
+    )
+    response = client.prepare_chat_context(request)
+    assert response.context.effective_input_tokens == 4
+    assert captured == [request.to_dict()]
+    assert response.context.tool_results == []
 
 
 def install_transport(client: AntflyClient, handler: httpx.MockTransport) -> None:
@@ -95,6 +158,134 @@ def test_generate_and_stream_reuse_auth_and_parse_framed_sse() -> None:
         {**generation_request().to_dict(), "stream": False},
         {**generation_request().to_dict(), "stream": True},
     ]
+
+
+def test_managed_generation_requires_and_preserves_context_attestation() -> None:
+    request = generation_request()
+    request.context_management = InferenceContextManagement(mode=InferenceContextManagementMode.REJECT)
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "id": "missing",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gemma",
+                    "choices": [],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "id": "wrong-policy",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gemma",
+                    "choices": [],
+                    "context": {
+                        "policy": "window",
+                        "applied": False,
+                        "original_input_tokens": 1,
+                        "effective_input_tokens": 1,
+                        "target_input_tokens": 8,
+                        "reserved_output_tokens": 1,
+                        "dropped_messages": 0,
+                        "retained_messages": 1,
+                        "retained_from_message": 0,
+                        "checkpoint_applied": False,
+                        "windowed": False,
+                        "compacted": False,
+                    },
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1},
+                },
+            ),
+            httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=(
+                    b'data: {"id":"managed","object":"chat.completion.chunk","created":1,'
+                    b'"model":"gemma","choices":[],"context":{"policy":"reject",'
+                    b'"applied":false,"original_input_tokens":1,"effective_input_tokens":1,'
+                    b'"target_input_tokens":8,"reserved_output_tokens":1,"dropped_messages":0,'
+                    b'"retained_messages":1,"retained_from_message":0,"checkpoint_applied":false,'
+                    b'"windowed":false,"compacted":false}}\n\ndata: [DONE]\n\n'
+                ),
+            ),
+        ]
+    )
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(lambda _: next(responses)))
+
+    with pytest.raises(AntflyException, match="did not attest"):
+        client.generate(request)
+    with pytest.raises(AntflyException, match="different context policy"):
+        client.generate(request)
+    with client.generate_stream(request) as chunks:
+        chunk = next(chunks)
+        assert isinstance(chunk.context, InferenceContextDiagnostics)
+        assert chunk.context.policy.value == "reject"
+        with pytest.raises(StopIteration):
+            next(chunks)
+
+
+@pytest.mark.parametrize("policy", ["context_management", "kv_cache", "both"])
+@pytest.mark.parametrize("attest", [True, False])
+def test_managed_stream_accepts_role_and_content_only_after_attestation(policy: str, attest: bool) -> None:
+    wire = generation_request().to_dict()
+    if policy in ("context_management", "both"):
+        wire["context_management"] = {"mode": "reject"}
+    if policy in ("kv_cache", "both"):
+        wire["kv_cache"] = {"mode": "exact_hybrid", "version": "v1"}
+    request = InferenceGenerateRequest.from_dict(wire)
+    envelope = {"id": "managed", "object": "chat.completion.chunk", "created": 1, "model": "gemma"}
+    diagnostics = {
+        "policy": "reject",
+        "applied": False,
+        "original_input_tokens": 1,
+        "effective_input_tokens": 1,
+        "target_input_tokens": 8,
+        "reserved_output_tokens": 1,
+        "dropped_messages": 0,
+        "retained_messages": 1,
+        "retained_from_message": 0,
+        "checkpoint_applied": False,
+        "windowed": False,
+        "compacted": False,
+        "kv_cache_mode": "exact_hybrid",
+        "kv_cache_version": "v1",
+    }
+    events = [{**envelope, "choices": [], "context": diagnostics}] if attest else []
+    events += [
+        {**envelope, "choices": [{"index": 0, "delta": {"role": "assistant"}}]},
+        {**envelope, "choices": [{"index": 0, "delta": {"content": "hello"}}]},
+    ]
+    stream = ChunkStream([*(f"data: {json.dumps(event)}\n\n".encode() for event in events), b"data: [DONE]\n\n"])
+    client = AntflyClient("http://test")
+    install_transport(
+        client,
+        httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=stream,
+            )
+        ),
+    )
+    if attest:
+        with client.generate_stream(request) as chunks:
+            received = list(chunks)
+        assert isinstance(received[0].context, InferenceContextDiagnostics)
+        assert received[0].context.policy.value == "reject"
+        assert isinstance(received[1].choices[0].delta.role, InferenceRole)
+        assert received[1].choices[0].delta.role.value == "assistant"
+        assert received[2].choices[0].delta.content == "hello"
+    else:
+        with pytest.raises(AntflyException, match="before attesting"):
+            with client.generate_stream(request) as chunks:
+                list(chunks)
+    assert stream.closed
 
 
 def test_generate_stream_returns_typed_507_and_requires_done() -> None:
@@ -459,3 +650,95 @@ def test_generated_request_models_preserve_nested_configuration(extraction: bool
         assert isinstance(request, GeneratedDecideRequest)
         result = client.decide(request)
     assert result.model == "registered"
+
+
+def test_native_region_with_unknown_geometry_round_trips():
+    raw = {"text": "Vertical native text", "bbox": None, "origin": "native"}
+    region = InferenceTextRegion.from_dict(raw)
+    assert region.bbox is None
+    assert region.to_dict() == raw
+
+
+def test_direct_document_read_preserves_page_identity_and_artifact():
+    request = {
+        "model": "balanced",
+        "retain_artifact": True,
+        "documents": [
+            {"id": "receipt", "url": "data:application/pdf;base64,ZmFrZQ==", "media_type": "application/pdf"}
+        ],
+    }
+    payload = {
+        "object": "list",
+        "model": "balanced",
+        "data": [
+            {
+                "object": "read",
+                "index": 0,
+                "source_id": "receipt",
+                "number": 2,
+                "text": "Total 12.50",
+                "origin": "transcription",
+                "regions": [
+                    {
+                        "id": 4,
+                        "bbox": [0, 0, 100, 20],
+                        "text": "Total 12.50",
+                        "text_start": 0,
+                        "text_end": 11,
+                        "origin": "transcription",
+                        "children": [{"id": 1, "text": "12.50", "text_start": 6, "text_end": 11}],
+                        "tables": [{"id": 1, "cells": [{"text": "12.50"}]}],
+                        "fields": {"total": "12.50"},
+                    }
+                ],
+                "inherited_parts": [{"path": "ppt/slideMasters/slideMaster1.xml", "shapes_visible": False}],
+            }
+        ],
+        "document": {"artifact_id": "a" * 64},
+    }
+
+    def handler(incoming):
+        assert incoming.url.path == "/ai/v1/read"
+        assert json.loads(incoming.read()) == request
+        return httpx.Response(200, json=payload)
+
+    client = AntflyClient("http://test")
+    client._client.set_httpx_client(httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler)))
+    assert client.read(request).to_dict() == payload
+
+
+def test_tool_call_preserves_provider_metadata_for_replay() -> None:
+    from antfly.client_generated.models import ToolCall
+
+    payload = {
+        "id": "call-google",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"id":7}'},
+        "extra_content": {"google": {"thought_signature": "opaque-signature"}},
+    }
+    assert ToolCall.from_dict(payload).to_dict() == payload
+
+
+def test_anthropic_config_and_signed_assistant_history_roundtrip() -> None:
+    from antfly.client_generated.models import (
+        AnthropicGeneratorConfig,
+        InferenceGenerateMessage,
+    )
+
+    config = {"provider": "anthropic", "model": "future-claude", "workspace_id": "workspace"}
+    assert AnthropicGeneratorConfig.from_dict(config).to_dict() == config
+    payload = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call", "type": "function", "function": {"name": "lookup", "arguments": '{"id":7}'}}],
+        "extra_content": {
+            "anthropic": {
+                "content": [
+                    {"type": "thinking", "thinking": "private", "signature": "signed"},
+                    {"type": "tool_use", "id": "call", "name": "lookup", "input": {"id": 7}},
+                ]
+            }
+        },
+    }
+    assert InferenceGenerateMessage.from_dict(payload).to_dict() == payload
+    assert InferenceChatMessage.from_dict(payload).to_dict() == payload

@@ -562,6 +562,7 @@ pub const testing = if (builtin.is_test) struct {
 const ControlProvisionedTableReadCache = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -577,6 +578,7 @@ const PhysicalProvisionedTableReadCache = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -722,6 +724,7 @@ const PhysicalProvisionedTableReadCache = struct {
         errdefer self.alloc.destroy(runtime);
         runtime.* = reranking_runtime.Runtime.init(self.alloc, self.threaded.io());
         self.reranker_runtime = runtime;
+        self.provider_runtime = &runtime.providers;
         return runtime;
     }
 
@@ -771,6 +774,7 @@ const PhysicalProvisionedTableReadCache = struct {
             .backend_runtime = self.backend_runtime,
             .antfly_provider = providerWithCapabilityCache(self.antfly_provider, &@constCast(self).remote_capability_cache),
             .decision_registry = self.decision_registry,
+            .provider_runtime = self.provider_runtime,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -2450,6 +2454,7 @@ fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
 
 pub const BoundTableReadSource = struct {
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     table_name: []const u8,
     db: *db_mod.DB,
     reads: raft_mod.FeatureDBReads,
@@ -2960,6 +2965,7 @@ pub const BoundTableReadSource = struct {
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, .{
             .source_table = table_name,
             .decision_registry = self.decision_registry,
+            .provider_runtime = self.provider_runtime,
             .backend_runtime = self.db.backend_runtime,
         });
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
@@ -3281,6 +3287,7 @@ pub const ProvisionedTableReadSource = struct {
     hot_standby_read_gate: ?HotStandbyReadGate = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -3470,6 +3477,7 @@ pub const ProvisionedTableReadSource = struct {
         hosted.group_visible_root_generation = self.group_visible_root_generation;
         hosted.antfly_provider = self.antfly_provider;
         hosted.decision_registry = self.decision_registry;
+        hosted.provider_runtime = self.provider_runtime;
         hosted.inference_api_url = self.inference_api_url;
         hosted.secret_store = self.secret_store;
         hosted.remote_content = self.remote_content;
@@ -3516,6 +3524,15 @@ pub const ProvisionedTableReadSource = struct {
     ) *ProvisionedTableReadSource {
         self.antfly_provider = provider;
         if (self.cache) |cache| cache.antfly_provider = provider;
+        return self;
+    }
+
+    pub fn withDecisionRegistry(
+        self: *ProvisionedTableReadSource,
+        registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry,
+    ) *ProvisionedTableReadSource {
+        self.decision_registry = registry;
+        if (self.cache) |cache| cache.decision_registry = registry;
         return self;
     }
 
@@ -4208,6 +4225,7 @@ pub const ProvisionedTableReadSource = struct {
                 if (comptime control_only_storage_sources) null else if (self.cache) |cache| &cache.remote_capability_cache else null,
             ),
             .decision_registry = self.decision_registry,
+            .provider_runtime = self.provider_runtime,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -6231,6 +6249,7 @@ pub const HostedProvisionedTableReadSource = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -6300,6 +6319,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
     pub fn withRerankerRuntime(self: *HostedProvisionedTableReadSource, runtime: *reranking_runtime.Runtime) *HostedProvisionedTableReadSource {
         self.reranker_runtime = runtime;
+        self.provider_runtime = &runtime.providers;
         return self;
     }
 
@@ -6333,6 +6353,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .backend_runtime = self.backend_runtime,
             .antfly_provider = providerWithCapabilityCache(self.antfly_provider, self.remote_capability_cache),
             .decision_registry = self.decision_registry,
+            .provider_runtime = self.provider_runtime,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -8881,10 +8902,13 @@ fn executeDistributedHydrationBatch(source: anytype, alloc: std.mem.Allocator, r
     hydration.limit = @intCast(keys.len);
     hydration.offset = 0;
     hydration.identity_read_generation = generations[ordinal] orelse return error.IdentityReadGenerationChanged;
-    return if (comptime @TypeOf(source) == *HostedProvisionedTableReadSource) switch ((routes orelse return error.InvalidQueryRequest)[ordinal]) {
+    var hydrated = if (comptime @TypeOf(source) == *HostedProvisionedTableReadSource) switch ((routes orelse return error.InvalidQueryRequest)[ordinal]) {
         .local => (try source.groupLocalSource().searchResultGroupLocal(alloc, owner, table_name, hydration, consistency)) orelse return error.TableNotFound,
         .remote => |remote| try queryRemote(source.internalExecutor(), alloc, remote.base_uri, owner, table_name, hydration),
     } else (try source.groupLocalSource().searchResultGroupLocal(alloc, owner, table_name, hydration, consistency)) orelse return error.TableNotFound;
+    errdefer hydrated.deinit();
+    try query_contract.finalizeHydratedProjectionSources(alloc, hydration, hydrated.hits);
+    return hydrated;
 }
 
 fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, table_name: []const u8, consistency: raft_mod.ReadConsistency, groups: []const u64, generations: []const ?u64, routes: ?[]const table_router.GroupRoute, result: *db_mod.types.SearchResult) !void {
@@ -9042,6 +9066,11 @@ fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, r
                     if (selected.computed_json) |prior| alloc.free(prior);
                     selected.computed_json = bytes;
                 }
+                // Hydration may already have normalized and masked this row.
+                // Rebind the producer receipt to the transferred/copied bytes.
+                if (hit.finalized_source) |receipt| if (receipt.matches(hit.stored_data orelse selected.stored_data.?)) {
+                    selected.finalized_source = .{ .bytes = selected.stored_data.? };
+                };
                 alloc.destroy(selected.document_authority.?);
                 selected.document_authority = null;
             }
@@ -9527,6 +9556,8 @@ const searchRequestHasUnserializableResolvedDocFilter = local_query_contract.sea
 
 const graphHydrateRequestHasResolvedDocFilter = local_query_contract.graphHydrateRequestHasResolvedDocFilter;
 
+const bindDocumentAuthorityToGroup = local_query_contract.bindDocumentAuthorityToGroup;
+
 /// Single-group graph queries execute locally against a snapshot that holds
 /// the graph index's complete row set: mark the request so the storage graph
 /// executors may expand THROUGH cross-table tagged nodes (entity-sourced
@@ -9605,10 +9636,9 @@ fn rejectUnsupportedGraphQueryMode(
     req: db_mod.types.SearchRequest,
 ) !void {
     if (req.graph_queries.len > 0 and
-        !distributed_graph.supportsCrossRange(req) and
         (group_count > 1 or req.graph_table_read_authorizer != null))
     {
-        return error.GraphQueryModeUnsupported;
+        try distributed_graph.rejectUnsupportedCrossRange(req);
     }
 }
 
@@ -15784,7 +15814,7 @@ fn queryRemoteWithScratch(
     req: db_mod.types.SearchRequest,
 ) !db_mod.types.SearchResult {
     var result = queryResponseRemote(executor, scratch, base_uri, group_id, table_name, req) catch |err| {
-        if (req.document_authority_mode == .hydrate and err == error.UnexpectedHttpStatus) return error.StorageReadTemporarilyUnavailable;
+        if ((req.document_authority_mode == .hydrate or req.document_authority_mode == .lookup) and err == error.UnexpectedHttpStatus) return error.StorageReadTemporarilyUnavailable;
         if (req.document_authority_mode != .candidates or err != error.UnexpectedHttpStatus) return err;
         var legacy = req;
         legacy.document_authority_mode = .none;
@@ -15793,13 +15823,13 @@ fn queryRemoteWithScratch(
         return queryRemoteWithScratch(executor, alloc, scratch, base_uri, group_id, table_name, legacy);
     };
     defer result.deinit(scratch);
-    var parsed = if (req.document_authority_mode != .none)
+    var parsed = if (req.document_authority_mode != .none and req.document_authority_mode != .lookup)
         try local_query_contract.parseRemoteSearchResultWithAuthority(alloc, scratch, result.json, group_id, req.document_output_allocator)
     else
         try local_query_contract.parseRemoteSearchResultWithScratch(alloc, scratch, result.json);
     errdefer parsed.deinit();
     parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
-    if (req.document_authority_mode != .none) {
+    if (req.document_authority_mode != .none and req.document_authority_mode != .lookup) {
         if (parsed.document_authority_version != 1) {
             if (req.document_authority_mode != .candidates) return error.StorageReadTemporarilyUnavailable;
             var legacy = req;
@@ -15827,7 +15857,7 @@ fn queryResponseRemote(
     table_name: []const u8,
     input: db_mod.types.SearchRequest,
 ) !query_api.QueryResponse {
-    var req = input;
+    var req = try bindDocumentAuthorityToGroup(input, group_id);
     if (req.native_query_cut) |cut| if (cut.create) {
         req.native_query_cut = try cut.forGroup(group_id);
     };
@@ -27314,6 +27344,41 @@ pub const document_hydration_tests = if (builtin.is_test) struct {
         std.debug.print("DOCUMENT_HYDRATION candidates=2 deferred=1 primary_bytes={d} deferred_body_bytes=0 winner_projection_bytes={d}\n", .{ large.len, before.hits[0].stored_data.?.len });
     }
 
+    test "native memory primary lookup preserves whole rows and exact IDs through private wire admission" {
+        const a = std.testing.allocator;
+        const request: db_mod.types.SearchRequest = .{ .document_authority_mode = .lookup, .document_authority_group = 11, .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "a", "b" }, .limit = 2 };
+        const body = try local_query_contract.encodeQueryRequest(a, request);
+        defer a.free(body);
+        var parsed = try query_contract.parseQueryRequest(a, null, "docs", body);
+        defer parsed.deinit(a);
+        try std.testing.expectEqual(.lookup, parsed.req.document_authority_mode);
+        try std.testing.expect(parsed.req.query == .match_all and parsed.req.full_text == null);
+        try std.testing.expect(parsed.req.include_stored and parsed.req.include_all_fields and parsed.req.filter_doc_ids_positive);
+        try std.testing.expectEqual(@as(usize, 2), parsed.req.filter_doc_ids.len);
+        for (request.filter_doc_ids, parsed.req.filter_doc_ids) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+        const shard = distributedSearchShardRequest(request, &.{}, false);
+        try std.testing.expectEqual(.lookup, shard.document_authority_mode);
+        try std.testing.expect(shard.include_stored);
+        try std.testing.expectError(error.InvalidQueryRequest, query_contract.parsePublicQueryRequest(a, null, "docs", body));
+        const Remote = struct {
+            fn execute(_: *anyopaque, alloc: std.mem.Allocator, http_request: http_common.HttpRequest) !http_common.HttpResponse {
+                var forwarded = try query_contract.parseQueryRequest(alloc, null, "docs", http_request.body);
+                defer forwarded.deinit(alloc);
+                try std.testing.expectEqual(@as(u64, 11), forwarded.req.document_authority_group);
+                try std.testing.expectEqual(.lookup, forwarded.req.document_authority_mode);
+                try std.testing.expect(forwarded.req.query == .match_all and forwarded.req.full_text == null);
+                return .{ .status = 200, .headers = &.{}, .body = try alloc.dupe(u8, "{}") };
+            }
+        };
+        var context: u8 = 0;
+        const transport: http_common.RequestExecutor = .{ .ptr = &context, .vtable = &.{ .execute = Remote.execute } };
+        var unscoped = request;
+        unscoped.document_authority_group = 0;
+        var remote = try queryResponseRemote(transport, a, "http://native.test", 11, "docs", unscoped);
+        defer remote.deinit(a);
+        try std.testing.expectError(error.InvalidQueryRequest, queryResponseRemote(transport, a, "http://native.test", 12, "docs", request));
+    }
+
     test "public graph metric borrowed wire document authority private controls roundtrip and public admission rejects them" {
         const a = std.testing.allocator;
         const request: db_mod.types.SearchRequest = .{ .include_stored = false, .document_authority_mode = .candidates, .document_authority_group = std.math.maxInt(u64), .defer_stored_projection = true };
@@ -30349,7 +30414,11 @@ fn implementationTests() type {
         }
 
         test "aggregation full-result rerun counts text matches and each vector window without changing ranked page" {
-            const alloc = std.testing.allocator;
+            // Keep the >2,000-document window regression and memory checks,
+            // without unwinding every successful allocation during ingestion.
+            var allocator_state = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+            defer allocator_state.deinit();
+            const alloc = allocator_state.allocator();
             var path_tmp = try TestDirectory.init("antfly-api-aggregation-hybrid");
             defer path_tmp.cleanup();
             var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});

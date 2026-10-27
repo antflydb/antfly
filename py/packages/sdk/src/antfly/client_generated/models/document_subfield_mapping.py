@@ -29,9 +29,10 @@ class DocumentSubfieldMapping:
             include_in_all (bool | Unset): Whether to include in the _all field for cross-field search Default: False.
             sortable (bool | Unset): Whether this exact scalar subfield can be used in order_by. Antfly derives the required
                 typed doc values when enabled. Default: False.
-            missing_null_policy (DocumentSubfieldMappingMissingNullPolicy | Unset): Missing/null sort policy. The current
-                production policy rejects missing or null native sort values. Default:
-                DocumentSubfieldMappingMissingNullPolicy.MISSING_REJECTED.
+            missing_null_policy (DocumentSubfieldMappingMissingNullPolicy | Unset): Missing/null sort policy. The default
+                missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending
+                and last descending, with JSON null cursor components. Nullable native layouts require a complete producer
+                proof. Default: DocumentSubfieldMappingMissingNullPolicy.MISSING_REJECTED.
     """
 
     type_: FieldMappingType | Unset = UNSET

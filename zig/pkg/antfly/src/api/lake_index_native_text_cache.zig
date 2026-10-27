@@ -114,6 +114,7 @@ pub const Cache = struct {
         try cancellation.check();
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("native-lake-text-snapshot-cache-v1");
+        hash.update(if (cached.lazy_lineage) "paged-lineage" else "complete-lineage");
         hash.update(&cached.scope);
         hash.update(root_ref.artifact_id);
         hash.update(schema_json);
@@ -413,6 +414,7 @@ const Entry = struct {
     arena: std.heap.ArenaAllocator,
     writer: ?local.index.IndexWriter = null,
     seekable: bool = false,
+    masked: bool = false,
     statistics_version: u8 = 0,
     term_statistics: ?corpus.statistics.Ref = null,
     segment_summaries: []const ?corpus.statistics.Ref = &.{},
@@ -467,7 +469,12 @@ const Entry = struct {
             if (field == .string) self.selected_field = field.string;
         };
         self.name = try a.dupe(u8, name);
-        self.writer = if (base) |prior| try prior.writer.?.forkImmutable() else try local.index.IndexWriter.init(self.allocator);
+        const masked = root.physical_documents != null;
+        self.masked = masked;
+        const predecessor = if (masked or (if (base) |prior| prior.masked else false)) null else base;
+        var live_by_id: std.AutoHashMapUnmanaged(u64, []const corpus.text_directory.Interval) = .empty;
+        defer live_by_id.deinit(self.allocator);
+        self.writer = if (predecessor) |prior| try prior.writer.?.forkImmutable() else try local.index.IndexWriter.init(self.allocator);
         var removed: std.ArrayList(u64) = .empty;
         defer removed.deinit(self.allocator);
         var additions: std.ArrayList(artifacts.ChunkRef) = .empty;
@@ -491,6 +498,13 @@ const Entry = struct {
             try self.descriptors.put(a, try a.dupe(u8, route.ref.artifact_id), .{ .manifest = ref, .ordinal = 0 });
             try routing_by_id.put(self.allocator, route.ref.artifact_id, .{ .segment = route, .manifest = ref, .ordinal = 0 });
         };
+        for (root.file_groups) |group| if (group.masked and root.routing.len == 0) {
+            const routes = try @import("lake_index_serving_inventory.zig").compactRoutes(a, group);
+            for (routes) |route| {
+                const descriptor = route.descriptor orelse return error.InvalidNativeLakeTextCorpus;
+                try routing_by_id.put(self.allocator, route.ref.artifact_id, .{ .segment = route, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len }, .ordinal = 0 });
+            }
+        };
         for (root.file_groups) |group| if (group.admissions.len != 0) {
             for (group.segments, group.admissions) |ref, metadata| try admission_by_id.put(self.allocator, ref.artifact_id, metadata);
         };
@@ -501,12 +515,12 @@ const Entry = struct {
         defer for (shared.items) |item| item.snapshot.release();
         var next_id = self.writer.?.next_segment_id;
         for (root.segments, 0..) |segment, ordinal| {
-            const existing = if (base) |prior| prior.segments.get(segment.artifact_id) else null;
+            const existing = if (predecessor) |prior| prior.segments.get(segment.artifact_id) else null;
             const id = if (existing) |location| location.id else next_id;
             if (existing == null) {
                 next_id += 1;
                 var reused = false;
-                for (peers) |peer| if (peer.segments.get(segment.artifact_id)) |location| {
+                if (!masked) for (peers) |peer| if (!peer.masked) if (peer.segments.get(segment.artifact_id)) |location| {
                     const snapshot = peer.writer.?.acquireSnapshot();
                     errdefer snapshot.release();
                     try shared.append(self.allocator, .{ .snapshot = snapshot, .ordinal = location.ordinal, .target_id = id });
@@ -519,8 +533,9 @@ const Entry = struct {
                 }
             }
             try self.segments.put(a, try a.dupe(u8, segment.artifact_id), .{ .id = id, .ordinal = ordinal });
+            if (routing_by_id.get(segment.artifact_id)) |route| if (route.segment.live.len != 0 and !(route.segment.live.len == 1 and route.segment.live[0].lower == 0 and route.segment.live[0].count == route.segment.doc_count)) try live_by_id.put(self.allocator, id, route.segment.live);
         }
-        if (base) |prior| {
+        if (predecessor) |prior| {
             var iterator = prior.segments.iterator();
             while (iterator.next()) |segment| if (!self.segments.contains(segment.key_ptr.*)) try removed.append(self.allocator, segment.value_ptr.id);
         }
@@ -596,6 +611,24 @@ const Entry = struct {
         }
         try cached.context.ensureActive();
         try self.writer.?.shareImmutableSegments(shared.items);
+        if (!masked and live_by_id.count() != 0) return error.InvalidNativeLakeTextCorpus;
+        const masks = try self.allocator.alloc(local.encoding_roaring.RoaringBitmap, if (masked) replacements.len else 0);
+        defer self.allocator.free(masks);
+        for (masks) |*mask| mask.* = .init(self.allocator);
+        defer for (masks) |*mask| mask.deinit();
+        for (replacements, 0..) |*replacement, ordinal| if (live_by_id.get(replacement.id)) |live| {
+            const mask = &masks[ordinal];
+            var previous: u32 = 0;
+            const count = (replacement.prepared_reader orelse return error.InvalidNativeLakeTextCorpus).doc_count;
+            for (live) |interval| {
+                const end = try std.math.add(u32, interval.lower, interval.count);
+                if (interval.count == 0 or interval.lower < previous or end > count) return error.InvalidNativeLakeTextCorpus;
+                try mask.addRange(previous, interval.lower);
+                previous = end;
+            }
+            try mask.addRange(previous, count);
+            replacement.deleted = mask;
+        };
         if (removed.items.len != 0 or replacements.len != 0) try self.writer.?.replaceSegmentsManyData(removed.items, replacements);
         loaded = 0; // writer owns every replacement after atomic publication
         for (replacements) |replacement| {
@@ -629,7 +662,7 @@ const Entry = struct {
             }
         }
         if (documents > std.math.maxInt(u32)) return error.InvalidNativeLakeTextCorpus;
-        try self.writer.?.sealImmutableCollection(@intCast(documents), fields);
+        if (masked) try self.writer.?.sealVerifiedMaskedCollection(@intCast(documents), fields) else try self.writer.?.sealImmutableCollection(@intCast(documents), fields);
         const snapshot = self.writer.?.acquireSnapshot();
         defer snapshot.release();
         self.identities = try @import("lake_index_text_predicate.zig").Identities.init(a, root, snapshot);

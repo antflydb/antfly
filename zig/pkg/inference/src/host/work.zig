@@ -734,6 +734,7 @@ pub const BoundedInvocationAllocator = struct {
     live_bytes: usize = 0,
     peak_live_bytes: usize = 0,
     limit_exceeded: bool = false,
+    mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(backing: std.mem.Allocator, max_live_bytes: usize) BoundedInvocationAllocator {
         return .{ .backing = backing, .max_live_bytes = max_live_bytes };
@@ -746,6 +747,13 @@ pub const BoundedInvocationAllocator = struct {
             .remap = remap,
             .free = free,
         } };
+    }
+
+    // The limit check, backing operation and accounting form one transaction.
+    // Duplex transport can free upload buffers while parsing response frames;
+    // this also serializes access to a thread-confined backing allocator.
+    fn lock(self: *BoundedInvocationAllocator) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
     fn permit(self: *BoundedInvocationAllocator, additional: usize) bool {
@@ -763,6 +771,8 @@ pub const BoundedInvocationAllocator = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         if (!self.permit(len)) return null;
         const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.recordGrowth(len);
@@ -771,6 +781,8 @@ pub const BoundedInvocationAllocator = struct {
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > 0 and !self.permit(growth)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
@@ -781,6 +793,8 @@ pub const BoundedInvocationAllocator = struct {
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > 0 and !self.permit(growth)) return null;
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
@@ -791,6 +805,8 @@ pub const BoundedInvocationAllocator = struct {
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         self.backing.rawFree(memory, alignment, ret_addr);
         self.live_bytes -|= memory.len;
     }
@@ -887,9 +903,27 @@ pub fn decodeInlineDataUriAlloc(
     return .{ .mime_type = decoded.media_type, .data = decoded.data };
 }
 
+/// Proven dense result geometry, without loading weights or invoking inference.
+/// The executor accepts every width in the inclusive range and normalizes
+/// truncated vectors according to the model's serving recipe.
+pub const DenseEmbeddingOutput = struct {
+    native_dimensions: u32,
+    minimum_dimensions: u32,
+
+    pub fn validate(self: DenseEmbeddingOutput) !void {
+        if (self.minimum_dimensions == 0 or self.minimum_dimensions > self.native_dimensions)
+            return error.InvalidInferenceCapabilities;
+    }
+
+    pub fn accepts(self: DenseEmbeddingOutput, dimensions: u32) bool {
+        return dimensions >= self.minimum_dimensions and dimensions <= self.native_dimensions;
+    }
+};
+
 pub const InferenceCapabilities = struct {
     /// Stable model/tokenizer identity, available before loading weights.
     model_revision: ?[32]u8 = null,
+    dense_output: ?DenseEmbeddingOutput = null,
     task: Task,
     input_modalities: Modalities,
     accepted_mime_types: MimeTypes = .{},
@@ -939,6 +973,10 @@ pub const InferenceCapabilities = struct {
 
     pub fn validate(self: InferenceCapabilities) !void {
         try self.batch.validate();
+        if (self.dense_output) |shape| {
+            if (self.task != .embed) return error.InvalidInferenceCapabilities;
+            try shape.validate();
+        }
         if ((self.generation_grammar_v1 or self.generation_token_logprobs_v1) and self.task != .generate) return error.InvalidInferenceCapabilities;
         if (self.image_transform) |transform| {
             try transform.validate();

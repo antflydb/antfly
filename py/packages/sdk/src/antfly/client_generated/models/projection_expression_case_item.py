@@ -28,7 +28,9 @@ class ProjectionExpressionCaseItem:
             Untaken CASE branches do not load fields or evaluate erroring calls.
             Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
             is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
-            Expressions are limited to depth 64 and 8192 nodes per request.
+            Expressions are limited to depth 64 including referenced aliases, and
+            8192 nodes per request. Alias dependencies are acyclic; each alias is a
+            requested output and is evaluated once per row.
         then (ProjectionExpression): Exactly one expression node: literal, field, ref, param, call with args,
             case with optional else, cast, or a binary operator. Pure expressions
             lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider
@@ -41,7 +43,9 @@ class ProjectionExpressionCaseItem:
             Untaken CASE branches do not load fields or evaluate erroring calls.
             Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
             is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
-            Expressions are limited to depth 64 and 8192 nodes per request.
+            Expressions are limited to depth 64 including referenced aliases, and
+            8192 nodes per request. Alias dependencies are acyclic; each alias is a
+            requested output and is evaluated once per row.
     """
 
     when: ProjectionExpression

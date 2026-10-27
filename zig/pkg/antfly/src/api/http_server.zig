@@ -1775,6 +1775,12 @@ pub const ApiHttpServerConfig = struct {
     /// a docstore at this path, else `<session_store_path>.research_jobs`.
     research_job_store: ?*backend_erased.Store = null,
     research_job_store_path: ?[]const u8 = null,
+    /// Document metadata uses its own namespace in the existing durable store.
+    document_job_store: ?*backend_erased.Store = null,
+    document_job_store_path: ?[]const u8 = null,
+    document_artifact_store: ?@import("../serverless/artifacts/store.zig").ArtifactStore = null,
+    document_artifact_path: ?[]const u8 = null,
+
     research_job_retention_ms: ?u64 = null,
     repair_job_store_path: ?[]const u8 = null,
     repair_job_retention_ms: ?u64 = null,
@@ -1973,6 +1979,9 @@ pub const AuthenticatedIdentity = struct {
     /// True only for an audience-bound node/service credential. A generic
     /// trusted upstream user is deliberately not an internal service.
     is_internal_service: bool = false,
+    /// Signed MCP discovery hint, never mutation authority. Every create/restore
+    /// invocation still requires an ordinary grant on its concrete target.
+    mcp_creation_discovery: bool = false,
     permissions: []usermgr.Permission = &.{},
     row_filter: []usermgr.RowFilterEntry = &.{},
     metadata_json: []u8 = &.{},
@@ -2012,6 +2021,7 @@ pub const StatusSource = struct {
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
         supports_resolver_catalog_read: bool = false,
+        supports_resolver_authority: bool = false,
         acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
@@ -2083,7 +2093,42 @@ pub const StatusSource = struct {
         return try BoundaryAbi.call("acquire_join_planning", self.boundary_dispatch, capture, .{ self.ptr, budget });
     }
 
+    /// The shared public data-admission boundary. Ownership is captured with
+    /// catalog identity, so every HTTP/MCP/SQL resolver gets the same decision.
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        switch (input) {
+            .native_memory_create => |request| {
+                if (context.native_service != .memory or !context.setting_admin or request.mutation.kind != .table or request.mutation.action != .create) return error.Forbidden;
+            },
+            .mutate => |request| {
+                if (request.mutation.native_service != null) return error.Forbidden;
+            },
+            else => {},
+        }
+        const bytes = try self.rawSystemCatalog(alloc, context, input);
+        errdefer alloc.free(bytes);
+        switch (input) {
+            .query_definition => {
+                var parsed = try std.json.parseFromSlice(?system_catalog.QueryDefinition, alloc, bytes, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                if (parsed.value) |definition| try @import("antfly_local_sources").api_operation.requireNativeServiceAccess(definition.native_service, context.native_service);
+            },
+            .resolve => {
+                var parsed = try std.json.parseFromSlice(?system_catalog.ResolvedTable, alloc, bytes, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                if (parsed.value) |table| try table.requireAccess(context.native_service);
+            },
+            .resolve_many => {
+                var parsed = try std.json.parseFromSlice(system_catalog.ResolvedMany, alloc, bytes, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                for (parsed.value.tables) |table| if (table) |value| try value.requireAccess(context.native_service);
+                for (parsed.value.relations) |relation| if (relation) |value| try value.table.requireAccess(context.native_service);
+            },
+            else => {},
+        }
+        return bytes;
+    }
+    fn rawSystemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const callback = self.vtable.system_catalog orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("system_catalog", self.boundary_dispatch, callback, .{ self.ptr, alloc, context, input }) catch |err| switch (err) {
             error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch => error.CatalogRoutingUnavailable,
@@ -2736,6 +2781,7 @@ pub const StatusSource = struct {
             .supports_query_definitions = true,
             .supports_object_tables = true,
             .supports_resolver_catalog_read = true,
+            .supports_resolver_authority = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .control_snapshot = if (@hasDecl(T, "controlSnapshot")) Gen.controlSnapshot else null,
@@ -3895,6 +3941,9 @@ pub const ApiHttpServer = struct {
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
+    memory_in_flight: std.atomic.Value(bool) = .init(false),
+    memory_range_cursor: std.atomic.Value(usize) = .init(0),
+    memory_work_cursors: std.AutoHashMapUnmanaged(u64, @import("antfly_local_sources").memory_scheduling.Cursor) = .empty,
     relational_activation_range_cursor: std.atomic.Value(usize) = .init(0),
     row_policy_publication_cursor: std.atomic.Value(u64) = .init(0),
     fk_generation_publication_cursor: std.atomic.Value(u64) = .init(0),
@@ -3917,6 +3966,12 @@ pub const ApiHttpServer = struct {
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    document_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{ .namespace = .documents } },
+    document_artifact_files: ?@import("../serverless/artifacts/fs_store.zig").FsStore = null,
+    document_artifact_configured: ?*@import("lake_index_store.zig").Store = null,
+    document_work_in_flight: std.atomic.Value(usize) = .init(0),
+    document_cursor: usize = 0,
+    document_schedule_mutex: std.atomic.Mutex = .unlocked,
     research_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     research_state_key: [32]u8 = undefined,
     research_state_key_ready: std.atomic.Value(bool) = .init(false),
@@ -3942,6 +3997,8 @@ pub const ApiHttpServer = struct {
     restore_jobs_closing: std.atomic.Value(bool) = .init(false),
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
     session_maintenance_owner_id: u64 = 0,
+    document_job_owner_id: std.atomic.Value(u64) = .init(0),
+    scheduled_documents: [4]?[]const u8 = @splat(null),
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
     lake_gc_owner_id: u64 = 0,
     lake_gc_in_flight: std.atomic.Value(bool) = .init(false),
@@ -3965,6 +4022,7 @@ pub const ApiHttpServer = struct {
     index_installation_reserved_slots: usize = 0,
     index_installation_next_generation: u64 = 1,
     index_installation_cursor: usize = 0,
+    lake_index_repairs: @import("lake_index_repairs.zig").Repairs = .{},
     lake_index_recovery_cursor: usize = 0,
     lake_index_recovery_after_ns: u64 = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
@@ -3973,6 +4031,7 @@ pub const ApiHttpServer = struct {
     backup_cohort_recovery_cursor: [192]u8 = undefined,
     backup_cohort_recovery_cursor_len: usize = 0,
     mcp_sessions: mcp.InMemorySessionStore = .{},
+    memory_mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     inference_sessions: @import("antfly_local_sources").common_provider_registry.gateway.Sessions = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -4025,6 +4084,7 @@ pub const ApiHttpServer = struct {
         repair: u64 = 0,
         restore: u64 = 0,
         session_maintenance: u64 = 0,
+        documents: u64 = 0,
         lake_gc: u64 = 0,
         backup_maintenance: u64 = 0,
         index_installation: u64 = 0,
@@ -4037,6 +4097,7 @@ pub const ApiHttpServer = struct {
         errdefer {
             if (ids.repair != 0) active.durable_jobs.closeOwner(ids.repair);
             if (ids.restore != 0) active.durable_jobs.closeOwner(ids.restore);
+            if (ids.documents != 0) active.durable_jobs.closeOwner(ids.documents);
             if (ids.session_maintenance != 0) active.durable_jobs.closeOwner(ids.session_maintenance);
             if (ids.lake_gc != 0) active.durable_jobs.closeOwner(ids.lake_gc);
             if (ids.backup_maintenance != 0) active.durable_jobs.closeOwner(ids.backup_maintenance);
@@ -4045,6 +4106,7 @@ pub const ApiHttpServer = struct {
         ids.repair = try active.allocOwnerId();
         ids.restore = try active.allocOwnerId();
         ids.session_maintenance = try active.allocOwnerId();
+        ids.documents = try active.allocOwnerId();
         ids.lake_gc = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
         ids.index_installation = try active.allocOwnerId();
@@ -4192,6 +4254,7 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
+            .document_job_store = research_jobs.Store.init(owner_alloc, .{ .namespace = .documents }),
             .research_job_store = research_jobs.Store.init(owner_alloc, .{
                 .path = cfg.research_job_store_path,
                 .retention_ms = cfg.research_job_retention_ms,
@@ -4207,6 +4270,7 @@ pub const ApiHttpServer = struct {
             .repair_job_owner_id = owner_ids.repair,
             .restore_job_owner_id = .init(owner_ids.restore),
             .session_maintenance_owner_id = owner_ids.session_maintenance,
+            .document_job_owner_id = .init(owner_ids.documents),
             .lake_gc_owner_id = owner_ids.lake_gc,
             .backup_maintenance_owner_id = owner_ids.backup_maintenance,
             .index_installation_owner_id = owner_ids.index_installation,
@@ -4223,6 +4287,9 @@ pub const ApiHttpServer = struct {
             .lake_read_cache = @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(owner_alloc, if (cfg.node_config) |config| config.lake_cache.max_memory_bytes else 64 * 1024 * 1024),
             .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
+                .now_ns_fn = protocolStoreNowNs,
+            }),
+            .memory_mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
                 .now_ns_fn = protocolStoreNowNs,
             }),
             .a2a_tasks = a2a.InMemoryTaskStore.initWithOptions(owner_alloc, api_io, .{
@@ -4644,6 +4711,45 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.artifact_reprocess_job_store.attachOpenedStore(opened);
         }
+        if (cfg.document_job_store orelse cfg.research_job_store) |store| {
+            try server.document_job_store.attachRuntime(store);
+        } else if (cfg.document_job_store_path orelse cfg.research_job_store_path orelse cfg.session_store_path) |base_path| {
+            const path = if (cfg.document_job_store_path != null) try alloc.dupe(u8, base_path) else try std.fmt.allocPrint(alloc, "{s}.document_jobs", .{base_path});
+            defer alloc.free(path);
+            const opened = try alloc.create(research_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try research_jobs.OpenedStore.open(alloc, path);
+            errdefer opened.deinit();
+            try server.document_job_store.attachOpenedStore(opened);
+        }
+        if (cfg.document_artifact_store == null) {
+            if (cfg.node_config) |config| if (config.storage.artifacts.connection != null) {
+                const Configured = @import("lake_index_store.zig").Store;
+                const configured = try alloc.create(Configured);
+                errdefer alloc.destroy(configured);
+                configured.* = try Configured.open(alloc, config, cfg.secret_store, false);
+                errdefer configured.deinit();
+                const namespace = try std.fmt.allocPrint(alloc, "{s}/document-jobs", .{configured.implementation.prefix});
+                alloc.free(configured.implementation.prefix);
+                configured.implementation.prefix = namespace;
+                configured.implementation.shared_namespace = configured.opened.s3_client != null or configured.opened.gcs_client != null;
+                const locator = configured.locator;
+                const identity = try std.json.Stringify.valueAlloc(alloc, .{ .protocol = locator.protocol, .bucket = locator.bucket, .prefix = namespace, .root = locator.root, .tls = locator.tls }, .{});
+                defer alloc.free(identity);
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(identity, &digest, .{});
+                configured.implementation.namespace_identity = digest;
+                server.document_artifact_configured = configured;
+                server.cfg.document_artifact_store = configured.artifactStore();
+            };
+        }
+        if (server.cfg.document_artifact_store == null) {
+            if (cfg.document_artifact_path orelse cfg.document_job_store_path orelse cfg.research_job_store_path orelse cfg.session_store_path orelse cfg.native_lake_artifact_base_dir) |base_path| {
+                const path = if (cfg.document_artifact_path != null) try alloc.dupe(u8, base_path) else if (cfg.document_job_store_path == null and cfg.research_job_store_path == null and cfg.session_store_path == null) try std.fmt.allocPrint(alloc, "{s}/document-artifacts", .{base_path}) else try std.fmt.allocPrint(alloc, "{s}.document_artifacts", .{base_path});
+                defer alloc.free(path);
+                server.document_artifact_files = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(alloc, path);
+            }
+        }
         if (cfg.research_job_store) |store| {
             try server.research_job_store.attachRuntime(store);
         } else if (cfg.research_job_store_path orelse cfg.session_store_path) |base_path| {
@@ -4725,6 +4831,8 @@ pub const ApiHttpServer = struct {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
             const restore_owner_id = self.restore_job_owner_id.load(.acquire);
             if (restore_owner_id != 0) runtime.durable_jobs.closeOwner(restore_owner_id);
+            const documents_owner = self.document_job_owner_id.load(.acquire);
+            if (documents_owner != 0) runtime.durable_jobs.closeOwner(documents_owner);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
             if (self.lake_gc_owner_id != 0) runtime.durable_jobs.closeOwner(self.lake_gc_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
@@ -4738,8 +4846,10 @@ pub const ApiHttpServer = struct {
         self.backup_maintenance_queue.deinit(self.owner_alloc);
         self.backup_maintenance_mutex.unlock();
         self.mcp_sessions.deinit(self.owner_alloc);
+        self.memory_mcp_sessions.deinit(self.owner_alloc);
         self.a2a_tasks.deinit(self.owner_alloc);
         self.txn_sessions.deinit(self.alloc);
+        self.memory_work_cursors.deinit(self.alloc);
         if (self.opened_session_store) |opened| {
             opened.deinit();
             self.owner_alloc.destroy(opened);
@@ -4747,6 +4857,12 @@ pub const ApiHttpServer = struct {
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
         self.research_job_store.deinit();
+        self.document_job_store.deinit();
+        if (self.document_artifact_files) |*files| files.deinit();
+        if (self.document_artifact_configured) |configured| {
+            configured.deinit();
+            self.alloc.destroy(configured);
+        }
         self.repair_job_store.deinit();
         self.restore_job_store.deinit();
         self.scheduled_restore_jobs.deinit(self.alloc);
@@ -4791,6 +4907,7 @@ pub const ApiHttpServer = struct {
 
     pub fn attachReplicatedRestoreJobStore(self: *ApiHttpServer, persistence: restore_jobs.ReplicatedPersistence) !void {
         try self.restore_job_store.attachReplicated(persistence);
+        if (persistence.job_state.valid()) try self.document_job_store.attachReplicated(persistence.job_state);
     }
 
     /// Rotates worker ownership and rebuilds the runnable queue from replicated
@@ -4814,6 +4931,10 @@ pub const ApiHttpServer = struct {
 
     fn prepareRestoreLeadershipLocked(self: *ApiHttpServer, runtime: *db_mod.background_runtime.BackendRuntime, leadership_term: u64) !void {
         self.restore_leadership_term.store(0, .release);
+        platform_sync.lockYielding(&self.document_schedule_mutex);
+        const previous_documents_owner = self.document_job_owner_id.swap(0, .acq_rel);
+        self.document_schedule_mutex.unlock();
+        if (previous_documents_owner != 0) runtime.durable_jobs.closeOwner(previous_documents_owner);
         const previous_owner_id = self.restore_job_owner_id.swap(0, .acq_rel);
         // Wake both classes of sleepers after publishing the ownership change.
         // The earlier admission-pause signal keeps dispatch responsive; this
@@ -4828,6 +4949,15 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
         self.restore_jobs_resumed.store(false, .release);
         try self.restore_job_store.prepareReplicatedLeadership(self.alloc, leadership_term);
+        const document_ready = ready: {
+            self.document_job_store.prepareReplicatedLeadership(leadership_term) catch |err| {
+                std.log.warn("document job authority preparation deferred err={s}", .{@errorName(err)});
+                break :ready false;
+            };
+            break :ready true;
+        };
+        self.document_cursor = 0;
+        if (document_ready) self.document_job_owner_id.store(try runtime.allocOwnerId(), .release);
         self.restore_job_owner_id.store(try runtime.allocOwnerId(), .release);
         self.restore_leadership_term.store(leadership_term, .release);
         self.restore_dispatch_paused.store(false, .release);
@@ -4969,24 +5099,23 @@ pub const ApiHttpServer = struct {
         deadline_ns: u64,
         stream: kernel_abi.StreamSink,
     ) !connections_api.InvokeResult {
-        if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id)) {
-            return connections_api.invokeInferenceConnection(
-                alloc,
-                null,
-                self.cfg.node_config,
-                self.cfg.local_inference_connection_target,
-                self.cfg.secret_store,
-                connection_id,
-                operation,
-                body,
-                cancellation,
-                deadline_ns,
-                stream,
-            );
-        }
+        return self.invokeInferenceConnectionObserved(alloc, connection_id, operation, body, cancellation, deadline_ns, stream, null);
+    }
+
+    pub fn invokeInferenceConnectionObserved(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        connection_id: []const u8,
+        operation: []const u8,
+        body: []const u8,
+        cancellation: ?httpx.CancellationToken,
+        deadline_ns: u64,
+        stream: kernel_abi.StreamSink,
+        observer: ?httpx.AttemptObserver,
+    ) !connections_api.InvokeResult {
         var client = httpx.Client.initWithConfig(alloc, self.inferenceIo(), .{ .keep_alive = false });
         defer client.deinit();
-        return connections_api.invokeInferenceConnection(
+        return connections_api.invokeInferenceConnectionWithRequest(
             alloc,
             &client,
             self.cfg.node_config,
@@ -4998,6 +5127,8 @@ pub const ApiHttpServer = struct {
             cancellation,
             deadline_ns,
             stream,
+            .post,
+            .{ .attempt_observer = observer },
         );
     }
 
@@ -5245,10 +5376,17 @@ pub const ApiHttpServer = struct {
         // Durable transaction, repair, and reprocess job checkpoints are
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
-        if (!self.mutationBackgroundExecutionPermitted()) return;
+        if (!self.mutationBackgroundExecutionPermitted()) {
+            try self.scheduleDocumentsOnce();
+            return;
+        }
         self.recoverBackupCohortSlice() catch |err| switch (err) {
             error.UnsupportedOperation, error.Canceled, error.DeadlineExceeded => {},
             else => std.log.warn("backup cohort recovery deferred err={s}", .{@errorName(err)}),
+        };
+        self.scheduleMemoryOnce() catch |err| switch (err) {
+            error.UnsupportedOperation, error.MemoryRevisionConflict, error.MemoryCommitPending, error.MemoryRetryNotReady, error.StoredDestinationAuthorizationRevoked, error.StoredDestinationCredentialUnsupported, error.GroupLeaderUnavailable, error.TableNotFound => {},
+            else => std.log.warn("native memory maintenance deferred err={s}", .{@errorName(err)}),
         };
         self.advanceRelationalActivationOnce() catch |err| switch (err) {
             error.ConstraintActivationChanged,
@@ -5325,6 +5463,7 @@ pub const ApiHttpServer = struct {
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
         self.research_job_store.cleanupExpiredJobs();
+        try self.scheduleDocumentsOnce();
         self.repair_job_store.cleanupExpiredJobs();
         if (self.cfg.backend_runtime) |runtime| {
             _ = runtime.durable_jobs.poll(32) catch |err| {
@@ -5332,6 +5471,316 @@ pub const ApiHttpServer = struct {
             };
         }
     }
+
+    fn memoryIndexCatalog(self: *ApiHttpServer) ?@import("memory.zig").engine.IndexCatalog {
+        if (self.source.vtable.create_index == null and self.source.vtable.drop_index == null) return null;
+        return .{ .ptr = self, .create = memoryCreateIndex, .drop = memoryDropIndex };
+    }
+
+    fn memoryCreateIndex(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, name: []const u8, json: []const u8) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try self.source.createIndex(a, table, name, json);
+    }
+
+    fn memoryDropIndex(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, name: []const u8) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try self.source.dropIndex(a, table, name);
+    }
+
+    pub fn documentJobsFailoverSafe(self: *const ApiHttpServer) bool {
+        return self.document_job_store.replicated != null and (if (self.cfg.document_artifact_store) |store| store.shared_across_owners and store.namespace_identity != null else false);
+    }
+    pub fn documentExecutionPermitted(self: *ApiHttpServer) bool {
+        if (self.cfg.deployment_mode == .distributed and (self.cfg.restore_execution_guard == null or !self.documentJobsFailoverSafe())) return false;
+        const term = self.restore_leadership_term.load(.acquire);
+        if (self.document_job_store.replicated != null and (term == 0 or self.document_job_store.replicated_term.load(.acquire) != term)) return false;
+        const coordinated = self.documentJobsFailoverSafe();
+        return !self.restore_jobs_closing.load(.acquire) and (self.mutationBackgroundExecutionPermitted() or coordinated) and self.restoreExecutionPermitted();
+    }
+    pub fn scheduleDocumentsOnce(self: *ApiHttpServer) !void {
+        if (!self.document_schedule_mutex.tryLock()) return;
+        defer self.document_schedule_mutex.unlock();
+        const module = @import("document_jobs.zig");
+        const runs = @import("antfly_readers").document_runs;
+        if (self.document_job_store.replicated != null and self.document_job_owner_id.load(.acquire) == 0 and self.restoreExecutionPermitted()) {
+            const term = self.restore_leadership_term.load(.acquire);
+            if (term == 0) return;
+            try self.document_job_store.prepareReplicatedLeadership(term);
+            if (term != self.restore_leadership_term.load(.acquire)) return;
+            const runtime = self.cfg.backend_runtime orelse return;
+            self.document_job_owner_id.store(try runtime.allocOwnerId(), .release);
+        }
+        if (!self.document_job_store.durable() or !self.documentExecutionPermitted()) return;
+        var persistence = module.context(self) catch return;
+        const Owner = struct {
+            server: *ApiHttpServer,
+            term: u64,
+            fn cancelled(raw: *const anyopaque) bool {
+                const owner: *const @This() = @ptrCast(@alignCast(raw));
+                return !owner.server.documentExecutionPermitted() or owner.server.restore_leadership_term.load(.acquire) != owner.term;
+            }
+            fn check(raw: *anyopaque) !void {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                if (!owner.server.documentExecutionPermitted() or owner.server.restore_leadership_term.load(.acquire) != owner.term) return error.DocumentRunLeaseLost;
+            }
+        };
+        var owner_scope = Owner{ .server = self, .term = self.restore_leadership_term.load(.acquire) };
+        persistence.authority = .{ .ptr = &owner_scope, .check_fn = Owner.check };
+        persistence.cancellation = .{ .ptr = &owner_scope, .is_cancelled_fn = Owner.cancelled };
+        const count = @min(32, self.document_job_store.documentCount());
+        for (0..count) |_| {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const outer = (try self.document_job_store.nextDocument(a, &self.document_cursor)) orelse return;
+            const record = try std.json.parseFromSliceLeaky(runs.Record, a, outer.request, .{});
+            const now_ms = research_jobs.nowMillis();
+            if (outer.maintenance_not_before_ms > now_ms) continue;
+            if (record.retention_until_ms != 0 and now_ms >= record.retention_until_ms) {
+                if (!self.documentExecutionPermitted()) return;
+                _ = try persistence.collectExpired(a, record.run_id, record.owner, 32);
+                continue;
+            }
+            if (record.not_before_ms > now_ms or record.retired or record.state == .succeeded or record.state == .failed or record.state == .cancelled or (record.state == .running and record.lease_until_ms > now_ms)) continue;
+            const runtime = self.cfg.backend_runtime orelse return;
+            if (runtime.threaded_jobs == null or self.document_job_owner_id.load(.acquire) == 0) return;
+            if (self.document_work_in_flight.load(.acquire) >= 4) return;
+            var duplicate = false;
+            for (self.scheduled_documents) |entry| if (entry) |id| {
+                if (std.mem.eql(u8, id, record.run_id)) {
+                    duplicate = true;
+                    break;
+                }
+            };
+            if (duplicate) continue;
+            const slot = for (self.scheduled_documents, 0..) |entry, index| {
+                if (entry == null) break index;
+            } else return;
+            const Work = module.Work(ApiHttpServer);
+            const work = try self.alloc.create(Work);
+            errdefer self.alloc.destroy(work);
+            const id = try self.alloc.dupe(u8, record.run_id);
+            errdefer self.alloc.free(id);
+            const owner = try self.alloc.dupe(u8, record.owner);
+            errdefer self.alloc.free(owner);
+            work.* = .{ .server = self, .id = id, .owner = owner, .term = self.restore_leadership_term.load(.acquire), .slot = slot };
+            self.scheduled_documents[slot] = id;
+            _ = self.document_work_in_flight.fetchAdd(1, .acq_rel);
+            runtime.durable_jobs.submit(.{ .owner_id = self.document_job_owner_id.load(.acquire), .class = .maintenance, .ptr = work, .run = Work.run, .deinit = Work.deinit }) catch |err| {
+                _ = self.document_work_in_flight.fetchSub(1, .acq_rel);
+                self.scheduled_documents[slot] = null;
+                return err;
+            };
+        }
+    }
+
+    const MemoryMaintenanceWork = struct {
+        server: *ApiHttpServer,
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.server.advanceMemoryOnce();
+        }
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.server.memory_in_flight.store(false, .release);
+            self.server.alloc.destroy(self);
+        }
+    };
+    fn scheduleMemoryOnce(self: *ApiHttpServer) !void {
+        // Serialize cursor ownership in both threaded and inline runtimes.
+        if (self.memory_in_flight.swap(true, .acq_rel)) return;
+        var submitted = false;
+        defer if (!submitted) self.memory_in_flight.store(false, .release);
+        const runtime = self.cfg.backend_runtime orelse return self.advanceMemoryOnce();
+        if (runtime.threaded_jobs == null or self.session_maintenance_owner_id == 0) return self.advanceMemoryOnce();
+        const work = try self.alloc.create(MemoryMaintenanceWork);
+        errdefer self.alloc.destroy(work);
+        work.* = .{ .server = self };
+        // Closing this existing owner joins session cleanup and memory tasks
+        // before either server resources or selection cursors are freed.
+        try runtime.durable_jobs.submit(.{ .owner_id = self.session_maintenance_owner_id, .class = .maintenance, .ptr = work, .run = MemoryMaintenanceWork.run, .deinit = MemoryMaintenanceWork.deinit });
+        submitted = true;
+    }
+    fn advanceMemoryOnce(self: *ApiHttpServer) !void {
+        const module = @import("memory.zig");
+        const reader = self.table_reads orelse return;
+        const writer = self.table_writes orelse return;
+        var snapshot = (try self.controlAdminSnapshot()) orelse return;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        if (snapshot.ranges.len == 0) return;
+        const owner_range = snapshot.ranges[self.memory_range_cursor.fetchAdd(1, .monotonic) % snapshot.ranges.len];
+        if (self.cfg.relational_maintenance_leadership) |leadership| {
+            if (!leadership.isLocalLeader(owner_range.group_id)) return;
+        } else if (self.cfg.deployment_mode != .standalone) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const table = for (snapshot.tables) |entry| {
+            if (entry.table_id == owner_range.table_id) break entry.name;
+        } else return;
+        const control = (try reader.lookup(a, table, "control", .{}, .read_index)) orelse return;
+        const control_json = module.engine.decodeRow(a, control.json) catch return;
+        const state = std.json.parseFromSliceLeaky(module.memory.types.State, a, control_json, .{}) catch return;
+        if (state.space.len == 0) return;
+        var deadline: MemoryWorkDeadline = .{ .server = self, .group_id = owner_range.group_id, .end = platform_time.monotonicNs() +| MemoryWorkDeadline.finalization_ns };
+        const context: module.memory.Context = .{ .check_ptr = &deadline, .check_fn = MemoryWorkDeadline.check, .principal = state.owner, .admin = false, .now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms) };
+        var adapter: module.engine.Routed = .{ .table = table, .reads = reader, .writes = writer, .index_catalog = self.memoryIndexCatalog(), .context = context };
+        adapter.request = .{ .deadline_ns = deadline.end };
+        const entry = try self.memory_work_cursors.getOrPut(self.alloc, owner_range.table_id);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        var work: MemoryWorkExecution = .{ .server = self, .alloc = a, .table = table, .state = state, .context = context, .deadline = &deadline };
+        try @import("antfly_local_sources").memory_scheduling.advance(adapter.backend(), a, context.now_ms, state, entry.value_ptr, .{ .ptr = &work, .execute = MemoryWorkExecution.execute });
+    }
+    fn memoryClockMs() i64 {
+        return @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
+    }
+    const MemoryWorkDeadline = struct {
+        // Selection/cleanup and durable finalization stay short. Model work has
+        // its own bounded budget, leaving time to record a provider timeout.
+        const inference_ns = 120 * std.time.ns_per_s;
+        const finalization_ns = 5 * std.time.ns_per_s;
+        server: *ApiHttpServer,
+        group_id: u64,
+        end: u64,
+        fn beginProcessing(self: *@This(), now: u64) u64 {
+            const inference_end = now +| inference_ns;
+            self.end = inference_end +| finalization_ns;
+            return inference_end;
+        }
+        fn beginExecution(self: *@This(), backend: @import("memory.zig").memory.Backend, a: std.mem.Allocator, now: u64, now_ms: i64, state: @import("memory.zig").memory.types.State, pending: ?@import("memory.zig").memory.types.Operation) !u64 {
+            // Maintenance has no pending receipt, but semantic backfills and
+            // refreshes perform model work. Keep retention on its short lane.
+            const models = pending != null or try @import("antfly_local_sources").memory_scheduling.maintenanceKind(backend, a, now_ms, state) == .semantic;
+            return if (models) self.beginProcessing(now) else self.end;
+        }
+        fn beginFinalization(self: *@This(), now: u64) void {
+            self.end = now +| finalization_ns;
+        }
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.checkAt(platform_time.monotonicNs());
+        }
+        fn checkAt(self: *@This(), now: u64) !void {
+            if (self.server.cfg.relational_maintenance_leadership) |leadership| {
+                if (!leadership.isLocalLeader(self.group_id)) return error.NotLeader;
+            } else if (self.server.cfg.deployment_mode != .standalone) return error.NotLeader;
+            if (now >= self.end) return error.DeadlineExceeded;
+        }
+    };
+    const MemoryWorkExecution = struct {
+        server: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table: []const u8,
+        state: @import("memory.zig").memory.types.State,
+        context: @import("memory.zig").memory.Context,
+        deadline: *MemoryWorkDeadline,
+
+        fn execute(ptr: *anyopaque, pending: ?@import("memory.zig").memory.types.Operation) !void {
+            const work: *@This() = @ptrCast(@alignCast(ptr));
+            const server = work.server;
+            const a = work.alloc;
+            const table = work.table;
+            const state = work.state;
+            const module = @import("memory.zig");
+            var context = work.context;
+            context.now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
+            context.clock_ms_fn = memoryClockMs;
+            try context.check();
+            var adapter: module.engine.Routed = .{ .table = table, .reads = server.table_reads.?, .writes = server.table_writes.?, .index_catalog = server.memoryIndexCatalog(), .context = context };
+            adapter.request = .{ .deadline_ns = work.deadline.end };
+            const inference_deadline = try work.deadline.beginExecution(adapter.backend(), a, platform_time.monotonicNs(), context.now_ms, state, pending);
+            const executor = if (pending) |item| item.execution_principal else state.execution_principal;
+            const signature = if (pending) |item| item.execution_signature else state.execution_signature;
+            context.principal = if (pending) |item| item.owner else if (state.execution_owner.len > 0) state.execution_owner else state.owner;
+            const table_label = try std.fmt.allocPrint(a, "memory_{s}", .{state.space});
+            const logical = if (server.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = state.database, .namespace = state.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
+            const bound_logical = (try server.logicalTableNamesInArena(a, .{}, &.{table}))[0];
+            if (!std.mem.eql(u8, logical, bound_logical)) return error.StoredDestinationAuthorizationInvalid;
+            const payload = try std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = logical, .owner = context.principal }, .{});
+            const authority: stored_destination_authorization.Authorizer = .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled };
+            try authority.authorize(a, executor, &.{}, payload, signature);
+            if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal)) {
+                context.admin = !server.cfg.auth_enabled;
+            } else {
+                const manager = server.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
+                const permissions = if (std.mem.startsWith(u8, executor, "basic:")) try manager.getPermissionsForUser(executor[6..]) else if (std.mem.startsWith(u8, executor, "api-key:")) try manager.effectiveApiKeyPermissions(executor[8..]) else return error.StoredDestinationCredentialUnsupported;
+                defer {
+                    for (permissions) |*permission| permission.deinit(manager.alloc);
+                    manager.alloc.free(permissions);
+                }
+                if (!permissionsAllow(permissions, .table, logical, .read)) return error.StoredDestinationAuthorizationRevoked;
+                const filters = try manager.durableCredentialRowFilters(executor);
+                defer {
+                    for (filters) |*filter| filter.deinit(manager.alloc);
+                    manager.alloc.free(filters);
+                }
+                if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
+                context.admin = permissionsAllow(permissions, .table, logical, .admin);
+                context.curator = permissionsAllow(permissions, .table, logical, .curator);
+            }
+            var publication: MemoryPublicationAuthority = .{ .server = server, .alloc = a, .executor = executor, .signature = signature, .payload = payload, .logical = logical, .table = table, .required = if (pending) |item| switch (module.memory.operationGrant(item)) {
+                .write => .write,
+                .curator => .curator,
+                .admin => .admin,
+            } else .admin };
+            context.grant_ptr = &publication;
+            context.require_grant_fn = MemoryPublicationAuthority.requireGrant;
+            context.final_check_ptr = &publication;
+            context.final_check_fn = MemoryPublicationAuthority.check;
+            context.execution_principal = executor;
+            context.execution_signature = signature;
+            context.table_id = state.table_id;
+            context.database = state.database;
+            context.namespace = state.namespace;
+            context.space = state.space;
+            var resources: MemoryResourceReader = .{ .server = server, .executor = executor, .database = state.database, .request = .{ .deadline_ns = work.deadline.end } };
+            var checkpoint: MemoryWorkCheckpoint = .{ .deadline = work.deadline, .adapter = &adapter, .resources = &resources };
+            context.checkpoint_ptr = &checkpoint;
+            context.checkpoint_fn = MemoryWorkCheckpoint.begin;
+            adapter.resource_ptr = &resources;
+            adapter.resource_fn = MemoryResourceReader.read;
+            adapter.context = context;
+            adapter.request = .{ .deadline_ns = work.deadline.end };
+            const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
+            const runtime = try Runtime.createOwned(a, server.inferenceIo(), .{ .provider_runtime = &server.embedding_provider_runtime, .antfly_provider = server.antfly_provider, .inference_api_url = server.configuredInferenceAPIURL(), .secret_store = server.cfg.secret_store, .source_table = table });
+            defer runtime.deinit();
+            var bridge: @import("antfly_local_sources").memory_models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = server.inferenceIo(), .deadline_ns = inference_deadline, .max_response_bytes = state.config.max_input_bytes }), .alloc = a, .embedding_options = .{ .deadline_ns = inference_deadline, .bounded_http_request = true, .antfly_provider = server.antfly_provider, .io = server.inferenceIo(), .secret_store = server.cfg.secret_store, .inference_api_url = server.configuredInferenceAPIURL(), .source_table = table } };
+            const token = try std.fmt.allocPrint(a, "worker:{d}:{s}", .{ state.revision, if (pending) |item| item.id else "maintenance" });
+            const service: module.memory.Service = .{ .backend = bridge.backend(), .context = context };
+            _ = service.advanceAtRevision(a, if (pending) |item| item.id else "", token, state.revision) catch |err| {
+                if (!module.memory.isProcessingTimeout(err) or pending == null) return err;
+                // A provider that overruns its deadline, or storage work that
+                // exhausts the grace period, must not erase the retry attempt.
+                // Re-enter policy with fresh live authority and a bounded budget.
+                // The revision/receipt fence prevents double charging an
+                // ambiguously committed result or modifying newer work.
+                work.deadline.beginFinalization(platform_time.monotonicNs());
+                context.now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
+                adapter.context = context;
+                adapter.request.deadline_ns = work.deadline.end;
+                resources.request.deadline_ns = work.deadline.end;
+                _ = (module.memory.Service{ .backend = bridge.backend(), .context = context }).recordAttemptFailure(a, pending.?.id, token, state.revision, err) catch |failure| {
+                    if (failure == error.MemoryRevisionConflict) return;
+                    return failure;
+                };
+                return;
+            };
+        }
+    };
+
+    const MemoryWorkCheckpoint = struct {
+        deadline: *MemoryWorkDeadline,
+        adapter: *@import("memory.zig").engine.Routed,
+        resources: *MemoryResourceReader,
+        fn begin(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.deadline.beginFinalization(platform_time.monotonicNs());
+            self.adapter.request.deadline_ns = self.deadline.end;
+            self.resources.request.deadline_ns = self.deadline.end;
+            // Policy rechecks live leadership/grants and every captured source
+            // before publishing the retained projections and resumable cursor.
+        }
+    };
 
     fn advanceRelationalActivationOnce(self: *ApiHttpServer) !void {
         const reader = self.table_reads orelse return;
@@ -5846,12 +6295,13 @@ pub const ApiHttpServer = struct {
                     }) orelse continue;
                 },
                 .commit => |*commit| {
-                    const distributed_tables = commit.request.distributedTables(self.alloc) catch |err| {
+                    const distributed_view = commit.request.distributedTables(self.alloc) catch |err| {
                         std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                         _ = self.txn_sessions.remove(self.alloc, txn_id);
                         continue;
                     };
-                    defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
+                    defer distributed_view.deinit();
+                    const distributed_tables = distributed_view.tables;
                     var execution_plan = if (commit.execution_plan) |bytes| transactions_api.parseExecutionPlan(self.alloc, bytes) catch |err| {
                         // A damaged durable plan is not permission to re-plan
                         // or discard a potentially committed transaction.
@@ -8177,6 +8627,7 @@ pub const ApiHttpServer = struct {
                 .{ jsonStringField(payload.get("iss")) orelse "", subject },
             ),
             .is_internal_service = is_internal_service,
+            .mcp_creation_discovery = jsonBoolField(payload.get("mcp_creation_discovery")),
             .permissions = permissions,
             .row_filter = row_filters,
             .metadata_json = metadata_json,
@@ -16388,6 +16839,16 @@ pub const ApiHttpServer = struct {
         self.activateLakeCommit(&prepared);
     }
 
+    /// Keep derived read failures bound to the exact publication generation.
+    pub fn attachLakeRepairHint(self: *ApiHttpServer, source: *@import("antfly_local_sources").serverless_query_lake_serving.ServingSource) void {
+        source.repair_hint = .{ .ptr = self, .report = struct {
+            fn report(raw: *anyopaque, table: u64, generation: u64, token: [16]u8) void {
+                const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
+                server.lake_index_repairs.report(table, generation, token);
+            }
+        }.report };
+    }
+
     /// Read-side freshness checks can observe an external commit before the
     /// periodic inventory sweep. Coalesce that hint without resetting an active
     /// build's generation, failure count, or retry deadline on every poll.
@@ -16675,7 +17136,12 @@ pub const ApiHttpServer = struct {
                 context = reader_lease.?.readContext();
             }
         }
-        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace, .read = Hooks.read }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
+        var repair_state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
+        defer repair_state.deinit();
+        const repair_publication = repair_state.value.published;
+        const force_rebuild = if (repair_publication) |ready| self.lake_index_repairs.contains(table.table_id, ready) else false;
+        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace, .read = Hooks.read }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .force_rebuild = force_rebuild, .identity_spill_bytes = if (self.cfg.node_config) |node| node.lake_indexes.row_identity.max_spill_bytes else 1024 * 1024 * 1024, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
+        if (repair_publication) |ready| self.lake_index_repairs.forget(table.table_id, ready);
         @import("lake_index_navigation_warming.zig").warmPublication(a, self, table) catch |err| {
             std.log.debug("native lake startup navigation warming deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };
@@ -16770,6 +17236,7 @@ pub const ApiHttpServer = struct {
             error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
             error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
                 std.log.err("public create index normalization failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -16788,6 +17255,7 @@ pub const ApiHttpServer = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
                 std.log.err("public create index validation failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -16842,6 +17310,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -16865,6 +17334,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.InvalidCreateTableRequest => return error.InvalidIndexRequest,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
@@ -21245,6 +21715,243 @@ pub const ApiHttpServer = struct {
         return alloc.dupe(u8, table.name);
     }
 
+    const MemoryResourceReader = struct {
+        server: *ApiHttpServer,
+        identity: ?*const ?AuthenticatedIdentity = null,
+        executor: []const u8 = "",
+        database: []const u8,
+        request: api_operation.RequestContext = .{},
+        fn read(ptr: *anyopaque, a: std.mem.Allocator, reference: @import("memory.zig").memory.types.provenance.Resource) !@import("memory.zig").memory.types.provenance.Snapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const server = self.server;
+            if (!std.mem.eql(u8, reference.database, self.database)) return .{ .state = .denied };
+            var identity: ?AuthenticatedIdentity = null;
+            defer if (identity) |*value| value.deinit(server.alloc);
+            if (self.identity) |borrowed| {
+                identity = try cloneCatalogIdentity(server.alloc, borrowed.*);
+            } else if (server.cfg.auth_enabled) {
+                const manager = server.cfg.user_manager orelse return .{ .state = .denied };
+                const permissions = if (std.mem.startsWith(u8, self.executor, "basic:")) try manager.getPermissionsForUser(self.executor[6..]) else if (std.mem.startsWith(u8, self.executor, "api-key:")) try manager.effectiveApiKeyPermissions(self.executor[8..]) else return .{ .state = .denied };
+                defer {
+                    for (permissions) |*permission| permission.deinit(manager.alloc);
+                    manager.alloc.free(permissions);
+                }
+                const filters = try manager.durableCredentialRowFilters(self.executor);
+                defer {
+                    for (filters) |*filter| filter.deinit(manager.alloc);
+                    manager.alloc.free(filters);
+                }
+                if (filters.len > 0) return .{ .state = .denied };
+                identity = try cloneCatalogIdentity(server.alloc, .{ .username = @constCast(self.executor), .permissions = permissions, .live_user_manager = manager, .credential_principal = @constCast(self.executor) });
+            }
+            if (server.cfg.auth_enabled and identity == null) return .{ .state = .denied };
+            var context = self.request;
+            context.native_service = null;
+            context.row_policy_credential = &identity;
+            const logical = if (reference.storage_name) |storage| (server.logicalTableNamesInArena(a, context, &.{storage}) catch |err| switch (err) {
+                error.TableNotFound => return .{ .state = .missing },
+                error.Forbidden, error.Unauthorized => return .{ .state = .denied },
+                else => return err,
+            })[0] else try (system_catalog.Target{ .database = reference.database, .namespace = reference.namespace, .table = reference.table }).resourceNameAlloc(a);
+            const current_target = try system_catalog.Target.parse(logical);
+            if (!std.mem.eql(u8, current_target.database, self.database)) return .{ .state = .denied };
+            if (!try tablePermissionCurrentlyAllowed(identity, logical, .read)) return .{ .state = .denied };
+            const filter = (try resolveEffectiveRowFilterJson(a, identity, logical)) orelse "";
+            if (filter.len != 0) return .{ .state = .denied };
+            var table_id: ?u64 = null;
+            const table = server.resolveCatalogKeyAlloc(a, context, logical, &identity, &table_id) catch |err| switch (err) {
+                error.Forbidden, error.Unauthorized => return .{ .state = .denied },
+                error.TableNotFound => return .{ .state = .missing },
+                else => return err,
+            };
+            if (table_id == null or (reference.table_id != 0 and table_id.? != reference.table_id)) return .{ .state = .missing };
+            const reads = server.table_reads orelse return error.MemoryCapabilityUnavailable;
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const row = (try reads.lookup(scratch.allocator(), table, reference.id, .{ .execution_deadline_ns = context.deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return .{ .state = .missing };
+            var snapshot = try @import("memory.zig").memory.types.provenance.snapshot(a, reference, table_id.?, row.version, row.json, row.expected_content_digest);
+            snapshot.storage_name = table;
+            return snapshot;
+        }
+    };
+
+    const MemoryPublicationAuthority = struct {
+        server: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        executor: []const u8,
+        signature: []const u8,
+        payload: []const u8,
+        logical: []const u8,
+        table: []const u8,
+        identity: ?*const ?AuthenticatedIdentity = null,
+        request: ?*api_operation.RequestContext = null,
+        required: usermgr.PermissionType = .write,
+        fn requireGrant(ptr: *anyopaque, grant: @import("memory.zig").memory.types.RequiredGrant) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.required = switch (grant) {
+                .write => .write,
+                .curator => .curator,
+                .admin => .admin,
+            };
+            try check(ptr);
+        }
+        fn check(ptr: *anyopaque) !void {
+            const authority: *@This() = @ptrCast(@alignCast(ptr));
+            const server = authority.server;
+            if (authority.identity) |identity| {
+                if (identity.* == null and server.cfg.auth_enabled) return error.Unauthorized;
+                if (!try tablePermissionCurrentlyAllowed(identity.*, authority.table, authority.required)) return error.Forbidden;
+                if (authority.request) |request| {
+                    const filter = try server.authorizedReadFilter(authority.alloc, request.*, authority.table);
+                    if (filter.len != 0) return error.MemoryRowPolicyUnsupported;
+                }
+            }
+            if (authority.signature.len == 0) return;
+            const verifier: stored_destination_authorization.Authorizer = .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled };
+            try verifier.authorize(authority.alloc, authority.executor, &.{}, authority.payload, authority.signature);
+            if (std.mem.eql(u8, authority.executor, stored_destination_authorization.auth_disabled_principal)) return;
+            const manager = server.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
+            const permissions = if (std.mem.startsWith(u8, authority.executor, "basic:")) try manager.getPermissionsForUser(authority.executor[6..]) else if (std.mem.startsWith(u8, authority.executor, "api-key:")) try manager.effectiveApiKeyPermissions(authority.executor[8..]) else return error.StoredDestinationCredentialUnsupported;
+            defer {
+                for (permissions) |*permission| permission.deinit(manager.alloc);
+                manager.alloc.free(permissions);
+            }
+            if (!permissionsAllow(permissions, .table, authority.logical, authority.required)) return error.StoredDestinationAuthorizationRevoked;
+            const filters = try manager.durableCredentialRowFilters(authority.executor);
+            defer {
+                for (filters) |*filter| filter.deinit(manager.alloc);
+                manager.alloc.free(filters);
+            }
+            if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
+        }
+    };
+
+    /// Capabilities borrow the owned credential that catalog resolution projects.
+    /// The original HTTP credential cannot authorize opaque storage aliases, and
+    /// non-HTTP adapters do not supply HTTP-specific authorization callbacks.
+    const MemoryIngressCredential = struct {
+        fn read(ptr: *const anyopaque, table: []const u8) bool {
+            const identity: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+            const value = identity.* orelse return true;
+            return permissionsAllow(value.permissions, .table, table, .read);
+        }
+        fn curate(ptr: *const anyopaque, table: []const u8) bool {
+            const identity: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+            const value = identity.* orelse return true;
+            return permissionsAllow(value.permissions, .table, table, .curator);
+        }
+        fn write(ptr: *const anyopaque, table: []const u8) bool {
+            const identity: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+            const value = identity.* orelse return true;
+            return permissionsAllow(value.permissions, .table, table, .write);
+        }
+    };
+
+    /// Native memory ingress shared by HTTP and MCP. Authentication stays at
+    /// the ingress; catalog grants and provenance policy are enforced here.
+    pub fn executeMemoryService(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
+        return self.executeMemoryServiceInner(space, input, borrowed_identity, borrowed_context) catch |err| {
+            const status_code = @import("memory.zig").status(err);
+            return contextual_operations.jsonWithStatus(status_code, try std.json.Stringify.valueAlloc(self.alloc, .{ .code = @errorName(err), .@"error" = @errorName(err), .retryable = status_code == 503 or status_code == 429 }, .{}), false);
+        };
+    }
+    fn executeMemoryServiceInner(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
+        const module = @import("memory.zig");
+        try module.memory.types.validateId(space);
+        if (std.mem.indexOfAny(u8, space, "/.\\%") != null) return error.InvalidMemoryId;
+        if (borrowed_identity == null and self.cfg.auth_enabled) return error.Unauthorized;
+        if (self.source.vtable.system_catalog == null) return error.MemoryCapabilityUnavailable;
+        if (module.memory.mutates(input.action) and (input.idempotency_key.len == 0 or input.idempotency_key.len > 256)) return error.MemoryIdempotencyKeyRequired;
+        const admitted = if (module.memory.mutates(input.action)) self.tryAcquireWrite() else self.tryAcquireQuery();
+        if (!admitted) return error.MemoryOverloaded;
+        defer if (module.memory.mutates(input.action)) self.releaseWrite() else self.releaseQuery();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try module.memory.screenIdentity(a, space);
+        const table_label = try std.fmt.allocPrint(a, "memory_{s}", .{space});
+        const logical = if (self.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = input.database, .namespace = input.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
+        var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
+        defer if (identity) |*value| value.deinit(self.alloc);
+        // Native storage/provider requests carry platform-monotonic budgets.
+        // Translate once while retaining the ingress fanout capability.
+        var request = try borrowed_context.platformDeadline();
+        request.native_service = .memory;
+        request.row_policy_credential = &identity;
+        request.table_read_authorization = .{ .ptr = &identity, .allows = MemoryIngressCredential.read };
+        request.table_write_authorization = .{ .ptr = &identity, .allows = if (module.memory.actionGrant(input.action) == .curator) MemoryIngressCredential.curate else MemoryIngressCredential.write };
+        request.principal = if (identity) |value| .{ .kind = .user, .subject = value.username } else null;
+        const required: usermgr.PermissionType = if (input.action == .advance and input.id.len == 0) .admin else switch (module.memory.actionGrant(input.action)) {
+            .admin => .admin,
+            .curator => .curator,
+            .write => if (module.memory.mutates(input.action)) .write else .read,
+        };
+        if (input.action == .create) {
+            const config = try std.json.parseFromSliceLeaky(module.memory.types.Config, a, try @import("antfly-json").stringifyValueAlloc(a, input.body), .{ .ignore_unknown_fields = false });
+            try config.validate();
+            if (identity) |value| if (!permissionsAllow(value.permissions, .table, logical, .admin)) return error.Forbidden;
+            const physical = if (self.source.vtable.system_catalog != null) try self.catalogStorageNameAlloc(a) else logical;
+            const create: tables_api.CreateTableRequest = .{ .num_shards = 1 };
+            var created = true;
+            self.createNativeMemoryTable(a, request, logical, physical, create) catch |err| switch (err) {
+                error.TableAlreadyExists, error.CatalogAlreadyExists, error.AlreadyExists, error.ObjectAlreadyExists => created = false,
+                else => return err,
+            };
+            if (created) _ = self.materializeCommittedTableCreate(a, physical, create);
+        }
+        var table_id: ?u64 = null;
+        const table = try self.resolveCatalogKeyAlloc(a, request, logical, &identity, &table_id);
+        if (identity) |value| if (!permissionsAllow(value.permissions, .table, table, required)) return error.Forbidden;
+        const row_filter = try self.authorizedReadFilter(a, request, table);
+        if (row_filter.len != 0) return error.MemoryRowPolicyUnsupported;
+        if (module.memory.mutates(input.action)) try self.authorizeIntegrityMutations(request, &.{.{ .table_name = table, .writes = &.{.{ .key = "control", .value = "{}" }} }});
+        const Check = struct {
+            fn call(ptr: *anyopaque) !void {
+                try (@as(*api_operation.RequestContext, @ptrCast(@alignCast(ptr)))).ensureActive();
+            }
+        };
+        const owner = if (identity) |value| value.username else "local";
+        const executor = storedDestinationPrincipal(identity);
+        const grant_payload = try std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = logical, .owner = owner }, .{});
+        const signature = if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal))
+            "auth-disabled"
+        else if (self.cfg.user_manager) |manager| blk: {
+            const mac = manager.destinationGrantMac(executor, grant_payload) catch break :blk "";
+            break :blk try a.dupe(u8, &std.fmt.bytesToHex(mac, .lower));
+        } else "";
+        var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = grant_payload, .logical = logical, .table = table, .identity = &identity, .request = &request, .required = required };
+        const context: module.memory.Context = .{
+            .branch = input.branch,
+            .table_id = table_id orelse 0,
+            .grant_ptr = &publication,
+            .require_grant_fn = MemoryPublicationAuthority.requireGrant,
+            .final_check_ptr = &publication,
+            .final_check_fn = MemoryPublicationAuthority.check,
+            .database = input.database,
+            .namespace = input.namespace,
+            .space = space,
+            .execution_principal = executor,
+            .execution_signature = signature,
+            .durable_execution_required = true,
+            .clock_ms_fn = memoryClockMs,
+            .principal = owner,
+            .admin = if (identity) |value| permissionsAllow(value.permissions, .table, table, .admin) else !self.cfg.auth_enabled,
+            .curator = if (identity) |value| permissionsAllow(value.permissions, .table, table, .curator) else !self.cfg.auth_enabled,
+            .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms),
+            .check_ptr = &request,
+            .check_fn = Check.call,
+        };
+        var resources: MemoryResourceReader = .{ .server = self, .identity = &identity, .database = input.database, .request = request };
+        var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .index_catalog = self.memoryIndexCatalog(), .context = context, .request = request, .resource_ptr = &resources, .resource_fn = MemoryResourceReader.read };
+        const models = @import("antfly_local_sources").memory_models;
+        const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
+        const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .provider_runtime = &self.embedding_provider_runtime, .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
+        defer runtime.deinit();
+        var bridge: models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = self.inferenceIo(), .deadline_ns = request.deadline_ns, .cancellation = request.cancellation }), .alloc = a, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.inferenceIo(), .bounded_http_request = true, .deadline_ns = request.deadline_ns, .cancellation = request.cancellation, .secret_store = self.cfg.secret_store, .inference_api_url = self.configuredInferenceAPIURL(), .source_table = table } };
+        const result = try (module.memory.Service{ .backend = bridge.backend(), .context = context }).execute(self.alloc, input.action, input.id, try @import("antfly-json").stringifyValueAlloc(a, input.body), input.idempotency_key);
+        return contextual_operations.jsonWithStatus(if (input.action == .create) 201 else 200, result, false);
+    }
+
     pub fn executeMcpApplicationOperation(
         self: *ApiHttpServer,
         input: contextual_operations.McpApplicationOperation,
@@ -21375,6 +22082,23 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn createNativeMemoryTable(self: *ApiHttpServer, alloc: std.mem.Allocator, borrowed_context: api_operation.RequestContext, logical: []const u8, physical: []const u8, create: tables_api.CreateTableRequest) !void {
+        const target = try system_catalog.Target.parse(logical);
+        var context = borrowed_context;
+        // This is node-internal provisioning authority after memory's catalog
+        // table-admin admission, never a caller-provided override.
+        context.setting_admin = true;
+        context.native_service = .memory;
+        const body = try tables_api.encodeStoredCreateTableRequestAlloc(alloc, create);
+        defer alloc.free(body);
+        const result = try self.source.systemCatalog(alloc, context, .{ .native_memory_create = .{
+            .mutation = .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table },
+            .physical_name = physical,
+            .create_table_json = body,
+        } });
+        alloc.free(result);
+    }
+
     fn createNativeOrLegacyTable(self: *ApiHttpServer, logical_name: []const u8, physical_name: []const u8, request: tables_api.CreateTableRequest, identity: ?AuthenticatedIdentity) !void {
         if (self.source.vtable.system_catalog == null) return self.source.createTable(self.alloc, physical_name, request);
         const target = try system_catalog.Target.parse(logical_name);
@@ -21428,6 +22152,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
             error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.InferenceEndpointAccessDenied => try contextualJsonResponse(self.alloc, 400, .{ .@"error" = "invalid_index_request", .message = public_table_http.inference_endpoint_access_denied_message, .retryable = false }),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
             error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment must declare positive expected_dims"),
@@ -21453,6 +22178,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
             error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.InferenceEndpointAccessDenied => try contextualJsonResponse(self.alloc, 400, .{ .@"error" = "invalid_index_request", .message = public_table_http.inference_endpoint_access_denied_message, .retryable = false }),
             error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
             error.MissingEmbeddingArtifactProducer => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment has no producer configuration"),
@@ -25913,7 +26639,7 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
             ) == null) {
                 if (physical_evidence_available) try validatePublicMappedSortCoverage(field.field, mapping);
             }
-            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, cursor[i]);
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, mapping.missing_null_policy, cursor[i]);
             continue;
         }
 
@@ -25922,8 +26648,8 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
             query_req.primary_text_index_name orelse query_req.index_name,
             physical,
             null,
-        )) |field_type| {
-            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, field_type, cursor[i]);
+        )) |evidence| {
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, evidence.field_type, evidence.policy, cursor[i]);
             continue;
         }
 
@@ -26143,6 +26869,7 @@ fn validatePublicObservedSortField(capability: storage_schema.FieldCapability, e
         recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", "missing_doc_values_capability");
         return error.UnsupportedExactSort;
     }
+    if (std.mem.eql(u8, capability.missing_null_policy, "nulls_ordered")) return capability.field_type;
     if (!std.mem.eql(u8, capability.doc_value_coverage, "covered") or
         !std.mem.eql(u8, capability.queryability_state, "queryable"))
     {
@@ -26157,6 +26884,7 @@ fn validatePublicObservedSortField(capability: storage_schema.FieldCapability, e
 }
 
 fn validatePublicMappedSortCoverage(field: []const u8, mapping: storage_schema.FieldMapping) !void {
+    if (mapping.missing_null_policy == .nulls_ordered) return;
     const coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
     const queryability = storage_schema.mappingQueryabilityStateName(mapping);
     const detail = if (!std.mem.eql(u8, coverage, "covered")) coverage else queryability;
@@ -26164,8 +26892,8 @@ fn validatePublicMappedSortCoverage(field: []const u8, mapping: storage_schema.F
     return error.UnsupportedExactSort;
 }
 
-fn validatePublicMappedSortCursor(field: []const u8, field_type: storage_schema.AntflyType, value: std.json.Value) !void {
-    const valid = switch (field_type) {
+fn validatePublicMappedSortCursor(field: []const u8, field_type: storage_schema.AntflyType, policy: storage_schema.MissingNullPolicy, value: std.json.Value) !void {
+    const valid = if (value == .null) policy == .nulls_ordered else switch (field_type) {
         .keyword, .link => value == .string,
         .numeric => publicSortCursorValueIsNumeric(value),
         .datetime => publicSortCursorValueIsDateLike(value),
@@ -26183,7 +26911,8 @@ fn publicSortCursorValueIsReplayable(value: std.json.Value) bool {
         .bool, .integer, .string => true,
         .float => |number| std.math.isFinite(number),
         .number_string => |text| publicJsonNumberStringIsFinite(text),
-        .null, .array, .object => false,
+        .null => true,
+        .array, .object => false,
     };
 }
 
@@ -26215,12 +26944,15 @@ fn publicJsonNumberStringIsFinite(text: []const u8) bool {
     return std.math.isFinite(value);
 }
 
+const PublicSortEvidence = struct { field_type: storage_schema.AntflyType, policy: storage_schema.MissingNullPolicy };
+
 fn validatePublicSortCapabilityEvidence(
     observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
     preferred_index_name: ?[]const u8,
     field: []const u8,
     expected_type: ?storage_schema.AntflyType,
-) !?storage_schema.AntflyType {
+) !?PublicSortEvidence {
+    var preferred_policy: storage_schema.MissingNullPolicy = .nulls_ordered;
     var matched_preferred = false;
     var preferred_type: ?storage_schema.AntflyType = null;
     for (observed_dynamic_capability_sets) |set| {
@@ -26231,12 +26963,14 @@ fn validatePublicSortCapabilityEvidence(
             if (!std.mem.eql(u8, capability_field, field)) continue;
             const effective_expected = expected_type orelse preferred_type;
             preferred_type = try validatePublicObservedSortField(capability, effective_expected);
+            if (!std.mem.eql(u8, capability.missing_null_policy, "nulls_ordered")) preferred_policy = .missing_rejected;
             matched_preferred = true;
         }
     }
-    if (matched_preferred) return preferred_type;
+    if (matched_preferred) return .{ .field_type = preferred_type.?, .policy = preferred_policy };
     if (preferred_index_name != null) return null;
 
+    var fallback_policy: storage_schema.MissingNullPolicy = .nulls_ordered;
     var matched_fallback = false;
     var fallback_type: ?storage_schema.AntflyType = null;
     for (observed_dynamic_capability_sets) |set| {
@@ -26245,10 +26979,11 @@ fn validatePublicSortCapabilityEvidence(
             if (!std.mem.eql(u8, capability_field, field)) continue;
             const effective_expected = expected_type orelse fallback_type;
             fallback_type = try validatePublicObservedSortField(capability, effective_expected);
+            if (!std.mem.eql(u8, capability.missing_null_policy, "nulls_ordered")) fallback_policy = .missing_rejected;
             matched_fallback = true;
         }
     }
-    return if (matched_fallback) fallback_type else null;
+    return if (matched_fallback) .{ .field_type = fallback_type.?, .policy = fallback_policy } else null;
 }
 
 fn recordPublicSortCapabilityRejection(field: []const u8, reason: []const u8, detail: []const u8) void {
@@ -28121,7 +28856,7 @@ pub fn permissionsAllow(
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
         const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or (resource_type == .table and system_catalog_routes.tableResourceMatches(permission.resource, resource));
         if (!type_match or !resource_match) continue;
-        if (permission.type == .admin or permission.type == permission_type) return true;
+        if (permission.type.allows(permission_type)) return true;
     }
     return false;
 }
@@ -28898,19 +29633,42 @@ fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std
         return try out.toOwnedSlice(alloc);
     }
 
-    const tables_value = payload.get("tables");
-    const operations_value = payload.get("operations");
-    if (operations_value == null or operations_value.? != .array or operations_value.?.array.items.len == 0) {
-        return try out.toOwnedSlice(alloc);
+    // Signed inference grants are independent of table scope. Older hosts
+    // ignore this additive claim and fail closed for non-admin job owners.
+    if (payload.get("inference_operations")) |operations| {
+        if (operations != .array) return error.Unauthorized;
+        for (operations.array.items) |operation| {
+            const name = jsonStringValue(operation) orelse return error.Unauthorized;
+            const permission: usermgr.PermissionType = if (std.mem.eql(u8, name, "read")) .read else if (std.mem.eql(u8, name, "write")) .write else return error.Unauthorized;
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .inference, "*", permission));
+        }
     }
 
-    if (tables_value == null or tables_value.? != .array or tables_value.?.array.items.len == 0) {
-        try appendTrustedPrincipalPermissionsForTable(alloc, &out, "*", operations_value.?.array.items);
-    } else {
-        for (tables_value.?.array.items) |table_value| {
-            const table = jsonStringValue(table_value) orelse continue;
-            if (table.len == 0) continue;
-            try appendTrustedPrincipalPermissionsForTable(alloc, &out, table, operations_value.?.array.items);
+    const tables_value = payload.get("tables");
+    const operations_value = payload.get("operations");
+    if (operations_value != null and operations_value.? == .array and operations_value.?.array.items.len > 0) {
+        if (tables_value == null or tables_value.? != .array or tables_value.?.array.items.len == 0) {
+            try appendTrustedPrincipalPermissionsForTable(alloc, &out, "*", operations_value.?.array.items);
+        } else {
+            for (tables_value.?.array.items) |table_value| {
+                const table = jsonStringValue(table_value) orelse continue;
+                if (table.len == 0) continue;
+                try appendTrustedPrincipalPermissionsForTable(alloc, &out, table, operations_value.?.array.items);
+            }
+        }
+    }
+    // Additive grants express narrow write/admin authority alongside a wider
+    // read scope. Older runtimes ignore this claim and retain only read access.
+    if (payload.get("table_operations")) |scopes| {
+        if (scopes != .object) return error.Unauthorized;
+        var it = scopes.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.len == 0 or std.mem.eql(u8, entry.key_ptr.*, "*") or entry.value_ptr.* != .array) return error.Unauthorized;
+            for (entry.value_ptr.array.items) |operation| {
+                const name = jsonStringValue(operation) orelse return error.Unauthorized;
+                if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "write") and !std.mem.eql(u8, name, "admin")) return error.Unauthorized;
+            }
+            try appendTrustedPrincipalPermissionsForTable(alloc, &out, entry.key_ptr.*, entry.value_ptr.array.items);
         }
     }
     return try out.toOwnedSlice(alloc);
@@ -29432,6 +30190,7 @@ fn permissionTypeFromOpenApi(value: usermgr_openapi.PermissionType) usermgr.Perm
     return switch (value) {
         .read => .read,
         .write => .write,
+        .curator => .curator,
         .admin => .admin,
     };
 }
@@ -29452,6 +30211,7 @@ fn permissionTypeToOpenApi(value: usermgr.PermissionType) usermgr_openapi.Permis
     return switch (value) {
         .read => .read,
         .write => .write,
+        .curator => .curator,
         .admin => .admin,
     };
 }
@@ -32800,6 +33560,14 @@ test "api http public sort capability gate resolves logical keyword fields" {
     const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order, schema);
     defer std.testing.allocator.free(fields);
     try std.testing.expectEqualStrings("title.keyword", fields[0]);
+    const null_cursor = [_]std.json.Value{ .null, .{ .string = "doc:a" } };
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order, .search_after = &null_cursor }, schema, &.{}, false));
+    var nullable_schema = schema;
+    var nullable_fields = [_]storage_schema.ExactField{ schema.exact_fields[0], schema.exact_fields[1] };
+    nullable_fields[1].mapping.missing_null_policy = .nulls_ordered;
+    nullable_schema.exact_fields = &nullable_fields;
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order, .search_after = &null_cursor }, nullable_schema, &.{}, false);
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order, .search_after = &null_cursor }, nullable_schema, &.{}, true);
     // Routed admission validates the same physical mapping as the shard.
     try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order }, schema, &.{}, false);
 }
@@ -57406,6 +58174,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     var owned = try cloneAuthenticatedIdentity(alloc, value.username, value.credential_principal, value.permissions, value.row_filter, value.metadata_json, value.roles);
     errdefer owned.deinit(alloc);
     owned.is_internal_service = value.is_internal_service;
+    owned.mcp_creation_discovery = value.mcp_creation_discovery;
     owned.live_user_manager = value.live_user_manager;
     for (value.catalog_aliases) |alias| try appendCatalogAlias(alloc, &owned, alias.logical, alias.physical);
     return owned;
@@ -58581,7 +59350,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     source.stress_pages = 64;
     var bounded = try resources.handle(&server, budget.allocator(), .entity_suppress, "entities", "", "concept/bounded", "{}", "", .{});
     try std.testing.expectEqual(@as(u16, 202), bounded.status);
-    try std.testing.expectEqual(@as(usize, 128), source.stress_reads);
+    try std.testing.expectEqual(@as(usize, 64), source.stress_reads);
     const bounded_result = try std.json.parseFromSlice(std.json.Value, alloc, bounded.body, .{});
     defer bounded_result.deinit();
     try std.testing.expectEqual(@as(usize, 64), bounded_result.value.object.get("results").?.array.items.len);
@@ -58591,7 +59360,8 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try std.testing.expectEqual(@as(u16, 200), bounded_get.status);
     bounded_get.deinit(budget.allocator());
     try std.testing.expectEqual(@as(usize, 0), budget.live);
-    // A policy conflict in the final page must be found by the validation pass
+    // A policy conflict in the final discovery page must be validated from
+    // the retained revision-fenced profiles, without a second catalog pass,
     // before any authoritative namespace CAS, even when earlier pages are valid.
     source.stress_pages = 2;
     source.incompatible_last_page = true;
@@ -59003,6 +59773,77 @@ test "external lake read refresh hints coalesce without superseding active publi
     try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
 }
 
+test "native memory background selection isolates revoked execution bindings and runs retention cleanup" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("memory-worker-authority-fairness");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const memory = @import("memory.zig");
+    const Fixture = struct {
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "memory_team", .schema_json = tables_api.default_schema_json, .indexes_json = tables_api.default_indexes_json, .placement_role = "data" }},
+        ranges: [1]metadata_table_manager.RangeRecord = .{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }},
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.tables, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn validate(_: *anyopaque, _: memory.memory.types.Config) !void {}
+        fn generate(_: *anyopaque, _: std.mem.Allocator, _: memory.memory.types.Config, _: []const memory.memory.types.StoredEvidence, _: memory.memory.InferenceBoundary) !memory.memory.types.Generated {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const context: memory.memory.Context = .{ .principal = "owner", .admin = true, .now_ms = 1, .space = "team", .execution_principal = stored_destination_authorization.auth_disabled_principal, .execution_signature = "auth-disabled" };
+    var native: memory.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    var backend = native.backend();
+    backend.generate = Fixture.generate;
+    backend.validate_models = Fixture.validate;
+    var service: memory.memory.Service = .{ .backend = backend, .context = context };
+    var config: memory.memory.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true }, .models = .{ .generator = .{ .provider = "fixture", .model = "fixture", .revision = "v1" } } };
+    _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
+    service.context.now_ms = 2;
+    _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"manual\",\"source_id\":\"manual\",\"source_version\":\"1\",\"text\":\"Retire this payload\"}],\"assertions\":[{\"id\":\"retired\",\"subject\":\"cleanup\",\"predicate\":\"fact\",\"value\":\"old\",\"statement\":\"Retire this payload\",\"evidence\":[{\"id\":\"manual\"}]}]}", "manual");
+    var receipts: [2]memory.memory.types.OperationStatus = undefined;
+    for ([_][]const u8{ "revoked", "healthy" }, 0..) |owner, index| {
+        service.context.principal = owner;
+        service.context.execution_principal = if (index == 0) "basic:revoked" else stored_destination_authorization.auth_disabled_principal;
+        service.context.execution_signature = if (index == 0) "revoked-binding" else "auth-disabled";
+        service.context.now_ms = @intCast(3 + index);
+        const source_value: memory.memory.types.Evidence = .{ .id = owner, .source_id = owner, .source_version = "1", .text = "Managed input", .managed = true };
+        const raw = try service.execute(alloc, .observe, "", try std.json.Stringify.valueAlloc(alloc, .{ .evidence = &.{source_value} }, .{}), "observe");
+        receipts[index] = try std.json.parseFromSliceLeaky(memory.memory.types.OperationStatus, alloc, raw, .{});
+    }
+    service.context = context;
+    service.context.now_ms = 5;
+    const inspected = try std.json.parseFromSliceLeaky(memory.memory.types.Inspection, alloc, try service.execute(alloc, .inspect, "", "{}", ""), .{});
+    config.policy_version = "v2";
+    _ = try service.execute(alloc, .configure, "", try std.json.Stringify.valueAlloc(alloc, .{ .expected_revision = inspected.state.revision, .config = config }, .{}), "reconfigure");
+    _ = try service.execute(alloc, .forget, "", "{\"evidence_ids\":[\"manual\"]}", "forget");
+    var reads = table_reads.BoundTableReadSource.init("memory_team", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .control_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.free } }, reads.source(), writes.source());
+    defer server.deinit();
+    for (0..6) |_| try server.advanceMemoryOnce();
+    try std.testing.expectEqual(@as(usize, 1), server.memory_work_cursors.count());
+    for (receipts, 0..) |receipt, index| {
+        const operation = try std.json.parseFromSliceLeaky(memory.memory.types.OperationStatus, alloc, try service.execute(alloc, .operation, receipt.id, "{}", ""), .{});
+        try std.testing.expectEqual(if (index == 0) memory.memory.types.Stage.pending else .cancelled, operation.phase);
+        try std.testing.expectEqual(@as(u8, 0), operation.attempts);
+    }
+    const rows = try backend.scan(backend.ptr, alloc, "assertion/", null, 64);
+    try std.testing.expectEqual(@as(usize, 0), rows.rows.len);
+    // Saved operation authority was never replaced with the cleanup owner's
+    // authority, even though that owner's independent cleanup made progress.
+
+}
+
 test "resolver curation HTTP destination checks ignore opaque control metadata" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -59013,4 +59854,310 @@ test "resolver curation HTTP destination checks ignore opaque control metadata" 
     try std.testing.expect(try graphResolverValueDestinationsAllowed(null, payload));
     const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverValueDestinationsAllowed(null, actual));
+}
+
+test "native memory worker separates model and finalization budgets while fencing leadership" {
+    const Fixture = struct {
+        leader: bool = true,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn isLeader(ptr: *anyopaque, group: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return group == 7001 and self.leader;
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .standalone, .relational_maintenance_leadership = .{ .ptr = &fixture, .vtable = &.{ .is_local_leader = Fixture.isLeader } } }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    const now = platform_time.monotonicNs();
+    var budget: ApiHttpServer.MemoryWorkDeadline = .{ .server = &server, .group_id = 7001, .end = now };
+    const inference_end = budget.beginProcessing(now);
+    // A provider taking more than the scheduling quantum remains admissible,
+    // and a model timeout still leaves a storage/publication grace period.
+    try std.testing.expect(inference_end > now + 5 * std.time.ns_per_s);
+    try std.testing.expect(budget.end > inference_end);
+    try ApiHttpServer.MemoryWorkDeadline.check(&budget);
+    budget.end = 0;
+    try std.testing.expectError(error.DeadlineExceeded, ApiHttpServer.MemoryWorkDeadline.check(&budget));
+    budget.beginFinalization(platform_time.monotonicNs());
+    try ApiHttpServer.MemoryWorkDeadline.check(&budget);
+    // Recovery must update copied storage/source deadlines as well as the
+    // live context clock, or checkpoint reads would still use the expired one.
+    var adapter: @import("memory.zig").engine.Routed = .{ .table = "memory_team", .reads = undefined, .writes = undefined, .context = .{ .principal = "owner", .now_ms = 1 }, .request = .{ .deadline_ns = 0 } };
+    var resources: ApiHttpServer.MemoryResourceReader = .{ .server = &server, .executor = "owner", .database = "default", .request = .{ .deadline_ns = 0 } };
+    var checkpoint: ApiHttpServer.MemoryWorkCheckpoint = .{ .deadline = &budget, .adapter = &adapter, .resources = &resources };
+    try ApiHttpServer.MemoryWorkCheckpoint.begin(&checkpoint);
+    try std.testing.expectEqual(budget.end, adapter.request.deadline_ns.?);
+    try std.testing.expectEqual(budget.end, resources.request.deadline_ns.?);
+    try ApiHttpServer.MemoryWorkDeadline.check(&budget);
+    fixture.leader = false;
+    try std.testing.expectError(error.NotLeader, ApiHttpServer.MemoryWorkDeadline.check(&budget));
+}
+
+test "native memory worker budgets slow semantic publication independently from retention" {
+    const memory = @import("memory.zig");
+    const scheduling = @import("antfly_local_sources").memory_scheduling;
+    const Native = memory.engine.Native(db_mod.DB);
+    const Fixture = struct {
+        now: u64,
+        budget: *ApiHttpServer.MemoryWorkDeadline,
+        leader: bool = true,
+        lose_leadership: bool = false,
+        embeddings: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn isLeader(ptr: *anyopaque, _: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.leader;
+        }
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.budget.checkAt(self.now);
+        }
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.budget.beginFinalization(self.now);
+        }
+        fn validate(_: *anyopaque, _: memory.memory.types.Config) !void {}
+        fn embed(ptr: *anyopaque, a: std.mem.Allocator, _: memory.memory.types.Model, _: []const u8) ![]const f32 {
+            const native: *Native = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @ptrCast(@alignCast(native.context.check_ptr.?));
+            self.now += 10 * std.time.ns_per_s;
+            self.embeddings += 1;
+            if (self.lose_leadership) self.leader = false;
+            if (self.now >= self.budget.end - 5 * std.time.ns_per_s) return error.Timeout;
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+        fn state(backend: memory.memory.Backend, a: std.mem.Allocator) !memory.memory.types.State {
+            return std.json.parseFromSliceLeaky(memory.memory.types.State, a, (try backend.get(backend.ptr, a, "control")).?.json, .{});
+        }
+    };
+    // This fixture measures model/publication budgets, not allocation stack
+    // unwinding. Keep safety and leak checks without tracing every DB scratch
+    // allocation through the large test executable's debug information.
+    var fixture_heap: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.testing.expectEqual(@as(usize, 0), fixture_heap.deinit()) catch @panic("memory budget fixture leaked");
+    const a = fixture_heap.allocator();
+    var directory = try TestDirectory.init("memory-worker-semantic-budget");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var budget: ApiHttpServer.MemoryWorkDeadline = .{ .server = undefined, .group_id = 7001, .end = 5 * std.time.ns_per_s };
+    var fixture: Fixture = .{ .now = 0, .budget = &budget };
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone, .relational_maintenance_leadership = .{ .ptr = &fixture, .vtable = &.{ .is_local_leader = Fixture.isLeader } } }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    budget.server = &server;
+    const context: memory.memory.Context = .{ .principal = "owner", .admin = true, .now_ms = 1, .check_ptr = &fixture, .check_fn = Fixture.check, .checkpoint_ptr = &fixture, .checkpoint_fn = Fixture.checkpoint };
+    var native: Native = .{ .db = &db, .context = context };
+    var backend = native.backend();
+    backend.validate_models = Fixture.validate;
+    backend.embed = Fixture.embed;
+    backend.embed_document = Fixture.embed;
+    const service: memory.memory.Service = .{ .backend = backend, .context = context };
+    const config: memory.memory.types.Config = .{ .semantic_discovery = .{ .enabled = true }, .models = .{ .embedder = .{ .provider = "fixture", .model = "fixture", .revision = "v1", .dimensions = 2 } } };
+    _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
+    _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"},{\"id\":\"obsolete\",\"source_id\":\"old\",\"source_version\":\"1\",\"text\":\"Old\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    var more: [7]memory.memory.types.Entity = undefined;
+    for (&more, 0..) |*entity, i| entity.* = .{ .id = try std.fmt.allocPrint(alloc, "graph-{d}", .{i}), .name = "graph", .evidence = &.{.{ .id = "e" }} };
+    _ = try service.execute(alloc, .observe, "", try std.json.Stringify.valueAlloc(alloc, .{ .evidence = &[_]memory.memory.types.Evidence{.{ .id = "e", .source_id = "s", .source_version = "1", .text = "Graph" }}, .entities = more }, .{}), "more");
+    var state = try Fixture.state(backend, alloc);
+    const inference_end = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+    try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_s), inference_end);
+    _ = try service.advanceAtRevision(alloc, "", "backfill", state.revision);
+    try std.testing.expect(fixture.now > 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 12), fixture.embeddings);
+    const partial = try std.json.parseFromSliceLeaky(memory.memory.types.SemanticIndex, alloc, (try backend.get(backend.ptr, alloc, "entity-semantic-index")).?.json, .{});
+    try std.testing.expect(!partial.complete and !partial.backfill_complete and partial.cursor != null);
+    const checkpointed = try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 32);
+    try std.testing.expectEqual(@as(usize, 6), checkpointed.rows.len);
+    const query_ready = (try backend.scan(backend.ptr, alloc, "entity-semantic-query/", null, 32)).rows.len;
+    // Eleven provider calls succeeded: six document roles and five query
+    // roles. The timed-out query retains its completed document projection.
+    try std.testing.expectEqual(@as(usize, 5), query_ready);
+    for (0..4) |i| {
+        const progress = try std.json.parseFromSliceLeaky(memory.memory.types.SemanticIndex, alloc, (try backend.get(backend.ptr, alloc, "entity-semantic-index")).?.json, .{});
+        if (progress.complete) break;
+        state = try Fixture.state(backend, alloc);
+        _ = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+        _ = try service.advanceAtRevision(alloc, "", try std.fmt.allocPrint(alloc, "resume-{d}", .{i}), state.revision);
+    }
+    // All 32 role vectors succeed, with two timeout attempts across quanta.
+    try std.testing.expectEqual(@as(usize, 34), fixture.embeddings);
+    const index_row = (try backend.get(backend.ptr, alloc, "entity-semantic-index")).?;
+    const index = try std.json.parseFromSliceLeaky(memory.memory.types.SemanticIndex, alloc, index_row.json, .{});
+    try std.testing.expect(index.complete and index.backfill_complete);
+    try std.testing.expectEqual(@as(usize, 16), (try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 32)).rows.len);
+    const completed_embeddings = fixture.embeddings;
+
+    // A new view and retention debt compete. Cleanup keeps the short budget
+    // and cannot invoke the slow provider or roll back its own progress.
+    _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"description\",\"subject\":\"graph\",\"predicate\":\"p\",\"value\":\"graph\",\"statement\":\"Derived graph description\",\"evidence\":[{\"id\":\"e\"}]}]}", "description");
+    _ = try service.execute(alloc, .forget, "", "{\"evidence_ids\":[\"obsolete\"]}", "forget");
+    var saw_recall_maintenance = false;
+    for (0..32) |i| {
+        state = try Fixture.state(backend, alloc);
+        const kind = try scheduling.maintenanceKind(backend, alloc, 1, state);
+        if (kind != .retention and kind != .recall) break;
+        saw_recall_maintenance = saw_recall_maintenance or kind == .recall;
+        budget.end = fixture.now + 5 * std.time.ns_per_s;
+        const cleanup_end = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+        try std.testing.expectEqual(fixture.now + 5 * std.time.ns_per_s, cleanup_end);
+        _ = try service.advanceAtRevision(alloc, "", try std.fmt.allocPrint(alloc, "cleanup-{d}", .{i}), state.revision);
+        try std.testing.expectEqual(completed_embeddings, fixture.embeddings);
+    }
+    try std.testing.expect(saw_recall_maintenance);
+    state = try Fixture.state(backend, alloc);
+    try std.testing.expectEqual(.semantic, try scheduling.maintenanceKind(backend, alloc, 1, state));
+    // The longer budget never extends leadership authority. A lost owner
+    // publishes neither refreshed vectors nor a cursor and can retry safely.
+    _ = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+    fixture.lose_leadership = true;
+    try std.testing.expectError(error.NotLeader, service.advanceAtRevision(alloc, "", "lost-owner", state.revision));
+    fixture.leader = true;
+    fixture.lose_leadership = false;
+    try std.testing.expectEqual(state.revision, (try Fixture.state(backend, alloc)).revision);
+    try std.testing.expectEqual(.semantic, try scheduling.maintenanceKind(backend, alloc, 1, state));
+    _ = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+    _ = try service.advanceAtRevision(alloc, "", "refresh", state.revision);
+    state = try Fixture.state(backend, alloc);
+    try std.testing.expectEqual(.idle, try scheduling.maintenanceKind(backend, alloc, 1, state));
+    const rows = try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 32);
+    for (rows.rows) |row| {
+        const projection = try std.json.parseFromSliceLeaky(memory.memory.types.EntityProjection, alloc, row.json, .{});
+        if (projection.kind == .view and std.mem.eql(u8, projection.entity_id, "graph")) try std.testing.expect(std.mem.indexOf(u8, projection.text, "Derived graph description") != null);
+    }
+}
+
+test "trusted principal table operations preserve unrelated writes and protect reserved tables" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"tables":["*"],"operations":["read"],"table_operations":{"application":["write"],"managed":["read"]}}
+    , .{});
+    defer parsed.deinit();
+    const permissions = try trustedPrincipalPermissionsFromPayload(a, parsed.value.object);
+    defer freePermissions(a, permissions);
+    try std.testing.expect(permissionsAllow(permissions, .table, "application", .write));
+    try std.testing.expect(permissionsAllow(permissions, .table, "managed", .read));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "managed", .write));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "antfly_sources", .write));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "future-table", .write));
+}
+test "trusted principal table operations reject malformed and wildcard grant expansions" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"table_operations":[]}
+        ,
+        \\{"table_operations":{"*":["write"]}}
+        ,
+        \\{"table_operations":{"docs":"write"}}
+        ,
+        \\{"table_operations":{"docs":["unknown"]}}
+    };
+    for (cases) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.Unauthorized, trustedPrincipalPermissionsFromPayload(a, parsed.value.object));
+    }
+}
+
+test "trusted principal table operations preserve discovery hints without granting target authority" {
+    const a = std.testing.allocator;
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{ .trusted_principal_issuer = "cloudaf" }, .{ .ptr = undefined, .vtable = &.{ .status = FakeSource.status } }, null, null);
+    defer server.deinit();
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(a,
+        \\{{"iss":"cloudaf","sub":"creator","tables":["*"],"operations":["read"],"mcp_creation_discovery":true,"iat":{d},"exp":{d}}}
+    , .{ now, now + 60 });
+    defer a.free(payload);
+    const token = try encodeTrustedPrincipalToken(a, "secret", payload);
+    defer a.free(token);
+    var identity = try server.authenticateTrustedPrincipal(token, "secret");
+    defer identity.deinit(a);
+    try std.testing.expect(identity.mcp_creation_discovery);
+    var clone = (try cloneCatalogIdentity(a, identity)).?;
+    defer clone.deinit(a);
+    try std.testing.expect(clone.mcp_creation_discovery);
+    try std.testing.expect(!permissionsAllow(clone.permissions, .table, "new_table", .admin));
+    try std.testing.expect(!permissionsAllow(clone.permissions, .table, "antfly_sources", .admin));
+}
+
+test "trusted principal inference operations grant no table or administrative authority" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"inference_operations":["read","write"]}
+    , .{});
+    defer parsed.deinit();
+    const permissions = try trustedPrincipalPermissionsFromPayload(a, parsed.value.object);
+    defer freePermissions(a, permissions);
+    try std.testing.expect(permissionsAllow(permissions, .inference, "*", .read));
+    try std.testing.expect(permissionsAllow(permissions, .inference, "*", .write));
+    try std.testing.expect(!permissionsAllow(permissions, .inference, "*", .admin));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "docs", .read));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "docs", .write));
+}
+test "trusted principal inference operations reject malformed and expanded grants" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"inference_operations":"write"}
+        ,
+        \\{"inference_operations":["admin"]}
+        ,
+        \\{"inference_operations":["*"]}
+        ,
+        \\{"inference_operations":[7]}
+    }) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.Unauthorized, trustedPrincipalPermissionsFromPayload(a, parsed.value.object));
+    }
+}
+
+test "httpx inference gateway document authority recovery does not block existing restore ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/deferred-document-authority", .{tmp.sub_path});
+    defer a.free(path);
+    var opened = try research_jobs.OpenedStore.open(a, path);
+    defer opened.deinit();
+    var backend = @import("document_run_storage.zig").SharedJobStateTestBackend{ .store = opened.docstore, .term = 7, .partitioned = true };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone, .backend_runtime = runtime.ptr() }, .{ .ptr = undefined, .vtable = &.{ .status = Source.status } }, null, null);
+    defer server.deinit();
+    const runs = @import("antfly_readers").document_runs;
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try std.testing.expect(try server.document_job_store.compareDocumentRun(@as(?runs.Version, null), runs.Record{ .run_id = "legacy", .owner = "alice", .identity = identity, .limits = .{}, .inputs = &.{} }, research_jobs.nowMillis));
+    try server.document_job_store.attachReplicated(backend.capability());
+    try std.testing.expect(!server.documentExecutionPermitted());
+    try server.prepareRestoreLeadership(7);
+    const restore_owner = server.restore_job_owner_id.load(.acquire);
+    try std.testing.expect(restore_owner != 0);
+    try std.testing.expectEqual(@as(u64, 7), server.restore_leadership_term.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.document_job_owner_id.load(.acquire));
+    try std.testing.expect(!server.documentExecutionPermitted());
+    backend.partitioned = false;
+    try server.scheduleDocumentsOnce();
+    try std.testing.expectEqual(restore_owner, server.restore_job_owner_id.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 7), server.document_job_store.replicated_term.load(.acquire));
+    try std.testing.expect(server.document_job_owner_id.load(.acquire) != 0);
+    try std.testing.expect(server.documentExecutionPermitted());
+    const migrated = (try backend.capability().get(a, "documents/legacy")).?;
+    defer a.free(migrated);
+    try std.testing.expect(migrated.len > 0);
 }

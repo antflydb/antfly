@@ -18,6 +18,8 @@ const Sha256 = @import("antfly_hash").Sha256;
 const coverage_identity = @import("coverage_identity.zig");
 const Allocator = std.mem.Allocator;
 
+pub const public_schema_json_key = "\x00\x00__metadata__:schema_json";
+
 pub const user_namespace: u8 = 0x01;
 pub const replay_namespace: u8 = 0x02;
 pub const identity_namespace: u8 = 0x03;
@@ -72,6 +74,8 @@ pub fn invalidatesRelationalColumns(key: []const u8) bool {
 pub const artifact_kind: u8 = 0x20;
 pub const chunk_record_kind: u8 = 0x30;
 pub const derived_embedding_kind: u8 = 0x31;
+/// A vector consumer window beneath one immutable parent chunk.
+pub const media_window_kind: u8 = 0x54;
 pub const graph_edge_record_kind: u8 = 0x32;
 /// Durable document-owned retirement of an exact primary graph relationship.
 pub const graph_retirement_kind: u8 = 0x50;
@@ -1512,6 +1516,30 @@ pub fn chunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_nam
     return try list.toOwnedSlice(alloc);
 }
 
+/// Window zero keeps its legacy parent key. All other windows sort inside
+/// that parent's subtree, so continuation and retirement remain parent-scoped.
+pub fn mediaWindowKeyAlloc(a: Allocator, parent: []const u8, index: u32) ![]u8 {
+    if (!isChunkArtifactRecordKey(parent) or mediaWindowIndex(parent) != null) return error.InvalidInternalUserKey;
+    if (index == 0) return a.dupe(u8, parent);
+    return mediaWindowChildKeyAlloc(a, parent, index);
+}
+pub fn mediaWindowChildKeyAlloc(a: Allocator, parent: []const u8, index: u32) ![]u8 {
+    if (!isChunkArtifactRecordKey(parent) or mediaWindowIndex(parent) != null) return error.InvalidInternalUserKey;
+    const out = try a.alloc(u8, parent.len + 5);
+    @memcpy(out[0..parent.len], parent);
+    out[parent.len] = media_window_kind;
+    std.mem.writeInt(u32, out[parent.len + 1 ..][0..4], index, .big);
+    return out;
+}
+pub fn mediaWindowIndex(key: []const u8) ?u32 {
+    if (key.len < 10 or key[key.len - 5] != media_window_kind or !isChunkArtifactRecordKey(key[0 .. key.len - 5])) return null;
+    const index = std.mem.readInt(u32, key[key.len - 4 ..][0..4], .big);
+    return index;
+}
+pub fn mediaWindowParent(key: []const u8) []const u8 {
+    return if (mediaWindowIndex(key) != null) key[0 .. key.len - 5] else key;
+}
+
 pub fn documentUnitChunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, unit_id: []const u8, chunk_id: u32) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -1828,7 +1856,9 @@ pub fn isChunkArtifactRecordKey(key: []const u8) bool {
         pos = unit_term + 2;
     }
 
-    return pos + 5 == key.len and key[pos] == chunk_record_kind;
+    if (pos + 5 > key.len or key[pos] != chunk_record_kind) return false;
+    if (pos + 5 == key.len) return true;
+    return pos + 10 == key.len and key[pos + 5] == media_window_kind;
 }
 
 pub fn matchesChunkArtifactName(key: []const u8, artifact_name: []const u8) bool {
@@ -1993,6 +2023,10 @@ fn skipDerivedEmbeddingBaseRecordSuffix(key: []const u8, pos: usize) ?usize {
     }
     if (cursor < key.len and key[cursor] == chunk_record_kind) {
         cursor += 1 + @sizeOf(u32);
+        if (cursor < key.len and key[cursor] == media_window_kind) {
+            cursor += 5;
+            if (cursor > key.len) return null;
+        }
     }
     if (cursor > key.len) return null;
     return cursor;

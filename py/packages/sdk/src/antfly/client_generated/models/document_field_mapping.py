@@ -42,9 +42,10 @@ class DocumentFieldMapping:
                 as title.keyword for sorted string pagination. Antfly derives the
                 required typed doc values when enabled.
                  Default: False.
-            missing_null_policy (DocumentFieldMappingMissingNullPolicy | Unset): Missing/null sort policy. The current
-                production policy rejects missing or null native sort values. Default:
-                DocumentFieldMappingMissingNullPolicy.MISSING_REJECTED.
+            missing_null_policy (DocumentFieldMappingMissingNullPolicy | Unset): Missing/null sort policy. The default
+                missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending
+                and last descending, with JSON null cursor components. Nullable native layouts require a complete producer
+                proof. Default: DocumentFieldMappingMissingNullPolicy.MISSING_REJECTED.
             fields (DocumentFieldMappingFields | Unset): Named one-level multifields emitted from this property's value. For
                 example, a text title can expose a sortable keyword subfield.
     """

@@ -971,7 +971,11 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     for hit in signed
                 )
         if layout == "files":
-            pages = {}
+            # Inspect and mutate one quiescent artifact namespace. Retention
+            # maintenance can rename staging files between is_file and read,
+            # and discovery must describe the same cold cut we remove below.
+            server.pause()
+            page_objects = {}
             objects = {}
             documents = {}
             roots = {}
@@ -990,10 +994,9 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     artifact_id = f"sha256:{checksum}"
                 payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
                 objects[artifact_id] = path
-                begin = payload.find(b"AFGPT003")
-                if begin >= 0:
-                    page = payload[begin:]
-                    pages[hashlib.sha256(page).digest()] = (path, page)
+                # Tree pages can share one content-addressed pack. The ref
+                # authenticates its exact byte range, not the entire object.
+                page_objects[bytes.fromhex(checksum)] = (path, payload)
                 begin = payload.find(b'{"version":')
                 if begin >= 0:
                     try:
@@ -1018,23 +1021,46 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
             )
 
             def leaves(ref):
-                path, page = pages[bytes(ref["digest"])]
+                pack = ref.get("pack")
+                path, payload = page_objects[
+                    bytes(pack["digest"] if pack else ref["digest"])
+                ]
+                begin = pack["offset"] if pack else 0
+                page = payload[begin : begin + ref["bytes"]]
+                assert len(page) == ref["bytes"]
+                assert hashlib.sha256(page).digest() == bytes(ref["digest"])
+                assert page.startswith(b"AFGPT003") and page[8] == ref["height"]
                 count = struct.unpack_from("<I", page, 12)[0]
                 offset = 56 + struct.unpack_from("<H", page, 10)[0]
+                prefix = b""
+                if page[9] & 2:
+                    prefix_size, _ = struct.unpack_from("<II", page, offset)
+                    offset += 8
+                    prefix = page[offset : offset + prefix_size]
+                    offset += prefix_size
                 records = []
                 for _ in range(count):
                     key_size, value_size = struct.unpack_from("<II", page, offset)
                     offset += 8
-                    key = page[offset : offset + key_size]
+                    key = prefix + page[offset : offset + key_size]
                     offset += key_size
                     value = page[offset : offset + value_size]
                     offset += value_size
                     records.append((key, value))
                 if ref["height"]:
                     for _, value in records:
-                        yield from leaves(
-                            {"digest": list(value[:32]), "height": value[36]}
-                        )
+                        child = {
+                            "digest": list(value[:32]),
+                            "bytes": struct.unpack_from("<I", value, 32)[0],
+                            "height": value[36],
+                        }
+                        if page[9] & 4 and value[61]:
+                            child["pack"] = {
+                                "digest": list(value[62:94]),
+                                "bytes": struct.unpack_from("<I", value, 94)[0],
+                                "offset": struct.unpack_from("<I", value, 98)[0],
+                            }
+                        yield from leaves(child)
                 else:
                     yield path, records
 
@@ -1062,7 +1088,6 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 record = json.loads(b"".join(value for _, value in sorted(chunks)))
                 unrelated.append(objects[record["route"]["descriptor"]["artifact_id"]])
             assert unrelated, "Fixture must have an unrelated serving descriptor"
-            server.pause()
             for cache_root in server.root.rglob("lake-ranges"):
                 if cache_root.is_dir():
                     shutil.rmtree(cache_root)
@@ -1192,6 +1217,10 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 "schema": {
                     "storage_mode": "relational",
                     "default_type": "row",
+                    "index_sort": [
+                        {"field": "id", "order": "asc"},
+                        {"field": "_id", "order": "asc"},
+                    ],
                     "document_schemas": {
                         "row": {
                             "schema": {
@@ -1235,9 +1264,10 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     },
                 },
                 "indexes": {
+                    # Whole-document projection carries the sortable id
+                    # alongside body text in both archive and recent rows.
                     "body_text": {
                         "type": "full_text",
-                        "field": "body",
                         "store_source": True,
                     },
                     **(
@@ -1595,8 +1625,31 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             assert [h["_source"] for h in recent_only["hits"]["hits"]] == [{"id": 1000}]
             counted = call("POST", "/tables/wal_windows/query", dict(pinned, limit=0))
             assert counted["hits"]["total"] == {"value": row_count, "relation": "exact"}
+            # The published ordered index covers archive rows, while this
+            # retained accepted cut also contains id=1000 from the WAL. Field
+            # ordering must include it before and after restart.
+            for descending in (False, True):
+                sorted_request = dict(
+                    pinned,
+                    fields=["id"],
+                    order_by=[{"field": "id", "desc": descending}],
+                    filter_query={"range": {"path": "/id", "gte": 0}},
+                    limit=10,
+                )
+                sorted_request.pop("highlight", None)
+                ordered = call("POST", "/tables/wal_windows/query", sorted_request)
+                expected = (
+                    [1000, *range(row_count - 1, row_count - 10, -1)]
+                    if descending
+                    else [0, *range(2, 11)]
+                )
+                assert [
+                    hit["_source"]["id"] for hit in ordered["hits"]["hits"]
+                ] == expected, ordered
         failed = False
     finally:
+        if failed:
+            print(server.debug_logs())
         server.stop(test_failed=failed)
         intents = lake / "buckets/antfly/objects/metadata/antfly-catalog/intents"
         held_intents = intents.with_name("held-intents")

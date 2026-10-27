@@ -21,6 +21,10 @@ const inference_work = @import("antfly_inference_work");
 const aws = @import("antfly_credentials").aws;
 const provider_defaults = @import("antfly_inference_provider_defaults");
 const template_mod = @import("antfly_template_content");
+const converse = @import("bedrock_converse.zig");
+const converse_stream = @import("bedrock_stream.zig");
+pub const testConverseWire = converse.testConverseWire;
+pub const testConverseStream = @import("bedrock_stream_test.zig").testDecoder;
 
 const HeaderPair = [2][]const u8;
 pub const cohere_max_batch_size = provider_defaults.cohere_max_embedding_batch_size;
@@ -116,6 +120,14 @@ pub const Provider = struct {
     options: Options,
     owned_credential_cache: CredentialCache = .{},
     credential_cache: ?*CredentialCache = null,
+    bearer_token: ?[]const u8 = null,
+    max_tokens: i64 = 256,
+    max_response_bytes: ?usize = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    tools_json: ?[]const u8 = null,
+    tool_choice_json: ?[]const u8 = null,
+    response_format_json: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, options: Options) Provider {
         return .{
@@ -136,6 +148,137 @@ pub const Provider = struct {
 
     pub fn deinit(self: *Provider) void {
         if (self.credential_cache == null) self.owned_credential_cache.deinit(self.allocator);
+    }
+
+    pub fn generator(self: *Provider) inference.Generator {
+        return .{ .ptr = self, .vtable = &.{ .generate = generateImpl } };
+    }
+
+    pub fn setRequestControl(self: *Provider, timeout_ms: ?u64, cancellation: ?CancellationToken) void {
+        self.options.timeout_ms = timeout_ms;
+        self.options.cancellation = cancellation;
+    }
+
+    fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
+        const self: *Provider = @ptrCast(@alignCast(ptr));
+        const control = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation);
+        try control.check(self.http.io);
+        const body = try converse.requestJsonAlloc(alloc, messages, .{
+            .max_tokens = self.max_tokens,
+            .temperature = self.temperature,
+            .top_p = self.top_p,
+            .tools_json = self.tools_json,
+            .tool_choice_json = self.tool_choice_json,
+            .response_format_json = self.response_format_json,
+        });
+        defer alloc.free(body);
+        var response = try self.invokeGenerationRequest(alloc, model, "converse", body, control, null);
+        defer response.deinit();
+        if (!response.ok()) return if (response.status.code == 400) error.InvalidInferenceRequest else inference.remoteGenerationStatusError(response.status.code);
+        return converse.responseAlloc(alloc, response.body orelse return error.EmptyResponse);
+    }
+
+    fn invokeGenerationRequest(self: *Provider, alloc: std.mem.Allocator, model: []const u8, operation: []const u8, body: []const u8, control: RequestContext, writer: anytype) !httpx.Response {
+        const encoded = try percentEncodePathSegmentAlloc(alloc, model);
+        defer alloc.free(encoded);
+        const path = try std.fmt.allocPrint(alloc, "/model/{s}/{s}", .{ encoded, operation });
+        defer alloc.free(path);
+        const endpoint = try endpointBaseAlloc(alloc, self.options.endpoint);
+        defer alloc.free(endpoint);
+        const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ endpoint, path });
+        defer alloc.free(url);
+        var creds: ?Credentials = null;
+        defer if (creds) |*value| value.deinit(alloc);
+        var headers: []HeaderPair = undefined;
+        if (self.bearer_token) |token| {
+            const content_key = try alloc.dupe(u8, "content-type");
+            errdefer alloc.free(content_key);
+            const content_value = try alloc.dupe(u8, "application/json");
+            errdefer alloc.free(content_value);
+            const key = try alloc.dupe(u8, "authorization");
+            errdefer alloc.free(key);
+            const value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+            errdefer alloc.free(value);
+            headers = try alloc.alloc(HeaderPair, 2);
+            headers[0] = .{ content_key, content_value };
+            headers[1] = .{ key, value };
+        } else {
+            // Credential refresh and the model call share one absolute
+            // deadline; refreshes cannot restart the request timeout.
+            const cache = self.credential_cache orelse &self.owned_credential_cache;
+            creds = try cache.getForSourceWithContext(alloc, std.heap.smp_allocator, self.http, self.options.region, self.options.credential_source, control);
+            const host = try endpointHostAlloc(alloc, endpoint);
+            defer alloc.free(host);
+            const parsed_url = try std.Uri.parse(url);
+            headers = try signHeadersAlloc(alloc, creds.?, self.options.region, host, parsed_url.path.percent_encoded, body);
+        }
+        defer freeHeaderPairs(alloc, headers);
+        const options = httpx.RequestOptions{
+            .attempt_observer = self.options.attempt_observer,
+            .headers = headers,
+            .body = body,
+            .max_response_size = self.max_response_bytes,
+            .timeout_ms = try control.remainingTimeoutMs(self.http.io),
+            .cancellation = control.httpCancellation(),
+            .cookies_enabled = false,
+            .max_retries = 0,
+            .follow_redirects = false,
+        };
+        if (comptime @TypeOf(writer) == @TypeOf(null)) {
+            return self.http.request(.POST, url, options);
+        } else {
+            return self.http.requestToWriter(.POST, url, options, writer, null, null);
+        }
+    }
+
+    pub fn chatStream(self: *Provider, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage, sink: inference.ChatStream, include_usage: bool) !httpx.Response {
+        const control = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation);
+        try control.check(self.http.io);
+        const body = try converse.requestJsonAlloc(alloc, messages, .{
+            .max_tokens = self.max_tokens,
+            .temperature = self.temperature,
+            .top_p = self.top_p,
+            .tools_json = self.tools_json,
+            .tool_choice_json = self.tool_choice_json,
+            .response_format_json = self.response_format_json,
+        });
+        defer alloc.free(body);
+        const id = try std.fmt.allocPrint(alloc, "chatcmpl-bedrock-{d}", .{std.Io.Clock.awake.now(self.http.io).nanoseconds});
+        defer alloc.free(id);
+        const Writer = struct {
+            decoder: converse_stream.Decoder,
+            pub fn startResponse(self_: *@This(), response: httpx.Response) !void {
+                if (!response.ok()) return if (response.status.code == 400) error.InvalidInferenceRequest else inference.remoteGenerationStatusError(response.status.code);
+                const content_type = response.contentType() orelse return error.InvalidInferenceResponse;
+                var parts = std.mem.splitScalar(u8, content_type, ';');
+                if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, parts.first(), " \t"), "application/vnd.amazon.eventstream")) return error.InvalidInferenceResponse;
+                self_.decoder.request_id = response.header("x-amzn-requestid");
+            }
+            pub fn writeAll(self_: *@This(), bytes: []const u8) !void {
+                try self_.decoder.push(bytes);
+            }
+        };
+        var writer = Writer{ .decoder = .{
+            .alloc = std.heap.smp_allocator,
+            .sink = sink,
+            .model = model,
+            .id = id,
+            .created = @intCast(try currentUnixSeconds()),
+            .include_usage = include_usage,
+            .frame_limit = @min(self.max_response_bytes orelse 4 * 1024 * 1024, 4 * 1024 * 1024),
+        } };
+        defer writer.decoder.deinit();
+        var response = try self.invokeGenerationRequest(alloc, model, "converse-stream", body, control, &writer);
+        errdefer response.deinit();
+        try response.headers.set("content-type", "text/event-stream");
+        response.releaseBody();
+        if (writer.decoder.usage) |usage| {
+            response.body = try std.json.Stringify.valueAlloc(alloc, .{ .usage = .{ .prompt_tokens = usage.input_tokens, .completion_tokens = usage.output_tokens, .total_tokens = usage.total_tokens orelse (usage.input_tokens +| usage.output_tokens) } }, .{});
+            response.body_owned = true;
+            response.body_allocator = alloc;
+        }
+        try writer.decoder.finish();
+        return response;
     }
 
     pub fn embedText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) !inference.EmbedResult {
@@ -657,6 +800,65 @@ fn endpointHostAlloc(alloc: std.mem.Allocator, endpoint: []const u8) ![]u8 {
 }
 
 const endpointBaseAlloc = aws.endpointBaseAlloc;
+
+pub fn testConverseSignedRequest() !void {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            const auth = req.header("Authorization") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.startsWith(u8, auth, "AWS4-HMAC-SHA256 Credential=AKIAPROFILE/"));
+            try std.testing.expect(std.mem.indexOf(u8, auth, "/us-east-1/bedrock/aws4_request") != null);
+            try std.testing.expectEqualStrings("profile-token", req.header("X-Amz-Security-Token").?);
+            const hash = try sha256HexAlloc(std.testing.allocator, req.body);
+            defer std.testing.allocator.free(hash);
+            try std.testing.expectEqualStrings(hash, req.header("X-Amz-Content-Sha256").?);
+            var body = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer body.deinit();
+            const image = body.value.object.get("messages").?.array.items[0].object.get("content").?.array.items[1].object.get("image").?.object;
+            try std.testing.expectEqualStrings("jpeg", image.get("format").?.string);
+            try std.testing.expectEqualStrings("aW1hZ2U=", image.get("source").?.object.get("bytes").?.string);
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            server.handleOne() catch |err| {
+                failure.* = err;
+            };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "credentials", .data = "[fixture]\naws_access_key_id = AKIAPROFILE\naws_secret_access_key = profile-secret\naws_session_token = profile-token\n" });
+    const credentials_path = try tmp.dir.realPathFileAlloc(io, "credentials", alloc);
+    defer alloc.free(credentials_path);
+    var server = try httpx.TestServer.start(alloc, io, &.{.{
+        .method = .POST,
+        .path = "/proxy/model/vision-model/converse",
+        .assert_request = Check.request,
+        .respond = .{ .body = "{\"output\":{\"message\":{\"role\":\"assistant\",\"content\":[{\"text\":\"saw sheets\"}]}},\"stopReason\":\"end_turn\",\"usage\":{\"inputTokens\":2,\"outputTokens\":1,\"totalTokens\":3}}" },
+    }});
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(alloc, "{s}/proxy", .{server.baseUrl()});
+    defer alloc.free(endpoint);
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var provider = Provider.init(alloc, &client, .{
+        .region = "us-east-1",
+        .endpoint = endpoint,
+        .credential_source = .{ .profile = .{ .name = "fixture", .shared_credentials_file = credentials_path } },
+        .timeout_ms = 10_000,
+    });
+    defer provider.deinit();
+    var failure: ?anyerror = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, Check.serve, .{ &server, &failure });
+    var result = try provider.generator().generate(alloc, "vision-model", &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .text = "Compare" }, .{ .image_url = .{ .url = "data:image/jpeg;base64,aW1hZ2U=" } } } } }});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("saw sheets", result.content);
+    try std.testing.expectEqual(@as(u64, 2), result.usage.?.input_tokens);
+    try group.await(io);
+    if (failure) |err| return err;
+}
 
 pub fn testBedrockSigningClockUsesUnixWallTime() !void {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});

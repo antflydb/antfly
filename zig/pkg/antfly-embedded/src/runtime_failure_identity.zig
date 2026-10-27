@@ -30,6 +30,8 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
+    .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
     .{ .status = .grouped_source_topology_unavailable, .err = error.GroupedSourceTopologyUnavailable },
     .{ .status = .apple_intelligence_provider_unavailable, .err = error.AppleIntelligenceProviderUnavailable },
@@ -335,6 +337,7 @@ const mappings = [_]Mapping{
     .{ .status = .identity_namespace_mismatch, .err = error.DocIdentityNamespaceMismatch },
     .{ .status = .invalid_query, .err = error.InvalidQueryRequest },
     .{ .status = .unsupported_query, .err = error.UnsupportedQueryRequest },
+    .{ .status = .unsupported_exact_sort, .err = error.UnsupportedExactSort },
     .{ .status = .index_not_found, .err = error.IndexNotFound },
     .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
     .{ .status = .incomplete_published_snapshot, .err = error.IncompletePublishedSnapshot },
@@ -1116,4 +1119,14 @@ test "graph start identity requirement survives the compiled query boundary" {
     try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
     try std.testing.expectError(error.GraphStartIdentityRequired, statusToError(failure.status));
     try std.testing.expectEqualStrings("GraphStartIdentityRequired", failure.errorName());
+}
+
+test "logical value exact sort rejection survives both compiled query boundaries" {
+    for ([_]abi.FailureBoundary{ .storage_owner, .local_query }) |boundary| {
+        const failure = failureFromError(error.UnsupportedExactSort, boundary, abi.abi_version, 4);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expect(failure.status != .internal);
+        try std.testing.expectError(error.UnsupportedExactSort, statusToError(failure.status));
+        try std.testing.expectEqualStrings("UnsupportedExactSort", failure.errorName());
+    }
 }

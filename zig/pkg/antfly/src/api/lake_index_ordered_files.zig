@@ -84,6 +84,36 @@ pub fn named(a: A, store: tree.Store, roots: Roots, name: []const u8) !?u32 {
     if (!std.mem.eql(u8, result.value.file, name) or result.value.slot >= roots.count) return error.InvalidNativeLakeRowIndex;
     return result.value.slot;
 }
+/// Resolve a bounded set of slots with shared ancestors and concurrent cold
+/// children. Records belong to the caller; duplicates preserve input order.
+pub fn filesMany(a: A, store: tree.Store, roots: Roots, slots: []const u32) ![]Record {
+    if (slots.len > tree.max_lookup_batch) return error.InvalidNativeLakeRowIndex;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const keys = try sa.alloc([4]u8, slots.len);
+    const pointers = try sa.alloc([]const u8, slots.len);
+    for (slots, keys, pointers) |slot, *key, *ptr| {
+        if (slot >= roots.count) return error.InvalidNativeLakeRowIndex;
+        key.* = slotKey(slot);
+        ptr.* = key;
+    }
+    const entries = try tree.lookupMany(sa, store, roots.slots, pointers);
+    const result = try a.alloc(Record, slots.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |record| a.free(record.file);
+        a.free(result);
+    }
+    for (entries, result) |entry, *record| {
+        const bytes = (entry orelse return error.InvalidNativeLakeRowIndex).value;
+        const decoded = try std.json.parseFromSliceLeaky(Record, sa, bytes, .{});
+        if (decoded.file.len == 0) return error.InvalidNativeLakeRowIndex;
+        record.* = .{ .file = try a.dupe(u8, decoded.file), .fingerprint = decoded.fingerprint };
+        initialized += 1;
+    }
+    return result;
+}
 pub fn publicSlot(a: A, store: tree.Store, roots: Roots, digest: [32]u8) !?u32 {
     const bytes = (try lookup(a, store, roots.public, &digest)) orelse return null;
     defer a.free(bytes);
@@ -318,6 +348,7 @@ fn bulkHashes(a: A, store: tree.Store, source: []const u8, snapshot: []const u8,
     if (manager) |managed| {
         var sort = local.sql_spill.Sort.init(a, managed, &.{.{}}, 512 * 1024);
         sort.run_limit = 4;
+        sort.shared_runs = true;
         sort.encoded_bytes = true;
         defer sort.deinit();
         for (files, 0..) |name, i| {

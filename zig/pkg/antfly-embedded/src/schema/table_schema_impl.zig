@@ -1676,16 +1676,14 @@ fn validatePropertySchemaDefinitionWithContext(context: SchemaContext, value: st
             });
         }
     }
-    try validatePropertySchemaKeywords(current_context, object);
+    try validatePropertyScalarKeywords(current_context, object);
+    var children: PropertySchemaChildren = .{ .object = object };
+    while (try children.next()) |child| try validatePropertySchemaDefinitionWithContext(current_context, child);
 }
 
-// Keep scalar validation scratch off the recursive descent stack. LLVM's
-// Debug frames otherwise retain every keyword's temporary through each child.
-fn validatePropertySchemaKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
-    try validatePropertyScalarKeywords(context, object);
-    try validatePropertyChildKeywords(context, object);
-}
-
+// Scalar validation and child discovery return before descending. Keeping the
+// keyword dispatch frame alive across every child exhausts small LLVM Debug
+// worker stacks even when the JSON/schema depth itself is bounded.
 noinline fn validatePropertyScalarKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
     if (object.get("type")) |schema_type| {
         if (schema_type != .null) _ = try validateTypeSpecDefinition(schema_type, false);
@@ -1782,19 +1780,23 @@ noinline fn validatePropertyScalarKeywords(context: SchemaContext, object: std.j
     }
 }
 
-// Dispatch child keywords through one runtime loop. Keeping one Value and
-// iterator live per level avoids a Debug stack slot for every optional keyword
-// on every recursive descent, without allocating or changing schema semantics.
-noinline fn validatePropertyChildKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
-    const Child = enum { definitions, properties, schema, pattern, boolean_schema, dependent, dependencies, array, additional_items };
-    const children = std.StaticStringMap(Child).initComptime(.{
-        .{ "$defs", .definitions },
-        .{ "properties", .properties },
+// The iterator owns only a position in the immutable JSON tree. Its keyword
+// validation scratch is reclaimed before recursion, with no heap work list or
+// allocation proportional to the width of a schema.
+const PropertySchemaChildren = struct {
+    object: std.json.ObjectMap,
+    keyword_index: usize = 0,
+    child_index: usize = 0,
+
+    const Child = enum { object, schema, pattern, boolean_schema, dependencies, array, additional_items };
+    const keywords = std.StaticStringMap(Child).initComptime(.{
+        .{ "$defs", .object },
+        .{ "properties", .object },
         .{ "propertyNames", .schema },
         .{ "patternProperties", .pattern },
         .{ "additionalProperties", .boolean_schema },
         .{ "unevaluatedProperties", .boolean_schema },
-        .{ "dependentSchemas", .dependent },
+        .{ "dependentSchemas", .object },
         .{ "dependencies", .dependencies },
         .{ "items", .schema },
         .{ "prefixItems", .array },
@@ -1809,31 +1811,53 @@ noinline fn validatePropertyChildKeywords(context: SchemaContext, object: std.js
         .{ "then", .schema },
         .{ "else", .schema },
     });
-    for (object.keys(), object.values()) |key, value| {
-        if (value == .null) continue;
-        switch (children.get(key) orelse continue) {
-            .definitions => try validateDefinitionsDefinition(context, value),
-            .properties => {
-                if (value != .object) return error.InvalidSchemaUpdateRequest;
-                var it = value.object.iterator();
-                while (it.next()) |entry| try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
-            },
-            .schema => try validatePropertySchemaDefinitionWithContext(context, value),
-            .pattern => try validatePatternPropertiesDefinition(context, value),
-            .boolean_schema => {
-                if (value != .bool and value != .object) return error.InvalidSchemaUpdateRequest;
-                if (value == .object) try validatePropertySchemaDefinitionWithContext(context, value);
-            },
-            .dependent => try validateDependentSchemasDefinition(context, value),
-            .dependencies => try validateDependenciesDefinition(context, value),
-            .array => {
-                if (value != .array) return error.InvalidSchemaUpdateRequest;
-                for (value.array.items) |variant| try validatePropertySchemaDefinitionWithContext(context, variant);
-            },
-            .additional_items => try validateAdditionalItemsDefinition(context, object),
+
+    noinline fn next(self: *@This()) !?std.json.Value {
+        while (self.keyword_index < self.object.count()) {
+            const key = self.object.keys()[self.keyword_index];
+            const value = self.object.values()[self.keyword_index];
+            const kind = keywords.get(key);
+            if (value != .null and kind != null) switch (kind.?) {
+                .object, .pattern, .dependencies => {
+                    if (value != .object) return error.InvalidSchemaUpdateRequest;
+                    while (self.child_index < value.object.count()) {
+                        const index = self.child_index;
+                        self.child_index += 1;
+                        const child = value.object.values()[index];
+                        if (kind.? == .dependencies and child == .array) {
+                            for (child.array.items) |required| if (required != .string) return error.InvalidSchemaUpdateRequest;
+                            continue;
+                        }
+                        if (kind.? == .pattern and try regexMatch(value.object.keys()[index], "_id")) {
+                            if (documentPropertySchemaValueContainsSortableMapping(child)) return error.InvalidSchemaUpdateRequest;
+                        }
+                        return child;
+                    }
+                },
+                .array => {
+                    if (value != .array) return error.InvalidSchemaUpdateRequest;
+                    if (self.child_index < value.array.items.len) {
+                        const index = self.child_index;
+                        self.child_index += 1;
+                        return value.array.items[index];
+                    }
+                },
+                .schema, .boolean_schema, .additional_items => {
+                    if (kind.? == .additional_items) {
+                        if (self.object.get("prefixItems") == null or self.object.get("items") != null) return error.InvalidSchemaUpdateRequest;
+                    }
+                    self.keyword_index += 1;
+                    self.child_index = 0;
+                    if (kind.? != .schema and value == .bool) continue;
+                    return value;
+                },
+            };
+            self.keyword_index += 1;
+            self.child_index = 0;
         }
+        return null;
     }
-}
+};
 
 fn validateEnumDefinition(value: std.json.Value) !void {
     if (value != .array) return error.InvalidSchemaUpdateRequest;
@@ -3967,6 +3991,61 @@ fn validatePropertyKeywords(property: *DocumentProperty) !void {
     }
 }
 
+test "relational contract property child traversal retains every keyword and sibling" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"$defs":{"a":{"type":"string"},"b":CHILD}}
+        ,
+        \\{"properties":{"a":{"type":"string"},"b":CHILD}}
+        ,
+        \\{"patternProperties":{"^a":{"type":"string"},"^b":CHILD}}
+        ,
+        \\{"dependentSchemas":{"a":{"type":"string"},"b":CHILD}}
+        ,
+        \\{"dependencies":{"a":["b"],"b":CHILD}}
+        ,
+        \\{"prefixItems":[{"type":"string"},CHILD]}
+        ,
+        \\{"anyOf":[{"type":"string"},CHILD]}
+        ,
+        \\{"oneOf":[{"type":"string"},CHILD]}
+        ,
+        \\{"allOf":[{"type":"string"},CHILD]}
+        ,
+        \\{"propertyNames":CHILD}
+        ,
+        \\{"additionalProperties":CHILD}
+        ,
+        \\{"unevaluatedProperties":CHILD}
+        ,
+        \\{"items":CHILD}
+        ,
+        \\{"prefixItems":[],"additionalItems":CHILD}
+        ,
+        \\{"unevaluatedItems":CHILD}
+        ,
+        \\{"contains":CHILD}
+        ,
+        \\{"not":CHILD}
+        ,
+        \\{"if":CHILD}
+        ,
+        \\{"if":{},"then":CHILD}
+        ,
+        \\{"if":{},"else":CHILD}
+        ,
+    };
+    for (cases) |template| for ([_]bool{ false, true }) |invalid| {
+        const text = try std.mem.replaceOwned(u8, alloc, template, "CHILD", if (invalid) "{\"type\":7}" else "{\"type\":\"string\"}");
+        defer alloc.free(text);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
+        defer parsed.deinit();
+        if (invalid) {
+            try std.testing.expectError(error.InvalidSchemaUpdateRequest, validatePropertySchemaDefinition(parsed.value));
+        } else try validatePropertySchemaDefinition(parsed.value);
+    };
+}
+
 test "relational contract schema parsing uses bounded stack and unwinds partial ownership" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -3980,6 +4059,35 @@ test "relational contract schema parsing uses bounded stack and unwinds partial 
     const Probe = struct {
         input: []const u8,
         failure: ?anyerror = null,
+        stack_start: usize = 0,
+        peak_stack_bytes: usize = 0,
+        backing: std.mem.Allocator = undefined,
+
+        fn observeStack(self: *@This()) void {
+            const here = @frameAddress();
+            const used = if (here < self.stack_start) self.stack_start - here else here - self.stack_start;
+            self.peak_stack_bytes = @max(self.peak_stack_bytes, used);
+        }
+        fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observeStack();
+            return self.backing.rawAlloc(len, alignment, ra);
+        }
+        fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observeStack();
+            return self.backing.rawResize(bytes, alignment, len, ra);
+        }
+        fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observeStack();
+            return self.backing.rawRemap(bytes, alignment, len, ra);
+        }
+        fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observeStack();
+            self.backing.rawFree(bytes, alignment, ra);
+        }
 
         fn parse(a: std.mem.Allocator, text: []const u8) !void {
             var parsed = try parseSchema(a, text);
@@ -3994,18 +4102,24 @@ test "relational contract schema parsing uses bounded stack and unwinds partial 
             // on the normal test thread.
             var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
             defer std.debug.assert(checked.deinit() == 0);
-            parse(checked.allocator(), self.input) catch |err| {
+            self.backing = checked.allocator();
+            self.stack_start = @frameAddress();
+            const measured: std.mem.Allocator = .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+            parse(measured, self.input) catch |err| {
                 self.failure = err;
             };
         }
     };
     var probe = Probe{ .input = input.items };
-    // Keep 32 nested objects within one serving-thread-sized stack, including
-    // leak checking and JSON parsing. Scalar scratch must not accumulate
-    // along the recursive child path.
-    const thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Probe.run, .{&probe});
+    // Linux includes static TLS in the requested pthread stack mapping. Its
+    // size varies with linked runtime owners, so a 1 MiB mapping does not give
+    // the parser 1 MiB of usable stack. Use the ordinary serving stack and
+    // measure parser/ownership traversal at every allocation and release.
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
     thread.join();
     if (probe.failure) |err| return err;
+    std.debug.print("SCHEMA_STACK depth=32 peak_bytes={d} budget_bytes={d}\n", .{ probe.peak_stack_bytes, 1024 * 1024 });
+    try std.testing.expect(probe.peak_stack_bytes > 0 and probe.peak_stack_bytes <= 1024 * 1024);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Probe.parse, .{input.items});
 }
 

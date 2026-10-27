@@ -108,6 +108,15 @@ semantics. A finalized disposable restore owner cancels and joins its maintenanc
 before surrendering its generation; shutdown does not asynchronously interrupt a
 header/rename operation.
 
+Native C ABI connections schedule physical maintenance separately from provider
+replay. A replay turn can publish a new checkpoint and thereby invalidate its
+captured storage snapshot. Before the next replay turn, the connection captures
+a fresh storage-only owner, releases the foreground gate, and services retirement,
+orphan leases, and eligible shrinking without opening another provider runtime.
+This does not relax inode/checkpoint publication checks. Bounded catalog and
+marker-directory sweeps retain their cursors across snapshot replacement, so a
+stable prefix of live leases cannot indefinitely hide abandoned leases.
+
 If the runtime cannot provide concurrency, the status reports it. Reopen and the
 cooperative owner operation can still service debt; the implementation does not
 promise an uninterrupted long-running workload will plateau in that configuration.
@@ -312,6 +321,33 @@ open/reuse proof can read retained values; routine mutations and service never
 perform a whole-file trace. Private vacuum publication rebases retirement epochs
 and writes a metadata checkpoint when discarding earlier private recovery roots.
 
+Opening an immutable artifact publishes an inode-local lease alias. These
+metadata-only commits have their own allocation policy. Mixed groups retain
+ordinary authored-write validation and batching. An unbounded owner with an
+unverified allocator appends their pages without consuming the free pool; the
+first subsequent authored write still performs the protected-graph proof before
+reuse. Hard-budget owners retain ordinary validation/admission so lease metadata
+can use verified free capacity. Lease publication remains durable and the marker
+lock continues to distinguish live readers from crash leftovers. No format or
+reader-compatibility change is needed.
+
+Orphan-alias removal and owner-controlled retirement use the same deferred-proof
+policy. Otherwise the first maintenance turn could merely move an open's full
+graph scan into its foreground publication fence. Unverified housekeeping appends
+metadata, while verified owners keep reusing pages. Authored writes, explicit
+reclamation, and hard-budget admission retain their existing validation policy.
+
+Externally owned DB opens also defer synchronous derived replay. Durable index
+watermarks admit cooperative replay, with one startup index/LSM service per
+namespace incarnation; opening
+tables for SQL recovery does not itself drain their indexes. Before a detached
+turn authors new data, an independent inode-fenced reader verifies its allocator
+outside the foreground gate. Writer admission then requires a proof for the
+current inode and both checkpoints. A rebase may inherit the foreground writer's
+matching proof; otherwise the detached work retries verification outside the
+gate. Closing the connection cancels the graph walk. This keeps the first query
+from inheriting an open's deferred scan while retaining validation before reuse.
+
 ## Shrinking
 
 Page reuse is the routine mechanism. Optional automatic shrinking retains the
@@ -329,6 +365,10 @@ Status exposes reusable pages, pending retirement objects and pending data objec
 reused pages, and serviced objects alongside current/retired/workspace bytes,
 reader retention, shrinking state, estimates, and errors. Reuse/service counters
 are scoped to the currently loaded ledger, rather than lifetime-persisted metrics.
+Assessment and rewrite counts belong to the running owner and also reset on
+reopen. Zero counters in a fresh status-only process do not establish that the
+previous writer never reused pages or ran maintenance; compare counters within
+the active owner and use physical/reusable bytes to inspect persistent state.
 
 The expected growth envelope is live data plus index/key/allocator metadata,
 packed-page slack, both recovery generations, reader-retained pages, and bounded
@@ -395,3 +435,34 @@ previously published partial roots remain durable and resumable. Cancellation
 is not injected into the final durability boundary, whose existing uncertainty
 fencing remains authoritative. Cooperative maintenance calls have independent
 cancellation from the owner's worker shutdown token.
+
+
+### Reuse during detached native turns
+
+A detached runtime used to hold shared locks on the entire inode through replay
+and provider work. Those locks correctly protected snapshots but also disabled
+reuse of pages already free before capture. Rapid native writes could append
+throughout the lifetime of a worker turn, including in short-lived processes.
+
+The connection now coordinates its data-reader fences. While holding the same
+cross-process path-writer lease used for publication, a verified writer accounts
+for their oldest checkpoint, suspends only its own shared inode locks, and tries
+the normal exclusive inode lock. Retirement retains the captured reader frontier
+for the entire allocation window. Remaining external readers still deny exclusive
+reuse. Shared locks are restored before releasing the path-writer lease. Reader
+registration and close remain serialized without retaining the registry mutex
+through allocator callbacks, so reclaiming an idle source can release its fence.
+
+An unrecognized checkpoint publication permanently disqualifies existing readers
+from coordinated suspension: an external writer may have promoted retirement
+without knowing their local frontier. Their ordinary shared locks remain until
+close. The next reader generation can coordinate again. Allocator verification
+and integrity readers retain their original whole-inode locks; the coordinated
+frontier applies to data readers, which do not inspect historical allocator pages.
+This changes no file format and requires no cooperation from older processes.
+
+Allocator ownership validation reads packed tree records through one bounded
+physical-page reader. It verifies each loaded bundle and each requested record
+without reconstructing a synthetic checksummed page per inline record. The
+reachable-root and ownership-count checks remain unchanged, including both
+recovery checkpoints and the cancellation fence.

@@ -1361,6 +1361,7 @@ pub const IndexManager = struct {
     /// Exact persisted envelope requirement, independent of temporary reader
     /// reservations and parent/child feature-epoch aggregation.
     resolver_catalog_format_version: std.atomic.Value(u32) = .init(1),
+    resolver_catalog_projection_dictionary: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
@@ -1445,6 +1446,8 @@ pub const IndexManager = struct {
     vector_block_projection_dirty: std.atomic.Value(bool) = .init(false),
     vector_block_candidate_sequence: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
+    resolver_namespace_lookup: ?ResolverNamespaceLookup = null,
+    test_resolver_catalog_publications: u64 = 0,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// Serialize local receipt counter preparation through its physical commit.
     /// Acquire after primary/graph/index guards; never acquire an index guard
@@ -3364,6 +3367,31 @@ pub const IndexManager = struct {
             .manager = self,
             .mutex = mutex,
         };
+    }
+
+    pub const ManagedIndexApplyPlan = struct {
+        guard: ManagedIndexApplyGuard,
+        snapshot: WritePlanSnapshotView,
+        pub fn unlock(self: *@This()) void {
+            self.guard.unlock();
+            self.snapshot.release();
+        }
+    };
+
+    /// Build/pin before entering catalog admission. A cold snapshot needs a
+    /// catalog reader and cannot be acquired recursively behind a writer.
+    pub fn lockManagedIndexApplyWithPlan(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyPlan {
+        while (true) {
+            var snapshot = try self.acquireWritePlanSnapshot();
+            var guard = self.lockManagedIndexApply(index_ref) catch |err| {
+                snapshot.release();
+                return err;
+            };
+            if (snapshot.generation() == self.writePlanGeneration())
+                return .{ .guard = guard, .snapshot = snapshot };
+            guard.unlock();
+            snapshot.release();
+        }
     }
 
     pub fn lockVectorIndexApply(self: *IndexManager, index_name: []const u8) !ManagedIndexApplyGuard {
@@ -7154,6 +7182,7 @@ pub const IndexManager = struct {
         self.graph_indexes.deinit(self.alloc);
         self.algebraic_indexes.deinit(self.alloc);
         self.enrichments.deinit(self.alloc);
+        self.invalidateResolverNamespaceLookup();
         self.resolvers.deinit(self.alloc);
         self.retired_resolvers.deinit(self.alloc);
         if (self.owned_vector_block_storage) |storage| {
@@ -7288,7 +7317,8 @@ pub const IndexManager = struct {
     /// must never become permission to delete or replace an index root.
     pub fn loadFailureRecoveryAction(err_name: []const u8) IndexLoadRecoveryAction {
         if (std.mem.eql(u8, err_name, "IncompleteBulkPublish") or
-            std.mem.eql(u8, err_name, "MissingPostingCheckpoint"))
+            std.mem.eql(u8, err_name, "MissingPostingCheckpoint") or
+            std.mem.eql(u8, err_name, "TextProjectionUpgradeRequired"))
         {
             return .rebuild_from_artifacts;
         }
@@ -7304,10 +7334,18 @@ pub const IndexManager = struct {
         // the HBC dense implementation. Keep the queue classification as
         // narrow as the execution allowlist so an unfamiliar future producer
         // cannot create an endlessly runnable automatic-repair entry.
-        if (action == .rebuild_from_artifacts and cfg.kind != .dense_vector) {
+        if (action == .rebuild_from_artifacts and !automaticLoadRebuildSupported(cfg.kind, err_name)) {
             return .manual_intervention;
         }
         return action;
+    }
+
+    pub fn automaticLoadRebuildSupported(kind: types.IndexKind, err_name: []const u8) bool {
+        return switch (kind) {
+            .dense_vector => std.mem.eql(u8, err_name, "IncompleteBulkPublish") or std.mem.eql(u8, err_name, "MissingPostingCheckpoint"),
+            .full_text => std.mem.eql(u8, err_name, "TextProjectionUpgradeRequired"),
+            else => false,
+        };
     }
 
     fn failedIndexLoadActionQueue(self: *IndexManager, action: IndexLoadRecoveryAction) *FailedIndexLoadActionQueue {
@@ -8691,13 +8729,18 @@ pub const IndexManager = struct {
             },
         };
 
-        pub fn deinit(self: *NativeBackupCheckpoints) void {
+        fn releaseCheckpoints(self: *NativeBackupCheckpoints) void {
             for (self.artifacts.items) |*artifact| {
                 switch (artifact.checkpoint) {
                     inline else => |*checkpoint| checkpoint.deinit(),
                 }
                 self.alloc.free(artifact.index_name);
             }
+            self.artifacts.clearRetainingCapacity();
+        }
+
+        pub fn deinit(self: *NativeBackupCheckpoints) void {
+            self.releaseCheckpoints();
             if (self.native_files) |*checkpoint| checkpoint.deinit();
             self.artifacts.deinit(self.alloc);
             self.* = undefined;
@@ -9034,6 +9077,32 @@ pub const IndexManager = struct {
                 .checkpoint = .{ .lsm = checkpoints.reverse },
             });
         }
+        // Retain manifested files independently of the live index owners.
+        // Snapshot refs protect compaction, but a catalog replacement can close
+        // an owner and retire its root before off-fence sealing starts. Capture
+        // immutable links and owned manifest bytes while catalog admission is
+        // still fenced, just as for native dense generations above.
+        for (result.artifacts.items) |*artifact| {
+            const relative_root = try std.fs.path.join(self.alloc, &.{ "indexes", artifact.index_name, artifact.backend_root });
+            defer self.alloc.free(relative_root);
+            switch (artifact.checkpoint) {
+                .lsm => |*checkpoint| {
+                    const manifest_path = try self.retainNativeBackupAllocation(&native_owned, try std.fs.path.join(self.alloc, &.{ relative_root, "manifest.bin" }));
+                    try native_specs.append(self.alloc, .{ .relative_path = manifest_path, .source = .{ .bytes = checkpoint.manifest_bytes } });
+                    for (checkpoint.run_paths, checkpoint.run_ids) |source, run_id| {
+                        const relative = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}/runs/{d}.tbl", .{ relative_root, run_id }));
+                        try native_specs.append(self.alloc, .{ .relative_path = relative, .source = .{ .immutable_file = source } });
+                    }
+                },
+                .text_segments => |*checkpoint| {
+                    for (checkpoint.snapshot.segments) |segment| {
+                        const source = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}/{d}.seg", .{ checkpoint.source_root, segment.id }));
+                        const relative = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}/{d}.seg", .{ relative_root, segment.id }));
+                        try native_specs.append(self.alloc, .{ .relative_path = relative, .source = .{ .immutable_file = source } });
+                    }
+                },
+            }
+        }
         if (native_specs.items.len != 0) {
             result.native_files = try native_backup.pinExplicitArtifacts(
                 self.alloc,
@@ -9043,6 +9112,7 @@ pub const IndexManager = struct {
                 cancellation,
             );
         }
+        result.releaseCheckpoints();
         return result;
     }
 
@@ -12840,6 +12910,8 @@ pub const IndexManager = struct {
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return existing.promote != next.promote or
             existing.namespace_curation_generation != next.namespace_curation_generation or
+            existing.namespace_curation_table_id != next.namespace_curation_table_id or
+            existing.namespace_curation_missing != next.namespace_curation_missing or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.merges, next.merges) or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.aliases, next.aliases) or
             !std.mem.eql(u8, existing.table, next.table) or
@@ -12887,6 +12959,62 @@ pub const IndexManager = struct {
         if (method == .string and std.mem.eql(u8, method.string, "generated") and policy == .string and std.mem.eql(u8, policy.string, "verdict_only")) return error.InvalidResolverConfig;
     }
 
+    /// Import immutable policy once into this owner's allocator. Transient
+    /// metadata arenas never lend their lifetime to persistent catalog slots.
+    const ResolverSlot = struct { retired: bool, index: usize };
+    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)) };
+    fn invalidateResolverNamespaceLookup(self: *IndexManager) void {
+        if (self.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
+        self.resolver_namespace_lookup = null;
+    }
+    fn resolverNamespaceSlots(self: *IndexManager, table: []const u8, template: []const u8) ![]const ResolverSlot {
+        if (self.resolver_namespace_lookup == null) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            var slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)) = .empty;
+            for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }, 0..) |definitions, retired| for (definitions, 0..) |cfg, index| {
+                if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) continue;
+                const identity = try std.json.Stringify.valueAlloc(a, .{ cfg.table, cfg.key_template }, .{});
+                const entry = try slots.getOrPut(a, identity);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(a, .{ .retired = retired != 0, .index = index });
+            };
+            self.resolver_namespace_lookup = .{ .arena = arena, .slots = slots };
+        }
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const identity = try std.json.Stringify.valueAlloc(scratch.allocator(), .{ table, template }, .{});
+        return if (self.resolver_namespace_lookup.?.slots.get(identity)) |slots| slots.items else &.{};
+    }
+    pub fn resolverNamespaceObservation(self: *IndexManager, a: Allocator, table: []const u8, template: []const u8) !?resolver_catalog.ResolverObservation {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slots = try self.resolverNamespaceSlots(table, template);
+        if (slots.len == 0) return null;
+        // Prefer an already bound definition when a new consumer joined late.
+        var selected = slots[0];
+        for (slots) |slot| if ((if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index]).namespace_curation_table_id != 0) {
+            selected = slot;
+            break;
+        };
+        return try resolver_catalog.ResolverObservation.fromConfig(a, if (selected.retired) self.retired_resolvers.items[selected.index] else self.resolvers.items[selected.index]);
+    }
+    fn cloneResolverOwned(self: *IndexManager, cfg: ResolverConfig) !ResolverConfig {
+        if (cfg.shared_projection) |incoming| {
+            if (cfg.merges.ptr == incoming.merges.ptr and cfg.merges.len == incoming.merges.len and cfg.curation_json.ptr == incoming.curation_json.ptr and cfg.curation_json.len == incoming.curation_json.len) {
+                if (incoming.alloc.ptr == self.alloc.ptr and incoming.alloc.vtable == self.alloc.vtable) return ResolverConfig.cloneWithProjection(self.alloc, cfg, incoming);
+                for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |entry| if (entry.shared_projection) |owned| {
+                    if (std.mem.eql(u8, &owned.digest, &incoming.digest)) return ResolverConfig.cloneWithProjection(self.alloc, cfg, owned);
+                };
+                const owned = try resolver_catalog.SharedProjection.create(self.alloc, incoming.merges, incoming.curation_json);
+                defer owned.release();
+                return ResolverConfig.cloneWithProjection(self.alloc, cfg, owned);
+            }
+        }
+        return ResolverConfig.clone(self.alloc, cfg);
+    }
+
     pub fn addResolver(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig) !void {
         var cfg = input_cfg;
         cfg.inline_managed = false;
@@ -12905,7 +13033,7 @@ pub const IndexManager = struct {
 
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
-        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.resolvers.append(self.alloc, try self.cloneResolverOwned(cfg));
         try self.persistResolverCatalog(store, .mark_reresolve_dirty);
     }
 
@@ -12915,6 +13043,21 @@ pub const IndexManager = struct {
     /// their incremental replay hints will not fire on their own.
     pub fn upsertResolver(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig) !ResolverUpsertResult {
         return self.upsertResolverWithNamespaceMigration(store, input_cfg, false);
+    }
+
+    fn retainNativeProjection(cfg: *ResolverConfig, previous: ResolverConfig, migrate: bool) !void {
+        if (migrate or previous.namespace_curation_table_id == 0 or cfg.namespace_curation_table_id != 0) return;
+        if (!std.mem.eql(u8, cfg.table, previous.table) or !std.mem.eql(u8, cfg.key_template, previous.key_template)) return error.ResolverMergeNamespaceChange;
+        cfg.namespace_curation_table_id = previous.namespace_curation_table_id;
+        cfg.namespace_curation_generation = previous.namespace_curation_generation;
+        cfg.namespace_curation_missing = previous.namespace_curation_missing;
+        cfg.curation_revision = previous.curation_revision;
+        cfg.curation_json = previous.curation_json;
+        cfg.merges = previous.merges;
+        cfg.merge_generation = previous.merge_generation;
+        cfg.merge_state_version = previous.merge_state_version;
+        cfg.shared_projection = previous.shared_projection;
+        cfg.validation_proof = previous.validation_proof;
     }
 
     pub fn upsertResolverWithNamespaceMigration(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig, migrate_namespace: bool) !ResolverUpsertResult {
@@ -12929,13 +13072,15 @@ pub const IndexManager = struct {
         if (cfg.retired) {
             for (self.retired_resolvers.items) |*entry| {
                 if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
-                if (cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
+                try retainNativeProjection(&cfg, entry.*, migrate_namespace);
+                try cfg.rebaseNativeProjection(entry.*);
+                if (cfg.namespace_curation_table_id == 0 and cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
                 if (!migrate_namespace and (!std.mem.eql(u8, cfg.table, entry.table) or !std.mem.eql(u8, cfg.key_template, entry.key_template))) return error.ResolverMergeNamespaceChange;
                 cfg.namespace_generation = if (migrate_namespace) @max(input_cfg.namespace_generation, try std.math.add(u64, entry.namespace_generation, 1)) else entry.namespace_generation;
                 cfg.resolution_generation = try std.math.add(u64, entry.effectiveGeneration(), 1);
                 try cfg.validate();
                 var previous = entry.*;
-                entry.* = try ResolverConfig.clone(self.alloc, cfg);
+                entry.* = try self.cloneResolverOwned(cfg);
                 self.persistResolverCatalog(store, .catalog_only) catch |err| {
                     entry.deinit(self.alloc);
                     entry.* = previous;
@@ -12969,7 +13114,9 @@ pub const IndexManager = struct {
             if (entry.inline_managed == false) cfg.inline_managed = false;
             if (cfg.inline_managed == null) cfg.inline_managed = entry.inline_managed;
             if (cfg.inline_managed == true and cfg.aliases.len == 0 and !migrate_namespace) cfg.aliases = entry.aliases;
-            if (cfg.merge_generation == 0 and cfg.curation_revision <= entry.curation_revision and !migrate_namespace) {
+            try retainNativeProjection(&cfg, entry.*, migrate_namespace);
+            try cfg.rebaseNativeProjection(entry.*);
+            if (cfg.namespace_curation_table_id == 0 and cfg.merge_generation == 0 and cfg.curation_revision <= entry.curation_revision and !migrate_namespace) {
                 cfg.merges = entry.merges;
                 if (cfg.curation_revision == 0) {
                     cfg.curation_json = entry.curation_json;
@@ -12978,8 +13125,8 @@ pub const IndexManager = struct {
                 cfg.merge_generation = entry.merge_generation;
                 cfg.merge_state_version = entry.merge_state_version;
             }
-            if (cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
-            if (cfg.curation_revision == entry.curation_revision and !std.mem.eql(u8, cfg.curation_json, entry.curation_json))
+            if (cfg.namespace_curation_table_id == 0 and cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
+            if (cfg.namespace_curation_table_id == 0 and cfg.curation_revision == entry.curation_revision and !std.mem.eql(u8, cfg.curation_json, entry.curation_json))
                 return error.ResolverCurationConflict;
             cfg.resolution_generation = entry.resolution_generation;
             cfg.namespace_generation = entry.namespace_generation;
@@ -13018,7 +13165,7 @@ pub const IndexManager = struct {
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
             if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
             var previous = entry.*;
-            entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
+            entry.* = try self.cloneResolverOwned(cfg);
             self.persistResolverCatalog(store, if (material_changed or reactivating) .mark_reresolve_dirty else .catalog_only) catch |err| {
                 entry.deinit(self.alloc);
                 entry.* = previous;
@@ -13032,7 +13179,7 @@ pub const IndexManager = struct {
         if (cfg.inline_managed == null) cfg.inline_managed = false;
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
-        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.resolvers.append(self.alloc, try self.cloneResolverOwned(cfg));
         try self.persistResolverCatalog(store, .mark_reresolve_dirty);
         return .inserted;
     }
@@ -13066,6 +13213,107 @@ pub const IndexManager = struct {
         return false;
     }
 
+    /// One namespace snapshot, one durable catalog publication, regardless of
+    /// the number of serving/retired consumers in this owner.
+    pub fn completeResolverProjectionWork(self: *IndexManager, store: anytype, key: []const u8) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.delete(key);
+        try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, key);
+        try txn.commit();
+    }
+
+    pub fn publishResolverNamespaceProjection(self: *IndexManager, store: anytype, table: []const u8, table_id: u64, namespace: @import("../resolver_namespace.zig").Namespace) !bool {
+        return self.publishResolverNamespaceProjectionWork(store, table, table_id, namespace, null);
+    }
+    pub fn publishResolverNamespaceProjectionWork(self: *IndexManager, store: anytype, table: []const u8, table_id: u64, namespace: @import("../resolver_namespace.zig").Namespace, completion: ?@import("../../lite/resolver_consumers.zig").Completion) !bool {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const state = try std.json.Stringify.valueAlloc(arena.allocator(), namespace.state, .{});
+        const projection = try resolver_catalog.SharedProjection.create(self.alloc, namespace.merges, state);
+        defer projection.release();
+        var validated_profiles: std.StringHashMapUnmanaged(void) = .empty;
+        const Change = struct { slot: *ResolverConfig, before: ResolverConfig, after: ResolverConfig };
+        var changes: std.ArrayList(Change) = .empty;
+        defer changes.deinit(self.alloc);
+        var published = false;
+        defer for (changes.items) |*change| {
+            if (published) {
+                change.before.deinit(self.alloc);
+            } else {
+                change.slot.* = change.before;
+                change.after.deinit(self.alloc);
+            }
+        };
+        for (try self.resolverNamespaceSlots(table, namespace.key_template)) |slot| {
+            const entry = if (slot.retired) &self.retired_resolvers.items[slot.index] else &self.resolvers.items[slot.index];
+            try self.requireResolverNotReplacing(entry.name);
+            if (entry.namespace_curation_table_id == table_id and entry.namespace_curation_generation == namespace.revision and entry.namespace_curation_missing == !namespace.record_store) continue;
+            var next = entry.*;
+            next.merges = namespace.merges;
+            next.curation_json = state;
+            next.namespace_curation_table_id = table_id;
+            next.namespace_curation_generation = namespace.revision;
+            next.namespace_curation_missing = !namespace.record_store;
+            try next.rebaseNativeProjection(entry.*);
+            next.resolution_generation = try std.math.add(u64, entry.effectiveGeneration(), 1);
+            next.merge_generation = if (next.merges.len == 0) 0 else next.resolution_generation;
+            next.merge_state_version = if (next.merges.len == 0) 2 else 1;
+            // Execution fields are unchanged from an admitted config. Validate
+            // a shared policy once per distinct static policy profile.
+            const profile = try std.json.Stringify.valueAlloc(arena.allocator(), .{ next.aliases, next.suppress_json }, .{});
+            if (!(try validated_profiles.getOrPut(arena.allocator(), profile)).found_existing) try next.validate();
+            try changes.ensureUnusedCapacity(self.alloc, 1);
+            const owned = try ResolverConfig.cloneWithProjection(self.alloc, next, projection);
+            changes.appendAssumeCapacity(.{ .slot = entry, .before = entry.*, .after = owned });
+        }
+        if (changes.items.len == 0) {
+            if (completion) |work| {
+                var runtime_store = try initRuntimeStore(self.alloc, store);
+                defer runtime_store.deinit();
+                var txn = try runtime_store.store.beginWrite();
+                errdefer txn.abort();
+                try txn.delete(work.key);
+                try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
+                try txn.commit();
+            }
+            return false;
+        }
+        for (changes.items) |change| change.slot.* = change.after;
+        const durable = @import("../resolver_projection.zig");
+        const slots = try self.resolverNamespaceSlots(table, namespace.key_template);
+        const bindings = try arena.allocator().alloc(durable.Binding, slots.len);
+        for (slots, bindings) |slot, *binding| {
+            const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+            binding.* = .{ .name = cfg.name, .retired = cfg.retired, .resolution_generation = cfg.resolution_generation, .merge_generation = cfg.merge_generation, .merge_state_version = cfg.merge_state_version };
+        }
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(try durable.key(arena.allocator(), table, namespace.key_template), try std.json.Stringify.valueAlloc(arena.allocator(), durable.Record{ .table = table, .table_id = table_id, .namespace = namespace, .bindings = bindings }, .{}));
+        const epoch = if (txn.get(durable.epoch_key)) |raw| try std.fmt.parseInt(u64, raw, 10) else |err| if (err == error.NotFound) @as(u64, 0) else return err;
+        try txn.put(durable.epoch_key, try std.fmt.allocPrint(arena.allocator(), "{d}", .{try std.math.add(u64, epoch, 1)}));
+        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_delta_reader_version));
+        try txn.put(resolver_catalog.reresolve_resume_key, "");
+        try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
+        if (completion) |work| {
+            try txn.delete(work.key);
+            try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
+        }
+        try txn.commit();
+        self.minimum_reader_version.store(resolver_catalog.resolver_projection_delta_reader_version, .release);
+        self.invalidateWritePlanSnapshot();
+        published = true;
+        return true;
+    }
+
     pub fn listResolverIdentities(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
@@ -13082,6 +13330,106 @@ pub const IndexManager = struct {
             result.appendAssumeCapacity(try ResolverConfig.clone(alloc, cfg));
         }
         return result.toOwnedSlice(alloc);
+    }
+
+    /// Maintenance admission only needs to know whether definitions exist.
+    /// Retired definitions can still own projection cleanup obligations.
+    pub fn hasResolverDefinitions(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.resolvers.items.len != 0 or self.retired_resolvers.items.len != 0;
+    }
+
+    /// Admission needs static policy and generation identities, never a copy of
+    /// every destination-owned correction or its receipts.
+    pub fn listResolverStaticDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const definitions = try self.resolverDefinitionsAlloc(alloc);
+        defer alloc.free(definitions);
+        var result: std.ArrayList(ResolverConfig) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for (definitions) |definition| {
+            if (std.mem.startsWith(u8, definition.name, "__antfly_replacement/")) continue;
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            try result.append(alloc, try ResolverConfig.clone(alloc, cfg));
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
+    /// One catalog pass for a batch of replay observations. Policy, providers,
+    /// aliases and extraction config never enter a wait-loop snapshot.
+    pub fn resolverObservationDescriptors(self: *IndexManager, alloc: Allocator, names: []const []const u8) ![]resolver_catalog.ResolverObservation {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        defer wanted.deinit(alloc);
+        for (names) |name| try wanted.put(alloc, name, {});
+        var result: std.ArrayList(resolver_catalog.ResolverObservation) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
+            if (!wanted.contains(definition.name)) continue;
+            const owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, definition);
+            errdefer {
+                var cleanup = owned;
+                cleanup.deinit(alloc);
+            }
+            try result.append(alloc, owned);
+        };
+        return result.toOwnedSlice(alloc);
+    }
+
+    /// Match listResolvers' active/staged routing selection without copying
+    /// destination-owned projected policy for unrelated resolver siblings.
+    pub fn listResolverRoutingDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const result = try alloc.alloc(ResolverConfig, self.resolvers.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*cfg| cfg.deinit(alloc);
+            alloc.free(result);
+        }
+        for (self.resolvers.items, result) |definition, *output| {
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            output.* = try ResolverConfig.clone(alloc, cfg);
+            initialized += 1;
+        }
+        return result;
+    }
+
+    /// Legacy point reads need only the selected definition's policy, never
+    /// copies of every sibling's projected namespace.
+    pub fn resolverIdentityAlloc(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
+            if (std.mem.eql(u8, definition.name, name)) return try ResolverConfig.clone(alloc, definition);
+        };
+        return null;
+    }
+
+    pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
+            if (!std.mem.eql(u8, definition.name, name)) continue;
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            return try ResolverConfig.clone(alloc, cfg);
+        };
+        return null;
     }
 
     /// Trusted admission rollback restores ownership as well as configuration.
@@ -14638,7 +14986,7 @@ pub const IndexManager = struct {
             }
             if (entry.chunk_name) |chunk_name| {
                 const chunk_cfg = self.getEnrichmentExcluding(.chunk, chunk_name, excluded_enrichment) orelse continue;
-                if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0) return true;
+                if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) return true;
             }
             for (entry.source_artifact_names) |artifact_name| {
                 if (self.getEnrichmentExcluding(.chunk, artifact_name, excluded_enrichment) != null or
@@ -15100,6 +15448,10 @@ pub const IndexManager = struct {
                 }
                 asset_emitted[entry_index] = true;
                 emit_progress = true;
+                if (self.getEnrichment(.chunk, entry.source_artifact_name)) |chunk| {
+                    try appendGeneratedChunkRequest(alloc, &requests, entry.name, doc_key, chunk, false, true, true);
+                }
+
                 try appendOwnedGeneratedRequest(alloc, &requests, .{
                     .kind = .asset,
                     .index_name = entry.name,
@@ -15124,14 +15476,14 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |entry| {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name)) |chunk_cfg| {
-                    if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0) {
+                    if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) {
                         try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
                     }
                 }
             }
             for (entry.source_artifact_names) |artifact_name| {
                 const chunk_cfg = self.getEnrichment(.chunk, artifact_name) orelse continue;
-                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0) continue;
+                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0 and !self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) continue;
                 try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
             }
         }
@@ -15139,7 +15491,7 @@ pub const IndexManager = struct {
         for (self.graph_indexes.items) |entry| {
             for (entry.artifact_sources) |source| {
                 const chunk_cfg = self.getEnrichment(.chunk, source.artifact_name) orelse continue;
-                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0) continue;
+                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0 and !self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) continue;
                 try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, true);
             }
         }
@@ -15205,7 +15557,7 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0)
+                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name))
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
@@ -15310,7 +15662,7 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims != 0) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0)
+                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name))
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
@@ -15436,6 +15788,7 @@ pub const IndexManager = struct {
             }
             requests.shrinkRetainingCapacity(retained);
         }
+        try orderGeneratedArtifactDependencies(self.alloc, requests.items);
         return try requests.toOwnedSlice(alloc);
     }
 
@@ -16819,6 +17172,13 @@ pub const IndexManager = struct {
         var producer = asset_producer_mod.parseProducerConfig(self.alloc, asset_cfg.producer_json) catch return false;
         defer producer.deinit(self.alloc);
         return producer.type == .document_extraction;
+    }
+
+    fn assetSourceIsMediaOutput(self: *const IndexManager, name: []const u8) bool {
+        const config = self.getEnrichment(.asset, name) orelse return false;
+        var producer = asset_producer_mod.parseProducerConfig(self.alloc, config.producer_json) catch return false;
+        defer producer.deinit(self.alloc);
+        return producer.type == .media_output;
     }
 
     fn artifactSourceSupportsUnitGrouping(self: *const IndexManager, artifact_name: []const u8) bool {
@@ -22040,7 +22400,13 @@ pub const IndexManager = struct {
                     cfg,
                     runtime_schema,
                 );
-                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, read_only) catch |err| {
+                const historical_projection = [_]TextProjectionProvenance{
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 0),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 1),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 2),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 3),
+                };
+                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, historical_projection, read_only) catch |err| {
                     std.log.warn("full_text open failed step=projection_provenance name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -22763,7 +23129,11 @@ pub const IndexManager = struct {
     /// and publication of the returned reader/envelope stamp.
     pub fn alignRowDerivedArtifactCatalogNoLock(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !CatalogReaderStamp {
         if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
-        const desired_format = if (expected.resolvers.len == 0) 1 else try resolver_catalog.catalogReaderVersion(self.alloc, expected.resolvers);
+        const desired_encoding: resolver_catalog.CatalogEncoding = if (expected.resolvers.len == 0)
+            .{ .minimum_reader_version = 1, .projection_dictionary = false }
+        else
+            try resolver_catalog.catalogEncoding(self.alloc, expected.resolvers);
+        const desired_format = desired_encoding.minimum_reader_version;
         const current_reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
         const current_resolvers = txn.get(resolver_catalog_key) catch |err| switch (err) {
             error.NotFound => "[]",
@@ -22783,7 +23153,7 @@ pub const IndexManager = struct {
         } else {
             // Retired definitions remain part of the durable identity. This
             // path may align their envelope, never replace unloaded contracts.
-            const loaded = try resolver_catalog.serializeCatalogWithMinimumVersion(self.alloc, self.retired_resolvers.items, desired_format);
+            const loaded = try resolver_catalog.serializeCatalogWithEncoding(self.alloc, self.retired_resolvers.items, desired_encoding);
             defer self.alloc.free(loaded);
             if (!std.mem.eql(u8, expected.resolvers, loaded)) return error.ArtifactCatalogDrift;
         }
@@ -22844,7 +23214,7 @@ pub const IndexManager = struct {
             };
         }
         try @import("../artifact_inventory.zig").refresh(txn);
-        return .{ .reader = reader_version, .format = desired_format };
+        return .{ .reader = reader_version, .format = desired_format, .projection_dictionary = desired_encoding.projection_dictionary };
     }
 
     pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
@@ -23274,6 +23644,7 @@ pub const IndexManager = struct {
         try txn.commit();
         self.publishCatalogReaderStamp(reader_version);
         self.truncateResolvers(0);
+        self.invalidateResolverNamespaceLookup();
         self.resolvers.deinit(self.alloc);
         self.truncateRetiredResolvers(0);
         self.retired_resolvers.deinit(self.alloc);
@@ -23419,11 +23790,12 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
     }
 
-    const CatalogReaderStamp = struct { reader: u32, format: u32 };
+    const CatalogReaderStamp = struct { reader: u32, format: u32, projection_dictionary: bool };
 
     /// Publish only after durability, while retaining the catalog publication fence.
     pub fn publishCatalogReaderStamp(self: *IndexManager, stamp: CatalogReaderStamp) void {
         self.resolver_catalog_format_version.store(stamp.format, .release);
+        self.resolver_catalog_projection_dictionary.store(stamp.projection_dictionary, .release);
         self.minimum_reader_version.store(stamp.reader, .release);
     }
 
@@ -23431,6 +23803,27 @@ pub const IndexManager = struct {
     /// them while any reservation exists, preserving the feature epoch in a
     /// separate baseline. Marker publication/removal and fencing share a txn.
     fn stampCatalogReaderVersion(self: *IndexManager, txn: anytype, catalog: []const u8) !CatalogReaderStamp {
+        if (comptime @import("builtin").is_test) self.test_resolver_catalog_publications += 1;
+        self.invalidateResolverNamespaceLookup();
+        {
+            const prefix = @import("../resolver_projection.zig").prefix;
+            var keys: std.ArrayList([]u8) = .empty;
+            defer {
+                for (keys.items) |key| self.alloc.free(key);
+                keys.deinit(self.alloc);
+            }
+            {
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                var row = try cursor.seekAtOrAfter(prefix);
+                while (row) |entry| {
+                    if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                    try keys.append(self.alloc, try self.alloc.dupe(u8, entry.key));
+                    row = try cursor.next();
+                }
+            }
+            for (keys.items) |key| try txn.delete(key);
+        }
         const current = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
         const baseline_raw = txn.get(replacement_reader_base_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -23446,7 +23839,17 @@ pub const IndexManager = struct {
         const graph_version: u32 = for (self.graph_indexes.items) |entry| {
             if (entry.ttl_duration_ns != 0) break resolver_catalog.graph_expiration_namespace_reader_version;
         } else 1;
-        const authoritative = @max(graph_version, @max(producer_version, @max(baseline, try resolver_catalog.catalogReaderVersion(self.alloc, catalog))));
+        const prior_catalog = txn.get(resolver_catalog_key) catch |err| switch (err) {
+            error.NotFound => "[]",
+            else => return err,
+        };
+        const prior_format = try resolver_catalog.catalogReaderVersion(self.alloc, prior_catalog);
+        // Native record publication can raise its epoch independently of this
+        // manager's catalog mutation. Such a durable increase is permanent;
+        // the old envelope already accounts for the reservation's own fence.
+        const independently_raised = if (current > prior_format) current else 1;
+        const encoding = try resolver_catalog.catalogEncoding(self.alloc, catalog);
+        const authoritative = @max(independently_raised, @max(graph_version, @max(producer_version, @max(baseline, encoding.minimum_reader_version))));
         var pending_version: u32 = 1;
         {
             var cursor = try txn.openCursor();
@@ -23465,11 +23868,11 @@ pub const IndexManager = struct {
             }
         }
         const pending = pending_version > 1;
-        const version = @max(authoritative, pending_version);
+        var version = @max(authoritative, pending_version);
         // Pre-epoch libraries ignore minimum_reader_version, but their strict
         // array parser rejects a versioned resolver envelope. Publish both
         // fences atomically; restore the plain array when the last shadow ends.
-        const catalog_version = try resolver_catalog.catalogReaderVersion(self.alloc, catalog);
+        const catalog_version = encoding.minimum_reader_version;
         const fenced_catalog = if ((pending and catalog_version == 1) or (version >= resolver_catalog.graph_expiration_namespace_reader_version and catalog_version < version))
             try resolver_catalog.versionedCatalog(self.alloc, catalog, version)
         else
@@ -23478,11 +23881,26 @@ pub const IndexManager = struct {
         const stored_catalog = fenced_catalog orelse catalog;
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(txn, resolver_catalog_key, stored_catalog);
         try txn.put(resolver_catalog_key, stored_catalog);
+        // Native binding maintenance can introduce durable projection jobs in
+        // this same transaction. Preserve its reader fence and envelope.
+        const derived_version = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
+        // Only a requirement introduced by this catalog write is new. The
+        // old effective epoch may still include the reservation being removed;
+        // treating it as a derived upgrade makes that temporary fence permanent.
+        const upgraded = derived_version > @max(current, version);
+        if (upgraded) {
+            version = derived_version;
+            const envelope = try resolver_catalog.versionedCatalog(self.alloc, catalog, version);
+            defer self.alloc.free(envelope);
+            try txn.put(resolver_catalog_key, envelope);
+        }
         try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(version));
         if (pending) {
-            try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(authoritative));
+            try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(@max(authoritative, if (upgraded) version else 1)));
         } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
-        return .{ .reader = version, .format = if (fenced_catalog != null) version else catalog_version };
+        // versionedCatalog changes only the reader fence: it preserves an
+        // object's dictionary and wraps a legacy array without inventing one.
+        return .{ .reader = version, .format = if (fenced_catalog != null or upgraded) version else catalog_version, .projection_dictionary = encoding.projection_dictionary };
     }
 
     /// Permanent requirements exclude a temporary reservation fence. Parent
@@ -23528,6 +23946,7 @@ pub const IndexManager = struct {
         if (fenced != null) try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(required));
         const version = @max(current, required);
         try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(version));
+        var encoding: ?resolver_catalog.CatalogEncoding = null;
         if (version >= resolver_catalog.graph_expiration_namespace_reader_version) {
             const catalog = txn.get(resolver_catalog_key) catch |err| switch (err) {
                 error.NotFound => "[]",
@@ -23535,19 +23954,22 @@ pub const IndexManager = struct {
             };
             const fenced_catalog = try resolver_catalog.versionedCatalog(self.alloc, catalog, version);
             defer self.alloc.free(fenced_catalog);
+            encoding = try resolver_catalog.catalogEncoding(self.alloc, fenced_catalog);
             try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, fenced_catalog);
             try txn.put(resolver_catalog_key, fenced_catalog);
             try @import("../artifact_inventory.zig").refresh(&txn);
         }
         try txn.commit();
         if (version >= resolver_catalog.graph_expiration_namespace_reader_version) {
-            self.resolver_catalog_format_version.store(version, .release);
+            self.resolver_catalog_format_version.store(encoding.?.minimum_reader_version, .release);
+            self.resolver_catalog_projection_dictionary.store(encoding.?.projection_dictionary, .release);
             self.invalidateWritePlanSnapshot();
         }
         self.minimum_reader_version.store(version, .release);
     }
 
     fn loadResolverCatalog(self: *IndexManager, store: anytype) !void {
+        self.invalidateResolverNamespaceLookup();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginRead();
@@ -23557,14 +23979,16 @@ pub const IndexManager = struct {
         const data = txn.get(resolver_catalog_key) catch |err| switch (err) {
             error.NotFound => {
                 self.resolver_catalog_format_version.store(1, .release);
+                self.resolver_catalog_projection_dictionary.store(false, .release);
                 return;
             },
             else => return err,
         };
 
-        const format = try resolver_catalog.catalogReaderVersion(self.alloc, data);
-        self.resolver_catalog_format_version.store(format, .release);
-        self.minimum_reader_version.store(@max(stamped_version, format), .release);
+        const encoding = try resolver_catalog.catalogEncoding(self.alloc, data);
+        self.resolver_catalog_format_version.store(encoding.minimum_reader_version, .release);
+        self.resolver_catalog_projection_dictionary.store(encoding.projection_dictionary, .release);
+        self.minimum_reader_version.store(@max(stamped_version, encoding.minimum_reader_version), .release);
         const configs = try resolver_catalog.deserializeCatalog(self.alloc, data);
         defer {
             for (configs) |*cfg| cfg.deinit(self.alloc);
@@ -23575,6 +23999,36 @@ pub const IndexManager = struct {
             else => return err,
         };
         try resolver_catalog.applyMergeState(self.alloc, configs, merge_data);
+        {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const durable = @import("../resolver_projection.zig");
+            var by_name: std.StringHashMapUnmanaged(usize) = .empty;
+            for (configs, 0..) |cfg, index| try by_name.put(a, try a.dupe(u8, cfg.name), index);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(durable.prefix);
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, durable.prefix)) break;
+                const record = try durable.parse(a, entry.key, entry.value);
+                const projection = try resolver_catalog.SharedProjection.create(self.alloc, record.namespace.merges, try std.json.Stringify.valueAlloc(a, record.namespace.state, .{}));
+                defer projection.release();
+                var validated: std.StringHashMapUnmanaged(void) = .empty;
+                for (record.bindings) |binding| {
+                    const index = by_name.get(binding.name) orelse return error.InvalidMetadataBatch;
+                    var next = try durable.apply(configs[index], record, binding, projection);
+                    const profile = try std.json.Stringify.valueAlloc(a, .{ next.aliases, next.suppress_json }, .{});
+                    if (!(try validated.getOrPut(a, profile)).found_existing) try next.validatePolicy();
+                    next.validation_proof = .{ .policy_digest = projection.digest, .static_digest = try resolver_catalog.policyProfileDigest(a, next.aliases, next.suppress_json) };
+                    const owned = try ResolverConfig.cloneWithProjection(self.alloc, next, projection);
+                    configs[index].deinit(self.alloc);
+                    configs[index] = owned;
+                }
+                row = try cursor.next();
+            }
+        }
+
         const active_checkpoint = self.resolvers.items.len;
         const retired_checkpoint = self.retired_resolvers.items.len;
         errdefer {
@@ -23583,7 +24037,15 @@ pub const IndexManager = struct {
         }
         for (configs) |cfg| {
             const definitions = if (cfg.retired) &self.retired_resolvers else &self.resolvers;
-            try definitions.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+            const owned = if (cfg.shared_projection) |projection|
+                try ResolverConfig.cloneWithProjection(self.alloc, cfg, projection)
+            else
+                try ResolverConfig.clone(self.alloc, cfg);
+            errdefer {
+                var cleanup = owned;
+                cleanup.deinit(self.alloc);
+            }
+            try definitions.append(self.alloc, owned);
         }
     }
 
@@ -23597,7 +24059,10 @@ pub const IndexManager = struct {
     fn serializeResolverDefinitions(self: *const IndexManager, alloc: Allocator) ![]u8 {
         const definitions = try self.resolverDefinitionsAlloc(alloc);
         defer alloc.free(definitions);
-        return resolver_catalog.serializeCatalogWithMinimumVersion(alloc, definitions, self.resolver_catalog_format_version.load(.acquire));
+        return resolver_catalog.serializeCatalogWithEncoding(alloc, definitions, .{
+            .minimum_reader_version = self.resolver_catalog_format_version.load(.acquire),
+            .projection_dictionary = self.resolver_catalog_projection_dictionary.load(.acquire),
+        });
     }
 
     /// Mutation stamping derives permanent requirements from definitions and
@@ -23635,7 +24100,35 @@ pub const IndexManager = struct {
         return try std.json.Stringify.valueAlloc(a, labels.items, .{});
     }
 
+    fn routingSignatures(a: Allocator, configs: []const ResolverConfig) !std.StringHashMapUnmanaged([]const u8) {
+        var buckets: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+        for (configs) |cfg| {
+            if (cfg.retired or cfg.labels.len == 0) continue;
+            for (std.enums.values(resolver_catalog.ResolverSourceArtifactKind)) |kind| {
+                if (!kind.overlaps(cfg.source_artifact_kind)) continue;
+                const identity = try std.json.Stringify.valueAlloc(a, .{ cfg.replacement_index, cfg.source_artifact, kind }, .{});
+                const entry = try buckets.getOrPut(a, identity);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.appendSlice(a, cfg.labels);
+            }
+        }
+        var result: std.StringHashMapUnmanaged([]const u8) = .empty;
+        var it = buckets.iterator();
+        while (it.next()) |entry| {
+            std.mem.sort([]const u8, entry.value_ptr.items, {}, struct {
+                fn less(_: void, l: []const u8, rhs: []const u8) bool {
+                    return std.mem.lessThan(u8, l, rhs);
+                }
+            }.less);
+            try result.put(a, entry.key_ptr.*, try std.json.Stringify.valueAlloc(a, entry.value_ptr.items, .{}));
+        }
+        return result;
+    }
     fn persistResolverCatalog(self: *IndexManager, store: anytype, mode: ResolverCatalogPersistMode) !void {
+        return self.persistResolverCatalogCompletion(store, mode, null);
+    }
+    fn persistResolverCatalogCompletion(self: *IndexManager, store: anytype, mode: ResolverCatalogPersistMode, completion: ?@import("../../lite/resolver_consumers.zig").Completion) !void {
+        self.invalidateResolverNamespaceLookup();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
@@ -23658,20 +24151,22 @@ pub const IndexManager = struct {
         errdefer for (self.resolvers.items, generations) |*cfg, generation| {
             cfg.resolution_generation = generation;
         };
+        var routing_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer routing_arena.deinit();
+        const routing_alloc = routing_arena.allocator();
+        const old_routes = try routingSignatures(routing_alloc, previous);
+        const new_routes = try routingSignatures(routing_alloc, self.resolvers.items);
+        var prior_by_name: std.StringHashMapUnmanaged(ResolverConfig) = .empty;
+        for (previous) |cfg| try prior_by_name.put(routing_alloc, cfg.name, cfg);
         var routing_changed = false;
         for (self.resolvers.items) |*cfg| {
             if (cfg.labels.len != 0) continue;
-            for (previous) |prior| {
-                if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
-                const old_labels = try resolverRoutingLabelsAlloc(self.alloc, previous, prior);
-                defer self.alloc.free(old_labels);
-                const new_labels = try resolverRoutingLabelsAlloc(self.alloc, self.resolvers.items, cfg.*);
-                defer self.alloc.free(new_labels);
-                if (!std.mem.eql(u8, old_labels, new_labels)) {
-                    cfg.resolution_generation = @max(cfg.resolution_generation, try std.math.add(u64, prior.effectiveGeneration(), 1));
-                    routing_changed = true;
-                }
-                break;
+            const prior = prior_by_name.get(cfg.name) orelse continue;
+            const old_key = try std.json.Stringify.valueAlloc(routing_alloc, .{ prior.replacement_index, prior.source_artifact, prior.source_artifact_kind }, .{});
+            const new_key = try std.json.Stringify.valueAlloc(routing_alloc, .{ cfg.replacement_index, cfg.source_artifact, cfg.source_artifact_kind }, .{});
+            if (!std.mem.eql(u8, old_routes.get(old_key) orelse "[]", new_routes.get(new_key) orelse "[]")) {
+                cfg.resolution_generation = @max(cfg.resolution_generation, try std.math.add(u64, prior.effectiveGeneration(), 1));
+                routing_changed = true;
             }
         }
         const data = try self.serializeResolverDefinitionsForMutation(self.alloc);
@@ -23685,6 +24180,10 @@ pub const IndexManager = struct {
         if (mode == .mark_reresolve_dirty or routing_changed) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");
             try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
+        }
+        if (completion) |work| {
+            try txn.delete(work.key);
+            try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
         }
         try txn.commit();
         self.publishCatalogReaderStamp(reader_version);
@@ -23891,6 +24390,29 @@ pub const IndexManager = struct {
                     // their own members are validated.
                     if (cfg.source_field.len > 0 or cfg.source_template.len > 0) return error.InvalidEnrichmentConfig;
                     try enrichment_config_validation.validateUpstreamAssetProducer(self.alloc, cfg.producer_json);
+                    var producer = try @import("../enrichment/asset_producer.zig").parseProducerConfig(self.alloc, cfg.producer_json);
+                    defer producer.deinit(self.alloc);
+                    if (producer.type == .media_output) {
+                        const upstream = self.getEnrichment(.chunk, cfg.source_artifact_name) orelse return error.InvalidEnrichmentConfig;
+                        var chunk_config = try @import("../../../chunking/types.zig").parseConfigFromSlice(self.alloc, upstream.chunker_json);
+                        defer chunk_config.deinit(self.alloc);
+                        if (chunk_config.outputs_json.len == 0) return error.InvalidEnrichmentConfig;
+                        var output_config = try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, self.alloc, chunk_config.outputs_json, .{});
+                        defer output_config.deinit();
+                        var consumer = try @import("../enrichment/media_output.zig").parse(self.alloc, producer.config_json);
+                        defer consumer.deinit();
+                        const found = for (output_config.value.targets) |target| {
+                            if (std.mem.eql(u8, target.name, consumer.value.output_name)) break true;
+                        } else false;
+                        if (!found or upstream.source_artifact_name.len != 0) return error.InvalidEnrichmentConfig;
+                        return;
+                    }
+                    if (producer.type == .vector_labels) {
+                        const upstream = self.getEnrichment(.embedding, cfg.source_artifact_name) orelse return error.InvalidEnrichmentConfig;
+                        const chunks = self.getEnrichment(.chunk, upstream.source_artifact_name) orelse return error.InvalidEnrichmentConfig;
+                        if (upstream.expected_dims == 0 or chunks.source_artifact_name.len != 0) return error.InvalidEnrichmentConfig;
+                        return;
+                    }
                     var hops: usize = 0;
                     var current: []const u8 = cfg.source_artifact_name;
                     while (current.len > 0) {
@@ -24287,11 +24809,11 @@ pub const IndexManager = struct {
         result.peak_task_alloc_bytes = @max(result.peak_task_alloc_bytes, @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())));
     }
 
-    /// Native Io cancellation and runtime-boundary cancellation have the same
-    /// retry/shutdown semantics. Neither indicates a damaged merge source.
+    /// Cancellation and invalidated source fences retire the current task and
+    /// retry from a fresh view. Neither indicates a damaged merge source.
     pub fn isTextMergeCancellation(err: anyerror) bool {
         return switch (err) {
-            error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled => true,
+            error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged => true,
             else => false,
         };
     }
@@ -34246,6 +34768,63 @@ fn containsOwnedString(items: []const []const u8, value: []const u8) bool {
     return false;
 }
 
+fn generatedOutputName(request: enrichment_types.GeneratedEnrichmentRequest) []const u8 {
+    return switch (request.kind) {
+        .asset, .chunk_text => if (request.artifact_name.len != 0) request.artifact_name else request.index_name,
+        .dense_embedding, .sparse_embedding => if (request.embedding_name.len != 0) request.embedding_name else request.index_name,
+    };
+}
+
+fn orderGeneratedArtifactDependencies(alloc: Allocator, items: []enrichment_types.GeneratedEnrichmentRequest) !void {
+    const Kind = @FieldType(enrichment_types.GeneratedEnrichmentRequest, "kind");
+    // Names are scoped by producer family. Resolve each typed edge once before
+    // sorting, then move its kind alongside the request.
+    const dependencies = try alloc.alloc(Kind, items.len);
+    defer alloc.free(dependencies);
+    for (items, dependencies) |request, *kind| {
+        kind.* = switch (request.kind) {
+            .dense_embedding, .sparse_embedding => .chunk_text,
+            .chunk_text, .asset => .asset,
+        };
+        if (request.kind == .asset and request.upstream_artifact_name.len != 0 and request.producer_json.len != 0) {
+            var producer = try @import("../enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
+            defer producer.deinit(alloc);
+            kind.* = switch (producer.type) {
+                .vector_labels => .dense_embedding,
+                .media_output => .chunk_text,
+                else => .asset,
+            };
+        }
+    }
+    for (0..items.len) |position| {
+        var selected: ?usize = null;
+        for (items[position..], position..) |request, index| {
+            const upstream = switch (request.kind) {
+                .dense_embedding, .sparse_embedding => if (request.input_kind != .document) request.artifact_name else request.upstream_artifact_name,
+                .asset, .chunk_text => request.upstream_artifact_name,
+            };
+            const pending = if (upstream.len != 0) blk: {
+                for (items[position..]) |candidate| {
+                    const compatible_kind = candidate.kind == dependencies[index];
+                    if (compatible_kind and std.mem.eql(u8, generatedOutputName(candidate), upstream)) break :blk true;
+                }
+                break :blk false;
+            } else false;
+            if (!pending) {
+                selected = index;
+                break;
+            }
+        }
+        const index = selected orelse return error.InvalidEnrichmentConfig;
+        const request = items[index];
+        const dependency = dependencies[index];
+        std.mem.copyBackwards(enrichment_types.GeneratedEnrichmentRequest, items[position + 1 .. index + 1], items[position..index]);
+        std.mem.copyBackwards(Kind, dependencies[position + 1 .. index + 1], dependencies[position..index]);
+        items[position] = request;
+        dependencies[position] = dependency;
+    }
+}
+
 fn appendGeneratedChunkRequest(
     alloc: Allocator,
     requests: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
@@ -34278,6 +34857,7 @@ fn appendGeneratedChunkRequest(
         .artifact_name = chunk_cfg.name,
         .doc_key = doc_key,
         .source_field = chunk_cfg.source_field,
+        .upstream_artifact_name = chunk_cfg.source_artifact_name,
         .source_template = chunk_cfg.source_template,
         .chunk_size = chunk_cfg.chunk_size,
         .chunk_overlap = chunk_cfg.chunk_overlap,
@@ -36540,6 +37120,9 @@ const TextProjectionProvenance = struct {
     // Semantic revisions belong to durable generation identity, independently
     // of public schema versions and the metadata codec's envelope version.
     fn fromRuntimeSchemaRevision(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32) !TextProjectionProvenance {
+        return fromRuntimeSchemaSemantics(alloc, cfg, schema, named_autocomplete_revision, 4);
+    }
+    fn fromRuntimeSchemaSemantics(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32, exclusion_revision: u32) !TextProjectionProvenance {
         // Field-selective projection uses the second semantic witness. Give
         // only those generations a new durable witness so an
         // existing whole-document posting set cannot be interpreted as if it
@@ -36559,6 +37142,58 @@ const TextProjectionProvenance = struct {
             std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
             std.mem.writeInt(u32, witness[8..12], named_autocomplete_revision, .little);
             schema_fingerprint = std.hash.Wyhash.hash(0x4154414e414c595a, &witness);
+        }
+        if (exclusion_revision != 0 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| for (value.exact_fields) |root| {
+                if (root.mapping.do_index or !std.mem.eql(u8, root.field, root.source_field)) continue;
+                const source = for (value.full_text_documents) |document| {
+                    if (for (document.fields) |field| {
+                        if (std.mem.eql(u8, field.path, root.source_field)) break true;
+                    } else false) break true;
+                } else false;
+                const subfields = for (value.exact_fields) |field| {
+                    if (field.mapping.do_index and !std.mem.eql(u8, field.field, field.source_field) and std.mem.eql(u8, field.source_field, root.source_field)) break true;
+                } else false;
+                if (!source and !subfields) continue;
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 1, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
+                break;
+            };
+        }
+        if (exclusion_revision >= 2 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| if (schema_mod.hasHistoricalDeclaredTextExclusions(value)) {
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 2, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
+            };
+        }
+        if (exclusion_revision >= 3 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| if (schema_mod.hasCrossDocumentTextExclusions(value)) {
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 3, .little);
+                var policy = std.hash.Wyhash.init(0x4146444953580003);
+                policy.update(&witness);
+                for (value.full_text_documents) |document| {
+                    const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .name = document.name, .rules = document.physical_exact_fields }, .{});
+                    defer alloc.free(bytes);
+                    policy.update(bytes);
+                }
+                schema_fingerprint = policy.final();
+            };
+        }
+        if (exclusion_revision >= 4) {
+            if (schema) |value| for (value.index_sort) |field| {
+                const mapping = schema_mod.resolveDeclaredFieldType(value, field.field) orelse continue;
+                if (mapping.missing_null_policy != .nulls_ordered) continue;
+                var witness: [8]u8 = undefined;
+                std.mem.writeInt(u64, &witness, schema_fingerprint, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x41464e554c4c0002, &witness);
+                break;
+            };
         }
         return .{
             .coverage_generation = coverageGenerationForConfig(cfg),
@@ -36659,6 +37294,7 @@ fn ensureTextProjectionProvenance(
     alloc: Allocator,
     persistent: *persistent_mod.PersistentIndex,
     expected: TextProjectionProvenance,
+    historical: [4]TextProjectionProvenance,
     read_only: bool,
 ) !void {
     const encoded = try persistent.readGenerationMetadataAlloc(
@@ -36670,6 +37306,11 @@ fn ensureTextProjectionProvenance(
     if (persisted != null and persisted.?.eql(expected)) return;
 
     if (persistent.hasPhysicalSegments()) {
+        // Only the exact prior projection witness authorizes an automatic
+        // private replacement. Unknown drift remains manual repair debt.
+        if (persisted) |witness| for (historical) |prior| {
+            if (!prior.eql(expected) and witness.eql(prior)) return error.TextProjectionUpgradeRequired;
+        };
         // There is no trustworthy upgrade witness for legacy postings. Keep
         // the configured index visible through load status, but do not attach
         // analyzers that may interpret its postings under different semantics.
@@ -36805,6 +37446,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
                 const missing_null_policy: schema_mod.MissingNullPolicy = if (version >= 3) blk_policy: {
                     const value: schema_mod.MissingNullPolicy = switch (data[pos]) {
                         0 => .missing_rejected,
+                        1 => .nulls_ordered,
                         else => return error.InvalidIndexCatalog,
                     };
                     pos += 1;
@@ -49255,6 +49897,47 @@ test "ordered artifact inventory TTL replacement retains temporary envelope with
     }
 }
 
+test "loaded resolver envelopes preserve inventory and completion identity with optional dictionaries" {
+    const a = std.testing.allocator;
+    const inventory = @import("../artifact_inventory.zig");
+    for ([_]bool{ false, true }) |dictionary| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+        defer a.free(path);
+        var store = try docstore_mod.DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        const index_data = try serializeCatalog(a, &manager);
+        defer a.free(index_data);
+        const resolver_data = if (dictionary) "{\"version\":4,\"resolvers\":[],\"projections\":{}}" else "{\"version\":4,\"resolvers\":[]}";
+        var runtime_store = try initRuntimeStore(a, &store);
+        defer runtime_store.deinit();
+        {
+            var txn = try runtime_store.store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(index_catalog_key, index_data);
+            try txn.put(enrichment_catalog_key, "[]");
+            try txn.put(resolver_catalog_key, resolver_data);
+            try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(4));
+            try inventory.refresh(&txn);
+            try txn.commit();
+        }
+        try manager.loadResolverCatalog(&store);
+        var read = try runtime_store.store.beginRead();
+        defer read.abort();
+        _ = try inventory.local(&read);
+        const catalogs = try inventory.catalogs(&read);
+        try std.testing.expectEqualStrings(resolver_data, catalogs.resolvers);
+        try std.testing.expect(try manager.matchesArtifactInventory(catalogs));
+        var snapshot = try manager.acquireWritePlanSnapshot();
+        defer snapshot.release();
+        try std.testing.expect(snapshot.plan().matchesArtifactInventory(catalogs));
+        try std.testing.expectEqual(catalogs.digest(), snapshot.plan().completion_plan.?.catalog);
+    }
+}
+
 fn canonicalEnrichmentPart(alloc: Allocator, value: anytype) ![]u8 {
     const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
     defer alloc.free(bytes);
@@ -49446,4 +50129,308 @@ test "index_manager bounded native prepared text publication spills before admis
     }
     try std.testing.expectEqual(@as(u32, 2), documents);
     std.debug.print("PREPARED_TEXT_SPILL documents={d} peak_bytes={d}\n", .{ documents, stats.peak_bytes });
+}
+
+test "logical query excluded source upgrade fences historical physical postings" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" }} }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 3 };
+    const historical = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 0);
+    const current = try TextProjectionProvenance.fromRuntimeSchema(a, config, schema);
+    try std.testing.expect(!historical.eql(current));
+    // Released logical epochs include the source. Produce pre-upgrade postings
+    // with the old physical policy, then restore the unchanged logical schema.
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        const entry = manager.textIndexEntry(config.name).?;
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = true;
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"payload\":\"quasar\"}" }});
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = false;
+        var lease = try entry.persistent.snapshot().leaseSegment(0);
+        defer lease.deinit();
+        var inverted = (try lease.entry.reader.invertedIndexScoped(a, "payload")).?;
+        defer inverted.deinit();
+        try std.testing.expect(try inverted.lookup("quasar") != null);
+        try saveTextProjectionProvenance(&entry.persistent, a, historical);
+    }
+    {
+        var reopened = try IndexManager.init(a, path);
+        defer reopened.deinit();
+        reopened.updateRange(.{ .start = "", .end = "" });
+        try reopened.load(&store);
+        try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+        try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    }
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.manual_intervention, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionProvenanceMismatch"));
+    const rebuilt_path = try std.fmt.allocPrint(a, "{s}/rebuilt", .{path});
+    defer a.free(rebuilt_path);
+    var rebuilt = try IndexManager.init(a, rebuilt_path);
+    defer rebuilt.deinit();
+    rebuilt.updateRange(.{ .start = "", .end = "" });
+    try rebuilt.registerReplacementIndex(&store, config);
+    try rebuilt.indexBatch(&store, &.{.{ .key = "old", .value = "{\"payload\":\"quasar\"}" }});
+    var lease = try rebuilt.textIndexEntry(config.name).?.persistent.snapshot().leaseSegment(0);
+    defer lease.deinit();
+    try std.testing.expect((try lease.entry.reader.invertedIndex("payload")) == null);
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, null, 2, 0)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, null)));
+}
+
+test "logical query projection upgrade is discovered by the admitted owner turn" {
+    const a = std.testing.allocator;
+    const DB = @import("../selected_root.zig").db.DB;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projection-owner", .{tmp.sub_path});
+    defer a.free(path);
+    const schema: schema_mod.TableSchema = .{
+        .version = 1,
+        .default_type = "doc",
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+            .{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" },
+        } }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+    };
+    const cfg: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const docs = &.{types.BatchWrite{ .key = "one", .value = "{\"body\":\"quasar\",\"payload\":\"secretpayload\"}" }};
+    {
+        var db = try DB.open(a, path, .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchema(schema);
+        try db.addIndex(cfg);
+        // Drain the live producer before manually simulating historical bytes.
+        try db.batch(.{ .writes = docs, .sync_level = .full_index });
+        const entry = db.core.index_manager.textIndexEntry(cfg.name).?;
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = true;
+        try db.core.index_manager.indexBatch(db.core.store, docs);
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = false;
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, schema, 2, 0));
+    }
+    var db = try DB.open(a, path, .{ .start_optional_runtimes = false });
+    defer db.close();
+    const owner = @import("antfly_source_root").antfly_sources.local_write;
+    const observed = try owner.repairStorageKernelOwnerDb(a, &db, null, false, .{});
+    try std.testing.expectEqual(@as(usize, 1), observed.repair_remaining);
+    try std.testing.expectEqual(@as(usize, 0), (try db.indexRepairIntentSummary(a)).runnable);
+    var completed = false;
+    for (0..64) |_| {
+        const result = try owner.repairStorageKernelOwnerDb(a, &db, null, true, .{});
+        if (result.state == .complete) {
+            completed = true;
+            break;
+        }
+    }
+    try std.testing.expect(completed);
+    const entry = db.core.index_manager.textIndexEntry(cfg.name).?;
+    var lease = try entry.persistent.snapshot().leaseSegment(0);
+    defer lease.deinit();
+    try std.testing.expect((try lease.entry.reader.invertedIndex("body")) != null);
+    try std.testing.expect((try lease.entry.reader.invertedIndex("payload")) == null);
+}
+
+test "model aware media generated dependencies order chunks vectors labels and transcript text" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/media-plan", .{tmp.sub_path});
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "media", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"model\",\"dimensions\":2},\"outputs\":{\"boundary_model\":\"embedding\",\"targets\":[{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"model\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"whisper\"}]}}" });
+    try manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "text", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
+    try manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}" });
+    try manager.addEnrichment(&store, .{ .name = "transcript", .kind = .asset, .source_artifact_name = "clips", .producer_json = "{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}" });
+    try manager.addEnrichment(&store, .{ .name = "text_chunks", .kind = .chunk, .field = "text", .source_artifact_name = "transcript", .chunk_size = 16 });
+    try manager.addAllNoBackfill(&store, &.{
+        .{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"vectors\"}]}" },
+        .{ .name = "spoken", .kind = .full_text, .config_json = "{\"field\":\"text\",\"sources\":[{\"artifact\":\"text_chunks\"}]}" },
+    });
+    const planned = try manager.planGeneratedEnrichments(a, "doc", "{\"media\":\"hello\"}", &.{}, &.{});
+    defer enrichment_types.deinitGeneratedRequests(a, planned);
+    var positions = std.StringHashMap(usize).init(a);
+    defer positions.deinit();
+    for (planned, 0..) |request, index| try positions.put(generatedOutputName(request), index);
+    try std.testing.expect(positions.get("clips").? < positions.get("vectors").?);
+    try std.testing.expect(positions.get("vectors").? < positions.get("labels").?);
+    try std.testing.expect(positions.get("clips").? < positions.get("transcript").?);
+    try std.testing.expect(positions.get("transcript").? < positions.get("text_chunks").?);
+    const text = planned[positions.get("text_chunks").?];
+    try std.testing.expectEqualStrings("transcript", text.upstream_artifact_name);
+    var pin = try manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    try std.testing.expectEqual(@import("../artifact_completion_plan.zig").Scope.document, (try pin.plan().completion_plan.?.providerFor(text)).scope);
+}
+
+test "model aware media dependency ordering permits a legacy shared chunk and embedding name" {
+    var requests = [_]enrichment_types.GeneratedEnrichmentRequest{
+        .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "semantic", .producer_json = "{\"type\":\"vector_labels\",\"config\":{}}" },
+        .{ .kind = .dense_embedding, .index_name = "semantic", .artifact_name = "semantic", .embedding_name = "semantic", .doc_key = "doc", .source_field = "body", .input_kind = .inline_chunks },
+        .{ .kind = .chunk_text, .index_name = "semantic", .artifact_name = "semantic", .doc_key = "doc", .source_field = "body" },
+    };
+    try orderGeneratedArtifactDependencies(std.testing.allocator, &requests);
+    try std.testing.expect(requests[0].kind == .chunk_text);
+    try std.testing.expect(requests[1].kind == .dense_embedding);
+    try std.testing.expect(requests[2].kind == .asset);
+}
+
+test "model aware media dependency ordering distinguishes identical names across families" {
+    var requests = [_]enrichment_types.GeneratedEnrichmentRequest{
+        .{ .kind = .asset, .index_name = "semantic", .artifact_name = "semantic", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "semantic", .producer_json = "{\"type\":\"vector_labels\",\"config\":{}}" },
+        .{ .kind = .dense_embedding, .index_name = "semantic", .artifact_name = "clips", .embedding_name = "semantic", .doc_key = "doc", .source_field = "body", .input_kind = .inline_chunks },
+        .{ .kind = .chunk_text, .index_name = "clips", .artifact_name = "clips", .doc_key = "doc", .source_field = "body" },
+    };
+    try orderGeneratedArtifactDependencies(std.testing.allocator, &requests);
+    try std.testing.expectEqual(.chunk_text, requests[0].kind);
+    try std.testing.expectEqual(.dense_embedding, requests[1].kind);
+    try std.testing.expectEqual(.asset, requests[2].kind);
+}
+
+test "capi resolver reservation removal preserves independently raised native epochs" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try manager.add(&store, .{ .name = "old", .kind = .graph, .config_json = config });
+    var prepared = try manager.prepareGraphReplacementConfig(&store, "old", .{ .name = "new", .kind = .graph, .config_json = config }, 0);
+    defer prepared.deinit(a);
+    try std.testing.expectEqual(@as(u32, 2), manager.minimum_reader_version.load(.acquire));
+    // Native binding/record publication may run independently of the loaded
+    // resolver manager. Its format requirement must survive cancellation.
+    const required = resolver_catalog.resolver_projection_delta_reader_version;
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(required));
+        try write.commit();
+    }
+    try std.testing.expect(try manager.cancelGraphReplacement(&store, "new"));
+    try std.testing.expectEqual(required, manager.minimum_reader_version.load(.acquire));
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(required, try resolver_catalog.readMinimumReaderVersion(&read, required));
+    try std.testing.expectEqual(required, try resolver_catalog.catalogReaderVersion(a, try read.get(resolver_catalog_key)));
+}
+
+test "logical query dynamic template projection upgrades only exact affected witnesses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const fields = [_]schema_mod.FullTextField{
+        .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        .{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" },
+    };
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &fields }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+        .dynamic_templates = &.{.{ .name = "numbers", .match_pattern = "*", .match_mapping_type = "number", .mapping = .{ .field_type = .numeric, .do_index = false } }},
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const prior = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 1);
+    const legacy = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 0);
+    const current = try TextProjectionProvenance.fromRuntimeSchema(a, config, schema);
+    try std.testing.expect(!prior.eql(current) and !legacy.eql(prior));
+    var unaffected = schema;
+    unaffected.dynamic_templates = &.{};
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, unaffected, 2, 1)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, unaffected)));
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        const entry = manager.textIndexEntry(config.name).?;
+        const document = &@constCast(entry.runtime_schema.?.full_text_documents)[0];
+        const original = document.fields;
+        document.fields = &.{};
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"body\":\"zebrafish\",\"payload\":\"stored-only\"}" }});
+        document.fields = original;
+        var lease = try entry.persistent.snapshot().leaseSegment(0);
+        defer lease.deinit();
+        try std.testing.expect((try lease.entry.reader.invertedIndex("body")) == null);
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, entry.runtime_schema, 2, 1));
+    }
+    var reopened = try IndexManager.init(a, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+    try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
+}
+
+test "logical query nullable ordering projection upgrades only exact affected witnesses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }},
+        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .keyword, .sortable = true, .missing_null_policy = .nulls_ordered } }},
+        .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const prior = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 3);
+    try std.testing.expect(!prior.eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, schema)));
+    var unaffected = schema;
+    unaffected.index_sort = &.{};
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, unaffected, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, unaffected)));
+    var selected = config;
+    selected.config_json = "{\"field\":\"body\"}";
+    try std.testing.expect(!(try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, schema, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, schema)));
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, unaffected, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, unaffected)));
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"body\":\"quasar\",\"rank\":[\"z\"]}" }});
+        const entry = manager.textIndexEntry(config.name).?;
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, entry.runtime_schema, 2, 3));
+    }
+    var reopened = try IndexManager.init(a, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+    try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
 }

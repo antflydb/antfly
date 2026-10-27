@@ -29,11 +29,15 @@ class ProjectionExpression:
     Untaken CASE branches do not load fields or evaluate erroring calls.
     Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
     is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
-    Expressions are limited to depth 64 and 8192 nodes per request.
+    Expressions are limited to depth 64 including referenced aliases, and
+    8192 nodes per request. Alias dependencies are acyclic; each alias is a
+    requested output and is evaluated once per row.
 
         Attributes:
             literal (Any | Unset):
-            field (str | Unset):
+            field (str | Unset): Logical source path. Dots traverse objects; numeric array components select an original
+                index (items.1.name), and named components traverse arrays collecting present values (items.name). Nested user
+                keys such as metadata._type are allowed. Internal root fields are reserved except _id.
             ref (str | Unset):
             param (str | Unset):
             call (str | Unset): Public pure SQL scalar function name, including value_identity and is_missing. Internal and
@@ -52,7 +56,9 @@ class ProjectionExpression:
                 Untaken CASE branches do not load fields or evaluate erroring calls.
                 Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
                 is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
-                Expressions are limited to depth 64 and 8192 nodes per request.
+                Expressions are limited to depth 64 including referenced aliases, and
+                8192 nodes per request. Alias dependencies are acyclic; each alias is a
+                requested output and is evaluated once per row.
             cast (ProjectionExpressionCast | Unset):
             eq (list[ProjectionExpression] | Unset):
             neq (list[ProjectionExpression] | Unset):

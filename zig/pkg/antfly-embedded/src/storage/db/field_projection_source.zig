@@ -85,10 +85,10 @@ pub const Row = struct {
         };
         const root = self.full_root orelse self.values.get(path) orelse loaded: {
             const bytes = try self.load(&.{path});
-            // Normalize stored wrappers/private fields through the same public
-            // projection rules before resolving any scalar operand.
-            const public = try query.lookupJsonWithOutput(self.a, self.a, bytes, .{ .fields = if (self.full_bytes != null) &.{} else &.{path}, .include_all_fields = self.full_bytes != null });
-            const value = try std.json.parseFromSliceLeaky(V, self.a, public.json, .{ .allocate = .alloc_always });
+            // The authenticated range loader preserves opaque array positions.
+            // Parse that immutable row view directly: re-masking compacts array
+            // indexes, and copying/encoding it adds work proportional to payload.
+            const value = try @import("antfly-json").parseFromSliceLeaky(V, self.a, bytes, .{ .allocate = .alloc_if_needed });
             if (self.full_bytes != null) self.full_root = value else try self.values.put(self.a, path, value);
             break :loaded value;
         };
@@ -139,4 +139,17 @@ test "api query contract native full source fallback retains hidden null and sib
     const number = try row.source().read(&row, a, "body.integer", .value);
     try std.testing.expectEqual(@as(i64, 9007199254740993), number.value.integer);
     try std.testing.expectEqual(@as(usize, 0), row.value_reads);
+}
+
+test "api query contract native scalar base preserves indexed array selection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "{\"arr\":[{\"n\":1},{\"n\":2}]}",
+        "{\"arr\":[{\"n\":1},{\"n\":2}],\"metadata\":{\"_type\":\"image\"},\"padding\":\"small\"}",
+    }) |bytes| {
+        var row: Row = .{ .a = a, .txn = null, .physical = "a", .id = "a", .req = .{ .fields = &.{"arr.1.n"}, .include_all_fields = false }, .authority = .{}, .full_bytes = bytes };
+        try std.testing.expectEqualStrings("{\"arr\":[{\"n\":2}]}", try row.base(a));
+    }
 }

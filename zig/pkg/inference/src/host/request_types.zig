@@ -18,11 +18,15 @@ const RequestContext = @import("antfly_inference_execution_control").RequestCont
 pub const EmbeddingTaskType = enum {
     retrieval_query,
     retrieval_document,
+    clustering,
+    classification,
 
     pub fn canonical(self: EmbeddingTaskType) []const u8 {
         return switch (self) {
             .retrieval_query => "RETRIEVAL_QUERY",
             .retrieval_document => "RETRIEVAL_DOCUMENT",
+            .clustering => "CLUSTERING",
+            .classification => "CLASSIFICATION",
         };
     }
 };
@@ -32,6 +36,8 @@ pub const EmbeddingRequestContext = struct {
     task_type: EmbeddingTaskType = .retrieval_document,
     instruction: ?[]const u8 = null,
     model_identity: ?[]const u8 = null,
+    /// Expected producing generation, independently of model identity.
+    model_revision: ?[32]u8 = null,
     dimensions: ?u32 = null,
 
     pub fn check(self: EmbeddingRequestContext) !void {

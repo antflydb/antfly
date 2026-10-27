@@ -1231,6 +1231,7 @@ const MutationRequest = struct {
     leader: bool = false,
     durable: bool = true,
     index_only: bool = false,
+    artifact_lease: bool = false,
     result: anyerror!void = {},
 };
 
@@ -1308,7 +1309,7 @@ var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
 /// Optional owner admission around every document/index publication.
 /// Detached computation can retain this Store without retaining a file
 /// writer lease; admission must validate its checkpoint before mutation.
-pub const PublicationScope = enum { primary, index, reclamation };
+pub const PublicationScope = enum { primary, index, reclamation, artifact_lease };
 
 pub const WriterAdmission = struct {
     ptr: *anyopaque,
@@ -1418,7 +1419,7 @@ pub const Store = struct {
     serving_writer_ticket: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
-    pub const MaintenancePhase = enum { assessment, copy };
+    pub const MaintenancePhase = enum { assessment, copy, verification };
     pub const MaintenanceTestHook = struct {
         ptr: *anyopaque,
         notify: *const fn (*anyopaque, MaintenancePhase) anyerror!void,
@@ -1691,7 +1692,7 @@ pub const Store = struct {
         if (self.read_generation != null) return;
         const generation = try self.allocator.create(ReadGeneration);
         errdefer self.allocator.destroy(generation);
-        generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .scoped_reader_lock = self.file.externally_locked, .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation or self.file.externally_locked, .resource_manager = self.resource_manager }) };
+        generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .scoped_reader_lock = self.file.externally_locked, .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation or self.file.externally_locked, .reader_coordinator = self.file.reader_coordinator, .resource_manager = self.resource_manager }) };
         self.read_generation = generation;
         self.file.secondary_page_cache = &generation.file.page_cache;
         self.file.reader_frontier = &self.reader_frontier;
@@ -1728,7 +1729,7 @@ pub const Store = struct {
                 // inode fence until exec/close, even after its parent closed
                 // the descriptor. Wait for that fence instead of failing an
                 // otherwise uncontended same-owner read.
-                try generation.file.file.lock(generation.file.runtime(), .shared);
+                try generation.file.acquireReaderFence(pin.sequence, &self.file);
             }
             generation.kernel_readers += 1;
         }
@@ -1786,7 +1787,7 @@ pub const Store = struct {
         if (pin.next) |next| next.previous = pin.previous else generation.last_pin = pin.previous;
         if (generation.scoped_reader_lock and pin.kernel_reader) {
             generation.kernel_readers -= 1;
-            if (generation.kernel_readers == 0) generation.file.file.unlock(generation.file.runtime());
+            if (generation.kernel_readers == 0) generation.file.releaseReaderFence();
         }
         generation.references -= 1;
         if (generation.first_pin) |first| generation.pinned_at = first.pinned_at;
@@ -1946,6 +1947,25 @@ pub const Store = struct {
         return self.maintainOnceWithCancel(force, null);
     }
 
+    /// The detached connection owner calls this before provider/index work,
+    /// while no foreground gate or writer path lease is held.
+    pub fn prepareAllocatorVerification(self: *Store, cancel: ?*const maintenance.CancelToken) !void {
+        if (self.file.free_pages_verified) return;
+        if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .verification);
+        const reader = try self.file.allocatorVerificationSnapshot(cancel);
+        defer {
+            reader.close();
+            self.file.allocator.destroy(reader);
+        }
+        // Publish the completed proof under the same short owner fence as
+        // lease metadata. Foreground readers may inherit this flag, so the
+        // detached scan must never mutate it concurrently outside that fence.
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .artifact_lease);
+        defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        try self.file.inheritAllocatorVerification(reader);
+        if (!self.file.free_pages_verified) return error.EnrichmentWaitCanceled;
+    }
+
     fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
         if (self.read_only) return;
         // External owners also defer requested allocator-format conversion to
@@ -1970,7 +1990,7 @@ pub const Store = struct {
             try self.artifact_marker_sweep.run(&self.file);
             if (try self.file.retirementNeedsService()) {
                 try self.refreshAdmissionAssumeLocked();
-                _ = try self.file.reclaimPagesWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
+                _ = try self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
@@ -2657,14 +2677,20 @@ pub const Store = struct {
     }
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true);
+        return self.submitScopedMutation(context, apply, durable, true, false);
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false);
+        return self.submitScopedMutation(context, apply, durable, false, false);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool) !void {
+    /// Immutable source aliases are read-path metadata, not authored writes.
+    /// Only groups containing exclusively these aliases may defer reuse proof.
+    pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitScopedMutation(context, apply, true, false, true);
+    }
+
+    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
         if (self.read_only) return error.ReadOnly;
         defer {
             // Start after publication: even one large final mutation crossing
@@ -2673,7 +2699,7 @@ pub const Store = struct {
             self.maintenance_wake.set(self.file.runtime());
         }
         const io = self.file.runtime();
-        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only };
+        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease };
         self.commit_mutex.lockUncancelable(io);
         if (self.commit_tail) |tail| tail.next = &request else self.commit_head = &request;
         self.commit_tail = &request;
@@ -2712,9 +2738,13 @@ pub const Store = struct {
 
     fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
         var index_only = true;
+        var artifact_lease_only = true;
         var member: ?*MutationRequest = head;
-        while (member) |item| : (member = item.next) index_only = index_only and item.index_only;
-        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (index_only) .index else .primary);
+        while (member) |item| : (member = item.next) {
+            index_only = index_only and item.index_only;
+            artifact_lease_only = artifact_lease_only and item.artifact_lease;
+        }
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease_only) .artifact_lease else if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
@@ -2722,8 +2752,12 @@ pub const Store = struct {
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
         errdefer self.publishReadCheckpointAssumeLocked();
-        try self.file.reclaimRetirementPressure();
-        try self.file.beginTransaction();
+        if (artifact_lease_only) {
+            try self.file.beginArtifactLeaseTransaction();
+        } else {
+            try self.file.reclaimRetirementPressure();
+            try self.file.beginTransaction();
+        }
         errdefer self.file.abortTransaction();
         var current: ?*MutationRequest = head;
         // Detached writers release their kernel lease after this group. The
@@ -3766,8 +3800,48 @@ pub const Txn = struct {
         }
     }
 
+    fn synchronizeResolverConsumers(self: *Txn, key: []const u8, after: ?[]const u8) anyerror!void {
+        const consumers = @import("resolver_consumers.zig");
+        if (std.mem.eql(u8, key, @import("embedded_catalog.zig").key)) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const before = self.get(key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            const source_prefix = self.prefix;
+            self.prefix = "";
+            defer self.prefix = source_prefix;
+            try consumers.directoryChanged(arena.allocator(), self, before, after);
+            return;
+        }
+        if (after) |raw| if (std.mem.startsWith(u8, key, "\x00\x00__metadata__:resolver_authority:v1:head/")) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const head = try std.json.parseFromSliceLeaky(struct { key_template: []const u8 }, arena.allocator(), raw, .{ .ignore_unknown_fields = true });
+            const destination = self.prefix;
+            self.prefix = "";
+            defer self.prefix = destination;
+            try consumers.authorityChanged(arena.allocator(), self, destination, head.key_template);
+            return;
+        };
+        if (!std.mem.eql(u8, key, consumers.catalog_key)) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const before = self.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const source_prefix = self.prefix;
+        self.prefix = "";
+        defer self.prefix = source_prefix;
+        try consumers.synchronize(a, self, source_prefix, before, after);
+    }
+
     pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
+        try self.synchronizeResolverConsumers(key, value);
         const owned_key = if (self.prefix.len == 0)
             try self.allocator.dupe(u8, key)
         else
@@ -3780,6 +3854,7 @@ pub const Txn = struct {
 
     pub fn delete(self: *Txn, key: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
+        try self.synchronizeResolverConsumers(key, null);
         const owned_key = if (self.prefix.len == 0)
             try self.allocator.dupe(u8, key)
         else
@@ -4872,6 +4947,46 @@ test "lite externally locked artifact capture publishes under its generation lea
     try std.testing.expectEqualStrings("contents", &bytes);
 }
 
+test "lite artifact leases defer allocator proof until an authored write" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "artifact-lease-proof.aflite");
+    defer a.free(path);
+    const options: OpenOptions = .{ .io = std.testing.io, .no_sync = true, .externally_locked = true };
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .externally_locked = true });
+    defer store.close();
+    try store.file.putIndexCatalogRecord("index/run", "contents");
+    const orphan_key = native.NativeFile.artifact_lease_key_prefix ++ "00000000000000000000000000000001";
+    try store.file.putCatalogRecord(orphan_key, "abandoned");
+    store.close();
+    store = try Store.openWithOptions(a, path, options);
+    try std.testing.expect(!store.file.free_pages_verified);
+    {
+        var source = try store.openArtifactSource("index/run");
+        defer source.close();
+        var bytes: [8]u8 = undefined;
+        try source.readInto(0, &bytes);
+        try std.testing.expectEqualStrings("contents", &bytes);
+        try std.testing.expect(!store.file.free_pages_verified);
+    }
+    try std.testing.expect(!store.file.free_pages_verified);
+    // Read-generated retirement must not move the deferred whole-file proof
+    // into a later foreground-gate-held maintenance publication.
+    store.maintenance_policy.options.enabled = false;
+    try store.maintainOnce(false);
+    try std.testing.expect(!store.file.free_pages_verified);
+    const orphan = try store.file.getCatalogRecordAlloc(a, orphan_key);
+    defer if (orphan) |bytes| a.free(bytes);
+    try std.testing.expect(orphan == null);
+    var write = try store.beginWrite();
+    errdefer write.abort();
+    try write.put("doc", "authored");
+    try write.commit();
+    try std.testing.expect(store.file.free_pages_verified);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
 test "lite externally locked read pins wait for catalog and document publication" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5419,12 +5534,24 @@ test "lite online vacuum retires generations without waiting for pinned readers"
 }
 
 test "lite group commit hands leadership to a bounded queued group" {
+    try testQueuedMutationGroups(.normal);
+}
+
+test "lite group commit upgrades mixed lease groups to authored validation" {
+    try testQueuedMutationGroups(.mixed);
+}
+
+test "lite group commit batches lease-only queued publications" {
+    try testQueuedMutationGroups(.leases);
+}
+
+fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "queued-group-commit.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .page_reuse = false } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .externally_locked = true, .reclamation = .{ .page_reuse = false, .enabled = false } });
     defer store.close();
     const Gate = struct {
         started: std.atomic.Value(bool) = .init(false),
@@ -5434,19 +5561,26 @@ test "lite group commit hands leadership to a bounded queued group" {
         store: *Store,
         gate: *Gate,
         id: usize,
+        artifact_lease: bool,
+        lease_transaction: bool,
         result: anyerror!void = {},
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.lease_transaction, file.artifact_lease_transaction);
             if (self.id == 0) {
                 self.gate.started.store(true, .release);
                 while (!self.gate.proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
             }
             var buf: [32]u8 = undefined;
-            const key = try std.fmt.bufPrint(&buf, "queued-{d}", .{self.id});
-            try file.putIndexCatalogRecord(key, "committed");
+            const key = if (self.artifact_lease) try std.fmt.bufPrint(&buf, "{x:0>32}", .{self.id}) else try std.fmt.bufPrint(&buf, "queued-{d}", .{self.id});
+            if (self.artifact_lease) {
+                const lease_key = try std.mem.concat(std.testing.allocator, u8, &.{ native.NativeFile.artifact_lease_key_prefix, key });
+                defer std.testing.allocator.free(lease_key);
+                try file.putCatalogRecord(lease_key, "committed");
+            } else try file.putIndexCatalogRecord(key, "committed");
         }
         fn run(self: *@This()) void {
-            self.result = self.store.submitMutation(self, apply);
+            self.result = if (self.artifact_lease) self.store.submitArtifactLeaseMutation(self, apply) else self.store.submitMutation(self, apply);
         }
     };
     var gate = Gate{};
@@ -5458,10 +5592,19 @@ test "lite group commit hands leadership to a bounded queued group" {
         for (threads[0..spawned]) |thread| thread.join();
     }
     for (&workers, 0..) |*worker, i| {
-        worker.* = .{ .store = &store, .gate = &gate, .id = i };
+        worker.* = .{ .store = &store, .gate = &gate, .id = i, .artifact_lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1)), .lease_transaction = i != 0 and mode == .leases };
         threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
         spawned += 1;
         if (i == 0) while (!gate.started.load(.acquire)) @import("antfly_platform").time.yieldNow();
+        if (mode != .normal and i != 0) while (true) {
+            store.commit_mutex.lockUncancelable(std.testing.io);
+            var queued: usize = 0;
+            var item = store.commit_head;
+            while (item) |request| : (item = request.next) queued += 1;
+            store.commit_mutex.unlock(std.testing.io);
+            if (queued == i) break;
+            @import("antfly_platform").time.yieldNow();
+        };
     }
     while (true) {
         store.commit_mutex.lockUncancelable(std.testing.io);
@@ -5482,8 +5625,13 @@ test "lite group commit hands leadership to a bounded queued group" {
     try std.testing.expectEqual(@as(u64, 2), store.file.activeCheckpoint().commit_sequence);
     for (0..workers.len) |i| {
         var buf: [32]u8 = undefined;
-        const key = try std.fmt.bufPrint(&buf, "queued-{d}", .{i});
-        const value = (try store.file.getIndexCatalogRecordAlloc(alloc, key)).?;
+        const lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1));
+        const key = if (lease) try std.fmt.bufPrint(&buf, "{x:0>32}", .{i}) else try std.fmt.bufPrint(&buf, "queued-{d}", .{i});
+        const value = if (lease) blk: {
+            const lease_key = try std.mem.concat(alloc, u8, &.{ native.NativeFile.artifact_lease_key_prefix, key });
+            defer alloc.free(lease_key);
+            break :blk (try store.file.getCatalogRecordAlloc(alloc, lease_key)).?;
+        } else (try store.file.getIndexCatalogRecordAlloc(alloc, key)).?;
         defer alloc.free(value);
         try std.testing.expectEqualStrings("committed", value);
     }

@@ -598,6 +598,7 @@ pub const Provider = struct {
             .json = json_body,
             .headers = self.requestHeaders(),
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = self.max_response_bytes,
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
@@ -620,6 +621,7 @@ pub const Provider = struct {
             .borrowed_body_segments = body_segments,
             .headers = self.request_header_storage[0 .. count + 1],
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = self.max_response_bytes,
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
@@ -871,6 +873,7 @@ pub const Provider = struct {
         const Response = struct {
             usage: std.json.Value = .null,
             choices: []const struct {
+                finish_reason: @FieldType(inference.GenerateResult, "finish_reason") = null,
                 logprobs: ?std.json.Value = null,
                 message: struct {
                     content: ?[]const u8 = null,
@@ -900,6 +903,7 @@ pub const Provider = struct {
             .content = try alloc.dupe(u8, content),
             .tool_calls = tool_calls,
             .tool_calls_synthesized = synthesized,
+            .finish_reason = choices[0].finish_reason,
             .token_logprobs_json = proof,
             .usage = inference.GenerationUsage.fromValue(parsed.value.usage, "prompt_tokens", "completion_tokens", "total_tokens"),
             .allocator = alloc,
@@ -1109,6 +1113,7 @@ pub fn testAntflyProviderRequestControls() !void {
     const options = provider.controlledJsonRequest("{}", 31);
     try std.testing.expectEqualStrings("{}", options.json orelse return error.TestExpectedJson);
     try std.testing.expectEqual(@as(?u64, 17), options.timeout_ms);
+    try std.testing.expectEqualStrings("X-Antfly-Inference-Timeout-Ms", options.remaining_timeout_header.?);
     try std.testing.expectEqual(@as(?usize, 23), options.max_response_size);
     try std.testing.expect(options.headers != null);
     try std.testing.expect(options.cancellation == null);

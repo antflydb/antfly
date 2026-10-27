@@ -205,6 +205,7 @@ pub const Config = struct {
     vision_spatial_merge_size: u32 = 1,
     vision_temporal_patch_size: u32 = 1,
     vision_use_quick_gelu: bool = false,
+    vision_use_gelu_tanh: bool = false,
     vision_deepstack_visual_indexes_len: u8 = 0,
     vision_deepstack_visual_indexes: [max_vision_deepstack_layers]u32 = @as([max_vision_deepstack_layers]u32, @splat(0)),
     vision_deepstack_visual_indexes_truncated: bool = false,
@@ -219,6 +220,11 @@ pub const Config = struct {
     // layers with full-attention layers; linear layers require recurrent state
     // rather than the standard KV cache.
     qwen35_has_linear_attention: bool = false,
+    /// Runtime-only resident Metal policy. Host fallback is unavailable when
+    /// the page deliberately owns only device recurrent/convolution state.
+    qwen35_device_only_state: bool = false,
+    // Internal Metal-only vision admission contract; never loaded from model JSON.
+    qwen35_metal_resident_vision: bool = false,
     qwen35_full_attention_interval: u32 = 0,
     qwen35_linear_conv_kernel_dim: u32 = 0,
     qwen35_linear_key_head_dim: u32 = 0,
@@ -249,6 +255,10 @@ pub const Config = struct {
 
     // Weight naming
     weight_prefix: []const u8 = "",
+
+    /// Runtime-only storage choice for the native LightOn reader epoch.
+    /// Recurrent histories remain separately allocated for every linear layer.
+    compact_qwen35_kv: bool = false,
 
     pub fn effectiveKVHeads(self: Config) u32 {
         return if (self.num_key_value_heads > 0) self.num_key_value_heads else self.num_attention_heads;
@@ -321,6 +331,19 @@ pub const Config = struct {
             previous = index;
         }
         return true;
+    }
+
+    /// Qwen3.5 shares Qwen3-VL's vision tower, without DeepStack taps,
+    /// and applies M-RoPE to only a prefix of each language attention head.
+    pub fn hasQwen35VisionArchitectureContract(self: Config) bool {
+        if (!self.isQwen35() or !self.supportsNativeQwen2VlVision() or self.usesMoe()) return false;
+        if (self.vision_temporal_patch_size != 2 or self.vision_num_position_embeddings == 0 or
+            self.vision_out_hidden_size != self.hidden_size or self.vision_deepstack_visual_indexes_len != 0 or
+            self.vision_deepstack_visual_indexes_truncated or !self.mrope_interleaved) return false;
+        const rotary_dim = self.layerRopeActiveDim(@max(self.qwen35_full_attention_interval, 1) - 1);
+        return rotary_dim > 0 and rotary_dim <= self.headDim() and
+            rotary_dim == 2 * (self.mrope_section[0] + self.mrope_section[1] + self.mrope_section[2]) and
+            self.boi_token_index >= 0 and self.eoi_token_index >= 0;
     }
 
     pub fn tokenEmbeddingScale(self: Config) f32 {
@@ -490,6 +513,32 @@ pub const Config = struct {
         return layer_index >= self.num_hidden_layers - self.num_kv_shared_layers;
     }
 
+    pub fn usesCompactQwen35Kv(self: Config) bool {
+        if (!self.compact_qwen35_kv or !self.hasQwen35VisionArchitectureContract()) return false;
+        for (0..self.num_hidden_layers) |layer| if (!self.layerUsesQwen35LinearAttention(layer)) return true;
+        return false;
+    }
+
+    pub fn kvStorageLayerCount(self: Config) usize {
+        if (!self.usesCompactQwen35Kv()) return self.num_hidden_layers;
+        var count: usize = 0;
+        for (0..self.num_hidden_layers) |layer| if (!self.layerUsesQwen35LinearAttention(layer)) {
+            count += 1;
+        };
+        return count;
+    }
+
+    pub fn compactQwen35KvStorageLayerIndex(self: Config, layer: usize) ?usize {
+        if (!self.usesCompactQwen35Kv()) return layer;
+        if (layer >= self.num_hidden_layers) return null;
+        if (self.layerUsesQwen35LinearAttention(layer)) return null;
+        var count: usize = 0;
+        for (0..layer) |previous| if (!self.layerUsesQwen35LinearAttention(previous)) {
+            count += 1;
+        };
+        return count;
+    }
+
     pub fn layerSharesKv(self: Config, layer_index: usize) bool {
         return self.layerUsesSharedTail(layer_index);
     }
@@ -519,6 +568,55 @@ pub const Config = struct {
             }
         }
         return donor;
+    }
+
+    pub const KvDonorGeometry = struct {
+        donor_layer: usize,
+        sliding: bool,
+        num_kv_heads: u32,
+        head_dim: u32,
+    };
+
+    /// Resolve the physical KV owner for a decoder layer. Shared-tail
+    /// consumers must use the donor's storage and must never allocate a
+    /// duplicate selected/global cache under their own layer index.
+    pub fn kvStorageLayerIndex(self: Config, layer_index: usize) !usize {
+        if (layer_index >= self.num_hidden_layers) return error.InvalidLayerIndex;
+        return self.kvDonorLayerIndex(layer_index) orelse layer_index;
+    }
+
+    pub fn kvDonorGeometry(self: Config, layer_index: usize) !KvDonorGeometry {
+        const donor = try self.kvStorageLayerIndex(layer_index);
+        if (donor >= self.num_hidden_layers) return error.InvalidKvDonorLayer;
+        const sliding = self.layerUsesSlidingAttention(layer_index);
+        if (self.layerUsesSlidingAttention(donor) != sliding) return error.InvalidKvDonorGeometry;
+        const heads = self.effectiveKVHeadsForLayer(layer_index);
+        const head_dim = self.effectiveHeadDimForLayer(layer_index);
+        if (self.effectiveKVHeadsForLayer(donor) != heads or
+            self.effectiveHeadDimForLayer(donor) != head_dim)
+        {
+            return error.InvalidKvDonorGeometry;
+        }
+        return .{
+            .donor_layer = donor,
+            .sliding = sliding,
+            .num_kv_heads = heads,
+            .head_dim = head_dim,
+        };
+    }
+
+    pub fn isKvDonorLayer(self: Config, layer_index: usize) bool {
+        const storage_layer = self.kvStorageLayerIndex(layer_index) catch return false;
+        return storage_layer == layer_index;
+    }
+
+    pub fn globalKvDonorCount(self: Config) usize {
+        var count: usize = 0;
+        const layer_count: usize = @intCast(self.num_hidden_layers);
+        for (0..layer_count) |layer| {
+            if (self.isKvDonorLayer(layer) and !self.layerUsesSlidingAttention(layer)) count += 1;
+        }
+        return count;
     }
 
     /// Gemma 4 full-attention layers may omit v_proj (V = K).
@@ -1203,6 +1301,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
             };
             if (vision_obj.get("hidden_act")) |vv| if (vv == .string) {
                 config.vision_use_quick_gelu = std.mem.eql(u8, vv.string, "quick_gelu");
+                config.vision_use_gelu_tanh = std.mem.eql(u8, vv.string, "gelu_pytorch_tanh") or std.mem.eql(u8, vv.string, "gelu_new");
             };
             if (vision_obj.get("deepstack_visual_indexes")) |vv| {
                 parseVisionDeepstackVisualIndexes(&config, vv);
@@ -3291,6 +3390,34 @@ test "gemma4 effective theta preserves the wider frequency domain" {
     }
 }
 
+test "Gemma4 selected KV geometry resolves shared global and local donors" {
+    const config = Config{
+        .family = .gemma,
+        .num_hidden_layers = 10,
+        .num_kv_shared_layers = 5,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .num_global_key_value_heads = 2,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+    };
+
+    const shared_local = try config.kvDonorGeometry(7);
+    try std.testing.expect(shared_local.sliding);
+    try std.testing.expectEqual(@as(usize, 3), shared_local.donor_layer);
+    try std.testing.expectEqual(@as(u32, 1), shared_local.num_kv_heads);
+    try std.testing.expectEqual(@as(u32, 256), shared_local.head_dim);
+
+    const shared_global = try config.kvDonorGeometry(9);
+    try std.testing.expect(!shared_global.sliding);
+    try std.testing.expectEqual(@as(usize, 4), shared_global.donor_layer);
+    try std.testing.expectEqual(@as(u32, 2), shared_global.num_kv_heads);
+    try std.testing.expectEqual(@as(u32, 512), shared_global.head_dim);
+    try std.testing.expectEqual(@as(usize, 1), config.globalKvDonorCount());
+}
+
 test "KV pool retains full history only for genuinely mixed attention" {
     const mixed_gemma = Config{
         .family = .gemma,
@@ -3637,4 +3764,39 @@ test "parse colqwen2 merged config lacks native vision detail" {
     try std.testing.expectEqual(@as(u32, 1536), config.vision_embed_dim);
     try std.testing.expectEqual(@as(u32, 14), config.vision_patch_size);
     try std.testing.expect(!config.supportsNativeQwen2VlVision());
+}
+
+test "LightOnOCR3 official 0.8B config has partial M-RoPE and no DeepStack" {
+    const config = try parseConfig(std.testing.allocator, @embedFile("testdata/lightonocr3/config.json"));
+    try std.testing.expectEqual(ModelFamily.qwen3_5, config.family);
+    try std.testing.expect(config.hasQwen35VisionArchitectureContract());
+    try std.testing.expect(config.vision_use_gelu_tanh);
+    try std.testing.expectEqual(@as(u32, 1024), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 24), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 256), config.headDim());
+    try std.testing.expectEqual(@as(usize, 64), config.layerRopeActiveDim(3));
+    try std.testing.expect(config.isEosToken(248046));
+    try std.testing.expectEqual(@as(u32, 16), config.qwen35_linear_num_value_heads);
+    try std.testing.expect(config.layerUsesQwen35LinearAttention(0));
+    try std.testing.expect(!config.layerUsesQwen35LinearAttention(3));
+    try std.testing.expectEqual(@as(u32, 12), config.vision_num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 768), config.vision_hidden_size);
+    try std.testing.expectEqual(@as(u8, 0), config.vision_deepstack_visual_indexes_len);
+    var invalid = config;
+    invalid.mrope_section = .{ 24, 20, 20 };
+    try std.testing.expect(!invalid.hasQwen35VisionArchitectureContract());
+}
+
+test "LightOnOCR3 official 4B config uses grouped recurrent heads and larger vision tower" {
+    const config = try parseConfig(std.testing.allocator, @embedFile("testdata/lightonocr3/config-4b.json"));
+    try std.testing.expect(config.hasQwen35VisionArchitectureContract());
+    try std.testing.expectEqual(@as(u32, 2560), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 9216), config.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 32), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 16), config.qwen35_linear_num_key_heads);
+    try std.testing.expectEqual(@as(u32, 32), config.qwen35_linear_num_value_heads);
+    try std.testing.expectEqual(@as(usize, 64), config.layerRopeActiveDim(3));
+    try std.testing.expectEqual(@as(u32, 24), config.vision_num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 1024), config.vision_hidden_size);
+    try std.testing.expect(config.isEosToken(248046));
 }

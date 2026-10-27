@@ -245,7 +245,7 @@ pub const Registry = struct {
         // Writable roots are protected by the catalog reference. Read-only
         // sources use the established external-reader lock, since they cannot
         // publish a lease and external writers must not reuse their pages.
-        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .no_sync = true });
+        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .reader_coordinator = owner.file.reader_coordinator, .no_sync = true });
         errdefer reader.close();
         reader.page_cache_enabled.store(false, .monotonic);
         var capture = Capture{ .allocator = a, .key = key, .lease_key = lease_key };
@@ -253,7 +253,7 @@ pub const Registry = struct {
         if (reader_fenced) {
             capture.checkpoint = reader.activeCheckpoint();
             capture.value = try reader.openIndexValue(a, key, capture.checkpoint);
-        } else try owner.submitMutation(&capture, Capture.apply);
+        } else try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
         state.* = .{
             .registry = self,
             .reader = reader,
@@ -431,7 +431,7 @@ const State = struct {
             var remove = Remove{ .key = self.lease_key };
             // On failure the marker will disappear and bounded orphan
             // service can retry. A failed release never frees live pages.
-            owner.submitMutation(&remove, Remove.apply) catch {};
+            owner.submitArtifactLeaseMutation(&remove, Remove.apply) catch {};
         };
         @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
         self.closeResources();
@@ -512,7 +512,11 @@ pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
     // Cursor navigation is finished before publication/reclamation can run.
     var mutations: [64]native.CatalogMutation = undefined;
     for (keys[0..count], 0..) |key, i| mutations[i] = .{ .key = key, .is_delete = true };
+    const owns_transaction = file.transaction_header == null;
+    if (owns_transaction) try file.beginArtifactLeaseTransaction();
+    errdefer if (owns_transaction) file.abortTransaction();
     try file.putCatalogBatch(mutations[0..count]);
+    if (owns_transaction) try file.commitTransaction();
     return count;
 }
 

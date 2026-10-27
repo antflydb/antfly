@@ -75,7 +75,11 @@ pub const grouped_sources_reader_version: u32 = 8;
 pub const namespace_curation_reader_version: u32 = 9;
 pub const curation_provenance_reader_version: u32 = 10;
 pub const scoped_curation_reader_version: u32 = 11;
-pub const supported_reader_version: u32 = scoped_curation_reader_version;
+pub const native_resolver_records_reader_version: u32 = 12;
+pub const resolver_projection_bindings_reader_version: u32 = 13;
+pub const resolver_projection_work_reader_version: u32 = 14;
+pub const resolver_projection_delta_reader_version: u32 = 15;
+pub const supported_reader_version: u32 = resolver_projection_delta_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -90,6 +94,10 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         9 => "9",
         10 => "10",
         11 => "11",
+        12 => "12",
+        13 => "13",
+        14 => "14",
+        15 => "15",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -105,7 +113,17 @@ pub fn versionedCatalog(a: Allocator, data: []const u8, version: u32) ![]u8 {
     return try std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }
 
+/// Physical envelope shape is part of the authenticated catalog identity.
+pub const CatalogEncoding = struct {
+    minimum_reader_version: u32,
+    projection_dictionary: bool,
+};
+
 pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
+    return (try catalogEncoding(a, data)).minimum_reader_version;
+}
+
+pub fn catalogEncoding(a: Allocator, data: []const u8) !CatalogEncoding {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
     defer parsed.deinit();
     const rows = try catalogRows(parsed.value);
@@ -130,6 +148,7 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
                 if (state.value == .object and state.value.object.contains("receipt_scope")) required = @max(required, scoped_curation_reader_version);
             }
         }
+        if (entry.object.contains("namespace_curation_table_id")) required = @max(required, resolver_projection_bindings_reader_version);
         if (entry.object.contains("namespace_curation_generation")) required = @max(required, namespace_curation_reader_version);
         if (entry.object.contains("suppress_json") or entry.object.contains("curation_json") or entry.object.contains("curation_revision")) required = @max(required, curation_reader_version);
         if (entry.object.contains("replacement_index") or entry.object.contains("replacement_resolver")) required = @max(required, 3);
@@ -137,7 +156,10 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
             if (entry.object.contains(field)) required = @max(required, 2);
         }
     }
-    return required;
+    return .{
+        .minimum_reader_version = required,
+        .projection_dictionary = parsed.value == .object and parsed.value.object.contains("projections"),
+    };
 }
 
 pub fn readMinimumReaderVersion(txn: anytype, supported: u32) !u32 {
@@ -186,6 +208,110 @@ pub const ResolverSourceArtifactKind = enum {
     }
 };
 
+/// In-process validation evidence. It is never deserialized or persisted.
+pub const PolicyValidation = struct {
+    policy_digest: [64]u8,
+    static_digest: [32]u8,
+    pub fn jsonParse(_: Allocator, _: anytype, _: std.json.ParseOptions) !PolicyValidation {
+        return error.UnexpectedToken;
+    }
+    pub fn jsonParseFromValue(_: Allocator, _: std.json.Value, _: std.json.ParseOptions) !PolicyValidation {
+        return error.UnexpectedToken;
+    }
+};
+pub fn policyProfileDigest(a: Allocator, aliases: []const resolver_lib.KeyAlias, suppress_json: []const u8) ![32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ aliases, suppress_json }, .{}), &digest, .{});
+    return digest;
+}
+
+/// Immutable policy owned once by a catalog generation. Ordinary `clone`
+/// remains detached (including arena callers); only persistent catalog slots
+/// opt into reference ownership through `cloneWithProjection`.
+pub const SharedProjection = struct {
+    alloc: Allocator,
+    references: std.atomic.Value(usize) = .init(1),
+    merges: []const resolver_lib.KeyAlias,
+    curation_json: []const u8,
+    encoded: []const u8,
+    digest: [64]u8,
+
+    pub fn create(alloc: Allocator, merges: []const resolver_lib.KeyAlias, state: []const u8) !*SharedProjection {
+        const owned = try ResolverConfig.cloneAliases(alloc, merges);
+        errdefer {
+            for (owned) |alias| {
+                alloc.free(alias.key);
+                alloc.free(alias.target);
+            }
+            alloc.free(owned);
+        }
+        const text = try alloc.dupe(u8, state);
+        errdefer alloc.free(text);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, StoredProjection{ .merges = owned, .curation_json = text }, .{});
+        errdefer alloc.free(encoded);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        const result = try alloc.create(SharedProjection);
+        result.* = .{ .alloc = alloc, .merges = owned, .curation_json = text, .encoded = encoded, .digest = std.fmt.bytesToHex(digest, .lower) };
+        return result;
+    }
+    pub fn retain(self: *SharedProjection) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
+    pub fn release(self: *SharedProjection) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        const a = self.alloc;
+        for (self.merges) |alias| {
+            a.free(alias.key);
+            a.free(alias.target);
+        }
+        a.free(self.merges);
+        a.free(self.curation_json);
+        a.free(self.encoded);
+        a.destroy(self);
+    }
+    // Ownership is never deserialized from a public or durable config.
+    pub fn jsonParse(_: Allocator, _: anytype, _: std.json.ParseOptions) !SharedProjection {
+        return error.UnexpectedToken;
+    }
+    pub fn jsonParseFromValue(_: Allocator, _: std.json.Value, _: std.json.ParseOptions) !SharedProjection {
+        return error.UnexpectedToken;
+    }
+};
+
+/// A replay observation is deliberately not an executable resolver config.
+/// It carries only owned identity strings and scalar publication fences.
+pub const ResolverObservation = struct {
+    name: []const u8,
+    table: []const u8,
+    key_template: []const u8,
+    retired: bool,
+    promote: bool,
+    config_generation: u64,
+    namespace_generation: u64,
+    curation_revision: u64,
+    namespace_curation_table_id: u64,
+    namespace_curation_generation: u64,
+    namespace_curation_missing: bool,
+
+    pub fn fromConfig(a: Allocator, cfg: ResolverConfig) !ResolverObservation {
+        const name = try a.dupe(u8, cfg.name);
+        errdefer a.free(name);
+        const table = try a.dupe(u8, cfg.table);
+        errdefer a.free(table);
+        const template = try a.dupe(u8, cfg.key_template);
+        return .{ .name = name, .table = table, .key_template = template, .retired = cfg.retired, .promote = cfg.promote, .config_generation = cfg.config_generation, .namespace_generation = cfg.namespace_generation, .curation_revision = cfg.curation_revision, .namespace_curation_table_id = cfg.namespace_curation_table_id, .namespace_curation_generation = cfg.namespace_curation_generation, .namespace_curation_missing = cfg.namespace_curation_missing };
+    }
+    pub fn deinit(self: *ResolverObservation, a: Allocator) void {
+        a.free(self.name);
+        a.free(self.table);
+        a.free(self.key_template);
+        self.* = undefined;
+    }
+};
+
+const ResolverConfigField = std.meta.FieldEnum(ResolverConfig);
+
 pub const ResolverConfig = struct {
     /// Catalog name of the resolver.
     name: []const u8,
@@ -204,6 +330,8 @@ pub const ResolverConfig = struct {
     aliases: []const resolver_lib.KeyAlias = &.{},
     /// API-created redirects are durable identity state, never inline config.
     merges: []const resolver_lib.KeyAlias = &.{},
+    shared_projection: ?*SharedProjection = null,
+    validation_proof: ?PolicyValidation = null,
     /// Combined resolution revision after the first merge. Advanced on either
     /// config changes or merges; the field name retains catalog compatibility.
     merge_generation: u64 = 0,
@@ -245,6 +373,9 @@ pub const ResolverConfig = struct {
     curation_json: []const u8 = "",
     curation_revision: u64 = 0,
     namespace_curation_generation: u64 = 0,
+    /// Physical authority incarnation; namespace revisions are scoped to it.
+    namespace_curation_table_id: u64 = 0,
+    namespace_curation_missing: bool = false,
     /// Candidate blocking strategy: "" (none, deterministic mint) or
     /// "exact_key" (look up the rendered canonical key as a candidate so the
     /// scorer can link to an existing entity). ANN/prefix blocking over the
@@ -319,6 +450,8 @@ pub const ResolverConfig = struct {
     pub fn publicValue(self: ResolverConfig, a: Allocator) !std.json.Value {
         var value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, self, .{}), .{});
         _ = value.object.swapRemove("curation_json");
+        _ = value.object.swapRemove("namespace_curation_table_id");
+        _ = value.object.swapRemove("namespace_curation_missing");
         if (value.object.fetchSwapRemove("suppress_json")) |entry|
             try value.object.put(a, "suppress", try std.json.parseFromSliceLeaky(std.json.Value, a, entry.value.string, .{}));
         if (value.object.fetchSwapRemove("adjudicate_json")) |entry| {
@@ -331,20 +464,38 @@ pub const ResolverConfig = struct {
         return value;
     }
 
+    fn sharedPolicyDigest(self: ResolverConfig) ?[64]u8 {
+        const projection = self.shared_projection orelse return null;
+        if (self.merges.ptr != projection.merges.ptr or self.merges.len != projection.merges.len or self.curation_json.ptr != projection.curation_json.ptr or self.curation_json.len != projection.curation_json.len) return null;
+        return projection.digest;
+    }
     pub fn eql(self: ResolverConfig, other: ResolverConfig) bool {
+        const shared_equal = if (self.sharedPolicyDigest()) |left| if (other.sharedPolicyDigest()) |right| std.mem.eql(u8, &left, &right) else false else false;
         inline for (@typeInfo(ResolverConfig).@"struct".field_names, @typeInfo(ResolverConfig).@"struct".field_types) |reflected_name, field_type| {
-            if (field_type == []const u8) {
-                if (!std.mem.eql(u8, @field(self, reflected_name), @field(other, reflected_name))) return false;
-            } else if (field_type == []const []const u8) {
-                const a = @field(self, reflected_name);
-                const b = @field(other, reflected_name);
-                if (a.len != b.len) return false;
-                for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
-            } else if (field_type == []const resolver_lib.KeyAlias) {
-                if (!aliasesEqual(@field(self, reflected_name), @field(other, reflected_name))) return false;
-            } else if (!std.meta.eql(@field(self, reflected_name), @field(other, reflected_name))) return false;
+            if (comptime std.mem.eql(u8, reflected_name, "shared_projection") or std.mem.eql(u8, reflected_name, "validation_proof")) continue;
+            if (!shared_equal or (comptime !std.mem.eql(u8, reflected_name, "merges") and !std.mem.eql(u8, reflected_name, "curation_json"))) {
+                if (field_type == []const u8) {
+                    if (!std.mem.eql(u8, @field(self, reflected_name), @field(other, reflected_name))) return false;
+                } else if (field_type == []const []const u8) {
+                    const a = @field(self, reflected_name);
+                    const b = @field(other, reflected_name);
+                    if (a.len != b.len) return false;
+                    for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
+                } else if (field_type == []const resolver_lib.KeyAlias) {
+                    if (!aliasesEqual(@field(self, reflected_name), @field(other, reflected_name))) return false;
+                } else if (!std.meta.eql(@field(self, reflected_name), @field(other, reflected_name))) return false;
+            }
         }
         return true;
+    }
+
+    pub fn rebaseNativeProjection(self: *ResolverConfig, previous: ResolverConfig) !void {
+        if (self.namespace_curation_table_id == 0) return;
+        const same = self.namespace_curation_table_id == previous.namespace_curation_table_id and std.mem.eql(u8, self.table, previous.table) and std.mem.eql(u8, self.key_template, previous.key_template);
+        if (same and self.namespace_curation_generation < previous.namespace_curation_generation) return error.ResolverCurationConflict;
+        // The source execution clock is resolution_generation. Curation is
+        // scoped to the physical destination and may restart after migration.
+        self.curation_revision = self.namespace_curation_generation;
     }
 
     pub fn effectiveGeneration(self: ResolverConfig) u64 {
@@ -374,12 +525,35 @@ pub const ResolverConfig = struct {
     pub fn jsonStringify(self: ResolverConfig, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime (std.mem.eql(u8, field, "adjudicate_json") or std.mem.eql(u8, field, "suppress_json") or std.mem.eql(u8, field, "curation_json"))) @field(self, field).len == 0 else if (comptime std.mem.eql(u8, field, "namespace_curation_generation")) self.namespace_curation_generation == 0 else if (comptime std.mem.eql(u8, field, "curation_revision")) self.curation_revision == 0 else if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "replacement_index")) self.replacement_index.len == 0 else if (comptime std.mem.eql(u8, field, "replacement_resolver")) self.replacement_resolver.len == 0 else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
+            if (comptime !std.mem.eql(u8, field, "merges") and !std.mem.eql(u8, field, "shared_projection") and !std.mem.eql(u8, field, "validation_proof")) {
+                const omit = switch (comptime @field(ResolverConfigField, field)) {
+                    .adjudicate_json, .suppress_json, .curation_json => @field(self, field).len == 0,
+                    .namespace_curation_missing, .retired => !@field(self, field),
+                    .namespace_curation_table_id, .namespace_curation_generation, .curation_revision, .merge_generation, .merge_state_version, .resolution_generation, .namespace_generation => @field(self, field) == 0,
+                    .aliases, .replacement_index, .replacement_resolver => @field(self, field).len == 0,
+                    .promote => self.promote,
+                    .inline_managed => self.inline_managed == null,
+                    .retain_work => self.retain_work == .full,
+                    .max_work_bytes => self.max_work_bytes == 1024 * 1024,
+                    else => false,
+                };
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
                 }
+            }
+        }
+        try writer.endObject();
+    }
+
+    /// Private execution/consumer wire includes legacy corrections that the
+    /// declarative serializer intentionally excludes. Runtime ownership stays local.
+    pub fn jsonExecution(self: ResolverConfig, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "shared_projection") and !std.mem.eql(u8, field, "validation_proof")) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
             }
         }
         try writer.endObject();
@@ -434,6 +608,7 @@ pub const ResolverConfig = struct {
 
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
         var owned = cfg;
+        owned.shared_projection = null;
         // Establish an empty cleanup owner before the first allocation. Keep
         // borrowed fields out of it until each clone has succeeded.
         inline for (@typeInfo(ResolverConfig).@"struct".field_names, @typeInfo(ResolverConfig).@"struct".field_types) |name, T| {
@@ -452,6 +627,18 @@ pub const ResolverConfig = struct {
         return owned;
     }
 
+    pub fn cloneWithProjection(alloc: Allocator, cfg: ResolverConfig, projection: *SharedProjection) !ResolverConfig {
+        var detached = cfg;
+        detached.merges = &.{};
+        detached.curation_json = "";
+        var owned = try clone(alloc, detached);
+        projection.retain();
+        owned.shared_projection = projection;
+        owned.merges = projection.merges;
+        owned.curation_json = projection.curation_json;
+        return owned;
+    }
+
     pub fn deinit(self: *ResolverConfig, alloc: Allocator) void {
         alloc.free(@constCast(self.name));
         alloc.free(@constCast(self.table));
@@ -463,17 +650,21 @@ pub const ResolverConfig = struct {
             alloc.free(alias.target);
         }
         alloc.free(self.aliases);
-        for (self.merges) |alias| {
-            alloc.free(alias.key);
-            alloc.free(alias.target);
+        if (self.shared_projection) |projection| {
+            projection.release();
+        } else {
+            for (self.merges) |alias| {
+                alloc.free(alias.key);
+                alloc.free(alias.target);
+            }
+            alloc.free(self.merges);
+            if (self.curation_json.len > 0) alloc.free(self.curation_json);
         }
-        alloc.free(self.merges);
         for (self.labels) |l| alloc.free(@constCast(l));
         if (self.labels.len > 0) alloc.free(self.labels);
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
         if (self.adjudicate_json.len > 0) alloc.free(self.adjudicate_json);
         if (self.suppress_json.len > 0) alloc.free(self.suppress_json);
-        if (self.curation_json.len > 0) alloc.free(self.curation_json);
         if (self.candidate_search.len > 0) alloc.free(@constCast(self.candidate_search));
         if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
@@ -489,25 +680,20 @@ pub const ResolverConfig = struct {
     /// prior outside [0, 1]) collapses every edge weight toward 0, which a
     /// weighted traversal with a positive `min_weight` would silently drop.
     pub fn validate(self: ResolverConfig) !void {
-        if (self.suppress_json.len > 0 or self.curation_json.len > 0) {
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer arena.deinit();
-            const a = arena.allocator();
-            const policy = try resolver_lib.curation.Index.init(a, self.suppress_json, self.curation_json);
-            const aliases = try self.effectiveAliasesAlloc(a);
-            const state = try resolver_lib.curation.parseState(a, self.curation_json);
-            const redirects = try resolver_lib.curation.RedirectIndex.init(a, aliases);
-            for (state.distinct) |pair| {
-                const from = redirects.canonical(pair.from);
-                const to = redirects.canonical(pair.to);
-                if (std.mem.eql(u8, from, to)) return error.ResolverDistinctPair;
-            }
-            for (aliases) |alias| {
-                const target = redirects.canonical(alias.target);
-                if (policy.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
-                if (try policy.pinnedDistinct(a, alias.key, target)) return error.ResolverDistinctPair;
-            }
-        }
+        try self.validateDefinition();
+        try self.validatePolicy();
+    }
+    pub fn validatePolicy(self: ResolverConfig) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (self.shared_projection) |projection| if (self.validation_proof) |proof| {
+            const static_digest = try policyProfileDigest(a, self.aliases, self.suppress_json);
+            if (self.merges.ptr == projection.merges.ptr and self.merges.len == projection.merges.len and self.curation_json.ptr == projection.curation_json.ptr and self.curation_json.len == projection.curation_json.len and std.mem.eql(u8, &proof.policy_digest, &projection.digest) and std.mem.eql(u8, &proof.static_digest, &static_digest)) return;
+        };
+        try @import("../resolver_authority.zig").validateProfile(a, .{ .key_template = self.key_template, .merges = self.merges, .state = try resolver_lib.curation.parseState(a, self.curation_json) }, self.aliases, self.suppress_json);
+    }
+    pub fn validateDefinition(self: ResolverConfig) !void {
         if (self.adjudicate_json.len > 0) {
             if (self.scorer_json.len == 0) return error.InvalidResolverConfig;
             try @import("../../../functions/resolver_adjudication.zig").validate(std.heap.page_allocator, self.adjudicate_json);
@@ -517,13 +703,8 @@ pub const ResolverConfig = struct {
                 if (self.source_artifact_kind != .asset or std.mem.eql(u8, artifact, self.source_artifact) or std.mem.eql(u8, artifact, self.resolution_artifact)) return error.InvalidResolverConfig;
             }
         }
-        try resolver_lib.validateAliases(self.aliases);
-        try resolver_lib.validateAliases(self.merges);
         if (self.max_work_bytes > 16 * 1024 * 1024) return error.InvalidResolverConfig;
         if (self.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
-        const effective = try self.effectiveAliasesAlloc(std.heap.page_allocator);
-        defer std.heap.page_allocator.free(effective);
-        try resolver_lib.validateAliases(effective);
         if (self.name.len == 0 or
             self.table.len == 0 or
             self.source_artifact.len == 0 or
@@ -593,15 +774,50 @@ pub fn serializeCatalog(alloc: Allocator, resolvers: []const ResolverConfig) ![]
 
 /// Preserve a loaded catalog's envelope independently of the feature versions
 /// inferred from its current definitions (which may now be empty).
+const StoredProjection = struct { merges: []const resolver_lib.KeyAlias, curation_json: []const u8 };
+
 pub fn serializeCatalogWithMinimumVersion(alloc: Allocator, resolvers: []const ResolverConfig, minimum: u32) ![]u8 {
+    return serializeCatalogWithEncoding(alloc, resolvers, .{ .minimum_reader_version = minimum, .projection_dictionary = true });
+}
+
+/// Preserve an optional empty dictionary when reproducing a loaded envelope.
+/// A nonempty dictionary is always emitted for its referenced projections.
+pub fn serializeCatalogWithEncoding(alloc: Allocator, resolvers: []const ResolverConfig, encoding: CatalogEncoding) ![]u8 {
+    const minimum = encoding.minimum_reader_version;
     if (minimum == 0 or minimum > supported_reader_version) return error.UnsupportedResolverCatalogVersion;
-    const rows = try std.json.Stringify.valueAlloc(alloc, resolvers, .{});
-    errdefer alloc.free(rows);
-    const version = @max(minimum, try catalogReaderVersion(alloc, rows));
-    if (version == 1) return rows;
-    const wrapped = try std.fmt.allocPrint(alloc, "{{\"version\":{d},\"resolvers\":{s}}}", .{ version, rows });
-    alloc.free(rows);
-    return wrapped;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rows = std.json.Array.init(a);
+    var projections: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    for (resolvers) |cfg| {
+        var stored = cfg;
+        if (cfg.namespace_curation_table_id != 0) {
+            stored.merges = &.{};
+            stored.curation_json = "";
+        }
+        var row = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, stored, .{}), .{});
+        if (cfg.namespace_curation_table_id != 0) {
+            const shared = if (cfg.shared_projection) |projection| if (cfg.merges.ptr == projection.merges.ptr and cfg.merges.len == projection.merges.len and cfg.curation_json.ptr == projection.curation_json.ptr and cfg.curation_json.len == projection.curation_json.len) projection else null else null;
+            const encoded = if (shared) |projection| projection.encoded else try std.json.Stringify.valueAlloc(a, StoredProjection{ .merges = cfg.merges, .curation_json = cfg.curation_json }, .{});
+            const id = if (shared) |projection| &projection.digest else blk: {
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+                break :blk try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+            };
+            try projections.put(a, id, encoded);
+            try row.object.put(a, "projection_ref", .{ .string = id });
+        }
+        try rows.append(row);
+    }
+    const encoded_rows = try std.json.Stringify.valueAlloc(a, std.json.Value{ .array = rows }, .{});
+    const version = @max(minimum, try catalogReaderVersion(a, encoded_rows));
+    if (version == 1) return alloc.dupe(u8, encoded_rows);
+    if (projections.count() == 0 and !encoding.projection_dictionary)
+        return std.json.Stringify.valueAlloc(alloc, .{ .version = version, .resolvers = std.json.Value{ .array = rows } }, .{});
+    var dictionary: std.json.ObjectMap = .empty;
+    for (projections.keys(), projections.values()) |id, encoded| try dictionary.put(a, id, try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
+    return std.json.Stringify.valueAlloc(alloc, .{ .version = version, .resolvers = std.json.Value{ .array = rows }, .projections = std.json.Value{ .object = dictionary } }, .{});
 }
 
 pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig {
@@ -620,7 +836,35 @@ pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig 
         for (out[0..initialized]) |*cfg| cfg.deinit(alloc);
         alloc.free(out);
     }
-    for (parsed.value, 0..) |cfg, i| {
+    var shared: std.StringHashMapUnmanaged(*SharedProjection) = .empty;
+    defer {
+        var owners = shared.valueIterator();
+        while (owners.next()) |owner| owner.*.release();
+        shared.deinit(alloc);
+    }
+    for (parsed.value, 0..) |input, i| {
+        const cfg = input;
+        if (rows.array.items[i].object.get("projection_ref")) |reference| {
+            if (reference != .string or root.value != .object) return error.InvalidResolverConfig;
+            const dictionary = root.value.object.get("projections") orelse return error.InvalidResolverConfig;
+            if (dictionary != .object) return error.InvalidResolverConfig;
+            const projection = dictionary.object.get(reference.string) orelse return error.InvalidResolverConfig;
+            const slot = try shared.getOrPut(alloc, reference.string);
+            if (!slot.found_existing) {
+                errdefer _ = shared.remove(reference.string);
+                const decoded = try std.json.parseFromValue(StoredProjection, alloc, projection, .{});
+                defer decoded.deinit();
+                const owned = try SharedProjection.create(alloc, decoded.value.merges, decoded.value.curation_json);
+                errdefer owned.release();
+                if (!std.mem.eql(u8, reference.string, &owned.digest)) return error.InvalidResolverConfig;
+                slot.value_ptr.* = owned;
+            }
+            if (cfg.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
+            if (cfg.retired and cfg.inline_managed != true) return error.InvalidResolverConfig;
+            out[i] = try ResolverConfig.cloneWithProjection(alloc, cfg, slot.value_ptr.*);
+            initialized += 1;
+            continue;
+        }
         if (cfg.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
         if (cfg.retired and cfg.inline_managed != true) return error.InvalidResolverConfig;
         out[i] = try ResolverConfig.clone(alloc, cfg);
@@ -667,7 +911,7 @@ pub fn validateSerializedMergeState(alloc: Allocator, data: []const u8) !void {
 pub fn serializeMergeState(alloc: Allocator, configs: []const ResolverConfig) ![]u8 {
     var states: std.ArrayList(MergeState) = .empty;
     defer states.deinit(alloc);
-    for (configs) |cfg| if (cfg.merges.len > 0) {
+    for (configs) |cfg| if (cfg.merges.len > 0 and cfg.namespace_curation_table_id == 0) {
         try states.append(alloc, .{ .name = cfg.name, .aliases = cfg.merges });
     };
     return try std.json.Stringify.valueAlloc(alloc, states.items, .{});
@@ -1113,4 +1357,92 @@ test "resolver curation state requires the current receipt decoder" {
     const scoped = try std.json.Stringify.valueAlloc(a, .{.{ .curation_json = try std.json.Stringify.valueAlloc(a, curation.State{ .receipt_scope = @splat('a') }, .{}) }}, .{});
     try std.testing.expectEqual(scoped_curation_reader_version, try catalogReaderVersion(a, scoped));
     try std.testing.expectEqualStrings("11", try readerVersionBytes(scoped_curation_reader_version));
+}
+
+test "resolver catalog native projection clock follows its physical namespace" {
+    const base: ResolverConfig = .{ .name = "concepts", .table = "old", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .curation_revision = 100, .namespace_curation_generation = 100, .namespace_curation_table_id = 7, .resolution_generation = 200 };
+    var next = base;
+    next.table = "new";
+    next.namespace_curation_table_id = 8;
+    next.namespace_curation_generation = 1;
+    try next.rebaseNativeProjection(base);
+    try std.testing.expectEqual(@as(u64, 1), next.curation_revision);
+    try std.testing.expectEqual(@as(u64, 200), next.resolution_generation);
+    next = base;
+    next.namespace_curation_generation = 99;
+    try std.testing.expectError(error.ResolverCurationConflict, next.rebaseNativeProjection(base));
+}
+
+test "resolver catalog stores shared native policy once per owner snapshot" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first: ResolverConfig = .{ .name = "first", .table = "entities", .key_template = "{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .namespace_curation_table_id = 7, .namespace_curation_generation = 1, .curation_revision = 1, .merges = &.{.{ .key = "a", .target = "b" }}, .curation_json = "{\"suppress\":{\"keys\":[\"noise\"]}}" };
+    var second = first;
+    second.name = "second";
+    second.resolution_artifact = "resolved2";
+    const raw = try serializeCatalog(a, &.{ first, second });
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    try std.testing.expectEqual(@as(usize, 1), root.object.get("projections").?.object.count());
+    const decoded = try deserializeCatalog(a, raw);
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    for (decoded) |cfg| {
+        try std.testing.expectEqualStrings(first.curation_json, cfg.curation_json);
+        try std.testing.expect(ResolverConfig.aliasesEqual(first.merges, cfg.merges));
+    }
+}
+
+test "resolver catalog shares immutable native policy in memory and after reopen" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const aliases = try scratch.alloc(resolver_lib.KeyAlias, 1000);
+    for (aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(scratch, "key-{d}", .{i}), .target = "canonical" };
+    const projection = try SharedProjection.create(a, aliases, "{}");
+    defer projection.release();
+    var configs: [20]ResolverConfig = undefined;
+    var count: usize = 0;
+    defer for (configs[0..count]) |*cfg| cfg.deinit(a);
+    for (&configs, 0..) |*cfg, i| {
+        cfg.* = try ResolverConfig.cloneWithProjection(a, .{ .name = try std.fmt.allocPrint(scratch, "resolver-{d}", .{i}), .table = "entities", .source_artifact = "source", .resolution_artifact = "resolved", .key_template = "{{_key}}", .namespace_curation_table_id = 7, .namespace_curation_generation = 1 }, projection);
+        count += 1;
+        try std.testing.expect(cfg.merges.ptr == projection.merges.ptr);
+    }
+    var detached = try ResolverConfig.clone(a, configs[0]);
+    defer detached.deinit(a);
+    try std.testing.expect(detached.shared_projection == null);
+    try std.testing.expect(detached.merges.ptr != projection.merges.ptr);
+    try std.testing.expect(configs[0].eql(detached));
+    const raw = try serializeCatalog(a, &configs);
+    defer a.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "shared_projection") == null);
+    const restored = try deserializeCatalog(a, raw);
+    defer {
+        for (restored) |*cfg| cfg.deinit(a);
+        a.free(restored);
+    }
+    for (restored) |cfg| {
+        try std.testing.expect(cfg.shared_projection == restored[0].shared_projection);
+        try std.testing.expect(cfg.merges.ptr == restored[0].merges.ptr);
+        try std.testing.expect(ResolverConfig.aliasesEqual(aliases, cfg.merges));
+    }
+    // No JSON input can manufacture a runtime ownership reference.
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(ResolverConfig, a, "{\"name\":\"r\",\"table\":\"t\",\"source_artifact\":\"s\",\"resolution_artifact\":\"o\",\"key_template\":\"{{_key}}\",\"shared_projection\":{}}", .{}));
+}
+
+test "resolver catalog encoding preserves optional empty projection dictionaries" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 2, 3, 4 }) |version| {
+        inline for ([_]bool{ false, true }) |dictionary| {
+            const data = try std.fmt.allocPrint(a, if (dictionary) "{{\"version\":{d},\"resolvers\":[],\"projections\":{{}}}}" else "{{\"version\":{d},\"resolvers\":[]}}", .{version});
+            defer a.free(data);
+            const encoding = try catalogEncoding(a, data);
+            try std.testing.expectEqual(version, encoding.minimum_reader_version);
+            try std.testing.expectEqual(dictionary, encoding.projection_dictionary);
+            const encoded = try serializeCatalogWithEncoding(a, &.{}, encoding);
+            defer a.free(encoded);
+            try std.testing.expectEqualStrings(data, encoded);
+        }
+    }
 }

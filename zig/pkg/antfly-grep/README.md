@@ -6,12 +6,55 @@ running the CLI requires no Rust toolchain, ripgrep executable, shell subprocess
 database, or persistent index. Regex execution, PCRE-style extensions, decompression,
 transcoding, discovery, source analysis, and output are implemented in Zig in this
 monorepo. There is no libpcre2 or libarchive dependency. Explicit `--pre` and
-`--hostname-bin` options run the user-specified program.
+`--hostname-bin` options run the user-specified program. Cloud source selection
+invokes the public `antfly-cloud context --json` command without a shell.
 
 This implements local and table-backed search for
 [#1151](https://github.com/antflydb/antfly/issues/1151). Table profiles select
-indexed documents using the versioned schema below. Connector ingestion and
-remote-source retrieval remain separate work.
+indexed documents using the versioned schema below. Colony owns provider
+connections and background ingestion; the Cloud integration below discovers its
+authorized canonical sources.
+
+## Connected Cloud sources
+
+After `antfly-cloud login` and active instance selection, compatible Colony servers
+provide source discovery without hand-authored table JSON or copied data-plane tokens:
+
+```sh
+antfly-grep --cloud --files
+antfly-grep --source engineering -n 'retry|budget'
+antfly-grep --source engineering --source work-drive 'deadline'
+antfly-grep ask 'Why was this retry policy chosen?' --source engineering --model MODEL
+```
+
+`--cloud` selects all authorized sources; repeat `--source` to select aliases or
+stable source IDs across repositories/providers. Exact IDs take precedence over
+aliases; an ambiguous alias fails before querying. Repeated selectors select each
+resolved source once. `--cloud-cli PATH` selects the CLI
+executable. Cloud selection cannot be mixed with explicit local paths or manual table
+credentials. Identical connection/URI/revision/content from overlapping selections is
+reported once after authorization and path filters. Deduplication memory is bounded by
+`max_page_memory`; independent sources retain independent query snapshots.
+
+Discovery reads the ordinary `antfly_sources` table using bounded snapshot pages.
+Cloud identity and current catalog policy are verified through trusted query
+response headers; continuation requests pin the policy proof. Incomplete or
+changed discovery never starts content search. Limits are 1 MiB per response,
+32 MiB total wire bytes, 64 MiB parsing memory, 1,000 sources and 1,024 pages.
+Cloud uses current server-enforced document permissions, with no separate reader
+list API. File catalogs and self-hosted search retain additional local reader hints.
+
+The session stays in memory. A 401 refreshes through the public CLI and resumes the
+same cursor/snapshot; changing the active instance or authenticated identity fails
+explicitly. Redirects are disabled. Source revocation, stale/pending sync, expired
+snapshots and other source failures preserve earlier results and exit 2. Inference
+endpoint/model/credentials remain independently configured through existing provider
+setup; source discovery never supplies provider refresh tokens or signing keys.
+
+Colony's source-management and data-plane protocols, provider setup and current
+format limits are tracked in [Colony #813](https://github.com/antflydb/colony/issues/813)
+and its `docs/dev/connected-source-search.md`. This integration does not itself
+implement provider synchronization, OAuth consent screens or document rendering.
 
 ## Build and test
 
@@ -324,7 +367,9 @@ antfly-grep --table-config tables.json --sort path -l 'retry' ./src
 `ANTFLY_GREP_TABLE_CONFIG` can supply the configuration path. With no explicit
 filesystem paths, table searches do not read stdin or implicitly walk the current
 directory. Repeated `--table` selects configured aliases; omitted selectors scan
-all configured tables. The default `prefetch: true` overlaps one retained-snapshot page
+all configured tables. A table with an alias is selected by that alias; physical
+names remain selectable for tables without aliases. Cloud source selectors use
+source ID precedence instead. The default `prefetch: true` overlaps one retained-snapshot page
 with matching and unlimited-budget decisions using one persistent producer. At most two decoded pages are
 live (each bounded by `max_page_memory`, plus bounded HTTP response buffers). Set
 `prefetch: false` for sequential retrieval. Quiet searches and finite per-file match
@@ -4866,3 +4911,52 @@ projection reports above predate this interface. The updated
 `e2e/antfly/bench_source_projection.py` compares ordinary, cold, metadata-backed
 warm, and equivalent value-reading reference expressions; optional comparison
 binaries must support `select`.
+
+Cloud catalog queries return an authenticated policy proof for snapshot traversal.
+A selected source's first successful ordinary content query returns its own
+`X-Antfly-Source-Access` proof and `X-Antfly-Source-Publication` fence. The server
+rechecks the job attempt and catalog publication after snapshot acquisition and
+before releasing any rows. Grep requires and pins both headers across
+continuations, asset reads and session renewal. Unrelated source sync/rename does not invalidate an ongoing scan.
+A selected-source sharing, principal/group or effective row-policy change ends the
+search explicitly as incomplete.
+
+Portable source profiles use [sources-v2.json](schema/sources-v2.json), independently
+of Cloud login. `antfly-grep --source-catalog catalog.json --source manuals PATTERN`
+loads an explicit endpoint, physical table bindings, source filters and readiness;
+`ANTFLY_GREP_TABLE_TOKEN` supplies its separate data-plane credential. This path
+never invokes `antfly-cloud`. Pending, syncing, stale and expired bindings fail
+explicitly. A catalog configures search and does not grant server access.
+
+The public [ingestion module and standalone runner](../../../go/pkg/sources/README.md)
+can produce this catalog from GitHub, Drive Docs/Slides, S3 or GCS without Colony.
+It uses the same provider/normalization components as hosted imports and can run
+from cron or another scheduler; synchronization is not embedded in grep.
+
+Cloud catalog discovery uses the same ordinary `antfly_sources` table queries.
+Both Cloud and self-hosted search use ordinary `/tables/{table}/query` requests.
+Cloud applies `X-Antfly-Source-ID`, `X-Antfly-Source-Access` and
+`X-Antfly-Source-Publication` preconditions on that route to enforce the current binding, access and readiness. These are Cloud
+preconditions, not new Antfly database APIs or authorization capabilities.
+
+Discover the same source catalog directly from a self-hosted Antfly table:
+
+```sh
+antfly-grep --source-endpoint https://antfly.example/db/v1 \
+  --source manuals 'retry budget'
+```
+
+The default ordinary catalog table is `antfly_sources`; override it with
+`--source-table NAME`. Authenticate with the normal table token and use
+`--source-principal ID` for additional local reader filtering when needed.
+The ingestion identity publishes versioned source records after content and
+reconciliation become query-visible. Grep traverses one bounded catalog snapshot
+before searching. Catalog and content visibility require server authorization;
+catalog records grant no authority. `--source-catalog FILE` remains available for
+file exports. See the [source record schema](schema/source-record-v1.json).
+
+Cloud source configuration and sync actions use existing Colony import-job
+endpoints with `mode: source`. There is no separate Cloud `/sources` API. The
+Cloud session adapter pins authenticated query identity and catalog/source policy
+headers across pagination, asset reads and token renewal; the gateway enforces
+current row permissions.

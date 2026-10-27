@@ -29,8 +29,38 @@ pub const GeminiOptions = struct {
     api_key: []const u8,
 };
 
+/// Wire transport and semantic task representation are independent of model IDs.
+pub const RequestFormat = enum { embed_content, predict, batch_embed_contents };
+pub const TaskEncoding = enum { prompt, task_type, none };
+
+pub fn requestFormat(provider: []const u8, configured: []const u8) !RequestFormat {
+    // Empty values belong to catalogs admitted before explicit transport pinning.
+    if (configured.len == 0) return if (std.mem.eql(u8, provider, "vertex")) .predict else .batch_embed_contents;
+    const format = std.meta.stringToEnum(RequestFormat, configured) orelse return error.InvalidEmbedderConfig;
+    if (format == .predict and !std.mem.eql(u8, provider, "vertex")) return error.InvalidEmbedderConfig;
+    if (format == .batch_embed_contents and !std.mem.eql(u8, provider, "gemini")) return error.InvalidEmbedderConfig;
+    return format;
+}
+
+pub fn taskEncoding(format: RequestFormat, configured: []const u8) !TaskEncoding {
+    if (configured.len == 0) return if (format == .embed_content) .prompt else .task_type;
+    return std.meta.stringToEnum(TaskEncoding, configured) orelse error.InvalidEmbedderConfig;
+}
+
+pub fn maxEmbeddingBatchSize(format: RequestFormat, model: []const u8, configured: ?u32) usize {
+    const limit = switch (format) {
+        .embed_content => @as(usize, 1),
+        .predict => provider_defaults.vertexMaxEmbeddingBatchSize(model),
+        .batch_embed_contents => 100,
+    };
+    return @min(limit, configured orelse limit);
+}
+
 pub const EmbedOptions = struct {
     task_type: []const u8,
+    request_format: RequestFormat = .embed_content,
+    task_encoding: TaskEncoding = .prompt,
+    batch_size: ?u32 = null,
     dimensions: ?u32 = null,
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
@@ -80,7 +110,41 @@ pub const GeminiProvider = struct {
         };
     }
 
-    pub fn embedText(
+    pub fn embedText(self: *GeminiProvider, alloc: Allocator, model: []const u8, texts: []const []const u8, options: EmbedOptions) !inference.EmbedResult {
+        const control = RequestControl.fromTimeout(options.timeout_ms, options.cancellation);
+        try control.check();
+        if (texts.len == 0) return error.EmptyResponse;
+        if (options.request_format == .predict) return error.InvalidEmbedderConfig;
+        const limit = maxEmbeddingBatchSize(options.request_format, model, options.batch_size);
+        if (limit == 0) return error.InvalidEmbeddingBatchSize;
+        var vectors = std.ArrayListUnmanaged([]const f32).empty;
+        errdefer {
+            for (vectors.items) |vector| alloc.free(vector);
+            vectors.deinit(alloc);
+        }
+        var dimension: usize = 0;
+        var offset: usize = 0;
+        while (offset < texts.len) {
+            const count = @min(limit, texts.len - offset);
+            try control.check();
+            var batch_options = options;
+            batch_options.timeout_ms = try control.remainingTimeoutMs();
+            var result = if (options.request_format == .embed_content) blk: {
+                const path = try std.fmt.allocPrint(alloc, "{s}/models/{s}:embedContent", .{ self.base_url, std.fs.path.basename(model) });
+                defer alloc.free(path);
+                break :blk try embedContent(alloc, self.http, self.attempt_observer, path, &.{self.api_key_header}, texts[offset], options, control);
+            } else try self.embedLegacyBatch(alloc, model, texts[offset .. offset + count], batch_options);
+            defer result.deinit();
+            if (result.vectors.len != count or (dimension != 0 and result.dimension != dimension)) return error.InvalidEmbeddingResponse;
+            dimension = result.dimension;
+            try vectors.ensureUnusedCapacity(alloc, result.vectors.len);
+            for (result.vectors) |vector| try vectors.append(alloc, try alloc.dupe(f32, vector));
+            offset += count;
+        }
+        return .{ .vectors = try vectors.toOwnedSlice(alloc), .dimension = dimension, .allocator = alloc };
+    }
+
+    fn embedLegacyBatch(
         self: *GeminiProvider,
         alloc: Allocator,
         model: []const u8,
@@ -89,20 +153,32 @@ pub const GeminiProvider = struct {
     ) !inference.EmbedResult {
         const model_path = if (std.mem.startsWith(u8, model, "models/")) model else try std.fmt.allocPrint(alloc, "models/{s}", .{model});
         defer if (model_path.ptr != model.ptr) alloc.free(model_path);
+        const Part = struct { text: []const u8 };
         const Request = struct {
             model: []const u8,
-            content: struct { parts: []const struct { text: []const u8 } },
-            taskType: []const u8,
+            content: struct { parts: []const Part },
+            taskType: ?[]const u8,
             outputDimensionality: ?u32 = null,
         };
         const requests = try alloc.alloc(Request, texts.len);
         defer alloc.free(requests);
-        for (texts, 0..) |text, i| requests[i] = .{
-            .model = model_path,
-            .content = .{ .parts = &.{.{ .text = text }} },
-            .taskType = options.task_type,
-            .outputDimensionality = options.dimensions,
-        };
+        const parts = try alloc.alloc(Part, texts.len);
+        defer alloc.free(parts);
+        var inputs = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (inputs.items) |input| alloc.free(input);
+            inputs.deinit(alloc);
+        }
+        for (texts) |text| try inputs.append(alloc, try embeddingInput(alloc, text, options));
+        for (inputs.items, 0..) |text, i| {
+            parts[i] = .{ .text = text };
+            requests[i] = .{
+                .model = model_path,
+                .content = .{ .parts = parts[i .. i + 1] },
+                .taskType = if (options.task_encoding == .task_type) options.task_type else null,
+                .outputDimensionality = options.dimensions,
+            };
+        }
         const json_body = try std.json.Stringify.valueAlloc(alloc, .{ .requests = requests }, .{ .emit_null_optional_fields = false });
         defer alloc.free(json_body);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/models/{s}:batchEmbedContents", .{ self.base_url, std.fs.path.basename(model_path) });
@@ -367,7 +443,8 @@ pub const Provider = struct {
         }
         var dimension: usize = 0;
         var offset: usize = 0;
-        const max_inputs = provider_defaults.vertexMaxEmbeddingBatchSize(model);
+        const max_inputs = maxEmbeddingBatchSize(options.request_format, model, options.batch_size);
+        if (max_inputs == 0) return error.InvalidEmbeddingBatchSize;
         while (offset < texts.len) {
             const batch_len = @min(max_inputs, texts.len - offset);
             var batch = try self.embedTextRequestWithControl(
@@ -414,17 +491,26 @@ pub const Provider = struct {
         control: google_auth.RequestControl,
     ) !inference.EmbedResult {
         try control.check();
-        if (texts.len == 0 or texts.len > provider_defaults.vertexMaxEmbeddingBatchSize(model))
+        if (texts.len == 0 or texts.len > maxEmbeddingBatchSize(options.request_format, model, options.batch_size))
             return error.InvalidEmbeddingBatchSize;
+        if (options.request_format == .embed_content)
+            return self.embedContentText(alloc, model, texts[0], options, control);
+        if (options.request_format != .predict) return error.InvalidEmbedderConfig;
         const Instance = struct {
             content: []const u8,
-            task_type: []const u8,
+            task_type: ?[]const u8,
         };
         const instances = try alloc.alloc(Instance, texts.len);
         defer alloc.free(instances);
-        for (texts, 0..) |text, i| instances[i] = .{
+        var inputs = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (inputs.items) |input| alloc.free(input);
+            inputs.deinit(alloc);
+        }
+        for (texts) |text| try inputs.append(alloc, try embeddingInput(alloc, text, options));
+        for (inputs.items, 0..) |text, i| instances[i] = .{
             .content = text,
-            .task_type = options.task_type,
+            .task_type = if (options.task_encoding == .task_type) options.task_type else null,
         };
         const json_body = try std.json.Stringify.valueAlloc(alloc, .{
             .instances = instances,
@@ -461,6 +547,19 @@ pub const Provider = struct {
         defer alloc.free(values);
         for (parsed.value.predictions, 0..) |prediction, i| values[i] = .{ .values = prediction.embeddings.values };
         return try copyEmbeddingValues(alloc, values);
+    }
+
+    fn embedContentText(self: *Provider, alloc: Allocator, model: []const u8, text: []const u8, options: EmbedOptions, control: RequestControl) !inference.EmbedResult {
+        const model_path = try self.vertexModelPathAlloc(alloc, model);
+        defer alloc.free(model_path);
+        const url = try std.fmt.allocPrint(alloc, "{s}/{s}:embedContent", .{ self.base_url, model_path });
+        defer alloc.free(url);
+        var headers = std.ArrayList([2][]const u8).empty;
+        defer headers.deinit(alloc);
+        var minted_auth: ?[]u8 = null;
+        defer if (minted_auth) |value| alloc.free(value);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
+        return embedContent(alloc, self.http, self.attempt_observer, url, headers.items, text, options, control);
     }
 
     pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
@@ -546,7 +645,18 @@ pub const Provider = struct {
         );
     }
 
-    fn appendAuthHeaders(
+    pub fn openAiChatUrlAlloc(self: *const Provider, alloc: Allocator, model: []const u8) ![]u8 {
+        const base = std.mem.trimEnd(u8, self.base_url, "/");
+        if (std.mem.endsWith(u8, base, "/endpoints/openapi")) return std.fmt.allocPrint(alloc, "{s}/chat/completions", .{base});
+        // A fully qualified model retains its project/location authority.
+        if (std.mem.startsWith(u8, model, "projects/")) {
+            const end = std.mem.indexOf(u8, model, "/publishers/") orelse return error.InvalidGeneratorConfig;
+            return std.fmt.allocPrint(alloc, "{s}/{s}/endpoints/openapi/chat/completions", .{ base, model[0..end] });
+        }
+        return std.fmt.allocPrint(alloc, "{s}/projects/{s}/locations/{s}/endpoints/openapi/chat/completions", .{ base, self.project_id, self.location });
+    }
+
+    pub fn appendAuthHeaders(
         self: *Provider,
         alloc: Allocator,
         headers: *std.ArrayList([2][]const u8),
@@ -1056,6 +1166,50 @@ fn mapEmbeddingStatus(status: u16) anyerror {
     };
 }
 
+fn embeddingInput(alloc: Allocator, text: []const u8, options: EmbedOptions) ![]u8 {
+    return if (options.task_encoding == .prompt) taskPromptInput(alloc, text, options.task_type) else alloc.dupe(u8, text);
+}
+
+fn embedContent(alloc: Allocator, http: *httpx.Client, observer: ?httpx.AttemptObserver, url: []const u8, headers: []const [2][]const u8, text: []const u8, options: EmbedOptions, control: RequestControl) !inference.EmbedResult {
+    try control.check();
+    const input = try embeddingInput(alloc, text, options);
+    defer alloc.free(input);
+    const body = try std.json.Stringify.valueAlloc(alloc, .{
+        .content = .{ .parts = [_]struct { text: []const u8 }{.{ .text = input }} },
+        .taskType = if (options.task_encoding == .task_type) options.task_type else @as(?[]const u8, null),
+        .outputDimensionality = options.dimensions,
+    }, .{ .emit_null_optional_fields = false });
+    defer alloc.free(body);
+    var response = try http.post(url, .{ .attempt_observer = observer, .json = body, .headers = headers, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = control.cancellation });
+    defer response.deinit();
+    if (!response.ok()) return mapEmbeddingStatus(response.status.code);
+    const Response = struct { embedding: struct { values: []const f32 } };
+    var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const values = [_]@TypeOf(parsed.value.embedding){parsed.value.embedding};
+    return copyEmbeddingValues(alloc, &values);
+}
+
+fn taskPromptInput(alloc: Allocator, text: []const u8, task: []const u8) ![]u8 {
+    if (task.len == 0) return alloc.dupe(u8, text);
+    if (std.mem.eql(u8, task, "RETRIEVAL_DOCUMENT"))
+        return std.fmt.allocPrint(alloc, "title: none | text: {s}", .{text});
+    const instruction: []const u8 = if (std.mem.eql(u8, task, "RETRIEVAL_QUERY")) "search result" else if (std.mem.eql(u8, task, "QUESTION_ANSWERING")) "question answering" else if (std.mem.eql(u8, task, "FACT_VERIFICATION")) "fact checking" else if (std.mem.eql(u8, task, "CODE_RETRIEVAL_QUERY")) "code retrieval" else if (std.mem.eql(u8, task, "CLASSIFICATION")) "classification" else if (std.mem.eql(u8, task, "CLUSTERING")) "clustering" else if (std.mem.eql(u8, task, "SEMANTIC_SIMILARITY")) "sentence similarity" else return error.InvalidEmbeddingTaskType;
+    return std.fmt.allocPrint(alloc, "task: {s} | query: {s}", .{ instruction, text });
+}
+
+test "vertex gemini embedding 2 pairs document and query instructions" {
+    const alloc = std.testing.allocator;
+    const query = try taskPromptInput(alloc, "flight records", "RETRIEVAL_QUERY");
+    defer alloc.free(query);
+    const document = try taskPromptInput(alloc, "native page text", "RETRIEVAL_DOCUMENT");
+    defer alloc.free(document);
+    try std.testing.expectEqualStrings("task: search result | query: flight records", query);
+    try std.testing.expectEqualStrings("title: none | text: native page text", document);
+    try std.testing.expectEqual(@as(usize, 1), provider_defaults.vertexMaxEmbeddingBatchSize("projects/p/locations/global/publishers/google/models/gemini-embedding-2"));
+    try std.testing.expectError(error.InvalidEmbeddingTaskType, taskPromptInput(alloc, "text", "unknown"));
+}
+
 pub fn testEmbeddingStatusMapping() !void {
     try std.testing.expectEqual(error.Timeout, mapEmbeddingStatus(408));
     try std.testing.expectEqual(error.Timeout, mapEmbeddingStatus(504));
@@ -1112,6 +1266,8 @@ pub fn testGeminiEmbeddingBatchesOneInputPerRequest() !void {
             inputs: []const []const u8,
         ) std.Io.Cancelable!void {
             out.* = p.embedText(a, "gemini-embedding-001", inputs, .{
+                .request_format = .predict,
+                .task_encoding = .task_type,
                 .task_type = "RETRIEVAL_DOCUMENT",
                 .dimensions = 2,
             }) catch |err| {
@@ -1129,6 +1285,55 @@ pub fn testGeminiEmbeddingBatchesOneInputPerRequest() !void {
     try std.testing.expectEqual(@as(usize, 2), result.?.vectors.len);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.?.vectors[0]);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.?.vectors[1]);
+}
+
+test "vertex explicit embedContent supports future qualified models with ADC and output dimensions" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Assert = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer test-token", req.header("Authorization") orelse return error.MissingHeader);
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            try std.testing.expect(root.get("task_type") == null);
+            try std.testing.expect(root.get("instances") == null);
+            try std.testing.expectEqual(@as(i64, 2), root.get("outputDimensionality").?.integer);
+            const text = root.get("content").?.object.get("parts").?.array.items[0].object.get("text").?.string;
+            try std.testing.expect(std.mem.startsWith(u8, text, "title: none | text: "));
+        }
+    };
+    var server = try httpx.TestServer.start(alloc, io, &.{.{
+        .method = .POST,
+        .path = "/projects/proj/locations/global/publishers/google/models/future-embedding:embedContent",
+        .assert_request = Assert.request,
+        .respond = .{ .body = "{\"embedding\":{\"values\":[1,2]}}" },
+    }});
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var provider = try Provider.init(alloc, &client, .{ .base_url = server.baseUrl(), .project_id = "proj", .location = "global", .bearer_token = "test-token" });
+    defer provider.deinit();
+    var result: ?inference.EmbedResult = null;
+    defer if (result) |*value| value.deinit();
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(p: *Provider, out: *?inference.EmbedResult, failure: *?anyerror) std.Io.Cancelable!void {
+            out.* = p.embedText(std.testing.allocator, "projects/proj/locations/global/publishers/google/models/future-embedding", &.{"document"}, .{ .task_type = "RETRIEVAL_DOCUMENT", .request_format = .embed_content, .task_encoding = .prompt, .dimensions = 2 }) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ &provider, &result, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), result.?.vectors.len);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.?.vectors[0]);
 }
 
 test "vertex provider exchanges service account credentials and generates content" {
@@ -1617,4 +1822,102 @@ test "provider registry gateway Google retains thought usage alongside exact too
     try std.testing.expectEqual(@as(u64, 4), result.usage.?.output_tokens);
     try std.testing.expectEqual(@as(?u64, 6), result.usage.?.total_tokens);
     try std.testing.expect(std.mem.indexOf(u8, result.tool_calls[0].arguments, "1.0000000000000001") != null);
+}
+
+test "Google transport defaults preserve legacy catalogs and modern requests never aggregate records" {
+    try std.testing.expectEqual(RequestFormat.predict, try requestFormat("vertex", ""));
+    try std.testing.expectEqual(RequestFormat.batch_embed_contents, try requestFormat("gemini", ""));
+    try std.testing.expectEqual(TaskEncoding.task_type, try taskEncoding(.predict, ""));
+    try std.testing.expectEqual(TaskEncoding.prompt, try taskEncoding(.embed_content, ""));
+    try std.testing.expectEqual(@as(usize, 1), maxEmbeddingBatchSize(.embed_content, "unknown-future-model", null));
+    try std.testing.expectEqual(@as(usize, 1), maxEmbeddingBatchSize(.embed_content, "text-embedding-005", 100));
+    try std.testing.expectEqual(@as(usize, 250), maxEmbeddingBatchSize(.predict, "text-embedding-005", null));
+    try std.testing.expectEqual(@as(usize, 2), maxEmbeddingBatchSize(.predict, "text-embedding-005", 2));
+    try std.testing.expectEqual(@as(usize, 1), maxEmbeddingBatchSize(.predict, "unknown-future-model", null));
+    try std.testing.expectError(error.InvalidEmbedderConfig, requestFormat("vertex", "batch_embed_contents"));
+    const raw = try embeddingInput(std.testing.allocator, "document", .{ .task_type = "RETRIEVAL_DOCUMENT", .task_encoding = .none });
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqualStrings("document", raw);
+}
+
+fn testGeminiEmbeddingTransport(comptime format: RequestFormat, comptime encoding: TaskEncoding, comptime status: u16) !void {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Assert = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("gemini-key", req.header("x-goog-api-key").?);
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            if (format == .batch_embed_contents) {
+                const requests = parsed.value.object.get("requests").?.array.items;
+                try std.testing.expectEqual(@as(usize, 2), requests.len);
+                try std.testing.expectEqualStrings("document one", requests[0].object.get("content").?.object.get("parts").?.array.items[0].object.get("text").?.string);
+                try std.testing.expectEqualStrings("document two", requests[1].object.get("content").?.object.get("parts").?.array.items[0].object.get("text").?.string);
+            }
+            const payload = if (format == .embed_content) parsed.value.object else parsed.value.object.get("requests").?.array.items[0].object;
+            const parts = payload.get("content").?.object.get("parts").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), parts.len);
+            const text = parts[0].object.get("text").?.string;
+            if (encoding == .prompt) {
+                try std.testing.expect(std.mem.startsWith(u8, text, "title: none | text: "));
+            } else try std.testing.expect(std.mem.startsWith(u8, text, "document"));
+            if (encoding == .task_type) {
+                try std.testing.expectEqualStrings("RETRIEVAL_DOCUMENT", payload.get("taskType").?.string);
+            } else try std.testing.expect(payload.get("taskType") == null);
+            try std.testing.expectEqual(@as(i64, 2), payload.get("outputDimensionality").?.integer);
+        }
+    };
+    const path = if (format == .embed_content) "/models/future-model:embedContent" else "/models/future-model:batchEmbedContents";
+    const body = if (format == .embed_content) "{\"embedding\":{\"values\":[1,2]}}" else "{\"embeddings\":[{\"values\":[1,2]},{\"values\":[3,4]}]}";
+    const fixture = httpx.testing_mod.Route{ .method = .POST, .path = path, .assert_request = Assert.request, .respond = .{ .status = status, .body = body } };
+    var server = try httpx.TestServer.start(alloc, io, &.{ fixture, fixture });
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    var provider = try GeminiProvider.init(alloc, &client, .{ .base_url = server.baseUrl(), .api_key = "gemini-key" });
+    defer provider.deinit();
+    var result: ?inference.EmbedResult = null;
+    defer if (result) |*value| value.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(p: *GeminiProvider, out: *?inference.EmbedResult, err: *?anyerror) std.Io.Cancelable!void {
+            out.* = p.embedText(std.testing.allocator, "models/future-model", &.{ "document one", "document two" }, .{
+                .task_type = "RETRIEVAL_DOCUMENT",
+                .request_format = format,
+                .task_encoding = encoding,
+                .dimensions = 2,
+            }) catch |value| {
+                err.* = value;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ &provider, &result, &failure }) catch return;
+    try server.handleOne();
+    if (format == .embed_content and status == 200) try server.handleOne();
+    group.await(io) catch {};
+    if (status != 200) {
+        try std.testing.expectEqual(mapEmbeddingStatus(status), failure.?);
+        try std.testing.expect(result == null);
+    } else {
+        if (failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 2), result.?.vectors.len);
+        try std.testing.expectEqual(@as(usize, 2), result.?.dimension);
+    }
+}
+
+test "gemini modern transport preserves independent records and explicit task representations" {
+    try testGeminiEmbeddingTransport(.embed_content, .prompt, 200);
+    try testGeminiEmbeddingTransport(.embed_content, .task_type, 200);
+    try testGeminiEmbeddingTransport(.embed_content, .none, 200);
+    try testGeminiEmbeddingTransport(.batch_embed_contents, .task_type, 200);
+}
+
+test "gemini modern transport fails without protocol fallback" {
+    try testGeminiEmbeddingTransport(.embed_content, .prompt, 404);
+    try testGeminiEmbeddingTransport(.embed_content, .prompt, 401);
+    try testGeminiEmbeddingTransport(.embed_content, .prompt, 429);
 }

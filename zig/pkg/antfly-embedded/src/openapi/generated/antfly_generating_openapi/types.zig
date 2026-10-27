@@ -78,11 +78,14 @@ pub const AntflyGeneratorConfig = struct {
 
 /// Configuration for the Anthropic generative AI provider.
 pub const AnthropicGeneratorConfig = struct {
+    provider: []const u8,
+    /// Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
+    workspace_id: ?[]const u8 = null,
     /// The full model ID of the Anthropic model to use.
     model: []const u8,
-    /// The Anthropic API key.
+    /// Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY.
     api_key: ?[]const u8 = null,
-    /// The URL of the Anthropic API endpoint.
+    /// Messages API base URL. Defaults to https://api.anthropic.com/v1.
     url: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-1.0).
     temperature: ?f32 = null,
@@ -95,6 +98,8 @@ pub const AnthropicGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "workspace_id", "workspace_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
         .{ "url", "url", true },
@@ -114,6 +119,12 @@ pub const AnthropicGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.workspace_id) |value| {
+            try jw.objectField("workspace_id");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.api_key) |value| {
@@ -183,11 +194,16 @@ pub const AppleGeneratorConfig = struct {
     }
 };
 
-/// Configuration for the AWS Bedrock generative AI provider.
+/// AWS Bedrock Converse generation, including image inputs and tools for models that support them. Uses the AWS default credential chain unless an explicit Bedrock API key is configured. Image capability is declared per target through inference_capabilities; model IDs are not allowlisted.
 pub const BedrockGeneratorConfig = struct {
+    provider: []const u8,
+    /// Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint.
+    url: ?[]const u8 = null,
+    /// Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests and the default credential chain.
+    api_key: ?[]const u8 = null,
     /// The Bedrock model ID to use.
     model: []const u8,
-    /// The AWS region for the Bedrock service.
+    /// AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
     region: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-1.0).
     temperature: ?f32 = null,
@@ -195,17 +211,17 @@ pub const BedrockGeneratorConfig = struct {
     max_tokens: ?i64 = null,
     /// Nucleus sampling parameter.
     top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
         .{ "model", "model", false },
         .{ "region", "region", true },
         .{ "temperature", "temperature", true },
         .{ "max_tokens", "max_tokens", true },
         .{ "top_p", "top_p", true },
-        .{ "top_k", "top_k", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -218,6 +234,16 @@ pub const BedrockGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.region) |value| {
@@ -234,10 +260,6 @@ pub const BedrockGeneratorConfig = struct {
         }
         if (self.top_p) |value| {
             try jw.objectField("top_p");
-            try jw.write(value);
-        }
-        if (self.top_k) |value| {
-            try jw.objectField("top_k");
             try jw.write(value);
         }
         try jw.endObject();
@@ -357,6 +379,8 @@ pub const ChatGPTGeneratorConfig = struct {
 
 /// OpenAI-compatible message in a generation/chat conversation.
 pub const ChatMessage = struct {
+    /// Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: ChatMessageRole,
     content: ?ChatMessageContent = null,
     /// Tool calls made by the assistant (only for role=assistant).
@@ -368,6 +392,7 @@ pub const ChatMessage = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", true },
         .{ "tool_calls", "tool_calls", true },
@@ -385,6 +410,10 @@ pub const ChatMessage = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         if (self.content) |value| {
@@ -439,6 +468,89 @@ pub const ChatMessageRole = enum {
             .{ "tool", .tool },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+pub const CloudflareGeneratorConfig = struct {
+    provider: []const u8,
+    account_id: []const u8,
+    /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
+    gateway_id: ?[]const u8 = null,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned endpoint override.
+    url: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "account_id", "account_id", false },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "frequency_penalty", "frequency_penalty", true },
+        .{ "presence_penalty", "presence_penalty", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("account_id");
+        try jw.write(self.account_id);
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -750,26 +862,30 @@ pub const ContentPart = union(enum) {
 /// A unified configuration for a generative AI provider.
 pub const GeneratorConfig = struct {
     provider: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
+    gateway_id: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned endpoint override.
+    url: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
     /// The Google Cloud project ID.
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1').
     location: ?[]const u8 = null,
-    /// The name of the generative model to use.
-    model: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
     /// Top-k sampling parameter.
     top_k: ?i64 = null,
-    /// The Google API key.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint.
-    url: ?[]const u8 = null,
     /// Path to service account JSON key file.
     credentials_path: ?[]const u8 = null,
+    /// AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
+    region: ?[]const u8 = null,
+    /// Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
+    workspace_id: ?[]const u8 = null,
     /// HTTP response timeout in seconds for Ollama API calls.
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -779,32 +895,35 @@ pub const GeneratorConfig = struct {
     connection_id: ?[]const u8 = null,
     /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
     max_completion_tokens: ?i64 = null,
-    /// Penalty for token frequency (-2.0 to 2.0).
-    frequency_penalty: ?f32 = null,
-    /// Penalty for token presence (-2.0 to 2.0).
-    presence_penalty: ?f32 = null,
+    /// Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
+    max_image_input_tokens: ?i64 = null,
     rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", true },
-        .{ "project_id", "project_id", true },
-        .{ "location", "location", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", true },
-        .{ "temperature", "temperature", true },
-        .{ "max_tokens", "max_tokens", true },
-        .{ "top_p", "top_p", true },
-        .{ "top_k", "top_k", true },
         .{ "api_key", "api_key", true },
         .{ "url", "url", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "frequency_penalty", "frequency_penalty", true },
+        .{ "presence_penalty", "presence_penalty", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "top_k", "top_k", true },
         .{ "credentials_path", "credentials_path", true },
+        .{ "region", "region", true },
+        .{ "workspace_id", "workspace_id", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
         .{ "reasoning_effort", "reasoning_effort", true },
         .{ "connection_id", "connection_id", true },
         .{ "max_completion_tokens", "max_completion_tokens", true },
-        .{ "frequency_penalty", "frequency_penalty", true },
-        .{ "presence_penalty", "presence_penalty", true },
+        .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "rate_limit", "rate_limit", false },
     };
 
@@ -822,32 +941,16 @@ pub const GeneratorConfig = struct {
             try jw.objectField("provider");
             try jw.write(value);
         }
-        if (self.project_id) |value| {
-            try jw.objectField("project_id");
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
             try jw.write(value);
         }
-        if (self.location) |value| {
-            try jw.objectField("location");
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
             try jw.write(value);
         }
         if (self.model) |value| {
             try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.temperature) |value| {
-            try jw.objectField("temperature");
-            try jw.write(value);
-        }
-        if (self.max_tokens) |value| {
-            try jw.objectField("max_tokens");
-            try jw.write(value);
-        }
-        if (self.top_p) |value| {
-            try jw.objectField("top_p");
-            try jw.write(value);
-        }
-        if (self.top_k) |value| {
-            try jw.objectField("top_k");
             try jw.write(value);
         }
         if (self.api_key) |value| {
@@ -858,8 +961,48 @@ pub const GeneratorConfig = struct {
             try jw.objectField("url");
             try jw.write(value);
         }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.workspace_id) |value| {
+            try jw.objectField("workspace_id");
             try jw.write(value);
         }
         if (self.timeout) |value| {
@@ -882,12 +1025,8 @@ pub const GeneratorConfig = struct {
             try jw.objectField("max_completion_tokens");
             try jw.write(value);
         }
-        if (self.frequency_penalty) |value| {
-            try jw.objectField("frequency_penalty");
-            try jw.write(value);
-        }
-        if (self.presence_penalty) |value| {
-            try jw.objectField("presence_penalty");
+        if (self.max_image_input_tokens) |value| {
+            try jw.objectField("max_image_input_tokens");
             try jw.write(value);
         }
         if (self.rate_limit) |value| {
@@ -903,8 +1042,11 @@ pub const GeneratorConfig = struct {
 
 /// Generator providers implemented by Antfly's generation runtime.
 pub const GeneratorProvider = enum {
+    cloudflare,
     gemini,
     vertex,
+    bedrock,
+    anthropic,
     ollama,
     openai,
     chatgpt,
@@ -914,8 +1056,11 @@ pub const GeneratorProvider = enum {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .cloudflare => "cloudflare",
             .gemini => "gemini",
             .vertex => "vertex",
+            .bedrock => "bedrock",
+            .anthropic => "anthropic",
             .ollama => "ollama",
             .openai => "openai",
             .chatgpt => "chatgpt",
@@ -932,8 +1077,11 @@ pub const GeneratorProvider = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cloudflare", .cloudflare },
             .{ "gemini", .gemini },
             .{ "vertex", .vertex },
+            .{ "bedrock", .bedrock },
+            .{ "anthropic", .anthropic },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
             .{ "chatgpt", .chatgpt },
@@ -1433,6 +1581,39 @@ pub const ToolCall = struct {
     id: []const u8,
     type: []const u8,
     function: ToolCallFunction,
+    /// Opaque provider tool metadata, including Google thought signatures. Preserve it unchanged when replaying assistant tool calls.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "type", "type", false },
+        .{ "function", "function", false },
+        .{ "extra_content", "extra_content", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("function");
+        try jw.write(self.function);
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The function called by a model tool call.

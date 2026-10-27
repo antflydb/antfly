@@ -86,11 +86,21 @@ pub fn create(b: *std.Build) ?Artifacts {
     defer @import("antfly_platform").finalizeMacosSdk(b);
     defer @import("build_support/embedded/source_owner.zig").finalize(b);
     const shared = @import("build_support/antfly/dependencies.zig").create(b, @This()) orelse return null;
+    @import("build_support/antfly/test_partitions.zig").setMemoryProfile(b, .{
+        .native_darwin_cpu_debug = shared.native_cpu_debug_test_profile,
+    });
     const api_bench_standalone = shared.api_bench_standalone;
     const conformance_fetch = shared.conformance_fetch;
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
+    const memory_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/memory_policy_test_root.zig"),
+        .imports = &.{.{ .name = "antfly_resolver", .module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/resolver/src/memory_contract.zig"), .target = target, .optimize = optimize }) }},
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("memory-test", "Run native memory policy, temporal, isolation and replay contracts").dependOn(&b.addRunArtifact(memory_tests).step);
     @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
     @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);
     const vopr_mod = shared.vopr_mod;
@@ -444,7 +454,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = &.{ "request gate", "request watchdog", "request task admission", "request cancellation before socket publication", "successful H1 requests do not wait" },
+        .filters = &.{ "admitted transport", "request gate", "request watchdog", "request task admission", "request cancellation before socket publication", "successful H1 requests do not wait" },
     });
     const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
     b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);
@@ -478,10 +488,24 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_structured_tests = b.addRunArtifact(structured_tests);
     b.step("lib-structured-test", "Run constrained output, evidence and generated extraction tests").dependOn(&run_structured_tests.step);
     const decisions_test_module = b.createModule(.{ .root_source_file = b.path("lib/decisions/root.zig"), .target = target, .optimize = optimize });
+    decisions_test_module.addImport("antfly_cloudflare", b.modules.get("antfly_cloudflare").?);
     decisions_test_module.addImport("antfly_structured", b.modules.get("antfly_structured").?);
-    const decisions_tests = b.addTest(.{ .root_module = decisions_test_module });
-    const run_decisions_tests = b.addRunArtifact(decisions_tests);
+    const decisions_tests = b.addTest(.{
+        .root_module = decisions_test_module,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_decisions_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, decisions_tests);
+    // Grep owns the standalone shared evidence wire tests in the aggregate.
+    // The focused decisions target retains its complete imported inventory.
+    const run_decisions_unit_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, decisions_tests);
+    run_decisions_unit_tests.addArgs(&.{ "--skip-test-filter", "^evidence.test." });
     b.step("lib-decisions-test", "Run shared decision wire and generated contract tests").dependOn(&run_decisions_tests.step);
+
+    const cloudflare_test_module = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/root.zig"), .target = target, .optimize = optimize });
+    var cloudflare_imports = b.modules.get("antfly_cloudflare").?.import_table.iterator();
+    while (cloudflare_imports.next()) |entry| cloudflare_test_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const cloudflare_tests = b.addTest(.{ .root_module = cloudflare_test_module });
+    b.step("lib-cloudflare-test", "Run Cloudflare wire and response validation tests").dependOn(&b.addRunArtifact(cloudflare_tests).step);
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -616,6 +640,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_mod = platform_mod,
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
+    const documents_tests = b.addTest(.{ .root_module = b.modules.get("antfly_documents").? });
+    const run_documents_tests = b.addRunArtifact(documents_tests);
+    b.step("lib-documents-test", "Run checked OOXML, DrawingML, slide and layout tests without inference").dependOn(&run_documents_tests.step);
     const pdf_integration = antfly_tests_build.createPdfIntegration(b, .{
         .root = b.path("pkg/antfly"),
         .fixture = b.path("lib/pdf/integration_fixture.zig"),
@@ -754,10 +781,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_test_mod = owner_tests.antfly_test_mod;
     const model_chunk_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "model aware media", "model chunk artifact" },
+        .filters = &.{ "model aware media", "model chunk artifact", "chunked dense", "ordered artifact inventory chunk vector callback" },
     });
     const model_chunk_step = b.step("antfly-media-chunking-test", "Qualify typed chunk provider ownership, artifact recipes and incomplete coverage");
     model_chunk_step.dependOn(&b.addRunArtifact(model_chunk_tests).step);
+    const output_recipe_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("lib/chunker/src/outputs.zig"), .target = target, .optimize = optimize }) });
+    model_chunk_step.dependOn(&b.addRunArtifact(output_recipe_tests).step);
     const chunk_capability_tests = b.addTest(.{
         .root_module = antfly_test_mod.import_table.get("antfly_inference_remote_capabilities").?,
         .filters = &.{"model aware media remote capability"},
@@ -811,6 +840,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&run_documents_tests.step);
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
     unit_test_step.dependOn(&run_exact_float_tests.step);
@@ -838,7 +868,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_lib_generating_tests.step);
     lib_test_step.dependOn(&run_structured_tests.step);
     lib_test_step.dependOn(&run_group_source_tests.step);
-    lib_test_step.dependOn(&run_decisions_tests.step);
+    lib_test_step.dependOn(&run_decisions_unit_tests.step);
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);
@@ -856,6 +886,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_png_tests.step);
     lib_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     lib_test_step.dependOn(&run_lib_pdf_tests.step);
+    lib_test_step.dependOn(&run_documents_tests.step);
     lib_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
     lib_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
     lib_test_step.dependOn(&run_lib_scraping_tests.step);

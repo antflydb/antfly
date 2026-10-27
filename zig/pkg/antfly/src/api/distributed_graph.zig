@@ -1587,37 +1587,63 @@ const GraphEdgesResponseJson = @import("antfly_local_sources").api_local_graph.G
 const jsonStringifyAlloc = @import("antfly_local_sources").api_local_graph.jsonStringifyAlloc;
 
 pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
-    if (req.graph_queries.len == 0) return false;
-    if (req.expand_strategy != null) return false;
+    return req.graph_queries.len > 0 and unsupportedCrossRangeDiagnostic(req) == null;
+}
+
+/// Capability probes stay pure. Only the admission path that actually rejects
+/// a request publishes the failing operation into its owning diagnostic sink.
+pub fn rejectUnsupportedCrossRange(req: db_mod.types.SearchRequest) !void {
+    if (unsupportedCrossRangeDiagnostic(req)) |diagnostic| {
+        graph_query_diagnostic.recordForRequest(req, diagnostic.operation, diagnostic.feature, diagnostic.reason);
+        return error.GraphQueryModeUnsupported;
+    }
+}
+
+fn unsupportedCrossRangeDiagnostic(req: db_mod.types.SearchRequest) ?graph_query_diagnostic.Diagnostic {
+    if (req.expand_strategy != null) return .{
+        .operation = "$request",
+        .feature = "expand_strategy",
+        .reason = .expand_strategy_not_supported,
+    };
 
     for (req.graph_queries) |graph_query| {
-        // Incoming projections are partitioned with their source-owned edge.
-        // Both traversal and edge-reader plans use exact batched reverse-index
-        // probes before fetching from positive source shards.
-        if (!graph_query.query.params.deduplicate) return false;
-        if (!supportsSelectorRef(req, graph_query.query.start_nodes)) return false;
-        if (graph_query.query.target_nodes) |target_nodes| {
-            if (!supportsSelectorRef(req, target_nodes)) return false;
-        }
-
-        switch (graph_query.query.query_type) {
-            .neighbors, .traverse => {
-                if (graph_query.query.params.weight_mode != .min_hops) return false;
-            },
-            .shortest_path => {
-                if (graph_query.query.target_nodes == null) return false;
-                if (graph_query.query.k > 1) return false;
-            },
-            .k_shortest_paths => {
-                if (graph_query.query.target_nodes == null) return false;
-                if (graph_query.query.k == 0) return false;
-            },
-            .pattern => {
-                if (graph_query.query.pattern.len == 0 and graph_query.query.match_pattern == null) return false;
-            },
-        }
+        const reason: ?graph_query_diagnostic.Reason = unsupportedCrossRangeQuery(req, graph_query.query);
+        if (reason) |value| return .{
+            .operation = graph_query.name,
+            .feature = graph_query_diagnostic.feature(graph_query.query),
+            .reason = value,
+        };
     }
-    return true;
+    return null;
+}
+
+fn unsupportedCrossRangeQuery(req: db_mod.types.SearchRequest, query: graph_query_mod.GraphQuery) ?graph_query_diagnostic.Reason {
+    // Incoming projections are partitioned with their source-owned edge.
+    // Both traversal and edge-reader plans use exact batched reverse-index
+    // probes before fetching from positive source shards.
+    if (!query.params.deduplicate) return .deduplicate_nodes_must_be_true;
+    if (!supportsSelectorRef(req, query.start_nodes)) return .start_selector_not_supported;
+    if (query.target_nodes) |target_nodes| {
+        if (!supportsSelectorRef(req, target_nodes)) return .target_selector_not_supported;
+    }
+
+    switch (query.query_type) {
+        .neighbors, .traverse => {
+            if (query.params.weight_mode != .min_hops) return .weight_mode_must_be_min_hops;
+        },
+        .shortest_path => {
+            if (query.target_nodes == null) return .target_required;
+            if (query.k > 1) return .k_must_equal_one;
+        },
+        .k_shortest_paths => {
+            if (query.target_nodes == null) return .target_required;
+            if (query.k == 0) return .k_must_be_positive;
+        },
+        .pattern => {
+            if (query.pattern.len == 0 and query.match_pattern == null) return .pattern_required;
+        },
+    }
+    return null;
 }
 
 pub fn requiresCompleteMatchAnchors(req: db_mod.types.SearchRequest) bool {
@@ -17197,7 +17223,9 @@ test "distributed graph metric post processing applies max results after filter 
 }
 
 test "distributed graph metric post processing applies max results after filter and order bounded canonical hydration" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     const FakeCatalog = struct {
         const tables = [_]metadata_table_manager.TableRecord{ .{
             .table_id = 7,
@@ -17269,6 +17297,8 @@ test "distributed graph metric post processing applies max results after filter 
         active: std.atomic.Value(u32) = .init(0),
         max_active: std.atomic.Value(u32) = .init(0),
         parallel_calls: std.atomic.Value(u32) = .init(0),
+        rendezvous_first_pair: bool = false,
+        first_pair_ready: std.Io.Event = .unset,
         port_calls: usize = 0,
         fail_batch: bool = false,
         cancellation: ?*std.atomic.Value(bool) = null,
@@ -17311,10 +17341,18 @@ test "distributed graph metric post processing applies max results after filter 
                 _ = state.active.fetchSub(1, .monotonic);
             };
             if (state.io_impl) |impl| {
-                _ = state.parallel_calls.fetchAdd(1, .monotonic);
+                const ordinal = state.parallel_calls.fetchAdd(1, .monotonic);
                 const current = state.active.fetchAdd(1, .monotonic) + 1;
                 state.updateMax(current);
-                try std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromNanoseconds(if (group == 11) 10 * std.time.ns_per_ms else std.time.ns_per_ms) }, impl.io());
+                if (state.rendezvous_first_pair and ordinal < 2) {
+                    if (ordinal == 1) state.first_pair_ready.set(impl.io());
+                    // Prove overlap before returning an error or cancellation;
+                    // scheduler timing must not decide whether two calls meet.
+                    try state.first_pair_ready.waitTimeout(impl.io(), .{ .duration = .{
+                        .raw = .fromSeconds(5),
+                        .clock = .awake,
+                    } });
+                }
             } else state.batch_edge_calls += 1;
             if (state.fail_batch and group == 22) return error.TopologyChanged;
             if (state.unsupported_batch) return error.GraphEdgesBatchUnsupported;
@@ -17485,7 +17523,7 @@ test "distributed graph metric post processing applies max results after filter 
         const delivered_bytes = baseline_work.retained_state_bytes;
         for (0..6) |mode| {
             var canceled: std.atomic.Value(bool) = .init(false);
-            var fixture = TestState{ .graph = &graph, .io_impl = &impl, .batch_edge_cap = if (mode == 5) 1 else null, .unsupported_batch = mode == 1, .fail_batch = mode == 2, .cancellation = if (mode == 4) &canceled else null };
+            var fixture = TestState{ .graph = &graph, .io_impl = &impl, .rendezvous_first_pair = mode != 3, .batch_edge_cap = if (mode == 5) 1 else null, .unsupported_batch = mode == 1, .fail_batch = mode == 2, .cancellation = if (mode == 4) &canceled else null };
             var work = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = if (mode == 3) 128 else graph_pattern_mod.default_max_explored_edges });
             {
                 var gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);

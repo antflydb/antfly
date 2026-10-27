@@ -61,6 +61,13 @@ const help =
     \\      --engine ENGINE       default, pcre2, auto
     \\  -z, --search-zip           Native streaming compressed-file search
     \\      --dictionary PATH     Brotli/LZ4/Zstandard external dictionary
+    \\      --source-endpoint URL Discover sources from an ordinary Antfly catalog table
+    \\      --source-table TABLE  Catalog table (default: antfly_sources)
+    \\      --source-principal ID Additional local reader identity (repeatable)
+    \\      --source-catalog FILE Portable source profile (no Cloud dependency)
+    \\      --cloud              Search authorized sources from antfly-cloud login
+    \\      --source NAME        Select connected source alias/ID (repeatable)
+    \\      --cloud-cli PATH     Cloud CLI executable (default antfly-cloud)
     \\      --table-config PATH  Versioned Antfly table connection JSON
     \\      --table NAME         Select a configured table (repeatable)
     \\      --table-filter JSON  Server-side structured filter
@@ -125,15 +132,19 @@ const help =
     \\
 ;
 pub fn main(init: std.process.Init) void {
-    const code = run(init) catch |err| {
+    std.process.exit(runMain(init));
+}
+
+/// Shared entry point for the CLI and its ownership-checking integration driver.
+pub fn runMain(init: std.process.Init) u8 {
+    return run(init) catch |err| {
         if (err != error.BrokenPipe) {
             std.debug.print("antfly-grep: {s} (see --help)\n", .{@errorName(err)});
             if (err == error.JevRequiresAntflyGateway) std.debug.print("Configure Jev as an Antfly gateway decider; use --provider antfly --model deciders/NAME.\n", .{});
             if (err == error.UseEnvironmentCredential) std.debug.print("Export OPENAI_API_KEY, ANTFLY_API_KEY, or ANTFLY_GREP_TOKEN; auth saves a profile without tokens.\n", .{});
         }
-        std.process.exit(if (err == error.BrokenPipe) 0 else 2);
+        return if (err == error.BrokenPipe) 0 else 2;
     };
-    std.process.exit(code);
 }
 fn run(init: std.process.Init) !u8 {
     const a = init.gpa;
@@ -201,6 +212,25 @@ fn run(init: std.process.Init) !u8 {
         try configured.appendSlice(a, args.items[1..]);
     } else try configured.appendSlice(a, args.items);
     try o.parse(a, configured.items);
+    if (workspace_service and o.indexed()) return error.UnsupportedIndexedWorkspace;
+    var cloud_session: ?grep.cloud.Session = null;
+    defer if (cloud_session) |*session| session.deinit();
+    if (o.cloud and !o.help and !o.version and o.generate == null) {
+        cloud_session = try grep.cloud.Session.init(a, init.io, o.cloud_cli);
+        const session = &cloud_session.?;
+        o.cloud_session = session;
+        o.table_token = session.token();
+        o.table_config_json = try session.discover(persistent, o.timeout_ms);
+    }
+
+    if (!o.help and !o.version and o.generate == null) if (o.source_catalog) |path| {
+        o.table_config_json = try grep.catalog.load(persistent, init.io, path);
+    };
+
+    if (!o.help and !o.version and o.generate == null) if (o.source_endpoint) |endpoint| {
+        o.table_config_json = try grep.catalog.discover(persistent, init.io, endpoint, o.source_table, o.table_token, o.source_principals.items, o.timeout_ms);
+    };
+
     inline for (.{ "types", "types_not" }) |field| for (@field(o, field).items) |name| if (!grep.filetypes.known(&o, name)) return error.UnknownFileType;
     if (o.type_list) {
         var names: std.ArrayList([]const u8) = .empty;

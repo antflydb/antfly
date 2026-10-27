@@ -19,6 +19,7 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
+#include "metal_compile_options.h"
 // Use libdispatch's exported implementation: the SDK inline fast path's
 // completion-state assumption trips Zig 0.17's C sanitizer on macOS.
 #undef dispatch_once
@@ -358,6 +359,15 @@ static BOOL termite_metal_env_bool_default(const char *env_name, BOOL default_va
 
 static BOOL termite_metal_qualified_m4_feature_enabled(const char *env_name) {
     return termite_metal_env_bool_default(env_name, termite_metal_qualified_m4_device_default() != 0);
+}
+
+// The serving preset changes execution policy only. Explicit per-feature
+// values (including false) always win, and other hardware keeps its defaults.
+static BOOL termite_metal_lightonocr3_profile_feature_enabled(const char *name) {
+    const char *value = getenv(name);
+    if (value != NULL) return termite_metal_env_flag_enabled(value);
+    return termite_metal_env_flag_enabled(getenv("ANTFLY_LIGHTONOCR3_THROUGHPUT")) &&
+        termite_metal_qualified_m4_device_default() != 0;
 }
 
 static BOOL termite_metal_generated_quant_disabled(void) {
@@ -982,6 +992,123 @@ typedef struct termite_metal_planned_encoder_range {
 
 #include "metal_mtp_head.h"
 
+typedef enum termite_metal_frame_env_key {
+    TERMITE_METAL_FRAME_DISABLE_F16_ENCODER_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_DOWN_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_GEMV,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LARGE_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LOCAL_KERNELS,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PROJECTIONS,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_SMALL_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TAIL_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS,
+    TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS,
+    TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_PREFILL_INPUTS,
+    TERMITE_METAL_FRAME_LIGHTONOCR3_SMALL_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_PROJECTION_TILES,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PACK_REUSE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_DECODE_PACK_REUSE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_VISION_PACK_REUSE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PLANNED_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_64_ROW_TILE,
+    TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_LARGE_VISION_PACK_REUSE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARALLEL_NORM,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_NORM,
+    TERMITE_METAL_FRAME_DISABLE_QWEN35_CORE_BATCH,
+    TERMITE_METAL_FRAME_DISABLE_QWEN35_CORE_PARALLEL_NORM,
+    TERMITE_METAL_FRAME_DISABLE_QWEN35_PREFILL_CONV_VEC4,
+    TERMITE_METAL_FRAME_DISABLE_QWEN35_FUSED_DECODE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL,
+    TERMITE_METAL_FRAME_TRACE_LIGHTONOCR3_RECURRENT_PARALLEL,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_GATE_UP,
+    TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_FULL64_GATE_UP,
+    TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_WIDE64_GATE_UP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_GATE_UP,
+    TERMITE_METAL_FRAME_DISABLE_QWEN35_PREFILL_COLUMNS,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_CORE_NORM,
+    TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL,
+    TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_WIDE_RECURRENT,
+    TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING,
+    TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_PREFILL_CORE_NORM,
+    TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_PREFILL_FFN,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_FFN,
+    TERMITE_METAL_FRAME_ENV_COUNT
+} termite_metal_frame_env_key;
+
+static const char *const termite_metal_frame_env_names[TERMITE_METAL_FRAME_ENV_COUNT] = {
+    "TERMITE_METAL_DISABLE_F16_ENCODER_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_GEMV",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_LARGE_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_SMALL_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_TAIL_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS",
+    "TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS",
+    "TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS",
+    "TERMITE_METAL_LIGHTONOCR3_SMALL_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_WIDE_PROJECTION_TILES",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_WIDE_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PACK_REUSE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_DECODE_PACK_REUSE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_VISION_PACK_REUSE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PLANNED_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_64_ROW_TILE",
+    "TERMITE_METAL_ENABLE_LIGHTONOCR3_LARGE_VISION_PACK_REUSE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PARALLEL_NORM",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_NORM",
+    "TERMITE_METAL_DISABLE_QWEN35_CORE_BATCH",
+    "TERMITE_METAL_DISABLE_QWEN35_CORE_PARALLEL_NORM",
+    "TERMITE_METAL_DISABLE_QWEN35_PREFILL_CONV_VEC4",
+    "TERMITE_METAL_DISABLE_QWEN35_FUSED_DECODE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL",
+    "TERMITE_METAL_TRACE_LIGHTONOCR3_RECURRENT_PARALLEL",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_GATE_UP",
+    "TERMITE_METAL_ENABLE_LIGHTONOCR3_FULL64_GATE_UP",
+    "TERMITE_METAL_ENABLE_LIGHTONOCR3_WIDE64_GATE_UP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_WIDE_GATE_UP",
+    "TERMITE_METAL_DISABLE_QWEN35_PREFILL_COLUMNS",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_CORE_NORM",
+    "TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL",
+    "TERMITE_METAL_ENABLE_LIGHTONOCR3_WIDE_RECURRENT",
+    "TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING",
+    "TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_CORE_NORM",
+    "TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_FFN",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_FFN",
+};
+_Static_assert(TERMITE_METAL_FRAME_ENV_COUNT <= 64, "Frame policy bitset capacity");
+
+struct termite_metal_lighton_attention_batch;
+static void termite_metal_lighton_attention_batch_abort(struct termite_metal_decode_runtime *runtime);
+
+typedef struct {
+    void *buffer;
+    size_t begin, end;
+    uint16_t next;
+    bool write;
+} termite_metal_core_access_interval;
 typedef struct termite_metal_decode_runtime {
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
@@ -1039,6 +1166,52 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> q8_1_cpy_f32_to_q_pipeline;
     id<MTLComputePipelineState> rope_pipeline;
     id<MTLComputePipelineState> mrope_pipeline;
+    id<MTLComputePipelineState> qwen35_conv_pipeline;
+    id<MTLComputePipelineState> qwen35_prefill_conv_vec4_pipeline;
+    id<MTLComputePipelineState> qwen35_history_pipeline;
+    id<MTLComputePipelineState> qwen35_prepare_pipeline;
+    id<MTLComputePipelineState> qwen35_recurrent_pipeline;
+    id<MTLComputePipelineState> qwen35_recurrent_columns4_pipeline;
+    id<MTLComputePipelineState> qwen35_recurrent_decode_pipeline;
+    id<MTLComputePipelineState> qwen35_fused_decode_pipeline;
+    id<MTLComputePipelineState> lightonocr3_copy_pipeline;
+    uint64_t lightonocr3_copy_dispatches;
+    id<MTLComputePipelineState> lightonocr3_recurrent_parallel_pipeline;
+    id<MTLComputePipelineState> lightonocr3_prefill_prepare_pipeline;
+    id<MTLComputePipelineState> lightonocr3_prefill_norm_pipeline;
+    uint64_t lightonocr3_prefill_norm_dispatches;
+    uint64_t lightonocr3_short_prefill_norm_dispatches;
+    uint64_t lightonocr3_short_direct_attention_dispatches;
+    id<MTLComputePipelineState> lightonocr3_prefill_attention_mpp_pipeline;
+    id<MTLComputePipelineState> lightonocr3_prefill_attention_mpp32_pipeline;
+    id<MTLComputePipelineState> lightonocr3_prefill_attention_direct_pipeline;
+    uint64_t lightonocr3_prefill_attention_direct_dispatches;
+    uint64_t lightonocr3_prefill_attention_mpp_dispatches;
+    BOOL lightonocr3_recurrent_initialization_attempted;
+    uint64_t lightonocr3_recurrent_parallel_dispatches;
+    uint64_t lightonocr3_wide_recurrent_dispatches;
+    uint64_t lightonocr3_wide_recurrent_max_rows;
+    uint64_t lightonocr3_wide_recurrent_staged_bytes;
+    uint64_t lightonocr3_recurrent_parallel_traced_rows;
+    uint64_t lightonocr3_wide_projection_tile_calls;
+    uint64_t lightonocr3_wide_mpp_projection_calls;
+    uint64_t lightonocr3_wide_mpp_head_calls;
+    uint64_t lightonocr3_standalone_wide_head_calls;
+    uint64_t argmax_on_frame_calls;
+    id<MTLComputePipelineState> qwen35_prepare_parallel_pipeline;
+    id<MTLComputePipelineState> qwen35_norm_parallel_pipeline;
+    id<MTLComputePipelineState> qwen35_norm_pipeline;
+    bool qwen35_core_batch_active;
+    size_t qwen35_core_batch_expected;
+    size_t qwen35_core_batch_count;
+    void *qwen35_core_batch_handles[64][15];
+    size_t qwen35_core_batch_offsets[64][15];
+    size_t qwen35_core_batch_bytes[64][15];
+    uint32_t qwen35_core_batch_params[64][6];
+    uint16_t qwen35_core_batch_interval_heads[2048];
+    termite_metal_core_access_interval qwen35_core_batch_intervals[64 * 15];
+    size_t qwen35_core_batch_interval_count;
+
     id<MTLComputePipelineState> vision_norm_rope_pipeline;
     id<MTLComputePipelineState> embedding_head_prepare_pipeline;
     id<MTLComputePipelineState> rotary_table_pipeline;
@@ -1060,6 +1233,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> attention_f32_dense_sg_q16_f16kv_hd128_pipeline;
     id<MTLComputePipelineState> attention_f32_dense_sg_q16_f16kv_gqa2_pipeline;
     id<MTLComputePipelineState> attention_paged_pipeline;
+    id<MTLComputePipelineState> selection_score_norm_pipeline;
+    id<MTLComputePipelineState> selection_score_reduce_pipeline;
     id<MTLComputePipelineState> attention_paged_prefill_sg_pipeline;
     id<MTLComputePipelineState> attention_paged_1x_pipeline;
     // Generated (descriptor-rendered) decode-1x paged attention candidate. Opt-in
@@ -1080,6 +1255,10 @@ typedef struct termite_metal_decode_runtime {
     // Gemma4's four query heads; stage 2 stably merges up to 32 context splits.
     id<MTLComputePipelineState> attention_decode_gqa_split_stage_pipeline;
     id<MTLComputePipelineState> attention_decode_gqa_split_reduce_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gqa_batch_stage_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gqa_batch_reduce_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gqa_split_stage_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gqa_split_reduce_pipeline;
     id<MTLBuffer> attention_decode_gqa_split_scratch_buffer;
     id<MTLBuffer> attention_decode_gqa_split_scratch_buffer_alt;
     size_t attention_decode_gqa_split_scratch_capacity;
@@ -1161,9 +1340,11 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> modernbert_training_attention_flash_dq_pipeline;
     id<MTLComputePipelineState> modernbert_training_attention_flash_dkdv_pipeline;
     id<MTLComputePipelineState> sdpa_f32_florence_window_hd32_pipeline;
+    id<MTLComputePipelineState> sdpa_f32_florence_window_parallel_pipeline;
     id<MTLComputePipelineState> florence_window_pack_f32_pipeline;
     id<MTLComputePipelineState> florence_window_unpack_f32_pipeline;
     id<MTLComputePipelineState> florence_channel_scores_f32_pipeline;
+    id<MTLComputePipelineState> florence_channel_scores_parallel_pipeline;
     id<MTLComputePipelineState> florence_channel_softmax_f32_pipeline;
     id<MTLComputePipelineState> florence_channel_apply_f32_pipeline;
     id<MTLComputePipelineState> disentangled_relative_attention_f32_pipeline;
@@ -1235,8 +1416,69 @@ typedef struct termite_metal_decode_runtime {
     // reduction avoids the eight threadgroup-wide barriers in the generic
     // reduce kernel. Kept behind TERMITE_METAL_ENABLE_A4B_PARALLEL_RMS_NORM.
     id<MTLComputePipelineState> rms_norm_rows_simd4_reduce_pipeline;
+    id<MTLComputePipelineState> lightonocr3_norm_cached1024_pipeline;
+    id<MTLComputePipelineState> lightonocr3_norm_cached2560_pipeline;
     // Model-scoped encoder policy, configured only under the provider lease.
     BOOL embeddinggemma2_rms_norm_enabled;
+    BOOL qwen35_ocr_vector_loads_enabled;
+    BOOL lightonocr3_projections_enabled;
+    bool lighton_vision_mpp_required;
+    // Immutable only while this frame is active; refresh on every begin so
+    // subsequent frame controls never inherit a process-global cached flag.
+    bool lighton_frame_policy_valid;
+    uint64_t lighton_frame_env_bits;
+    bool lighton_frame_access_profile;
+    bool lighton_frame_barriers_disabled;
+    uint64_t lighton_frame_policy_snapshots;
+    BOOL lightonocr3_mpp_initialization_attempted;
+    id<MTLComputePipelineState> lightonocr3_gemv_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gemv_rows2_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gate_up_gemv_pipeline;
+    id<MTLComputePipelineState> lightonocr3_pack_bf16_pipeline;
+    id<MTLComputePipelineState> lightonocr3_batch2_pipeline;
+    id<MTLComputePipelineState> lightonocr3_batch4_pipeline;
+    id<MTLComputePipelineState> lightonocr3_batch8_pipeline;
+    id<MTLComputePipelineState> lightonocr3_batch16_pipeline;
+    id<MTLComputePipelineState> lightonocr3_tiled_pipelines[17];
+    id<MTLComputePipelineState> lightonocr3_mpp_f32_pipeline;
+    id<MTLComputePipelineState> f16_encoder_mpp_pipeline;
+    id<MTLComputePipelineState> lightonocr3_mpp_small_tile_pipeline;
+    id<MTLComputePipelineState> lightonocr3_mpp_four_row_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gate_up_split16_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gate_up_split_reduce_pipeline;
+    id<MTLComputePipelineState> lightonocr3_local_gate_vectors[2];
+    id<MTLComputePipelineState> lightonocr3_local_projection_vectors[3];
+    id<MTLComputePipelineState> lightonocr3_local_down_vectors[2];
+    id<MTLComputePipelineState> lightonocr3_local_down_vector4;
+    id<MTLComputePipelineState> lightonocr3_recurrent_gate_vectors[2][8];
+    id<MTLComputePipelineState> lightonocr3_decode_chunks[4][4],lightonocr3_decode_tails[6][3];
+    id<MTLComputePipelineState> lightonocr3_local_gate_tg16, lightonocr3_local_gate_tg32;
+    id<MTLComputePipelineState> lightonocr3_prefill_gate8_16,lightonocr3_prefill_gate16_32;
+    id<MTLComputePipelineState> lightonocr3_vision_pack_pipeline, lightonocr3_vision_mpp_pipeline;
+    id<MTLBuffer> lightonocr3_vision_pack_buffers[2];
+    __weak id<MTLCommandBuffer> lightonocr3_vision_pack_owners[2];
+    uint64_t lightonocr3_vision_mpp_dispatches;
+    id<MTLComputePipelineState> lightonocr3_local_down_tg8, lightonocr3_local_down_tg16;
+    id<MTLComputePipelineState> lightonocr3_gate_up_small16_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gate_up_wide16_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gate_up_wide32_pipeline;
+    id<MTLComputePipelineState> lightonocr3_gate_up_wide64_pipeline;
+    uint64_t lightonocr3_wide_gate_up_calls;
+    uint64_t lightonocr3_full64_gate_up_calls;
+    uint64_t lighton_batch_argmax_calls;
+    uint64_t lighton_batch_argmax_rows;
+    id<MTLComputePipelineState> lightonocr3_wide_mpp_pipelines[3];
+    id<MTLComputePipelineState> lightonocr3_gate_up_small32_pipeline;
+    id<MTLComputePipelineState> lightonocr3_four_row_segment_pipeline;
+    id<MTLComputePipelineState> lightonocr3_down_split32_pipeline;
+    id<MTLComputePipelineState> lightonocr3_down_split64_pipeline;
+    id<MTLComputePipelineState> lightonocr3_down_split_reduce_pipeline;
+    id<MTLComputePipelineState> lightonocr3_mpp_f32_n32_pipeline;
+    id<MTLComputePipelineState> lightonocr3_mpp_bf16_pipeline;
+    id<MTLComputePipelineState> lighton_prefill_ffn_pipelines[2];
+    bool lighton_prefill_ffn_initialization_attempted;
+    uint64_t lighton_prefill_ffn_calls;
+    id<MTLComputePipelineState> lightonocr3_mpp_bf16_n32_pipeline;
     // Gemma 4 shared/routed/router branches normalize the same activation.
     // This specialization shares their SIMD4 denominator reduction.
     id<MTLComputePipelineState> rms_norm_rows_triple_simd4_reduce_pipeline;
@@ -1289,6 +1531,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> argmax_logits_partials_pipeline;
     id<MTLComputePipelineState> argmax_logits_suppress_partials_pipeline;
     id<MTLComputePipelineState> argmax_logits_reduce_pipeline;
+    id<MTLComputePipelineState> lighton_batch_argmax_partials_pipeline;
+    id<MTLComputePipelineState> lighton_batch_argmax_reduce_pipeline;
     id<MTLComputePipelineState> layer_norm_add_sum_pipeline;
     id<MTLComputePipelineState> whisper_logits_partials_pipeline;
     id<MTLComputePipelineState> whisper_logits_reduce_pipeline;
@@ -1714,6 +1958,13 @@ typedef struct termite_metal_decode_runtime {
     // allocations wired through Metal instead of relying on opportunistic OS
     // page-cache residency. The slot bitmap prevents duplicate allocations as
     // each layer lazily binds its three expert projections.
+    NSMutableArray *ocr_residency_sets;
+    NSMutableArray<NSNumber *> *ocr_residency_set_bytes;
+    NSMapTable *ocr_residency_placements;
+    id<MTLBuffer> ocr_residency_slots[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
+    size_t ocr_residency_total_bytes;
+    size_t ocr_residency_peak_bytes;
+    bool ocr_residency_failed;
     id mapped_moe_residency_set;
     // Residency sets retain the allocations themselves. This non-owning list
     // exists only to make addAllocation idempotent when tied weights are
@@ -1949,6 +2200,16 @@ typedef struct termite_metal_decode_runtime {
     uint64_t audio_linear_tunes;
     uint64_t audio_norm_clamp_launches;
     void **frame_reuse_pool;
+    // Read-epoch activation storage is separately admitted and bounded. A
+    // retained command-buffer fence prevents reuse across an unfinished frame.
+    id<MTLBuffer> lighton_activation_buffers[128];
+    id<MTLCommandBuffer> lighton_activation_fences[128];
+    size_t lighton_activation_charges[128];
+    size_t lighton_activation_limit, lighton_activation_bytes, lighton_activation_peak;
+    uint64_t lighton_activation_hits, lighton_activation_duplicate_retirements;
+    uint64_t lighton_activation_prefill_hits, lighton_activation_prefill_hit_bytes;
+    bool lighton_activation_prefill;
+    bool lighton_activation_capture_decode;
     size_t frame_reuse_pool_len;
     size_t frame_reuse_pool_cap;
     int buffer_reuse_enabled; // -1 uninit, else 0/1
@@ -2084,6 +2345,26 @@ typedef struct termite_metal_decode_runtime {
     uint64_t deberta_attention_gemm_fallbacks;
     uint64_t paged_attention_1x_calls;
     uint64_t decode_gqa_split_calls;
+    struct termite_metal_lighton_attention_batch *lighton_attention_batch;
+    id<MTLBuffer> lighton_attention_batch_scratch[2];
+    bool lighton_prefill_stream_pack_reuse;
+    uint64_t lighton_prefill_pack_calls;
+    uint64_t lighton_prefill_pack_reuse_hits;
+    uint64_t lighton_decode_pack_calls;
+    uint64_t lighton_decode_pack_reuse_hits;
+    uint64_t lighton_vision_pack_calls;
+    uint64_t lighton_vision_pack_reuse_hits;
+    uint64_t lighton_large_vision_pack_calls;
+    uint64_t lighton_large_vision_pack_reuse_hits;
+    BOOL lighton_vision_workspace_keep;
+    uint64_t lighton_vision_workspace_allocations;
+    uint64_t lighton_vision_workspace_reuses;
+    uint64_t lighton_mpp_planned_calls;
+    uint64_t lighton_mpp_dedicated_calls;
+    uint64_t lighton_attention_batch_kernel_calls;
+    uint64_t lighton_attention_batch_calls;
+    uint64_t lighton_attention_batch_rows;
+    uint64_t lightonocr3_gqa_split_calls;
     uint64_t decode_gqa_split_below_min_kv_calls;
     uint64_t decode_gqa_split_schedule_calls[TERMITE_METAL_DECODE_GQA_SPLIT_SHAPE_COUNT][TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_COUNT];
     uint64_t decode_gqa_split_schedule_fallback_calls;
@@ -2198,6 +2479,48 @@ typedef struct termite_metal_decode_runtime {
     uint64_t expert_subbuffer_cache_hits;
     uint64_t expert_subbuffer_cache_misses;
 } termite_metal_decode_runtime;
+
+static bool termite_metal_frame_env_resolve(termite_metal_frame_env_key key) {
+    const char *name = termite_metal_frame_env_names[key];
+    if (key == TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL ||
+        key == TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_PREFILL_CORE_NORM) {
+        const char *value = getenv(name);
+        return value == NULL || termite_metal_env_flag_enabled(value);
+    }
+    if (key == TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING)
+        return termite_metal_lightonocr3_profile_feature_enabled(name);
+    return termite_metal_env_flag_enabled(getenv(name));
+}
+
+static bool termite_metal_frame_env_enabled(
+    const termite_metal_decode_runtime *runtime, termite_metal_frame_env_key key
+) {
+    if (runtime != NULL && runtime->active_frame_cb != nil && runtime->lighton_frame_policy_valid)
+        return (runtime->lighton_frame_env_bits & (UINT64_C(1) << key)) != 0;
+    return termite_metal_frame_env_resolve(key);
+}
+
+static void termite_metal_snapshot_lighton_frame_policy(termite_metal_decode_runtime *runtime) {
+    runtime->lighton_frame_policy_valid = runtime->lightonocr3_projections_enabled &&
+        termite_metal_lightonocr3_profile_feature_enabled("TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY");
+    if (!runtime->lighton_frame_policy_valid) return;
+    uint64_t bits = 0;
+    for (unsigned key = 0; key < TERMITE_METAL_FRAME_ENV_COUNT; ++key)
+        if (termite_metal_frame_env_resolve(key))
+            bits |= UINT64_C(1) << key;
+    runtime->lighton_frame_env_bits = bits;
+    // Preserve these legacy switches' exact nonempty/nonzero semantics.
+    const char *profile = getenv("TERMITE_METAL_PLANNED_ACCESS_PROFILE");
+    runtime->lighton_frame_access_profile = profile != NULL && profile[0] != '\0' && strcmp(profile, "0") != 0;
+    const char *disabled = getenv("TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS");
+    runtime->lighton_frame_barriers_disabled = disabled != NULL && disabled[0] != '\0' && strcmp(disabled, "0") != 0;
+    runtime->lighton_frame_policy_snapshots += 1;
+}
+
+uint64_t termite_metal_decode_runtime_lighton_frame_policy_snapshots(const termite_metal_decode_runtime *runtime) {
+    return runtime == NULL ? 0 : runtime->lighton_frame_policy_snapshots;
+}
+
 
 // Generated-route env gates are resolved once per decode-runtime instance and
 // cached here: getenv is a linear scan of environ and these gates sit on the
@@ -2868,6 +3191,8 @@ static const char *termite_metal_compute_source_name(size_t source);
 static const char *termite_metal_compute_region_name(size_t region);
 static void termite_metal_maybe_trace_last_frame(termite_metal_decode_runtime *runtime);
 static const char *termite_metal_dense_linear_variant(bool use_bf16, bool use_shared_row_reduce, bool use_tiled32_m16, bool use_tiled32, bool use_tiled, bool use_reduce, bool activation_fused);
+static void termite_metal_ocr_residency_track(termite_metal_decode_runtime *r,size_t slot,id<MTLBuffer> buffer);
+static void termite_metal_ocr_residency_shutdown(termite_metal_decode_runtime *r);
 static void termite_metal_maybe_trace_dense_linear_dispatch(const char *site, size_t slot, size_t rows, size_t in_dim, size_t out_dim, const char *variant, bool active_frame, bool planned_encoder, bool packed_weight, bool activation_fused, bool mps);
 static int termite_metal_encode_q8_0_linear(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, int failure_code);
 static int termite_metal_encode_q8_0_linear_family(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, termite_metal_q8_0_linear_family_kind q8_family, int failure_code);
@@ -3269,6 +3594,7 @@ static void termite_metal_decode_runtime_close_planned_compute_encoder_for_trans
 
 void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t length, int storage_mode);
 void termite_metal_buffer_release(void *handle);
+void termite_metal_decode_runtime_release_buffer(termite_metal_decode_runtime *runtime, void *handle);
 void *termite_metal_buffer_contents(void *handle);
 int termite_metal_buffer_upload(
     termite_metal_decode_runtime *runtime,
@@ -4093,7 +4419,7 @@ void termite_metal_generated_pipeline_destroy(termite_metal_generated_pipeline *
 // kernels inside a coalesced Metal frame.  Keeping this below the generated
 // pipeline helpers avoids changing their microbenchmark dispatches; all model
 // execution call sites are below this point in the translation unit.
-#define TERMITE_METAL_DEBUG_DISPATCH_PROFILE_CAPACITY 512u
+#define TERMITE_METAL_DEBUG_DISPATCH_PROFILE_CAPACITY 4096u
 #define TERMITE_METAL_DEBUG_DISPATCH_PROFILE_LABEL_BYTES 160u
 
 typedef struct termite_metal_debug_dispatch_profile_entry {
@@ -4450,7 +4776,8 @@ static void termite_metal_encoder_timing_resolve(id<MTLCommandBuffer> cb) {
 // ordinary encoder (timing off, another frame still pending, or capacity).
 static id<MTLComputeCommandEncoder> termite_metal_encoder_timing_encoder(
     id<MTLDevice> device,
-    id<MTLCommandBuffer> command_buffer
+    id<MTLCommandBuffer> command_buffer,
+    bool concurrent
 ) {
     if (!termite_metal_encoder_timing_enabled() || device == nil || command_buffer == nil) return nil;
     if (termite_metal_encoder_timing_cb != command_buffer) {
@@ -4500,7 +4827,7 @@ static id<MTLComputeCommandEncoder> termite_metal_encoder_timing_encoder(
     }
     const uint32_t index = termite_metal_encoder_timing_intervals;
     MTLComputePassDescriptor *descriptor = [MTLComputePassDescriptor computePassDescriptor];
-    descriptor.dispatchType = MTLDispatchTypeSerial;
+    descriptor.dispatchType = concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
     MTLComputePassSampleBufferAttachmentDescriptor *attachment = descriptor.sampleBufferAttachments[0];
     const uint32_t local = index % TERMITE_METAL_ENCODER_TIMING_PER_BUFFER;
     attachment.sampleBuffer = termite_metal_encoder_timing_samples[index / TERMITE_METAL_ENCODER_TIMING_PER_BUFFER];
@@ -6109,6 +6436,7 @@ typedef struct termite_metal_paged_attention_params {
     uint32_t has_sinks;
     float softcap;
     uint32_t swa_scan_clamp;
+    uint32_t has_explicit_positions;
 } termite_metal_paged_attention_params;
 
 // Per-dispatch schedule data is deliberately separate from the stable paged
@@ -6121,7 +6449,7 @@ typedef struct termite_metal_decode_gqa_split_params {
     uint32_t reduce_simdgroups;
 } termite_metal_decode_gqa_split_params;
 
-_Static_assert(sizeof(termite_metal_paged_attention_params) == 80, "paged attention params ABI size drift");
+_Static_assert(sizeof(termite_metal_paged_attention_params) == 84, "paged attention params ABI size drift");
 _Static_assert(offsetof(termite_metal_paged_attention_params, q_len) == 0, "paged attention q_len ABI drift");
 _Static_assert(offsetof(termite_metal_paged_attention_params, kv_tokens) == 4, "paged attention kv_tokens ABI drift");
 _Static_assert(offsetof(termite_metal_paged_attention_params, num_heads) == 8, "paged attention num_heads ABI drift");
@@ -6142,6 +6470,7 @@ _Static_assert(offsetof(termite_metal_paged_attention_params, v_element_bytes) =
 _Static_assert(offsetof(termite_metal_paged_attention_params, has_sinks) == 68, "paged attention sinks ABI drift");
 _Static_assert(offsetof(termite_metal_paged_attention_params, softcap) == 72, "paged attention softcap ABI drift");
 _Static_assert(offsetof(termite_metal_paged_attention_params, swa_scan_clamp) == 76, "paged attention SWA scan clamp ABI drift");
+_Static_assert(offsetof(termite_metal_paged_attention_params, has_explicit_positions) == 80, "paged attention explicit positions ABI drift");
 _Static_assert(sizeof(termite_metal_decode_gqa_split_params) == 16, "decode GQA split params ABI size drift");
 _Static_assert(offsetof(termite_metal_decode_gqa_split_params, split_count) == 0, "decode GQA split count ABI drift");
 _Static_assert(offsetof(termite_metal_decode_gqa_split_params, max_splits) == 4, "decode GQA max splits ABI drift");
@@ -6718,6 +7047,882 @@ typedef struct termite_metal_conv2d_f32_params {
     uint32_t reserved0;
 } termite_metal_conv2d_f32_params;
 
+// Independent optional library: unsupported pointer-table/PSO compilation must
+// leave the existing recurrent implementation available. F32 state, products,
+// reductions and outputs; each SIMD group owns eight value columns and splits
+// the 128 keys across its lanes. One dispatch covers independent pages.
+static NSString *termite_metal_lightonocr3_recurrent_source(void) {
+    return @""
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "kernel void termite_lightonocr3_copy16(device const uint4 *x [[buffer(0)]], device uint4 *y [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) y[i] = x[i]; }\n"
+        "struct CoreParams {\n"
+        "    uint seq, key_heads, value_heads, dim, kernel_size, initialized;\n"
+        "};\n"
+        "struct CoreRow {\n"
+        "    device float *buffers[15];\n"
+        "    CoreParams params;\n"
+        "};\n"
+        "kernel void termite_lightonocr3_recurrent_parallel(constant CoreRow *rows [[buffer(0)]],\n"
+        "                                                   uint2 group [[threadgroup_position_in_grid]],\n"
+        "                                                   uint d [[thread_index_in_threadgroup]],\n"
+        "                                                   ushort lane [[thread_index_in_simdgroup]],\n"
+        "                                                   ushort simd [[simdgroup_index_in_threadgroup]]) {\n"
+        "    constant CoreRow &r = rows[group.y];\n"
+        "    constant CoreParams &p = r.params;\n"
+        "    uint h = group.x;\n"
+        "    device const float *mixed = r.buffers[0];\n"
+        "    device const float *weight = r.buffers[1];\n"
+        "    device const float *beta = r.buffers[2];\n"
+        "    device const float *a = r.buffers[3];\n"
+        "    device const float *alog = r.buffers[4];\n"
+        "    device const float *dt = r.buffers[5];\n"
+        "    device const float *history = r.buffers[6];\n"
+        "    device float *next = r.buffers[7];\n"
+        "    device float *state = r.buffers[8];\n"
+        "    device float *conv = r.buffers[9];\n"
+        "    device float *gates = r.buffers[10];\n"
+        "    device float *core = r.buffers[11];\n"
+        "    device const float *z = r.buffers[12];\n"
+        "    device const float *norm = r.buffers[13];\n"
+        "    device float *output = r.buffers[14];\n"
+        "\n"
+        "    threadgroup float q[128], k[128], values[128], reduction[64], scales[4];\n"
+        "    const uint TM = 8, SG = 128 / TM;\n"
+        "    uint ratio = p.value_heads / p.key_heads, kh = h / ratio;\n"
+        "    if (d < 128) {\n"
+        "        uint indices[3] = {kh * 128 + d, (p.key_heads + kh) * 128 + d, 2 * p.key_heads * 128 + h * 128 + d};\n"
+        "        float v[3];\n"
+        "        for (uint j = 0; j < 3; j++) {\n"
+        "            uint c = indices[j];\n"
+        "            float sum = 0;\n"
+        "            for (uint t = 0; t < 4; t++) {\n"
+        "                float x = t == 3 ? mixed[c] : (p.initialized ? history[c * 4 + t + 1] : 0.0f);\n"
+        "                sum += x * weight[c * 4 + t];\n"
+        "                if (j == 2 || h % ratio == 0)\n"
+        "                    next[c * 4 + t] = x;\n"
+        "            }\n"
+        "            v[j] = sum / (1.0f + exp(-sum));\n"
+        "        }\n"
+        "        float qs = simd_sum(v[0] * v[0]), ks = simd_sum(v[1] * v[1]);\n"
+        "        if (lane == 0) {\n"
+        "            reduction[simd] = qs;\n"
+        "            reduction[4 + simd] = ks;\n"
+        "        }\n"
+        "        q[d] = v[0];\n"
+        "        k[d] = v[1];\n"
+        "        values[d] = v[2];\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    if (d == 0) {\n"
+        "        float qs = 0, ks = 0;\n"
+        "        for (uint s = 0; s < 4; s++) {\n"
+        "            qs += reduction[s];\n"
+        "            ks += reduction[4 + s];\n"
+        "        }\n"
+        "        scales[0] = 1.0f / sqrt(qs + 1e-6f) / sqrt(128.0f);\n"
+        "        scales[1] = 1.0f / sqrt(ks + 1e-6f);\n"
+        "        float x = a[h] + dt[h], sp = x > 20.0f ? x : (x < -20.0f ? exp(x) : log(1.0f + exp(x)));\n"
+        "        scales[2] = exp(-exp(alog[h]) * sp);\n"
+        "        scales[3] = 1.0f / (1.0f + exp(-beta[h]));\n"
+        "        gates[h * 2] = scales[2];\n"
+        "        gates[h * 2 + 1] = scales[3];\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    if (d < 128) {\n"
+        "        q[d] *= scales[0];\n"
+        "        k[d] *= scales[1];\n"
+        "        if (h % ratio == 0) {\n"
+        "            conv[kh * 128 + d] = q[d];\n"
+        "            conv[(p.key_heads + kh) * 128 + d] = k[d];\n"
+        "        }\n"
+        "        conv[2 * p.key_heads * 128 + h * 128 + d] = values[d];\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    uint col = simd * TM;\n"
+        "    float4 memories[TM / 4], previous[4][TM / 4], outputs[TM / 4];\n"
+        "#pragma unroll\n"
+        "    for (uint t = 0; t < TM / 4; t++)\n"
+        "        memories[t] = 0;\n"
+        "#pragma unroll\n"
+        "    for (uint i = 0; i < 4; i++) {\n"
+        "        uint key = lane * 4 + i;\n"
+        "#pragma unroll\n"
+        "        for (uint t = 0; t < TM / 4; t++) {\n"
+        "            float4 v = p.initialized\n"
+        "                           ? *((device const float4 *)(state + h * 128 * 128 + key * 128 + col + t * 4))\n"
+        "                           : float4(0);\n"
+        "            previous[i][t] = v * scales[2];\n"
+        "            memories[t] += previous[i][t] * k[key];\n"
+        "        }\n"
+        "    }\n"
+        "#pragma unroll\n"
+        "    for (uint t = 0; t < TM / 4; t++) {\n"
+        "        float4 memory = float4(simd_sum(memories[t].x), simd_sum(memories[t].y), simd_sum(memories[t].z),\n"
+        "                               simd_sum(memories[t].w));\n"
+        "        float4 delta = (float4(values[col + t * 4], values[col + t * 4 + 1], values[col + t * 4 + 2],\n"
+        "                               values[col + t * 4 + 3]) -\n"
+        "                        memory) *\n"
+        "                       scales[3];\n"
+        "        outputs[t] = 0;\n"
+        "#pragma unroll\n"
+        "        for (uint i = 0; i < 4; i++) {\n"
+        "            uint key = lane * 4 + i;\n"
+        "            float4 v = previous[i][t] + k[key] * delta;\n"
+        "            *((device float4 *)(state + h * 128 * 128 + key * 128 + col + t * 4)) = v;\n"
+        "            outputs[t] += v * q[key];\n"
+        "        }\n"
+        "        outputs[t] = float4(simd_sum(outputs[t].x), simd_sum(outputs[t].y), simd_sum(outputs[t].z),\n"
+        "                            simd_sum(outputs[t].w));\n"
+        "    }\n"
+        "    if (lane == 0) {\n"
+        "        float sum = 0;\n"
+        "#pragma unroll\n"
+        "        for (uint t = 0; t < TM / 4; t++) {\n"
+        "            float4 v = outputs[t];\n"
+        "            sum += dot(v, v);\n"
+        "            *((device float4 *)(core + h * 128 + col + t * 4)) = v;\n"
+        "        }\n"
+        "        reduction[simd] = sum;\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    if (d == 0) {\n"
+        "        float sum = 0;\n"
+        "        for (uint s = 0; s < SG; s++)\n"
+        "            sum += reduction[s];\n"
+        "        scales[0] = 1.0f / sqrt(sum / 128.0f + 1e-6f);\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    if (lane == 0) {\n"
+        "#pragma unroll\n"
+        "        for (uint t = 0; t < TM / 4; t++) {\n"
+        "            float4 gate = *((device const float4 *)(z + h * 128 + col + t * 4)),\n"
+        "                   n = *((device const float4 *)(norm + col + t * 4));\n"
+        "            *((device float4 *)(output + h * 128 + col + t * 4)) =\n"
+        "                outputs[t] * scales[0] * n * (gate / (1.0f + exp(-gate)));\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "kernel void termite_lightonocr3_prefill_prepare_parallel(device const float *beta [[buffer(2)]], device const float *a [[buffer(3)]], device const float *alog [[buffer(4)]], device const float *dt [[buffer(5)]], device float *conv [[buffer(9)]], device float *gates [[buffer(10)]], constant CoreParams &p [[buffer(15)]], uint gid [[thread_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+        "    uint row=gid/32; if(row>=p.seq*p.value_heads)return;uint t=row/p.value_heads,h=row%p.value_heads;\n"
+        "    if(h<p.key_heads) {\n"
+        "        uint qb=t*(2*p.key_heads+p.value_heads)*p.dim+h*p.dim,kb=qb+p.key_heads*p.dim;\n"
+        "        float qs=0,ks=0;\n"
+        "        for(uint d=uint(lane);d<p.dim;d+=32){float q=conv[qb+d],k=conv[kb+d];qs+=q*q;ks+=k*k;}\n"
+        "        float qn=1.0f/sqrt(simd_sum(qs)+1e-6f)/sqrt(float(p.dim)),kn=1.0f/sqrt(simd_sum(ks)+1e-6f);\n"
+        "        for(uint d=uint(lane);d<p.dim;d+=32){conv[qb+d]*=qn;conv[kb+d]*=kn;}\n"
+        "    }\n"
+        "    if(lane==0) {\n"
+        "        float x=a[row]+dt[h];\n"
+        "        float sp=x>20.0f?x:(x< -20.0f?exp(x):log(1.0f+exp(x)));\n"
+        "        gates[row*2]=exp(-exp(alog[h])*sp);\n"
+        "        gates[row*2+1]=1.0f/(1.0f+exp(-beta[row]));\n"
+        "    }\n"
+        "}\n"
+        "kernel void termite_lightonocr3_prefill_norm_parallel(device const float *core [[buffer(11)]], device const float *z [[buffer(12)]], device const float *weight [[buffer(13)]], device float *output [[buffer(14)]], constant CoreParams &p [[buffer(15)]], uint gid [[thread_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+        "    uint h=gid/32; if(h>=p.seq*p.value_heads)return; uint base=h*p.dim;\n"
+        "    float sum=0;\n"
+        "    for(uint d=uint(lane);d<p.dim;d+=32){float v=core[base+d];sum+=v*v;}\n"
+        "    float scale=1.0f/sqrt(simd_sum(sum)/float(p.dim)+1e-6f);\n"
+        "    for(uint d=uint(lane);d<p.dim;d+=32){float gate=z[base+d];output[base+d]=core[base+d]*scale*weight[d]*(gate/(1.0f+exp(-gate)));}\n"
+        "}\n"
+        ;
+}
+
+// Same RNE packing and clamped SiLU as the ordinary prefill path.
+static NSString *termite_metal_lighton_prefill_ffn_source(void) {
+    return @""
+        "#include <metal_stdlib>\n"
+        "#include <metal_tensor>\n"
+        "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+        "using namespace metal;using namespace mpp::tensor_ops;\n"
+        "struct Params {uint rows,in_dim,out_dim,pad;};\n"
+        "inline float termite_lighton_prefill_silu(float x) {\n"
+        "    if (!isfinite(x)) return 0.0f;\n"
+        "    if (x > 20.0f) return x;\n"
+        "    if (x < -20.0f) return 0.0f;\n"
+        "    float y = x / (1.0f + exp(-x));\n"
+        "    return isfinite(y) ? y : 0.0f;\n"
+        "}\n"
+        "inline ushort termite_lighton_prefill_pack(float x){uint bits=as_type<uint>(x);return (bits&0x7fffffffu)>0x7f800000u?ushort((bits>>16)|0x40u):ushort((bits+0x7fffu+((bits>>16)&1u))>>16);}\n"
+        "template<uint M, uint N, uint SG> inline void termite_lighton_prefill_gate(device bfloat*x,device bfloat*gw,device bfloat*uw,device float*gb,device float*ub,device ushort*y,constant Params&p,uint2 group){\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>gmat(gw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)}),umat(uw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*M);auto rightG=gmat.slice(0,int(group.x)*N);auto rightU=umat.slice(0,int(group.x)*N);\n"
+        " constexpr auto desc=matmul2d_descriptor(M,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<SG>>op;\n"
+        " auto g=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();auto u=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n"
+        " op.run(left,rightG,g);op.run(left,rightU,u);\n"
+        " #pragma unroll\n"
+        " for(ushort i=0;i<g.get_capacity();i++){auto coord=g.get_multidimensional_index(i);int col=int(group.x)*N+coord[0],row=int(group.y)*M+coord[1];if(coord[0]>=0&&coord[0]<N&&coord[1]>=0&&coord[1]<M&&col<int(p.out_dim)&&row<int(p.rows)){float gs=g[i]+gb[col],us=u[i]+ub[col];float activated=termite_lighton_prefill_silu(gs);float value=activated==0.0f?0.0f:activated*us;y[uint(row)*p.out_dim+uint(col)]=termite_lighton_prefill_pack(value);}}\n"
+        "\n"
+        "}\n"
+        "kernel void termite_lighton_prefill_gate0(device bfloat*x[[buffer(0)]],device bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device ushort*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lighton_prefill_gate<32,64,4>(x,g,u,gb,ub,y,p,group);}\n"
+        "kernel void termite_lighton_prefill_gate1(device bfloat*x[[buffer(0)]],device bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device ushort*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lighton_prefill_gate<64,32,4>(x,g,u,gb,ub,y,p,group);}\n"
+        ;
+}
+
+static NSString *termite_metal_lightonocr3_tensor_source(void) {
+    return @""
+        "#include <metal_stdlib>\n"
+        "#include <metal_tensor>\n"
+        "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+        "using namespace metal; using namespace mpp::tensor_ops;\n"
+        "struct VisionParams {uint batch,seq_len,num_heads,head_dim,bias_mode,has_mask,layout,reserved1;};\n"
+        "#include <metal_tensor>\n"
+        "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+        "using namespace mpp::tensor_ops;\n"
+        "kernel void termite_sdpa_f32_vision_hd64_flash_packed_mpp(device half*q[[buffer(0)]],device half*k[[buffer(1)]],device half*v[[buffer(2)]],device const float*bias[[buffer(3)]],device const float*mask[[buffer(4)]],device float*output[[buffer(5)]],constant VisionParams&p[[buffer(6)]],uint tid[[thread_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]],uint sg[[simdgroup_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]){\n"
+        " const uint tiles=(p.seq_len+15)/16,qtile=group%tiles,h=(group/tiles)%p.num_heads,b=group/(tiles*p.num_heads),q0=qtile*16,qrow=(sg/4)*16,kcol=(sg%4)*32,dcol=(sg%4)*16,base=(b*p.num_heads+h)*p.reserved1*64;\n"
+        " threadgroup float scores[16*128],rowmax[16],rowsum[16],correction[16];threadgroup half probs[16*128];\n"
+        " if(tid<16){rowmax[tid]=-INFINITY;rowsum[tid]=0;}threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        " tensor<device half,dextents<int,2>,tensor_inline> Q(q+base+(q0+qrow)*64,dextents<int,2>(64,16),array<int,2>{1,64});\n"
+        " tensor<threadgroup half,dextents<int,2>,tensor_inline> P(probs+qrow*128,dextents<int,2>(128,16),array<int,2>{1,128});\n"
+        " tensor<threadgroup float,dextents<int,2>,tensor_inline> S(scores+qrow*128+kcol,dextents<int,2>(32,16),array<int,2>{1,128});\n"
+        " constexpr auto qkd=matmul2d_descriptor(16,32,64,false,true,false);matmul2d<qkd,execution_simdgroups<1>> qkop;\n"
+        " constexpr auto pvd=matmul2d_descriptor(16,16,128,false,false,false,matmul2d_descriptor::mode::multiply_accumulate);matmul2d<pvd,execution_simdgroups<1>> pvop;\n"
+        " tensor<device half,dextents<int,2>,tensor_inline> V(v+base+dcol,dextents<int,2>(16,128),array<int,2>{1,64});\n"
+        " auto out=pvop.get_destination_cooperative_tensor<decltype(P),decltype(V),float>();\n"
+        " for(ushort i=0;i<out.get_capacity();i++)out[i]=0;\n"
+        " for(uint start=0;start<p.seq_len;start+=128){\n"
+        "  tensor<device half,dextents<int,2>,tensor_inline> K(k+base+(start+kcol)*64,dextents<int,2>(64,32),array<int,2>{1,64});\n"
+        "  auto dot=qkop.get_destination_cooperative_tensor<decltype(Q),decltype(K),float>();qkop.run(Q,K,dot);dot.store(S);\n"
+        "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "  for(uint pass=0;pass<4;pass++){\n"
+        "   uint row=sg+pass*4;float x[4],e[4],m=-INFINITY;\n"
+        "   for(uint j=0;j<4;j++){x[j]=(q0+row<p.seq_len&&start+lane+j*32<p.seq_len)?scores[row*128+lane+j*32]:-INFINITY;if(!isfinite(x[j]))x[j]=-INFINITY;m=max(m,x[j]);}\n"
+        "   m=simd_max(m);float nm=max(rowmax[row],m),c=isfinite(nm)&&isfinite(rowmax[row])?exp(rowmax[row]-nm):0,sum=0;\n"
+        "   for(uint j=0;j<4;j++){e[j]=isfinite(x[j])?exp(x[j]-nm):0;probs[row*128+lane+j*32]=half(e[j]);sum+=e[j];}\n"
+        "   sum=simd_sum(sum);if(lane==0){rowmax[row]=nm;rowsum[row]=rowsum[row]*c+sum;correction[row]=c;}\n"
+        "  }\n"
+        "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "  for(ushort i=0;i<out.get_capacity();i++){auto c=out.get_multidimensional_index(i);out[i]*=correction[qrow+c[1]];}\n"
+        "  tensor<device half,dextents<int,2>,tensor_inline> vb(v+base+start*64+dcol,dextents<int,2>(16,128),array<int,2>{1,64});\n"
+        "  pvop.run(P,vb,out);\n"
+        " }\n"
+        " for(ushort i=0;i<out.get_capacity();i++){auto c=out.get_multidimensional_index(i);uint row=qrow+c[1],d=dcol+c[0];if(q0+row<p.seq_len)output[((b*p.seq_len+q0+row)*p.num_heads+h)*64+d]=rowsum[row]>0?out[i]/rowsum[row]:0;}\n"
+        "}\n"
+        "kernel void vision_pack_half(device const float*q[[buffer(0)]],device const float*k[[buffer(1)]],device const float*v[[buffer(2)]],device half*out[[buffer(3)]],constant VisionParams&p[[buffer(4)]],uint i[[thread_position_in_grid]]){\n"
+        " uint count=p.batch*p.num_heads*p.reserved1*64;if(i>=count)return;uint d=i%64,s=(i/64)%p.reserved1,h=(i/(64*p.reserved1))%p.num_heads,b=i/(64*p.reserved1*p.num_heads);uint offset=((b*p.seq_len+s)*p.num_heads+h)*64+d;\n"
+        " out[i]=s<p.seq_len?half(q[offset]*0.125f):half(0);out[count+i]=s<p.seq_len?half(k[offset]):half(0);out[2*count+i]=s<p.seq_len?half(v[offset]):half(0);\n"
+        "}\n"
+        "struct LightOnPrefillParams {\n"
+        "    uint q_len, kv_tokens, num_heads, num_kv_heads, head_dim, key_row_bytes, base_key_row_bytes,\n"
+        "        query_position_offset, kv_position_offset, sliding_window, v_row_stride, page_size, block_count,\n"
+        "        contiguous_base_token, contiguous_blocks, format, v_element_bytes, has_sinks;\n"
+        "    float softcap;\n"
+        "    uint swa_scan_clamp;\n"
+        "};\n"
+        "kernel void termite_lightonocr3_prefill_attention_mpp(\n"
+        "    device float *q [[buffer(0)]], device const half *k [[buffer(1)]], device const half *v [[buffer(2)]],\n"
+        "    device const uint *blocks [[buffer(3)]], device const float *sinks [[buffer(4)]],\n"
+        "    device float *y [[buffer(5)]], constant LightOnPrefillParams &p [[buffer(6)]],\n"
+        "    uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],\n"
+        "    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+        "    const uint q0 = group.x * 16, h = group.y, kh = h / (p.num_heads / p.num_kv_heads), hd = 256,\n"
+        "               kw = p.key_row_bytes / 2;\n"
+        "    threadgroup atomic_uint nonfinite_v;\n"
+        "    threadgroup half kv[32 * 256];\n"
+        "    threadgroup float scores[16 * 32], prob[16 * 32], maxima[16], denom[16], correction[16];\n"
+        "    if (tid < 16) {\n"
+        "        maxima[tid] = -INFINITY;\n"
+        "        denom[tid] = 0;\n"
+        "    }\n"
+        "    tensor<device float, dextents<int, 2>, tensor_inline> qa(q + h * hd, dextents<int, 2>(hd, p.q_len),\n"
+        "                                                             array<int, 2>{1, int(p.num_heads * hd)});\n"
+        "    auto Q = qa.slice(0, int(q0));\n"
+        "    tensor<threadgroup half, dextents<int, 2>, tensor_inline> ka(kv, dextents<int, 2>(hd, 32),\n"
+        "                                                                 array<int, 2>{1, hd});\n"
+        "    auto K = ka.slice(0, int(sg * 8));\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> S(scores + sg * 8, dextents<int, 2>(8, 16),\n"
+        "                                                                 array<int, 2>{1, 32});\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> P(prob, dextents<int, 2>(32, 16),\n"
+        "                                                                 array<int, 2>{1, 32});\n"
+        "    tensor<threadgroup half, dextents<int, 2>, tensor_inline> V(kv + sg * 64, dextents<int, 2>(64, 32),\n"
+        "                                                                array<int, 2>{1, hd});\n"
+        "    constexpr auto qkd = matmul2d_descriptor(16, 8, 256, false, true, false);\n"
+        "    constexpr auto pvd =\n"
+        "        matmul2d_descriptor(16, 64, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);\n"
+        "    matmul2d<qkd, execution_simdgroups<1>> qkop;\n"
+        "    matmul2d<pvd, execution_simdgroups<1>> pvop;\n"
+        "    auto out = pvop.get_destination_cooperative_tensor<decltype(P), decltype(V), float>();\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++)\n"
+        "        out[i] = 0;\n"
+        "    uint end = min(p.kv_tokens, p.query_position_offset + min(q0 + 16, p.q_len) - p.kv_position_offset);\n"
+        "    for (uint start = 0; start < end; start += 32) {\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 32 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            uint physical = t < p.kv_tokens ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "            kv[i] = t < p.kv_tokens ? k[physical * kw + kh * hd + d] : half(0);\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        auto dots = qkop.get_destination_cooperative_tensor<decltype(Q), decltype(K), float>();\n"
+        "        qkop.run(Q, K, dots);\n"
+        "        dots.store(S);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint pass = 0; pass < 4; pass++) {\n"
+        "            uint row = sg + pass * 4, t = start + lane;\n"
+        "            bool valid = q0 + row < p.q_len && t < p.kv_tokens &&\n"
+        "                         t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "            float x = valid ? scores[row * 32 + lane] * 0.0625f : -INFINITY;\n"
+        "            if (!isfinite(x))\n"
+        "                x = -INFINITY;\n"
+        "            float m = simd_max(x), nm = max(maxima[row], m),\n"
+        "                  c = isfinite(maxima[row]) && isfinite(nm) ? exp(maxima[row] - nm) : 0;\n"
+        "            float e = isfinite(x) ? exp(x - nm) : 0;\n"
+        "            prob[row * 32 + lane] = e;\n"
+        "            float sum = simd_sum(e);\n"
+        "            if (lane == 0) {\n"
+        "                maxima[row] = nm;\n"
+        "                denom[row] = denom[row] * c + sum;\n"
+        "                correction[row] = c;\n"
+        "            }\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "            auto coord = out.get_multidimensional_index(i);\n"
+        "            out[i] = correction[coord[1]] == 0 ? 0 : out[i] * correction[coord[1]];\n"
+        "        }\n"
+        "        if (tid == 0)\n"
+        "            atomic_store_explicit(&nonfinite_v, 0, memory_order_relaxed);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 32 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            uint physical = t < p.kv_tokens ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "            half value = t < p.kv_tokens ? v[physical * p.v_row_stride + kh * hd + d] : half(0);\n"
+        "            kv[i] = value;\n"
+        "            if (!isfinite(value))\n"
+        "                atomic_store_explicit(&nonfinite_v, 1, memory_order_relaxed);\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        if (atomic_load_explicit(&nonfinite_v, memory_order_relaxed) == 0)\n"
+        "            pvop.run(P, V, out);\n"
+        "        else\n"
+        "            for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "                auto coord = out.get_multidimensional_index(i);\n"
+        "                uint row = coord[1], d = sg * 64 + coord[0];\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < 32; t++) {\n"
+        "                    float weight = prob[row * 32 + t];\n"
+        "                    if (weight != 0)\n"
+        "                        sum += weight * float(kv[t * 256 + d]);\n"
+        "                }\n"
+        "                out[i] += sum;\n"
+        "            }\n"
+        "    }\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "        auto coord = out.get_multidimensional_index(i);\n"
+        "        uint row = coord[1], d = sg * 64 + coord[0];\n"
+        "        if (q0 + row < p.q_len) {\n"
+        "            float value = denom[row] > 0 ? out[i] / denom[row] : 0;\n"
+        "            // Match the existing sentinel-softmax route when every score is invalid:\n"
+        "            // exp(sentinel-sentinel) gives uniform mass, including masked physical zero.\n"
+        "            if (denom[row] == 0) {\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < p.kv_tokens; t++) {\n"
+        "                    bool allowed = t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "                    uint physical = allowed ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "                    sum += float(v[physical * p.v_row_stride + kh * hd + d]);\n"
+        "                }\n"
+        "                value = sum / float(p.kv_tokens);\n"
+        "            }\n"
+        "            y[((q0 + row) * p.num_heads + h) * hd + d] = value;\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "kernel void termite_lightonocr3_prefill_attention_mpp32(\n"
+        "    device float *q [[buffer(0)]], device const half *k [[buffer(1)]], device const half *v [[buffer(2)]],\n"
+        "    device const uint *blocks [[buffer(3)]], device const float *sinks [[buffer(4)]],\n"
+        "    device float *y [[buffer(5)]], constant LightOnPrefillParams &p [[buffer(6)]],\n"
+        "    uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],\n"
+        "    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+        "    const uint q0 = group.x * 32, h = group.y, kh = h / (p.num_heads / p.num_kv_heads), hd = 256,\n"
+        "               kw = p.key_row_bytes / 2;\n"
+        "    threadgroup atomic_uint nonfinite_v;\n"
+        "    threadgroup half kv[32 * 256];\n"
+        "    threadgroup float scores[32 * 32], prob[32 * 32], maxima[32], denom[32], correction[32];\n"
+        "    if (tid < 32) {\n"
+        "        maxima[tid] = -INFINITY;\n"
+        "        denom[tid] = 0;\n"
+        "    }\n"
+        "    tensor<device float, dextents<int, 2>, tensor_inline> qa(q + h * hd, dextents<int, 2>(hd, p.q_len),\n"
+        "                                                             array<int, 2>{1, int(p.num_heads * hd)});\n"
+        "    auto Q = qa.slice(0, int(q0));\n"
+        "    tensor<threadgroup half, dextents<int, 2>, tensor_inline> ka(kv, dextents<int, 2>(hd, 32),\n"
+        "                                                                 array<int, 2>{1, hd});\n"
+        "    auto K = ka.slice(0, int(sg * 8));\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> S(scores + sg * 8, dextents<int, 2>(8, 32),\n"
+        "                                                                 array<int, 2>{1, 32});\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> P(prob, dextents<int, 2>(32, 32),\n"
+        "                                                                 array<int, 2>{1, 32});\n"
+        "    tensor<threadgroup half, dextents<int, 2>, tensor_inline> V(kv + sg * 64, dextents<int, 2>(64, 32),\n"
+        "                                                                array<int, 2>{1, hd});\n"
+        "    constexpr auto qkd = matmul2d_descriptor(32, 8, 256, false, true, false);\n"
+        "    constexpr auto pvd =\n"
+        "        matmul2d_descriptor(32, 64, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);\n"
+        "    matmul2d<qkd, execution_simdgroups<1>> qkop;\n"
+        "    matmul2d<pvd, execution_simdgroups<1>> pvop;\n"
+        "    auto out = pvop.get_destination_cooperative_tensor<decltype(P), decltype(V), float>();\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++)\n"
+        "        out[i] = 0;\n"
+        "    uint end = min(p.kv_tokens, p.query_position_offset + min(q0 + 32, p.q_len) - p.kv_position_offset);\n"
+        "    for (uint start = 0; start < end; start += 32) {\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 32 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            uint physical = t < p.kv_tokens ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "            kv[i] = t < p.kv_tokens ? k[physical * kw + kh * hd + d] : half(0);\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        auto dots = qkop.get_destination_cooperative_tensor<decltype(Q), decltype(K), float>();\n"
+        "        qkop.run(Q, K, dots);\n"
+        "        dots.store(S);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint pass = 0; pass < 8; pass++) {\n"
+        "            uint row = sg + pass * 4, t = start + lane;\n"
+        "            bool valid = q0 + row < p.q_len && t < p.kv_tokens &&\n"
+        "                         t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "            float x = valid ? scores[row * 32 + lane] * 0.0625f : -INFINITY;\n"
+        "            if (!isfinite(x))\n"
+        "                x = -INFINITY;\n"
+        "            float m = simd_max(x), nm = max(maxima[row], m),\n"
+        "                  c = isfinite(maxima[row]) && isfinite(nm) ? exp(maxima[row] - nm) : 0;\n"
+        "            float e = isfinite(x) ? exp(x - nm) : 0;\n"
+        "            prob[row * 32 + lane] = e;\n"
+        "            float sum = simd_sum(e);\n"
+        "            if (lane == 0) {\n"
+        "                maxima[row] = nm;\n"
+        "                denom[row] = denom[row] * c + sum;\n"
+        "                correction[row] = c;\n"
+        "            }\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "            auto coord = out.get_multidimensional_index(i);\n"
+        "            out[i] = correction[coord[1]] == 0 ? 0 : out[i] * correction[coord[1]];\n"
+        "        }\n"
+        "        if (tid == 0)\n"
+        "            atomic_store_explicit(&nonfinite_v, 0, memory_order_relaxed);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 32 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            uint physical = t < p.kv_tokens ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "            half value = t < p.kv_tokens ? v[physical * p.v_row_stride + kh * hd + d] : half(0);\n"
+        "            kv[i] = value;\n"
+        "            if (!isfinite(value))\n"
+        "                atomic_store_explicit(&nonfinite_v, 1, memory_order_relaxed);\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        if (atomic_load_explicit(&nonfinite_v, memory_order_relaxed) == 0)\n"
+        "            pvop.run(P, V, out);\n"
+        "        else\n"
+        "            for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "                auto coord = out.get_multidimensional_index(i);\n"
+        "                uint row = coord[1], d = sg * 64 + coord[0];\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < 32; t++) {\n"
+        "                    float weight = prob[row * 32 + t];\n"
+        "                    if (weight != 0)\n"
+        "                        sum += weight * float(kv[t * 256 + d]);\n"
+        "                }\n"
+        "                out[i] += sum;\n"
+        "            }\n"
+        "    }\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "        auto coord = out.get_multidimensional_index(i);\n"
+        "        uint row = coord[1], d = sg * 64 + coord[0];\n"
+        "        if (q0 + row < p.q_len) {\n"
+        "            float value = denom[row] > 0 ? out[i] / denom[row] : 0;\n"
+        "            // Match the existing sentinel-softmax route when every score is invalid:\n"
+        "            // exp(sentinel-sentinel) gives uniform mass, including masked physical zero.\n"
+        "            if (denom[row] == 0) {\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < p.kv_tokens; t++) {\n"
+        "                    bool allowed = t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "                    uint physical = allowed ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "                    sum += float(v[physical * p.v_row_stride + kh * hd + d]);\n"
+        "                }\n"
+        "                value = sum / float(p.kv_tokens);\n"
+        "            }\n"
+        "            y[((q0 + row) * p.num_heads + h) * hd + d] = value;\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "kernel void termite_lightonocr3_prefill_attention_direct16_64(\n"
+        "    device float *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],\n"
+        "    device const uint *blocks [[buffer(3)]], device const float *sinks [[buffer(4)]],\n"
+        "    device float *y [[buffer(5)]], constant LightOnPrefillParams &p [[buffer(6)]],\n"
+        "    uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],\n"
+        "    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+        "    const uint q0 = group.x * 16, h = group.y, kh = h / (p.num_heads / p.num_kv_heads),\n"
+        "               kw = p.key_row_bytes / 2;\n"
+        "    threadgroup float scores[16 * 64], prob[16 * 64], maxima[16], denom[16], correction[16];\n"
+        "    threadgroup atomic_uint nonfinite_v;\n"
+        "    if (tid < 16) {\n"
+        "        maxima[tid] = -INFINITY;\n"
+        "        denom[tid] = 0;\n"
+        "    }\n"
+        "    tensor<device float, dextents<int, 2>, tensor_inline> qa(q + h * 256, dextents<int, 2>(256, p.q_len),\n"
+        "                                                             array<int, 2>{1, int(p.num_heads * 256)});\n"
+        "    auto Q = qa.slice(0, int(q0));\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> S(scores + sg * 16, dextents<int, 2>(16, 16),\n"
+        "                                                                 array<int, 2>{1, 64});\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> Pbase(prob, dextents<int, 2>(16, 16),\n"
+        "                                                                     array<int, 2>{1, 64});\n"
+        "    tensor<device half, dextents<int, 2>, tensor_inline> Vbase(\n"
+        "        v + kh * 256 + sg * 64, dextents<int, 2>(64, 16), array<int, 2>{1, int(p.v_row_stride)});\n"
+        "    constexpr auto qkd = matmul2d_descriptor(16, 16, 256, false, true, false);\n"
+        "    constexpr auto pvd =\n"
+        "        matmul2d_descriptor(16, 64, 16, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);\n"
+        "    matmul2d<qkd, execution_simdgroups<1>> qkop;\n"
+        "    matmul2d<pvd, execution_simdgroups<1>> pvop;\n"
+        "    auto out = pvop.get_destination_cooperative_tensor<decltype(Pbase), decltype(Vbase), float>();\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++)\n"
+        "        out[i] = 0;\n"
+        "    uint end = min(p.kv_tokens, p.query_position_offset + min(q0 + 16, p.q_len) - p.kv_position_offset);\n"
+        "    for (uint start = 0; start < end; start += 64) {\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        uint key = start + sg * 16, count = key < p.kv_tokens ? min(16u, p.kv_tokens - key) : 0;\n"
+        "        if (count) {\n"
+        "            uint physical = blocks[key / p.page_size] + key % p.page_size;\n"
+        "            tensor<device half, dextents<int, 2>, tensor_inline> K(\n"
+        "                k + physical * kw + kh * 256, dextents<int, 2>(256, count), array<int, 2>{1, int(kw)});\n"
+        "            auto dots = qkop.get_destination_cooperative_tensor<decltype(Q), decltype(K), float>();\n"
+        "            qkop.run(Q, K, dots);\n"
+        "            dots.store(S);\n"
+        "        } else\n"
+        "            for (uint i = lane; i < 16 * 16; i += 32)\n"
+        "                scores[(i / 16) * 64 + sg * 16 + i % 16] = 0;\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint pass = 0; pass < 16 / 4; pass++) {\n"
+        "            uint row = sg + pass * 4;\n"
+        "            float x[2], m = -INFINITY;\n"
+        "            for (uint j = 0; j < 2; j++) {\n"
+        "                uint t = start + lane + j * 32;\n"
+        "                bool valid = q0 + row < p.q_len && t < p.kv_tokens &&\n"
+        "                             t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "                x[j] = valid ? scores[row * 64 + lane + j * 32] * .0625f : -INFINITY;\n"
+        "                if (!isfinite(x[j]))\n"
+        "                    x[j] = -INFINITY;\n"
+        "                m = max(m, x[j]);\n"
+        "            }\n"
+        "            m = simd_max(m);\n"
+        "            float nm = max(maxima[row], m),\n"
+        "                  c = isfinite(maxima[row]) && isfinite(nm) ? exp(maxima[row] - nm) : 0, sum = 0;\n"
+        "            for (uint j = 0; j < 2; j++) {\n"
+        "                float e = isfinite(x[j]) ? exp(x[j] - nm) : 0;\n"
+        "                prob[row * 64 + lane + j * 32] = e;\n"
+        "                sum += e;\n"
+        "            }\n"
+        "            sum = simd_sum(sum);\n"
+        "            if (lane == 0) {\n"
+        "                maxima[row] = nm;\n"
+        "                denom[row] = denom[row] * c + sum;\n"
+        "                correction[row] = c;\n"
+        "            }\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "            auto c = out.get_multidimensional_index(i);\n"
+        "            float scale = correction[c[1]];\n"
+        "            out[i] = scale == 0 ? 0 : out[i] * scale;\n"
+        "        }\n"
+        "        if (tid == 0)\n"
+        "            atomic_store_explicit(&nonfinite_v, 0, memory_order_relaxed);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 64 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            if (t < p.kv_tokens) {\n"
+        "                uint physical = blocks[t / p.page_size] + t % p.page_size;\n"
+        "                if (!isfinite(v[physical * p.v_row_stride + kh * 256 + d]))\n"
+        "                    atomic_store_explicit(&nonfinite_v, 1, memory_order_relaxed);\n"
+        "            }\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        if (atomic_load_explicit(&nonfinite_v, memory_order_relaxed) == 0) {\n"
+        "            for (uint part = 0; part < 64 / 16; part++) {\n"
+        "                uint key = start + part * 16;\n"
+        "                if (key >= p.kv_tokens)\n"
+        "                    break;\n"
+        "                uint count = min(16u, p.kv_tokens - key),\n"
+        "                     physical = blocks[key / p.page_size] + key % p.page_size;\n"
+        "                tensor<threadgroup float, dextents<int, 2>, tensor_inline> P(\n"
+        "                    prob + part * 16, dextents<int, 2>(count, 16), array<int, 2>{1, 64});\n"
+        "                tensor<device half, dextents<int, 2>, tensor_inline> V(\n"
+        "                    v + physical * p.v_row_stride + kh * 256 + sg * 64, dextents<int, 2>(64, count),\n"
+        "                    array<int, 2>{1, int(p.v_row_stride)});\n"
+        "                pvop.run(P, V, out);\n"
+        "            }\n"
+        "        } else\n"
+        "            for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "                auto c = out.get_multidimensional_index(i);\n"
+        "                uint row = c[1], d = sg * 64 + c[0];\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < 64 && start + t < p.kv_tokens; t++) {\n"
+        "                    float w = prob[row * 64 + t];\n"
+        "                    if (w != 0) {\n"
+        "                        uint key = start + t, physical = blocks[key / p.page_size] + key % p.page_size;\n"
+        "                        sum += w * float(v[physical * p.v_row_stride + kh * 256 + d]);\n"
+        "                    }\n"
+        "                }\n"
+        "                out[i] += sum;\n"
+        "            }\n"
+        "    }\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "        auto c = out.get_multidimensional_index(i);\n"
+        "        uint row = c[1], d = sg * 64 + c[0];\n"
+        "        if (q0 + row >= p.q_len)\n"
+        "            continue;\n"
+        "        float value = denom[row] > 0 ? out[i] / denom[row] : 0;\n"
+        "        if (denom[row] == 0) {\n"
+        "            float sum = 0;\n"
+        "            for (uint t = 0; t < p.kv_tokens; t++) {\n"
+        "                bool allowed = t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "                uint physical = allowed ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "                sum += float(v[physical * p.v_row_stride + kh * 256 + d]);\n"
+        "            }\n"
+        "            value = sum / float(p.kv_tokens);\n"
+        "        }\n"
+        "        y[((q0 + row) * p.num_heads + h) * 256 + d] = value;\n"
+        "    }\n"
+        "}\n"
+        "struct Params { uint rows; uint in_dim; uint out_dim; uint pad; };\n"
+        "template<uint S,uint N> inline void termite_lightonocr3_prefill_gate_body(device float*x,device bfloat*w,device float*bias,device float*y,constant Params&p,threadgroup float*tmp,uint2 group,uint sg,uint tid){\n"
+        " const uint chunk=p.in_dim/S,row=group.y*8,col=group.x*N;\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>b(w+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<threadgroup float,dextents<int,2>,tensor_inline>dest(tmp+sg*8*N,dextents<int,2>(N,8),array<int,2>{1,int(N)});\n"
+        " auto left=a.slice(0,int(row));auto right=b.slice(0,int(col));\n"
+        " constexpr auto desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+        " auto result=op.template get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);result.store(dest);\n"
+        " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        " for(uint i=tid;i<min(8u,p.rows-row)*N;i+=S*32){float sum=0;\n"
+        "  #pragma unroll\n"
+        "  for(uint j=0;j<S;j++)sum+=tmp[j*8*N+i];\n"
+        "  uint c=col+i%N;if(c<p.out_dim)y[(row+i/N)*p.out_dim+c]=sum+bias[c];\n"
+        " }\n"
+        "}\n"
+        "#define PN(S,N) kernel void termite_lightonocr3_prefill_gate##S##_##N(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*b[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],threadgroup float*tmp[[threadgroup(0)]],uint2 group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){termite_lightonocr3_prefill_gate_body<S,N>(x,w,b,y,p,tmp,group,sg,tid);}\n"
+        "PN(8,16) PN(16,32)\n"
+        "#undef PN\n"
+        "\n"
+        "template<uint S,uint N> inline void termite_lightonocr3_local_gate_body(device float*x,device bfloat*gw,device bfloat*uw,device float*gb,device float*ub,device float*y,constant Params&p,threadgroup float*tmp,uint group,uint sg,uint tid){\n"
+        " uint chunk=p.in_dim/S;\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>gmat(gw+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)}),umat(uw+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<threadgroup float,dextents<int,2>,tensor_inline>dest(tmp+sg*8*N,dextents<int,2>(N,p.rows),array<int,2>{1,int(N)}),destU(tmp+(S+sg)*8*N,dextents<int,2>(N,p.rows),array<int,2>{1,int(N)});\n"
+        " auto left=a.slice(0,0);auto rightG=gmat.slice(0,int(group)*N);auto rightU=umat.slice(0,int(group)*N);\n"
+        " constexpr auto desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+        " auto g=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();auto u=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n"
+        " op.run(left,rightG,g);op.run(left,rightU,u);g.store(dest);u.store(destU);\n"
+        " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        " for(uint i=tid;i<p.rows*N;i+=S*32){float gs=0,us=0;\n"
+        "  #pragma unroll\n"
+        "  for(uint j=0;j<S;j++){gs+=tmp[j*8*N+i];us+=tmp[(S+j)*8*N+i];}\n"
+        "  uint col=group*N+i%N;gs+=gb[col];us+=ub[col];y[(i/N)*p.out_dim+col]=(gs/(1.0f+exp(-gs)))*us;\n"
+        " }\n"
+        "}\n"
+        "#define TG(S,N) kernel void termite_lightonocr3_local_gate##S##_##N(device float*x[[buffer(0)]],device bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],threadgroup float*tmp[[threadgroup(0)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){termite_lightonocr3_local_gate_body<S,N>(x,g,u,gb,ub,y,p,tmp,group,sg,tid);}\n"
+        "TG(4,16) TG(4,32)\n"
+        "#undef TG\n"
+        "\n"
+        "template<uint S,uint N> inline void termite_lightonocr3_local_down_body(device float*x,device bfloat*w,device float*bias,device float*y,constant Params&p,threadgroup float*tmp,uint group,uint sg,uint tid){\n"
+        " uint chunk=p.in_dim/S;\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>wm(w+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<threadgroup float,dextents<int,2>,tensor_inline>dest(tmp+sg*8*N,dextents<int,2>(N,p.rows),array<int,2>{1,int(N)});\n"
+        " auto left=a.slice(0,0);auto right=wm.slice(0,int(group)*N);\n"
+        " constexpr auto desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+        " auto result=op.template get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);result.store(dest);\n"
+        " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        " for(uint i=tid;i<p.rows*N;i+=S*32){float sum=0;\n"
+        "  #pragma unroll\n"
+        "  for(uint j=0;j<S;j++)sum+=tmp[j*8*N+i];\n"
+        "  uint col=group*N+i%N;y[(i/N)*p.out_dim+col]=sum+bias[col];\n"
+        " }\n"
+        "}\n"
+        "#define TP(S,N) kernel void termite_lightonocr3_local_down##S##_##N(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],threadgroup float*tmp[[threadgroup(0)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){termite_lightonocr3_local_down_body<S,N>(x,w,bias,y,p,tmp,group,sg,tid);}\n"
+        "TP(8,16) TP(16,16)\n"
+        "#undef TP\n"
+        "struct GateSplitParams{uint rows,in_dim,out_dim,pad;};\n"
+        "template<uint N> inline void termite_gate_split_body(device float*x,device bfloat*gw,device bfloat*uw,device float*gb,device float*ub,device float*y,constant GateSplitParams&p,uint2 group){\n"
+        " uint chunk=p.in_dim/p.pad;\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x+group.y*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>gmat(gw+group.y*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)}),umat(uw+group.y*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>dest(y+group.y*p.rows*p.out_dim,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>destU(y+(p.pad+group.y)*p.rows*p.out_dim,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,0);auto rightG=gmat.slice(0,int(group.x)*N);auto rightU=umat.slice(0,int(group.x)*N);auto out=dest.slice(int(group.x)*N,0);auto outU=destU.slice(int(group.x)*N,0);\n"
+        " constexpr auto desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+        " auto g=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();auto u=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n"
+        " op.run(left,rightG,g);op.run(left,rightU,u);\n"
+        " g.store(out);u.store(outU);\n"
+        "}\n"
+        "#define K(N) kernel void termite_gate_split##N(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant GateSplitParams&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_gate_split_body<N>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "K(16)\n"
+        "#undef K\n"
+        "kernel void termite_gate_split_reduce(device const float*s[[buffer(0)]],device const float*gb[[buffer(1)]],device const float*ub[[buffer(2)]],device float*y[[buffer(3)]],constant GateSplitParams&p[[buffer(4)]],uint i[[thread_position_in_grid]]){uint count=p.rows*p.out_dim;if(i>=count)return;float g=0,u=0;for(uint j=0;j<p.pad;j++){g+=s[j*count+i];u+=s[(p.pad+j)*count+i];}g+=gb[i%p.out_dim];u+=ub[i%p.out_dim];y[i]=(g/(1.0f+exp(-g)))*u;}\n"
+        "template<uint N, uint M=8, uint SG=1> inline void termite_lightonocr3_gate_up_small_body(device float*x,device bfloat*gw,device bfloat*uw,device float*gb,device float*ub,device float*y,constant Params&p,uint2 group){\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>gmat(gw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)}),umat(uw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>dest(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*M);auto rightG=gmat.slice(0,int(group.x)*N);auto rightU=umat.slice(0,int(group.x)*N);auto out=dest.slice(int(group.x)*N,int(group.y)*M);\n"
+        " constexpr auto desc=matmul2d_descriptor(M,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<SG>>op;\n"
+        " auto g=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();auto u=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n"
+        " op.run(left,rightG,g);op.run(left,rightU,u);\n"
+        " #pragma unroll\n"
+        " for(ushort i=0;i<g.get_capacity();i++){auto coord=g.get_multidimensional_index(i);int col=int(group.x)*N+coord[0],row=int(group.y)*M+coord[1];if(coord[0]>=0&&coord[0]<N&&coord[1]>=0&&coord[1]<M&&col<int(p.out_dim)&&row<int(p.rows)){float gs=g[i]+gb[col],us=u[i]+ub[col];g[i]=(gs/(1.0f+exp(-gs)))*us;}}\n"
+        " g.store(out);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_gate_up_small16(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<16>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "kernel void termite_lightonocr3_gate_up_small32(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<32>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "kernel void termite_lightonocr3_gate_up_wide16(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<16,16>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "kernel void termite_lightonocr3_gate_up_wide32(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<16,32,2>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "kernel void termite_lightonocr3_gate_up_wide64(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<32,64,4>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "kernel void termite_lightonocr3_down_split_reduce(device const float*s[[buffer(0)]], device const float*bias[[buffer(1)]], device float*y[[buffer(2)]], constant Params&p[[buffer(3)]],uint i[[thread_position_in_grid]]) {\n"
+        " if(i>=p.rows*p.out_dim)return;float sum=0;for(uint j=0;j<p.pad;j++)sum+=s[j*p.rows*p.out_dim+i];y[i]=sum+bias[i%p.out_dim];\n"
+        "}\n"
+        "kernel void termite_lightonocr3_down_split32(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*s[[buffer(2)]],constant Params&p[[buffer(3)]],uint2 g[[threadgroup_position_in_grid]]){\n"
+        " uint chunk=p.in_dim/p.pad;\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x+g.y*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>b(w+g.y*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>c(s+g.y*p.rows*p.out_dim,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,0);auto right=b.slice(0,int(g.x)*32);auto dest=c.slice(int(g.x)*32,0);\n"
+        " constexpr auto desc=matmul2d_descriptor(8,32,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_down_split64(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*s[[buffer(2)]],constant Params&p[[buffer(3)]],uint2 g[[threadgroup_position_in_grid]]){\n"
+        " uint chunk=p.in_dim/p.pad;\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x+g.y*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>b(w+g.y*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>c(s+g.y*p.rows*p.out_dim,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,0);auto right=b.slice(0,int(g.x)*64);auto dest=c.slice(int(g.x)*64,0);\n"
+        " constexpr auto desc=matmul2d_descriptor(8,64,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_mpp_float_8_16(device float *x [[buffer(0)]], device bfloat *w [[buffer(1)]], device float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant Params &p [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]]) {\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline> b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*8); auto right=b.slice(0,int(group.x)*16); auto dest=c.slice(int(group.x)*16,int(group.y)*8);\n"
+        " constexpr auto desc=matmul2d_descriptor(8,16,dynamic_length_v<int>,false,true,false);\n"
+        " matmul2d<desc,execution_simdgroups<1>> op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();\n"
+        " op.run(left,right,result);\n"
+        " #pragma unroll\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*16+coord[0],row=int(group.y)*8+coord[1];if(coord[0]>=0 && coord[0]<16 && coord[1]>=0 && coord[1]<8 && col<int(p.out_dim) && row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_mpp_float_8_32(device float *x [[buffer(0)]], device bfloat *w [[buffer(1)]], device float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant Params &p [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]]) {\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline> b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*8); auto right=b.slice(0,int(group.x)*32); auto dest=c.slice(int(group.x)*32,int(group.y)*8);\n"
+        " constexpr auto desc=matmul2d_descriptor(8,32,dynamic_length_v<int>,false,true,false);\n"
+        " matmul2d<desc,execution_simdgroups<1>> op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();\n"
+        " op.run(left,right,result);\n"
+        " #pragma unroll\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*32+coord[0],row=int(group.y)*8+coord[1];if(coord[0]>=0 && coord[0]<32 && coord[1]>=0 && coord[1]<8 && col<int(p.out_dim) && row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+        "kernel void termite_f16_encoder_mpp_float_32_64(device float *x [[buffer(0)]], device half *w [[buffer(1)]], device float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant Params &p [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]]) {\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device half,dextents<int,2>,tensor_inline> b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*32); auto right=b.slice(0,int(group.x)*64); auto dest=c.slice(int(group.x)*64,int(group.y)*32);\n"
+        " constexpr auto desc=matmul2d_descriptor(32,64,dynamic_length_v<int>,false,true,false);\n"
+        " matmul2d<desc,execution_simdgroups<4>> op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();\n"
+        " op.run(left,right,result);\n"
+        " #pragma unroll\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*64+coord[0],row=int(group.y)*32+coord[1];if(coord[0]>=0 && coord[0]<64 && coord[1]>=0 && coord[1]<32 && col<int(p.out_dim) && row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_mpp_float_32_64(device float *x [[buffer(0)]], device bfloat *w [[buffer(1)]], device float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant Params &p [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]]) {\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline> b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*32); auto right=b.slice(0,int(group.x)*64); auto dest=c.slice(int(group.x)*64,int(group.y)*32);\n"
+        " constexpr auto desc=matmul2d_descriptor(32,64,dynamic_length_v<int>,false,true,false);\n"
+        " matmul2d<desc,execution_simdgroups<4>> op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();\n"
+        " op.run(left,right,result);\n"
+        " #pragma unroll\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*64+coord[0],row=int(group.y)*32+coord[1];if(coord[0]>=0 && coord[0]<64 && coord[1]>=0 && coord[1]<32 && col<int(p.out_dim) && row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_mpp_float_64_32(device float *x [[buffer(0)]], device bfloat *w [[buffer(1)]], device float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant Params &p [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]]) {\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline> b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*64); auto right=b.slice(0,int(group.x)*32); auto dest=c.slice(int(group.x)*32,int(group.y)*64);\n"
+        " constexpr auto desc=matmul2d_descriptor(64,32,dynamic_length_v<int>,false,true,false);\n"
+        " matmul2d<desc,execution_simdgroups<4>> op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();\n"
+        " op.run(left,right,result);\n"
+        " #pragma unroll\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*32+coord[0],row=int(group.y)*64+coord[1];if(coord[0]>=0 && coord[0]<32 && coord[1]>=0 && coord[1]<64 && col<int(p.out_dim) && row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_mpp_bfloat_32_64(device bfloat *x [[buffer(0)]], device bfloat *w [[buffer(1)]], device float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant Params &p [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]]) {\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline> a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline> b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*32); auto right=b.slice(0,int(group.x)*64); auto dest=c.slice(int(group.x)*64,int(group.y)*32);\n"
+        " constexpr auto desc=matmul2d_descriptor(32,64,dynamic_length_v<int>,false,true,false);\n"
+        " matmul2d<desc,execution_simdgroups<4>> op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();\n"
+        " op.run(left,right,result);\n"
+        " #pragma unroll\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*64+coord[0],row=int(group.y)*32+coord[1];if(coord[0]>=0 && coord[0]<64 && coord[1]>=0 && coord[1]<32 && col<int(p.out_dim) && row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_mpp_bfloat_64_32(device bfloat *x [[buffer(0)]], device bfloat *w [[buffer(1)]], device float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant Params &p [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]]) {\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline> a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline> b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline> c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*64); auto right=b.slice(0,int(group.x)*32); auto dest=c.slice(int(group.x)*32,int(group.y)*64);\n"
+        " constexpr auto desc=matmul2d_descriptor(64,32,dynamic_length_v<int>,false,true,false);\n"
+        " matmul2d<desc,execution_simdgroups<4>> op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();\n"
+        " op.run(left,right,result);\n"
+        " #pragma unroll\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*32+coord[0],row=int(group.y)*64+coord[1];if(coord[0]>=0 && coord[0]<32 && coord[1]>=0 && coord[1]<64 && col<int(p.out_dim) && row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_wide_mpp_0(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],uint2 group[[threadgroup_position_in_grid]]){\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*16);auto right=b.slice(0,int(group.x)*8);auto dest=c.slice(int(group.x)*8,int(group.y)*16);\n"
+        " constexpr auto desc=matmul2d_descriptor(16,8,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*8+coord[0],row=int(group.y)*16+coord[1];if(coord[0]>=0&&coord[0]<8&&coord[1]>=0&&coord[1]<16&&col<int(p.out_dim)&&row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_wide_mpp_1(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],uint2 group[[threadgroup_position_in_grid]]){\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*16);auto right=b.slice(0,int(group.x)*16);auto dest=c.slice(int(group.x)*16,int(group.y)*16);\n"
+        " constexpr auto desc=matmul2d_descriptor(16,16,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*16+coord[0],row=int(group.y)*16+coord[1];if(coord[0]>=0&&coord[0]<16&&coord[1]>=0&&coord[1]<16&&col<int(p.out_dim)&&row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+        "kernel void termite_lightonocr3_wide_mpp_2(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],uint2 group[[threadgroup_position_in_grid]]){\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device bfloat,dextents<int,2>,tensor_inline>b(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        " tensor<device float,dextents<int,2>,tensor_inline>c(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+        " auto left=a.slice(0,int(group.y)*16);auto right=b.slice(0,int(group.x)*64);auto dest=c.slice(int(group.x)*64,int(group.y)*16);\n"
+        " constexpr auto desc=matmul2d_descriptor(16,64,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<4>>op;\n"
+        " auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);\n"
+        " for(ushort i=0;i<result.get_capacity();i++){auto coord=result.get_multidimensional_index(i);int col=int(group.x)*64+coord[0],row=int(group.y)*16+coord[1];if(coord[0]>=0&&coord[0]<64&&coord[1]>=0&&coord[1]<16&&col<int(p.out_dim)&&row<int(p.rows))result[i]+=bias[col];}\n"
+        " result.store(dest);\n"
+        "}\n"
+    ;
+}
+
 static NSString *termite_metal_shader_source(void) {
     return @"#include <metal_stdlib>\n"
            "using namespace metal;\n"
@@ -6779,7 +7984,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_compressed_attention_component_params { uint query_rows; uint query_abs_start; uint total_tokens; uint compress_rate; uint row_dim; uint gate_width; uint row_count; uint rope_dim; float theta; float freq_scale; float eps; uint consecutive_pairs; uint bias_rows; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_compressed_attention_params { uint query_abs_start; uint query_rows; uint token_count; uint compressed_rows; uint num_heads; uint head_dim; uint sliding_window; uint top_k; uint has_indexer; uint index_rows; uint index_heads; uint index_head_dim; uint has_sinks; uint reserved0; float scale; float reserved1; };\n"
            "struct termite_metal_attention_span_params { uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position; uint kv_position_offset; uint sliding_window; uint v_row_stride; };\n"
-           "struct termite_metal_paged_attention_params { uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp; };\n"
+           "struct termite_metal_paged_attention_params { uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp; uint has_explicit_positions; };\n"
            "struct termite_metal_decode_gqa_split_params { uint split_count; uint max_splits; uint key_chunk; uint reduce_simdgroups; };\n"
            "struct termite_metal_encode_key_params { uint rows; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; };\n"
            "struct termite_metal_paged_f32_kv_seed_params { uint total_tokens; uint suffix_tokens; uint values_per_row; uint page_size; uint key_row_floats; uint v_row_stride; };\n"
@@ -7429,7 +8634,7 @@ static NSString *termite_metal_shader_source(void) {
            "    int ql_off = half_idx * 64 + (group & 1) * 32; int qh_off = half_idx * 32; int qh_shift = group * 2; int nibble_shift = (group >> 1) * 4; int low4 = int((ql[ql_off + l] >> nibble_shift) & 0x0fu); int high2 = int((qh[qh_off + l] >> qh_shift) & 0x03u);\n"
            "    int scale_u = int(scales[sub]); int scale = scale_u >= 128 ? scale_u - 256 : scale_u; return antfly_qk_half_le_to_float(block + 208) * float(scale) * float((low4 | (high2 << 4)) - 32);\n"
            "}\n"
-           "struct antfly_paged_attention_1x_params { uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp; };\n"
+           "struct antfly_paged_attention_1x_params { uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp; uint has_explicit_positions; };\n"
            "inline uint antfly_paged_attention_1x_page_token(device const uint *block_table, constant antfly_paged_attention_1x_params &p, uint logical_token) { if (p.contiguous_blocks != 0u) return p.contiguous_base_token + logical_token; uint logical_block = logical_token / p.page_size; uint token_in_block = logical_token - logical_block * p.page_size; if (logical_block >= p.block_count) return 0xffffffffu; return block_table[logical_block] + token_in_block; }\n"
            "kernel void antfly_q4_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {\n"
            "    const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NC; const uint first_r = group_pos.y * NR;\n"
@@ -8438,6 +9643,29 @@ static NSString *termite_metal_shader_source(void) {
            "    float inv_rms = rsqrt(shmem[0] / float(p.hidden_size) + p.eps);\n"
            "    for (uint i = tid; i < p.hidden_size; i += tpg) output[row_base + i] = input[row_base + i] * inv_rms * weight[i];\n"
            "}\n"
+           "template<uint H> inline void termite_lightonocr3_norm_cached_body(device const float4 *x, device const float4 *w, device float4 *y, constant termite_metal_apply_row_norm_params &p, threadgroup float *partial, uint tid, uint sg, uint lane, uint row) {\n"
+           "    if (row >= p.rows) return;\n"
+           "    constexpr uint count = H / (4 * 128);\n"
+           "    float4 stored[count];\n"
+           "    float sum = 0.0f;\n"
+           "    #pragma unroll\n"
+           "    for (uint i = 0; i < count; i++) {\n"
+           "        uint col = tid + i * 128;\n"
+           "        stored[i] = x[row * (H / 4) + col];\n"
+           "        sum += dot(stored[i], stored[i]);\n"
+           "    }\n"
+           "    sum = simd_sum(sum);\n"
+           "    if (lane == 0) partial[sg] = sum;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    float scale = rsqrt(simd_sum(lane < 4 ? partial[lane] : 0.0f) / float(H) + p.eps);\n"
+           "    #pragma unroll\n"
+           "    for (uint i = 0; i < count; i++) {\n"
+           "        uint col = tid + i * 128;\n"
+           "        y[row * (H / 4) + col] = stored[i] * (scale * w[col]);\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_lightonocr3_norm_cached1024(device const float4 *x [[buffer(0)]], device const float4 *w [[buffer(1)]], device float4 *y [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *partial [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) { termite_lightonocr3_norm_cached_body<1024>(x,w,y,p,partial,tid,sg,lane,row); }\n"
+           "kernel void termite_lightonocr3_norm_cached2560(device const float4 *x [[buffer(0)]], device const float4 *w [[buffer(1)]], device float4 *y [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *partial [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) { termite_lightonocr3_norm_cached_body<2560>(x,w,y,p,partial,tid,sg,lane,row); }\n"
            "kernel void termite_apply_rms_norm_rows_simd4_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint simd_group [[simdgroup_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.hidden_size == 0u || (p.hidden_size & 3u) != 0u) return;\n"
            "    if (simd_group == 0u) shmem[simd_lane] = 0.0f;\n"
@@ -8828,6 +10056,337 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "    if (lane == 0u) output[group] = partials[0];\n"
+           "}\n"
+           "kernel void termite_lightonocr3_gemv_vec4(device const float *x [[buffer(0)]], device const ushort *w [[buffer(1)]], device const float *b [[buffer(2)]], device float *y [[buffer(3)]], constant termite_metal_apply_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {\n"
+           " float4 accum[1]; for(uint r=0;r<1;r++)accum[r]=0;\n"
+           " for(uint i=lane*4;i<p.in_dim;i+=128) {\n"
+           "  float4 v=*((device const float4 *)(x+i));\n"
+           "  for(uint r=0;r<1;r++){uint row=group*1+r;if(row<p.out_dim){ushort4 bits=*((device const ushort4 *)(w+row*p.in_dim+i));accum[r]+=v*as_type<float4>(uint4(bits)<<16);}}\n"
+           " }\n"
+           " for(uint r=0;r<1;r++){uint row=group*1+r;float sum=simd_sum(dot(accum[r],float4(1)));if(lane==0 && row<p.out_dim)y[row]=sum+b[row];}\n"
+           "}\n"
+           "struct termite_lightonocr3_local_params{uint rows,in_dim,out_dim,pad;};\n"
+           "template<uint B,uint S,uint SN,uint TM> inline void termite_lightonocr3_recurrent_gate_body(device const float*x,device const ushort*w,device const float*b,device float*y,constant termite_lightonocr3_local_params&p,uint group,uint sg,uint lane,uint tid,threadgroup float*scratch){\n"
+           " const uint N=(32/SN)*TM,localcol=(lane/SN)*TM,col=group*N+localcol,chunk=p.in_dim/S;\n"
+           " float acc[B][TM];\n"
+           " #pragma unroll\n"
+           " for(uint r=0;r<B;r++){\n"
+           "  #pragma unroll\n"
+           "  for(uint t=0;t<TM;t++)acc[r][t]=0.0f;\n"
+           " }\n"
+           " for(uint k=sg*chunk+(lane%SN)*4;k<(sg+1)*chunk;k+=SN*4){\n"
+           "  float4 a[B];\n"
+           "  #pragma unroll\n"
+           "  for(uint r=0;r<B;r++)a[r]=*((device const float4*)(x+r*p.in_dim+k));\n"
+           "  \n"
+           "  #pragma unroll\n"
+           "  for(uint t=0;t<TM;t++) {float4 v=float4(0.0f);if(col+t<p.out_dim){ushort4 z=*((device const ushort4*)(w+(col+t)*p.in_dim+k));v=as_type<float4>(uint4(z)<<16);}\n"
+           "   #pragma unroll\n"
+           "   for(uint r=0;r<B;r++)acc[r][t]+=dot(a[r],v);}\n"
+           " }\n"
+           " #pragma unroll\n"
+           " for(uint r=0;r<B;r++){\n"
+           "  #pragma unroll\n"
+           "  for(uint t=0;t<TM;t++){\n"
+           "  float v=acc[r][t];\n"
+           "  #pragma unroll\n"
+           "  for(uint d=SN/2;d>0;d/=2)v+=simd_shuffle_xor(v,d);\n"
+           "  if(lane%SN==0)scratch[sg*8*N+r*N+localcol+t]=v;\n"
+           " }\n"
+           " }\n"
+           " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           " for(uint i=tid;i<B*N;i+=S*32){uint c=group*N+i%N;if(c<p.out_dim){float v=0.0f;\n"
+           " #pragma unroll\n"
+           " for(uint s=0;s<S;s++)v+=scratch[s*8*N+i];y[(i/N)*p.out_dim+c]=v+b[c];}}\n"
+           "}\n"
+           "#define DS(B,S,SN,TM) kernel void termite_lightonocr3_recurrent_gate_##B##_##S##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*b[[buffer(2)]],device float*y[[buffer(3)]],constant termite_lightonocr3_local_params&p[[buffer(4)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]],uint tid[[thread_index_in_threadgroup]],threadgroup float*scratch[[threadgroup(0)]]){termite_lightonocr3_recurrent_gate_body<B,S,SN,TM>(x,w,b,y,p,group,sg,lane,tid,scratch);}\n"
+           "#define DB(B) DS(B,8,32,1) DS(B,16,32,1)\n"
+           "DB(1) DB(2) DB(3) DB(4) DB(5) DB(6) DB(7) DB(8)\n"
+           "#undef DB\n"
+           "#undef DS\n"
+           "template<uint B,uint SN,uint TM> inline void termite_lightonocr3_decode_body(device const float*x,device const ushort*w,device const float*b,device float*y,constant termite_lightonocr3_local_params&p,uint2 group,uint sg,uint lane){\n"
+           " const uint start=group.y*B,col=((group.x*4+sg)*(32/SN)+lane/SN)*TM;\n"
+           " float acc[B][TM];\n"
+           " #pragma unroll\n"
+           " for(uint r=0;r<B;r++){\n"
+           "  #pragma unroll\n"
+           "  for(uint t=0;t<TM;t++)acc[r][t]=0.0f;\n"
+           " }\n"
+           " for(uint k=(lane%SN)*4;k<p.in_dim;k+=SN*4){\n"
+           "  float4 a[B];\n"
+           "  #pragma unroll\n"
+           "  for(uint r=0;r<B;r++)a[r]=*((device const float4*)(x+min(start+r,p.rows-1)*p.in_dim+k));\n"
+           "  #pragma unroll\n"
+           "  for(uint t=0;t<TM;t++){\n"
+           "   float4 v=as_type<float4>(uint4(*((device const ushort4*)(w+(col+t)*p.in_dim+k)))<<16);\n"
+           "   #pragma unroll\n"
+           "   for(uint r=0;r<B;r++)acc[r][t]+=dot(a[r],v);\n"
+           "  }\n"
+           " }\n"
+           " #pragma unroll\n"
+           " for(uint r=0;r<B;r++){\n"
+           "  #pragma unroll\n"
+           "  for(uint t=0;t<TM;t++){\n"
+           "   float v=acc[r][t];\n"
+           "   #pragma unroll\n"
+           "   for(uint d=SN/2;d>0;d/=2)v+=simd_shuffle_xor(v,d);\n"
+           "   if(lane%SN==0&&start+r<p.rows)y[(start+r)*p.out_dim+col+t]=v+b[col+t];\n"
+           "  }\n"
+           " }\n"
+           "}\n"
+           "\n"
+           "template<uint R,uint CAP,uint SN,uint TM> inline void termite_lightonocr3_decode_dispatch(device const float*x,device const ushort*w,device const float*b,device float*y,constant termite_lightonocr3_local_params&p,uint2 group,uint sg,uint lane){\n"
+           " if constexpr(R>CAP && R%CAP!=0){\n"
+           "  if(group.y==R/CAP){const uint start=R/CAP*CAP;termite_lightonocr3_decode_body<R%CAP,SN,TM>(x+start*p.in_dim,w,b,y+start*p.out_dim,p,uint2(group.x,0),sg,lane);return;}\n"
+           " }\n"
+           " termite_lightonocr3_decode_body<(R<CAP?R:CAP),SN,TM>(x,w,b,y,p,group,sg,lane);\n"
+           "}\n"
+           "#define EX(R,CAP,SN,TM) kernel void termite_lightonocr3_decode_##R##_##CAP##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*b[[buffer(2)]],device float*y[[buffer(3)]],constant termite_lightonocr3_local_params&p[[buffer(4)]],uint2 group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){termite_lightonocr3_decode_dispatch<R,CAP,SN,TM>(x,w,b,y,p,group,sg,lane);}\n"
+           "#define EB(R) EX(R,4,16,2) EX(R,4,16,4) EX(R,4,32,4) EX(R,4,32,8) EX(R,2,16,4) EX(R,2,32,8)\n"
+           "EB(5) EB(6) EB(7)\n"
+           "#undef EB\n"
+           "#undef EX\n"
+           "#define CH(B,SN,TM) kernel void termite_lightonocr3_chunk_##B##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*b[[buffer(2)]],device float*y[[buffer(3)]],constant termite_lightonocr3_local_params&p[[buffer(4)]],uint2 group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){termite_lightonocr3_decode_body<B,SN,TM>(x,w,b,y,p,group,sg,lane);}\n"
+           "#define CB(B) CH(B,16,2) CH(B,16,4) CH(B,32,4) CH(B,32,8)\n"
+           "CB(1) CB(2) CB(3) CB(4)\n"
+           "#undef CB\n"
+           "#undef CH\n"
+           "template<uint B,uint SN,uint TM,bool GATE> inline void termite_lightonocr3_local_tile_body(device const float*x,device const ushort*gw,device const ushort*uw,device const float*gb,device const float*ub,device float*y,constant termite_lightonocr3_local_params&p,uint group,uint sg,uint lane){\n"
+           " uint col=((group*4+sg)*(32/SN)+lane/SN)*TM;\n"
+           " float gs[B][TM],us[B][TM];\n"
+           " #pragma unroll\n"
+           " for(uint b=0;b<B;b++){\n"
+           "  #pragma unroll\n"
+           "  for(uint t=0;t<TM;t++){gs[b][t]=0;us[b][t]=0;}\n"
+           " }\n"
+           " for(uint k=(lane%SN)*4;k<p.in_dim;k+=SN*4){\n"
+           "  float4 a[B];\n"
+           "  #pragma unroll\n"
+           "  for(uint b=0;b<B;b++)a[b]=*((device const float4*)(x+b*p.in_dim+k));\n"
+           "  #pragma unroll\n"
+           "  for(uint t=0;t<TM;t++){\n"
+           "   float4 wg=as_type<float4>(uint4(*((device const ushort4*)(gw+(col+t)*p.in_dim+k)))<<16);\n"
+           "   float4 wu=GATE?as_type<float4>(uint4(*((device const ushort4*)(uw+(col+t)*p.in_dim+k)))<<16):float4(0);\n"
+           "   #pragma unroll\n"
+           "   for(uint b=0;b<B;b++){gs[b][t]+=dot(a[b],wg);if(GATE)us[b][t]+=dot(a[b],wu);}\n"
+           "  }\n"
+           " }\n"
+           " #pragma unroll\n"
+           " for(uint b=0;b<B;b++){\n"
+           "  #pragma unroll\n"
+           "  for(uint t=0;t<TM;t++){\n"
+           "   float g=gs[b][t],u=us[b][t];\n"
+           "   #pragma unroll\n"
+           "   for(uint step=SN/2;step>0;step/=2){g+=simd_shuffle_xor(g,step);if(GATE)u+=simd_shuffle_xor(u,step);}\n"
+           "   if(lane%SN==0){g+=gb[col+t];if(GATE){u+=ub[col+t];g=(g/(1.0f+exp(-g)))*u;}y[b*p.out_dim+col+t]=g;}\n"
+           "  }\n"
+           " }\n"
+           "}\n"
+           "#define T(B,SN,TM) kernel void termite_lightonocr3_local_gate_vec##B##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*g[[buffer(1)]],device const ushort*u[[buffer(2)]],device const float*gb[[buffer(3)]],device const float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant termite_lightonocr3_local_params&p[[buffer(6)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){termite_lightonocr3_local_tile_body<B,SN,TM,true>(x,g,u,gb,ub,y,p,group,sg,lane);}\n"
+           "#define V(B,SN,TM) kernel void termite_lightonocr3_local_proj_vec##B##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*g[[buffer(1)]],device const float*gb[[buffer(2)]],device float*y[[buffer(3)]],constant termite_lightonocr3_local_params&p[[buffer(4)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){termite_lightonocr3_local_tile_body<B,SN,TM,false>(x,g,g,gb,gb,y,p,group,sg,lane);}\n"
+           "T(2,16,2) T(3,16,2)\n"
+           "V(2,16,2) V(3,16,2) V(4,16,4) V(4,16,2) V(2,32,4) V(3,32,4)\n"
+           "#undef T\n"
+           "#undef V\n"
+           "kernel void termite_lightonocr3_gemv_vec4_rows2(device const float *x [[buffer(0)]], device const ushort *w [[buffer(1)]], device const float *b [[buffer(2)]], device float *y [[buffer(3)]], constant termite_metal_apply_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {\n"
+           " float4 accum[2]; for(uint r=0;r<2;r++)accum[r]=0;\n"
+           " for(uint i=lane*4;i<p.in_dim;i+=128) {\n"
+           "  float4 v=*((device const float4 *)(x+i));\n"
+           "  for(uint r=0;r<2;r++){uint row=group*2+r;if(row<p.out_dim){ushort4 bits=*((device const ushort4 *)(w+row*p.in_dim+i));accum[r]+=v*as_type<float4>(uint4(bits)<<16);}}\n"
+           " }\n"
+           " for(uint r=0;r<2;r++){uint row=group*2+r;float sum=simd_sum(dot(accum[r],float4(1)));if(lane==0 && row<p.out_dim)y[row]=sum+b[row];}\n"
+           "}\n"
+           "kernel void termite_lightonocr3_gate_up_gemv(device const float *x [[buffer(0)]], device const ushort *gate_w [[buffer(1)]], device const ushort *up_w [[buffer(2)]], device const float *gate_b [[buffer(3)]], device const float *up_b [[buffer(4)]], device float *y [[buffer(5)]], constant termite_metal_linear_params &p [[buffer(6)]], uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           " if(row>=p.out_dim)return;\n"
+           " float4 g=0.0f,u=0.0f;\n"
+           " for(uint i=lane*4;i<p.in_dim;i+=128){\n"
+           "  float4 v=*((device const float4 *)(x+i));\n"
+           "  ushort4 gb=*((device const ushort4 *)(gate_w+row*p.in_dim+i));\n"
+           "  ushort4 ub=*((device const ushort4 *)(up_w+row*p.in_dim+i));\n"
+           "  g+=v*as_type<float4>(uint4(gb)<<16);u+=v*as_type<float4>(uint4(ub)<<16);\n"
+           " }\n"
+           " float gs=simd_sum(dot(g,float4(1.0f))),us=simd_sum(dot(u,float4(1.0f)));\n"
+           " if(lane==0){gs+=gate_b[row];us+=up_b[row];y[row]=(gs/(1.0f+exp(-gs)))*us;}\n"
+           "}\n"
+           "kernel void termite_lightonocr3_batch2_vec4(device const float *x [[buffer(0)]], device const ushort *w [[buffer(1)]], device const float *b [[buffer(2)]], device float *y [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           " if(row>=p.out_dim || p.rows>2) return;\n"
+           " float4 a0=0.0f;\n"
+           " float4 a1=0.0f;\n"
+           " for(uint i=lane*4;i<p.in_dim;i+=128) {\n"
+           "  ushort4 bits=*((device const ushort4 *)(w+row*p.in_dim+i));\n"
+           "  float4 weight=as_type<float4>(uint4(bits)<<16);\n"
+           "  if(p.rows>0) a0+=*((device const float4 *)(x+0*p.in_dim+i))*weight;\n"
+           "  if(p.rows>1) a1+=*((device const float4 *)(x+1*p.in_dim+i))*weight;\n"
+           " }\n"
+           " float s0=simd_sum(dot(a0,float4(1))); if(lane==0 && p.rows>0) y[0*p.out_dim+row]=s0+b[row];\n"
+           " float s1=simd_sum(dot(a1,float4(1))); if(lane==0 && p.rows>1) y[1*p.out_dim+row]=s1+b[row];\n"
+           "}\n"
+           "kernel void termite_lightonocr3_batch4_vec4(device const float *x [[buffer(0)]], device const ushort *w [[buffer(1)]], device const float *b [[buffer(2)]], device float *y [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           " if(row>=p.out_dim || p.rows>4) return;\n"
+           " float4 a0=0.0f;\n"
+           " float4 a1=0.0f;\n"
+           " float4 a2=0.0f;\n"
+           " float4 a3=0.0f;\n"
+           " for(uint i=lane*4;i<p.in_dim;i+=128) {\n"
+           "  ushort4 bits=*((device const ushort4 *)(w+row*p.in_dim+i));\n"
+           "  float4 weight=as_type<float4>(uint4(bits)<<16);\n"
+           "  if(p.rows>0) a0+=*((device const float4 *)(x+0*p.in_dim+i))*weight;\n"
+           "  if(p.rows>1) a1+=*((device const float4 *)(x+1*p.in_dim+i))*weight;\n"
+           "  if(p.rows>2) a2+=*((device const float4 *)(x+2*p.in_dim+i))*weight;\n"
+           "  if(p.rows>3) a3+=*((device const float4 *)(x+3*p.in_dim+i))*weight;\n"
+           " }\n"
+           " float s0=simd_sum(dot(a0,float4(1))); if(lane==0 && p.rows>0) y[0*p.out_dim+row]=s0+b[row];\n"
+           " float s1=simd_sum(dot(a1,float4(1))); if(lane==0 && p.rows>1) y[1*p.out_dim+row]=s1+b[row];\n"
+           " float s2=simd_sum(dot(a2,float4(1))); if(lane==0 && p.rows>2) y[2*p.out_dim+row]=s2+b[row];\n"
+           " float s3=simd_sum(dot(a3,float4(1))); if(lane==0 && p.rows>3) y[3*p.out_dim+row]=s3+b[row];\n"
+           "}\n"
+           "kernel void termite_lightonocr3_batch8_vec4(device const float *x [[buffer(0)]], device const ushort *w [[buffer(1)]], device const float *b [[buffer(2)]], device float *y [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           " if(row>=p.out_dim || p.rows>8) return;\n"
+           " float4 a0=0.0f;\n"
+           " float4 a1=0.0f;\n"
+           " float4 a2=0.0f;\n"
+           " float4 a3=0.0f;\n"
+           " float4 a4=0.0f;\n"
+           " float4 a5=0.0f;\n"
+           " float4 a6=0.0f;\n"
+           " float4 a7=0.0f;\n"
+           " for(uint i=lane*4;i<p.in_dim;i+=128) {\n"
+           "  ushort4 bits=*((device const ushort4 *)(w+row*p.in_dim+i));\n"
+           "  float4 weight=as_type<float4>(uint4(bits)<<16);\n"
+           "  if(p.rows>0) a0+=*((device const float4 *)(x+0*p.in_dim+i))*weight;\n"
+           "  if(p.rows>1) a1+=*((device const float4 *)(x+1*p.in_dim+i))*weight;\n"
+           "  if(p.rows>2) a2+=*((device const float4 *)(x+2*p.in_dim+i))*weight;\n"
+           "  if(p.rows>3) a3+=*((device const float4 *)(x+3*p.in_dim+i))*weight;\n"
+           "  if(p.rows>4) a4+=*((device const float4 *)(x+4*p.in_dim+i))*weight;\n"
+           "  if(p.rows>5) a5+=*((device const float4 *)(x+5*p.in_dim+i))*weight;\n"
+           "  if(p.rows>6) a6+=*((device const float4 *)(x+6*p.in_dim+i))*weight;\n"
+           "  if(p.rows>7) a7+=*((device const float4 *)(x+7*p.in_dim+i))*weight;\n"
+           " }\n"
+           " float s0=simd_sum(dot(a0,float4(1))); if(lane==0 && p.rows>0) y[0*p.out_dim+row]=s0+b[row];\n"
+           " float s1=simd_sum(dot(a1,float4(1))); if(lane==0 && p.rows>1) y[1*p.out_dim+row]=s1+b[row];\n"
+           " float s2=simd_sum(dot(a2,float4(1))); if(lane==0 && p.rows>2) y[2*p.out_dim+row]=s2+b[row];\n"
+           " float s3=simd_sum(dot(a3,float4(1))); if(lane==0 && p.rows>3) y[3*p.out_dim+row]=s3+b[row];\n"
+           " float s4=simd_sum(dot(a4,float4(1))); if(lane==0 && p.rows>4) y[4*p.out_dim+row]=s4+b[row];\n"
+           " float s5=simd_sum(dot(a5,float4(1))); if(lane==0 && p.rows>5) y[5*p.out_dim+row]=s5+b[row];\n"
+           " float s6=simd_sum(dot(a6,float4(1))); if(lane==0 && p.rows>6) y[6*p.out_dim+row]=s6+b[row];\n"
+           " float s7=simd_sum(dot(a7,float4(1))); if(lane==0 && p.rows>7) y[7*p.out_dim+row]=s7+b[row];\n"
+           "}\n"
+           "kernel void termite_lightonocr3_batch16_vec4(device const float *x [[buffer(0)]], device const ushort *w [[buffer(1)]], device const float *b [[buffer(2)]], device float *y [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           " if(row>=p.out_dim || p.rows>16) return;\n"
+           " float4 a0=0.0f;\n"
+           " float4 a1=0.0f;\n"
+           " float4 a2=0.0f;\n"
+           " float4 a3=0.0f;\n"
+           " float4 a4=0.0f;\n"
+           " float4 a5=0.0f;\n"
+           " float4 a6=0.0f;\n"
+           " float4 a7=0.0f;\n"
+           " float4 a8=0.0f;\n"
+           " float4 a9=0.0f;\n"
+           " float4 a10=0.0f;\n"
+           " float4 a11=0.0f;\n"
+           " float4 a12=0.0f;\n"
+           " float4 a13=0.0f;\n"
+           " float4 a14=0.0f;\n"
+           " float4 a15=0.0f;\n"
+           " for(uint i=lane*4;i<p.in_dim;i+=128) {\n"
+           "  ushort4 bits=*((device const ushort4 *)(w+row*p.in_dim+i));\n"
+           "  float4 weight=as_type<float4>(uint4(bits)<<16);\n"
+           "  if(p.rows>0) a0+=*((device const float4 *)(x+0*p.in_dim+i))*weight;\n"
+           "  if(p.rows>1) a1+=*((device const float4 *)(x+1*p.in_dim+i))*weight;\n"
+           "  if(p.rows>2) a2+=*((device const float4 *)(x+2*p.in_dim+i))*weight;\n"
+           "  if(p.rows>3) a3+=*((device const float4 *)(x+3*p.in_dim+i))*weight;\n"
+           "  if(p.rows>4) a4+=*((device const float4 *)(x+4*p.in_dim+i))*weight;\n"
+           "  if(p.rows>5) a5+=*((device const float4 *)(x+5*p.in_dim+i))*weight;\n"
+           "  if(p.rows>6) a6+=*((device const float4 *)(x+6*p.in_dim+i))*weight;\n"
+           "  if(p.rows>7) a7+=*((device const float4 *)(x+7*p.in_dim+i))*weight;\n"
+           "  if(p.rows>8) a8+=*((device const float4 *)(x+8*p.in_dim+i))*weight;\n"
+           "  if(p.rows>9) a9+=*((device const float4 *)(x+9*p.in_dim+i))*weight;\n"
+           "  if(p.rows>10) a10+=*((device const float4 *)(x+10*p.in_dim+i))*weight;\n"
+           "  if(p.rows>11) a11+=*((device const float4 *)(x+11*p.in_dim+i))*weight;\n"
+           "  if(p.rows>12) a12+=*((device const float4 *)(x+12*p.in_dim+i))*weight;\n"
+           "  if(p.rows>13) a13+=*((device const float4 *)(x+13*p.in_dim+i))*weight;\n"
+           "  if(p.rows>14) a14+=*((device const float4 *)(x+14*p.in_dim+i))*weight;\n"
+           "  if(p.rows>15) a15+=*((device const float4 *)(x+15*p.in_dim+i))*weight;\n"
+           " }\n"
+           " float s0=simd_sum(dot(a0,float4(1))); if(lane==0 && p.rows>0) y[0*p.out_dim+row]=s0+b[row];\n"
+           " float s1=simd_sum(dot(a1,float4(1))); if(lane==0 && p.rows>1) y[1*p.out_dim+row]=s1+b[row];\n"
+           " float s2=simd_sum(dot(a2,float4(1))); if(lane==0 && p.rows>2) y[2*p.out_dim+row]=s2+b[row];\n"
+           " float s3=simd_sum(dot(a3,float4(1))); if(lane==0 && p.rows>3) y[3*p.out_dim+row]=s3+b[row];\n"
+           " float s4=simd_sum(dot(a4,float4(1))); if(lane==0 && p.rows>4) y[4*p.out_dim+row]=s4+b[row];\n"
+           " float s5=simd_sum(dot(a5,float4(1))); if(lane==0 && p.rows>5) y[5*p.out_dim+row]=s5+b[row];\n"
+           " float s6=simd_sum(dot(a6,float4(1))); if(lane==0 && p.rows>6) y[6*p.out_dim+row]=s6+b[row];\n"
+           " float s7=simd_sum(dot(a7,float4(1))); if(lane==0 && p.rows>7) y[7*p.out_dim+row]=s7+b[row];\n"
+           " float s8=simd_sum(dot(a8,float4(1))); if(lane==0 && p.rows>8) y[8*p.out_dim+row]=s8+b[row];\n"
+           " float s9=simd_sum(dot(a9,float4(1))); if(lane==0 && p.rows>9) y[9*p.out_dim+row]=s9+b[row];\n"
+           " float s10=simd_sum(dot(a10,float4(1))); if(lane==0 && p.rows>10) y[10*p.out_dim+row]=s10+b[row];\n"
+           " float s11=simd_sum(dot(a11,float4(1))); if(lane==0 && p.rows>11) y[11*p.out_dim+row]=s11+b[row];\n"
+           " float s12=simd_sum(dot(a12,float4(1))); if(lane==0 && p.rows>12) y[12*p.out_dim+row]=s12+b[row];\n"
+           " float s13=simd_sum(dot(a13,float4(1))); if(lane==0 && p.rows>13) y[13*p.out_dim+row]=s13+b[row];\n"
+           " float s14=simd_sum(dot(a14,float4(1))); if(lane==0 && p.rows>14) y[14*p.out_dim+row]=s14+b[row];\n"
+           " float s15=simd_sum(dot(a15,float4(1))); if(lane==0 && p.rows>15) y[15*p.out_dim+row]=s15+b[row];\n"
+           "}\n"
+           "template<uint SN>inline void termite_lightonocr3_segment_body(device const float*x,device const ushort*w,device const float*bias,device float*y,constant termite_metal_linear_params&p,uint lane,uint group){\n"
+           " uint col=group*(32/SN)+lane/SN,k=lane%SN;float4 acc[4];for(uint b=0;b<4;b++)acc[b]=0;\n"
+           " for(uint i=k*4;i<p.in_dim;i+=SN*4){float4 weights=as_type<float4>(uint4(*((device const ushort4*)(w+col*p.in_dim+i)))<<16);\n"
+           " #pragma unroll\n"
+           " for(uint b=0;b<4;b++)acc[b]+=*((device const float4*)(x+b*p.in_dim+i))*weights;\n"
+           " }\n"
+           " #pragma unroll\n"
+           " for(uint b=0;b<4;b++){float sum=dot(acc[b],float4(1));\n"
+           " #pragma unroll\n"
+           " for(uint step=SN/2;step>0;step/=2)sum+=simd_shuffle_xor(sum,step);\n"
+           " if(k==0)y[b*p.out_dim+col]=sum+bias[col];}\n"
+           "}\n"
+           "kernel void termite_lightonocr3_four_row_segment(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]){termite_lightonocr3_segment_body<4>(x,w,bias,y,p,lane,group);}\n"
+           "// Exact batch specializations remove inactive-row branches and registers.\n"
+           "template <uint Batch, uint Columns>\n"
+           "inline void termite_lightonocr3_tiled_body(device const float*x,device const ushort*w,device const float*bias,device float*y,constant termite_metal_linear_params&p,uint lane,uint group) {\n"
+           " uint first=group*Columns;\n"
+           " float accum[Batch][Columns];\n"
+           " #pragma unroll\n"
+           " for(uint b=0;b<Batch;b++) {\n"
+           "  #pragma unroll\n"
+           "  for(uint c=0;c<Columns;c++)accum[b][c]=0;\n"
+           " }\n"
+           " for(uint i=lane*4;i<p.in_dim;i+=128) {\n"
+           "  float4 weights[Columns];\n"
+           "  #pragma unroll\n"
+           "  for(uint c=0;c<Columns;c++)weights[c]=as_type<float4>(uint4(*((device const ushort4*)(w+(first+c)*p.in_dim+i)))<<16);\n"
+           "  #pragma unroll\n"
+           "  for(uint b=0;b<Batch;b++) {\n"
+           "   float4 v=*((device const float4*)(x+b*p.in_dim+i));\n"
+           "   #pragma unroll\n"
+           "   for(uint c=0;c<Columns;c++)accum[b][c]+=dot(v,weights[c]);\n"
+           "  }\n"
+           " }\n"
+           " #pragma unroll\n"
+           " for(uint b=0;b<Batch;b++) {\n"
+           "  #pragma unroll\n"
+           "  for(uint c=0;c<Columns;c++) {\n"
+           "   float value=simd_sum(accum[b][c]);\n"
+           "   if(lane==0)y[b*p.out_dim+first+c]=value+bias[first+c];\n"
+           "  }\n"
+           " }\n"
+           "}\n"
+           "kernel void termite_lightonocr3_batch2_tile2(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<2,2>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch3_tile2(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<3,2>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch4_tile2(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<4,2>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch5_tile4(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<5,4>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch6_tile4(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<6,4>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch7_tile4(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<7,4>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch8_tile4(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<8,4>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch9_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<9,1>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch10_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<10,1>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch11_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<11,1>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch12_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<12,1>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch13_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<13,1>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch14_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<14,1>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch15_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<15,1>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_batch16_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<16,1>(x,w,bias,y,p,lane,group); }\n"
+           "kernel void termite_lightonocr3_pack_bf16(device const float *input [[buffer(0)]], device ushort *output [[buffer(1)]], constant uint &count [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n"
+           " if(i>=count)return;uint bits=as_type<uint>(input[i]);\n"
+           " output[i]=(bits&0x7fffffffu)>0x7f800000u?ushort((bits>>16)|0x40u):ushort((bits+0x7fffu+((bits>>16)&1u))>>16);\n"
            "}\n"
            "kernel void termite_apply_linear_pair_1x_reduce(device const float *input [[buffer(0)]], device const float *weight_a [[buffer(1)]], device const float *weight_b [[buffer(2)]], device const float *bias_a [[buffer(3)]], device const float *bias_b [[buffer(4)]], device float *output_a [[buffer(5)]], device float *output_b [[buffer(6)]], constant termite_metal_apply_linear_params &p [[buffer(7)]], uint lane [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {\n"
            "    if (group >= p.out_dim) return;\n"
@@ -9442,9 +11001,9 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_argmax_logits_1x(device const float *logits [[buffer(0)]], device uint *output [[buffer(1)]], constant uint &out_dim [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid != 0) return;\n"
            "    if (out_dim == 0u) { output[0] = 0u; return; }\n"
-           "    float best = logits[0];\n"
+           "    float best = -INFINITY;\n"
            "    uint best_idx = 0u;\n"
-           "    for (uint i = 1u; i < out_dim; ++i) {\n"
+           "    for (uint i = 0u; i < out_dim; ++i) {\n"
            "        float value = logits[i];\n"
            "        if (value > best) { best = value; best_idx = i; }\n"
            "    }\n"
@@ -9507,6 +11066,50 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            "kernel void termite_argmax_logits_reduce(device const float *partial_values [[buffer(0)]], device const uint *partial_ids [[buffer(1)]], device uint *output [[buffer(2)]], constant uint &partial_count [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid != 0u) return;\n"
+           "    if (partial_count == 0u) { output[0] = 0u; return; }\n"
+           "    float best = partial_values[0];\n"
+           "    uint best_idx = partial_ids[0];\n"
+           "    for (uint i = 1u; i < partial_count; ++i) {\n"
+           "        float value = partial_values[i];\n"
+           "        uint idx = partial_ids[i];\n"
+           "        if (value > best || (value == best && idx < best_idx)) { best = value; best_idx = idx; }\n"
+           "    }\n"
+           "    output[0] = best_idx;\n"
+           "}\n"
+           "kernel void termite_lighton_batch_argmax_partials(device const float *logits [[buffer(0)]], device const int *suppress_ids [[buffer(1)]], device float *partial_values [[buffer(2)]], device uint *partial_ids [[buffer(3)]], constant termite_metal_argmax_suppress_params &p [[buffer(4)]], threadgroup float *sh_vals [[threadgroup(0)]], threadgroup uint *sh_ids [[threadgroup(1)]], ushort tid [[thread_index_in_threadgroup]], ushort3 tg_shape [[threads_per_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {\n"
+           "    const ushort tg_size = tg_shape.x;\n"
+           "    const uint block = group.x;\n"
+           "    logits += size_t(group.y) * p.out_dim;\n"
+           "    partial_values += size_t(group.y) * ((p.out_dim + 1023u) / 1024u);\n"
+           "    partial_ids += size_t(group.y) * ((p.out_dim + 1023u) / 1024u);\n"
+           "    const uint block_size = 1024u;\n"
+           "    uint start = block * block_size;\n"
+           "    uint end = min(start + block_size, p.out_dim);\n"
+           "    float best = -INFINITY;\n"
+           "    uint best_idx = 0xffffffffu;\n"
+           "    for (uint i = start + uint(tid); i < end; i += uint(tg_size)) {\n"
+           "        if (termite_argmax_suppressed_token(i, suppress_ids, p.suppress_count)) continue;\n"
+           "        float value = logits[i];\n"
+           "        if (value > best || (value == best && i < best_idx)) { best = value; best_idx = i; }\n"
+           "    }\n"
+           "    if (best_idx == 0xffffffffu) best_idx = 0u;\n"
+           "    sh_vals[tid] = best;\n"
+           "    sh_ids[tid] = best_idx;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) {\n"
+           "        if (uint(tid) < stride) {\n"
+           "            float other = sh_vals[uint(tid) + stride];\n"
+           "            uint other_idx = sh_ids[uint(tid) + stride];\n"
+           "            if (other > sh_vals[tid] || (other == sh_vals[tid] && other_idx < sh_ids[tid])) { sh_vals[tid] = other; sh_ids[tid] = other_idx; }\n"
+           "        }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    if (tid == 0u) { partial_values[block] = sh_vals[0]; partial_ids[block] = sh_ids[0]; }\n"
+           "}\n"
+           "kernel void termite_lighton_batch_argmax_reduce(device const float *partial_values [[buffer(0)]], device const uint *partial_ids [[buffer(1)]], device uint *output [[buffer(2)]], constant uint &partial_count [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    output += gid;\n"
+           "    partial_values += size_t(gid) * partial_count;\n"
+           "    partial_ids += size_t(gid) * partial_count;\n"
            "    if (partial_count == 0u) { output[0] = 0u; return; }\n"
            "    float best = partial_values[0];\n"
            "    uint best_idx = partial_ids[0];\n"
@@ -13242,6 +14845,15 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { float denom = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { const float weight = exp(scores[ki] - best); scores[ki] = weight; denom += weight; } scores[p.seq_len] = denom; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    const float denom = scores[p.seq_len]; float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { const uint v_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * 32u : (bh * p.seq_len + ki) * 32u; accum += scores[ki] * v[v_base + uint(lane)]; } output[q_base + uint(lane)] = denom > 0.0f ? accum / denom : 0.0f;\n"
            "}\n"
+           "kernel void termite_sdpa_f32_florence_window_parallel(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], threadgroup float *scores [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {\n"
+           "    (void)bias; (void)mask; if (p.seq_len == 0u || p.seq_len > 256u || p.head_dim != 32u || p.bias_mode != 0u || p.has_mask != 0u) return;\n"
+           "    const uint qi = tg % p.seq_len; const uint tmp = tg / p.seq_len; const uint h = tmp % p.num_heads; const uint b = tmp / p.num_heads; if (b >= p.batch) return;\n"
+           "    const uint hidden = p.num_heads * 32u; const uint bh = b * p.num_heads + h; const uint q_base = p.layout == 1u ? (b * p.seq_len + qi) * hidden + h * 32u : (bh * p.seq_len + qi) * 32u; const float scale = rsqrt(32.0f); const float neg_inf = -3.402823466e+38f; float local_best = neg_inf;\n"
+           "    for (uint ki = uint(lane); ki < p.seq_len; ki += 32u) { const uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * 32u : (bh * p.seq_len + ki) * 32u; float dot = 0.0f; for (uint d = 0u; d < 32u; ++d) dot += q[q_base + d] * k[k_base + d]; const float score = dot * scale; scores[ki] = score; local_best = max(local_best, score); }\n"
+           "    const float best = simd_max(local_best); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    float partial = 0.0f; for (uint ki = uint(lane); ki < p.seq_len; ki += 32u) { float weight = exp(scores[ki] - best); scores[ki] = weight; partial += weight; }\n"
+           "    const float denom = simd_sum(partial); threadgroup_barrier(mem_flags::mem_threadgroup); float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { const uint v_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * 32u : (bh * p.seq_len + ki) * 32u; accum += scores[ki] * v[v_base + uint(lane)]; } output[q_base + uint(lane)] = denom > 0.0f ? accum / denom : 0.0f;\n"
+           "}\n"
            "kernel void termite_sdpa_f32_bert_prefill_s256_hd64_q8(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    (void)bias; (void)mask; if (p.seq_len != 256u || p.head_dim != 64u || p.bias_mode != 0u || p.has_mask != 0u || sgitg >= 8u) return;\n"
            "    const uint tile = tg.x & 31u; const uint tmp = tg.x >> 5u; const uint h = tmp % p.num_heads; const uint b = tmp / p.num_heads; if (b >= p.batch) return;\n"
@@ -13311,6 +14923,20 @@ static NSString *termite_metal_shader_source(void) {
            "    uint kc = gid % cpg; uint tmp = gid / cpg; uint qc = tmp % cpg; tmp /= cpg; uint g = tmp % p.groups; uint b = tmp / p.groups; uint group_off = g * cpg;\n"
            "    float acc = 0.0f; for (uint n = 0u; n < p.seq_len; ++n) { uint base = ((b * p.seq_len + n) * p.dim * 3u) + group_off; acc += qkv[base + qc] * qkv[base + p.dim + kc]; }\n"
            "    scores[gid] = acc * rsqrt(float(p.seq_len));\n"
+           "}\n"
+           "// Eight SIMD groups split the spatial reduction for each channel-score row.\n"
+           "// Lanes still read adjacent key channels; partial sums stay in threadgroup memory.\n"
+           "kernel void termite_florence_channel_scores_parallel(device const float *qkv [[buffer(0)]], device float *scores [[buffer(1)]], constant termite_metal_florence_channel_params &p [[buffer(2)]], uint row [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort simd [[simdgroup_index_in_threadgroup]]) {\n"
+           " threadgroup float partials[256];\n"
+           " uint qc=row%32,group=row/32,g=group%p.groups,b=group/p.groups;\n"
+           " float sum=0;\n"
+           " for(uint n=uint(simd);n<p.seq_len;n+=8) {\n"
+           "  uint base=(b*p.seq_len+n)*p.dim*3+g*32;\n"
+           "  sum+=qkv[base+qc]*qkv[base+p.dim+uint(lane)];\n"
+           " }\n"
+           " partials[uint(simd)*32+uint(lane)]=sum;\n"
+           " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           " if(simd==0){float value=0;for(uint i=0;i<8;i++)value+=partials[i*32+uint(lane)];scores[row*32+uint(lane)]=value*rsqrt(float(p.seq_len));}\n"
            "}\n"
            "kernel void termite_florence_channel_softmax_f32(device float *scores [[buffer(0)]], constant termite_metal_florence_channel_params &p [[buffer(1)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint cpg = p.channels_per_group; uint rows = p.batch * p.groups * cpg; if (gid >= rows || cpg == 0u) return; uint base = gid * cpg;\n"
@@ -13789,6 +15415,223 @@ static NSString *termite_metal_shader_source(void) {
            "    if (d == idx0) output[gid] = x0 * cos_val - x1 * sin_val;\n"
            "    else if (d == idx1) output[gid] = x0 * sin_val + x1 * cos_val;\n"
            "    else output[gid] = input[gid];\n"
+           "}\n"
+           "struct termite_qwen35_params { uint seq; uint key_heads; uint value_heads; uint dim; uint kernel_size; uint initialized; };\n"
+           "// One threadgroup owns one value head. Shared Q/K vectors avoid global\n"
+           "// producer/consumer stages; only the first value head for a key head writes\n"
+           "// its convolution history. Every recurrent state element has one writer.\n"
+           "kernel void termite_qwen35_fused_decode(\n"
+           "    device const float *mixed [[buffer(0)]], device const float *weight [[buffer(1)]],\n"
+           "    device const float *beta [[buffer(2)]], device const float *a [[buffer(3)]],\n"
+           "    device const float *alog [[buffer(4)]], device const float *dt [[buffer(5)]],\n"
+           "    device const float *history [[buffer(6)]], device float *next [[buffer(7)]],\n"
+           "    device float *state [[buffer(8)]], device float *conv [[buffer(9)]],\n"
+           "    device float *gates [[buffer(10)]], device float *core [[buffer(11)]],\n"
+           "    device const float *z [[buffer(12)]], device const float *norm [[buffer(13)]],\n"
+           "    device float *output [[buffer(14)]], constant termite_qwen35_params &p [[buffer(15)]],\n"
+           "    uint h [[threadgroup_position_in_grid]], uint d [[thread_index_in_threadgroup]],\n"
+           "    ushort lane [[thread_index_in_simdgroup]], ushort simd [[simdgroup_index_in_threadgroup]]) {\n"
+           "    threadgroup float q[128], k[128], reduction[12], scales[4];\n"
+           "    uint ratio=p.value_heads/p.key_heads, kh=h/ratio;\n"
+           "    uint channels=(2*p.key_heads+p.value_heads)*128;\n"
+           "    uint indices[3]={kh*128+d,(p.key_heads+kh)*128+d,2*p.key_heads*128+h*128+d};\n"
+           "    float values[3];\n"
+           "    for(uint j=0;j<3;j++) {\n"
+           "        uint c=indices[j]; float sum=0;\n"
+           "        for(uint t=0;t<4;t++) {\n"
+           "            float x=t==3?mixed[c]:(p.initialized?history[c*4+t+1]:0.0f);\n"
+           "            sum+=x*weight[c*4+t];\n"
+           "            if(j==2 || h%ratio==0)next[c*4+t]=x;\n"
+           "        }\n"
+           "        values[j]=sum/(1.0f+exp(-sum));\n"
+           "    }\n"
+           "    float qs=simd_sum(values[0]*values[0]),ks=simd_sum(values[1]*values[1]);\n"
+           "    if(lane==0){reduction[simd]=qs;reduction[4+simd]=ks;}\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    if(d==0) {\n"
+           "        float qs=0,ks=0;\n"
+           "        for(uint s=0;s<4;s++){qs+=reduction[s];ks+=reduction[4+s];}\n"
+           "        scales[0]=1.0f/sqrt(qs+1e-6f)/sqrt(128.0f);\n"
+           "        scales[1]=1.0f/sqrt(ks+1e-6f);\n"
+           "        float x=a[h]+dt[h];\n"
+           "        float sp=x>20.0f?x:(x< -20.0f?exp(x):log(1.0f+exp(x)));\n"
+           "        scales[2]=exp(-exp(alog[h])*sp);scales[3]=1.0f/(1.0f+exp(-beta[h]));\n"
+           "        gates[h*2]=scales[2];gates[h*2+1]=scales[3];\n"
+           "    }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    q[d]=values[0]*scales[0];k[d]=values[1]*scales[1];\n"
+           "    if(h%ratio==0){conv[indices[0]]=q[d];conv[indices[1]]=k[d];}\n"
+           "    conv[indices[2]]=values[2];\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    uint base=h*128*128+d;\n"
+           "    float memory=0;\n"
+           "    for(uint row=0;row<128;row++) {\n"
+           "        float value=p.initialized?state[base+row*128]:0.0f;\n"
+           "        memory+=(value*scales[2])*k[row];\n"
+           "    }\n"
+           "    float delta=(values[2]-memory)*scales[3],value=0;\n"
+           "    for(uint row=0;row<128;row++) {\n"
+           "        float previous=p.initialized?state[base+row*128]:0.0f;\n"
+           "        float updated=previous*scales[2]+k[row]*delta;\n"
+           "        state[base+row*128]=updated;value+=updated*q[row];\n"
+           "    }\n"
+           "    core[h*128+d]=value;\n"
+           "    float sum=simd_sum(value*value);\n"
+           "    if(lane==0)reduction[8+simd]=sum;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    if(d==0) {\n"
+           "        float sum=0;for(uint s=0;s<4;s++)sum+=reduction[8+s];\n"
+           "        scales[0]=1.0f/sqrt(sum/128.0f+1e-6f);\n"
+           "    }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    float gate=z[h*128+d];\n"
+           "    output[h*128+d]=value*scales[0]*norm[d]*(gate/(1.0f+exp(-gate)));\n"
+           "}\n"
+           "kernel void termite_qwen35_prefill_conv_vec4(device const float*mixed[[buffer(0)]],device const float*weight[[buffer(1)]],device const float*history[[buffer(6)]],device float*conv[[buffer(9)]],constant termite_qwen35_params&p[[buffer(15)]],uint gid[[thread_position_in_grid]]){\n"
+           " uint channels=(2*p.key_heads+p.value_heads)*p.dim;\n"
+           " if(gid>=p.seq*(channels/4))return;uint t=gid/(channels/4),c=gid%(channels/4)*4;\n"
+           " float4 w0=*((device const float4*)(weight+c*4)),w1=*((device const float4*)(weight+(c+1)*4)),w2=*((device const float4*)(weight+(c+2)*4)),w3=*((device const float4*)(weight+(c+3)*4));\n"
+           " float4 sum=0;\n"
+           " #pragma unroll\n"
+           " for(uint k=0;k<4;k++){int src=int(t)+int(k)-3;float4 x=0;if(src>=0)x=*((device const float4*)(mixed+uint(src)*channels+c));else if(p.initialized)x=float4(history[c*4+uint(4+src)],history[(c+1)*4+uint(4+src)],history[(c+2)*4+uint(4+src)],history[(c+3)*4+uint(4+src)]);sum+=x*float4(w0[k],w1[k],w2[k],w3[k]);}\n"
+           " *((device float4*)(conv+t*channels+c))=sum/(1.0f+exp(-sum));\n"
+           "}\n"
+           "kernel void termite_qwen35_conv(device const float *mixed [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *history [[buffer(6)]], device float *conv [[buffer(9)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint channels=(2*p.key_heads+p.value_heads)*p.dim;\n"
+           "    if(gid>=p.seq*channels)return;\n"
+           "    uint t=gid/channels,c=gid%channels;\n"
+           "    float sum=0;\n"
+           "    for(uint k=0;k<p.kernel_size;k++) {\n"
+           "        int src=int(t)+int(k)+1-int(p.kernel_size);\n"
+           "        float x=src>=0?mixed[uint(src)*channels+c]:(p.initialized?history[c*p.kernel_size+uint(int(p.kernel_size)+src)]:0.0f);\n"
+           "        sum+=x*weight[c*p.kernel_size+k];\n"
+           "    }\n"
+           "    conv[gid]=sum/(1.0f+exp(-sum));\n"
+           "}\n"
+           "kernel void termite_qwen35_history(device const float *mixed [[buffer(0)]], device const float *history [[buffer(6)]], device float *next [[buffer(7)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint channels=(2*p.key_heads+p.value_heads)*p.dim;\n"
+           "    if(gid>=channels*p.kernel_size)return;\n"
+           "    uint c=gid/p.kernel_size,slot=gid%p.kernel_size;\n"
+           "    int src=int(p.seq)+int(slot)-int(p.kernel_size);\n"
+           "    next[gid]=src>=0?mixed[uint(src)*channels+c]:(p.initialized?history[c*p.kernel_size+uint(int(p.kernel_size)+src)]:0.0f);\n"
+           "}\n"
+           "kernel void termite_qwen35_prepare(device const float *beta [[buffer(2)]], device const float *a [[buffer(3)]], device const float *alog [[buffer(4)]], device const float *dt [[buffer(5)]], device float *conv [[buffer(9)]], device float *gates [[buffer(10)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if(gid>=p.seq*p.value_heads)return;\n"
+           "    uint t=gid/p.value_heads,h=gid%p.value_heads;\n"
+           "    uint channels=(2*p.key_heads+p.value_heads)*p.dim;\n"
+           "    if(h<p.key_heads) {\n"
+           "        uint qb=t*channels+h*p.dim,kb=qb+p.key_heads*p.dim;\n"
+           "        float qs=0,ks=0;\n"
+           "        for(uint d=0;d<p.dim;d++){float q=conv[qb+d],k=conv[kb+d];qs+=q*q;ks+=k*k;}\n"
+           "        float qn=1.0f/sqrt(qs+1e-6f)/sqrt(float(p.dim)),kn=1.0f/sqrt(ks+1e-6f);\n"
+           "        for(uint d=0;d<p.dim;d++){conv[qb+d]*=qn;conv[kb+d]*=kn;}\n"
+           "    }\n"
+           "    float x=a[gid]+dt[h];\n"
+           "    float sp=x>20.0f?x:(x< -20.0f?exp(x):log(1.0f+exp(x)));\n"
+           "    gates[gid*2]=exp(-exp(alog[h])*sp);\n"
+           "    gates[gid*2+1]=1.0f/(1.0f+exp(-beta[gid]));\n"
+           "}\n"
+           "kernel void termite_qwen35_recurrent_decode(device float *state [[buffer(8)]], device const float *conv [[buffer(9)]], device const float *gates [[buffer(10)]], device float *output [[buffer(11)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if(gid>=p.value_heads*p.dim)return;\n"
+           "    uint h=gid/p.dim,col=gid%p.dim,kh=h/(p.value_heads/p.key_heads);\n"
+           "    uint channels=(2*p.key_heads+p.value_heads)*p.dim;\n"
+           "    uint base=h*p.dim*p.dim+col;\n"
+           "    if(!p.initialized)for(uint k=0;k<p.dim;k++)state[base+k*p.dim]=0.0f;\n"
+           "    // Each lane owns one value column for the entire token stream. Adjacent\n"
+           "    // lanes access adjacent state elements; columns and heads are independent.\n"
+           "    for(uint t=0;t<p.seq;t++) {\n"
+           "        uint qb=t*channels+kh*p.dim,kb=qb+p.key_heads*p.dim;\n"
+           "        float decay=gates[(t*p.value_heads+h)*2],beta=gates[(t*p.value_heads+h)*2+1];\n"
+           "        float memory=0;\n"
+           "        for(uint k=0;k<p.dim;k++)memory+=(state[base+k*p.dim]*decay)*conv[kb+k];\n"
+           "        float value=conv[t*channels+2*p.key_heads*p.dim+h*p.dim+col];\n"
+           "        float delta=(value-memory)*beta,out=0;\n"
+           "        for(uint k=0;k<p.dim;k++) {\n"
+           "            float decayed=state[base+k*p.dim]*decay;\n"
+           "            float updated=decayed+conv[kb+k]*delta;\n"
+           "            state[base+k*p.dim]=updated;\n"
+           "            out+=updated*conv[qb+k];\n"
+           "        }\n"
+           "        output[(t*p.value_heads+h)*p.dim+col]=out;\n"
+           "    }\n"
+           "}\n"
+           "template<uint C>inline void termite_qwen35_recurrent_columns_body(device float*state,device const float*conv,device const float*gates,device float*output,constant termite_qwen35_params&p,uint gid,uint lane){\n"
+           " constexpr uint K=4*C;uint column=gid/32,h=column/(128/C),col=(column%(128/C))*C+lane%C,klane=lane/C;if(h>=p.value_heads)return;\n"
+           " uint kh=h/(p.value_heads/p.key_heads),channels=(2*p.key_heads+p.value_heads)*128,base=h*128*128+klane*K*128+col;\n"
+           " float s[K];\n"
+           " #pragma unroll\n"
+           " for(uint i=0;i<K;i++)s[i]=p.initialized?state[base+i*128]:0;\n"
+           " for(uint t=0;t<p.seq;t++){\n"
+           "  uint qb=t*channels+kh*128+klane*K,kb=qb+p.key_heads*128;float decay=gates[(t*p.value_heads+h)*2],beta=gates[(t*p.value_heads+h)*2+1];float memory=0;\n"
+           "  #pragma unroll\n"
+           "  for(uint i=0;i<K;i++){s[i]*=decay;memory+=s[i]*conv[kb+i];}\n"
+           "  #pragma unroll\n"
+           "  for(uint step=16/C;step>0;step/=2)memory+=simd_shuffle_xor(memory,step*C);\n"
+           "  float delta=(conv[t*channels+2*p.key_heads*128+h*128+col]-memory)*beta,out=0;\n"
+           "  #pragma unroll\n"
+           "  for(uint i=0;i<K;i++){s[i]+=conv[kb+i]*delta;out+=s[i]*conv[qb+i];}\n"
+           "  #pragma unroll\n"
+           "  for(uint step=16/C;step>0;step/=2)out+=simd_shuffle_xor(out,step*C);\n"
+           "  if(klane==0)output[(t*p.value_heads+h)*128+col]=out;\n"
+           " }\n"
+           " #pragma unroll\n"
+           " for(uint i=0;i<K;i++)state[base+i*128]=s[i];\n"
+           "}\n"
+           "kernel void termite_qwen35_recurrent_columns4(device float*s[[buffer(8)]],device const float*x[[buffer(9)]],device const float*g[[buffer(10)]],device float*y[[buffer(11)]],constant termite_qwen35_params&p[[buffer(15)]],uint gid[[thread_position_in_grid]],uint lane[[thread_index_in_simdgroup]]){termite_qwen35_recurrent_columns_body<4>(s,x,g,y,p,gid,lane);}\n"
+           "kernel void termite_qwen35_recurrent(device float *state [[buffer(8)]], device const float *conv [[buffer(9)]], device const float *gates [[buffer(10)]], device float *output [[buffer(11)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+           "    uint column=gid/32;\n"
+           "    if(column>=p.value_heads*128)return;\n"
+           "    uint h=column/128,col=column%128,kh=h/(p.value_heads/p.key_heads);\n"
+           "    uint channels=(2*p.key_heads+p.value_heads)*128;\n"
+           "    uint base=h*128*128+uint(lane)*128+col;\n"
+           "    // A SIMD group owns one value column: four recurrent values per lane.\n"
+           "    // Only the initial/final state touches device memory across the stream.\n"
+           "    float4 values=p.initialized?float4(state[base],state[base+32*128],state[base+64*128],state[base+96*128]):float4(0.0f);\n"
+           "    for(uint t=0;t<p.seq;t++) {\n"
+           "        uint qb=t*channels+kh*128+uint(lane),kb=qb+p.key_heads*128;\n"
+           "        float4 q=float4(conv[qb],conv[qb+32],conv[qb+64],conv[qb+96]);\n"
+           "        float4 k=float4(conv[kb],conv[kb+32],conv[kb+64],conv[kb+96]);\n"
+           "        float decay=gates[(t*p.value_heads+h)*2],beta=gates[(t*p.value_heads+h)*2+1];\n"
+           "        values*=decay;\n"
+           "        float memory=simd_sum(dot(values,k));\n"
+           "        float value=conv[t*channels+2*p.key_heads*128+h*128+col];\n"
+           "        float delta=(value-memory)*beta;\n"
+           "        values+=k*delta;\n"
+           "        float out=simd_sum(dot(values,q));\n"
+           "        if(lane==0)output[(t*p.value_heads+h)*128+col]=out;\n"
+           "    }\n"
+           "    state[base]=values.x;state[base+32*128]=values.y;state[base+64*128]=values.z;state[base+96*128]=values.w;\n"
+           "}\n"
+           "kernel void termite_qwen35_norm(device const float *core [[buffer(11)]], device const float *z [[buffer(12)]], device const float *weight [[buffer(13)]], device float *output [[buffer(14)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if(gid>=p.seq*p.value_heads)return;\n"
+           "    uint base=gid*p.dim;\n"
+           "    float sum=0;\n"
+           "    for(uint d=0;d<p.dim;d++){float v=core[base+d];sum+=v*v;}\n"
+           "    float scale=1.0f/sqrt(sum/float(p.dim)+1e-6f);\n"
+           "    for(uint d=0;d<p.dim;d++) {float gate=z[base+d];output[base+d]=core[base+d]*scale*weight[d]*(gate/(1.0f+exp(-gate)));}\n"
+           "}\n"
+           "kernel void termite_qwen35_prepare_parallel(device const float *beta [[buffer(2)]], device const float *a [[buffer(3)]], device const float *alog [[buffer(4)]], device const float *dt [[buffer(5)]], device float *conv [[buffer(9)]], device float *gates [[buffer(10)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+           "    uint h=gid/32; if(h>=p.value_heads)return;\n"
+           "    if(h<p.key_heads) {\n"
+           "        uint qb=h*p.dim,kb=qb+p.key_heads*p.dim;\n"
+           "        float qs=0,ks=0;\n"
+           "        for(uint d=uint(lane);d<p.dim;d+=32){float q=conv[qb+d],k=conv[kb+d];qs+=q*q;ks+=k*k;}\n"
+           "        float qn=1.0f/sqrt(simd_sum(qs)+1e-6f)/sqrt(float(p.dim)),kn=1.0f/sqrt(simd_sum(ks)+1e-6f);\n"
+           "        for(uint d=uint(lane);d<p.dim;d+=32){conv[qb+d]*=qn;conv[kb+d]*=kn;}\n"
+           "    }\n"
+           "    if(lane==0) {\n"
+           "        float x=a[h]+dt[h];\n"
+           "        float sp=x>20.0f?x:(x< -20.0f?exp(x):log(1.0f+exp(x)));\n"
+           "        gates[h*2]=exp(-exp(alog[h])*sp);\n"
+           "        gates[h*2+1]=1.0f/(1.0f+exp(-beta[h]));\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_qwen35_norm_parallel(device const float *core [[buffer(11)]], device const float *z [[buffer(12)]], device const float *weight [[buffer(13)]], device float *output [[buffer(14)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+           "    uint h=gid/32; if(h>=p.value_heads)return; uint base=h*p.dim;\n"
+           "    float sum=0;\n"
+           "    for(uint d=uint(lane);d<p.dim;d+=32){float v=core[base+d];sum+=v*v;}\n"
+           "    float scale=1.0f/sqrt(simd_sum(sum)/float(p.dim)+1e-6f);\n"
+           "    for(uint d=uint(lane);d<p.dim;d+=32){float gate=z[base+d];output[base+d]=core[base+d]*scale*weight[d]*(gate/(1.0f+exp(-gate)));}\n"
            "}\n"
            "kernel void termite_packed_gelu(device const float *x [[buffer(0)]], device float *y [[buffer(1)]], constant uint2 &p [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i >= p.x * p.y) return; uint row = i / p.y, col = i % p.y; y[i] = termite_gated_activation_product(x[row * p.y * 2u + col], x[row * p.y * 2u + p.y + col], 0u); }\n"
            "struct antfly_rotary_params { uint dim, x, y, vision; float theta; };\n"
@@ -14432,19 +16275,22 @@ static NSString *termite_metal_shader_source(void) {
            "    if (p.format == 1u) { uint k_base = physical_token * p.key_row_bytes; uint residual_base = k_base + p.base_key_row_bytes; float residual_acc = 0.0f; for (uint projection = 0u; projection < 32u; ++projection) { uint residual_bit = kv_h * 32u + projection; uchar residual_byte = encoded_key[residual_base + (residual_bit >> 3)]; float residual_sign = ((residual_byte >> (residual_bit & 7u)) & 1u) != 0u ? 1.0f : -1.0f; residual_acc += residual_sign * residual_projection[projection]; } acc += 0.125f * (residual_acc / 32.0f); }\n"
            "    return acc * rsqrt(float(p.head_dim));\n"
            "}\n"
-           "kernel void termite_paged_attention_kv(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_paged_attention_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
+           "kernel void termite_paged_attention_kv(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_paged_attention_params &p [[buffer(6)]], device const uint *key_positions [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.q_len * p.num_heads; if (gid >= total || p.page_size == 0u || p.num_kv_heads == 0u) return;\n"
            "    uint qi = gid / p.num_heads; uint h = gid - qi * p.num_heads; uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint q_stride = p.num_heads * p.head_dim; uint q_base = qi * q_stride + h * p.head_dim; uint out_base = qi * q_stride + h * p.head_dim; uint query_pos = p.query_position_offset + qi;\n"
            "    thread float residual_projection[32];\n"
            "    if (p.format == 1u) { for (uint projection = 0u; projection < 32u; ++projection) { float projected_query = 0.0f; for (uint d = 0u; d < p.head_dim; ++d) { ulong x = (ulong(kv_h + 1u) * 0x9e3779b97f4a7c15UL); x ^= (ulong(projection + 1u) * 0xbf58476d1ce4e5b9UL); x ^= (ulong(d + 1u) * 0x94d049bb133111ebUL); x ^= x >> 30; x *= 0xbf58476d1ce4e5b9UL; x ^= x >> 27; x *= 0x94d049bb133111ebUL; x ^= x >> 31; float sign = ((x & 1UL) == 0UL) ? 1.0f : -1.0f; projected_query += sign * q[q_base + d]; } residual_projection[projection] = projected_query; } } else { for (uint projection = 0u; projection < 32u; ++projection) residual_projection[projection] = 0.0f; }\n"
            "    float best = -3.402823466e+38f;\n"
-           "    for (uint ki = 0u; ki < p.kv_tokens; ++ki) { uint key_pos = p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; if (!allowed) continue; uint physical_token = termite_attention_page_token(block_table, p, ki); if (physical_token == 0xffffffffu) continue; float score = termite_paged_attention_score(q, encoded_key, p, q_base, physical_token, kv_h, residual_projection); if (p.has_sinks != 0u) score += sinks[h]; if (p.softcap > 0.0f) score = tanh(score / p.softcap) * p.softcap; if (!isfinite(score)) score = -3.402823466e+38f; if (score > best) best = score; }\n"
+           "    for (uint ki = 0u; ki < p.kv_tokens; ++ki) { uint key_pos = p.has_explicit_positions != 0u ? key_positions[ki] : p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; if (!allowed) continue; uint physical_token = termite_attention_page_token(block_table, p, ki); if (physical_token == 0xffffffffu) continue; float score = termite_paged_attention_score(q, encoded_key, p, q_base, physical_token, kv_h, residual_projection); if (p.has_sinks != 0u) score += sinks[h]; if (p.softcap > 0.0f) score = tanh(score / p.softcap) * p.softcap; if (!isfinite(score)) score = -3.402823466e+38f; if (score > best) best = score; }\n"
            "    for (uint d = 0u; d < p.head_dim; ++d) output[out_base + d] = 0.0f;\n"
            "    float sum = 0.0f;\n"
-           "    for (uint ki = 0u; ki < p.kv_tokens; ++ki) { uint key_pos = p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; if (!allowed) continue; uint physical_token = termite_attention_page_token(block_table, p, ki); if (physical_token == 0xffffffffu) continue; float score = termite_paged_attention_score(q, encoded_key, p, q_base, physical_token, kv_h, residual_projection); if (p.has_sinks != 0u) score += sinks[h]; if (p.softcap > 0.0f) score = tanh(score / p.softcap) * p.softcap; if (!isfinite(score)) continue; float e = exp(score - best); if (!isfinite(e)) continue; sum += e; for (uint d = 0u; d < p.head_dim; ++d) output[out_base + d] += e * termite_paged_attention_value_scalar(v_bytes, p, physical_token, kv_h, d); }\n"
+           "    for (uint ki = 0u; ki < p.kv_tokens; ++ki) { uint key_pos = p.has_explicit_positions != 0u ? key_positions[ki] : p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; if (!allowed) continue; uint physical_token = termite_attention_page_token(block_table, p, ki); if (physical_token == 0xffffffffu) continue; float score = termite_paged_attention_score(q, encoded_key, p, q_base, physical_token, kv_h, residual_projection); if (p.has_sinks != 0u) score += sinks[h]; if (p.softcap > 0.0f) score = tanh(score / p.softcap) * p.softcap; if (!isfinite(score)) continue; float e = exp(score - best); if (!isfinite(e)) continue; sum += e; for (uint d = 0u; d < p.head_dim; ++d) output[out_base + d] += e * termite_paged_attention_value_scalar(v_bytes, p, physical_token, kv_h, d); }\n"
            "    float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;\n"
            "    for (uint d = 0u; d < p.head_dim; ++d) output[out_base + d] *= inv_sum;\n"
            "}\n"
+           "struct termite_selection_score_params { termite_metal_paged_attention_params p; float score_scale; };\n"
+           "kernel void termite_selection_score_norm(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uint *query_positions [[buffer(2)]], device const uint *key_positions [[buffer(3)]], device float2 *norm [[buffer(4)]], constant termite_selection_score_params &s [[buffer(5)]], uint gid [[thread_position_in_grid]]) { uint total=s.p.q_len*s.p.num_heads; if(gid>=total)return; uint qi=gid/s.p.num_heads; uint h=gid-qi*s.p.num_heads; uint kvh=h/(s.p.num_heads/s.p.num_kv_heads); uint qb=gid*s.p.head_dim; thread float rp[32]; for(uint x=0;x<32;x++){float a=0.0f;if(s.p.format==1u)for(uint d=0;d<s.p.head_dim;d++){ulong z=(ulong(kvh+1u)*0x9e3779b97f4a7c15UL)^(ulong(x+1u)*0xbf58476d1ce4e5b9UL)^(ulong(d+1u)*0x94d049bb133111ebUL);z^=z>>30;z*=0xbf58476d1ce4e5b9UL;z^=z>>27;z*=0x94d049bb133111ebUL;z^=z>>31;a+=((z&1UL)==0UL?1.0f:-1.0f)*q[qb+d];}rp[x]=a;} bool invalid=false; float best=-3.402823466e+38f; for(uint k=0;k<s.p.kv_tokens;k++){if(key_positions[k]>query_positions[qi])continue;float v=termite_paged_attention_score(q,encoded_key,s.p,qb,k,kvh,rp)*(s.score_scale*sqrt(float(s.p.head_dim)));if(s.p.softcap>0.0f)v=tanh(v/s.p.softcap)*s.p.softcap;if(!isfinite(v))invalid=true;else if(v>best)best=v;} float sum=0.0f;for(uint k=0;k<s.p.kv_tokens;k++){if(key_positions[k]>query_positions[qi])continue;float v=termite_paged_attention_score(q,encoded_key,s.p,qb,k,kvh,rp)*(s.score_scale*sqrt(float(s.p.head_dim)));if(s.p.softcap>0.0f)v=tanh(v/s.p.softcap)*s.p.softcap;if(!isfinite(v))invalid=true;else sum+=exp(v-best);}norm[gid]=float2(best,invalid ? -1.0f : sum);}\n"
+           "kernel void termite_selection_score_reduce(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uint *query_positions [[buffer(2)]], device const uint *key_positions [[buffer(3)]], device const float2 *norm [[buffer(4)]], device float *out [[buffer(5)]], constant termite_selection_score_params &s [[buffer(6)]], uint k [[thread_position_in_grid]]) {if(k>=s.p.kv_tokens)return;float total=0.0f;for(uint qi=0;qi<s.p.q_len;qi++){if(key_positions[k]>query_positions[qi])continue;for(uint h=0;h<s.p.num_heads;h++){uint kvh=h/(s.p.num_heads/s.p.num_kv_heads);uint qb=(qi*s.p.num_heads+h)*s.p.head_dim;thread float rp[32];for(uint x=0;x<32;x++){float a=0.0f;if(s.p.format==1u)for(uint d=0;d<s.p.head_dim;d++){ulong z=(ulong(kvh+1u)*0x9e3779b97f4a7c15UL)^(ulong(x+1u)*0xbf58476d1ce4e5b9UL)^(ulong(d+1u)*0x94d049bb133111ebUL);z^=z>>30;z*=0xbf58476d1ce4e5b9UL;z^=z>>27;z*=0x94d049bb133111ebUL;z^=z>>31;a+=((z&1UL)==0UL?1.0f:-1.0f)*q[qb+d];}rp[x]=a;}float v=termite_paged_attention_score(q,encoded_key,s.p,qb,k,kvh,rp)*(s.score_scale*sqrt(float(s.p.head_dim)));if(s.p.softcap>0.0f)v=tanh(v/s.p.softcap)*s.p.softcap;float2 n=norm[qi*s.p.num_heads+h];if(isfinite(v)&&n.y>0.0f)total+=exp(v-n.x)/n.y;}}out[k]=total/float(s.p.q_len*s.p.num_heads);}\n"
            "kernel void termite_paged_attention_kv_1x(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_paged_attention_params &p [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    uint qi = tg.x; uint h = tg.y; if (qi >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u) return;\n"
            "    const uint NT = 256u; const uint NW = 32u; const uint NSG = 8u; const float scale = rsqrt(float(p.head_dim)); uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint q_stride = p.num_heads * p.head_dim; uint q_base = qi * q_stride + h * p.head_dim; uint out_base = qi * q_stride + h * p.head_dim; uint kv_head_base = kv_h * p.head_dim; uint query_pos = p.query_position_offset + qi; uint kv_end_pos = p.kv_position_offset + p.kv_tokens; bool all_tokens_allowed = query_pos + 1u >= kv_end_pos && (p.sliding_window == 0u || p.sliding_window >= p.kv_tokens); threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.kv_tokens; threadgroup float *phys_tokens = shmem + p.kv_tokens + 256u; const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n"
@@ -14554,6 +16400,92 @@ static NSString *termite_metal_shader_source(void) {
            "// Split is innermost so every SIMD lane reads one coalesced float4.\n"
            "kernel void termite_paged_attention_kv_decode_gqa_split_reduce(device const float4 *partial_o [[buffer(0)]], device float4 *output [[buffer(1)]], constant termite_metal_paged_attention_params &p [[buffer(2)]], constant termite_metal_decode_gqa_split_params &schedule [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint qi = tg.x; const uint h = tg.y; const uint hd = p.head_dim; const uint split_count = schedule.split_count; const bool legacy_geometry = p.num_heads == 8u && (p.num_kv_heads == 1u || p.num_kv_heads == 2u) && ((hd == 256u && p.sliding_window == 512u) || (hd == 512u && p.sliding_window == 0u)); const bool a4b_geometry = p.num_heads == 16u && ((p.num_kv_heads == 8u && hd == 256u && p.sliding_window == 1024u) || (p.num_kv_heads == 2u && hd == 512u && p.sliding_window == 0u)); if (p.kv_tokens == 0u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || h >= p.num_heads || p.q_len == 0u || p.q_len > 2u || (!legacy_geometry && !a4b_geometry)) return;\n"
+           "    const uint qh = qi * p.num_heads + h; const uint hd4 = hd / 4u; const device float *partial_stats = reinterpret_cast<const device float *>(partial_o + p.q_len * p.num_heads * hd4 * split_count);\n"
+           "    float S = lane < split_count ? partial_stats[qh * (2u * split_count) + uint(lane)] : 0.0f; float M = lane < split_count ? partial_stats[qh * (2u * split_count) + split_count + uint(lane)] : -3.402823466e+38f; float merged_m = simd_max(M); float weight = lane < split_count && S > 0.0f ? exp(M - merged_m) : 0.0f; float denom = simd_sum(S * weight); float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
+           "    for (uint d4 = uint(sgitg); d4 < hd4; d4 += schedule.reduce_simdgroups) { float4 value = lane < split_count ? partial_o[(qh * hd4 + d4) * split_count + uint(lane)] : float4(0.0f); float4 merged = simd_sum(value * weight); if (lane == 0u) output[qh * hd4 + d4] = merged * inv_denom; }\n"
+           "}\n"
+           // Qualified OCR global attention reuses the staged SIMD matrix algorithm.
+           "kernel void termite_lightonocr3_gqa_split_stage(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float4 *partial_o [[buffer(5)]], constant termite_metal_paged_attention_params &p [[buffer(6)]], constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z; const uint hd = p.head_dim; const uint split_count = schedule.split_count;\n"
+           "    const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u));\n"
+           "    if (p.kv_tokens == 0u || p.kv_tokens > 2048u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || kv_h >= p.num_kv_heads || split >= split_count || p.q_len == 0u || p.q_len != 1u || p.format != 3u || p.v_element_bytes != 2u || p.page_size == 0u || (p.page_size & 7u) != 0u || !lightonocr3_geometry || p.key_row_bytes != 2u * p.num_kv_heads * hd || p.v_row_stride != p.num_kv_heads * hd || p.has_sinks != 0u || p.softcap != 0.0f) return;\n"
+           "    const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint q_stride = p.num_heads * hd; const uint kv_head_base = kv_h * hd; const uint k_row_halfs = p.key_row_bytes / 2u; const uint query_pos = p.query_position_offset + qi; const float scale = rsqrt(float(hd));\n"
+           "    threadgroup half *sq = (threadgroup half *)shmem; threadgroup char *fb = shmem + 8u * hd * 2u;\n"
+           "    threadgroup float *ss = (threadgroup float *)fb; threadgroup half *sp = (threadgroup half *)(fb + 1024u); threadgroup uint *sphys = (threadgroup uint *)(fb + 1536u);\n"
+           "    threadgroup float *sM = (threadgroup float *)(fb + 1664u); threadgroup float *sS = (threadgroup float *)(fb + 1696u); threadgroup float *sdiag = (threadgroup float *)(fb + 1728u); threadgroup float *so = (threadgroup float *)(fb + 1984u);\n"
+           "    const device half *k_half = reinterpret_cast<const device half *>(encoded_key); const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n"
+           "    for (uint i = uint(tid); i < 8u * hd; i += 256u) { uint j = i / hd; uint d = i - j * hd; uint h = kv_h * heads_per_group + j; sq[i] = j < heads_per_group ? half(q[qi * q_stride + h * hd + d] * scale) : half(0.0f); }\n"
+           "    if (tid < 8u) { sM[tid] = -3.402823466e+38f; sS[tid] = 0.0f; } if (tid < 64u) sdiag[tid] = 0.0f;\n"
+           "    const uint dslice = hd / 8u; const uint d_tiles = dslice / 8u; simdgroup_float8x8 mo[8]; for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    for (uint kc = split * schedule.key_chunk; kc < p.kv_tokens; kc += split_count * schedule.key_chunk) {\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup); if (tid < 32u) { uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? termite_attention_page_token(block_table, p, ki) : 0xffffffffu; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        if (sgitg < 4u) { uint ktile = uint(sgitg); uint phys = sphys[ktile * 8u]; const device half *kbase = k_half + (phys != 0xffffffffu ? phys : 0u) * k_row_halfs + kv_head_base; simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f); for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, kbase + d, k_row_halfs, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } simdgroup_store(ms, ss + ktile * 8u, 32u, 0, false); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        if (sgitg < 4u) { for (uint jj = 0u; jj < 2u; ++jj) { uint j = uint(sgitg) + jj * 4u; uint kk = uint(lane); uint ki = kc + kk; bool allowed = j < heads_per_group && ki < p.kv_tokens && sphys[kk] != 0xffffffffu; if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; } float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f; float row_max = simd_max(sc); float m_old = sM[j]; float m_new = max(m_old, row_max); float e = 0.0f; float corr = 1.0f; if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; } sp[j * 32u + kk] = half(e); float row_sum = simd_sum(e); if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; } } }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup); simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u); for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[dt]); mo[dt] = scaled; }\n"
+           "        for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = uint(sgitg) * dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); if (kc + kk8 * 8u + 8u <= p.kv_tokens) { uint phys = sphys[kk8 * 8u]; const device half *vbase = v_half + phys * p.v_row_stride + kv_head_base + d8; simdgroup_load(mv, vbase, p.v_row_stride); } else { threadgroup half *sv = (threadgroup half *)ss + uint(sgitg) * 64u; for (uint vi = uint(lane); vi < 64u; vi += 32u) { uint vr = vi / 8u; uint vc = vi - vr * 8u; uint vphys = sphys[kk8 * 8u + vr]; sv[vi] = vphys != 0xffffffffu ? v_half[vphys * p.v_row_stride + kv_head_base + d8 + vc] : half(0.0f); } simdgroup_barrier(mem_flags::mem_threadgroup); simdgroup_load(mv, sv, 8u); } simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; }\n"
+           "    }\n"
+           "    device float *partial_stats = reinterpret_cast<device float *>(partial_o + p.q_len * p.num_heads * (hd / 4u) * split_count); if (tid < heads_per_group) { uint h = kv_h * heads_per_group + uint(tid); uint qh = qi * p.num_heads + h; partial_stats[qh * (2u * split_count) + split] = sS[tid]; partial_stats[qh * (2u * split_count) + split_count + split] = sM[tid]; }\n"
+           "    threadgroup float *so_sg = so + uint(sgitg) * 8u * dslice; for (uint dt = 0u; dt < d_tiles; ++dt) simdgroup_store(mo[dt], so_sg + dt * 8u, dslice);\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    const uint hd4 = hd / 4u; const uint dslice4 = dslice / 4u; for (uint i = uint(tid); i < heads_per_group * hd4; i += 256u) { uint j = i / hd4; uint d4 = i - j * hd4; uint owner = d4 / dslice4; uint dv = d4 - owner * dslice4; uint h = kv_h * heads_per_group + j; uint qh = qi * p.num_heads + h; uint so_base = owner * 8u * dslice + j * dslice + dv * 4u; partial_o[(qh * hd4 + d4) * split_count + split] = float4(so[so_base], so[so_base + 1u], so[so_base + 2u], so[so_base + 3u]); }\n"
+           "}\n"
+           "// Stage 2 merges split-local (O,S,M) with the global stable softmax.\n"
+           "// Split is innermost so every SIMD lane reads one coalesced float4.\n"
+           "kernel void termite_lightonocr3_gqa_split_reduce(device const float4 *partial_o [[buffer(0)]], device float4 *output [[buffer(1)]], constant termite_metal_paged_attention_params &p [[buffer(2)]], constant termite_metal_decode_gqa_split_params &schedule [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    const uint qi = tg.x; const uint h = tg.y; const uint hd = p.head_dim; const uint split_count = schedule.split_count; const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u)); if (p.kv_tokens == 0u || p.kv_tokens > 2048u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || h >= p.num_heads || p.q_len == 0u || p.q_len != 1u || !lightonocr3_geometry) return;\n"
+           "    const uint qh = qi * p.num_heads + h; const uint hd4 = hd / 4u; const device float *partial_stats = reinterpret_cast<const device float *>(partial_o + p.q_len * p.num_heads * hd4 * split_count);\n"
+           "    float S = lane < split_count ? partial_stats[qh * (2u * split_count) + uint(lane)] : 0.0f; float M = lane < split_count ? partial_stats[qh * (2u * split_count) + split_count + uint(lane)] : -3.402823466e+38f; float merged_m = simd_max(M); float weight = lane < split_count && S > 0.0f ? exp(M - merged_m) : 0.0f; float denom = simd_sum(S * weight); float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
+           "    for (uint d4 = uint(sgitg); d4 < hd4; d4 += schedule.reduce_simdgroups) { float4 value = lane < split_count ? partial_o[(qh * hd4 + d4) * split_count + uint(lane)] : float4(0.0f); float4 merged = simd_sum(value * weight); if (lane == 0u) output[qh * hd4 + d4] = merged * inv_denom; }\n"
+           "}\n"
+           "struct termite_lighton_batch_row {\n"
+           "    device const float *q;\n"
+           "    device const uchar *k;\n"
+           "    device const uchar *v;\n"
+           "    device const uint *blocks;\n"
+           "    device float4 *partial_o;\n"
+           "    device float4 *output;\n"
+           "    termite_metal_paged_attention_params params;\n"
+           "    termite_metal_decode_gqa_split_params schedule;\n"
+           "};\n"
+           "kernel void termite_lightonocr3_gqa_batch_stage(constant termite_lighton_batch_row *rows [[buffer(0)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    constant termite_lighton_batch_row &row=rows[tg.x];\n"
+           "    constant termite_metal_paged_attention_params &p=row.params;\n"
+           "    constant termite_metal_decode_gqa_split_params &schedule=row.schedule;\n"
+           "    device const float *q=row.q; device const uchar *encoded_key=row.k; device const uchar *v_bytes=row.v;\n"
+           "    device const uint *block_table=row.blocks; device float4 *partial_o=row.partial_o;\n"
+           "\n"
+           "    const uint qi = 0u; const uint kv_h = tg.y; const uint split = tg.z; const uint hd = p.head_dim; const uint split_count = schedule.split_count;\n"
+           "    const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u));\n"
+           "    if (p.kv_tokens == 0u || p.kv_tokens > 2048u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || kv_h >= p.num_kv_heads || split >= split_count || p.q_len == 0u || p.q_len != 1u || p.format != 3u || p.v_element_bytes != 2u || p.page_size == 0u || (p.page_size & 7u) != 0u || !lightonocr3_geometry || p.key_row_bytes != 2u * p.num_kv_heads * hd || p.v_row_stride != p.num_kv_heads * hd || p.has_sinks != 0u || p.softcap != 0.0f) return;\n"
+           "    const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint q_stride = p.num_heads * hd; const uint kv_head_base = kv_h * hd; const uint k_row_halfs = p.key_row_bytes / 2u; const uint query_pos = p.query_position_offset + qi; const float scale = rsqrt(float(hd));\n"
+           "    threadgroup half *sq = (threadgroup half *)shmem; threadgroup char *fb = shmem + 8u * hd * 2u;\n"
+           "    threadgroup float *ss = (threadgroup float *)fb; threadgroup half *sp = (threadgroup half *)(fb + 1024u); threadgroup uint *sphys = (threadgroup uint *)(fb + 1536u);\n"
+           "    threadgroup float *sM = (threadgroup float *)(fb + 1664u); threadgroup float *sS = (threadgroup float *)(fb + 1696u); threadgroup float *sdiag = (threadgroup float *)(fb + 1728u); threadgroup float *so = (threadgroup float *)(fb + 1984u);\n"
+           "    const device half *k_half = reinterpret_cast<const device half *>(encoded_key); const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n"
+           "    for (uint i = uint(tid); i < 8u * hd; i += 256u) { uint j = i / hd; uint d = i - j * hd; uint h = kv_h * heads_per_group + j; sq[i] = j < heads_per_group ? half(q[qi * q_stride + h * hd + d] * scale) : half(0.0f); }\n"
+           "    if (tid < 8u) { sM[tid] = -3.402823466e+38f; sS[tid] = 0.0f; } if (tid < 64u) sdiag[tid] = 0.0f;\n"
+           "    const uint dslice = hd / 8u; const uint d_tiles = dslice / 8u; simdgroup_float8x8 mo[8]; for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    for (uint kc = split * schedule.key_chunk; kc < p.kv_tokens; kc += split_count * schedule.key_chunk) {\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup); if (tid < 32u) { uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? termite_attention_page_token(block_table, p, ki) : 0xffffffffu; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        if (sgitg < 4u) { uint ktile = uint(sgitg); uint phys = sphys[ktile * 8u]; const device half *kbase = k_half + (phys != 0xffffffffu ? phys : 0u) * k_row_halfs + kv_head_base; simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f); for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, kbase + d, k_row_halfs, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } simdgroup_store(ms, ss + ktile * 8u, 32u, 0, false); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        if (sgitg < 4u) { for (uint jj = 0u; jj < 2u; ++jj) { uint j = uint(sgitg) + jj * 4u; uint kk = uint(lane); uint ki = kc + kk; bool allowed = j < heads_per_group && ki < p.kv_tokens && sphys[kk] != 0xffffffffu; if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; } float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f; float row_max = simd_max(sc); float m_old = sM[j]; float m_new = max(m_old, row_max); float e = 0.0f; float corr = 1.0f; if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; } sp[j * 32u + kk] = half(e); float row_sum = simd_sum(e); if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; } } }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup); simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u); for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[dt]); mo[dt] = scaled; }\n"
+           "        for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = uint(sgitg) * dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); if (kc + kk8 * 8u + 8u <= p.kv_tokens) { uint phys = sphys[kk8 * 8u]; const device half *vbase = v_half + phys * p.v_row_stride + kv_head_base + d8; simdgroup_load(mv, vbase, p.v_row_stride); } else { threadgroup half *sv = (threadgroup half *)ss + uint(sgitg) * 64u; for (uint vi = uint(lane); vi < 64u; vi += 32u) { uint vr = vi / 8u; uint vc = vi - vr * 8u; uint vphys = sphys[kk8 * 8u + vr]; sv[vi] = vphys != 0xffffffffu ? v_half[vphys * p.v_row_stride + kv_head_base + d8 + vc] : half(0.0f); } simdgroup_barrier(mem_flags::mem_threadgroup); simdgroup_load(mv, sv, 8u); } simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; }\n"
+           "    }\n"
+           "    device float *partial_stats = reinterpret_cast<device float *>(partial_o + p.q_len * p.num_heads * (hd / 4u) * split_count); if (tid < heads_per_group) { uint h = kv_h * heads_per_group + uint(tid); uint qh = qi * p.num_heads + h; partial_stats[qh * (2u * split_count) + split] = sS[tid]; partial_stats[qh * (2u * split_count) + split_count + split] = sM[tid]; }\n"
+           "    threadgroup float *so_sg = so + uint(sgitg) * 8u * dslice; for (uint dt = 0u; dt < d_tiles; ++dt) simdgroup_store(mo[dt], so_sg + dt * 8u, dslice);\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    const uint hd4 = hd / 4u; const uint dslice4 = dslice / 4u; for (uint i = uint(tid); i < heads_per_group * hd4; i += 256u) { uint j = i / hd4; uint d4 = i - j * hd4; uint owner = d4 / dslice4; uint dv = d4 - owner * dslice4; uint h = kv_h * heads_per_group + j; uint qh = qi * p.num_heads + h; uint so_base = owner * 8u * dslice + j * dslice + dv * 4u; partial_o[(qh * hd4 + d4) * split_count + split] = float4(so[so_base], so[so_base + 1u], so[so_base + 2u], so[so_base + 3u]); }\n"
+           "}\n"
+           "kernel void termite_lightonocr3_gqa_batch_reduce(constant termite_lighton_batch_row *rows [[buffer(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    constant termite_lighton_batch_row &row=rows[tg.x];\n"
+           "    constant termite_metal_paged_attention_params &p=row.params;\n"
+           "    constant termite_metal_decode_gqa_split_params &schedule=row.schedule;\n"
+           "    device const float4 *partial_o=row.partial_o; device float4 *output=row.output;\n"
+           "\n"
+           "    const uint qi = 0u; const uint h = tg.y; const uint hd = p.head_dim; const uint split_count = schedule.split_count; const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u)); if (p.kv_tokens == 0u || p.kv_tokens > 2048u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || h >= p.num_heads || p.q_len == 0u || p.q_len != 1u || !lightonocr3_geometry) return;\n"
            "    const uint qh = qi * p.num_heads + h; const uint hd4 = hd / 4u; const device float *partial_stats = reinterpret_cast<const device float *>(partial_o + p.q_len * p.num_heads * hd4 * split_count);\n"
            "    float S = lane < split_count ? partial_stats[qh * (2u * split_count) + uint(lane)] : 0.0f; float M = lane < split_count ? partial_stats[qh * (2u * split_count) + split_count + uint(lane)] : -3.402823466e+38f; float merged_m = simd_max(M); float weight = lane < split_count && S > 0.0f ? exp(M - merged_m) : 0.0f; float denom = simd_sum(S * weight); float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
            "    for (uint d4 = uint(sgitg); d4 < hd4; d4 += schedule.reduce_simdgroups) { float4 value = lane < split_count ? partial_o[(qh * hd4 + d4) * split_count + uint(lane)] : float4(0.0f); float4 merged = simd_sum(value * weight); if (lane == 0u) output[qh * hd4 + d4] = merged * inv_denom; }\n"
@@ -15725,6 +17657,11 @@ static void termite_metal_stage_timing_resolve_submitted_frame(
         termite_metal_stage_sample_frame_reset(frame);
         return;
     }
+    if(termite_metal_env_flag_enabled(getenv("TERMITE_METAL_STAGE_TIMING_LOG_FRAMES")))
+        fprintf(stderr,"lightonocr3_gpu_frame regime=%s frame=%llu gpu_ns=%llu attention_ns=%llu ffn_ns=%llu other_ns=%llu\n",
+            frame->regime==TERMITE_METAL_FRAME_REGIME_PREFILL?"prefill":"decode",
+            (unsigned long long)frame->frame_id,(unsigned long long)whole_frame_gpu_nanos,
+            (unsigned long long)coarse[0],(unsigned long long)coarse[1],(unsigned long long)coarse[5]);
     target->sampled_frames += 1;
     target->whole_frame_gpu_nanos += whole_frame_gpu_nanos;
     for (size_t bucket = 0; bucket < TERMITE_METAL_STAGE_BUCKET_COUNT; ++bucket) {
@@ -15829,13 +17766,17 @@ static bool termite_metal_planned_compute_barriers_enabled(termite_metal_decode_
     // Concurrent dispatch relies on range-tracked barriers for correctness, so
     // they cannot be disabled or suppressed in that mode.
     if (termite_metal_concurrent_planned_dispatch_enabled(runtime)) return true;
-    const char *disabled = getenv("TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS");
+    const char *disabled = runtime != NULL && runtime->active_frame_cb != nil && runtime->lighton_frame_policy_valid
+        ? (runtime->lighton_frame_barriers_disabled ? "1" : "0")
+        : getenv("TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS");
     if (disabled != NULL && disabled[0] != '\0' && strcmp(disabled, "0") != 0) return false;
     if (runtime != NULL && runtime->planned_compute_barrier_suppression_depth != 0) return false;
     return true;
 }
 
-static bool termite_metal_planned_access_profile_enabled(void) {
+static bool termite_metal_planned_access_profile_enabled(const termite_metal_decode_runtime *runtime) {
+    if (runtime != NULL && runtime->active_frame_cb != nil && runtime->lighton_frame_policy_valid)
+        return runtime->lighton_frame_access_profile;
     const char *enabled = getenv("TERMITE_METAL_PLANNED_ACCESS_PROFILE");
     return enabled != NULL && enabled[0] != '\0' && strcmp(enabled, "0") != 0;
 }
@@ -15970,7 +17911,7 @@ static void termite_metal_decode_runtime_reset_planned_access_profile(termite_me
 }
 
 static void termite_metal_decode_runtime_print_planned_access_profile(termite_metal_decode_runtime *runtime) {
-    if (runtime == NULL || !termite_metal_planned_access_profile_enabled()) return;
+    if (runtime == NULL || !termite_metal_planned_access_profile_enabled(runtime)) return;
     const uint64_t calls = runtime->active_frame_planned_access_prepare_calls;
     if (calls == 0) return;
     const double total_ms = (double)runtime->active_frame_planned_access_nanos / 1000000.0;
@@ -16118,7 +18059,7 @@ static void termite_metal_record_global_planned_barrier(
     if (runtime == NULL) return;
     runtime->active_frame_planned_barrier_count += 1;
     runtime->active_frame_planned_global_barrier_count += 1;
-    if (termite_metal_planned_access_profile_enabled()) {
+    if (termite_metal_planned_access_profile_enabled(runtime)) {
         runtime->active_frame_planned_access_barriers += 1;
     }
 }
@@ -16139,7 +18080,7 @@ static bool termite_metal_encode_resource_barrier(
     runtime->active_frame_planned_barrier_count += 1;
     runtime->active_frame_planned_resource_barrier_count += 1;
     runtime->active_frame_planned_barrier_resource_count += resource_count;
-    if (termite_metal_planned_access_profile_enabled()) {
+    if (termite_metal_planned_access_profile_enabled(runtime)) {
         runtime->active_frame_planned_access_barriers += 1;
     }
     return true;
@@ -16169,7 +18110,7 @@ static int termite_metal_decode_runtime_prepare_planned_compute_accesses(
     if (runtime == NULL || accesses == NULL || access_count == 0) return 0;
     if (runtime->active_frame_cb == nil || runtime->active_planned_compute_encoder == nil) return 0;
 
-    const bool collect_profile = termite_metal_planned_access_profile_enabled();
+    const bool collect_profile = termite_metal_planned_access_profile_enabled(runtime);
     const uint64_t profile_start_ns = collect_profile ? termite_metal_clock_monotonic_nanos() : 0;
     if (collect_profile) {
         runtime->active_frame_planned_access_prepare_calls += 1;
@@ -16808,7 +18749,7 @@ static void termite_metal_maybe_trace_last_frame(termite_metal_decode_runtime *r
     }
 }
 
-static id<MTLComputeCommandEncoder> termite_metal_tracked_compute_command_encoder_for(id<MTLCommandBuffer> command_buffer, size_t source) {
+static id<MTLComputeCommandEncoder> termite_metal_tracked_compute_command_encoder_for_dispatch(id<MTLCommandBuffer> command_buffer, size_t source, bool concurrent) {
     termite_metal_decode_runtime *runtime = termite_metal_active_encoder_runtime;
     if (runtime != NULL && runtime->active_frame_cb == command_buffer) {
         if (termite_metal_trace_encoders_enabled()) fprintf(stderr, "metal_encoder_trace: tracked compute source=%zu\n", source);
@@ -16835,14 +18776,14 @@ static id<MTLComputeCommandEncoder> termite_metal_tracked_compute_command_encode
     }
     id<MTLComputeCommandEncoder> encoder =
         runtime != NULL && runtime->active_frame_cb == command_buffer && runtime->active_stage_sample.selected == 0
-            ? termite_metal_encoder_timing_encoder(runtime->device, command_buffer)
+            ? termite_metal_encoder_timing_encoder(runtime->device, command_buffer, concurrent)
             : nil;
     if (encoder == nil) {
         encoder = termite_metal_stage_timing_compute_encoder(
             runtime,
             command_buffer,
             termite_metal_stage_bucket_for_region(encoder_region),
-            false);
+            concurrent);
     }
     if (runtime != NULL && runtime->active_frame_cb == command_buffer) {
         size_t region = runtime->active_compute_region;
@@ -16856,6 +18797,22 @@ static id<MTLComputeCommandEncoder> termite_metal_tracked_compute_command_encode
     }
     termite_metal_debug_dispatch_profile_install_on_encoder(encoder);
     return encoder;
+}
+
+static id<MTLComputeCommandEncoder> termite_metal_tracked_compute_command_encoder_for(id<MTLCommandBuffer> command_buffer, size_t source) {
+    return termite_metal_tracked_compute_command_encoder_for_dispatch(command_buffer, source, false);
+}
+
+// Reopen only at callers that register dependencies after opening the scope.
+// In particular, the shared F32 norm/residual dispatcher validates all bindings
+// first, then records every producer and consumer in the new serial encoder.
+static bool termite_metal_lightonocr3_decode_coalescing_enabled(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL && runtime->lightonocr3_projections_enabled &&
+        runtime->qwen35_ocr_vector_loads_enabled && runtime->active_frame_cb != nil &&
+        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE &&
+        !termite_metal_concurrent_planned_dispatch_enabled(runtime) &&
+        termite_metal_should_coalesce_planned_compute_encoder(runtime) &&
+        termite_metal_lightonocr3_profile_feature_enabled("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING");
 }
 
 static id<MTLComputeCommandEncoder> termite_metal_scoped_compute_encoder_for(
@@ -18610,6 +20567,7 @@ int termite_metal_decode_runtime_clear_linear_slot(termite_metal_decode_runtime 
         runtime->mtp_head_workspace = nil;
 
 
+    termite_metal_ocr_residency_track(runtime,slot,nil);
     runtime->linear_weight_buffers[slot] = nil;
     runtime->linear_bias_buffers[slot] = nil;
     runtime->linear_in_dims[slot] = 0;
@@ -24831,6 +26789,76 @@ static bool termite_metal_generated_flash_prefill_eligible(
     return eligible;
 }
 
+// F32 query and probability tiles consume the existing F16 paged KV cache.
+// No query/probability quantization, extra persistent storage or cache-format change.
+// These model/device-scoped kernels are qualified by the numerical and reader
+// gates. Explicit enable=0 and the independent disable switches both roll back.
+static bool termite_metal_lightonocr3_feature_default_enabled(const char *enable_name) {
+    const char *value = getenv(enable_name);
+    return value == NULL || termite_metal_env_flag_enabled(value);
+}
+
+static id<MTLComputePipelineState> termite_metal_lightonocr3_prefill_attention_pipeline(
+    termite_metal_decode_runtime *runtime, size_t queries, size_t page_size) {
+    // Each Q.K segment fits one physical 16-token page, including fragmented
+    // page tables. P.V consumes the same page-sized segments directly, avoiding
+    // the K/V threadgroup staging allocation without changing F32 arithmetic.
+    id<MTLComputePipelineState> direct = runtime->lightonocr3_prefill_attention_direct_pipeline;
+    if (queries >= 32 && page_size > 0 && page_size % 16 == 0 && direct != nil &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_DIRECT_KV")) &&
+        direct.threadExecutionWidth == 32 && direct.maxTotalThreadsPerThreadgroup >= 128 &&
+        direct.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength) return direct;
+    id<MTLComputePipelineState> large = runtime->lightonocr3_prefill_attention_mpp32_pipeline;
+    if (queries >= 256 && large != nil && large.threadExecutionWidth == 32 &&
+        large.maxTotalThreadsPerThreadgroup >= 128 &&
+        large.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength) return large;
+    return runtime->lightonocr3_prefill_attention_mpp_pipeline;
+}
+
+static bool termite_metal_lightonocr3_prefill_attention_mpp_eligible(
+    termite_metal_decode_runtime *runtime, const termite_metal_paged_attention_params *p) {
+    id<MTLComputePipelineState> pipeline = termite_metal_lightonocr3_prefill_attention_pipeline(runtime, p->q_len, p->page_size);
+    // Short queries only use the direct-KV pipeline at measured crossovers.
+    // A missing/disabled direct pipeline falls back to generic attention;
+    // staging K/V for these shapes is slower. Single-token decode is unchanged.
+    const bool short_direct = p->q_len < 128 && p->kv_tokens >= 256 &&
+        ((p->num_heads == 16 && p->q_len >= 32) || (p->num_heads == 8 && p->q_len >= 64)) &&
+        pipeline != nil && pipeline == runtime->lightonocr3_prefill_attention_direct_pipeline;
+    return runtime->lightonocr3_projections_enabled && runtime->qwen35_ocr_vector_loads_enabled &&
+        termite_metal_lightonocr3_feature_default_enabled("TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP") &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP")) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")) &&
+        p->format == 3 && p->v_element_bytes == 2 && p->head_dim == 256 && p->has_sinks == 0 &&
+        p->has_explicit_positions == 0 &&
+        p->softcap == 0 && p->sliding_window == 0 && (p->q_len >= 128 || short_direct) && p->q_len <= 2048 &&
+        p->kv_tokens >= p->q_len && p->kv_tokens <= 4096 && p->page_size > 0 &&
+        p->query_position_offset >= p->kv_position_offset &&
+        p->q_len <= UINT32_MAX - p->query_position_offset &&
+        p->kv_tokens <= UINT32_MAX - p->kv_position_offset &&
+        ((p->num_heads == 8 && p->num_kv_heads == 2) || (p->num_heads == 16 && p->num_kv_heads == 4)) &&
+        p->key_row_bytes >= p->num_kv_heads * 256 * 2 && p->key_row_bytes % 2 == 0 &&
+        p->v_row_stride >= p->num_kv_heads * 256 && pipeline != nil &&
+        pipeline.threadExecutionWidth == 32 && pipeline.maxTotalThreadsPerThreadgroup >= 128 &&
+        pipeline.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength;
+}
+
+static void termite_metal_lightonocr3_dispatch_prefill_attention(
+    termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder,
+    const termite_metal_paged_attention_params *p) {
+    const size_t tile = termite_metal_lightonocr3_prefill_attention_pipeline(runtime, p->q_len, p->page_size) ==
+        runtime->lightonocr3_prefill_attention_mpp32_pipeline ? 32 : 16;
+    const bool direct = termite_metal_lightonocr3_prefill_attention_pipeline(runtime, p->q_len, p->page_size) ==
+        runtime->lightonocr3_prefill_attention_direct_pipeline;
+    if (direct) runtime->lightonocr3_prefill_attention_direct_dispatches++;
+    [encoder dispatchThreadgroups:MTLSizeMake((p->q_len + tile - 1u) / tile, p->num_heads, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (p->q_len < 128 && direct) runtime->lightonocr3_short_direct_attention_dispatches++;
+    if (runtime->lightonocr3_prefill_attention_mpp_dispatches++ == 0 &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_ATTENTION_MPP")))
+        fprintf(stderr, "lightonocr3_prefill_attention_mpp: queries=%u keys=%u heads=%u tile=%zu direct=%d\n",
+            p->q_len, p->kv_tokens, p->num_heads, tile, direct);
+}
+
 static bool termite_metal_handwritten_flash_prefill_eligible(
     termite_metal_decode_runtime *runtime,
     uint32_t format,
@@ -24872,7 +26900,281 @@ typedef struct termite_metal_decode_gqa_split_launch {
     termite_metal_decode_gqa_split_params params;
     termite_metal_decode_gqa_split_shape shape;
     size_t scratch_bytes;
+    bool lightonocr3;
 } termite_metal_decode_gqa_split_launch;
+
+// Bounded decode-only collector. Each page keeps its own parameters and
+// physical KV pages; only command encoding and disjoint split scratch are
+// shared.
+#define TERMITE_METAL_LIGHTON_BATCH_ROWS 16u
+#define TERMITE_METAL_LIGHTON_BATCH_SCRATCH (9u * 1024u * 1024u)
+typedef struct termite_metal_lighton_attention_record {
+  termite_metal_decode_runtime *owner;
+  id<MTLBuffer> q, k, v, output;
+  size_t q_offset, output_offset, scratch_offset;
+  uint32_t blocks[256];
+  termite_metal_paged_attention_params params;
+  termite_metal_decode_gqa_split_launch launch;
+} termite_metal_lighton_attention_record;
+typedef struct termite_metal_lighton_attention_batch {
+  size_t count, scratch_bytes;
+  id<MTLBuffer> scratch;
+  termite_metal_lighton_attention_record rows[TERMITE_METAL_LIGHTON_BATCH_ROWS];
+} termite_metal_lighton_attention_batch;
+
+static void termite_metal_lighton_attention_batch_abort(
+    termite_metal_decode_runtime *runtime) {
+  if (runtime == NULL || runtime->lighton_attention_batch == NULL)
+    return;
+  termite_metal_lighton_attention_batch *batch =
+      runtime->lighton_attention_batch;
+  runtime->lighton_attention_batch = NULL;
+  for (size_t i = 0; i < batch->count; ++i) {
+    batch->rows[i].q = nil;
+    batch->rows[i].k = nil;
+    batch->rows[i].v = nil;
+    batch->rows[i].output = nil;
+  }
+  batch->scratch = nil;
+  free(batch);
+}
+
+int termite_metal_decode_runtime_lighton_attention_batch_begin(
+    termite_metal_decode_runtime *runtime) {
+  if (runtime == NULL || runtime->active_frame_cb == nil ||
+      runtime->lighton_attention_batch != NULL ||
+      !termite_metal_qualified_m4_device_default())
+    return -1;
+  const size_t bank = runtime->active_frame_decode_gqa_split_scratch_slot & 1u;
+  if (runtime->lighton_attention_batch_scratch[bank] == nil) {
+    runtime->lighton_attention_batch_scratch[bank] =
+        antfly_observe_metal_buffer(
+            [runtime->device
+                newBufferWithLength:TERMITE_METAL_LIGHTON_BATCH_SCRATCH
+                            options:MTLResourceStorageModePrivate],
+            ANTFLY_BUFFER_OWNED);
+    if (runtime->lighton_attention_batch_scratch[bank] == nil)
+      return -2;
+  }
+  termite_metal_lighton_attention_batch *batch = calloc(1, sizeof(*batch));
+  if (batch == NULL)
+    return -3;
+  batch->scratch = runtime->lighton_attention_batch_scratch[bank];
+  runtime->lighton_attention_batch = batch;
+  return 0;
+}
+
+void termite_metal_decode_runtime_lighton_attention_batch_abort(
+    termite_metal_decode_runtime *runtime) {
+  termite_metal_lighton_attention_batch_abort(runtime);
+}
+
+typedef struct termite_metal_lighton_batch_row {
+  uint64_t q, k, v, blocks, partial_o, output;
+  termite_metal_paged_attention_params params;
+  termite_metal_decode_gqa_split_params schedule;
+} termite_metal_lighton_batch_row;
+_Static_assert(sizeof(termite_metal_lighton_batch_row) == 152,
+               "OCR batch row ABI drift");
+_Static_assert(offsetof(termite_metal_lighton_batch_row, params) == 48,
+               "OCR batch params ABI drift");
+_Static_assert(offsetof(termite_metal_lighton_batch_row, schedule) == 132,
+               "OCR batch schedule ABI drift");
+
+// Return zero only before any GPU command is encoded. Fallback never replays
+// a stage, reduction, KV seed, or recurrent state update.
+static int termite_metal_lighton_attention_encode_batch_kernel(
+    termite_metal_decode_runtime *runtime,
+    termite_metal_lighton_attention_batch *batch) {
+  if (runtime->lightonocr3_gqa_batch_stage_pipeline == nil ||
+      runtime->lightonocr3_gqa_batch_reduce_pipeline == nil ||
+      termite_metal_env_flag_enabled(
+          getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCHED_GQA_KERNEL")))
+    return 0;
+  if (runtime->lightonocr3_gqa_batch_stage_pipeline
+              .maxTotalThreadsPerThreadgroup < 256u ||
+      runtime->lightonocr3_gqa_batch_reduce_pipeline
+              .maxTotalThreadsPerThreadgroup < 256u ||
+      runtime->lightonocr3_gqa_batch_stage_pipeline.threadExecutionWidth !=
+          32u ||
+      runtime->lightonocr3_gqa_batch_reduce_pipeline.threadExecutionWidth !=
+          32u)
+    return 0;
+  const uint32_t heads = batch->rows[0].params.num_heads,
+                 kv_heads = batch->rows[0].params.num_kv_heads;
+  uint32_t max_splits = 0;
+  uint32_t blocks[TERMITE_METAL_LIGHTON_BATCH_ROWS][256];
+  memset(blocks, 0, sizeof(blocks));
+  for (size_t i = 0; i < batch->count; i++) {
+    termite_metal_lighton_attention_record *r = &batch->rows[i];
+    if (r->params.num_heads != heads || r->params.num_kv_heads != kv_heads ||
+        r->q.gpuAddress == 0 || r->k.gpuAddress == 0 || r->v.gpuAddress == 0 ||
+        r->output.gpuAddress == 0)
+      return 0;
+    memcpy(blocks[i], r->blocks, r->params.block_count * sizeof(uint32_t));
+    if (r->launch.params.split_count > max_splits)
+      max_splits = r->launch.params.split_count;
+  }
+  id<MTLBuffer> table = antfly_observe_metal_buffer(
+      [runtime->device newBufferWithBytes:blocks
+                                   length:batch->count * sizeof(blocks[0])
+                                  options:MTLResourceStorageModeShared],
+      ANTFLY_BUFFER_INITIALIZED);
+  if (table == nil || table.gpuAddress == 0 || batch->scratch.gpuAddress == 0)
+    return 0;
+  termite_metal_lighton_batch_row rows[TERMITE_METAL_LIGHTON_BATCH_ROWS];
+  id<MTLResource> resources[TERMITE_METAL_LIGHTON_BATCH_ROWS * 4 + 2];
+  size_t resource_count = 0;
+  resources[resource_count++] = table;
+  resources[resource_count++] = batch->scratch;
+  for (size_t i = 0; i < batch->count; i++) {
+    termite_metal_lighton_attention_record *r = &batch->rows[i];
+    rows[i] = (termite_metal_lighton_batch_row){
+        .q = r->q.gpuAddress + r->q_offset,
+        .k = r->k.gpuAddress,
+        .v = r->v.gpuAddress,
+        .blocks = table.gpuAddress + i * sizeof(blocks[0]),
+        .partial_o = batch->scratch.gpuAddress + r->scratch_offset,
+        .output = r->output.gpuAddress + r->output_offset,
+        .params = r->params,
+        .schedule = r->launch.params};
+    resources[resource_count++] = r->q;
+    resources[resource_count++] = r->k;
+    resources[resource_count++] = r->v;
+    resources[resource_count++] = r->output;
+  }
+  if (termite_metal_decode_runtime_retain_frame_resource(runtime, table) != 0)
+    return -1;
+  // Ending the producer encoder orders all KV seeds and Q writes before the
+  // two dispatches. Their indirect buffers are explicitly declared resident.
+  termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(
+      runtime);
+  id<MTLComputeCommandEncoder> encoder = [runtime->active_frame_cb
+      computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+  if (encoder == nil)
+    return -1;
+  [encoder useResources:resources
+                  count:resource_count
+                  usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  [encoder setBytes:rows length:batch->count * sizeof(rows[0]) atIndex:0];
+  [encoder
+      setComputePipelineState:runtime->lightonocr3_gqa_batch_stage_pipeline];
+  [encoder setThreadgroupMemoryLength:
+               TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(256)
+                              atIndex:0];
+  [encoder dispatchThreadgroups:MTLSizeMake(batch->count, kv_heads, max_splits)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  [encoder
+      setComputePipelineState:runtime->lightonocr3_gqa_batch_reduce_pipeline];
+  [encoder dispatchThreadgroups:MTLSizeMake(batch->count, heads, 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [encoder endEncoding];
+  for (size_t i = 0; i < batch->count; i++)
+    batch->rows[i].owner->lightonocr3_gqa_split_calls += 1;
+  return 1;
+}
+
+int termite_metal_decode_runtime_lighton_attention_batch_end(
+    termite_metal_decode_runtime *runtime) {
+  if (runtime == NULL || runtime->active_frame_cb == nil ||
+      runtime->lighton_attention_batch == NULL)
+    return -1;
+  termite_metal_lighton_attention_batch *batch =
+      runtime->lighton_attention_batch;
+  if (batch->count == 0u) {
+    termite_metal_lighton_attention_batch_abort(runtime);
+    return 0;
+  }
+  const int batch_kernel =
+      termite_metal_lighton_attention_encode_batch_kernel(runtime, batch);
+  if (batch_kernel < 0)
+    return -2;
+  if (batch_kernel > 0) {
+    runtime->lighton_attention_batch_kernel_calls += 1;
+    runtime->lighton_attention_batch_calls += 1;
+    runtime->lighton_attention_batch_rows += batch->count;
+    termite_metal_lighton_attention_batch_abort(runtime);
+    return 0;
+  }
+  // Finish all Q producers and KV seeds before concurrent read-only attention.
+  termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(
+      runtime);
+  id<MTLComputeCommandEncoder> encoder = [runtime->active_frame_cb
+      computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+  if (encoder == nil)
+    return -2;
+  const float zero_sink = 0.0f;
+  for (size_t i = 0; i < batch->count; ++i) {
+    termite_metal_lighton_attention_record *r = &batch->rows[i];
+    [encoder
+        setComputePipelineState:r->owner->lightonocr3_gqa_split_stage_pipeline];
+    [encoder setBuffer:r->q offset:r->q_offset atIndex:0];
+    [encoder setBuffer:r->k offset:0 atIndex:1];
+    [encoder setBuffer:r->v offset:0 atIndex:2];
+    [encoder setBytes:r->blocks
+               length:r->params.block_count * sizeof(uint32_t)
+              atIndex:3];
+    [encoder setBytes:&zero_sink length:sizeof(zero_sink) atIndex:4];
+    [encoder setBuffer:batch->scratch offset:r->scratch_offset atIndex:5];
+    [encoder setBytes:&r->params length:sizeof(r->params) atIndex:6];
+    [encoder setBytes:&r->launch.params
+               length:sizeof(r->launch.params)
+              atIndex:7];
+    [encoder setThreadgroupMemoryLength:
+                 TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(
+                     r->params.head_dim)
+                                atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, r->params.num_kv_heads,
+                                              r->launch.params.split_count)
+            threadsPerThreadgroup:MTLSizeMake(r->launch.schedule.stage_threads,
+                                              1, 1)];
+  }
+  [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  for (size_t i = 0; i < batch->count; ++i) {
+    termite_metal_lighton_attention_record *r = &batch->rows[i];
+    [encoder setComputePipelineState:r->owner->
+                                     lightonocr3_gqa_split_reduce_pipeline];
+    [encoder setBuffer:batch->scratch offset:r->scratch_offset atIndex:0];
+    [encoder setBuffer:r->output offset:r->output_offset atIndex:1];
+    [encoder setBytes:&r->params length:sizeof(r->params) atIndex:2];
+    [encoder setBytes:&r->launch.params
+               length:sizeof(r->launch.params)
+              atIndex:3];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, r->params.num_heads, 1)
+            threadsPerThreadgroup:MTLSizeMake(r->launch.schedule.reduce_threads,
+                                              1, 1)];
+    r->owner->lightonocr3_gqa_split_calls += 1;
+  }
+  [encoder endEncoding];
+  runtime->lighton_attention_batch_calls += 1;
+  runtime->lighton_attention_batch_rows += batch->count;
+  termite_metal_lighton_attention_batch_abort(runtime);
+  return 0;
+}
+
+// The provider may outlive a backend epoch. Release admitted scratch only
+// after both active and submitted work have been retired by the epoch owner.
+int termite_metal_decode_runtime_lighton_attention_batch_release(
+    termite_metal_decode_runtime *runtime) {
+  if (runtime == NULL)
+    return -1;
+  if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil)
+    return -2;
+  termite_metal_lighton_attention_batch_abort(runtime);
+  runtime->lighton_attention_batch_scratch[0] = nil;
+  runtime->lighton_attention_batch_scratch[1] = nil;
+  return 0;
+}
+
+void termite_metal_decode_runtime_lighton_attention_batch_stats(
+    termite_metal_decode_runtime *runtime, uint64_t *out) {
+  if (out == NULL)
+    return;
+  out[0] = runtime != NULL ? runtime->lighton_attention_batch_calls : 0;
+  out[1] = runtime != NULL ? runtime->lighton_attention_batch_rows : 0;
+  out[2] = runtime != NULL ? runtime->lighton_attention_batch_kernel_calls : 0;
+}
 
 static bool termite_metal_decode_gqa_split_schedule_for_variant(
     termite_metal_decode_gqa_split_variant requested,
@@ -25157,7 +27459,11 @@ static bool termite_metal_decode_gqa_split_eligible(
     if (launch_out != NULL) memset(launch_out, 0, sizeof(*launch_out));
     if (strict_failure_out != NULL) *strict_failure_out = false;
     if (runtime == NULL) return false;
-    const size_t min_kv_tokens = runtime->decode_gqa_split_min_kv_explicit
+    const bool lightonocr3_shape = runtime->qwen35_ocr_vector_loads_enabled &&
+        termite_metal_qualified_m4_device_default() && q_len == 1u &&
+        head_dim == 256u && sliding_window == 0u &&
+        ((num_heads == 8u && num_kv_heads == 2u) || (num_heads == 16u && num_kv_heads == 4u));
+    size_t min_kv_tokens = runtime->decode_gqa_split_min_kv_explicit
         ? runtime->decode_gqa_split_min_kv_override
         : termite_metal_decode_gqa_split_effective_default_min_kv_tokens(
             q_len,
@@ -25165,11 +27471,15 @@ static bool termite_metal_decode_gqa_split_eligible(
             num_kv_heads,
             head_dim,
             sliding_window);
+    if (lightonocr3_shape && min_kv_tokens < 192u) min_kv_tokens = 192u;
     // Record the effective floor before every policy exit so the documented
     // disable/rollback lane reports the model- and q_len-specific policy it
     // bypassed instead of the runtime's generic initialization value.
     runtime->decode_gqa_split_min_kv_tokens = min_kv_tokens;
     if (!runtime->decode_gqa_split_enabled) return false;
+    const bool lightonocr3_geometry = lightonocr3_shape &&
+        kv_tokens >= min_kv_tokens && kv_tokens <= 2048u &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_GQA_SPLIT"));
     const bool legacy_geometry = num_heads == 8u &&
         (num_kv_heads == 1u || num_kv_heads == 2u) &&
         ((head_dim == 256u && sliding_window == 512u) ||
@@ -25187,60 +27497,68 @@ static bool termite_metal_decode_gqa_split_eligible(
         runtime->decode_gqa_split_frame_scratch_reported = 1u;
     }
     if (format != 3u || sinks != NULL || softcap != 0.0f || q_len == 0u || q_len > 2u ||
-        (!legacy_geometry && !a4b_geometry) ||
+        (!legacy_geometry && !a4b_geometry && !lightonocr3_geometry) ||
         page_size == 0u || page_size % 8u != 0u) return false;
     if (kv_tokens < min_kv_tokens) {
-        runtime->decode_gqa_split_below_min_kv_calls += 1u;
+        if (!lightonocr3_geometry) runtime->decode_gqa_split_below_min_kv_calls += 1u;
         return false;
     }
-    termite_metal_decode_gqa_split_shape shape;
-    if (!termite_metal_decode_gqa_split_shape_classify(head_dim, sliding_window, &shape)) return false;
-    termite_metal_decode_gqa_split_launch launch;
-    const int selected = termite_metal_decode_gqa_split_select(
-        termite_metal_decode_gqa_split_override_for_shape(runtime, shape),
-        min_kv_tokens,
-        q_len,
-        kv_tokens,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        sliding_window,
-        &launch);
+    termite_metal_decode_gqa_split_launch launch = {0};
+    int selected = 0;
+    if (lightonocr3_geometry) {
+        // Keep OCR outside the exported Gemma schedule portfolio and counters.
+        // Its global HD256 route has separate shaders and fixed qualification.
+        if (termite_metal_decode_gqa_split_schedule_for_variant(TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_AUTO, &launch.schedule)) {
+            const size_t splits = ((kv_tokens + launch.schedule.key_chunk - 1u) / launch.schedule.key_chunk < launch.schedule.max_splits) ? (kv_tokens + launch.schedule.key_chunk - 1u) / launch.schedule.key_chunk : launch.schedule.max_splits;
+            launch.params = (termite_metal_decode_gqa_split_params){
+                .split_count = (uint32_t)splits, .max_splits = launch.schedule.max_splits,
+                .key_chunk = launch.schedule.key_chunk, .reduce_simdgroups = launch.schedule.reduce_threads / 32u,
+            };
+            launch.lightonocr3 = true;
+            selected = termite_metal_decode_gqa_split_scratch_bytes(q_len, num_heads, head_dim, splits, &launch.scratch_bytes) ? 1 : -3;
+        }
+    } else {
+        termite_metal_decode_gqa_split_shape shape;
+        if (!termite_metal_decode_gqa_split_shape_classify(head_dim, sliding_window, &shape)) return false;
+        selected = termite_metal_decode_gqa_split_select(
+            termite_metal_decode_gqa_split_override_for_shape(runtime, shape), min_kv_tokens,
+            q_len, kv_tokens, num_heads, num_kv_heads, head_dim, sliding_window, &launch);
+    }
     if (selected <= 0) {
-        runtime->decode_gqa_split_schedule_fallback_calls += 1;
-        if (strict_failure_out != NULL && runtime->decode_gqa_split_explicitly_requested) {
+        if (!lightonocr3_geometry) runtime->decode_gqa_split_schedule_fallback_calls += 1;
+        if (strict_failure_out != NULL && runtime->decode_gqa_split_explicitly_requested && !lightonocr3_geometry) {
             *strict_failure_out = true;
         }
         return false;
     }
+    id<MTLComputePipelineState> stage = lightonocr3_geometry ? runtime->lightonocr3_gqa_split_stage_pipeline : runtime->attention_decode_gqa_split_stage_pipeline;
+    id<MTLComputePipelineState> reduce = lightonocr3_geometry ? runtime->lightonocr3_gqa_split_reduce_pipeline : runtime->attention_decode_gqa_split_reduce_pipeline;
     size_t expected_key_row_bytes = 0;
     size_t expected_v_row_stride = 0;
     id<MTLBuffer> scratch_buffer =
         termite_metal_decode_gqa_split_scratch_for_encoding(scratch_runtime);
     if (scratch_runtime == NULL || runtime->device != scratch_runtime->device ||
         output_offset % (4u * sizeof(float)) != 0u ||
-        runtime->attention_decode_gqa_split_stage_pipeline == nil ||
-        runtime->attention_decode_gqa_split_reduce_pipeline == nil ||
+        stage == nil ||
+        reduce == nil ||
         scratch_buffer == nil ||
         !termite_metal_size_mul3(num_kv_heads, head_dim, sizeof(uint16_t), &expected_key_row_bytes) ||
         !termite_metal_size_mul(num_kv_heads, head_dim, &expected_v_row_stride) ||
         key_row_bytes != expected_key_row_bytes || v_row_stride != expected_v_row_stride ||
         launch.scratch_bytes > scratch_runtime->attention_decode_gqa_split_scratch_capacity ||
         launch.scratch_bytes > scratch_buffer.length) {
-        runtime->decode_gqa_split_schedule_fallback_calls += 1;
-        if (strict_failure_out != NULL && runtime->decode_gqa_split_explicitly_requested) {
+        if (!lightonocr3_geometry) runtime->decode_gqa_split_schedule_fallback_calls += 1;
+        if (strict_failure_out != NULL && runtime->decode_gqa_split_explicitly_requested && !lightonocr3_geometry) {
             *strict_failure_out = true;
         }
         return false;
     }
-    id<MTLComputePipelineState> stage = runtime->attention_decode_gqa_split_stage_pipeline;
-    id<MTLComputePipelineState> reduce = runtime->attention_decode_gqa_split_reduce_pipeline;
     if (stage.maxTotalThreadsPerThreadgroup < launch.schedule.stage_threads ||
         reduce.maxTotalThreadsPerThreadgroup < launch.schedule.reduce_threads ||
         stage.threadExecutionWidth != 32u || reduce.threadExecutionWidth != 32u ||
         runtime->device.maxThreadgroupMemoryLength < TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(head_dim)) {
-        runtime->decode_gqa_split_schedule_fallback_calls += 1;
-        if (strict_failure_out != NULL && runtime->decode_gqa_split_explicitly_requested) {
+        if (!lightonocr3_geometry) runtime->decode_gqa_split_schedule_fallback_calls += 1;
+        if (strict_failure_out != NULL && runtime->decode_gqa_split_explicitly_requested && !lightonocr3_geometry) {
             *strict_failure_out = true;
         }
         return false;
@@ -25271,7 +27589,7 @@ static int termite_metal_encode_decode_gqa_split_dispatch(
         launch->schedule.variant < TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_S8 ||
         launch->schedule.variant > TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_S32 ||
         launch->shape >= TERMITE_METAL_DECODE_GQA_SPLIT_SHAPE_COUNT) return failure_code;
-    [encoder setComputePipelineState:runtime->attention_decode_gqa_split_stage_pipeline];
+    [encoder setComputePipelineState:launch->lightonocr3 ? runtime->lightonocr3_gqa_split_stage_pipeline : runtime->attention_decode_gqa_split_stage_pipeline];
     [encoder setBuffer:scratch_buffer offset:0 atIndex:5];
     [encoder setBytes:params length:sizeof(*params) atIndex:6];
     [encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:7];
@@ -25302,7 +27620,7 @@ static int termite_metal_encode_decode_gqa_split_dispatch(
             2,
             failure_code) != 0) return failure_code;
     if (needs_explicit_split_barrier) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-    [encoder setComputePipelineState:runtime->attention_decode_gqa_split_reduce_pipeline];
+    [encoder setComputePipelineState:launch->lightonocr3 ? runtime->lightonocr3_gqa_split_reduce_pipeline : runtime->attention_decode_gqa_split_reduce_pipeline];
     [encoder setBuffer:scratch_buffer offset:0 atIndex:0];
     [encoder setBuffer:output_buffer offset:output_offset atIndex:1];
     [encoder setBytes:params length:sizeof(*params) atIndex:2];
@@ -25310,9 +27628,12 @@ static int termite_metal_encode_decode_gqa_split_dispatch(
     [encoder dispatchThreadgroups:MTLSizeMake(params->q_len, params->num_heads, 1)
         threadsPerThreadgroup:MTLSizeMake(launch->schedule.reduce_threads, 1, 1)];
 
-    runtime->decode_gqa_split_calls += 1;
-    const size_t variant_index = (size_t)launch->schedule.variant - 1u;
-    runtime->decode_gqa_split_schedule_calls[launch->shape][variant_index] += 1;
+    if (launch->lightonocr3) runtime->lightonocr3_gqa_split_calls += 1;
+    else {
+        runtime->decode_gqa_split_calls += 1;
+        const size_t variant_index = (size_t)launch->schedule.variant - 1u;
+        runtime->decode_gqa_split_schedule_calls[launch->shape][variant_index] += 1;
+    }
     return 0;
 }
 
@@ -25520,6 +27841,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
         return failure_code;
     }
 
+    const bool use_lightonocr3_prefill = termite_metal_lightonocr3_prefill_attention_mpp_eligible(runtime, &params);
     id<MTLComputePipelineState> decode_1x_pipeline = runtime->attention_1x_generated_pipeline != nil
         ? runtime->attention_1x_generated_pipeline
         : runtime->attention_paged_1x_pipeline;
@@ -25585,7 +27907,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     // of the kernel body — the model-token acceptance gate for the generated route.
     // Prefer generated flash only when its model-shape and device gates pass;
     // otherwise preserve the independently eligible hand-written flash route.
-    [encoder setComputePipelineState:use_decode_gqa_split ? runtime->attention_decode_gqa_split_stage_pipeline : (use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline)))];
+    [encoder setComputePipelineState:use_lightonocr3_prefill ? termite_metal_lightonocr3_prefill_attention_pipeline(runtime, q_len, page_size) : (use_decode_gqa_split ? (split_launch.lightonocr3 ? runtime->lightonocr3_gqa_split_stage_pipeline : runtime->attention_decode_gqa_split_stage_pipeline) : (use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline))))];
     [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
     [encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];
     [encoder setBuffer:runtime->attention_span_v_buffers[slot] offset:0 atIndex:2];
@@ -25607,7 +27929,12 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     }
     [encoder setBuffer:(use_decode_gqa_split ? decode_gqa_split_scratch_buffer : output_buffer) offset:(use_decode_gqa_split ? 0u : output_offset) atIndex:5];
     [encoder setBytes:&params length:sizeof(params) atIndex:6];
-    if (use_decode_gqa_split) {
+    if (!use_decode_gqa_split && !use_prefill_hd512 && !use_prefill_sg && !use_decode_1x) {
+        [encoder setBytes:&params.kv_position_offset length:sizeof(params.kv_position_offset) atIndex:7];
+    }
+    if (use_lightonocr3_prefill) {
+        termite_metal_lightonocr3_dispatch_prefill_attention(runtime, encoder, &params);
+    } else if (use_decode_gqa_split) {
         if (termite_metal_encode_decode_gqa_split_dispatch(
                 runtime,
                 runtime,
@@ -27919,6 +30246,17 @@ static bool termite_metal_a4b_simd4_rms_norm_rows_preferred(
 ) {
     if (runtime == NULL || runtime->rms_norm_rows_simd4_reduce_pipeline == nil) return false;
     if (runtime->rms_norm_rows_simd4_reduce_pipeline.maxTotalThreadsPerThreadgroup < 256) return false;
+    // The integrated 4B OCR decoder otherwise launches a single scalar lane
+    // for its wide decode norms. Keep F32 reductions and scope this rollout
+    // to the model/device owner and its hidden/head dimensions.
+    if (runtime->lightonocr3_projections_enabled && rows >= 1u && rows <= 32u &&
+        (hidden_size == 2560u || hidden_size == 256u) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS")) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PARALLEL_NORM"))) return true;
+    if (runtime->qwen35_ocr_vector_loads_enabled && rows >= 1u && rows <= 16u &&
+        (hidden_size == 1024u || hidden_size == 128u) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS")) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PARALLEL_NORM"))) return true;
     static int enabled = -1;
     if (enabled < 0) {
         enabled = termite_metal_a4b_high_memory_feature_enabled(
@@ -27926,6 +30264,128 @@ static bool termite_metal_a4b_simd4_rms_norm_rows_preferred(
             "TERMITE_METAL_DISABLE_A4B_PARALLEL_RMS_NORM");
     }
     return enabled == 1 && rows >= 1u && rows <= 32u && hidden_size >= 128u && (hidden_size % 4u) == 0u;
+}
+
+// Model-scoped rollout: the shared provider lease is held by its owner.
+void termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(termite_metal_decode_runtime *runtime, int enabled) {
+    if (runtime == NULL) return;
+    runtime->qwen35_ocr_vector_loads_enabled = enabled != 0 &&
+        [runtime->device.name isEqualToString:@"Apple M4 Max"];
+}
+
+int termite_metal_decode_runtime_lightonocr3_batch_projection_available(termite_metal_decode_runtime *runtime, size_t rows, size_t in_dim) {
+    if (runtime == NULL || !runtime->qwen35_ocr_vector_loads_enabled || rows < 2 || rows > 16 || in_dim % 128 != 0 ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS")) ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS"))) return 0;
+    id<MTLComputePipelineState> pipeline = rows <= 2 ? runtime->lightonocr3_batch2_pipeline :
+        rows <= 4 ? runtime->lightonocr3_batch4_pipeline :
+        rows <= 8 ? runtime->lightonocr3_batch8_pipeline : runtime->lightonocr3_batch16_pipeline;
+    return pipeline != nil && pipeline.threadExecutionWidth == 32 && pipeline.maxTotalThreadsPerThreadgroup >= 32;
+}
+
+static void termite_metal_initialize_lightonocr3_mpp(termite_metal_decode_runtime *runtime) {
+    if (runtime->lightonocr3_mpp_initialization_attempted)
+        return;
+    runtime->lightonocr3_mpp_initialization_attempted = YES;
+    id<MTLDevice> device = runtime->device;
+    // Optional Metal 4 TensorOps: preserve old devices and failed PSOs.
+    if (@available(macOS 26.1, *)) {
+        MTLCompileOptions *tensor_options = [MTLCompileOptions new];
+        tensor_options.languageVersion = MTLLanguageVersion4_0;
+        termite_metal_set_precise_math(tensor_options);
+        NSError *tensor_error = nil;
+        id<MTLLibrary> tensor_library = [device newLibraryWithSource:termite_metal_lightonocr3_tensor_source()
+                                                             options:tensor_options
+                                                               error:&tensor_error];
+        if (tensor_library != nil) {
+            runtime->f16_encoder_mpp_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_f16_encoder_mpp_float_32_64");
+            runtime->lightonocr3_mpp_f32_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_mpp_float_32_64");
+            runtime->lightonocr3_down_split32_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_down_split32");
+            runtime->lightonocr3_down_split64_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_down_split64");
+            runtime->lightonocr3_down_split_reduce_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_down_split_reduce");
+            runtime->lightonocr3_mpp_four_row_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_mpp_float_8_16");
+            runtime->lightonocr3_vision_pack_pipeline = termite_metal_make_pipeline(device,tensor_library,@"vision_pack_half");
+            runtime->lightonocr3_vision_mpp_pipeline = termite_metal_make_pipeline(device,tensor_library,@"termite_sdpa_f32_vision_hd64_flash_packed_mpp");
+            runtime->lightonocr3_prefill_attention_mpp_pipeline = termite_metal_make_pipeline(
+                device, tensor_library, @"termite_lightonocr3_prefill_attention_mpp");
+            runtime->lightonocr3_prefill_attention_mpp32_pipeline = termite_metal_make_pipeline(
+                device, tensor_library, @"termite_lightonocr3_prefill_attention_mpp32");
+            runtime->lightonocr3_prefill_attention_direct_pipeline = termite_metal_make_pipeline(
+                device, tensor_library, @"termite_lightonocr3_prefill_attention_direct16_64");
+            runtime->lightonocr3_prefill_gate8_16=termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_prefill_gate8_16");
+            runtime->lightonocr3_prefill_gate16_32=termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_prefill_gate16_32");
+            runtime->lightonocr3_local_gate_tg16 = termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_local_gate4_16");
+            runtime->lightonocr3_local_gate_tg32 = termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_local_gate4_32");
+            runtime->lightonocr3_local_down_tg8 = termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_local_down8_16");
+            runtime->lightonocr3_local_down_tg16 = termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_local_down16_16");
+            runtime->lightonocr3_gate_up_split16_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_gate_split16");
+            runtime->lightonocr3_gate_up_split_reduce_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_gate_split_reduce");
+            runtime->lightonocr3_gate_up_small16_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_gate_up_small16");
+            runtime->lightonocr3_gate_up_wide16_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_gate_up_wide16");
+            runtime->lightonocr3_gate_up_wide32_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_gate_up_wide32");
+            runtime->lightonocr3_gate_up_wide64_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_gate_up_wide64");
+            for (size_t i = 0; i < 3; i++) runtime->lightonocr3_wide_mpp_pipelines[i] = termite_metal_make_pipeline(device, tensor_library, [NSString stringWithFormat:@"termite_lightonocr3_wide_mpp_%zu", i]);
+            runtime->lightonocr3_gate_up_small32_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_gate_up_small32");
+            runtime->lightonocr3_mpp_small_tile_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_mpp_float_8_32");
+            runtime->lightonocr3_mpp_f32_n32_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_mpp_float_64_32");
+            runtime->lightonocr3_mpp_bf16_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_mpp_bfloat_32_64");
+            runtime->lightonocr3_mpp_bf16_n32_pipeline =
+                termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_mpp_bfloat_64_32");
+        }
+    }
+}
+
+static void termite_metal_initialize_lightonocr3_recurrent(termite_metal_decode_runtime *runtime) {
+    if (runtime->lightonocr3_recurrent_initialization_attempted) return;
+    runtime->lightonocr3_recurrent_initialization_attempted = YES;
+    if (runtime->device.argumentBuffersSupport != MTLArgumentBuffersTier2) return;
+    MTLCompileOptions *options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion3_1;
+    if (![options respondsToSelector:@selector(setMathMode:)]) return;
+    termite_metal_set_precise_math(options);
+    NSError *error = nil;
+    id<MTLLibrary> library = [runtime->device newLibraryWithSource:termite_metal_lightonocr3_recurrent_source()
+                                                        options:options error:&error];
+    if (library != nil) {
+        runtime->lightonocr3_copy_pipeline = termite_metal_make_pipeline(
+            runtime->device, library, @"termite_lightonocr3_copy16");
+        runtime->lightonocr3_recurrent_parallel_pipeline = termite_metal_make_pipeline(
+            runtime->device, library, @"termite_lightonocr3_recurrent_parallel");
+        runtime->lightonocr3_prefill_prepare_pipeline = termite_metal_make_pipeline(
+            runtime->device, library, @"termite_lightonocr3_prefill_prepare_parallel");
+        runtime->lightonocr3_prefill_norm_pipeline = termite_metal_make_pipeline(
+            runtime->device, library, @"termite_lightonocr3_prefill_norm_parallel");
+    }
+}
+
+// Scoped by the serialized vision caller. Failed qualification must not
+// enter a different device kernel under the smaller resident working bound.
+int termite_metal_decode_runtime_require_lighton_vision_mpp(termite_metal_decode_runtime *runtime, int required) {
+    if (runtime == NULL) return 0;
+    const int previous = runtime->lighton_vision_mpp_required ? 1 : 0;
+    runtime->lighton_vision_mpp_required = required != 0;
+    return previous;
+}
+
+void termite_metal_decode_runtime_set_lightonocr3_projections(termite_metal_decode_runtime *runtime, int enabled) {
+    if (runtime == NULL)
+        return;
+    runtime->lightonocr3_projections_enabled =
+        enabled != 0 && [runtime->device.name isEqualToString:@"Apple M4 Max"];
+    if (runtime->lightonocr3_projections_enabled) termite_metal_initialize_lightonocr3_recurrent(runtime);
+    if (runtime->lightonocr3_projections_enabled &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS")) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")))
+        termite_metal_initialize_lightonocr3_mpp(runtime);
 }
 
 void termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(
@@ -27952,12 +30412,37 @@ uint32_t termite_metal_decode_runtime_embeddinggemma2_rms_norm_threads(
     return runtime->rms_norm_rows_simd4_reduce_pipeline.maxTotalThreadsPerThreadgroup >= threads ? threads : 0u;
 }
 
+// Wide prefill rows must not scan each hidden vector on one scalar lane.
+// Reuse the existing F32 SIMD reduction with one group per row; no new scratch.
+static uint32_t termite_metal_lightonocr3_prefill_norm_threads(
+    termite_metal_decode_runtime *runtime, size_t rows, size_t hidden_size
+) {
+    if (runtime == NULL || rows > 32768 || runtime->rms_norm_rows_simd4_reduce_pipeline == nil ||
+        runtime->rms_norm_rows_simd4_reduce_pipeline.threadExecutionWidth != 32 ||
+        runtime->rms_norm_rows_simd4_reduce_pipeline.maxTotalThreadsPerThreadgroup < 32 ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARALLEL_NORM) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_NORM)) return 0;
+    if (runtime->lightonocr3_projections_enabled && rows >= 33 &&
+        (hidden_size == 2560 || hidden_size == 256)) return 32;
+    if (runtime->qwen35_ocr_vector_loads_enabled && rows >= 9 &&
+        (hidden_size == 1024 || hidden_size == 128)) return 32;
+    return 0;
+}
+
 static void termite_metal_dispatch_rms_norm_rows(
     termite_metal_decode_runtime *runtime,
     id<MTLComputeCommandEncoder> encoder,
     size_t rows,
     size_t hidden_size
 ) {
+    const uint32_t prefill_threads = termite_metal_lightonocr3_prefill_norm_threads(runtime, rows, hidden_size);
+    if (prefill_threads != 0) {
+        [encoder setComputePipelineState:runtime->rms_norm_rows_simd4_reduce_pipeline];
+        [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(prefill_threads, 1, 1)];
+        return;
+    }
     const uint32_t embedding_threads = termite_metal_decode_runtime_embeddinggemma2_rms_norm_threads(runtime, rows, hidden_size);
     if (embedding_threads != 0u) {
         [encoder setComputePipelineState:runtime->rms_norm_rows_simd4_reduce_pipeline];
@@ -28769,6 +31254,18 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->q8_1_cpy_f32_to_q_pipeline = termite_metal_make_pipeline(device, library, @"termite_q8_1_cpy_f32_to_q");
         runtime->rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_rope");
         runtime->mrope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_mrope");
+        runtime->qwen35_conv_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_conv");
+        runtime->qwen35_prefill_conv_vec4_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_prefill_conv_vec4");
+        runtime->qwen35_history_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_history");
+        runtime->qwen35_prepare_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_prepare");
+        runtime->qwen35_recurrent_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_recurrent");
+        runtime->qwen35_recurrent_columns4_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_recurrent_columns4");
+        runtime->qwen35_recurrent_decode_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_recurrent_decode");
+        runtime->qwen35_fused_decode_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_fused_decode");
+        runtime->qwen35_prepare_parallel_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_prepare_parallel");
+        runtime->qwen35_norm_parallel_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_norm_parallel");
+        runtime->qwen35_norm_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_qwen35_norm");
+
         runtime->packed_gelu_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_packed_gelu");
         runtime->embedding_head_prepare_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_embedding_head_prepare");
         runtime->video_position_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_video_position");
@@ -28830,6 +31327,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             ? termite_metal_make_pipeline(device, precise_library, @"termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2")
             : nil;
         runtime->attention_paged_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv");
+        runtime->selection_score_norm_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_selection_score_norm");
+        runtime->selection_score_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_selection_score_reduce");
         runtime->attention_paged_1x_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv_1x");
         // Generated decode-1x paged attention: opt-in candidate, built from the
         // precise (exact-math) library so it matches the hand-written baseline.
@@ -28861,6 +31360,10 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         if (runtime->decode_gqa_split_enabled) {
             runtime->attention_decode_gqa_split_stage_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv_decode_gqa_split_stage");
             runtime->attention_decode_gqa_split_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv_decode_gqa_split_reduce");
+            runtime->lightonocr3_gqa_batch_stage_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lightonocr3_gqa_batch_stage");
+            runtime->lightonocr3_gqa_batch_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lightonocr3_gqa_batch_reduce");
+            runtime->lightonocr3_gqa_split_stage_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lightonocr3_gqa_split_stage");
+            runtime->lightonocr3_gqa_split_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lightonocr3_gqa_split_reduce");
             size_t split_scratch_capacity = 0;
             if (termite_metal_decode_gqa_split_runtime_scratch_capacity(runtime, &split_scratch_capacity)) {
                 runtime->attention_decode_gqa_split_scratch_buffer =
@@ -28893,6 +31396,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
                 fprintf(stderr, "metal-runtime-create: decode_gqa_split unavailable; using paged attention fallback\n");
                 runtime->attention_decode_gqa_split_stage_pipeline = nil;
                 runtime->attention_decode_gqa_split_reduce_pipeline = nil;
+    runtime->lightonocr3_gqa_split_stage_pipeline = nil;
+    runtime->lightonocr3_gqa_split_reduce_pipeline = nil;
                 runtime->attention_decode_gqa_split_scratch_buffer = nil;
                 runtime->attention_decode_gqa_split_scratch_buffer_alt = nil;
                 runtime->attention_decode_gqa_split_scratch_capacity = 0;
@@ -28965,9 +31470,11 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->modernbert_training_attention_flash_dq_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_modernbert_training_attention_flash_dq");
         runtime->modernbert_training_attention_flash_dkdv_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_modernbert_training_attention_flash_dkdv");
         runtime->sdpa_f32_florence_window_hd32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_florence_window_hd32");
+        runtime->sdpa_f32_florence_window_parallel_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_florence_window_parallel");
         runtime->florence_window_pack_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_florence_window_pack_f32");
         runtime->florence_window_unpack_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_florence_window_unpack_f32");
         runtime->florence_channel_scores_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_florence_channel_scores_f32");
+        runtime->florence_channel_scores_parallel_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_florence_channel_scores_parallel");
         runtime->florence_channel_softmax_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_florence_channel_softmax_f32");
         runtime->florence_channel_apply_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_florence_channel_apply_f32");
         runtime->disentangled_relative_attention_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_disentangled_relative_attention_f32");
@@ -29024,6 +31531,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->rms_norm_rows_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows");
         runtime->rms_norm_rows_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows_reduce");
         runtime->rms_norm_rows_simd4_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows_simd4_reduce");
+        runtime->lightonocr3_norm_cached2560_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_norm_cached2560");
+        runtime->lightonocr3_norm_cached1024_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_norm_cached1024");
         runtime->rms_norm_rows_triple_simd4_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows_triple_simd4_reduce");
         runtime->parallel_ffn_post_residual_simd4_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_parallel_ffn_post_residual_simd4");
         runtime->rms_norm_add_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_add_1x");
@@ -29047,6 +31556,36 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->linear_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_1x_reduce");
         runtime->linear_bf16_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_1x");
         runtime->linear_bf16_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_1x_reduce");
+        runtime->lightonocr3_gemv_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_gemv_vec4");
+        runtime->lightonocr3_gemv_rows2_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_gemv_vec4_rows2");
+        if ([device.name isEqualToString:@"Apple M4 Max"]) {
+            for(size_t b=0;b<2;b++) {
+                runtime->lightonocr3_local_gate_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_gate_vec%zu_16_2",b+2]);
+                runtime->lightonocr3_local_down_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_proj_vec%zu_32_4",b+2]);
+            }
+            for(size_t b=0;b<3;b++)runtime->lightonocr3_local_projection_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_proj_vec%zu_16_%zu",b+2,b==2?(size_t)4:(size_t)2]);
+            runtime->lightonocr3_local_down_vector4=termite_metal_make_pipeline(device,library,@"termite_lightonocr3_local_proj_vec4_16_2");
+            for(size_t model=0;model<2;model++)for(size_t row=0;row<8;row++)
+                runtime->lightonocr3_recurrent_gate_vectors[model][row]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_recurrent_gate_%zu_%zu_32_1",row+1,model?(size_t)16:(size_t)8]);
+            const size_t caps[6]={4,4,4,4,2,2},lanes[6]={16,16,32,32,16,32},tiles[6]={2,4,4,8,4,8};
+            for(size_t tile=0;tile<4;tile++)for(size_t row=0;row<4;row++)
+                runtime->lightonocr3_decode_chunks[tile][row]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_chunk_%zu_%zu_%zu",row+1,lanes[tile],tiles[tile]]);
+            for(size_t tile=0;tile<6;tile++)for(size_t row=0;row<3;row++)
+                runtime->lightonocr3_decode_tails[tile][row]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_decode_%zu_%zu_%zu_%zu",row+5,caps[tile],lanes[tile],tiles[tile]]);
+        }
+        runtime->lightonocr3_gate_up_gemv_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_gate_up_gemv");
+        runtime->lightonocr3_pack_bf16_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lightonocr3_pack_bf16");
+        runtime->lightonocr3_batch2_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_batch2_vec4");
+        runtime->lightonocr3_four_row_segment_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lightonocr3_four_row_segment");
+        runtime->lightonocr3_batch4_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_batch4_vec4");
+        runtime->lightonocr3_batch8_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_batch8_vec4");
+        runtime->lightonocr3_batch16_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_batch16_vec4");
+        for (size_t rows = 2; rows <= 16; rows++) {
+            NSString *name = [NSString stringWithFormat:@"termite_lightonocr3_batch%zu_tile%zu", rows, rows <= 4 ? (size_t)2 : rows <= 8 ? (size_t)4 : (size_t)1];
+            runtime->lightonocr3_tiled_pipelines[rows] = termite_metal_make_pipeline(device, library, name);
+        }
+
+
         runtime->linear_f16_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_f16_1x");
         runtime->linear_f16_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_f16_1x_reduce");
         runtime->linear_f16_multi_row_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_f16_multi_row");
@@ -29080,6 +31619,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->argmax_logits_partials_pipeline = termite_metal_make_pipeline(device, library, @"termite_argmax_logits_partials");
         runtime->argmax_logits_suppress_partials_pipeline = termite_metal_make_pipeline(device, library, @"termite_argmax_logits_suppress_partials");
         runtime->argmax_logits_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_argmax_logits_reduce");
+        runtime->lighton_batch_argmax_partials_pipeline = termite_metal_make_pipeline(device, library, @"termite_lighton_batch_argmax_partials");
+        runtime->lighton_batch_argmax_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_lighton_batch_argmax_reduce");
         runtime->layer_norm_add_sum_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_add_layer_norm_sum_1x");
         runtime->whisper_logits_partials_pipeline = termite_metal_make_pipeline(device, library, @"termite_whisper_logits_partials");
         runtime->whisper_logits_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_whisper_logits_reduce");
@@ -29713,6 +32254,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
 }
 
 static void termite_metal_decode_runtime_drain_reuse_pool(termite_metal_decode_runtime *runtime, int keep_alive);
+static void termite_metal_lighton_activation_clear(termite_metal_decode_runtime *runtime);
 int antfly_metal_audio_storage_clear(termite_metal_decode_runtime *r);
 
 void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime) {
@@ -29728,6 +32270,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
             (void)termite_metal_decode_runtime_wait_frame(runtime);
         }
     }
+    termite_metal_ocr_residency_shutdown(runtime);
     if (@available(macOS 15.0, *)) {
         id<MTLResidencySet> mapped_moe_residency_set = runtime->mapped_moe_residency_set;
         if (mapped_moe_residency_set != nil) {
@@ -29787,6 +32330,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->audio_reuse_scope=0;
     (void)antfly_metal_audio_storage_clear(runtime);
     termite_metal_decode_runtime_drain_reuse_pool(runtime, 0);
+    termite_metal_lighton_activation_clear(runtime);
     if (runtime->frame_reuse_pool != NULL) {
         free(runtime->frame_reuse_pool);
         runtime->frame_reuse_pool = NULL;
@@ -29848,6 +32392,67 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->q8_1_cpy_f32_to_q_pipeline = nil;
     runtime->rope_pipeline = nil;
     runtime->mrope_pipeline = nil;
+    runtime->qwen35_conv_pipeline = nil;
+    runtime->qwen35_prefill_conv_vec4_pipeline = nil;
+    runtime->qwen35_history_pipeline = nil;
+    runtime->qwen35_prepare_pipeline = nil;
+    runtime->qwen35_recurrent_pipeline = nil;
+    runtime->qwen35_recurrent_columns4_pipeline = nil;
+    runtime->qwen35_recurrent_decode_pipeline = nil;
+    runtime->qwen35_fused_decode_pipeline = nil;
+    runtime->lightonocr3_copy_pipeline = nil;
+    runtime->lightonocr3_recurrent_parallel_pipeline = nil;
+    runtime->lightonocr3_prefill_prepare_pipeline = nil;
+    runtime->lightonocr3_prefill_norm_pipeline = nil;
+    runtime->lightonocr3_prefill_attention_mpp_pipeline = nil;
+    runtime->lightonocr3_prefill_attention_mpp32_pipeline = nil;
+    runtime->lightonocr3_prefill_attention_direct_pipeline = nil;
+    runtime->qwen35_prepare_parallel_pipeline = nil;
+    runtime->qwen35_norm_parallel_pipeline = nil;
+    runtime->lightonocr3_gemv_pipeline = nil;
+    runtime->lightonocr3_gemv_rows2_pipeline = nil;
+    runtime->lightonocr3_gate_up_gemv_pipeline = nil;
+    runtime->lightonocr3_pack_bf16_pipeline = nil;
+    runtime->lightonocr3_batch2_pipeline = nil;
+    runtime->lightonocr3_batch4_pipeline = nil;
+    runtime->lightonocr3_batch8_pipeline = nil;
+    runtime->lightonocr3_batch16_pipeline = nil;
+    for (size_t rows = 0; rows < 17; rows++) runtime->lightonocr3_tiled_pipelines[rows] = nil;
+
+    runtime->lightonocr3_mpp_f32_pipeline = nil;
+    runtime->f16_encoder_mpp_pipeline = nil;
+    runtime->lightonocr3_mpp_small_tile_pipeline = nil;
+    runtime->lightonocr3_mpp_four_row_pipeline = nil;
+    runtime->lightonocr3_gate_up_split16_pipeline = nil;
+    runtime->lightonocr3_gate_up_split_reduce_pipeline = nil;
+    for(size_t i=0;i<2;i++) {runtime->lightonocr3_local_gate_vectors[i]=nil;runtime->lightonocr3_local_down_vectors[i]=nil;}
+    for(size_t i=0;i<3;i++)runtime->lightonocr3_local_projection_vectors[i]=nil;
+    runtime->lightonocr3_local_down_vector4=nil;
+    for(size_t model=0;model<2;model++)for(size_t row=0;row<8;row++)runtime->lightonocr3_recurrent_gate_vectors[model][row]=nil;
+    for(size_t tile=0;tile<4;tile++)for(size_t row=0;row<4;row++)runtime->lightonocr3_decode_chunks[tile][row]=nil;
+    for(size_t tile=0;tile<6;tile++)for(size_t row=0;row<3;row++)runtime->lightonocr3_decode_tails[tile][row]=nil;
+    runtime->lightonocr3_vision_pack_pipeline=nil;runtime->lightonocr3_vision_mpp_pipeline=nil;
+    for(size_t i=0;i<2;i++){runtime->lightonocr3_vision_pack_buffers[i]=nil;runtime->lightonocr3_vision_pack_owners[i]=nil;}
+    runtime->lightonocr3_prefill_gate8_16=nil;runtime->lightonocr3_prefill_gate16_32=nil;
+    runtime->lightonocr3_local_gate_tg16=nil;runtime->lightonocr3_local_gate_tg32=nil;
+    runtime->lightonocr3_local_down_tg8=nil;runtime->lightonocr3_local_down_tg16=nil;
+    runtime->lightonocr3_gate_up_small16_pipeline = nil;
+    runtime->lightonocr3_gate_up_wide16_pipeline = nil;
+    runtime->lightonocr3_gate_up_wide32_pipeline = nil;
+    runtime->lightonocr3_gate_up_wide64_pipeline = nil;
+    for (size_t i = 0; i < 3; i++) runtime->lightonocr3_wide_mpp_pipelines[i] = nil;
+    runtime->lightonocr3_gate_up_small32_pipeline = nil;
+    runtime->lightonocr3_four_row_segment_pipeline = nil;
+    runtime->lightonocr3_down_split32_pipeline = nil;
+    runtime->lightonocr3_down_split64_pipeline = nil;
+    runtime->lightonocr3_down_split_reduce_pipeline = nil;
+    runtime->lightonocr3_mpp_f32_n32_pipeline = nil;
+    runtime->lightonocr3_mpp_bf16_pipeline = nil;
+    runtime->lighton_prefill_ffn_pipelines[0] = nil;
+    runtime->lighton_prefill_ffn_pipelines[1] = nil;
+    runtime->lightonocr3_mpp_bf16_n32_pipeline = nil;
+    runtime->qwen35_norm_pipeline = nil;
+
     runtime->packed_gelu_pipeline = nil;
     runtime->embedding_head_prepare_pipeline = nil;
     runtime->video_position_pipeline = nil;
@@ -29879,7 +32484,14 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->attention_flash_hd512_generated_pipeline = nil;
     runtime->attention_decode_gqa_split_stage_pipeline = nil;
     runtime->attention_decode_gqa_split_reduce_pipeline = nil;
+    runtime->lightonocr3_gqa_batch_stage_pipeline = nil;
+    runtime->lightonocr3_gqa_batch_reduce_pipeline = nil;
+    runtime->lightonocr3_gqa_split_stage_pipeline = nil;
+    runtime->lightonocr3_gqa_split_reduce_pipeline = nil;
     runtime->attention_decode_gqa_split_scratch_buffer = nil;
+    termite_metal_lighton_attention_batch_abort(runtime);
+    runtime->lighton_attention_batch_scratch[0] = nil;
+    runtime->lighton_attention_batch_scratch[1] = nil;
     runtime->attention_decode_gqa_split_scratch_buffer_alt = nil;
     runtime->attention_decode_gqa_split_scratch_capacity = 0;
     runtime->active_frame_decode_gqa_split_scratch_valid = 0u;
@@ -29945,9 +32557,11 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->modernbert_training_attention_flash_dq_pipeline = nil;
     runtime->modernbert_training_attention_flash_dkdv_pipeline = nil;
     runtime->sdpa_f32_florence_window_hd32_pipeline = nil;
+    runtime->sdpa_f32_florence_window_parallel_pipeline = nil;
     runtime->florence_window_pack_f32_pipeline = nil;
     runtime->florence_window_unpack_f32_pipeline = nil;
     runtime->florence_channel_scores_f32_pipeline = nil;
+    runtime->florence_channel_scores_parallel_pipeline = nil;
     runtime->florence_channel_softmax_f32_pipeline = nil;
     runtime->florence_channel_apply_f32_pipeline = nil;
     runtime->disentangled_relative_attention_f32_pipeline = nil;
@@ -30004,6 +32618,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->rms_inv_scale_pipeline = nil;
     runtime->rms_norm_rows_pipeline = nil;
     runtime->rms_norm_rows_reduce_pipeline = nil;
+    runtime->lightonocr3_norm_cached1024_pipeline = nil;
+    runtime->lightonocr3_norm_cached2560_pipeline = nil;
     runtime->rms_norm_rows_simd4_reduce_pipeline = nil;
     runtime->rms_norm_rows_triple_simd4_reduce_pipeline = nil;
     runtime->parallel_ffn_post_residual_simd4_pipeline = nil;
@@ -30046,6 +32662,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->argmax_logits_partials_pipeline = nil;
     runtime->argmax_logits_suppress_partials_pipeline = nil;
     runtime->argmax_logits_reduce_pipeline = nil;
+    runtime->lighton_batch_argmax_partials_pipeline = nil;
+    runtime->lighton_batch_argmax_reduce_pipeline = nil;
     runtime->layer_norm_add_sum_pipeline = nil;
     runtime->whisper_logits_partials_pipeline = nil;
     runtime->whisper_logits_reduce_pipeline = nil;
@@ -30397,6 +33015,10 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->mapped_model_allocated_bytes = 0;
     runtime->deberta_cc_mps_mm = nil;
     runtime->deberta_relative_mps_mm = nil;
+    for (size_t i = 0; i < TERMITE_METAL_DOT_GENERAL_MPS_CACHE_CAPACITY; ++i)
+        runtime->dot_general_mps_mm[i] = nil;
+    for (size_t i = 0; i < TERMITE_METAL_GEMM_MPS_CACHE_CAPACITY; ++i)
+        runtime->gemm_mps_mm[i] = nil;
     runtime->deberta_mps_seq_len = 0;
     runtime->deberta_mps_relative_count = 0;
     runtime->deberta_mps_head_dim = 0;
@@ -30404,6 +33026,11 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->host_staging_buffer = nil;
     runtime->active_frame_host_staging_buffer = nil;
     runtime->active_frame_host_staging_retained_buffer = nil;
+    for (size_t i = 0; i < 2; ++i) {
+        runtime->frame_host_staging_buffers[i] = nil;
+        runtime->frame_host_staging_capacities[i] = 0;
+    }
+    runtime->frame_host_staging_index = 0;
     runtime->token_buffer = nil;
     runtime->sample_logits_buffer = nil;
     runtime->sample_topk_values_buffer = nil;
@@ -30545,6 +33172,17 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     memset(runtime->active_frame_blit_source_counts, 0, sizeof(runtime->active_frame_blit_source_counts));
     memset(runtime->submitted_frame_blit_source_counts, 0, sizeof(runtime->submitted_frame_blit_source_counts));
     memset(runtime->last_frame_blit_source_counts, 0, sizeof(runtime->last_frame_blit_source_counts));
+    // The runtime is calloc/free storage: ARC does not destroy its strong
+    // fields automatically. Retire these optional and shared-library PSOs too.
+    runtime->compressed_attention_store_local_pipeline = nil;
+    runtime->compressed_attention_store_component_pipeline = nil;
+    runtime->compressed_attention_update_component_pipeline = nil;
+    runtime->compressed_attention_select_compressed_pipeline = nil;
+    runtime->compressed_attention_hybrid_attention_pipeline = nil;
+    runtime->linear_bias_pipeline = nil;
+    runtime->ffn_gelu_backward_rank1_branches_pipeline = nil;
+    runtime->ffn_gelu_backward_rank1_first_branch_pipeline = nil;
+    runtime->audio_pad_pipeline = nil;
     runtime->precise_library = nil;
     runtime->library = nil;
     runtime->queue = nil;
@@ -31075,6 +33713,77 @@ int termite_metal_decode_runtime_embed_absolute_position(
         if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_size * sizeof(float));
         return 0;
     }
+}
+
+// Keep already-admitted dense OCR weights resident without allocating copies.
+// Bound both total bytes and per-set size; leaving a weight unwired is always
+// a valid fallback. The Metal runtime is owned by one model execution lane.
+static void termite_metal_ocr_residency_track(termite_metal_decode_runtime *r,size_t slot,id<MTLBuffer> buffer) {
+    if(r==NULL||slot>=TERMITE_METAL_LINEAR_SLOT_CAPACITY)return;
+    const bool enabled=r->lightonocr3_projections_enabled && r->mapped_moe_residency_set==nil &&
+        termite_metal_lightonocr3_profile_feature_enabled("TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY");
+    if(!enabled)buffer=nil;
+    id<MTLBuffer>old=r->ocr_residency_slots[slot];
+    if(old==buffer)return;
+    if (@available(macOS 15.0,*)) {
+        if(old!=nil){
+            NSMutableDictionary *record=[r->ocr_residency_placements objectForKey:old];
+            const size_t refs=[record[@"refs"] unsignedLongLongValue];
+            if(refs>1)record[@"refs"]=@(refs-1);
+            else if(record!=nil){
+                const size_t bucket=[record[@"bucket"] unsignedLongLongValue],bytes=[record[@"bytes"] unsignedLongLongValue];
+                id<MTLResidencySet>set=r->ocr_residency_sets[bucket];
+                [set removeAllocation:old];[set commit];
+                r->ocr_residency_set_bytes[bucket]=@([r->ocr_residency_set_bytes[bucket] unsignedLongLongValue]-bytes);
+                r->ocr_residency_total_bytes-=bytes;
+                [r->ocr_residency_placements removeObjectForKey:old];
+            }
+            r->ocr_residency_slots[slot]=nil;
+        }
+        if(buffer==nil||r->ocr_residency_failed)return;
+        if(r->ocr_residency_placements==nil){
+            r->ocr_residency_sets=[NSMutableArray new];r->ocr_residency_set_bytes=[NSMutableArray new];
+            r->ocr_residency_placements=[NSMapTable mapTableWithKeyOptions:NSPointerFunctionsOpaqueMemory|NSPointerFunctionsOpaquePersonality valueOptions:NSPointerFunctionsStrongMemory];
+        }
+        NSMutableDictionary *record=[r->ocr_residency_placements objectForKey:buffer];
+        if(record!=nil){record[@"refs"]=@([record[@"refs"] unsignedLongLongValue]+1);r->ocr_residency_slots[slot]=buffer;return;}
+        const size_t bytes=buffer.length,cap=(size_t)12*1024*1024*1024,bucket_cap=(size_t)512*1024*1024;
+        if(bytes==0||bytes>cap||r->ocr_residency_total_bytes>cap-bytes)return;
+        size_t bucket=SIZE_MAX,least=0;
+        for(size_t i=0;i<r->ocr_residency_sets.count;i++){
+            const size_t used=[r->ocr_residency_set_bytes[i] unsignedLongLongValue];
+            if(used<[r->ocr_residency_set_bytes[least] unsignedLongLongValue])least=i;
+            if(used<=bucket_cap&&bytes<=bucket_cap-used){bucket=i;break;}
+        }
+        if(bucket==SIZE_MAX&&r->ocr_residency_sets.count<32){
+            MTLResidencySetDescriptor *desc=[MTLResidencySetDescriptor new];desc.initialCapacity=64;desc.label=@"antfly admitted OCR weights";
+            NSError *error=nil;id<MTLResidencySet>set=[r->device newResidencySetWithDescriptor:desc error:&error];
+            if(set==nil||error!=nil){r->ocr_residency_failed=true;return;}
+            bucket=r->ocr_residency_sets.count;[r->ocr_residency_sets addObject:set];[r->ocr_residency_set_bytes addObject:@0];
+            [r->queue addResidencySet:set];
+        }
+        if(bucket==SIZE_MAX)bucket=least;
+        id<MTLResidencySet>set=r->ocr_residency_sets[bucket];
+        [set addAllocation:buffer];[set commit];[set requestResidency];
+        if(r->active_frame_cb!=nil)[r->active_frame_cb useResidencySet:set];
+        r->ocr_residency_set_bytes[bucket]=@([r->ocr_residency_set_bytes[bucket] unsignedLongLongValue]+bytes);
+        r->ocr_residency_total_bytes+=bytes;
+        if(r->ocr_residency_total_bytes>r->ocr_residency_peak_bytes)r->ocr_residency_peak_bytes=r->ocr_residency_total_bytes;
+        [r->ocr_residency_placements setObject:[@{@"bucket":@(bucket),@"bytes":@(bytes),@"refs":@1} mutableCopy] forKey:buffer];
+        r->ocr_residency_slots[slot]=buffer;
+    }
+}
+
+static void termite_metal_ocr_residency_shutdown(termite_metal_decode_runtime *r){
+    if(r==NULL)return;
+    if (@available(macOS 15.0,*)) {
+        if(r->ocr_residency_sets.count!=0 && termite_metal_env_flag_enabled(getenv("ANTFLY_BENCH_LIGHTONOCR3")))
+            fprintf(stderr,"metal_ocr_weight_residency: sets=%zu allocations=%zu peak_bytes=%llu current_bytes=%llu released=1\n",(size_t)r->ocr_residency_sets.count,(size_t)r->ocr_residency_placements.count,(unsigned long long)r->ocr_residency_peak_bytes,(unsigned long long)r->ocr_residency_total_bytes);
+        for(id<MTLResidencySet>set in r->ocr_residency_sets){[r->queue removeResidencySet:set];[set endResidency];[set removeAllAllocations];[set commit];}
+    }
+    [r->ocr_residency_placements removeAllObjects];
+    for(size_t slot=0;slot<TERMITE_METAL_LINEAR_SLOT_CAPACITY;slot++)r->ocr_residency_slots[slot]=nil;
+    r->ocr_residency_sets=nil;r->ocr_residency_set_bytes=nil;r->ocr_residency_placements=nil;r->ocr_residency_total_bytes=0;
 }
 
 static bool termite_metal_decode_runtime_allocation_overlaps_model_mmap(
@@ -32672,6 +35381,558 @@ int termite_metal_decode_runtime_apply_rope_device(
     }
 }
 
+// Qwen3.5 convolution, gate preparation and recurrent state stay on device.
+// Separate serial encoders provide the producer/consumer boundaries, including
+// the in-place Q/K normalization and persistent recurrent state update.
+int termite_metal_decode_runtime_qwen35_core_available(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL && runtime->qwen35_conv_pipeline != nil && runtime->qwen35_history_pipeline != nil && runtime->qwen35_prepare_pipeline != nil && runtime->qwen35_norm_pipeline != nil && runtime->qwen35_recurrent_pipeline != nil && runtime->qwen35_recurrent_decode_pipeline != nil && runtime->qwen35_recurrent_pipeline.threadExecutionWidth == 32;
+}
+
+// Collect a decoder layer's independent page cores before encoding. Five
+// stage boundaries preserve producer/consumer ordering; concurrent dispatches
+// within a stage cover disjoint page histories and scratch allocations.
+// Zig worker threads have no Cocoa run loop to drain autoreleased Metal
+// objects. Keep the pool lexical to the synchronous callback's thread.
+void termite_metal_with_autorelease_pool(void *context, void (*callback)(void *)) {
+    @autoreleasepool { callback(context); }
+}
+
+// Keep the qualified narrow path unless a wide parallel core is available.
+// Shared side-weight identity is checked separately at the prepared caller.
+size_t termite_metal_decode_runtime_lighton_recurrent_group_rows(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL || !runtime->qwen35_ocr_vector_loads_enabled || !runtime->lightonocr3_projections_enabled ||
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_WIDE_RECURRENT) ||
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_FUSED_DECODE) ||
+        runtime->lightonocr3_recurrent_parallel_pipeline == nil ||
+        runtime->lightonocr3_recurrent_parallel_pipeline.threadExecutionWidth != 32 ||
+        runtime->lightonocr3_recurrent_parallel_pipeline.maxTotalThreadsPerThreadgroup < 512) return 16;
+    return 64;
+}
+void termite_metal_decode_runtime_lighton_short_prefill_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime == NULL ? 0 : runtime->lightonocr3_short_prefill_norm_dispatches;
+    out[1] = runtime == NULL ? 0 : runtime->lightonocr3_short_direct_attention_dispatches;
+}
+void termite_metal_decode_runtime_lighton_wide_recurrent_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime == NULL ? 0 : runtime->lightonocr3_wide_recurrent_dispatches;
+    out[1] = runtime == NULL ? 0 : runtime->lightonocr3_wide_recurrent_max_rows;
+    out[2] = runtime == NULL ? 0 : runtime->lightonocr3_wide_recurrent_staged_bytes;
+}
+int termite_metal_decode_runtime_qwen35_core_batch_begin(termite_metal_decode_runtime *runtime, size_t rows) {
+    if (runtime == NULL || runtime->active_frame_cb == nil || rows < 2 || rows > 64 ||
+        (rows > 16 && !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_WIDE_RECURRENT)) ||
+        !runtime->qwen35_ocr_vector_loads_enabled || !termite_metal_decode_runtime_qwen35_core_available(runtime) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_CORE_BATCH)) return 0;
+    if (runtime->qwen35_core_batch_active) return -1;
+    runtime->qwen35_core_batch_active = true;
+    runtime->qwen35_core_batch_expected = rows;
+    runtime->qwen35_core_batch_count = 0;
+    if (rows > 16) {
+        memset(runtime->qwen35_core_batch_interval_heads,0,sizeof(runtime->qwen35_core_batch_interval_heads));
+        runtime->qwen35_core_batch_interval_count=0;
+    }
+    return 1;
+}
+
+void termite_metal_decode_runtime_qwen35_core_batch_abort(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return;
+    runtime->qwen35_core_batch_active = false;
+    runtime->qwen35_core_batch_expected = 0;
+    runtime->qwen35_core_batch_count = 0;
+}
+
+static bool termite_metal_qwen35_parallel_norm_available(termite_metal_decode_runtime *runtime) {
+    return runtime->qwen35_ocr_vector_loads_enabled &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_CORE_PARALLEL_NORM) &&
+        runtime->qwen35_prepare_parallel_pipeline != nil && runtime->qwen35_norm_parallel_pipeline != nil &&
+        runtime->qwen35_prepare_parallel_pipeline.threadExecutionWidth == 32 &&
+        runtime->qwen35_norm_parallel_pipeline.threadExecutionWidth == 32 &&
+        runtime->qwen35_prepare_parallel_pipeline.maxTotalThreadsPerThreadgroup >= 32 &&
+        runtime->qwen35_norm_parallel_pipeline.maxTotalThreadsPerThreadgroup >= 32;
+}
+
+static bool termite_metal_qwen35_prefill_conv_vec4_available(termite_metal_decode_runtime *runtime,
+    size_t seq, size_t dim, size_t kernel, const size_t *offsets) {
+    return seq > 1 && dim == 128 && kernel == 4 && runtime->qwen35_ocr_vector_loads_enabled &&
+        (offsets[0] | offsets[1] | offsets[6] | offsets[9]) % 16 == 0 &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_PREFILL_CONV_VEC4) &&
+        runtime->qwen35_prefill_conv_vec4_pipeline != nil &&
+        runtime->qwen35_prefill_conv_vec4_pipeline.threadExecutionWidth == 32 &&
+        runtime->qwen35_prefill_conv_vec4_pipeline.maxTotalThreadsPerThreadgroup >= 32;
+}
+
+static bool termite_metal_qwen35_fused_decode_available(termite_metal_decode_runtime *runtime) {
+    return runtime->qwen35_ocr_vector_loads_enabled &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_FUSED_DECODE) &&
+        runtime->qwen35_fused_decode_pipeline != nil &&
+        runtime->qwen35_fused_decode_pipeline.threadExecutionWidth == 32 &&
+        runtime->qwen35_fused_decode_pipeline.maxTotalThreadsPerThreadgroup >= 128;
+}
+
+// ABI shared with CoreRow in the optional Metal library. The inline table is
+// copied by setBytes; all referenced buffers remain command-buffer owned.
+typedef struct {
+    uint64_t buffers[15];
+    uint32_t params[6];
+} termite_metal_lightonocr3_recurrent_row;
+_Static_assert(sizeof(termite_metal_lightonocr3_recurrent_row) == 144, "Metal recurrent row ABI");
+_Static_assert(offsetof(termite_metal_lightonocr3_recurrent_row, params) == 120,
+               "Metal recurrent params ABI");
+
+// 0 declines before encoding, 1 encoded, negative values report a frame error.
+static int termite_metal_lightonocr3_encode_recurrent_parallel_narrow(termite_metal_decode_runtime *runtime,
+                                                               id<MTLCommandBuffer> cb, void *const *handles,
+                                                               const size_t *offsets, const size_t *bytes,
+                                                               const uint32_t *params, size_t rows) {
+    id<MTLComputePipelineState> pipeline = runtime->lightonocr3_recurrent_parallel_pipeline;
+    if (!runtime->lightonocr3_projections_enabled || !runtime->qwen35_ocr_vector_loads_enabled ||
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_FUSED_DECODE) || rows < 1 ||
+        rows > 16 || pipeline == nil || pipeline.threadExecutionWidth != 32 ||
+        pipeline.maxTotalThreadsPerThreadgroup < 512 ||
+        pipeline.staticThreadgroupMemoryLength > runtime->device.maxThreadgroupMemoryLength)
+        return 0;
+    termite_metal_lightonocr3_recurrent_row table[16];
+    termite_metal_planned_encoder_range accesses[16 * 15];
+    __unsafe_unretained id<MTLResource> resources[16 * 15];
+    __unsafe_unretained id<MTLResource> writes[16 * 6];
+    size_t write_count = 0;
+    const size_t write_indices[6] = {7, 8, 9, 10, 11, 14};
+    for (size_t row = 0; row < rows; row++) {
+        const uint32_t *p = params + row * 6;
+        if (p[0] != 1 || p[1] != 16 || (p[2] != 16 && p[2] != 32) || p[2] != params[2] || p[3] != 128 ||
+            p[4] != 4)
+            return 0;
+        memcpy(table[row].params, p, sizeof(table[row].params));
+        for (size_t j = 0; j < 15; j++) {
+            const size_t index = row * 15 + j;
+            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handles[index];
+            const uint64_t address = buffer.gpuAddress;
+            if (address == 0 || offsets[index] % 16 != 0 || offsets[index] > UINT64_MAX - address)
+                return 0;
+            table[row].buffers[j] = address + offsets[index];
+            resources[index] = buffer;
+            const bool write = j == 7 || j == 8 || j == 9 || j == 10 || j == 11 || j == 14;
+            if (write)
+                writes[write_count++] = buffer;
+            if (termite_metal_planned_range_make(buffer, offsets[index], bytes[index],
+                                                 write ? TERMITE_METAL_PLANNED_RANGE_WRITE
+                                                       : TERMITE_METAL_PLANNED_RANGE_READ,
+                                                 &accesses[index], -12) != 0)
+                return -12;
+        }
+        // The generic implementation supports more aliasing than this kernel.
+        // Only the persistent state itself is read and written in place here.
+        for (size_t w = 0; w < 6; w++)
+            for (size_t j = 0; j < 15; j++) {
+                const size_t wi = row * 15 + write_indices[w], ri = row * 15 + j;
+                if (wi == ri)
+                    continue;
+                if (handles[wi] == handles[ri] && offsets[wi] < offsets[ri] + bytes[ri] &&
+                    offsets[ri] < offsets[wi] + bytes[wi])
+                    return 0;
+            }
+    }
+    // Coalescing is independently qualified; ordinary tracked serial encoders
+    // remain the fallback. Range tracking includes all indirect GPU accesses.
+    if (runtime->active_frame_cb == cb && runtime->active_planned_compute_encoder == nil &&
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING) &&
+        termite_metal_should_coalesce_planned_compute_encoder(runtime) &&
+        !termite_metal_concurrent_planned_dispatch_enabled(runtime)) {
+        if (termite_metal_decode_runtime_begin_planned_compute_scope(
+                runtime, TERMITE_METAL_COMPUTE_SOURCE_OTHER, runtime->active_compute_region) != 0)
+            return -12;
+    }
+    BOOL owned = YES;
+    id<MTLComputeCommandEncoder> encoder =
+        termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER, &owned);
+    if (encoder == nil)
+        return -12;
+    if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, rows * 15, -12) !=
+        0) {
+        termite_metal_end_scoped_compute_encoder(encoder, owned);
+        return -12;
+    }
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBytes:table length:rows * sizeof(table[0]) atIndex:0];
+    [encoder useResources:resources count:rows * 15 usage:MTLResourceUsageRead];
+    [encoder useResources:writes count:write_count usage:MTLResourceUsageWrite];
+    [encoder dispatchThreadgroups:MTLSizeMake(params[2], rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+    termite_metal_end_scoped_compute_encoder(encoder, owned);
+    runtime->lightonocr3_recurrent_parallel_dispatches++;
+    if ((runtime->lightonocr3_recurrent_parallel_traced_rows & (UINT64_C(1) << (rows - 1))) == 0 &&
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_TRACE_LIGHTONOCR3_RECURRENT_PARALLEL)) {
+        runtime->lightonocr3_recurrent_parallel_traced_rows |= UINT64_C(1) << (rows - 1);
+        fprintf(stderr, "lightonocr3_recurrent_parallel: rows=%zu heads=%u threads=512\n", rows, params[2]);
+    }
+    return 1;
+}
+static int termite_metal_lightonocr3_encode_recurrent_parallel(termite_metal_decode_runtime *runtime,
+                                                               id<MTLCommandBuffer> cb, void *const *handles,
+                                                               const size_t *offsets, const size_t *bytes,
+                                                               const uint32_t *params, size_t rows) {
+    if (rows <= 16) return termite_metal_lightonocr3_encode_recurrent_parallel_narrow(runtime, cb, handles, offsets, bytes, params, rows);
+    if (!termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_WIDE_RECURRENT)) return 0;
+    id<MTLComputePipelineState> pipeline = runtime->lightonocr3_recurrent_parallel_pipeline;
+    if (!runtime->lightonocr3_projections_enabled || !runtime->qwen35_ocr_vector_loads_enabled ||
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_FUSED_DECODE) || rows < 1 ||
+        rows > 64 || pipeline == nil || pipeline.threadExecutionWidth != 32 ||
+        pipeline.maxTotalThreadsPerThreadgroup < 512 ||
+        pipeline.staticThreadgroupMemoryLength > runtime->device.maxThreadgroupMemoryLength)
+        return 0;
+    termite_metal_lightonocr3_recurrent_row table[64];
+    termite_metal_planned_encoder_range accesses[64 * 15 + 1];
+    __unsafe_unretained id<MTLResource> resources[64 * 15];
+    __unsafe_unretained id<MTLResource> writes[64 * 6];
+    size_t write_count = 0;
+    const size_t write_indices[6] = {7, 8, 9, 10, 11, 14};
+    for (size_t row = 0; row < rows; row++) {
+        const uint32_t *p = params + row * 6;
+        if (p[0] != 1 || p[1] != 16 || (p[2] != 16 && p[2] != 32) || p[2] != params[2] || p[3] != 128 ||
+            p[4] != 4)
+            return 0;
+        memcpy(table[row].params, p, sizeof(table[row].params));
+        for (size_t j = 0; j < 15; j++) {
+            const size_t index = row * 15 + j;
+            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handles[index];
+            const uint64_t address = buffer.gpuAddress;
+            if (address == 0 || offsets[index] % 16 != 0 || offsets[index] > UINT64_MAX - address)
+                return 0;
+            table[row].buffers[j] = address + offsets[index];
+            resources[index] = buffer;
+            const bool write = j == 7 || j == 8 || j == 9 || j == 10 || j == 11 || j == 14;
+            if (write)
+                writes[write_count++] = buffer;
+            if (rows <= 16 && termite_metal_planned_range_make(buffer, offsets[index], bytes[index],
+                                                 write ? TERMITE_METAL_PLANNED_RANGE_WRITE
+                                                       : TERMITE_METAL_PLANNED_RANGE_READ,
+                                                 &accesses[index], -12) != 0)
+                return -12;
+        }
+        // The generic implementation supports more aliasing than this kernel.
+        // Only the persistent state itself is read and written in place here.
+        for (size_t w = 0; w < 6; w++)
+            for (size_t j = 0; j < 15; j++) {
+                const size_t wi = row * 15 + write_indices[w], ri = row * 15 + j;
+                if (wi == ri)
+                    continue;
+                if (handles[wi] == handles[ri] && offsets[wi] < offsets[ri] + bytes[ri] &&
+                    offsets[ri] < offsets[wi] + bytes[wi])
+                    return 0;
+            }
+    }
+    // Inline Metal arguments are limited to 4 KiB. Larger cohorts use a
+    // distinct slice of the existing frame-owned staging bank. The producer
+    // retains that bank until completion; submitted/active frames use two banks.
+    termite_metal_host_staging_slice staged = {nil, 0};
+    size_t access_count = rows * 15;
+    if (rows > 16) {
+        // Packed projections, workspace and immutable weights are shared
+        // buffers with disjoint views. Track a conservative bounding range
+        // for each shared column rather than repeating it for every page.
+        // Independent history/state allocations retain independent ranges.
+        access_count = 0;
+        for (size_t j = 0; j < 15; j++) {
+            const bool write = j == 7 || j == 8 || j == 9 || j == 10 || j == 11 || j == 14;
+            const termite_metal_planned_range_type type = write ? TERMITE_METAL_PLANNED_RANGE_WRITE : TERMITE_METAL_PLANNED_RANGE_READ;
+            bool shared = true;
+            size_t begin = offsets[j], end = offsets[j] + bytes[j];
+            for (size_t row = 1; row < rows; row++) {
+                const size_t index = row * 15 + j;
+                shared = shared && handles[index] == handles[j];
+                begin = MIN(begin, offsets[index]);
+                end = MAX(end, offsets[index] + bytes[index]);
+            }
+            if (shared) {
+                if (termite_metal_planned_range_make((__bridge id<MTLBuffer>)handles[j], begin, end - begin, type, &accesses[access_count++], -12)) return -12;
+            } else for (size_t row = 0; row < rows; row++) {
+                const size_t index = row * 15 + j;
+                if (termite_metal_planned_range_make((__bridge id<MTLBuffer>)handles[index], offsets[index], bytes[index], type, &accesses[access_count++], -12)) return -12;
+            }
+        }
+        // Preserve the global planner's bound. Unsupported layouts decline
+        // before encoding so the ordinary per-page core can still execute.
+        if (access_count + (rows * sizeof(table[0]) > 4096) > TERMITE_METAL_PLANNED_RANGE_CAPACITY) return 0;
+    }
+    if (rows * sizeof(table[0]) > 4096) {
+        if (runtime->active_frame_cb != cb ||
+            termite_metal_decode_runtime_stage_host_bytes(runtime, table, rows * sizeof(table[0]), false, &staged) != 0)
+            return -12;
+        if (termite_metal_planned_range_make(staged.buffer, staged.offset, rows * sizeof(table[0]),
+            TERMITE_METAL_PLANNED_RANGE_READ, &accesses[access_count++], -12) != 0) return -12;
+    }
+    // Coalescing is independently qualified; ordinary tracked serial encoders
+    // remain the fallback. Range tracking includes all indirect GPU accesses.
+    if (runtime->active_frame_cb == cb && runtime->active_planned_compute_encoder == nil &&
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING) &&
+        termite_metal_should_coalesce_planned_compute_encoder(runtime) &&
+        !termite_metal_concurrent_planned_dispatch_enabled(runtime)) {
+        if (termite_metal_decode_runtime_begin_planned_compute_scope(
+                runtime, TERMITE_METAL_COMPUTE_SOURCE_OTHER, runtime->active_compute_region) != 0)
+            return -12;
+    }
+    BOOL owned = YES;
+    id<MTLComputeCommandEncoder> encoder =
+        termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER, &owned);
+    if (encoder == nil)
+        return -12;
+    if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, access_count, -12) !=
+        0) {
+        termite_metal_end_scoped_compute_encoder(encoder, owned);
+        return -12;
+    }
+    [encoder setComputePipelineState:pipeline];
+    if (staged.buffer != nil) [encoder setBuffer:staged.buffer offset:staged.offset atIndex:0];
+    else [encoder setBytes:table length:rows * sizeof(table[0]) atIndex:0];
+    [encoder useResources:resources count:rows * 15 usage:MTLResourceUsageRead];
+    [encoder useResources:writes count:write_count usage:MTLResourceUsageWrite];
+    [encoder dispatchThreadgroups:MTLSizeMake(params[2], rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+    termite_metal_end_scoped_compute_encoder(encoder, owned);
+    runtime->lightonocr3_recurrent_parallel_dispatches++;
+    runtime->lightonocr3_wide_recurrent_dispatches++;
+    runtime->lightonocr3_wide_recurrent_max_rows = MAX(runtime->lightonocr3_wide_recurrent_max_rows, rows);
+    if (staged.buffer != nil) runtime->lightonocr3_wide_recurrent_staged_bytes += rows * sizeof(table[0]);
+    if ((runtime->lightonocr3_recurrent_parallel_traced_rows & (UINT64_C(1) << (rows - 1))) == 0 &&
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_TRACE_LIGHTONOCR3_RECURRENT_PARALLEL)) {
+        runtime->lightonocr3_recurrent_parallel_traced_rows |= UINT64_C(1) << (rows - 1);
+        fprintf(stderr, "lightonocr3_recurrent_parallel: rows=%zu heads=%u threads=512\n", rows, params[2]);
+    }
+    return 1;
+}
+int termite_metal_decode_runtime_qwen35_core_batch_end(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL || !runtime->qwen35_core_batch_active || runtime->active_frame_cb == nil ||
+        runtime->qwen35_core_batch_count != runtime->qwen35_core_batch_expected) return -1;
+    @autoreleasepool {
+        const int parallel_rc = termite_metal_lightonocr3_encode_recurrent_parallel(runtime,
+            runtime->active_frame_cb, &runtime->qwen35_core_batch_handles[0][0],
+            &runtime->qwen35_core_batch_offsets[0][0], &runtime->qwen35_core_batch_bytes[0][0],
+            &runtime->qwen35_core_batch_params[0][0], runtime->qwen35_core_batch_count);
+        if (parallel_rc != 0) {
+            termite_metal_decode_runtime_qwen35_core_batch_abort(runtime);
+            return parallel_rc < 0 ? parallel_rc : 0;
+        }
+        if (termite_metal_qwen35_fused_decode_available(runtime)) {
+            id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for_dispatch(
+                runtime->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER, true);
+            if (encoder == nil) return -2;
+            [encoder setComputePipelineState:runtime->qwen35_fused_decode_pipeline];
+            for (size_t row = 0; row < runtime->qwen35_core_batch_count; row++) {
+                const uint32_t *params = runtime->qwen35_core_batch_params[row];
+                for (size_t i = 0; i < 15; i++) [encoder setBuffer:(__bridge id<MTLBuffer>)runtime->qwen35_core_batch_handles[row][i]
+                    offset:runtime->qwen35_core_batch_offsets[row][i] atIndex:i];
+                [encoder setBytes:params length:6 * sizeof(uint32_t) atIndex:15];
+                [encoder dispatchThreadgroups:MTLSizeMake(params[2], 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            }
+            [encoder endEncoding];
+            termite_metal_decode_runtime_qwen35_core_batch_abort(runtime);
+            return 0;
+        }
+        id<MTLComputePipelineState> pipelines[5] = {runtime->qwen35_conv_pipeline, runtime->qwen35_history_pipeline,
+            runtime->qwen35_prepare_pipeline, runtime->qwen35_recurrent_decode_pipeline, runtime->qwen35_norm_pipeline};
+        const bool parallel_norm = termite_metal_qwen35_parallel_norm_available(runtime);
+        if (parallel_norm) {
+            pipelines[2] = runtime->qwen35_prepare_parallel_pipeline;
+            pipelines[4] = runtime->qwen35_norm_parallel_pipeline;
+        }
+        for (size_t stage = 0; stage < 5; stage++) {
+            id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for_dispatch(
+                runtime->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER, true);
+            if (encoder == nil) return -2;
+            [encoder setComputePipelineState:pipelines[stage]];
+            for (size_t row = 0; row < runtime->qwen35_core_batch_count; row++) {
+                const uint32_t *params = runtime->qwen35_core_batch_params[row];
+                const size_t channels = (2 * params[1] + params[2]) * params[3];
+                const size_t norm_grid = params[2] * (parallel_norm ? 32 : 1);
+                const size_t grids[5] = {channels, channels * params[4], norm_grid, params[2] * params[3], norm_grid};
+                for (size_t i = 0; i < 15; i++) [encoder setBuffer:(__bridge id<MTLBuffer>)runtime->qwen35_core_batch_handles[row][i]
+                    offset:runtime->qwen35_core_batch_offsets[row][i] atIndex:i];
+                [encoder setBytes:params length:6 * sizeof(uint32_t) atIndex:15];
+                const size_t width = stage == 3 ? 64 : (parallel_norm && (stage == 2 || stage == 4) ? 32 : termite_metal_thread_width(pipelines[stage], grids[stage]));
+                [encoder dispatchThreads:MTLSizeMake(grids[stage], 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            }
+            [encoder endEncoding];
+        }
+    }
+    termite_metal_decode_runtime_qwen35_core_batch_abort(runtime);
+    return 0;
+}
+
+// An exact interval index avoids the quadratic cross-page alias scan in
+// wide batches. Each row is checked entirely before any of its ranges are
+// inserted, preserving the generic core's supported within-row aliases.
+static size_t termite_metal_qwen35_core_interval_bucket(void *buffer) {
+    const uint64_t key=(uint64_t)(uintptr_t)buffer;
+    return (size_t)(((key >> 4) * UINT64_C(11400714819323198485)) >> 53);
+}
+static int termite_metal_qwen35_core_collect_intervals(termite_metal_decode_runtime *runtime,
+    void *const *handles,const size_t *offsets,const size_t *counts) {
+    const uint16_t *heads=runtime->qwen35_core_batch_interval_heads;
+    for(size_t j=0;j<15;j++) {
+        const bool write=j==7||j==8||j==9||j==10||j==11||j==14;
+        const size_t begin=offsets[j],end=begin+counts[j]*sizeof(float);
+        for(uint16_t link=heads[termite_metal_qwen35_core_interval_bucket(handles[j])];link;link=runtime->qwen35_core_batch_intervals[link-1].next) {
+            const termite_metal_core_access_interval *prior=&runtime->qwen35_core_batch_intervals[link-1];
+            if(prior->buffer==handles[j]&&(write||prior->write)&&begin<prior->end&&prior->begin<end)return -11;
+        }
+    }
+    for(size_t j=0;j<15;j++) {
+        const bool write=j==7||j==8||j==9||j==10||j==11||j==14;
+        const size_t begin=offsets[j],end=begin+counts[j]*sizeof(float);
+        const size_t bucket=termite_metal_qwen35_core_interval_bucket(handles[j]);
+        bool merged=false;
+        for(uint16_t link=heads[bucket];link;link=runtime->qwen35_core_batch_intervals[link-1].next) {
+            termite_metal_core_access_interval *prior=&runtime->qwen35_core_batch_intervals[link-1];
+            // Merge only overlapping or adjacent ranges with identical access
+            // modes. Gaps and read-only regions never become spurious writes.
+            if(prior->buffer==handles[j]&&prior->write==write&&begin<=prior->end&&prior->begin<=end) {
+                prior->begin=MIN(prior->begin,begin);prior->end=MAX(prior->end,end);merged=true;break;
+            }
+        }
+        if(!merged) {
+            const size_t index=runtime->qwen35_core_batch_interval_count;
+            if(index>=64*15)return -11;
+            runtime->qwen35_core_batch_interval_count++;
+            runtime->qwen35_core_batch_intervals[index]=(termite_metal_core_access_interval){handles[j],begin,end,runtime->qwen35_core_batch_interval_heads[bucket],write};
+            runtime->qwen35_core_batch_interval_heads[bucket]=(uint16_t)(index+1);
+        }
+    }
+    return 0;
+}
+int termite_metal_decode_runtime_qwen35_core_device(
+    termite_metal_decode_runtime *runtime, void *const *handles, const size_t *offsets,
+    size_t seq, size_t key_heads, size_t value_heads, size_t dim, size_t kernel, int initialized
+) {
+    if(runtime==NULL||handles==NULL||offsets==NULL)return -1;
+    if(seq==0||seq>UINT32_MAX||key_heads==0||key_heads>64||value_heads==0||value_heads>64||value_heads%key_heads!=0||dim!=128||kernel!=4)return -2;
+    if(!termite_metal_decode_runtime_qwen35_core_available(runtime))return -3;
+    const size_t channels=(2*key_heads+value_heads)*dim;
+    const size_t counts[15]={seq*channels,channels*kernel,seq*value_heads,seq*value_heads,value_heads,value_heads,channels*kernel,channels*kernel,value_heads*dim*dim,seq*channels,seq*value_heads*2,seq*value_heads*dim,seq*value_heads*dim,dim,seq*value_heads*dim};
+    @autoreleasepool {
+        id<MTLBuffer> buffers[15];
+        for(size_t i=0;i<15;i++) {
+            if(handles[i]==NULL||counts[i]>SIZE_MAX/sizeof(float))return -4;
+            buffers[i]=(__bridge id<MTLBuffer>)handles[i];
+            size_t bytes=counts[i]*sizeof(float);
+            if(offsets[i]>buffers[i].length||bytes>buffers[i].length-offsets[i])return -5;
+        }
+        bool frame_owned=true;
+        id<MTLCommandBuffer> cb=termite_metal_decode_runtime_command_buffer(runtime,__func__,&frame_owned);
+        if(cb==nil)return -6;
+        if(!frame_owned)for(size_t i=0;i<15;i++)if(termite_metal_decode_runtime_retain_frame_resource(runtime,buffers[i])!=0)return -7;
+        struct { uint32_t seq,key_heads,value_heads,dim,kernel,initialized; } params={(uint32_t)seq,(uint32_t)key_heads,(uint32_t)value_heads,(uint32_t)dim,(uint32_t)kernel,initialized!=0};
+        if (runtime->qwen35_core_batch_active) {
+            const size_t row = runtime->qwen35_core_batch_count;
+            if (seq != 1 || frame_owned || row >= runtime->qwen35_core_batch_expected) return -10;
+            if(runtime->qwen35_core_batch_expected>16) {
+                const int aliases=termite_metal_qwen35_core_collect_intervals(runtime,handles,offsets,counts);
+                if(aliases)return aliases;
+            } else {
+            const size_t writes[6] = {7, 8, 9, 10, 11, 14};
+            for (size_t peer = 0; peer < row; peer++) for (size_t w = 0; w < 6; w++) for (size_t k = 0; k < 15; k++) {
+                const size_t j = writes[w];
+                if (handles[j] == runtime->qwen35_core_batch_handles[peer][k] &&
+                    offsets[j] < runtime->qwen35_core_batch_offsets[peer][k] + runtime->qwen35_core_batch_bytes[peer][k] &&
+                    runtime->qwen35_core_batch_offsets[peer][k] < offsets[j] + counts[j] * sizeof(float)) return -11;
+                if (runtime->qwen35_core_batch_handles[peer][j] == handles[k] &&
+                    runtime->qwen35_core_batch_offsets[peer][j] < offsets[k] + counts[k] * sizeof(float) &&
+                    offsets[k] < runtime->qwen35_core_batch_offsets[peer][j] + runtime->qwen35_core_batch_bytes[peer][j]) return -11;
+            }
+            }
+            memcpy(runtime->qwen35_core_batch_handles[row], handles, sizeof(runtime->qwen35_core_batch_handles[row]));
+            memcpy(runtime->qwen35_core_batch_offsets[row], offsets, sizeof(runtime->qwen35_core_batch_offsets[row]));
+            memcpy(runtime->qwen35_core_batch_params[row], &params, sizeof(params));
+            for (size_t i = 0; i < 15; i++) runtime->qwen35_core_batch_bytes[row][i] = counts[i] * sizeof(float);
+            runtime->qwen35_core_batch_count++;
+            return 0;
+        }
+        if (seq == 1) {
+            size_t bytes[15];
+            for (size_t i = 0; i < 15; i++) bytes[i] = counts[i] * sizeof(float);
+            const int parallel_rc = termite_metal_lightonocr3_encode_recurrent_parallel(
+                runtime, cb, handles, offsets, bytes, (const uint32_t *)&params, 1);
+            if (parallel_rc < 0) return parallel_rc;
+            if (parallel_rc > 0) return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -9);
+        }
+        if (seq == 1 && termite_metal_qwen35_fused_decode_available(runtime)) {
+            id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER);
+            if (encoder == nil) return -8;
+            [encoder setComputePipelineState:runtime->qwen35_fused_decode_pipeline];
+            for (size_t i = 0; i < 15; i++) [encoder setBuffer:buffers[i] offset:offsets[i] atIndex:i];
+            [encoder setBytes:&params length:sizeof(params) atIndex:15];
+            [encoder dispatchThreadgroups:MTLSizeMake(value_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [encoder endEncoding];
+            return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -9);
+        }
+        id<MTLComputePipelineState> pipelines[5]={runtime->qwen35_conv_pipeline,runtime->qwen35_history_pipeline,runtime->qwen35_prepare_pipeline,seq==1?runtime->qwen35_recurrent_decode_pipeline:runtime->qwen35_recurrent_pipeline,runtime->qwen35_norm_pipeline};
+        size_t grids[5]={seq*channels,channels*kernel,seq*value_heads,value_heads*dim*(seq==1?1:32),seq*value_heads};
+        if (termite_metal_qwen35_prefill_conv_vec4_available(runtime, seq, dim, kernel, offsets)) {
+            pipelines[0] = runtime->qwen35_prefill_conv_vec4_pipeline;
+            grids[0] /= 4;
+        }
+        if (runtime->qwen35_ocr_vector_loads_enabled && seq >= 2 && seq <= 2048 &&
+            dim == 128 && key_heads == 16 && (value_heads == 16 || value_heads == 32) && kernel == 4 &&
+            !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_PREFILL_COLUMNS) &&
+            runtime->qwen35_recurrent_columns4_pipeline != nil &&
+            runtime->qwen35_recurrent_columns4_pipeline.threadExecutionWidth == 32 &&
+            runtime->qwen35_recurrent_columns4_pipeline.maxTotalThreadsPerThreadgroup >= 32) {
+            pipelines[3] = runtime->qwen35_recurrent_columns4_pipeline;
+            grids[3] /= 4;
+        }
+        const bool prefill_norm = seq >= 2 && seq <= 2048 && key_heads == 16 &&
+            (value_heads == 16 || value_heads == 32) && runtime->lightonocr3_projections_enabled &&
+            runtime->qwen35_ocr_vector_loads_enabled &&
+            termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_PREFILL_CORE_NORM) &&
+            !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_CORE_NORM) &&
+            !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_CORE_PARALLEL_NORM) &&
+            runtime->lightonocr3_prefill_prepare_pipeline != nil && runtime->lightonocr3_prefill_norm_pipeline != nil &&
+            runtime->lightonocr3_prefill_prepare_pipeline.threadExecutionWidth == 32 &&
+            runtime->lightonocr3_prefill_norm_pipeline.threadExecutionWidth == 32 &&
+            runtime->lightonocr3_prefill_prepare_pipeline.maxTotalThreadsPerThreadgroup >= 32 &&
+            runtime->lightonocr3_prefill_norm_pipeline.maxTotalThreadsPerThreadgroup >= 32;
+        const bool parallel_norm = prefill_norm || (seq == 1 && termite_metal_qwen35_parallel_norm_available(runtime));
+        if (parallel_norm) {
+            pipelines[2] = prefill_norm ? runtime->lightonocr3_prefill_prepare_pipeline : runtime->qwen35_prepare_parallel_pipeline;
+            pipelines[4] = prefill_norm ? runtime->lightonocr3_prefill_norm_pipeline : runtime->qwen35_norm_parallel_pipeline;
+            if (prefill_norm && seq < 128) runtime->lightonocr3_short_prefill_norm_dispatches++;
+            if (prefill_norm && runtime->lightonocr3_prefill_norm_dispatches++ == 0 &&
+                termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_CORE_NORM")))
+                fprintf(stderr, "lightonocr3_prefill_core_norm: rows=%zu heads=%zu\n", seq, value_heads);
+            grids[2] *= 32;
+            grids[4] *= 32;
+        }
+        const bool shared_encoder = runtime->qwen35_ocr_vector_loads_enabled &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_QWEN35_CORE_ENCODER"));
+        id<MTLComputeCommandEncoder> shared = shared_encoder ?
+            termite_metal_tracked_compute_command_encoder_for(cb,TERMITE_METAL_COMPUTE_SOURCE_OTHER) : nil;
+        if (shared_encoder && shared == nil) return -8;
+        for(size_t stage=0;stage<5;stage++) {
+            id<MTLComputeCommandEncoder> encoder=shared_encoder ? shared :
+                termite_metal_tracked_compute_command_encoder_for(cb,TERMITE_METAL_COMPUTE_SOURCE_OTHER);
+            if(encoder==nil)return -8;
+            [encoder setComputePipelineState:pipelines[stage]];
+            if (!shared_encoder || stage == 0) {
+                for(size_t i=0;i<15;i++)[encoder setBuffer:buffers[i] offset:offsets[i] atIndex:i];
+                [encoder setBytes:&params length:sizeof(params) atIndex:15];
+            }
+            size_t width=stage==3?(seq==1?64:128):(parallel_norm && (stage==2 || stage==4) ? 32 : termite_metal_thread_width(pipelines[stage],grids[stage]));
+            if (stage == 3 && pipelines[stage] == runtime->qwen35_recurrent_columns4_pipeline) width = 32;
+            [encoder dispatchThreads:MTLSizeMake(grids[stage],1,1) threadsPerThreadgroup:MTLSizeMake(width,1,1)];
+            if (shared_encoder && stage < 4) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (!shared_encoder) [encoder endEncoding];
+        }
+        if (shared_encoder) [shared endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(cb,frame_owned,-9);
+    }
+}
+
 int termite_metal_decode_runtime_apply_mrope_device(
     termite_metal_decode_runtime *runtime,
     void *input_handle,
@@ -33903,12 +37164,23 @@ int termite_metal_decode_runtime_florence_channel_attention_f32_device(
         if (!frame_owned && termite_metal_decode_runtime_retain_frame_resource(runtime, scores_buffer) != 0) return -13;
         id<MTLComputeCommandEncoder> scores_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
         if (scores_encoder == nil) return -14;
-        [scores_encoder setComputePipelineState:runtime->florence_channel_scores_f32_pipeline];
+        const bool parallel_scores = channels_per_group == 32 && seq_len >= 64 &&
+            termite_metal_qualified_m4_device_default() &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_FLORENCE2_CHANNEL_REDUCTION")) &&
+            runtime->florence_channel_scores_parallel_pipeline != nil &&
+            runtime->florence_channel_scores_parallel_pipeline.threadExecutionWidth == 32 &&
+            runtime->florence_channel_scores_parallel_pipeline.maxTotalThreadsPerThreadgroup >= 256;
+        id<MTLComputePipelineState> score_pipeline = parallel_scores ? runtime->florence_channel_scores_parallel_pipeline : runtime->florence_channel_scores_f32_pipeline;
+        [scores_encoder setComputePipelineState:score_pipeline];
         [scores_encoder setBuffer:qkv_buffer offset:qkv_offset atIndex:0];
         [scores_encoder setBuffer:scores_buffer offset:0 atIndex:1];
         [scores_encoder setBytes:&params length:sizeof(params) atIndex:2];
-        [scores_encoder dispatchThreads:MTLSizeMake(score_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->florence_channel_scores_f32_pipeline, score_elems), 1, 1)];
+        if (parallel_scores) {
+            [scores_encoder dispatchThreadgroups:MTLSizeMake(score_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [scores_encoder dispatchThreads:MTLSizeMake(score_elems, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(score_pipeline, score_elems), 1, 1)];
+        }
         [scores_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> softmax_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
@@ -35296,6 +38568,66 @@ int termite_metal_decode_runtime_reserve_argmax_rows(
     return termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, rows * partial_bytes);
 }
 
+// All row outputs and partials are reserved before the frame starts. The
+// two dispatches have the same per-row reduction order as the scalar path.
+static int termite_metal_encode_lighton_batch_argmax(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> logits_buffer,
+    size_t logits_offset,
+    size_t rows,
+    size_t out_dim,
+    id<MTLBuffer> suppress_buffer,
+    size_t suppress_count,
+    int failure_code
+) {
+    const size_t blocks = (out_dim + 1023u) / 1024u;
+    size_t logits_bytes = 0, partial_bytes = 0, token_bytes = 0, suppress_bytes = 0;
+    if (encoder == nil || rows < 2 || rows > 64 || out_dim != 248320u ||
+        runtime->lighton_batch_argmax_partials_pipeline == nil ||
+        runtime->lighton_batch_argmax_reduce_pipeline == nil ||
+        !termite_metal_size_mul(rows, out_dim * sizeof(float), &logits_bytes) ||
+        !termite_metal_size_mul(rows, blocks * sizeof(float), &partial_bytes) ||
+        !termite_metal_size_mul(rows, sizeof(uint32_t), &token_bytes) ||
+        !termite_metal_size_mul(suppress_count, sizeof(int32_t), &suppress_bytes)) return failure_code;
+    termite_metal_planned_encoder_range partial_accesses[4];
+    size_t n = 0;
+    if (termite_metal_planned_range_make(logits_buffer, logits_offset, logits_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &partial_accesses[n++], failure_code) != 0 ||
+        (suppress_count != 0 && termite_metal_planned_range_make(suppress_buffer, 0, suppress_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &partial_accesses[n++], failure_code) != 0) ||
+        termite_metal_planned_range_make(runtime->sample_topk_values_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[n++], failure_code) != 0 ||
+        termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[n++], failure_code) != 0 ||
+        termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, partial_accesses, n, failure_code) != 0) return failure_code;
+    const uint32_t params[4] = {(uint32_t)out_dim, (uint32_t)suppress_count, 0, 0};
+    [encoder setComputePipelineState:runtime->lighton_batch_argmax_partials_pipeline];
+    [encoder setBuffer:logits_buffer offset:logits_offset atIndex:0];
+    [encoder setBuffer:suppress_buffer offset:0 atIndex:1];
+    [encoder setBuffer:runtime->sample_topk_values_buffer offset:0 atIndex:2];
+    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:0 atIndex:3];
+    [encoder setBytes:params length:sizeof(params) atIndex:4];
+    [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+    [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
+    [encoder dispatchThreadgroups:MTLSizeMake(blocks, rows, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (runtime->active_planned_compute_encoder == encoder) {
+        termite_metal_planned_encoder_range reduce_accesses[3];
+        if (termite_metal_planned_range_make(runtime->sample_topk_values_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[0], failure_code) != 0 ||
+            termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[1], failure_code) != 0 ||
+            termite_metal_planned_range_make(runtime->token_buffer, 0, token_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &reduce_accesses[2], failure_code) != 0 ||
+            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, reduce_accesses, 3, failure_code) != 0) return failure_code;
+    } else {
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+    const uint32_t block_count = (uint32_t)blocks;
+    [encoder setComputePipelineState:runtime->lighton_batch_argmax_reduce_pipeline];
+    [encoder setBuffer:runtime->sample_topk_values_buffer offset:0 atIndex:0];
+    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:0 atIndex:1];
+    [encoder setBuffer:runtime->token_buffer offset:0 atIndex:2];
+    [encoder setBytes:&block_count length:sizeof(block_count) atIndex:3];
+    [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(rows, (size_t)32), 1, 1)];
+    runtime->lighton_batch_argmax_calls = termite_metal_u64_saturating_add(runtime->lighton_batch_argmax_calls, 1);
+    runtime->lighton_batch_argmax_rows = termite_metal_u64_saturating_add(runtime->lighton_batch_argmax_rows, rows);
+    return 0;
+}
+
 int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
     termite_metal_decode_runtime *runtime,
     void *logits_handle,
@@ -35334,6 +38666,7 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
         const bool encode_on_active_frame =
             consume_active_frame != 0 &&
             runtime->active_frame_cb != nil && runtime->active_planned_compute_encoder != nil;
+        if (consume_active_frame == 2 && !encode_on_active_frame) return -18;
         const bool restore_active_frame = runtime->active_frame_cb != nil && !encode_on_active_frame;
         if (restore_active_frame) {
             if (!termite_metal_decode_runtime_active_frame_empty(runtime)) {
@@ -35356,20 +38689,39 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
             encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -12;
         }
+        const bool batch_argmax = rows >= 2 && rows <= 64 && out_dim == 248320u &&
+            runtime->lightonocr3_projections_enabled && termite_metal_qualified_m4_device_default() != 0 &&
+            termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_BATCH_ARGMAX")) &&
+            runtime->lighton_batch_argmax_partials_pipeline != nil &&
+            runtime->lighton_batch_argmax_reduce_pipeline != nil &&
+            runtime->lighton_batch_argmax_partials_pipeline.maxTotalThreadsPerThreadgroup >= 256u;
         int encode_rc = 0;
-        for (size_t row = 0; row < rows; ++row) {
-            encode_rc = termite_metal_encode_argmax_logits_suppress_on_encoder_at(
-                runtime,
-                encoder,
-                logits_buffer,
-                logits_offset + row * row_bytes,
-                out_dim,
-                suppress_buffer,
-                suppress_count,
-                row * sizeof(uint32_t),
-                row * partial_bytes,
-                -13);
-            if (encode_rc != 0) break;
+        if (batch_argmax) {
+            encode_rc = termite_metal_encode_lighton_batch_argmax(runtime, encoder, logits_buffer, logits_offset,
+                rows, out_dim, suppress_buffer, suppress_count, -13);
+        } else {
+            for (size_t row = 0; row < rows; ++row) {
+                encode_rc = termite_metal_encode_argmax_logits_suppress_on_encoder_at(
+                    runtime,
+                    encoder,
+                    logits_buffer,
+                    logits_offset + row * row_bytes,
+                    out_dim,
+                    suppress_buffer,
+                    suppress_count,
+                    row * sizeof(uint32_t),
+                    row * partial_bytes,
+                    -13);
+                if (encode_rc != 0) break;
+            }
+        }
+        if (encode_on_active_frame && consume_active_frame == 2) {
+            // Encode-only OCR pipeline mode. No CPU result is exposed until
+            // the caller drains this submitted producer. Keep buffer ownership
+            // and the existing reduction order unchanged.
+            if (encode_rc != 0) return encode_rc;
+            runtime->argmax_on_frame_calls = termite_metal_u64_saturating_add(runtime->argmax_on_frame_calls, 1);
+            return 0;
         }
         if (encode_on_active_frame) {
             // The logits producer, row argmaxes, and token writeback now share
@@ -35380,6 +38732,7 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
             int wait_rc = termite_metal_decode_runtime_wait_frame(runtime);
             if (wait_rc != 0) return -14;
             if (encode_rc != 0) return encode_rc;
+            runtime->argmax_on_frame_calls = termite_metal_u64_saturating_add(runtime->argmax_on_frame_calls, 1);
         } else {
             [encoder endEncoding];
             if (encode_rc != 0) return encode_rc;
@@ -35654,6 +39007,35 @@ int termite_metal_decode_runtime_apply_rms_norm_scratch_device(
     }
 }
 
+// Cached input vectors avoid rereading the entire row after its reduction.
+// Scalar-aligned views and missing optional PSOs retain the existing path.
+static id<MTLComputePipelineState> termite_metal_lightonocr3_cached_norm_pipeline(
+    termite_metal_decode_runtime *runtime, size_t rows, size_t hidden_size,
+    size_t input_offset, size_t weight_offset, size_t output_offset
+) {
+    if ((input_offset | weight_offset | output_offset) % 16 != 0 ||
+        termite_metal_lightonocr3_prefill_norm_threads(runtime, rows, hidden_size) == 0) return nil;
+    id<MTLComputePipelineState> pipeline = hidden_size == 1024 ? runtime->lightonocr3_norm_cached1024_pipeline :
+        hidden_size == 2560 ? runtime->lightonocr3_norm_cached2560_pipeline : nil;
+    return pipeline != nil && pipeline.threadExecutionWidth == 32 && pipeline.maxTotalThreadsPerThreadgroup >= 128
+        ? pipeline : nil;
+}
+
+static void termite_metal_dispatch_lightonocr3_norm_or_rows(
+    termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder,
+    size_t rows, size_t hidden_size, size_t input_offset, size_t weight_offset, size_t output_offset
+) {
+    id<MTLComputePipelineState> cached = termite_metal_lightonocr3_cached_norm_pipeline(
+        runtime, rows, hidden_size, input_offset, weight_offset, output_offset);
+    if (cached != nil) {
+        [encoder setComputePipelineState:cached];
+        [encoder setThreadgroupMemoryLength:4u * sizeof(float) atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else {
+        termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
+    }
+}
+
 int termite_metal_decode_runtime_apply_rms_norm_rows_device(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -35710,7 +39092,7 @@ int termite_metal_decode_runtime_apply_rms_norm_rows_device(
         [encoder setBuffer:runtime->rms_norm_weight_buffers[slot] offset:0 atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
+        termite_metal_dispatch_lightonocr3_norm_or_rows(runtime, encoder, rows, hidden_size, input_offset, 0, output_offset);
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
         [command_buffer commit];
@@ -35771,7 +39153,7 @@ int termite_metal_decode_runtime_apply_rms_norm_weight_device(
         [encoder setBuffer:weight_buffer offset:weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
+        termite_metal_dispatch_lightonocr3_norm_or_rows(runtime, encoder, rows, hidden_size, input_offset, weight_offset, output_offset);
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
         [command_buffer commit];
@@ -36388,6 +39770,7 @@ static int termite_metal_decode_runtime_prepare_linear_storage(
         // Publish only after both allocations succeed. Failed replacement
         // leaves the old slot and its cached matrix views intact.
         runtime->linear_weight_buffers[slot] = weight_buffer;
+        termite_metal_ocr_residency_track(runtime,slot,weight_buffer);
         runtime->linear_bias_buffers[slot] = bias_buffer;
         runtime->linear_in_dims[slot] = in_dim;
         runtime->linear_out_dims[slot] = out_dim;
@@ -36525,6 +39908,7 @@ int termite_metal_decode_runtime_prepare_linear_f16(
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (weight_buffer == nil || bias_buffer == nil) return -5;
         runtime->linear_weight_buffers[slot] = weight_buffer;
+        termite_metal_ocr_residency_track(runtime,slot,weight_buffer);
         runtime->linear_bias_buffers[slot] = bias_buffer;
         runtime->linear_in_dims[slot] = in_dim;
         runtime->linear_out_dims[slot] = out_dim;
@@ -36561,6 +39945,7 @@ int termite_metal_decode_runtime_prepare_linear_bf16(
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (weight_buffer == nil || bias_buffer == nil) return -5;
         runtime->linear_weight_buffers[slot] = weight_buffer;
+        termite_metal_ocr_residency_track(runtime,slot,weight_buffer);
         runtime->linear_bias_buffers[slot] = bias_buffer;
         runtime->linear_in_dims[slot] = in_dim;
         runtime->linear_out_dims[slot] = out_dim;
@@ -36602,6 +39987,7 @@ int termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (bias_buffer == nil) return -6;
         runtime->linear_weight_buffers[slot] = weight_buffer;
+        termite_metal_ocr_residency_track(runtime,slot,weight_buffer);
         runtime->linear_bias_buffers[slot] = bias_buffer;
         runtime->linear_in_dims[slot] = in_dim;
         runtime->linear_out_dims[slot] = out_dim;
@@ -37116,6 +40502,763 @@ int termite_metal_decode_runtime_prepare_bitnet_tl2_linear_slot(
     }
 }
 
+static bool termite_metal_lightonocr3_fast_projections(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL && runtime->lightonocr3_projections_enabled &&
+           !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PROJECTIONS);
+}
+
+static id<MTLComputePipelineState> termite_metal_lightonocr3_gemv_pipeline(termite_metal_decode_runtime *runtime,
+                                                                           size_t input_offset, size_t in_dim,
+                                                                           size_t out_dim, size_t *rows_per_group) {
+    *rows_per_group = 1;
+    if (!termite_metal_lightonocr3_fast_projections(runtime) || input_offset % 16 != 0 || in_dim % 128 != 0 ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_GEMV))
+        return nil;
+    const bool shape = (in_dim == 1024 && (out_dim == 16 || out_dim == 512 || out_dim == 2048 || out_dim == 4096 ||
+                                           out_dim == 6144 || out_dim == 3584 || out_dim == 248320)) ||
+                       ((in_dim == 2048 || in_dim == 3584) && out_dim == 1024) ||
+                       (in_dim == 2560 && (out_dim == 32 || out_dim == 64 || out_dim == 1024 || out_dim == 4096 ||
+                                           out_dim == 8192 || out_dim == 9216 || out_dim == 248320)) ||
+                       ((in_dim == 4096 || in_dim == 9216) && out_dim == 2560);
+    if (!shape)
+        return nil;
+    const bool single_down = in_dim == 3584 && out_dim == 1024 &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE);
+    const bool rows2 = !single_down && (in_dim >= 3584 || out_dim == 248320);
+    id<MTLComputePipelineState> pipeline =
+        rows2 ? runtime->lightonocr3_gemv_rows2_pipeline : runtime->lightonocr3_gemv_pipeline;
+    if (pipeline == nil || pipeline.threadExecutionWidth != 32 || pipeline.maxTotalThreadsPerThreadgroup < 32)
+        return nil;
+    *rows_per_group = rows2 ? 2 : 1;
+    return pipeline;
+}
+
+// The scalar accumulators let each SIMD group reuse input vectors across
+// several output columns without multiplying the live vector register count.
+// Promote only measured decoder shapes; keep the original kernels available.
+static size_t termite_metal_lightonocr3_tiled_columns(termite_metal_decode_runtime *runtime, size_t rows, size_t in_dim, size_t out_dim) {
+    if (!termite_metal_lightonocr3_fast_projections(runtime) ||
+        !runtime->qwen35_ocr_vector_loads_enabled || in_dim % 128u != 0u ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS)) return 0;
+    // Keep TensorOps ahead of tiling where the measured eight-row matrix
+    // kernel wins. Partial batches retain their exact-row tiled kernels.
+    if (rows == 8u && ((in_dim == 1024u && out_dim == 6144u) ||
+        (in_dim == 2560u && out_dim == 8192u))) return 0;
+    const bool down = (in_dim == 3584u && out_dim == 1024u) || (in_dim == 9216u && out_dim == 2560u);
+    const bool wide = in_dim == 2560u && (out_dim == 8192u || out_dim == 9216u);
+    const bool eight = down || wide || (in_dim == 1024u && (out_dim == 3584u || out_dim == 6144u)) ||
+        ((in_dim == 1024u || in_dim == 2560u) && out_dim == 248320u);
+    id<MTLComputePipelineState> p = nil;
+    size_t columns = 0;
+    if (rows >= 9u && rows <= 16u) { p = runtime->lightonocr3_tiled_pipelines[rows]; columns = 1; }
+    else if (rows >= 5u && rows <= 8u && eight) { p = runtime->lightonocr3_tiled_pipelines[rows]; columns = 4; }
+    else if (rows >= 3u && rows <= 4u && (down || wide)) { p = runtime->lightonocr3_tiled_pipelines[rows]; columns = 2; }
+    else if (rows == 2u && down) { p = runtime->lightonocr3_tiled_pipelines[rows]; columns = 2; }
+    if (p == nil || p.threadExecutionWidth != 32 || p.maxTotalThreadsPerThreadgroup < 32) return 0;
+    return columns;
+}
+
+// Large F16 encoder mirrors currently use mixed-type MPS matmul. These
+// qualified Florence/BART geometries use TensorOps with the same F32 inputs,
+// accumulation and output, folding bias into the store without another pass.
+static bool termite_metal_f16_encoder_mpp_shape(size_t rows, size_t in_dim, size_t out_dim) {
+    if (rows < 128 || rows > 524288) return false;
+    const bool vision_width = in_dim == 128 || in_dim == 256 || in_dim == 512 || in_dim == 1024;
+    const bool vision = vision_width && (out_dim == in_dim || out_dim == 3 * in_dim || out_dim == 4 * in_dim);
+    const bool down = (in_dim == 512 && out_dim == 128) || (in_dim == 1024 && out_dim == 256) ||
+        (in_dim == 2048 && out_dim == 512) || (in_dim == 4096 && out_dim == 1024);
+    const bool text = (in_dim == 768 && (out_dim == 768 || out_dim == 3072)) ||
+        (in_dim == 3072 && out_dim == 768) || (in_dim == 1024 && out_dim == 768);
+    return vision || down || text;
+}
+
+static int termite_metal_try_f16_encoder_mpp(termite_metal_decode_runtime *runtime, size_t slot,
+    id<MTLBuffer> input, size_t input_offset, size_t rows, size_t in_dim, size_t out_dim,
+    id<MTLBuffer> output, size_t output_offset) {
+    if (runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F16 ||
+        !termite_metal_f16_encoder_mpp_shape(rows,in_dim,out_dim) || input_offset % 16 != 0 ||
+        output_offset % 4 != 0 || input == output ||
+        ![runtime->device.name isEqualToString:@"Apple M4 Max"] ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_F16_ENCODER_MPP)) return 0;
+    // Shares the existing optional Metal 4 library; unsupported OS/pipelines
+    // retain MPS. Initialization is once per execution-lane-owned runtime.
+    termite_metal_initialize_lightonocr3_mpp(runtime);
+    id<MTLComputePipelineState> pipeline = runtime->f16_encoder_mpp_pipeline;
+    if (pipeline == nil || pipeline.threadExecutionWidth != 32 || pipeline.maxTotalThreadsPerThreadgroup < 128) return 0;
+    bool owned = true;
+    id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &owned);
+    if (cb == nil) return -10;
+    if (!owned && (termite_metal_decode_runtime_retain_frame_resource(runtime,input) != 0 ||
+        termite_metal_decode_runtime_retain_frame_resource(runtime,output) != 0)) return -10;
+    // MPS made the same transition. Do not open a second encoder while a
+    // planned compute scope still owns the command buffer.
+    termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+    id<MTLComputeCommandEncoder> enc =
+        termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
+    if (enc == nil)
+        return -11;
+    const termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)in_dim, (uint32_t)out_dim, 0};
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:input offset:input_offset atIndex:0];
+    [enc setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+    [enc setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
+    [enc setBuffer:output offset:output_offset atIndex:3];
+    [enc setBytes:&params length:sizeof(params) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(out_dim / 64, (rows + 31) / 32, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in_dim, out_dim,
+                                                    "f16_encoder_mpp", !owned, false, false, false, false);
+    const int rc = termite_metal_decode_runtime_finish_command_buffer(cb, owned, -12);
+    return rc == 0 ? 1 : rc;
+}
+
+// Split qualified four-row projections and long down projections across eight TensorOps tiles.
+// Reuse only the scratch slot owned by the frame being encoded. Attention's
+// reducer and this reducer finish before the next encoder can reuse the slot;
+// no per-layer allocations or extra unaccounted persistent buffers are needed.
+// Local reductions keep partials in registers or bounded threadgroup memory.
+// Unsupported resource envelopes retain the preceding production routes.
+static bool termite_metal_lightonocr3_local_pipeline_valid(termite_metal_decode_runtime *r,
+                                                           id<MTLComputePipelineState> p, size_t threads,
+                                                           size_t memory) {
+    return p != nil && p.threadExecutionWidth == 32 && p.maxTotalThreadsPerThreadgroup >= threads &&
+           p.staticThreadgroupMemoryLength <= r->device.maxThreadgroupMemoryLength &&
+           memory <= r->device.maxThreadgroupMemoryLength - p.staticThreadgroupMemoryLength;
+}
+static id<MTLComputePipelineState>
+termite_metal_lightonocr3_local_gate_pipeline(termite_metal_decode_runtime *r, size_t rows, size_t in,
+                                              size_t out) {
+    if (rows < 2 || rows > 8 || !((in == 1024 && out == 3584) || (in == 2560 && out == 9216)) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LOCAL_KERNELS))
+        return nil;
+    id<MTLComputePipelineState> p = rows <= 3    ? r->lightonocr3_local_gate_vectors[rows - 2]
+                                    : in == 1024 ? r->lightonocr3_local_gate_tg16
+                                                 : r->lightonocr3_local_gate_tg32;
+    const size_t memory = rows <= 3 ? 0 : 2 * 4 * 8 * (in == 1024 ? 16 : 32) * sizeof(float);
+    return termite_metal_lightonocr3_local_pipeline_valid(r, p, 128, memory) ? p : nil;
+}
+// A larger vocabulary-head batch underfills the scalar
+// vector route. A sixteen-row matrix tile reuses its weights across the full
+// batch. Keep the established small-row/unsupported routes available.
+static int termite_metal_try_lightonocr3_wide_mpp(termite_metal_decode_runtime *r, size_t slot,
+    id<MTLBuffer> input, size_t input_offset, size_t rows, size_t in, size_t out,
+    id<MTLBuffer> output, size_t output_offset) {
+    const bool head = out == 248320 && ((in == 1024 && rows >= 5) || (in == 2560 && rows >= 7));
+    const bool projection = rows >= 9 && rows <= 16 && r->active_frame_cb != nil &&
+        r->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE && (
+        (in == 1024 && (out == 3584 || out == 4096 || out == 6144 || (out == 2048 && rows >= 13))) ||
+        (in == 2560 && (out == 4096 || out == 8192 || out == 9216)) ||
+        (in == 4096 && out == 2560 && rows >= 13) || (in == 2048 && out == 1024 && rows == 16));
+    if (rows < 2 || rows > 16 || (!head && !projection) || !termite_metal_lightonocr3_fast_projections(r) ||
+        !r->qwen35_ocr_vector_loads_enabled || input_offset % 16 || output_offset % 4 ||
+        r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_MPP) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS)) return 0;
+    const size_t variant = head ? (rows >= 9 ? 2 : in == 1024 ? 1 : 0) : (in == 2560 && out == 8192) ? 2 :
+        (in == 1024 && out == 3584) || (in == 2560 && out == 9216) ? 1 : 0;
+    const size_t columns = variant == 2 ? 64 : variant == 1 ? 16 : 8;
+    const size_t threads = variant == 2 ? 128 : 32;
+    id<MTLComputePipelineState> pipeline = r->lightonocr3_wide_mpp_pipelines[variant];
+    if (!termite_metal_lightonocr3_local_pipeline_valid(r, pipeline, threads, 0)) return 0;
+    if (input == output || output == r->linear_weight_buffers[slot] || output == r->linear_bias_buffers[slot]) return -3;
+    const size_t ib = rows * in * sizeof(float), ob = rows * out * sizeof(float);
+    if (input_offset > input.length || ib > input.length - input_offset || output_offset > output.length ||
+        ob > output.length - output_offset || r->linear_weight_buffers[slot].length < in * out * 2 ||
+        r->linear_bias_buffers[slot].length < out * sizeof(float)) return -7;
+    bool owned = true;
+    id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(r, __func__, &owned);
+    if (cb == nil) return -10;
+    if (!owned && (termite_metal_decode_runtime_retain_frame_resource(r, input) ||
+        termite_metal_decode_runtime_retain_frame_resource(r, output))) return -10;
+    termite_metal_planned_encoder_range accesses[4];
+    if (termite_metal_planned_range_make(input, input_offset, ib, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -11) ||
+        termite_metal_planned_range_make(r->linear_weight_buffers[slot], 0, in * out * 2, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -11) ||
+        termite_metal_planned_range_make(r->linear_bias_buffers[slot], 0, out * sizeof(float), TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -11) ||
+        termite_metal_planned_range_make(output, output_offset, ob, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -11) ||
+        termite_metal_decode_runtime_prepare_planned_compute_accesses(r, accesses, 4, -11)) return -11;
+    id<MTLComputeCommandEncoder> encoder = r->active_planned_compute_encoder;
+    const bool planned = encoder != nil;
+    if (!planned) encoder = termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
+    if (encoder == nil) return -12;
+    const termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)in, (uint32_t)out, 0};
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:input offset:input_offset atIndex:0];
+    [encoder setBuffer:r->linear_weight_buffers[slot] offset:0 atIndex:1];
+    [encoder setBuffer:r->linear_bias_buffers[slot] offset:0 atIndex:2];
+    [encoder setBuffer:output offset:output_offset atIndex:3];
+    [encoder setBytes:&params length:sizeof(params) atIndex:4];
+    [encoder dispatchThreadgroups:MTLSizeMake(out / columns, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    if (!planned) [encoder endEncoding];
+    termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in, out,
+        head ? "lightonocr3_wide_mpp_head" : "lightonocr3_wide_mpp_projection", !owned, planned, false, false, false);
+    const int rc = termite_metal_decode_runtime_finish_command_buffer(cb, owned, -13);
+    if (rc != 0) return rc;
+    if (head) r->lightonocr3_wide_mpp_head_calls = termite_metal_u64_saturating_add(r->lightonocr3_wide_mpp_head_calls, 1);
+    else r->lightonocr3_wide_mpp_projection_calls = termite_metal_u64_saturating_add(r->lightonocr3_wide_mpp_projection_calls, 1);
+    return 1;
+}
+
+static int termite_metal_try_lightonocr3_local_projection(termite_metal_decode_runtime *r, size_t slot,
+                                                          id<MTLBuffer> input, size_t input_offset,
+                                                          size_t rows, size_t in, size_t out,
+                                                          id<MTLBuffer> output, size_t output_offset) {
+    if (rows < 1 || rows > 8 || !termite_metal_lightonocr3_fast_projections(r) || input_offset % 16 ||
+        output_offset % 4 || r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LOCAL_KERNELS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS))
+        return 0;
+    const bool recurrent_gate = (in == 1024 && out == 16) || (in == 2560 && out == 32);
+    if (rows == 1 && !recurrent_gate)
+        return 0;
+    // Each row chooses a qualified register tile; partial groups either mask
+    // stores or use an exact tail specialization, without rounding activations.
+    static const size_t decode_shapes[7][2] = {{2048, 1024}, {1024, 2048}, {1024, 512}, {1024, 4096},
+                                               {4096, 2560}, {2560, 4096}, {2560, 1024}};
+    static const uint8_t decode_tiles[7][7] = {
+        {2, 2, 2, 11, 11, 5, 5}, {0, 0, 0, 10, 10, 1, 1}, {12, 12, 12, 5, 11, 11, 2}, {0, 0, 4, 10, 4, 1, 1},
+        {0, 0, 2, 10, 4, 1, 1},  {1, 1, 4, 11, 5, 1, 1},  {2, 2, 2, 11, 11, 11, 5}};
+    size_t decode_shape = 7;
+    for (size_t shape = 0; shape < 7; shape++)
+        if (in == decode_shapes[shape][0] && out == decode_shapes[shape][1]) {
+            decode_shape = shape;
+            break;
+        }
+    const bool decode_projection = rows >= 2 && decode_shape < 7;
+    const bool qkv = (in == 1024 && out == 6144) || (in == 2560 && out == 8192);
+    const bool ffn = (in == 1024 && out == 3584) || (in == 2560 && out == 9216);
+    const bool small_down = in == 3584 && out == 1024, large_down = in == 9216 && out == 2560;
+    if ((qkv && termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE)) ||
+        (ffn && termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE)) ||
+        ((small_down || large_down) &&
+         termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_DOWN_SPLIT)))
+        return 0;
+    id<MTLComputePipelineState> p = nil;
+    size_t columns = 16, threads = 128, memory = 0, row_groups = 1;
+    if (recurrent_gate) {
+        const size_t model = in == 2560, splits = model ? 16 : 8;
+        p = r->lightonocr3_recurrent_gate_vectors[model][rows - 1];
+        columns = 1;
+        threads = splits * 32;
+        memory = splits * 8 * sizeof(float);
+    } else if (decode_projection) {
+        const size_t variant = decode_tiles[decode_shape][rows - 2], tile = variant % 6;
+        if (variant == 12) {
+            // The low-width projection needs more independent threadgroups.
+            p = r->lightonocr3_tiled_pipelines[rows];
+            columns = 2;
+            threads = 32;
+        } else {
+            const size_t caps[6] = {4, 4, 4, 4, 2, 2}, lanes[6] = {16, 16, 32, 32, 16, 32},
+                         tiles[6] = {2, 4, 4, 8, 4, 8};
+            const size_t batch = MIN(rows, caps[tile]), family = tile < 4 ? tile : tile == 4 ? 1 : 3;
+            p = variant >= 6 ? r->lightonocr3_decode_tails[tile][rows - 5]
+                             : r->lightonocr3_decode_chunks[family][batch - 1];
+            columns = 4 * (32 / lanes[tile]) * tiles[tile];
+            row_groups = (rows + batch - 1) / batch;
+        }
+    } else if (rows <= 4 && (qkv || ffn)) {
+        p = r->lightonocr3_local_projection_vectors[rows - 2];
+        if (rows == 4)
+            columns = 32;
+    } else if (large_down && rows <= 3) {
+        p = r->lightonocr3_local_down_vectors[rows - 2];
+        columns = 16;
+    } else if (large_down && rows == 4)
+        p = r->lightonocr3_local_down_vector4;
+    else if (small_down && rows >= 4) {
+        p = r->lightonocr3_local_down_tg16;
+        threads = 512;
+        memory = 16 * 8 * 16 * 4;
+    } else if (large_down && rows == 8) {
+        p = r->lightonocr3_local_down_tg8;
+        threads = 256;
+        memory = 8 * 8 * 16 * 4;
+    }
+    if (!termite_metal_lightonocr3_local_pipeline_valid(r, p, threads, memory))
+        return 0;
+    if (input == output || output == r->linear_weight_buffers[slot] || output == r->linear_bias_buffers[slot])
+        return -3;
+    const size_t ib = rows * in * 4, ob = rows * out * 4;
+    if (input_offset > input.length || ib > input.length - input_offset || output_offset > output.length ||
+        ob > output.length - output_offset || r->linear_weight_buffers[slot].length < in * out * 2 ||
+        r->linear_bias_buffers[slot].length < out * 4)
+        return -7;
+    bool owned = true;
+    id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(r, __func__, &owned);
+    if (!cb)
+        return -10;
+    if (!owned && (termite_metal_decode_runtime_retain_frame_resource(r, input) ||
+                   termite_metal_decode_runtime_retain_frame_resource(r, output)))
+        return -10;
+    termite_metal_planned_encoder_range ranges[4];
+    if (termite_metal_planned_range_make(input, input_offset, ib, TERMITE_METAL_PLANNED_RANGE_READ,
+                                         &ranges[0], -11) ||
+        termite_metal_planned_range_make(r->linear_weight_buffers[slot], 0, in * out * 2,
+                                         TERMITE_METAL_PLANNED_RANGE_READ, &ranges[1], -11) ||
+        termite_metal_planned_range_make(r->linear_bias_buffers[slot], 0, out * 4,
+                                         TERMITE_METAL_PLANNED_RANGE_READ, &ranges[2], -11) ||
+        termite_metal_planned_range_make(output, output_offset, ob, TERMITE_METAL_PLANNED_RANGE_WRITE,
+                                         &ranges[3], -11) ||
+        termite_metal_decode_runtime_prepare_planned_compute_accesses(r, ranges, 4, -11))
+        return -11;
+    id<MTLComputeCommandEncoder> e = r->active_planned_compute_encoder;
+    const bool planned = e != nil;
+    if (!planned)
+        e = termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
+    if (!e)
+        return -12;
+    const termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)in, (uint32_t)out, 0};
+    [e setComputePipelineState:p];
+    [e setBuffer:input offset:input_offset atIndex:0];
+    [e setBuffer:r->linear_weight_buffers[slot] offset:0 atIndex:1];
+    [e setBuffer:r->linear_bias_buffers[slot] offset:0 atIndex:2];
+    [e setBuffer:output offset:output_offset atIndex:3];
+    [e setBytes:&params length:sizeof(params) atIndex:4];
+    if (memory)
+        [e setThreadgroupMemoryLength:memory atIndex:0];
+    [e dispatchThreadgroups:MTLSizeMake(out / columns, row_groups, 1)
+        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    if (!planned)
+        [e endEncoding];
+    termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in, out,
+                                                    decode_projection ? "lightonocr3_decode_projection_chunk"
+                                                    : recurrent_gate  ? "lightonocr3_recurrent_gate_tg"
+                                                    : memory          ? "lightonocr3_down_local_tg"
+                                                                      : "lightonocr3_projection_local_vector",
+                                                    !owned, planned, false, false, false);
+    int rc = termite_metal_decode_runtime_finish_command_buffer(cb, owned, -13);
+    return rc == 0 ? 1 : rc;
+}
+static int termite_metal_try_lightonocr3_down_split(termite_metal_decode_runtime *runtime, size_t slot,
+                                                    id<MTLBuffer> input, size_t input_offset, size_t rows,
+                                                    size_t in_dim, size_t out_dim, id<MTLBuffer> output,
+                                                    size_t output_offset) {
+    const bool small = in_dim == 3584 && out_dim == 1024 && rows >= 5 && rows <= 8;
+    const bool large = in_dim == 9216 && out_dim == 2560 && rows >= 4 && rows <= 8;
+    const bool four_row =
+        rows == 4 &&
+        ((in_dim == 1024 && (out_dim == 6144 || out_dim == 3584)) ||
+         (in_dim == 2560 && (out_dim == 8192 || out_dim == 9216)) || large) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT);
+    const bool partial_qkv =
+        rows >= 5 && rows <= 7 && in_dim == 1024 && out_dim == 6144 &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT);
+    // Balanced native/production/MLX trials qualify these partial cohorts.
+    // Other tails keep the existing tile or streaming projection.
+    const bool tail_shape = (in_dim == 1024 && out_dim == 6144 && rows == 3) ||
+                            (in_dim == 1024 && out_dim == 3584 && (rows == 3 || (rows >= 5 && rows <= 7))) ||
+                            (in_dim == 2560 && (out_dim == 8192 || out_dim == 9216) &&
+                             (rows == 2 || rows == 3 || (rows >= 5 && rows <= 7))) ||
+                            (in_dim == 9216 && out_dim == 2560 && (rows == 3 || (rows >= 5 && rows <= 7)));
+    const bool tail_split =
+        tail_shape && !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TAIL_SPLIT);
+    if ((!small && !large && !four_row && !partial_qkv && !tail_split) ||
+        !termite_metal_lightonocr3_fast_projections(runtime) || input_offset % 16 != 0 ||
+        output_offset % 4 != 0 ||
+        runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_DOWN_SPLIT) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS))
+        return 0;
+    const bool narrow = small || four_row || partial_qkv || tail_split;
+    id<MTLComputePipelineState> stage =
+        narrow ? runtime->lightonocr3_down_split32_pipeline : runtime->lightonocr3_down_split64_pipeline;
+    id<MTLComputePipelineState> reduce = runtime->lightonocr3_down_split_reduce_pipeline;
+    id<MTLBuffer> scratch = termite_metal_decode_gqa_split_scratch_for_encoding(runtime);
+    size_t splits = small && rows <= 7 &&
+                            !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT)
+                        ? 16
+                        : 8;
+    size_t scratch_bytes = splits * rows * out_dim * sizeof(float);
+    // Keep the earlier eight-way route when the finer split does not fit the
+    // current frame's physical and admitted logical scratch capacities.
+    if (splits == 16 && (scratch == nil || scratch.length < scratch_bytes ||
+                         runtime->attention_decode_gqa_split_scratch_capacity < scratch_bytes)) {
+        splits = 8;
+        scratch_bytes = splits * rows * out_dim * sizeof(float);
+    }
+    if (stage == nil || reduce == nil || stage.threadExecutionWidth != 32 ||
+        stage.maxTotalThreadsPerThreadgroup < 32 || reduce.maxTotalThreadsPerThreadgroup < 32 ||
+        scratch == nil || scratch.length < scratch_bytes ||
+        scratch_bytes > runtime->attention_decode_gqa_split_scratch_capacity || scratch == input ||
+        scratch == output || scratch == runtime->linear_weight_buffers[slot] ||
+        scratch == runtime->linear_bias_buffers[slot])
+        return 0;
+    bool owned = true;
+    id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &owned);
+    if (cb == nil)
+        return -10;
+    if (!owned && (termite_metal_decode_runtime_retain_frame_resource(runtime, input) != 0 ||
+                   termite_metal_decode_runtime_retain_frame_resource(runtime, output) != 0 ||
+                   termite_metal_decode_runtime_retain_frame_resource(runtime, scratch) != 0))
+        return -10;
+    const bool coalesced = termite_metal_lightonocr3_decode_coalescing_enabled(runtime);
+    BOOL encoder_owned = YES;
+    id<MTLComputeCommandEncoder> enc;
+    if (coalesced) {
+        termite_metal_planned_encoder_range accesses[5];
+        if (termite_metal_planned_range_make(input, input_offset, rows * in_dim * 4,
+                TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -11) ||
+            termite_metal_planned_range_make(runtime->linear_weight_buffers[slot], 0, in_dim * out_dim * 2,
+                TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -11) ||
+            termite_metal_planned_range_make(runtime->linear_bias_buffers[slot], 0, out_dim * 4,
+                TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -11) ||
+            termite_metal_planned_range_make(scratch, 0, scratch_bytes,
+                TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -11) ||
+            termite_metal_planned_range_make(output, output_offset, rows * out_dim * 4,
+                TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[4], -11)) return -11;
+        enc = termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR,
+            &encoder_owned);
+        if (enc == nil) return -11;
+        if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 5, -11)) {
+            termite_metal_end_scoped_compute_encoder(enc, encoder_owned);
+            return -11;
+        }
+    } else {
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+        enc = termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
+        if (enc == nil) return -11;
+    }
+    termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)in_dim, (uint32_t)out_dim,
+                                          (uint32_t)splits};
+    [enc setComputePipelineState:stage];
+    [enc setBuffer:input offset:input_offset atIndex:0];
+    [enc setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+    [enc setBuffer:scratch offset:0 atIndex:2];
+    [enc setBytes:&params length:sizeof(params) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(out_dim / (narrow ? 32 : 64), splits, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [enc setComputePipelineState:reduce];
+    [enc setBuffer:scratch offset:0 atIndex:0];
+    [enc setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:1];
+    [enc setBuffer:output offset:output_offset atIndex:2];
+    [enc setBytes:&params length:sizeof(params) atIndex:3];
+    const size_t count = rows * out_dim;
+    [enc dispatchThreads:MTLSizeMake(count, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(reduce, count), 1, 1)];
+    termite_metal_end_scoped_compute_encoder(enc, encoder_owned);
+    termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in_dim, out_dim,
+                                                    splits == 16 ? "lightonocr3_down_split16"
+                                                    : tail_split ? "lightonocr3_tail_split"
+                                                                 : "lightonocr3_down_split",
+                                                    !owned, !encoder_owned, false, false, false);
+    const int rc = termite_metal_decode_runtime_finish_command_buffer(cb, owned, -12);
+    return rc == 0 ? 1 : rc;
+}
+
+// Thirty-two decode pages are not a prefill. Preserve the existing vision and
+// prefill routes while keeping this optional precision setting out of decode.
+static bool termite_metal_lighton_bf16_prefill_inputs(termite_metal_decode_runtime *r,
+                                                    size_t rows, size_t in, size_t out) {
+    if (r == NULL || rows < 32) return false;
+    if (r->active_frame_cb != nil && r->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE) return false;
+    // A greedy vocabulary head owns its command buffer after decode closes.
+    if (r->active_frame_cb == nil && out == 248320 && (in == 1024 || in == 2560)) return false;
+    return termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_PREFILL_INPUTS);
+}
+
+// Narrow recurrent gates underfill an ordinary prefill matrix tile. Split K
+// within each eight-row group, without global scratch or another dispatch.
+static int termite_metal_try_lightonocr3_prefill_gate(termite_metal_decode_runtime *r, size_t slot,
+                                                      id<MTLBuffer> input, size_t input_offset, size_t rows,
+                                                      size_t in, size_t out, id<MTLBuffer> output,
+                                                      size_t output_offset) {
+    if (!termite_metal_lightonocr3_fast_projections(r) || rows < 32 || rows > 2048 ||
+        slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || input == output || input_offset % 16 ||
+        output_offset % 4 || !((in == 1024 && out == 16) || (in == 2560 && out == 32)) ||
+        r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
+        !r->linear_slot_prepared[slot] || r->linear_in_dims[slot] != in || r->linear_out_dims[slot] != out ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS) ||
+        termite_metal_lighton_bf16_prefill_inputs(r, rows, in, out))
+        return 0;
+    const size_t splits = out == 16 ? 8 : 16;
+    const size_t columns = out == 16 ? 16 : 32;
+    id<MTLComputePipelineState> pipeline =
+        out == 16 ? r->lightonocr3_prefill_gate8_16 : r->lightonocr3_prefill_gate16_32;
+    const size_t scratch = splits * 8 * columns * sizeof(float);
+    id<MTLBuffer> weight = r->linear_weight_buffers[slot], bias = r->linear_bias_buffers[slot];
+    if (output == weight || output == bias || pipeline == nil || pipeline.threadExecutionWidth != 32 ||
+        pipeline.maxTotalThreadsPerThreadgroup < splits * 32 ||
+        pipeline.staticThreadgroupMemoryLength + scratch > r->device.maxThreadgroupMemoryLength ||
+        weight.length < in * out * sizeof(uint16_t) || bias.length < out * sizeof(float) ||
+        input_offset > input.length || rows * in * sizeof(float) > input.length - input_offset ||
+        output_offset > output.length || rows * out * sizeof(float) > output.length - output_offset)
+        return 0;
+    bool owned = true;
+    id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(r, __func__, &owned);
+    if (cb == nil)
+        return -10;
+    if (!owned && (termite_metal_decode_runtime_retain_frame_resource(r, input) ||
+                   termite_metal_decode_runtime_retain_frame_resource(r, output) ||
+                   termite_metal_decode_runtime_retain_frame_resource(r, weight) ||
+                   termite_metal_decode_runtime_retain_frame_resource(r, bias)))
+        return -10;
+    const bool coalesced = r->active_planned_compute_encoder != nil &&
+        !termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PLANNED_MPP);
+    BOOL encoder_owned = YES;
+    id<MTLComputeCommandEncoder> enc;
+    if (coalesced) {
+        termite_metal_planned_encoder_range accesses[4];
+        if (termite_metal_planned_range_make(input, input_offset, rows * in * 4,
+                TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -11) ||
+            termite_metal_planned_range_make(weight, 0, in * out * 2,
+                TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -11) ||
+            termite_metal_planned_range_make(bias, 0, out * 4,
+                TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -11) ||
+            termite_metal_planned_range_make(output, output_offset, rows * out * 4,
+                TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -11)) return -11;
+        enc = termite_metal_scoped_compute_encoder_for(r, cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR,
+            &encoder_owned);
+        if (enc == nil) return -11;
+        if (termite_metal_decode_runtime_prepare_planned_compute_accesses(r, accesses, 4, -11)) {
+            termite_metal_end_scoped_compute_encoder(enc, encoder_owned);
+            return -11;
+        }
+    } else {
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        enc = termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
+        if (enc == nil) return -11;
+    }
+    termite_metal_linear_params p = {(uint32_t)rows, (uint32_t)in, (uint32_t)out, 0};
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:input offset:input_offset atIndex:0];
+    [enc setBuffer:weight offset:0 atIndex:1];
+    [enc setBuffer:bias offset:0 atIndex:2];
+    [enc setBuffer:output offset:output_offset atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    [enc setThreadgroupMemoryLength:scratch atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((out + columns - 1) / columns, (rows + 7) / 8, 1)
+        threadsPerThreadgroup:MTLSizeMake(splits * 32, 1, 1)];
+    if (!encoder_owned) [enc setThreadgroupMemoryLength:0 atIndex:0];
+    termite_metal_end_scoped_compute_encoder(enc, encoder_owned);
+    termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in, out,
+                                                    "lightonocr3_prefill_gate_tg", !owned, !encoder_owned, false,
+                                                    false, false);
+    int rc = termite_metal_decode_runtime_finish_command_buffer(cb, owned, -12);
+    return rc == 0 ? 1 : rc;
+}
+
+// Return zero to decline, one on success, negative on an encoding failure.
+static int termite_metal_try_lightonocr3_mpp(termite_metal_decode_runtime *runtime, size_t slot,
+                                             id<MTLBuffer> input, size_t input_offset, size_t rows,
+                                             size_t in_dim, size_t out_dim, id<MTLBuffer> output,
+                                             size_t output_offset) {
+    const int prefill_gate_rc=termite_metal_try_lightonocr3_prefill_gate(runtime,slot,input,input_offset,rows,in_dim,out_dim,output,output_offset);
+    if(prefill_gate_rc!=0)return prefill_gate_rc;
+    const bool prefill_post=rows>=32&&rows<=2048&&in_dim==2048&&out_dim==1024&&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS);
+    const bool bf16 = termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS) ||
+                      termite_metal_lighton_bf16_prefill_inputs(runtime, rows, in_dim, out_dim);
+    // Retain F32 inputs for short prefill projections. The existing MPP
+    // implementation already covers these row counts for decoder cohorts.
+    const bool short_prefill = !bf16 && rows >= 17 && rows <= 31 && runtime->active_frame_cb != nil &&
+        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_PREFILL &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_MPP);
+    const bool four_row_enabled = rows == 4 && !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE);
+    const bool segment4 =
+        !bf16 && four_row_enabled && in_dim == 1024 && out_dim == 3584 &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) &&
+        runtime->lightonocr3_four_row_segment_pipeline != nil &&
+        runtime->lightonocr3_four_row_segment_pipeline.threadExecutionWidth == 32 &&
+        runtime->lightonocr3_four_row_segment_pipeline.maxTotalThreadsPerThreadgroup >= 32;
+    const bool four_row_mpp = four_row_enabled && in_dim == 2560 &&
+        (out_dim == 8192 || out_dim == 9216) && runtime->lightonocr3_mpp_four_row_pipeline != nil;
+    id<MTLComputePipelineState> small_pipeline = four_row_mpp ? runtime->lightonocr3_mpp_four_row_pipeline : runtime->lightonocr3_mpp_small_tile_pipeline;
+    // A single SIMD group covers small FFN/QKV tiles without padding to
+    // 32 rows. Preserve F32 inputs/accumulation and exact-row fallbacks.
+    const bool small_ffn_shape =
+        ((rows >= 7 && in_dim == 1024 && out_dim == 3584) || (in_dim == 2560 && out_dim == 9216)) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE);
+    const bool small_qkv_shape =
+        ((in_dim == 1024 && out_dim == 6144) || (in_dim == 2560 && out_dim == 8192)) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE);
+    const bool small_tile = !bf16 && ((rows >= 4 && rows <= 8 && (small_ffn_shape || small_qkv_shape)) || prefill_post) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) &&
+        small_pipeline != nil &&
+        small_pipeline.threadExecutionWidth == 32 &&
+        small_pipeline.maxTotalThreadsPerThreadgroup >= 32;
+    if (rows < 32u && !small_tile && !segment4 && !short_prefill && termite_metal_lightonocr3_tiled_columns(runtime, rows, in_dim, out_dim) != 0 &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_SMALL_MPP)) return 0;
+    const bool small_default = segment4 || small_tile || (rows == 8 &&
+        ((in_dim == 1024 && (out_dim == 3584 || out_dim == 6144)) ||
+         (in_dim == 2560 && (out_dim == 8192 || out_dim == 9216)) ||
+         (in_dim == 9216 && out_dim == 2560)) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_SMALL_MPP));
+    // Decoder cohorts retain their explicit precision policy. Wider
+    // cohorts share weight reads while histories remain in sixteen-row chunks.
+    const bool wide_rows = rows >= 17 && rows <= 64 &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_MPP);
+    const bool wide_decode = wide_rows && runtime->active_frame_cb != nil &&
+        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE;
+    // The ordinary greedy path closes the decoder frame before its head.
+    // Qualify that owned command buffer just as the sixteen-row head does.
+    const bool wide_head = wide_rows && out_dim == 248320 && (in_dim == 1024 || in_dim == 2560);
+    const bool small_rows = small_default || wide_decode || wide_head || short_prefill || (rows >= 2 && rows <= 8 &&
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_SMALL_MPP));
+    if (!termite_metal_lightonocr3_fast_projections(runtime) || (rows < 32 && !small_rows) || rows > 16384 ||
+        (rows > 2048 && termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LARGE_MPP)) || input_offset % 16 != 0 ||
+        output_offset % 4 != 0 || termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16)
+        return 0;
+    const bool shape = prefill_post || wide_head || (in_dim == 768 && (out_dim == 768 || out_dim == 2304 || out_dim == 3072)) ||
+                       (in_dim == 3072 && (out_dim == 768 || out_dim == 1024 || out_dim == 3072)) ||
+                       (in_dim == 1024 && (out_dim == 512 || out_dim == 2048 || out_dim == 3584 || out_dim == 6144)) ||
+                       (in_dim == 3584 && out_dim == 1024) ||
+                       (in_dim == 2560 && (out_dim == 1024 || out_dim == 4096 || out_dim == 8192 || out_dim == 9216)) ||
+                       (in_dim == 1024 && (out_dim == 1024 || out_dim == 3072 || out_dim == 4096)) ||
+                       (in_dim == 4096 && (out_dim == 1024 || out_dim == 2560 || out_dim == 4096)) ||
+                       (in_dim == 9216 && out_dim == 2560);
+    if (!shape)
+        return 0;
+    const bool n32 = (in_dim == 4096 && out_dim == 4096) ||
+        (rows > 32 && (wide_decode || wide_head) &&
+         !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_64_ROW_TILE));
+    id<MTLComputePipelineState> pipeline =
+        segment4 ? runtime->lightonocr3_four_row_segment_pipeline : small_tile ? small_pipeline : bf16 ? (n32 ? runtime->lightonocr3_mpp_bf16_n32_pipeline : runtime->lightonocr3_mpp_bf16_pipeline)
+             : (n32 ? runtime->lightonocr3_mpp_f32_n32_pipeline : runtime->lightonocr3_mpp_f32_pipeline);
+    if (pipeline == nil || pipeline.threadExecutionWidth != 32 || pipeline.maxTotalThreadsPerThreadgroup < ((small_tile || segment4) ? 32 : 128) ||
+        (bf16 && runtime->lightonocr3_pack_bf16_pipeline == nil))
+        return 0;
+    if (rows > UINT32_MAX / in_dim || rows > UINT32_MAX / out_dim || out_dim > UINT32_MAX / in_dim)
+        return 0;
+    bool owned = true;
+    id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &owned);
+    if (cb == nil)
+        return -10;
+    // The packed input has exactly one consumer. Recycle only after its
+    // projection in this serial frame. Admitted prompt streaming also permits
+    // a submitted prefix: submit_frame drains its pool into retained resources,
+    // so this active group starts with independent packing storage. No private
+    // pack is rewritten by the host or borrowed across the two frame pools.
+    // All other callers keep the existing no-submitted-prefix gate.
+    const bool prefill_pack_scope = rows >= 32u && rows <= 4096u &&
+        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_PREFILL &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PACK_REUSE);
+    const bool decode_pack_scope = wide_rows &&
+        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_DECODE_PACK_REUSE);
+    const bool large_vision_pack = rows > 4096u && rows <= 16384u &&
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_LARGE_VISION_PACK_REUSE);
+    const bool vision_pack_scope = rows >= 32u && (rows <= 4096u || large_vision_pack) &&
+        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_NONE &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_VISION_PACK_REUSE);
+    const bool reuse_packed = bf16 && !owned && (prefill_pack_scope || decode_pack_scope || vision_pack_scope) &&
+        runtime->active_frame_cb == cb &&
+        (runtime->submitted_frame_cb == nil ||
+         (prefill_pack_scope && runtime->lighton_prefill_stream_pack_reuse)) &&
+        !termite_metal_concurrent_planned_dispatch_enabled(runtime);
+    id<MTLBuffer> packed = nil;
+    if (bf16) {
+        const uint64_t reuse_before = runtime->reuse_hit_count;
+        const uint64_t activation_before = runtime->lighton_activation_hits;
+        packed = reuse_packed
+            ? (__bridge_transfer id<MTLBuffer>)termite_metal_buffer_alloc(runtime, rows * in_dim * 2u, 1)
+            : antfly_observe_metal_buffer([runtime->device newBufferWithLength:rows * in_dim * 2u options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        if (packed == nil) return -10;
+        if (reuse_packed && prefill_pack_scope) {
+            runtime->lighton_prefill_pack_calls += 1;
+            runtime->lighton_prefill_pack_reuse_hits += runtime->reuse_hit_count > reuse_before;
+        } else if (reuse_packed && decode_pack_scope) {
+            runtime->lighton_decode_pack_calls += 1;
+            runtime->lighton_decode_pack_reuse_hits += runtime->reuse_hit_count > reuse_before ||
+                runtime->lighton_activation_hits > activation_before;
+        } else if (reuse_packed && vision_pack_scope) {
+            runtime->lighton_vision_pack_calls += 1;
+            runtime->lighton_vision_pack_reuse_hits += runtime->reuse_hit_count > reuse_before;
+            if (large_vision_pack) {
+                runtime->lighton_large_vision_pack_calls += 1;
+                runtime->lighton_large_vision_pack_reuse_hits += runtime->reuse_hit_count > reuse_before;
+            }
+        }
+    }
+    if (!owned && (termite_metal_decode_runtime_retain_frame_resource(runtime, input) != 0 ||
+                   termite_metal_decode_runtime_retain_frame_resource(runtime, output) != 0 ||
+                   (packed != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, packed) != 0)))
+        return -10;
+    // Preserve a caller's serial/planned encoder instead of closing it for
+    // every projection. Register all real storage, including the BF16 pack,
+    // so concurrent scopes retain their producer/consumer barriers as well.
+    id<MTLComputeCommandEncoder> enc = nil;
+    bool planned = false;
+    if (!owned && runtime->active_planned_compute_encoder != nil &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PLANNED_MPP)) {
+        termite_metal_planned_encoder_range accesses[5];
+        __unsafe_unretained id<MTLBuffer> buffers[5] = {input, runtime->linear_weight_buffers[slot],
+            runtime->linear_bias_buffers[slot], output, packed};
+        const size_t offsets[5] = {input_offset, 0, 0, output_offset, 0};
+        const size_t sizes[5] = {rows * in_dim * 4u, in_dim * out_dim * 2u,
+            out_dim * 4u, rows * out_dim * 4u, rows * in_dim * 2u};
+        const uint32_t types[5] = {TERMITE_METAL_PLANNED_RANGE_READ, TERMITE_METAL_PLANNED_RANGE_READ,
+            TERMITE_METAL_PLANNED_RANGE_READ, TERMITE_METAL_PLANNED_RANGE_WRITE, TERMITE_METAL_PLANNED_RANGE_WRITE};
+        const size_t count = bf16 ? 5u : 4u;
+        for (size_t i = 0; i < count; ++i)
+            if (termite_metal_planned_range_make(buffers[i], offsets[i], sizes[i], types[i], &accesses[i], -11)) return -11;
+        if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, count, -11)) return -11;
+        enc = runtime->active_planned_compute_encoder;
+        planned = enc != nil;
+    }
+    if (!planned)
+        enc = termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
+    if (enc == nil)
+        return -11;
+    if (bf16) {
+        uint32_t count = (uint32_t)(rows * in_dim);
+        [enc setComputePipelineState:runtime->lightonocr3_pack_bf16_pipeline];
+        [enc setBuffer:input offset:input_offset atIndex:0];
+        [enc setBuffer:packed offset:0 atIndex:1];
+        [enc setBytes:&count length:4 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(count, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(
+                                      termite_metal_thread_width(runtime->lightonocr3_pack_bf16_pipeline, count), 1,
+                                      1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+    termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)in_dim, (uint32_t)out_dim, 0};
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:bf16 ? packed : input offset:bf16 ? 0 : input_offset atIndex:0];
+    [enc setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+    [enc setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
+    [enc setBuffer:output offset:output_offset atIndex:3];
+    [enc setBytes:&params length:sizeof(params) atIndex:4];
+    size_t tm = (small_tile || segment4) ? 8 : (n32 ? 64 : 32), tn = segment4 ? 8 : small_tile ? (four_row_mpp ? 16 : 32) : (n32 ? 32 : 64);
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + tn - 1) / tn, (rows + tm - 1) / tm, 1)
+        threadsPerThreadgroup:MTLSizeMake((small_tile || segment4) ? 32 : 128, 1, 1)];
+    if (!planned) [enc endEncoding];
+    if (reuse_packed) {
+        // Transfer a new +1 into the existing in-frame allocator. Its prior
+        // pack and matrix reads precede every subsequent GPU write on this CB.
+        termite_metal_decode_runtime_release_buffer(runtime, (__bridge_retained void *)packed);
+    }
+    termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in_dim, out_dim,
+                                                    segment4 ? "lightonocr3_four_row_segment" : small_tile ? (four_row_mpp ? "lightonocr3_mpp_four_row" : "lightonocr3_mpp_small_tile") : (bf16 ? "lightonocr3_mpp_bf16" : "lightonocr3_mpp_f32"), !owned,
+                                                    false, false, false, false);
+    int rc = termite_metal_decode_runtime_finish_command_buffer(cb, owned, -12);
+    if (rc == 0) {
+        if (planned) runtime->lighton_mpp_planned_calls += 1;
+        else runtime->lighton_mpp_dedicated_calls += 1;
+    }
+    if (rc == 0 && (wide_decode || wide_head)) {
+        if (wide_head) {
+            runtime->lightonocr3_wide_mpp_head_calls = termite_metal_u64_saturating_add(runtime->lightonocr3_wide_mpp_head_calls, 1);
+            if (owned) runtime->lightonocr3_standalone_wide_head_calls = termite_metal_u64_saturating_add(runtime->lightonocr3_standalone_wide_head_calls, 1);
+        }
+        else runtime->lightonocr3_wide_mpp_projection_calls = termite_metal_u64_saturating_add(runtime->lightonocr3_wide_mpp_projection_calls, 1);
+    }
+    return rc == 0 ? 1 : rc;
+}
+
 int termite_metal_decode_runtime_apply_linear(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -37157,13 +41300,20 @@ int termite_metal_decode_runtime_apply_linear(
             : (use_bf16
                 ? (use_reduce ? runtime->linear_bf16_reduce_pipeline : runtime->linear_bf16_pipeline)
                 : (use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline));
+        size_t lighton_rows = 1;
+        id<MTLComputePipelineState> lighton_pipeline = use_bf16
+            ? termite_metal_lightonocr3_gemv_pipeline(runtime, 0, in_dim, out_dim, &lighton_rows) : nil;
+        if (lighton_pipeline != nil) pipeline = lighton_pipeline;
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input_buffer offset:0 atIndex:0];
         [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
         [encoder setBuffer:output_buffer offset:0 atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
-        if (use_reduce) {
+        if (lighton_pipeline != nil) {
+            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + lighton_rows - 1) / lighton_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        } else if (use_reduce) {
             [encoder dispatchThreads:MTLSizeMake(out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         } else {
             id<MTLComputePipelineState> scalar_pipeline = use_f16 ? runtime->linear_f16_pipeline : (use_bf16 ? runtime->linear_bf16_pipeline : runtime->linear_pipeline);
@@ -37193,6 +41343,7 @@ int termite_metal_decode_runtime_apply_linear_device(
     size_t output_offset
 ) {
     if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
+    if (runtime->lighton_vision_mpp_required) return -65;
     if (runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil || runtime->linear_bf16_pipeline == nil || runtime->linear_bf16_reduce_pipeline == nil) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || in_dim == 0 || out_dim == 0) return -3;
     if (runtime->linear_slot_prepared[slot] == 0) return -4;
@@ -37205,6 +41356,8 @@ int termite_metal_decode_runtime_apply_linear_device(
         const size_t output_bytes = out_dim * sizeof(float);
         if (input_offset + input_bytes > input_buffer.length) return -7;
         if (output_offset + output_bytes > output_buffer.length) return -8;
+        const int local_rc = termite_metal_try_lightonocr3_local_projection(runtime, slot, input_buffer, input_offset, 1, in_dim, out_dim, output_buffer, output_offset);
+        if(local_rc != 0) return local_rc == 1 ? 0 : local_rc;
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -10;
@@ -37240,11 +41393,22 @@ static bool termite_metal_use_bf16_mm(
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_BF16_TILED"));
 }
 
-// Qualification is scoped to the measured base M4 and Qwen3 0.6B projection
-// geometries. Other devices, larger shapes and longer rows remain explicit-only.
+// Defaults cover base-M4 Qwen3 0.6B shapes and the model-scoped M4 Max
+// LightOnOCR shapes below. Other devices and shapes remain explicit-only.
 static bool termite_metal_bf16_qualified_default(
     termite_metal_decode_runtime *runtime, size_t rows, size_t in_dim, size_t out_dim
 ) {
+    if (runtime != NULL && runtime->qwen35_ocr_vector_loads_enabled && rows >= 32u && rows <= 2048u) {
+        // LightOnOCR-3-0.8B and 4B text and vision projections. Keep F32 activations
+        // and accumulation; only contiguous BF16 weight loads are vectorized.
+        return (in_dim == 1024u && (out_dim == 512u || out_dim == 1024u || out_dim == 2048u || out_dim == 3072u || out_dim == 3584u || out_dim == 4096u || out_dim == 6144u)) ||
+            ((in_dim == 2048u || in_dim == 3584u) && out_dim == 1024u) ||
+            (in_dim == 768u && (out_dim == 768u || out_dim == 2304u || out_dim == 3072u)) ||
+            (in_dim == 3072u && (out_dim == 768u || out_dim == 1024u || out_dim == 3072u)) ||
+            (in_dim == 2560u && (out_dim == 1024u || out_dim == 4096u || out_dim == 8192u || out_dim == 9216u)) ||
+            (in_dim == 4096u && (out_dim == 1024u || out_dim == 2560u || out_dim == 4096u)) ||
+            (in_dim == 9216u && out_dim == 2560u);
+    }
     if (runtime == NULL || !runtime->apple_m4_device ||
         ![runtime->device.name isEqualToString:@"Apple M4"] || rows < 32u || rows > 2551u) return false;
     return (in_dim == 1024u && (out_dim == 1024u || out_dim == 2048u || out_dim == 3072u)) ||
@@ -37290,28 +41454,177 @@ static id<MTLComputePipelineState> termite_metal_bf16_gate_up_pipeline(
     return runtime->bf16_gate_up_mm_pipeline;
 }
 
-// Raw capability admission is independent of rollout flags so conformance tests
-// can exercise the primitive. Production uses the separate rollout check below.
-int termite_metal_decode_runtime_can_apply_bf16_gate_up(
-    termite_metal_decode_runtime *runtime, size_t gate_slot, size_t up_slot,
-    size_t rows, size_t in_dim, size_t out_dim
-) {
+// Small tails qualify only while the current frame can own the split scratch.
+// Missing optional state retains the earlier projection path.
+static bool termite_metal_lightonocr3_gate_split_available(termite_metal_decode_runtime *runtime, size_t rows,
+                                                           size_t out_dim) {
+    if (runtime == NULL || runtime->active_frame_cb == nil ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_GATE_UP_SPLIT")))
+        return false;
+    id<MTLComputePipelineState> stage = runtime->lightonocr3_gate_up_split16_pipeline;
+    id<MTLComputePipelineState> reduce = runtime->lightonocr3_gate_up_split_reduce_pipeline;
+    const size_t bytes = 8 * rows * out_dim * sizeof(float);
+    id<MTLBuffer> scratch = termite_metal_decode_gqa_split_scratch_for_encoding(runtime);
+    return stage != nil && reduce != nil && stage.threadExecutionWidth == 32 &&
+           reduce.threadExecutionWidth == 32 && stage.maxTotalThreadsPerThreadgroup >= 32 &&
+           reduce.maxTotalThreadsPerThreadgroup >= 128 &&
+           stage.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength &&
+           reduce.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength &&
+           scratch != nil && scratch.length >= bytes &&
+           bytes <= runtime->attention_decode_gqa_split_scratch_capacity;
+}
+
+static id<MTLComputePipelineState>
+termite_metal_lightonocr3_batch_gate_up_pipeline(termite_metal_decode_runtime *runtime, size_t rows,
+                                                 size_t in_dim, size_t out_dim) {
+    if (runtime == NULL || rows > 64 || !termite_metal_lightonocr3_fast_projections(runtime) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_GATE_UP) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS))
+        return nil;
+    // Preserve the vectorized generic default at exactly 64 rows. A separate
+    // opt-in can assess the F32 matrix tile there without changing precision.
+    // Intermediate tails retain their independently qualified smaller tile.
+    if (rows >= 17 && rows <= 64 &&
+        (rows < 64 || termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_FULL64_GATE_UP)) &&
+        in_dim == 2560 && out_dim == 9216 &&
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_WIDE64_GATE_UP) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_GATE_UP)) {
+        id<MTLComputePipelineState> wide = rows < 32
+            ? runtime->lightonocr3_gate_up_wide32_pipeline : runtime->lightonocr3_gate_up_wide64_pipeline;
+        if (wide != nil && wide.threadExecutionWidth == 32 &&
+            wide.maxTotalThreadsPerThreadgroup >= (rows < 32 ? 64u : 128u) &&
+            wide.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength)
+            return wide;
+    }
+    if (rows >= 32 && in_dim == 1024 && out_dim == 3584 &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_GATE_UP)) {
+        id<MTLComputePipelineState> wide = runtime->lightonocr3_gate_up_wide32_pipeline;
+        if (wide != nil && wide.threadExecutionWidth == 32 &&
+            wide.maxTotalThreadsPerThreadgroup >= 64 &&
+            wide.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength)
+            return wide;
+    }
+    if (rows > 16) return nil;
+    id<MTLComputePipelineState> local=termite_metal_lightonocr3_local_gate_pipeline(runtime,rows,in_dim,out_dim);
+    if(local!=nil)return local;
+    // The wider row tile improves the 4B gate/up geometry. The 0.8B
+    // matrix fits cache and retains its independently qualified eight-row tile.
+    if (rows >= 9 && in_dim == 2560 && out_dim == 9216 &&
+        runtime->lightonocr3_gate_up_wide16_pipeline != nil)
+        return runtime->lightonocr3_gate_up_wide16_pipeline;
+    if (in_dim == 1024 && out_dim == 3584 && rows >= 2) {
+        // Small tails qualify only for split fusion. A missing frame/scratch
+        // retains separate projections rather than slower unsplit fusion.
+        if (rows < 5 && !termite_metal_lightonocr3_gate_split_available(runtime, rows, out_dim))
+            return nil;
+        return runtime->lightonocr3_gate_up_small16_pipeline;
+    }
+    if (in_dim == 2560 && out_dim == 9216 && rows >= 2) {
+        if (rows < 4 && !termite_metal_lightonocr3_gate_split_available(runtime, rows, out_dim))
+            return nil;
+        return rows <= 4 ? runtime->lightonocr3_gate_up_small16_pipeline
+                         : runtime->lightonocr3_gate_up_small32_pipeline;
+    }
+    return nil;
+}
+
+// Reuse the current frame's bounded attention scratch. A standalone call
+// retains its existing path; no scratch is allocated here.
+// A planned encoder transitions only after all eligibility checks succeed.
+static int termite_metal_try_lightonocr3_gate_split(termite_metal_decode_runtime *runtime, size_t gate_slot,
+                                                    size_t up_slot, id<MTLBuffer> input, size_t input_offset,
+                                                    size_t rows, size_t in_dim, size_t out_dim,
+                                                    id<MTLBuffer> output, size_t output_offset) {
+    const bool shape = (in_dim == 1024 && out_dim == 3584 && rows >= 2 && rows <= 8) ||
+                       (in_dim == 2560 && out_dim == 9216 && rows >= 2 && rows <= 7);
+    if (!shape || runtime->active_frame_cb == nil ||
+        termite_metal_lightonocr3_batch_gate_up_pipeline(runtime, rows, in_dim, out_dim) == nil ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_GATE_UP_SPLIT")))
+        return 0;
+    if(termite_metal_lightonocr3_local_gate_pipeline(runtime,rows,in_dim,out_dim)!=nil)return 0;
+    id<MTLComputePipelineState> stage = runtime->lightonocr3_gate_up_split16_pipeline;
+    id<MTLComputePipelineState> reduce = runtime->lightonocr3_gate_up_split_reduce_pipeline;
+    const size_t bytes = 8 * rows * out_dim * sizeof(float);
+    id<MTLBuffer> scratch = termite_metal_decode_gqa_split_scratch_for_encoding(runtime);
+    if (stage == nil || reduce == nil || stage.threadExecutionWidth != 32 ||
+        reduce.threadExecutionWidth != 32 || stage.maxTotalThreadsPerThreadgroup < 32 ||
+        reduce.maxTotalThreadsPerThreadgroup < 128 ||
+        stage.staticThreadgroupMemoryLength > runtime->device.maxThreadgroupMemoryLength ||
+        reduce.staticThreadgroupMemoryLength > runtime->device.maxThreadgroupMemoryLength || scratch == nil ||
+        scratch.length < bytes || bytes > runtime->attention_decode_gqa_split_scratch_capacity ||
+        scratch == input || scratch == output || scratch == runtime->linear_weight_buffers[gate_slot] ||
+        scratch == runtime->linear_weight_buffers[up_slot] ||
+        scratch == runtime->linear_bias_buffers[gate_slot] ||
+        scratch == runtime->linear_bias_buffers[up_slot])
+        return 0;
+    if (termite_metal_decode_runtime_retain_frame_resource(runtime, scratch) != 0)
+        return -4;
+    termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+    id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(
+        runtime->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_FFN);
+    if (encoder == nil)
+        return -6;
+    termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)in_dim, (uint32_t)out_dim, 4};
+    [encoder setComputePipelineState:stage];
+    [encoder setBuffer:input offset:input_offset atIndex:0];
+    [encoder setBuffer:runtime->linear_weight_buffers[gate_slot] offset:0 atIndex:1];
+    [encoder setBuffer:runtime->linear_weight_buffers[up_slot] offset:0 atIndex:2];
+    [encoder setBuffer:runtime->linear_bias_buffers[gate_slot] offset:0 atIndex:3];
+    [encoder setBuffer:runtime->linear_bias_buffers[up_slot] offset:0 atIndex:4];
+    [encoder setBuffer:scratch offset:0 atIndex:5];
+    [encoder setBytes:&params length:sizeof(params) atIndex:6];
+    [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 16, 4, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [encoder setComputePipelineState:reduce];
+    [encoder setBuffer:scratch offset:0 atIndex:0];
+    [encoder setBuffer:runtime->linear_bias_buffers[gate_slot] offset:0 atIndex:1];
+    [encoder setBuffer:runtime->linear_bias_buffers[up_slot] offset:0 atIndex:2];
+    [encoder setBuffer:output offset:output_offset atIndex:3];
+    [encoder setBytes:&params length:sizeof(params) atIndex:4];
+    [encoder dispatchThreads:MTLSizeMake(rows * out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [encoder endEncoding];
+    termite_metal_maybe_trace_dense_linear_dispatch("bf16_gate_up_device", gate_slot, rows, in_dim, out_dim,
+                                                    "lightonocr3_gate_up_split", true, false, false, true,
+                                                    false);
+    return 1;
+}
+
+int termite_metal_decode_runtime_can_apply_bf16_gate_up(termite_metal_decode_runtime *runtime,
+                                                        size_t gate_slot, size_t up_slot, size_t rows,
+                                                        size_t in_dim, size_t out_dim) {
     if (runtime == NULL || gate_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY ||
-        up_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || rows < 32u || in_dim < 128u || out_dim < 128u) return 0;
+        up_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || in_dim < 128u || out_dim < 128u)
+        return 0;
+    id<MTLComputePipelineState> small =
+        termite_metal_lightonocr3_batch_gate_up_pipeline(runtime, rows, in_dim, out_dim);
+    if (rows != 1u && rows < 32u && small == nil)
+        return 0;
+    if (rows == 1 && (in_dim % 128 != 0 || out_dim % 128 != 0))
+        return 0;
     // All kernel address arithmetic is uint. These also bound byte products on
     // supported 64-bit hosts and prevent overflow in the rounded tile counts.
-    if (rows > UINT32_MAX / in_dim || rows > UINT32_MAX / out_dim || out_dim > UINT32_MAX / in_dim) return 0;
-    id<MTLComputePipelineState> pipeline = runtime->bf16_gate_up_mm_pipeline;
-    if (pipeline == nil || pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < 256u ||
-        pipeline.staticThreadgroupMemoryLength > runtime->device.maxThreadgroupMemoryLength) return 0;
-    const size_t slots[2] = { gate_slot, up_slot };
+    if (rows > UINT32_MAX / in_dim || rows > UINT32_MAX / out_dim || out_dim > UINT32_MAX / in_dim)
+        return 0;
+    id<MTLComputePipelineState> pipeline = small != nil ? small
+                                           : rows == 1  ? runtime->lightonocr3_gate_up_gemv_pipeline
+                                                        : runtime->bf16_gate_up_mm_pipeline;
+    if (pipeline == nil || pipeline.threadExecutionWidth != 32u ||
+        pipeline.maxTotalThreadsPerThreadgroup < (rows == 1 || small != nil ? 32u : 256u) ||
+        pipeline.staticThreadgroupMemoryLength > runtime->device.maxThreadgroupMemoryLength)
+        return 0;
+    const size_t slots[2] = {gate_slot, up_slot};
     for (size_t i = 0; i < 2; ++i) {
         const size_t slot = slots[i];
-        if (!runtime->linear_slot_prepared[slot] || runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
+        if (!runtime->linear_slot_prepared[slot] ||
+            runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
             runtime->linear_in_dims[slot] != in_dim || runtime->linear_out_dims[slot] != out_dim ||
             runtime->linear_weight_buffers[slot] == nil || runtime->linear_bias_buffers[slot] == nil ||
             runtime->linear_weight_buffers[slot].length < in_dim * out_dim * sizeof(uint16_t) ||
-            runtime->linear_bias_buffers[slot].length < out_dim * sizeof(float)) return 0;
+            runtime->linear_bias_buffers[slot].length < out_dim * sizeof(float))
+            return 0;
     }
     return 1;
 }
@@ -37323,6 +41636,15 @@ int termite_metal_decode_runtime_should_apply_bf16_gate_up(
     if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP")) ||
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_BF16_MM")) ||
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_BF16_TILED"))) return 0;
+    if(rows==1)return termite_metal_lightonocr3_fast_projections(runtime) && input_offset%16==0 && ((in_dim==2560 && out_dim==9216) || (in_dim==1024 && out_dim==3584)) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FUSED_GEMV")) &&
+        termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime,gate_slot,up_slot,rows,in_dim,out_dim);
+    if (rows < 32) return input_offset % 16 == 0 &&
+        termite_metal_lightonocr3_batch_gate_up_pipeline(runtime, rows, in_dim, out_dim) != nil &&
+        termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, gate_slot, up_slot, rows, in_dim, out_dim);
+    if (rows >= 32 && rows <= 64 && input_offset % 16 == 0 &&
+        termite_metal_lightonocr3_batch_gate_up_pipeline(runtime, rows, in_dim, out_dim) != nil)
+        return termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, gate_slot, up_slot, rows, in_dim, out_dim);
     const bool explicit_enable = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_BF16_FUSED_GATE_UP"));
     const bool qualified_default = in_dim == 1024u && out_dim == 3072u &&
         termite_metal_bf16_qualified_default(runtime, rows, in_dim, out_dim);
@@ -37336,6 +41658,130 @@ int termite_metal_decode_runtime_should_apply_bf16_gate_up(
     return 1;
 }
 
+// Optional BF16 prefill FFN. Every scratch view is caller-owned and frame-retained;
+// no allocation or fallible selector change follows the first encoded dispatch.
+int antfly_metal_lighton_prefill_ffn_enabled(termite_metal_decode_runtime *r) {
+    if (r == NULL || !r->lightonocr3_projections_enabled || !r->qwen35_ocr_vector_loads_enabled ||
+        r->active_frame_cb == nil || r->active_frame_regime != TERMITE_METAL_FRAME_REGIME_PREFILL ||
+        r->submitted_frame_cb != nil || termite_metal_concurrent_planned_dispatch_enabled(r) ||
+        !termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_PREFILL_FFN) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_FFN) ||
+        !termite_metal_lightonocr3_fast_projections(r) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PACK_REUSE) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PLANNED_MPP) ||
+        !termite_metal_lighton_bf16_prefill_inputs(r, 128, 2560, 9216)) return 0;
+    if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP")) ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_BF16_MM")) ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_BF16_TILED"))) return 0;
+    return 1;
+}
+static void termite_metal_initialize_lighton_prefill_ffn(termite_metal_decode_runtime *r) {
+    if (r->lighton_prefill_ffn_initialization_attempted) return;
+    r->lighton_prefill_ffn_initialization_attempted = true;
+    if (@available(macOS 26.1, *)) {
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        options.languageVersion = MTLLanguageVersion4_0;
+        termite_metal_set_precise_math(options);
+        NSError *error = nil;
+        id<MTLLibrary> library = [r->device newLibraryWithSource:termite_metal_lighton_prefill_ffn_source()
+                                                       options:options error:&error];
+        if (library != nil) for (size_t i = 0; i < 2; ++i)
+            r->lighton_prefill_ffn_pipelines[i] = termite_metal_make_pipeline(
+                r->device, library, [NSString stringWithFormat:@"termite_lighton_prefill_gate%zu", i]);
+    }
+}
+int antfly_metal_lighton_prefill_ffn_can_apply(termite_metal_decode_runtime *r,
+    size_t gate, size_t up, size_t down, size_t rows, size_t hidden, size_t intermediate) {
+    if (!antfly_metal_lighton_prefill_ffn_enabled(r) || rows < 128 || rows > 1024 ||
+        hidden != 2560 || intermediate != 9216 || gate >= TERMITE_METAL_LINEAR_SLOT_CAPACITY ||
+        up >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || down >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return 0;
+    const size_t slots[3] = {gate, up, down}, ins[3] = {hidden, hidden, intermediate},
+                 outs[3] = {intermediate, intermediate, hidden};
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t s = slots[i];
+        if (!r->linear_slot_prepared[s] || r->linear_weight_dtypes[s] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
+            r->linear_in_dims[s] != ins[i] || r->linear_out_dims[s] != outs[i] ||
+            r->linear_weight_buffers[s] == nil || r->linear_bias_buffers[s] == nil ||
+            r->linear_weight_buffers[s].length < ins[i] * outs[i] * sizeof(uint16_t) ||
+            r->linear_bias_buffers[s].length < outs[i] * sizeof(float)) return 0;
+    }
+    termite_metal_initialize_lighton_prefill_ffn(r);
+    const size_t variant = rows <= 512 ? 1 : 0;
+    id<MTLComputePipelineState> pipelines[3] = {r->lighton_prefill_ffn_pipelines[variant],
+        r->lightonocr3_pack_bf16_pipeline, r->lightonocr3_mpp_bf16_pipeline};
+    for (size_t i = 0; i < 3; ++i) if (pipelines[i] == nil || pipelines[i].threadExecutionWidth != 32 ||
+        pipelines[i].maxTotalThreadsPerThreadgroup < 128 ||
+        pipelines[i].staticThreadgroupMemoryLength > r->device.maxThreadgroupMemoryLength) return 0;
+    return 1;
+}
+int antfly_metal_lighton_prefill_ffn_apply(termite_metal_decode_runtime *r,
+    size_t gate, size_t up, size_t down, size_t rows, size_t hidden, size_t intermediate,
+    void *input_handle, size_t input_offset, void *norm_handle, size_t norm_offset,
+    void *gated_handle, size_t gated_offset, void *output_handle, size_t output_offset) {
+    if (!antfly_metal_lighton_prefill_ffn_can_apply(r, gate, up, down, rows, hidden, intermediate) ||
+        input_handle == NULL || norm_handle == NULL || gated_handle == NULL || output_handle == NULL)
+        return -1;
+    @autoreleasepool {
+        if ((input_offset | norm_offset | gated_offset) % 16 != 0 || output_offset % 4 != 0) return -2;
+        id<MTLBuffer> buffers[10] = {(__bridge id<MTLBuffer>)input_handle, (__bridge id<MTLBuffer>)norm_handle,
+            (__bridge id<MTLBuffer>)gated_handle, (__bridge id<MTLBuffer>)output_handle,
+            r->linear_weight_buffers[gate], r->linear_weight_buffers[up], r->linear_weight_buffers[down],
+            r->linear_bias_buffers[gate], r->linear_bias_buffers[up], r->linear_bias_buffers[down]};
+        const size_t offsets[10] = {input_offset, norm_offset, gated_offset, output_offset, 0, 0, 0, 0, 0, 0};
+        const size_t bytes[10] = {rows*hidden*4, rows*hidden*2, rows*intermediate*2, rows*hidden*4,
+            hidden*intermediate*2, hidden*intermediate*2, intermediate*hidden*2,
+            intermediate*4, intermediate*4, hidden*4};
+        termite_metal_planned_encoder_range accesses[10];
+        for (size_t i = 0; i < 10; ++i) if (termite_metal_planned_range_make(buffers[i], offsets[i], bytes[i],
+            i >= 1 && i <= 3 ? TERMITE_METAL_PLANNED_RANGE_WRITE : TERMITE_METAL_PLANNED_RANGE_READ,
+            &accesses[i], -2) != 0) return -2;
+        // A scratch/output write must not overlap another view, even when views
+        // share one arena buffer. All bounds were checked before these sums.
+        for (size_t w = 1; w <= 3; ++w) for (size_t j = 0; j < 10; ++j)
+            if (w != j && buffers[w] == buffers[j] && offsets[w] < offsets[j] + bytes[j] &&
+                offsets[j] < offsets[w] + bytes[w]) return -3;
+        for (size_t i = 0; i < 10; ++i)
+            if (termite_metal_decode_runtime_retain_frame_resource(r, buffers[i]) != 0) return -4;
+        if (termite_metal_decode_runtime_prepare_planned_compute_accesses(r, accesses, 10, -5) != 0) return -5;
+        id<MTLComputeCommandEncoder> encoder = r->active_planned_compute_encoder;
+        const BOOL planned = encoder != nil;
+        if (!planned) encoder = termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_FFN);
+        if (encoder == nil) return -6;
+        uint32_t count = (uint32_t)(rows * hidden);
+        [encoder setComputePipelineState:r->lightonocr3_pack_bf16_pipeline];
+        [encoder setBuffer:buffers[0] offset:offsets[0] atIndex:0];
+        [encoder setBuffer:buffers[1] offset:offsets[1] atIndex:1];
+        [encoder setBytes:&count length:sizeof(count) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(r->lightonocr3_pack_bf16_pipeline, count), 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        const size_t variant = rows <= 512 ? 1 : 0, m = variant ? 64 : 32, n = variant ? 32 : 64;
+        termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)hidden, (uint32_t)intermediate, 0};
+        [encoder setComputePipelineState:r->lighton_prefill_ffn_pipelines[variant]];
+        [encoder setBuffer:buffers[1] offset:offsets[1] atIndex:0];
+        [encoder setBuffer:buffers[4] offset:0 atIndex:1]; [encoder setBuffer:buffers[5] offset:0 atIndex:2];
+        [encoder setBuffer:buffers[7] offset:0 atIndex:3]; [encoder setBuffer:buffers[8] offset:0 atIndex:4];
+        [encoder setBuffer:buffers[2] offset:offsets[2] atIndex:5];
+        [encoder setBytes:&params length:sizeof(params) atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake((intermediate+n-1)/n, (rows+m-1)/m, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        params.in_dim = (uint32_t)intermediate; params.out_dim = (uint32_t)hidden;
+        [encoder setComputePipelineState:r->lightonocr3_mpp_bf16_pipeline];
+        [encoder setBuffer:buffers[2] offset:offsets[2] atIndex:0];
+        [encoder setBuffer:buffers[6] offset:0 atIndex:1]; [encoder setBuffer:buffers[9] offset:0 atIndex:2];
+        [encoder setBuffer:buffers[3] offset:offsets[3] atIndex:3];
+        [encoder setBytes:&params length:sizeof(params) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake((hidden+63)/64, (rows+31)/32, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (!planned) [encoder endEncoding];
+        r->lighton_prefill_ffn_calls += 1;
+        return 0;
+    }
+}
+
 int termite_metal_decode_runtime_apply_bf16_gate_up_device(
     termite_metal_decode_runtime *runtime, size_t gate_slot, size_t up_slot,
     void *input_handle, size_t input_offset, size_t rows, size_t in_dim, size_t out_dim,
@@ -37346,6 +41792,8 @@ int termite_metal_decode_runtime_apply_bf16_gate_up_device(
     @autoreleasepool {
         id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle;
         id<MTLBuffer> output = (__bridge id<MTLBuffer>)output_handle;
+        id<MTLComputePipelineState> small = termite_metal_lightonocr3_batch_gate_up_pipeline(runtime, rows, in_dim, out_dim);
+        if (small != nil && input_offset % 16 != 0) return -2;
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
         if (input_offset % sizeof(float) != 0 || output_offset % sizeof(float) != 0 ||
@@ -37369,6 +41817,8 @@ int termite_metal_decode_runtime_apply_bf16_gate_up_device(
             termite_metal_planned_range_make(runtime->linear_bias_buffers[up_slot], 0, out_dim * sizeof(float), TERMITE_METAL_PLANNED_RANGE_READ, &accesses[4], -5) != 0 ||
             termite_metal_planned_range_make(output, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[5], -5) != 0 ||
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 6, -5) != 0) return -5;
+        const int split_rc = termite_metal_try_lightonocr3_gate_split(runtime, gate_slot, up_slot, input, input_offset, rows, in_dim, out_dim, output, output_offset);
+        if (split_rc != 0) return split_rc > 0 ? 0 : split_rc;
         id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
         const BOOL planned_encoder = encoder != nil;
         if (!planned_encoder) encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_FFN);
@@ -37376,7 +41826,7 @@ int termite_metal_decode_runtime_apply_bf16_gate_up_device(
         termite_metal_linear_params params = {
             .rows = (uint32_t)rows, .in_dim = (uint32_t)in_dim, .out_dim = (uint32_t)out_dim, .row_blocks = 0u,
         };
-        id<MTLComputePipelineState> pipeline = termite_metal_bf16_gate_up_pipeline(runtime, rows, input_offset, in_dim, out_dim);
+        id<MTLComputePipelineState> pipeline = small != nil ? small : rows==1?runtime->lightonocr3_gate_up_gemv_pipeline:termite_metal_bf16_gate_up_pipeline(runtime, rows, input_offset, in_dim, out_dim);
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input offset:input_offset atIndex:0];
         [encoder setBuffer:runtime->linear_weight_buffers[gate_slot] offset:0 atIndex:1];
@@ -37385,10 +41835,35 @@ int termite_metal_decode_runtime_apply_bf16_gate_up_device(
         [encoder setBuffer:runtime->linear_bias_buffers[up_slot] offset:0 atIndex:4];
         [encoder setBuffer:output offset:output_offset atIndex:5];
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1u)
+        const bool local_tg=small!=nil&&(small==runtime->lightonocr3_local_gate_tg16||small==runtime->lightonocr3_local_gate_tg32);
+        const bool local_vec=small!=nil&&(small==runtime->lightonocr3_local_gate_vectors[0]||small==runtime->lightonocr3_local_gate_vectors[1]);
+        if(local_tg){
+            const size_t columns=small==runtime->lightonocr3_local_gate_tg16?16:32;
+            [encoder setThreadgroupMemoryLength:2*4*8*columns*sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(out_dim/columns,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+        } else if(local_vec)[encoder dispatchThreadgroups:MTLSizeMake(out_dim/16,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+        else if (small == runtime->lightonocr3_gate_up_wide64_pipeline && small != nil) {
+            [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 32, (rows + 63u) / 64u, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            runtime->lightonocr3_wide_gate_up_calls =
+                termite_metal_u64_saturating_add(runtime->lightonocr3_wide_gate_up_calls, 1);
+            if (rows == 64 && in_dim == 2560 && out_dim == 9216)
+                runtime->lightonocr3_full64_gate_up_calls =
+                    termite_metal_u64_saturating_add(runtime->lightonocr3_full64_gate_up_calls, 1);
+        }
+        else if (small == runtime->lightonocr3_gate_up_wide32_pipeline && small != nil) {
+            [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 16, (rows + 31u) / 32u, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            runtime->lightonocr3_wide_gate_up_calls =
+                termite_metal_u64_saturating_add(runtime->lightonocr3_wide_gate_up_calls, 1);
+        }
+        else if (small == runtime->lightonocr3_gate_up_wide16_pipeline && small != nil) [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 16, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        else if (small != nil) [encoder dispatchThreadgroups:MTLSizeMake(out_dim / (small == runtime->lightonocr3_gate_up_small16_pipeline ? 16 : 32), (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        else if(rows==1)[encoder dispatchThreadgroups:MTLSizeMake(out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        else [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1u)
                 threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         termite_metal_maybe_trace_dense_linear_dispatch("bf16_gate_up_device", gate_slot, rows, in_dim, out_dim,
-            pipeline == runtime->bf16_gate_up_mm_vec4_pipeline ? "bf16_gate_up_mm_m64_n32_vec4" : "bf16_gate_up_mm_m64_n32",
+            local_tg ? "lightonocr3_gate_up_local_tg" : local_vec ? "lightonocr3_gate_up_local_vector" : small != nil && small == runtime->lightonocr3_gate_up_wide64_pipeline ? "lightonocr3_wide64_gate_up_mpp" : small != nil && small == runtime->lightonocr3_gate_up_wide32_pipeline ? "lightonocr3_wide_gate_up_mpp" : small != nil ? "lightonocr3_batch_gate_up" : pipeline == runtime->bf16_gate_up_mm_vec4_pipeline ? "bf16_gate_up_mm_m64_n32_vec4" : "bf16_gate_up_mm_m64_n32",
             !frame_owned, planned_encoder, false, true, false);
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -7);
@@ -37522,6 +41997,58 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
         const size_t output_bytes = rows * out_dim * sizeof(float);
         if (input_offset + input_bytes > input_buffer.length) return -7;
         if (output_offset + output_bytes > output_buffer.length) return -8;
+        if (runtime->lighton_vision_mpp_required) {
+            const int rc = termite_metal_try_lightonocr3_mpp(runtime, slot, input_buffer, input_offset,
+                rows, in_dim, out_dim, output_buffer, output_offset);
+            // Zero means unsupported before encoding. Negative failures already
+            // own their encoded work and propagate without any fallback replay.
+            return rc == 1 ? 0 : rc < 0 ? rc : -65;
+        }
+        const int wide_mpp_rc = termite_metal_try_lightonocr3_wide_mpp(runtime,slot,input_buffer,input_offset,rows,in_dim,out_dim,output_buffer,output_offset);
+        if (wide_mpp_rc != 0) return wide_mpp_rc == 1 ? 0 : wide_mpp_rc;
+        const bool wide_shape =
+            (in_dim == 1024 && (out_dim == 512 || out_dim == 2048 || out_dim == 3584 || out_dim == 4096 || out_dim == 6144)) ||
+            (in_dim == 2560 && (out_dim == 1024 || out_dim == 4096 || out_dim == 8192 || out_dim == 9216)) ||
+            (in_dim == 2048 && out_dim == 1024) || (in_dim == 4096 && out_dim == 2560) ||
+            (in_dim == 3584 && out_dim == 1024) || (in_dim == 9216 && out_dim == 2560);
+        if (!termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_PROJECTION_TILES) && rows >= 9 && rows <= 16 && wide_shape &&
+            runtime->active_frame_cb != nil && runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE &&
+            termite_metal_lightonocr3_fast_projections(runtime) &&
+            runtime->linear_weight_dtypes[slot] == TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 &&
+            !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS) &&
+            !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LOCAL_KERNELS) &&
+            !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) &&
+            !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS) &&
+            input_offset % 16 == 0 && output_offset % 4 == 0 && input_buffer != output_buffer &&
+            output_buffer != runtime->linear_weight_buffers[slot] && output_buffer != runtime->linear_bias_buffers[slot] &&
+            input_offset <= input_buffer.length && input_bytes <= input_buffer.length - input_offset &&
+            output_offset <= output_buffer.length && output_bytes <= output_buffer.length - output_offset) {
+            // These rows are independent. Reuse the qualified small-row
+            // kernels inside the existing frame, preserving tracked hazards
+            // and the canonical handling of a one-row tail. Never replay an
+            // earlier tile after an encoding failure.
+            for (size_t row = 0; row < rows; row += 8) {
+                const size_t count = MIN((size_t)8, rows - row);
+                const int rc = count == 1
+                    ? termite_metal_decode_runtime_apply_linear_device(runtime, slot, input_handle,
+                        input_offset + row * in_dim * sizeof(float), in_dim, out_dim, output_handle,
+                        output_offset + row * out_dim * sizeof(float))
+                    : termite_metal_decode_runtime_apply_linear_multi_row_device(runtime, slot, input_handle,
+                        input_offset + row * in_dim * sizeof(float), count, in_dim, out_dim, output_handle,
+                        output_offset + row * out_dim * sizeof(float));
+                if (rc != 0) return rc;
+            }
+            runtime->lightonocr3_wide_projection_tile_calls = termite_metal_u64_saturating_add(runtime->lightonocr3_wide_projection_tile_calls, 1);
+            return 0;
+        }
+        const int local_rc=termite_metal_try_lightonocr3_local_projection(runtime,slot,input_buffer,input_offset,rows,in_dim,out_dim,output_buffer,output_offset);
+        if(local_rc!=0)return local_rc==1?0:local_rc;
+        const int down_split_rc = termite_metal_try_lightonocr3_down_split(runtime, slot, input_buffer, input_offset, rows, in_dim, out_dim, output_buffer, output_offset);
+        if (down_split_rc != 0) return down_split_rc == 1 ? 0 : down_split_rc;
+        const int lighton_rc=termite_metal_try_lightonocr3_mpp(runtime,slot,input_buffer,input_offset,rows,in_dim,out_dim,output_buffer,output_offset);
+        if(lighton_rc!=0)return lighton_rc==1?0:lighton_rc;
+        const int f16_mpp_rc = termite_metal_try_f16_encoder_mpp(runtime,slot,input_buffer,input_offset,rows,in_dim,out_dim,output_buffer,output_offset);
+        if (f16_mpp_rc != 0) return f16_mpp_rc == 1 ? 0 : f16_mpp_rc;
         termite_metal_linear_params params = {
             .rows = (uint32_t)rows,
             .in_dim = (uint32_t)in_dim,
@@ -37657,6 +42184,25 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             runtime->linear_bf16_multi_row_tiled32_m16_pipeline != nil &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_BF16_TILED"));
         const BOOL use_shared_row_reduce = use_bf16 && use_reduce && rows > 1u && rows <= 64u && runtime->linear_bf16_multi_row_shared_reduce_pipeline != nil;
+        // Reuse each vector of BF16 weights across the small OCR cohort while
+        // retaining F32 inputs and accumulation. Other owners keep their path.
+        id<MTLComputePipelineState> lighton_batch = nil;
+        size_t lighton_columns = 1;
+        if (use_bf16 && runtime->qwen35_ocr_vector_loads_enabled && rows >= 2u && rows <= 16u &&
+            in_dim % 128u == 0u && input_offset % 16u == 0u &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS")) &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS"))) {
+            lighton_batch = rows <= 2u ? runtime->lightonocr3_batch2_pipeline :
+                rows <= 4u ? runtime->lightonocr3_batch4_pipeline :
+                rows <= 8u ? runtime->lightonocr3_batch8_pipeline : runtime->lightonocr3_batch16_pipeline;
+            const size_t tiled_columns = termite_metal_lightonocr3_tiled_columns(runtime, rows, in_dim, out_dim);
+            if (tiled_columns != 0) {
+                lighton_batch = runtime->lightonocr3_tiled_pipelines[rows];
+                lighton_columns = tiled_columns;
+            }
+            if (lighton_batch.threadExecutionWidth != 32 || lighton_batch.maxTotalThreadsPerThreadgroup < 32) lighton_batch = nil;
+        }
+
         // F16 uses the reduction kernel; its grid must not use F32 tile dimensions.
         const BOOL use_tiled32_m16 = !use_bf16 && !use_f16 && use_reduce && rows >= 128u && runtime->linear_multi_row_tiled32_m16_f32_pipeline != nil;
         const BOOL use_tiled32 = !use_bf16 && !use_f16 && use_reduce && rows >= 128u && runtime->linear_multi_row_tiled32_f32_pipeline != nil;
@@ -37666,13 +42212,14 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
 	            : (use_bf16
 	                ? (use_bf16_mm ? termite_metal_bf16_mm_pipeline(runtime, input_offset, rows, in_dim, out_dim) : use_bf16_tiled32_m16 ? runtime->linear_bf16_multi_row_tiled32_m16_pipeline : (use_reduce ? (use_shared_row_reduce ? runtime->linear_bf16_multi_row_shared_reduce_pipeline : runtime->linear_bf16_multi_row_reduce_pipeline) : runtime->linear_bf16_multi_row_pipeline))
 	                : (use_tiled32_m16 ? runtime->linear_multi_row_tiled32_m16_f32_pipeline : (use_tiled32 ? runtime->linear_multi_row_tiled32_f32_pipeline : (use_tiled ? runtime->linear_multi_row_tiled_f32_pipeline : (use_reduce ? runtime->linear_multi_row_reduce_pipeline : runtime->linear_multi_row_pipeline)))));
+        if (lighton_batch != nil) pipeline = lighton_batch;
 	        termite_metal_maybe_trace_dense_linear_dispatch(
 	            "linear_multi_row_device",
 	            slot,
 	            rows,
 	            in_dim,
 	            out_dim,
-	            use_f16 ? (use_reduce ? "f16_multi_row_reduce" : "f16_multi_row") : use_bf16_mm ? termite_metal_bf16_mm_variant(runtime, pipeline) : termite_metal_dense_linear_variant(use_bf16, use_shared_row_reduce, use_bf16_tiled32_m16 || use_tiled32_m16, use_tiled32, use_tiled, use_reduce, false),
+	            lighton_batch != nil ? "lightonocr3_batch_vec4" : use_f16 ? (use_reduce ? "f16_multi_row_reduce" : "f16_multi_row") : use_bf16_mm ? termite_metal_bf16_mm_variant(runtime, pipeline) : termite_metal_dense_linear_variant(use_bf16, use_shared_row_reduce, use_bf16_tiled32_m16 || use_tiled32_m16, use_tiled32, use_tiled, use_reduce, false),
 	            !frame_owned,
 	            planned_encoder,
 	            false,
@@ -37684,7 +42231,9 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
-        if (use_bf16_mm) {
+        if (lighton_batch != nil) {
+            [encoder dispatchThreadgroups:MTLSizeMake(out_dim / lighton_columns, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+        } else if (use_bf16_mm) {
             [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         } else if (use_bf16_tiled32_m16 || use_tiled32_m16) {
             [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
@@ -43026,13 +47575,20 @@ static int termite_metal_encode_dense_linear_on_encoder(
         : (use_bf16
             ? (use_reduce ? runtime->linear_bf16_reduce_pipeline : runtime->linear_bf16_pipeline)
             : (use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline));
+    size_t lighton_rows = 1;
+    id<MTLComputePipelineState> lighton_pipeline = use_bf16
+        ? termite_metal_lightonocr3_gemv_pipeline(runtime, input_offset, in_dim, out_dim, &lighton_rows) : nil;
+    if (lighton_pipeline != nil) pipeline = lighton_pipeline;
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
     [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
     [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
     [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
     [encoder setBytes:&params length:sizeof(params) atIndex:4];
-    if (use_reduce) {
+    if (lighton_pipeline != nil) {
+        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + lighton_rows - 1) / lighton_rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else if (use_reduce) {
         [encoder dispatchThreads:MTLSizeMake(out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     } else {
         id<MTLComputePipelineState> scalar_pipeline = use_f16 ? runtime->linear_f16_pipeline : (use_bf16 ? runtime->linear_bf16_pipeline : runtime->linear_pipeline);
@@ -48947,6 +53503,73 @@ int termite_metal_decode_runtime_convert_dtype_f32_device(
     }
 }
 
+// At most two command buffers may own packed vision storage. Reusing within
+// one buffer is ordered by the compute encoder; a submitted peer gets a
+// separate slot. Growth in an encoded buffer declines to the original SDPA.
+static id<MTLBuffer> termite_metal_lightonocr3_vision_workspace(termite_metal_decode_runtime *r,
+                                                                id<MTLCommandBuffer> cb, size_t bytes) {
+    for (size_t i = 0; i < 2; ++i) {
+        if (r->lightonocr3_vision_pack_owners[i] == cb) {
+            return r->lightonocr3_vision_pack_buffers[i].length >= bytes
+                       ? r->lightonocr3_vision_pack_buffers[i]
+                       : nil;
+        }
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        id<MTLCommandBuffer> owner = r->lightonocr3_vision_pack_owners[i];
+        if (owner != nil && (owner == r->active_frame_cb || owner == r->submitted_frame_cb ||
+                             owner.status < MTLCommandBufferStatusCompleted))
+            continue;
+        if (r->lightonocr3_vision_pack_buffers[i].length < bytes) {
+            // Drop the old free allocation before growing: no transient third
+            // workspace can escape the two-buffer admission envelope.
+            r->lightonocr3_vision_pack_buffers[i] = nil;
+            r->lightonocr3_vision_pack_buffers[i] = antfly_observe_metal_buffer(
+                [r->device newBufferWithLength:bytes options:MTLResourceStorageModePrivate],
+                ANTFLY_BUFFER_OWNED);
+            if (r->lightonocr3_vision_pack_buffers[i] != nil)
+                r->lighton_vision_workspace_allocations = termite_metal_u64_saturating_add(r->lighton_vision_workspace_allocations, 1);
+        } else {
+            r->lighton_vision_workspace_reuses = termite_metal_u64_saturating_add(r->lighton_vision_workspace_reuses, 1);
+        }
+        id<MTLBuffer> packed = r->lightonocr3_vision_pack_buffers[i];
+        if (packed == nil)
+            return nil;
+        r->lightonocr3_vision_pack_owners[i] = cb;
+        return packed;
+    }
+    return nil;
+}
+
+// Cache ownership keeps unretained command buffers safe. Release at the
+// frame boundary, before the vision pages can retire their admission leases.
+static void termite_metal_release_lightonocr3_vision_frame(termite_metal_decode_runtime *r,
+                                                           id<MTLCommandBuffer> cb) {
+    if (r == NULL || cb == nil)
+        return;
+    for (size_t i = 0; i < 2; i++)
+        if (r->lightonocr3_vision_pack_owners[i] == cb) {
+            if (!r->lighton_vision_workspace_keep) r->lightonocr3_vision_pack_buffers[i] = nil;
+            r->lightonocr3_vision_pack_owners[i] = nil;
+        }
+}
+int termite_metal_decode_runtime_clear_lightonocr3_vision_workspace(termite_metal_decode_runtime *r) {
+    if (r == NULL || r->active_frame_cb != nil || r->submitted_frame_cb != nil)
+        return -1;
+    for (size_t i = 0; i < 2; ++i) {
+        id<MTLCommandBuffer> owner = r->lightonocr3_vision_pack_owners[i];
+        if (owner != nil && owner.status >= MTLCommandBufferStatusEnqueued &&
+            owner.status < MTLCommandBufferStatusCompleted)
+            return -2;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        r->lightonocr3_vision_pack_buffers[i] = nil;
+        r->lightonocr3_vision_pack_owners[i] = nil;
+    }
+    r->lighton_vision_workspace_keep = NO;
+    return 0;
+}
+
 int termite_metal_decode_runtime_sdpa_f32_device(
     termite_metal_decode_runtime *runtime,
     void *q_handle,
@@ -49065,9 +53688,15 @@ int termite_metal_decode_runtime_sdpa_f32_device(
         const BOOL use_florence_window_hd32 = runtime->florence_window_sdpa_enabled != 0 &&
             bias_mode == 0u && has_mask == 0u && head_dim == 32u && seq_len <= 256u &&
             runtime->sdpa_f32_florence_window_hd32_pipeline != nil;
+        const BOOL use_florence_window_parallel = use_florence_window_hd32 &&
+            termite_metal_qualified_m4_device_default() &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_FLORENCE2_WINDOW_SOFTMAX")) &&
+            runtime->sdpa_f32_florence_window_parallel_pipeline != nil &&
+            runtime->sdpa_f32_florence_window_parallel_pipeline.threadExecutionWidth == 32 &&
+            runtime->sdpa_f32_florence_window_parallel_pipeline.maxTotalThreadsPerThreadgroup >= 32;
         if (!use_florence_window_hd32 && !use_bert_prefill_q8 && !use_vision_hd64_flash_q32 && !use_vision_hd64_flash_q16 && !use_vision_hd64_q32 && !use_vision_hd64_q8 && !use_nomic_q8 && !use_tg && getenv("TERMITE_METAL_REQUIRE_SDPA_TG") != NULL) return -18;
         id<MTLComputePipelineState> pipeline = use_florence_window_hd32
-            ? runtime->sdpa_f32_florence_window_hd32_pipeline
+            ? (use_florence_window_parallel ? runtime->sdpa_f32_florence_window_parallel_pipeline : runtime->sdpa_f32_florence_window_hd32_pipeline)
             : (use_bert_prefill_q8
             ? runtime->sdpa_f32_bert_prefill_s256_hd64_q8_pipeline
             : (use_vision_hd64_flash_q32
@@ -49087,6 +53716,28 @@ int termite_metal_decode_runtime_sdpa_f32_device(
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -14;
+        // Optional packed TensorOps retains the same half Q/K/V/probability
+        // tiles and F32 accumulation/output as the original Qwen vision flash.
+        id<MTLBuffer> vision_packed = nil;
+        const size_t vision_padded = (seq_len + 127u) / 128u * 128u;
+        if (use_vision_hd64_flash_q32 && qwen3vl_vision_flash == 1u &&
+            batch <= 4 && (num_heads == 12 || num_heads == 16) && termite_metal_lightonocr3_fast_projections(runtime) &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_VISION_MPP")) &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")) &&
+            runtime->lightonocr3_vision_pack_pipeline != nil && runtime->lightonocr3_vision_mpp_pipeline != nil &&
+            runtime->lightonocr3_vision_pack_pipeline.threadExecutionWidth == 32 &&
+            runtime->lightonocr3_vision_mpp_pipeline.threadExecutionWidth == 32 &&
+            runtime->lightonocr3_vision_pack_pipeline.maxTotalThreadsPerThreadgroup >= 256 &&
+            runtime->lightonocr3_vision_mpp_pipeline.maxTotalThreadsPerThreadgroup >= 128 &&
+            runtime->lightonocr3_vision_mpp_pipeline.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength &&
+            q_offset % 4 == 0 && k_offset % 4 == 0 && v_offset % 4 == 0 && output_offset % 4 == 0 &&
+            q_buffer != output_buffer &&
+            k_buffer != output_buffer &&
+            v_buffer != output_buffer) {
+            vision_packed = termite_metal_lightonocr3_vision_workspace(runtime,command_buffer,
+                3u * batch * num_heads * vision_padded * 64u * sizeof(uint16_t));
+        }
+        if (vision_packed != nil) { pipeline=runtime->lightonocr3_vision_mpp_pipeline;params.reserved1=(uint32_t)vision_padded; }
         const size_t bias_bytes = bias_mode != 0u
             ? ((bias_mode == 1u ? num_heads : (bias_mode == 2u ? batch * num_heads : batch)) * seq_len * seq_len * sizeof(float))
             : sizeof(float);
@@ -49105,6 +53756,22 @@ int termite_metal_decode_runtime_sdpa_f32_device(
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
         if (encoder == nil) return -15;
+        if (vision_packed != nil) {
+            const size_t count=batch*num_heads*vision_padded*64u;
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [encoder setComputePipelineState:runtime->lightonocr3_vision_pack_pipeline];
+            [encoder setBuffer:q_buffer offset:q_offset atIndex:0];[encoder setBuffer:k_buffer offset:k_offset atIndex:1];
+            [encoder setBuffer:v_buffer offset:v_offset atIndex:2];[encoder setBuffer:vision_packed offset:0 atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            q_buffer=vision_packed;k_buffer=vision_packed;v_buffer=vision_packed;
+            q_offset=0;k_offset=count*sizeof(uint16_t);v_offset=2u*count*sizeof(uint16_t);
+            runtime->lightonocr3_vision_mpp_dispatches+=1;
+            if(termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_VISION_ATTENTION")))
+                fprintf(stderr,"metal_vision_attention_trace: batch=%zu rows=%zu heads=%zu variant=lightonocr3_vision_mpp\n",batch,seq_len,num_heads);
+
+        }
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
         [encoder setBuffer:k_buffer offset:k_offset atIndex:1];
@@ -49121,8 +53788,9 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * (seq_len / 8u), 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
         } else if (use_vision_hd64_flash_q32) {
-            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * ((seq_len + 31u) / 32u), 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            const size_t query_tile = vision_packed != nil ? 16u : 32u;
+            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * ((seq_len + query_tile - 1u) / query_tile), 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(vision_packed != nil ? 128u : 256u, 1, 1)];
         } else if (use_vision_hd64_flash_q16) {
             [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * ((seq_len + 15u) / 16u), 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
@@ -49144,7 +53812,9 @@ int termite_metal_decode_runtime_sdpa_f32_device(
                threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_pipeline, total), 1, 1)];
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
+        const int finish_rc=termite_metal_decode_runtime_finish_command_buffer(command_buffer,frame_owned,-16);
+        if(frame_owned)termite_metal_release_lightonocr3_vision_frame(runtime,command_buffer);
+        return finish_rc;
     }
 }
 
@@ -54753,7 +59423,7 @@ static int termite_metal_decode_runtime_gemma4_audio_dispatch(
         // MPS and unscoped helpers close the shared encoder. Reopen at the
         // next audio dispatch, after validating bindings and before recording
         // dependencies. Never open an empty encoder immediately before MPS.
-        if (runtime->audio_replay_scope &&
+        if ((runtime->audio_replay_scope || termite_metal_lightonocr3_decode_coalescing_enabled(runtime)) &&
             termite_metal_should_coalesce_planned_compute_encoder(runtime) &&
             runtime->active_planned_compute_encoder == nil &&
             termite_metal_decode_runtime_begin_planned_compute_scope(runtime,
@@ -61149,6 +65819,36 @@ int termite_metal_decode_runtime_release_paged_kv_slot(
     return 0;
 }
 
+/// Release a private staging/selected slot and return its backing allocation
+/// to Metal. Callers must prove no shared binding references this slot and no
+/// frame is in flight; global page-pool slots use the retaining release above.
+int termite_metal_decode_runtime_discard_paged_kv_slot(
+    termite_metal_decode_runtime *runtime,
+    size_t slot
+) {
+    if (runtime == NULL) return -1;
+    if (slot < TERMITE_METAL_PAGED_KV_SLOT_BASE || slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
+    if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil || runtime->active_planned_compute_encoder != nil) return -3;
+    const size_t local = slot - TERMITE_METAL_PAGED_KV_SLOT_BASE;
+    uint8_t expected = 1;
+    if (!atomic_compare_exchange_strong_explicit(
+            &runtime->attention_span_paged_slot_leased[local],
+            &expected,
+            2,
+            memory_order_acq_rel,
+            memory_order_relaxed)) return -4;
+    runtime->attention_span_slot_tokens[slot] = 0;
+    runtime->attention_span_slot_key_row_bytes[slot] = 0;
+    runtime->attention_span_slot_v_row_stride[slot] = 0;
+    runtime->attention_span_slot_position_offset[slot] = 0;
+    runtime->attention_span_encoded_key_buffers[slot] = nil;
+    runtime->attention_span_encoded_key_capacities[slot] = 0;
+    runtime->attention_span_v_buffers[slot] = nil;
+    runtime->attention_span_v_capacities[slot] = 0;
+    atomic_store_explicit(&runtime->attention_span_paged_slot_leased[local], 0, memory_order_release);
+    return 0;
+}
+
 /// Reserve backing buffers for a persistent attention-span slot without
 /// marking any logical tokens as written. MetalKvStorage uses this at
 /// sequence-growth boundaries so suffix writes do not have to reallocate or
@@ -61185,6 +65885,96 @@ int termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     if (token_capacity > SIZE_MAX / v_row_bytes) return -7;
     const size_t v_bytes = token_capacity * v_row_bytes;
     return termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes);
+}
+
+// Copy selected encoded K/V rows into an already leased and reserved staging
+// slot. Metadata is published only after the GPU copy completes, so callers
+// can atomically replace their sequence binding while the source remains
+// readable on every failure path.
+int termite_metal_decode_runtime_compact_attention_span_slot(
+    termite_metal_decode_runtime *runtime,
+    size_t source_slot,
+    size_t destination_slot,
+    uint32_t format,
+    const uint32_t *source_token_offsets,
+    size_t selected_count,
+    size_t key_row_bytes,
+    size_t v_row_stride,
+    size_t position_offset
+) {
+    if (runtime == NULL || source_token_offsets == NULL) return -1;
+    if (source_slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY ||
+        destination_slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY ||
+        source_slot == destination_slot) return -2;
+    if (selected_count == 0 || key_row_bytes == 0 || v_row_stride == 0 || position_offset > UINT32_MAX) return -3;
+    // Compaction runs only at a committed decode/prefill boundary. Joining an
+    // active frame would expose staging metadata before its deferred copy ran.
+    if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil || runtime->active_planned_compute_encoder != nil) return -4;
+    if (runtime->attention_span_encoded_key_buffers[source_slot] == nil ||
+        runtime->attention_span_v_buffers[source_slot] == nil ||
+        runtime->attention_span_encoded_key_buffers[destination_slot] == nil ||
+        runtime->attention_span_v_buffers[destination_slot] == nil) return -5;
+    if (runtime->attention_span_slot_key_row_bytes[source_slot] != key_row_bytes ||
+        runtime->attention_span_slot_v_row_stride[source_slot] != v_row_stride) return -6;
+    size_t v_element_bytes = sizeof(float);
+    switch (format) {
+        case 0u:
+        case 1u:
+        case 2u:
+        case 4u:
+            break;
+        case 3u:
+            v_element_bytes = sizeof(uint16_t);
+            break;
+        default:
+            return -7;
+    }
+    if (v_row_stride > SIZE_MAX / v_element_bytes) return -8;
+    const size_t v_row_bytes = v_row_stride * v_element_bytes;
+    if (selected_count > SIZE_MAX / key_row_bytes || selected_count > SIZE_MAX / v_row_bytes) return -8;
+    const size_t destination_key_bytes = selected_count * key_row_bytes;
+    const size_t destination_v_bytes = selected_count * v_row_bytes;
+    if (runtime->attention_span_encoded_key_capacities[source_slot] < key_row_bytes ||
+        runtime->attention_span_v_capacities[source_slot] < v_row_bytes) return -9;
+    if (destination_key_bytes > runtime->attention_span_encoded_key_capacities[destination_slot] ||
+        destination_v_bytes > runtime->attention_span_v_capacities[destination_slot]) return -9;
+    for (size_t row = 0; row < selected_count; ++row) {
+        const size_t source_token = source_token_offsets[row];
+        if (source_token > SIZE_MAX / key_row_bytes || source_token > SIZE_MAX / v_row_bytes) return -10;
+        const size_t source_key_offset = source_token * key_row_bytes;
+        const size_t source_v_offset = source_token * v_row_bytes;
+        if (source_key_offset > runtime->attention_span_encoded_key_capacities[source_slot] - key_row_bytes ||
+            source_v_offset > runtime->attention_span_v_capacities[source_slot] - v_row_bytes) return -10;
+    }
+    @autoreleasepool {
+        id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
+        if (command_buffer == nil) return -11;
+        termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_ATTENTION_SPAN);
+        id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
+        if (blit == nil) return -12;
+        for (size_t row = 0; row < selected_count; ++row) {
+            const size_t source_token = source_token_offsets[row];
+            [blit copyFromBuffer:runtime->attention_span_encoded_key_buffers[source_slot]
+                    sourceOffset:source_token * key_row_bytes
+                       toBuffer:runtime->attention_span_encoded_key_buffers[destination_slot]
+              destinationOffset:row * key_row_bytes
+                           size:key_row_bytes];
+            [blit copyFromBuffer:runtime->attention_span_v_buffers[source_slot]
+                    sourceOffset:source_token * v_row_bytes
+                       toBuffer:runtime->attention_span_v_buffers[destination_slot]
+              destinationOffset:row * v_row_bytes
+                           size:v_row_bytes];
+        }
+        [blit endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -13;
+        runtime->attention_span_slot_tokens[destination_slot] = selected_count;
+        runtime->attention_span_slot_key_row_bytes[destination_slot] = key_row_bytes;
+        runtime->attention_span_slot_v_row_stride[destination_slot] = v_row_stride;
+        runtime->attention_span_slot_position_offset[destination_slot] = position_offset;
+        return 0;
+    }
 }
 
 /// Snapshot the current state + buffer handles for an attention-span slot so a
@@ -61814,6 +66604,8 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     size_t q_offset,
     const uint32_t *block_table,
     size_t block_count,
+    const uint32_t *key_positions,
+    size_t key_position_count,
     size_t page_size,
     size_t q_len,
     size_t kv_tokens,
@@ -61845,6 +66637,15 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     if (runtime->attention_span_slot_v_row_stride[slot] > UINT32_MAX) return -10;
     if (sinks != NULL && sink_count < num_heads) return -11;
     if (block_count > SIZE_MAX / sizeof(uint32_t)) return -12;
+    const bool has_explicit_positions = key_positions != NULL;
+    if (has_explicit_positions) {
+        if (key_position_count != kv_tokens || key_position_count > SIZE_MAX / sizeof(uint32_t)) return -12;
+        for (size_t i = 1; i < key_position_count; ++i) {
+            if (key_positions[i - 1] >= key_positions[i]) return -12;
+        }
+    } else if (key_position_count != 0) {
+        return -12;
+    }
     const uint32_t v_element_bytes = (format == 3u) ? (uint32_t)sizeof(uint16_t) : (uint32_t)sizeof(float);
     switch (format) {
         case 0u:
@@ -61862,7 +66663,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     // lie outside every query's window contribute exactly zero (the kernels
     // mask per position). Clamp before validating physical pages so validation
     // cost also tracks the window rather than the full logical history.
-    if (sliding_window > 0 && sliding_window < kv_tokens && runtime->swa_scan_clamp_enabled) {
+    if (!has_explicit_positions && sliding_window > 0 && sliding_window < kv_tokens && runtime->swa_scan_clamp_enabled) {
         const size_t window_start = query_position_offset + 1 > sliding_window
             ? query_position_offset + 1 - sliding_window
             : 0;
@@ -61917,9 +66718,11 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
         .v_element_bytes = v_element_bytes,
         .has_sinks = sinks != NULL ? 1u : 0u,
         .softcap = softcap,
-        .swa_scan_clamp = runtime->swa_scan_clamp_enabled ? 1u : 0u,
+        .swa_scan_clamp = !has_explicit_positions && runtime->swa_scan_clamp_enabled ? 1u : 0u,
+        .has_explicit_positions = has_explicit_positions ? 1u : 0u,
     };
     const float zero_sink = 0.0f;
+    const uint32_t zero_position = 0u;
     const size_t block_table_bytes = needed_blocks * sizeof(uint32_t);
     const size_t sinks_bytes = sinks != NULL ? num_heads * sizeof(float) : sizeof(zero_sink);
     id<MTLBuffer> block_table_buffer = block_table_bytes > 4096u
@@ -61928,19 +66731,21 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     id<MTLBuffer> sinks_buffer = sinks != NULL && sinks_bytes > 4096u
         ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:sinks length:sinks_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
         : nil;
+    const size_t key_positions_bytes = has_explicit_positions ? key_position_count * sizeof(uint32_t) : 0u;
+    id<MTLBuffer> key_positions_buffer = has_explicit_positions
+        ? [runtime->device newBufferWithBytes:key_positions length:key_positions_bytes options:MTLResourceStorageModeShared]
+        : nil;
     if ((block_table_bytes > 4096u && block_table_buffer == nil) ||
-        (sinks != NULL && sinks_bytes > 4096u && sinks_buffer == nil)) return -14;
+        (sinks != NULL && sinks_bytes > 4096u && sinks_buffer == nil) ||
+        (has_explicit_positions && key_positions_buffer == nil)) return -14;
     if (frame_runtime->active_frame_cb != nil) {
         if (block_table_buffer != nil && termite_metal_decode_runtime_retain_frame_resource(frame_runtime, block_table_buffer) != 0) return -14;
         if (sinks_buffer != nil && termite_metal_decode_runtime_retain_frame_resource(frame_runtime, sinks_buffer) != 0) return -14;
+        if (key_positions_buffer != nil && termite_metal_decode_runtime_retain_frame_resource(frame_runtime, key_positions_buffer) != 0) return -14;
     }
 
     id<MTLComputeCommandEncoder> encoder = frame_runtime->active_planned_compute_encoder;
     const BOOL planned_encoder = (encoder != nil);
-    if (!planned_encoder) {
-        encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
-        if (encoder == nil) return -15;
-    }
     size_t q_bytes = 0;
     if (!termite_metal_size_mul3(q_len, num_heads, head_dim, &q_bytes) ||
         !termite_metal_size_mul(q_bytes, sizeof(float), &q_bytes))
@@ -61950,7 +66755,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     termite_metal_decode_gqa_split_launch split_launch = {0};
     id<MTLBuffer> decode_gqa_split_scratch_buffer = nil;
     bool decode_gqa_split_strict_failure = false;
-    const bool use_decode_gqa_split = termite_metal_decode_gqa_split_eligible(
+    const bool use_decode_gqa_split = !has_explicit_positions && termite_metal_decode_gqa_split_eligible(
         runtime,
         frame_runtime,
         format,
@@ -61970,6 +66775,34 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
         &split_launch,
         &decode_gqa_split_strict_failure);
     if (decode_gqa_split_strict_failure) return -15;
+    if (frame_runtime->lighton_attention_batch != NULL && use_decode_gqa_split && split_launch.lightonocr3 &&
+        q_len == 1u && needed_blocks <= 256u) {
+        termite_metal_lighton_attention_batch *batch = frame_runtime->lighton_attention_batch;
+        const size_t scratch_offset = (batch->scratch_bytes + 255u) & ~(size_t)255u;
+        if (batch->count >= TERMITE_METAL_LIGHTON_BATCH_ROWS ||
+            scratch_offset > batch->scratch.length || split_launch.scratch_bytes > batch->scratch.length - scratch_offset ||
+            q_offset > q_buffer.length || q_bytes > q_buffer.length - q_offset ||
+            output_offset > output_buffer.length || q_bytes > output_buffer.length - output_offset) return -15;
+        termite_metal_lighton_attention_record *r = &batch->rows[batch->count++];
+        r->owner = runtime;
+        r->q = q_buffer;
+        r->k = runtime->attention_span_encoded_key_buffers[slot];
+        r->v = runtime->attention_span_v_buffers[slot];
+        r->output = output_buffer;
+        r->q_offset = q_offset;
+        r->output_offset = output_offset;
+        r->scratch_offset = scratch_offset;
+        r->params = params;
+        r->launch = split_launch;
+        memcpy(r->blocks, block_table, needed_blocks * sizeof(uint32_t));
+        batch->scratch_bytes = scratch_offset + split_launch.scratch_bytes;
+        return 0;
+    }
+    if (!planned_encoder) {
+        encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
+        if (encoder == nil) return -15;
+    }
+
     termite_metal_planned_encoder_range accesses[4];
     if (termite_metal_planned_range_make(q_buffer, q_offset, q_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -15) != 0 ||
         termite_metal_planned_range_make(runtime->attention_span_encoded_key_buffers[slot], 0, runtime->attention_span_encoded_key_buffers[slot].length, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -15) != 0 ||
@@ -61985,10 +66818,11 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     {
         return -15;
     }
+    const bool use_lightonocr3_prefill = termite_metal_lightonocr3_prefill_attention_mpp_eligible(runtime, &params);
     id<MTLComputePipelineState> decode_1x_pipeline = runtime->attention_1x_generated_pipeline != nil
         ? runtime->attention_1x_generated_pipeline
         : runtime->attention_paged_1x_pipeline;
-    const bool generated_prefill_sg = termite_metal_generated_flash_prefill_eligible(
+    const bool generated_prefill_sg = !has_explicit_positions && termite_metal_generated_flash_prefill_eligible(
         runtime,
         format,
         q_len,
@@ -61999,7 +66833,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
         sliding_window,
         softcap,
         sinks);
-    const bool handwritten_prefill_sg = termite_metal_handwritten_flash_prefill_eligible(
+    const bool handwritten_prefill_sg = !has_explicit_positions && termite_metal_handwritten_flash_prefill_eligible(
         runtime,
         format,
         q_len,
@@ -62013,7 +66847,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
         ? runtime->attention_flash_generated_pipeline
         : runtime->attention_paged_prefill_sg_pipeline;
     id<MTLComputePipelineState> prefill_hd512_pipeline = runtime->attention_flash_hd512_generated_pipeline;
-    const bool use_prefill_hd512 = format == 3u &&
+    const bool use_prefill_hd512 = !has_explicit_positions && format == 3u &&
         sinks == NULL &&
         softcap == 0.0f &&
         q_len >= 8u &&
@@ -62037,7 +66871,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
         params.contiguous_base_token = contiguous_base_token;
         params.contiguous_blocks = 1u;
     }
-    const bool use_decode_1x = !use_decode_gqa_split && !use_prefill_hd512 && !use_prefill_sg &&
+    const bool use_decode_1x = !has_explicit_positions && !use_decode_gqa_split && !use_prefill_hd512 && !use_prefill_sg &&
         format == 3u &&
         sinks == NULL &&
         softcap == 0.0f &&
@@ -62050,7 +66884,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     // of the kernel body — the model-token acceptance gate for the generated route.
     // Prefer generated flash only when its model-shape and device gates pass;
     // otherwise preserve the independently eligible hand-written flash route.
-    [encoder setComputePipelineState:use_decode_gqa_split ? runtime->attention_decode_gqa_split_stage_pipeline : (use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline)))];
+    [encoder setComputePipelineState:use_lightonocr3_prefill ? termite_metal_lightonocr3_prefill_attention_pipeline(runtime, q_len, page_size) : (use_decode_gqa_split ? (split_launch.lightonocr3 ? runtime->lightonocr3_gqa_split_stage_pipeline : runtime->attention_decode_gqa_split_stage_pipeline) : (use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline))))];
     [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
     [encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];
     [encoder setBuffer:runtime->attention_span_v_buffers[slot] offset:0 atIndex:2];
@@ -62068,7 +66902,14 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     }
     [encoder setBuffer:(use_decode_gqa_split ? decode_gqa_split_scratch_buffer : output_buffer) offset:(use_decode_gqa_split ? 0u : output_offset) atIndex:5];
     [encoder setBytes:&params length:sizeof(params) atIndex:6];
-    if (use_decode_gqa_split) {
+    if (has_explicit_positions) {
+        [encoder setBuffer:key_positions_buffer offset:0 atIndex:7];
+    } else {
+        [encoder setBytes:&zero_position length:sizeof(zero_position) atIndex:7];
+    }
+    if (use_lightonocr3_prefill) {
+        termite_metal_lightonocr3_dispatch_prefill_attention(runtime, encoder, &params);
+    } else if (use_decode_gqa_split) {
         if (termite_metal_encode_decode_gqa_split_dispatch(
                 runtime,
                 frame_runtime,
@@ -62105,6 +66946,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     if (!planned_encoder) [encoder endEncoding];
     (void)block_table_buffer;
     (void)sinks_buffer;
+    (void)key_positions_buffer;
     return 0;
 }
 
@@ -62151,6 +66993,8 @@ int termite_metal_decode_runtime_attention_paged_slot_device(
             q_offset,
             block_table,
             block_count,
+            NULL,
+            0,
             page_size,
             q_len,
             kv_tokens,
@@ -62173,6 +67017,116 @@ int termite_metal_decode_runtime_attention_paged_slot_device(
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+    }
+}
+
+// Arbitrary logical positions for retained global-attention rows. This is a
+// separate ABI so exact contiguous callers cannot accidentally opt into the
+// slower generic route. K/V rows and key_positions share the same logical
+// ordering; the encoder validates a strictly increasing position vector.
+int termite_metal_decode_runtime_attention_paged_slot_device_selected(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    uint32_t format,
+    void *q_handle,
+    size_t q_offset,
+    const uint32_t *block_table,
+    size_t block_count,
+    const uint32_t *key_positions,
+    size_t key_position_count,
+    size_t page_size,
+    size_t q_len,
+    size_t kv_tokens,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t key_row_bytes,
+    size_t base_key_row_bytes,
+    size_t query_position_offset,
+    size_t sliding_window,
+    float softcap,
+    const float *sinks,
+    size_t sink_count,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (runtime == NULL || q_handle == NULL || output_handle == NULL || key_positions == NULL) return -1;
+    @autoreleasepool {
+        id<MTLBuffer> q_buffer = (__bridge id<MTLBuffer>)q_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        if (q_buffer == nil || output_buffer == nil) return -2;
+        const bool frame_active = runtime->active_frame_cb != nil;
+        id<MTLCommandBuffer> command_buffer = frame_active ? runtime->active_frame_cb : termite_metal_new_command_buffer(runtime->queue, __func__);
+        if (command_buffer == nil) return -3;
+        const int rc = termite_metal_decode_runtime_encode_paged_attention_slot_ex(
+            runtime,
+            runtime,
+            command_buffer,
+            slot,
+            format,
+            q_buffer,
+            q_offset,
+            block_table,
+            block_count,
+            key_positions,
+            key_position_count,
+            page_size,
+            q_len,
+            kv_tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            key_row_bytes,
+            base_key_row_bytes,
+            query_position_offset,
+            0,
+            sliding_window,
+            softcap,
+            sinks,
+            sink_count,
+            output_buffer,
+            output_offset
+        );
+        if (rc != 0) return rc;
+        if (frame_active) return 0;
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+    }
+}
+
+typedef struct termite_selection_score_params_host {
+    termite_metal_paged_attention_params p;
+    float score_scale;
+} termite_selection_score_params_host;
+_Static_assert(offsetof(termite_selection_score_params_host, score_scale) == 84, "selection score ABI drift");
+_Static_assert(sizeof(termite_selection_score_params_host) == 88, "selection score params size drift");
+
+int termite_metal_decode_runtime_score_selected_attention(
+    termite_metal_decode_runtime *runtime, size_t slot, uint32_t format,
+    const float *queries, const uint32_t *query_positions, size_t query_count,
+    const uint32_t *key_positions, size_t key_count, size_t num_heads,
+    size_t num_kv_heads, size_t head_dim, size_t key_row_bytes,
+    size_t base_key_row_bytes, float score_scale, float softcap,
+    float *scores_out, void *check_ctx, int (*check_fn)(void *)) {
+    if (runtime == NULL || queries == NULL || query_positions == NULL || key_positions == NULL || scores_out == NULL || check_fn == NULL) return -1;
+    if (slot >= TERMITE_METAL_PAGED_KV_SLOT_CAPACITY || query_count == 0 || query_count > 64u || key_count == 0 || key_count > 8704u || num_heads == 0 || num_kv_heads == 0 || num_heads % num_kv_heads != 0 || format > 4u || !isfinite(score_scale) || score_scale <= 0.0f || !isfinite(softcap) || softcap < 0.0f) return -2;
+    if (query_count > UINT32_MAX || key_count > UINT32_MAX || num_heads > UINT32_MAX || num_kv_heads > UINT32_MAX || head_dim > UINT32_MAX || key_row_bytes > UINT32_MAX || base_key_row_bytes > UINT32_MAX) return -2;
+    if (runtime->selection_score_norm_pipeline == nil || runtime->selection_score_reduce_pipeline == nil || runtime->attention_span_encoded_key_buffers[slot] == nil) return -3;
+    if (check_fn(check_ctx) != 0) return -12;
+    @autoreleasepool {
+        const size_t q_values = query_count * num_heads * head_dim;
+        id<MTLBuffer> q = [runtime->device newBufferWithBytes:queries length:q_values*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> qp = [runtime->device newBufferWithBytes:query_positions length:query_count*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kp = [runtime->device newBufferWithBytes:key_positions length:key_count*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> norm = [runtime->device newBufferWithLength:query_count*num_heads*2u*sizeof(float) options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> out = [runtime->device newBufferWithLength:key_count*sizeof(float) options:MTLResourceStorageModeShared];
+        if (q==nil||qp==nil||kp==nil||norm==nil||out==nil) return -4;
+        termite_selection_score_params_host p={0}; p.p.q_len=(uint32_t)query_count;p.p.kv_tokens=(uint32_t)key_count;p.p.num_heads=(uint32_t)num_heads;p.p.num_kv_heads=(uint32_t)num_kv_heads;p.p.head_dim=(uint32_t)head_dim;p.p.key_row_bytes=(uint32_t)key_row_bytes;p.p.base_key_row_bytes=(uint32_t)base_key_row_bytes;p.p.format=format;p.p.softcap=softcap;p.score_scale=score_scale;
+        id<MTLCommandBuffer> cb=termite_metal_new_command_buffer(runtime->queue,__func__); if(cb==nil)return -5;
+        id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder]; if(e==nil)return -5;
+        [e setComputePipelineState:runtime->selection_score_norm_pipeline];[e setBuffer:q offset:0 atIndex:0];[e setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];[e setBuffer:qp offset:0 atIndex:2];[e setBuffer:kp offset:0 atIndex:3];[e setBuffer:norm offset:0 atIndex:4];[e setBytes:&p length:sizeof(p) atIndex:5];size_t n=query_count*num_heads;[e dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->selection_score_norm_pipeline,n),1,1)];[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return -6;if(check_fn(check_ctx)!=0)return -12;
+        cb=termite_metal_new_command_buffer(runtime->queue,__func__);e=[cb computeCommandEncoder];if(e==nil)return -5;[e setComputePipelineState:runtime->selection_score_reduce_pipeline];[e setBuffer:q offset:0 atIndex:0];[e setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];[e setBuffer:qp offset:0 atIndex:2];[e setBuffer:kp offset:0 atIndex:3];[e setBuffer:norm offset:0 atIndex:4];[e setBuffer:out offset:0 atIndex:5];[e setBytes:&p length:sizeof(p) atIndex:6];[e dispatchThreads:MTLSizeMake(key_count,1,1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->selection_score_reduce_pipeline,key_count),1,1)];[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return -6;if(check_fn(check_ctx)!=0)return -12;memcpy(scores_out,out.contents,key_count*sizeof(float));return 0;
     }
 }
 
@@ -62232,6 +67186,8 @@ int termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
             q_offset,
             block_table,
             block_count,
+            NULL,
+            0,
             page_size,
             q_len,
             kv_tokens,
@@ -65150,6 +70106,8 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                     q_offset,
                     block_table,
                     block_count,
+                    NULL,
+                    0,
                     page_size,
                     q_len,
                     kv_tokens,
@@ -66002,6 +70960,77 @@ static void antfly_audio_storage_retire(termite_metal_decode_runtime *r, id<MTLB
     r->audio_reuse_bytes += charge;
 }
 
+static void termite_metal_lighton_activation_clear(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return;
+    for (size_t i = 0; i < 128; i++) {
+        runtime->lighton_activation_buffers[i] = nil;
+        runtime->lighton_activation_fences[i] = nil;
+        runtime->lighton_activation_charges[i] = 0;
+    }
+    runtime->lighton_activation_bytes = 0;
+}
+
+static bool termite_metal_lighton_activation_retire(termite_metal_decode_runtime *runtime,
+                                                   id<MTLBuffer> buffer, id<MTLCommandBuffer> fence) {
+    if (runtime->lighton_activation_limit == 0 || buffer.storageMode != MTLStorageModePrivate) return false;
+    const size_t charge = MAX((size_t)buffer.length, (size_t)buffer.allocatedSize);
+    if (charge == 0 || charge > runtime->lighton_activation_limit) return false;
+    // Independent retained ownership records may retire the same allocation.
+    // Cache storage identities once: two entries would hand the same buffer to
+    // simultaneous callers. The later same-queue fence covers both uses.
+    for (size_t i = 0; i < 128; i++) {
+        if (runtime->lighton_activation_buffers[i] == buffer) {
+            runtime->lighton_activation_fences[i] = fence;
+            runtime->lighton_activation_duplicate_retirements++;
+            return true;
+        }
+    }
+    size_t empty = 128;
+    for (;;) {
+        size_t victim = 128, smallest = SIZE_MAX;
+        for (size_t i = 0; i < 128; i++) {
+            if (runtime->lighton_activation_buffers[i] == nil) { if (empty == 128) empty = i; }
+            else if (runtime->lighton_activation_fences[i] == nil && runtime->lighton_activation_charges[i] < smallest) {
+                smallest = runtime->lighton_activation_charges[i]; victim = i;
+            }
+        }
+        if (empty != 128 && charge <= runtime->lighton_activation_limit - runtime->lighton_activation_bytes) break;
+        // Never evict or recycle storage held by an unfinished frame. Idle
+        // small buffers may be replaced when a larger batch needs new shapes.
+        if (victim == 128) return false;
+        runtime->lighton_activation_bytes -= runtime->lighton_activation_charges[victim];
+        runtime->lighton_activation_buffers[victim] = nil;
+        runtime->lighton_activation_charges[victim] = 0;
+        empty = victim;
+    }
+    runtime->lighton_activation_buffers[empty] = buffer;
+    runtime->lighton_activation_fences[empty] = fence;
+    runtime->lighton_activation_charges[empty] = charge;
+    runtime->lighton_activation_bytes += charge;
+    runtime->lighton_activation_peak = MAX(runtime->lighton_activation_peak, runtime->lighton_activation_bytes);
+    return true;
+}
+
+static void *termite_metal_lighton_activation_take(termite_metal_decode_runtime *runtime, size_t length) {
+    size_t best = 128, best_length = SIZE_MAX;
+    for (size_t i = 0; i < 128; i++) {
+        id<MTLBuffer> buffer = runtime->lighton_activation_buffers[i];
+        if (buffer != nil && runtime->lighton_activation_fences[i] == nil &&
+            // Large cached buffers must not inflate small working sets. The
+            // epoch covers retained storage; borrowed exact-size storage is
+            // already covered by the caller's ordinary working-set lease.
+            (!runtime->lighton_activation_prefill || buffer.length == length) &&
+            buffer.length >= length && buffer.length < best_length) { best = i; best_length = buffer.length; }
+    }
+    if (best == 128) return NULL;
+    void *handle = (__bridge_retained void *)runtime->lighton_activation_buffers[best];
+    runtime->lighton_activation_bytes -= runtime->lighton_activation_charges[best];
+    runtime->lighton_activation_buffers[best] = nil;
+    runtime->lighton_activation_charges[best] = 0;
+    runtime->lighton_activation_hits++;
+    return handle;
+}
+
 static void termite_metal_decode_runtime_drain_reuse_pool(termite_metal_decode_runtime *runtime,
                                                           int keep_alive) {
     if (runtime == NULL || runtime->frame_reuse_pool == NULL)
@@ -66013,6 +71042,8 @@ static void termite_metal_decode_runtime_drain_reuse_pool(termite_metal_decode_r
         @autoreleasepool {
             id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)handle; // reclaim the +1
             if (keep_alive && buffer != nil) {
+                if (runtime->lighton_activation_capture_decode &&
+                    termite_metal_lighton_activation_retire(runtime, buffer, runtime->submitted_frame_cb)) continue;
                 if (runtime->audio_reuse_scope)
                     antfly_audio_storage_retire(
                         runtime, buffer, runtime->active_frame_cb ?: runtime->submitted_frame_cb);
@@ -66074,6 +71105,7 @@ static int termite_metal_decode_runtime_begin_frame_internal(
             }
         }
         cb.label = @"termite_metal_decode_runtime_frame";
+        termite_metal_snapshot_lighton_frame_policy(runtime);
         runtime->active_frame_cb = cb;
         runtime->active_frame_encode_started_nanos = termite_metal_clock_monotonic_nanos();
         runtime->active_frame_encode_wait_nanos = 0;
@@ -66146,6 +71178,10 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     if (runtime->active_frame_cb == nil) return -2;
     if (runtime->submitted_frame_cb != nil) return -3;
     id<MTLCommandBuffer> cb = runtime->active_frame_cb;
+    runtime->lighton_activation_capture_decode = runtime->lighton_activation_limit != 0 &&
+        (runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE ||
+         (runtime->lighton_activation_prefill &&
+          runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_PREFILL));
     if (runtime->active_planned_compute_encoder != nil) {
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
     }
@@ -66200,6 +71236,7 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
         termite_metal_stage_sample_frame_reset(&runtime->submitted_stage_sample);
         runtime->submitted_stage_sample.buffer = runtime->active_stage_sample.buffer;
         runtime->submitted_stage_sample.regime = runtime->active_stage_sample.regime;
+        runtime->submitted_stage_sample.frame_id = runtime->active_stage_sample.frame_id;
         runtime->submitted_stage_sample.selected = runtime->active_stage_sample.selected;
         runtime->submitted_stage_sample.complete = runtime->active_stage_sample.complete;
         runtime->submitted_stage_sample.has_current_bucket = runtime->active_stage_sample.has_current_bucket;
@@ -66255,6 +71292,7 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     // Buffers still pooled (not reused) are referenced by this committed
     // frame's commands; keep them alive (now under submitted) until wait_frame.
     termite_metal_decode_runtime_drain_reuse_pool(runtime, 1);
+    runtime->lighton_activation_capture_decode = false;
     runtime->frame_cb_count += 1;
     {
         const char *stats_env = getenv("TERMITE_METAL_BUFFER_REUSE_STATS");
@@ -66309,6 +71347,7 @@ int termite_metal_decode_runtime_cancel_frame(termite_metal_decode_runtime *runt
     runtime->planned_compute_barrier_suppression_depth = 0;
     // Cancelled frame: its commands never execute, so release pooled buffers.
     termite_metal_decode_runtime_drain_reuse_pool(runtime, 0);
+    termite_metal_release_lightonocr3_vision_frame(runtime,runtime->active_frame_cb);
     runtime->active_frame_cb = nil;
     runtime->active_frame_encode_started_nanos = 0;
     runtime->active_frame_encode_wait_nanos = 0;
@@ -66414,6 +71453,9 @@ int termite_metal_decode_runtime_wait_frame(termite_metal_decode_runtime *runtim
         termite_metal_log_command_buffer_failure(cb, __func__);
     }
     for (size_t i=0;i<128;i++) if(runtime->audio_reuse_fences[i]==cb) runtime->audio_reuse_fences[i]=nil;
+    for (size_t i = 0; i < 128; i++)
+        if (runtime->lighton_activation_fences[i] == cb) runtime->lighton_activation_fences[i] = nil;
+    termite_metal_release_lightonocr3_vision_frame(runtime,runtime->submitted_frame_cb);
     runtime->submitted_frame_cb = nil;
     runtime->submitted_frame_decode_gqa_split_scratch_valid = 0u;
     termite_metal_decode_runtime_clear_frame_resources(&runtime->submitted_frame_retained_resources);
@@ -66784,7 +71826,10 @@ int termite_metal_decode_runtime_memory_snapshot(
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->scratch_buffer, &snapshot->scratch_bytes);
     }
     termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->attention_decode_gqa_split_scratch_buffer, &snapshot->scratch_bytes);
+    for(size_t i=0;i<2;i++)termite_metal_decode_runtime_memory_add_buffer(snapshot,runtime->lightonocr3_vision_pack_buffers[i],&snapshot->scratch_bytes);
     termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->attention_decode_gqa_split_scratch_buffer_alt, &snapshot->scratch_bytes);
+    termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->lighton_attention_batch_scratch[0], &snapshot->scratch_bytes);
+    termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->lighton_attention_batch_scratch[1], &snapshot->scratch_bytes);
     termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->host_staging_buffer, &snapshot->scratch_bytes);
     termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->active_frame_host_staging_buffer, &snapshot->scratch_bytes);
     termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->token_buffer, &snapshot->scratch_bytes);
@@ -67219,6 +72264,7 @@ size_t termite_metal_decode_runtime_embedding_workspace_bytes(termite_metal_deco
     for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_SHARED_BUFFER_COUNT; ++i) ADD_EMBED_WORKSPACE(runtime->direct_block_shared_buffers[i]);
     for (size_t i = 0; i < 6; ++i) ADD_EMBED_WORKSPACE(runtime->active_layer_projection_buffers[i]);
     for (size_t i = 0; i < runtime->frame_reuse_pool_len; ++i) ADD_EMBED_WORKSPACE((__bridge id<MTLBuffer>)runtime->frame_reuse_pool[i]);
+    for (size_t i = 0; i < 128; i++) ADD_EMBED_WORKSPACE(runtime->lighton_activation_buffers[i]);
     ADD_EMBED_WORKSPACE(runtime->direct_block_q_buffer);
     ADD_EMBED_WORKSPACE(runtime->dense_sg_f16_k_buffer);
     ADD_EMBED_WORKSPACE(runtime->dense_sg_f16_v_buffer);
@@ -67289,6 +72335,20 @@ void *termite_metal_buffer_retain_external(termite_metal_decode_runtime *runtime
 
 void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t length, int storage_mode) {
     if (runtime == NULL || runtime->device == nil || length == 0) return NULL;
+    if (storage_mode == 1 && runtime->active_frame_cb != nil && runtime->lighton_activation_bytes != 0 &&
+        (runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE ||
+         (runtime->lighton_activation_prefill &&
+          runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_PREFILL))) {
+        void *cached = termite_metal_lighton_activation_take(runtime, length);
+        if (cached != NULL) {
+            if (runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_PREFILL) {
+                runtime->lighton_activation_prefill_hits++;
+                runtime->lighton_activation_prefill_hit_bytes = termite_metal_u64_saturating_add(
+                    runtime->lighton_activation_prefill_hit_bytes, length);
+            }
+            return cached;
+        }
+    }
     // In-frame reuse: serve a same-or-larger released private buffer from the
     // pool (best-fit) instead of allocating. The returned handle keeps the
     // pooled buffer's +1 ownership (transferred to the caller).
@@ -67345,7 +72405,7 @@ void termite_metal_decode_runtime_release_buffer(termite_metal_decode_runtime *r
     // A shared buffer can be written by the host immediately (an upload is a
     // memcpy), which would land before those queued commands run.
     if (runtime != NULL && runtime->active_frame_cb != nil &&
-        termite_metal_buffer_reuse_enabled(runtime) &&
+        termite_metal_buffer_reuse_enabled(runtime) && !runtime->qwen35_core_batch_active &&
         ((__bridge id<MTLBuffer>)handle).storageMode == MTLStorageModePrivate) {
         if (runtime->frame_reuse_pool_len >= runtime->frame_reuse_pool_cap) {
             size_t new_cap = runtime->frame_reuse_pool_cap == 0 ? 256 : runtime->frame_reuse_pool_cap * 2;
@@ -67459,6 +72519,45 @@ int termite_metal_buffer_download(
     }
 }
 
+// Bit-preserving small device copies stay on a tracked serial compute encoder.
+// This avoids a blit transition between each page's attention result and its
+// following projections. Standalone, large, unaligned and aliasing copies keep
+// their established route. No persistent buffers or arithmetic conversions.
+static int termite_metal_lightonocr3_copy_on_frame(termite_metal_decode_runtime *runtime,
+    id<MTLBuffer> src, size_t src_offset, id<MTLBuffer> dst, size_t dst_offset, size_t length) {
+    if (runtime == NULL || !runtime->lightonocr3_projections_enabled ||
+        !runtime->qwen35_ocr_vector_loads_enabled || runtime->active_frame_cb == nil ||
+        runtime->active_frame_regime != TERMITE_METAL_FRAME_REGIME_DECODE ||
+        !termite_metal_should_coalesce_planned_compute_encoder(runtime) ||
+        termite_metal_concurrent_planned_dispatch_enabled(runtime) ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_COMPUTE_COPIES")) ||
+        length > 65536 || length % 16 != 0 || src_offset % 16 != 0 || dst_offset % 16 != 0 ||
+        src.device != runtime->device || dst.device != runtime->device) return 0;
+    id<MTLComputePipelineState> pipeline = runtime->lightonocr3_copy_pipeline;
+    if (pipeline == nil || pipeline.threadExecutionWidth != 32 ||
+        pipeline.maxTotalThreadsPerThreadgroup < 128 ||
+        pipeline.staticThreadgroupMemoryLength > runtime->device.maxThreadgroupMemoryLength) return 0;
+    if (src == dst && src_offset < dst_offset + length && dst_offset < src_offset + length) return 0;
+    if (termite_metal_decode_runtime_retain_frame_resource(runtime, src) ||
+        termite_metal_decode_runtime_retain_frame_resource(runtime, dst)) return -7;
+    if (runtime->active_planned_compute_encoder == nil &&
+        termite_metal_decode_runtime_begin_planned_compute_scope(runtime,
+            TERMITE_METAL_COMPUTE_SOURCE_OTHER, runtime->active_compute_region)) return -7;
+    if (termite_metal_decode_runtime_prepare_planned_compute_unary_accesses(runtime,
+        src, src_offset, length, dst, dst_offset, length, -7)) return -7;
+    id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+    const uint32_t count = (uint32_t)(length / 16);
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:src offset:src_offset atIndex:0];
+    [encoder setBuffer:dst offset:dst_offset atIndex:1];
+    [encoder setBytes:&count length:sizeof(count) atIndex:2];
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (runtime->lightonocr3_copy_dispatches++ == 0 &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_COMPUTE_COPIES")))
+        fprintf(stderr, "lightonocr3_compute_copy: bytes=%zu planned=1\n", length);
+    return 1;
+}
+
 int termite_metal_buffer_copy(
     termite_metal_decode_runtime *runtime,
     void *src_handle,
@@ -67471,7 +72570,8 @@ int termite_metal_buffer_copy(
     @autoreleasepool {
         id<MTLBuffer> src = (__bridge id<MTLBuffer>)src_handle;
         id<MTLBuffer> dst = (__bridge id<MTLBuffer>)dst_handle;
-        if (src_offset + length > src.length || dst_offset + length > dst.length) return -2;
+        if (src_offset > src.length || length > src.length - src_offset ||
+            dst_offset > dst.length || length > dst.length - dst_offset) return -2;
         if (src.storageMode == MTLStorageModeShared && dst.storageMode == MTLStorageModeShared &&
             (runtime == NULL || (runtime->active_frame_cb == nil && runtime->submitted_frame_cb == nil))) {
             memcpy((uint8_t *)dst.contents + dst_offset, (const uint8_t *)src.contents + src_offset, length);
@@ -67479,6 +72579,11 @@ int termite_metal_buffer_copy(
             return 0;
         }
         if (runtime == NULL || runtime->device == nil || runtime->queue == nil) return -3;
+        const int copied = termite_metal_lightonocr3_copy_on_frame(runtime, src, src_offset, dst, dst_offset, length);
+        if (copied != 0) {
+            if (copied > 0) termite_metal_telemetry_copy(TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS, length);
+            return copied > 0 ? 0 : copied;
+        }
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -4;
@@ -70449,4 +75554,296 @@ int antfly_metal_video_position(termite_metal_decode_runtime *r, void *input, si
     const uint32_t params[4] = {rows * 768u, grid_x, grid_y, axis};
     return termite_metal_decode_runtime_gemma4_audio_dispatch(r, r->video_position_pipeline,
         b, 3, params, sizeof(params), rows * 768u, 1, 256, __func__);
+}
+
+// Prepared Qwen3.5 recurrent decoder block. Slot identities and vector weights
+// are retained by the model backend; frame-safe persistent workspace replaces transient
+// tensor wrappers. Dispatches and F32 state math reuse the canonical operators.
+int termite_metal_decode_runtime_lighton_prepared_linear_block(
+    termite_metal_decode_runtime *runtime, const size_t *slots,
+    void *const *norms, const size_t *norm_offsets,
+    void *input_handle, size_t input_offset, void *const *buffers, const size_t *offsets,
+    void *const *states, const size_t *state_offsets,
+    size_t rows, size_t hidden, size_t intermediate, size_t value_heads
+) {
+    if (runtime == NULL || runtime->active_frame_cb == nil || runtime->qwen35_core_batch_active ||
+        slots == NULL || norms == NULL || norm_offsets == NULL || states == NULL || state_offsets == NULL ||
+        input_handle == NULL || buffers == NULL || offsets == NULL || rows == 0 || rows > 64 ||
+        !runtime->lightonocr3_projections_enabled || !runtime->qwen35_ocr_vector_loads_enabled ||
+        !((hidden == 1024 && intermediate == 3584 && value_heads == 16) ||
+          (hidden == 2560 && intermediate == 9216 && value_heads == 32))) return 0;
+    const size_t channels = (32 + value_heads) * 128, value_width = value_heads * 128;
+    const size_t widths[15] = {hidden,channels,value_width,value_heads,value_heads,channels,
+        value_heads*2,value_width,value_width,hidden,hidden,intermediate,intermediate,intermediate,hidden};
+    for (size_t i = 0; i < 15; i++) {
+        if (buffers[i] == NULL) return -1;
+        id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)buffers[i];
+        size_t bytes = rows * widths[i] * sizeof(float);
+        if (offsets[i] > buffer.length || bytes > buffer.length - offsets[i]) return -1;
+        for (size_t j = 0; j < i; j++) if (buffers[j] == buffers[i]) return -1;
+    }
+    const size_t ins[8] = {hidden,hidden,hidden,hidden,value_width,hidden,hidden,intermediate};
+    const size_t outs[8] = {channels,value_width,value_heads,value_heads,hidden,intermediate,intermediate,hidden};
+    for (size_t i = 0; i < 8; i++)
+        if (slots[i] >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || !runtime->linear_slot_prepared[slots[i]] ||
+            runtime->linear_in_dims[slots[i]] != ins[i] || runtime->linear_out_dims[slots[i]] != outs[i] ||
+            runtime->linear_weight_dtypes[slots[i]] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16) return 0;
+    if (!termite_metal_decode_runtime_qwen35_core_available(runtime) || runtime->rms_norm_rows_pipeline == nil ||
+        runtime->add_pipeline == nil || runtime->activation_multiply_pipeline == nil ||
+        (rows > 1 && termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_QWEN35_CORE_BATCH")))) return 0;
+    int rc = 0;
+    bool collecting = false;
+    const size_t previous_region = runtime->active_compute_region;
+    // Keep the block on the canonical tracked encoder. Range tracking orders
+    // workspace reuse, including the residual retained by the next layer.
+    const bool scope_owned = runtime->active_planned_compute_encoder == nil;
+    if (scope_owned && termite_metal_decode_runtime_begin_planned_compute_scope(runtime,
+        TERMITE_METAL_COMPUTE_SOURCE_LAYER, TERMITE_METAL_COMPUTE_REGION_ATTENTION) != 0) return -2;
+#define LIGHTON_DO(call) do { rc = (call); if (rc != 0) goto done; } while (0)
+#define LIGHTON_LINEAR(index, source, source_offset, dest) \
+    LIGHTON_DO(rows == 1 ? termite_metal_decode_runtime_apply_linear_device(runtime, slots[index], source, source_offset, ins[index], outs[index], buffers[dest], offsets[dest]) : \
+        termite_metal_decode_runtime_apply_linear_multi_row_device(runtime, slots[index], source, source_offset, rows, ins[index], outs[index], buffers[dest], offsets[dest]))
+    termite_metal_enter_compute_region(runtime, TERMITE_METAL_COMPUTE_REGION_ATTENTION);
+    LIGHTON_DO(termite_metal_decode_runtime_apply_rms_norm_weight_device(runtime, input_handle, input_offset,
+        norms[0], norm_offsets[0], rows, hidden, 1e-6f, buffers[0], offsets[0]));
+    LIGHTON_LINEAR(0, buffers[0], offsets[0], 1);
+    LIGHTON_LINEAR(1, buffers[0], offsets[0], 2);
+    LIGHTON_LINEAR(2, buffers[0], offsets[0], 3);
+    LIGHTON_LINEAR(3, buffers[0], offsets[0], 4);
+    size_t core_group_rows = termite_metal_decode_runtime_lighton_recurrent_group_rows(runtime);
+    for (size_t row = 1; core_group_rows > 16 && row < rows; row++)
+        for (size_t weight = 3; weight < 7; weight++)
+            if (states[row * 7 + weight] != states[weight] || state_offsets[row * 7 + weight] != state_offsets[weight])
+                core_group_rows = 16;
+    for (size_t row = 0; row < rows; row++) {
+        if (rows > 1 && row % core_group_rows == 0) {
+            const size_t chunk = MIN(rows - row, core_group_rows);
+            if (chunk > 1) {
+                rc = termite_metal_decode_runtime_qwen35_core_batch_begin(runtime, chunk);
+                if (rc != 1) { rc = -2; goto done; }
+                collecting = true;
+            }
+        }
+        void *const *state = states + row * 7;
+        const size_t *so = state_offsets + row * 7;
+        void *handles[15] = {buffers[1],state[3],buffers[3],buffers[4],state[4],state[5],state[0],state[1],state[2],
+            buffers[5],buffers[6],buffers[7],buffers[2],state[6],buffers[8]};
+        size_t off[15] = {offsets[1]+row*channels*4,so[3],offsets[3]+row*value_heads*4,offsets[4]+row*value_heads*4,
+            so[4],so[5],so[0],so[1],so[2],offsets[5]+row*channels*4,offsets[6]+row*value_heads*8,
+            offsets[7]+row*value_width*4,offsets[2]+row*value_width*4,so[6],offsets[8]+row*value_width*4};
+        LIGHTON_DO(termite_metal_decode_runtime_qwen35_core_device(runtime, handles, off, 1, 16, value_heads, 128, 4, 1));
+        if (collecting && ((row + 1) % core_group_rows == 0 || row + 1 == rows)) {
+            LIGHTON_DO(termite_metal_decode_runtime_qwen35_core_batch_end(runtime));
+            collecting = false;
+        }
+    }
+    LIGHTON_LINEAR(4, buffers[8], offsets[8], 9);
+    LIGHTON_DO(termite_metal_decode_runtime_apply_add_device(runtime, buffers[9], offsets[9], input_handle,
+        input_offset, rows*hidden, buffers[10], offsets[10]));
+    termite_metal_enter_compute_region(runtime, TERMITE_METAL_COMPUTE_REGION_FFN_NORM);
+    LIGHTON_DO(termite_metal_decode_runtime_apply_rms_norm_weight_device(runtime, buffers[10], offsets[10],
+        norms[1], norm_offsets[1], rows, hidden, 1e-6f, buffers[0], offsets[0]));
+    termite_metal_enter_compute_region(runtime, TERMITE_METAL_COMPUTE_REGION_FFN);
+    if (termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, slots[5], slots[6], rows, hidden, intermediate)) {
+        LIGHTON_DO(termite_metal_decode_runtime_apply_bf16_gate_up_device(runtime, slots[5], slots[6], buffers[0], offsets[0], rows, hidden, intermediate, buffers[13], offsets[13]));
+    } else {
+        LIGHTON_LINEAR(5, buffers[0], offsets[0], 11);
+        LIGHTON_LINEAR(6, buffers[0], offsets[0], 12);
+        // DecoderRuntimeActivationKind.silu == 2.
+        LIGHTON_DO(termite_metal_decode_runtime_apply_activation_multiply_device(runtime, 2, buffers[11], offsets[11],
+            buffers[12], offsets[12], rows, intermediate, buffers[13], offsets[13]));
+    }
+    LIGHTON_LINEAR(7, buffers[13], offsets[13], 9);
+    LIGHTON_DO(termite_metal_decode_runtime_apply_add_device(runtime, buffers[9], offsets[9], buffers[10], offsets[10], rows*hidden, buffers[14], offsets[14]));
+    rc = 1;
+done:
+    if (collecting) termite_metal_decode_runtime_qwen35_core_batch_abort(runtime);
+    if (scope_owned && termite_metal_decode_runtime_end_planned_compute_scope(runtime) != 0 && rc == 1) rc = -2;
+    termite_metal_restore_compute_region(runtime, previous_region);
+#undef LIGHTON_LINEAR
+#undef LIGHTON_DO
+    return rc;
+}
+
+
+static int termite_metal_set_lighton_activation_pool(termite_metal_decode_runtime *runtime,
+                                                    size_t limit, bool prefill) {
+    if (runtime == NULL) return -1;
+    if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -2;
+    if (limit > (prefill ? 64u : 8u) * 1024u * 1024u) return -3;
+    termite_metal_lighton_activation_clear(runtime);
+    runtime->lighton_activation_limit = limit;
+    runtime->lighton_activation_peak = 0;
+    runtime->lighton_activation_hits = 0;
+    runtime->lighton_activation_duplicate_retirements = 0;
+    runtime->lighton_activation_prefill_hits = 0;
+    runtime->lighton_activation_prefill_hit_bytes = 0;
+    runtime->lighton_activation_prefill = prefill && limit != 0;
+    return 0;
+}
+int termite_metal_decode_runtime_set_lighton_activation_pool(termite_metal_decode_runtime *runtime, size_t limit) {
+    return termite_metal_set_lighton_activation_pool(runtime, limit, false);
+}
+// The caller admits this entire retained cache for the epoch. Submitted
+// entries remain fenced; vision and cancelled frames never populate it.
+int termite_metal_decode_runtime_set_lighton_prefill_activation_pool(termite_metal_decode_runtime *runtime, size_t limit) {
+    return termite_metal_set_lighton_activation_pool(runtime, limit, true);
+}
+void termite_metal_decode_runtime_lighton_prefill_activation_pool_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_activation_prefill_hits : 0;
+    out[1] = runtime != NULL ? runtime->lighton_activation_prefill_hit_bytes : 0;
+}
+void termite_metal_decode_runtime_lighton_activation_pool_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_activation_hits : 0;
+    out[1] = runtime != NULL ? runtime->lighton_activation_peak : 0;
+    out[2] = runtime != NULL ? runtime->lighton_activation_bytes : 0;
+    out[3] = runtime != NULL ? runtime->lighton_activation_duplicate_retirements : 0;
+}
+
+uint64_t termite_metal_decode_runtime_lighton_wide_projection_tiles(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL ? runtime->lightonocr3_wide_projection_tile_calls : 0;
+}
+
+uint64_t termite_metal_decode_runtime_argmax_on_frame_calls(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL ? runtime->argmax_on_frame_calls : 0;
+}
+
+void termite_metal_decode_runtime_lighton_wide_mpp_stats(termite_metal_decode_runtime *runtime, uint64_t *values) {
+    if (values == NULL) return;
+    values[0] = runtime != NULL ? runtime->lightonocr3_wide_mpp_projection_calls : 0;
+    values[1] = runtime != NULL ? runtime->lightonocr3_wide_mpp_head_calls : 0;
+}
+
+uint64_t termite_metal_decode_runtime_lighton_standalone_wide_head_calls(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL ? runtime->lightonocr3_standalone_wide_head_calls : 0;
+}
+
+size_t termite_metal_buffer_allocated_size(void *handle) {
+    if (handle == NULL) return 0;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handle;
+    return buffer.allocatedSize;
+}
+
+int termite_metal_decode_runtime_stream_frames_available(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL && termite_metal_pipelined_decode_frame_enabled() &&
+        runtime->decode_gqa_split_frame_scratch_enabled &&
+        runtime->attention_decode_gqa_split_scratch_buffer != nil &&
+        runtime->attention_decode_gqa_split_scratch_buffer_alt != nil;
+}
+
+void termite_metal_decode_runtime_lighton_prefill_pack_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_prefill_pack_calls : 0;
+    out[1] = runtime != NULL ? runtime->lighton_prefill_pack_reuse_hits : 0;
+}
+
+
+void termite_metal_decode_runtime_lighton_decode_pack_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_decode_pack_calls : 0;
+    out[1] = runtime != NULL ? runtime->lighton_decode_pack_reuse_hits : 0;
+}
+
+
+void termite_metal_decode_runtime_lighton_vision_pack_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_vision_pack_calls : 0;
+    out[1] = runtime != NULL ? runtime->lighton_vision_pack_reuse_hits : 0;
+}
+
+void termite_metal_decode_runtime_lighton_mpp_encoder_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_mpp_planned_calls : 0;
+    out[1] = runtime != NULL ? runtime->lighton_mpp_dedicated_calls : 0;
+}
+
+uint64_t termite_metal_decode_runtime_lighton_wide_gate_up_calls(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL ? runtime->lightonocr3_wide_gate_up_calls : 0;
+}
+
+uint64_t termite_metal_decode_runtime_lighton_full64_gate_up_calls(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL ? runtime->lightonocr3_full64_gate_up_calls : 0;
+}
+
+void termite_metal_decode_runtime_lighton_batch_argmax_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_batch_argmax_calls : 0;
+    out[1] = runtime != NULL ? runtime->lighton_batch_argmax_rows : 0;
+}
+
+int termite_metal_decode_runtime_set_lighton_vision_workspace_cache(termite_metal_decode_runtime *runtime, int enabled) {
+    int rc = termite_metal_decode_runtime_clear_lightonocr3_vision_workspace(runtime);
+    if (rc != 0) return rc;
+    runtime->lighton_vision_workspace_keep = enabled != 0 ? YES : NO;
+    return 0;
+}
+void termite_metal_decode_runtime_lighton_vision_workspace_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_vision_workspace_allocations : 0;
+    out[1] = runtime != NULL ? runtime->lighton_vision_workspace_reuses : 0;
+    out[2] = runtime != NULL ? runtime->lightonocr3_vision_pack_buffers[0].length + runtime->lightonocr3_vision_pack_buffers[1].length : 0;
+}
+void termite_metal_decode_runtime_lighton_large_vision_pack_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_large_vision_pack_calls : 0;
+    out[1] = runtime != NULL ? runtime->lighton_large_vision_pack_reuse_hits : 0;
+}
+
+// Two-step OCR decode reads the previous frame's GPU argmax without a CPU
+// token handoff. The slot is the original BF16 embedding weight, already
+// covered by model-weight admission; this does not create a table mirror.
+int antfly_metal_lighton_embed_tokens(termite_metal_decode_runtime *r,
+    size_t slot, size_t rows, size_t dim, void *out_handle, size_t out_offset) {
+    if (!r || !out_handle || !r->active_frame_cb || !r->active_planned_compute_encoder ||
+        rows < 2 || rows > 64 || (dim != 1024 && dim != 2560) ||
+        slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || !r->linear_slot_prepared[slot] ||
+        r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
+        r->linear_in_dims[slot] != dim || r->linear_out_dims[slot] != 248320 ||
+        !r->embedding_lookup_bf16_pipeline || !r->token_buffer ||
+        r->token_capacity < rows * sizeof(uint32_t)) return -1;
+    id<MTLBuffer> weight = r->linear_weight_buffers[slot];
+    id<MTLBuffer> out = (__bridge id<MTLBuffer>)out_handle;
+    const size_t weight_bytes = 248320 * dim * sizeof(uint16_t);
+    const size_t output_bytes = rows * dim * sizeof(float);
+    if (!weight || weight.length < weight_bytes || out == weight || out == r->token_buffer ||
+        out_offset % 4 || !termite_metal_buffer_range_valid(out, out_offset, output_bytes)) return -2;
+    termite_metal_planned_encoder_range accesses[3];
+    if (termite_metal_planned_range_make(weight, 0, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -3) ||
+        termite_metal_planned_range_make(r->token_buffer, 0, rows * sizeof(uint32_t), TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -3) ||
+        termite_metal_planned_range_make(out, out_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], -3) ||
+        termite_metal_decode_runtime_prepare_planned_compute_accesses(r, accesses, 3, -3)) return -3;
+    if (termite_metal_decode_runtime_retain_frame_resource(r, weight) ||
+        termite_metal_decode_runtime_retain_frame_resource(r, r->token_buffer) ||
+        termite_metal_decode_runtime_retain_frame_resource(r, out)) return -4;
+    id<MTLComputeCommandEncoder> e = r->active_planned_compute_encoder;
+    const termite_metal_embedding_lookup_params p = {.total=(uint32_t)rows, .dim=(uint32_t)dim};
+    [e setComputePipelineState:r->embedding_lookup_bf16_pipeline];
+    [e setBuffer:weight offset:0 atIndex:0];
+    [e setBuffer:r->token_buffer offset:0 atIndex:1];
+    [e setBuffer:out offset:out_offset atIndex:2];
+    [e setBytes:&p length:sizeof(p) atIndex:3];
+    [e dispatchThreads:MTLSizeMake(rows * dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 0;
+}
+
+// Only call after the submitted producer has completed, and before submitting
+// a second producer. An active frame is allowed: its token writes are pending.
+// Configure only between complete forwards. This is never a permission to
+// reuse a submitted prefix's buffers: those remain frame-retained until drain.
+int antfly_metal_lighton_prefill_pack_streaming(termite_metal_decode_runtime *r, int enabled) {
+    if (!r || r->active_frame_cb || r->submitted_frame_cb) return -1;
+    if (enabled && (!r->lightonocr3_projections_enabled ||
+        termite_metal_concurrent_planned_dispatch_enabled(r))) return -2;
+    r->lighton_prefill_stream_pack_reuse = enabled != 0;
+    return 0;
+}
+
+int antfly_metal_lighton_read_tokens(termite_metal_decode_runtime *r, uint32_t *out, size_t rows) {
+    if (!r || !out || rows < 2 || rows > 64 || r->submitted_frame_cb || !r->token_buffer ||
+        r->token_buffer.storageMode != MTLStorageModeShared || r->token_capacity < rows * sizeof(uint32_t) ||
+        !r->token_buffer.contents) return -1;
+    memcpy(out, r->token_buffer.contents, rows * sizeof(uint32_t));
+    return 0;
 }

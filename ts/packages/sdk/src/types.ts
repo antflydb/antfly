@@ -434,6 +434,7 @@ export type GeneratorConfig =
 export type EmbedderProvider = components["schemas"]["EmbedderProvider"];
 export type IndexEmbedderProvider = NonNullable<IndexEmbedderConfig["provider"]>;
 export const embedderProviderCapabilities = {
+  cloudflare: { index: true },
   antfly: { index: true },
   bedrock: { index: true },
   cohere: { index: false },
@@ -449,7 +450,10 @@ export const indexEmbedderProviders = embedderProviders.filter(
 );
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
 export const generatorProviderCapabilities = {
+  cloudflare: {},
+  anthropic: {},
   antfly: {},
+  bedrock: {},
   apple: {},
   gemini: {},
   ollama: {},

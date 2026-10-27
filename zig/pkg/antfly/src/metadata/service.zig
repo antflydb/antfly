@@ -3430,6 +3430,7 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .compare_and_set_job_state) return metadata_topology_protocol.job_state_version;
     const namespace_indexes = switch (command) {
         .apply_restore_staging, .apply_system_catalog => |bytes| bytes,
         .upsert_table => |table| table.indexes_json,
@@ -3440,13 +3441,17 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         else => "",
     };
+    if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
     switch (command) {
-        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| for (delta.upsert_tables) |table| {
-            if (transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }) >= metadata_topology_protocol.resolver_namespaces_version) return metadata_topology_protocol.resolver_namespaces_version;
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| {
+            var required: u16 = 0;
+            for (delta.upsert_tables) |table| required = @max(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+            if (required >= metadata_topology_protocol.resolver_namespaces_version) return required;
         },
         else => {},
     }
+    if (command == .apply_resolver_authority) return metadata_topology_protocol.resolver_records_version;
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
         return metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
@@ -3466,6 +3471,12 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         else => false,
     };
+    const has_native_resolver_records = switch (command) {
+        .upsert_table => |table| std.mem.indexOf(u8, table.indexes_json, "_resolver_record_store") != null,
+        .compare_and_replace_table => |cas| std.mem.indexOf(u8, cas.replacement.indexes_json, "_resolver_record_store") != null,
+        else => false,
+    };
+    if (has_native_resolver_records) return metadata_topology_protocol.resolver_records_version;
     if (object_engine) return metadata_topology_protocol.object_table_engine_version;
     switch (command) {
         .mutate_lake_index_lifecycle, .remove_table => return metadata_topology_protocol.lake_index_catalog_version,
@@ -6115,12 +6126,19 @@ pub const MetadataService = struct {
             .ensure_listener_registered = catalogProjectionEnsureListener,
             .catalog_epoch = catalogProjectionEpoch,
             .capture_projection = catalogProjectionCapture,
+            .execution_indexes = catalogProjectionExecutionIndexes,
         } };
     }
 
     fn catalogProjectionEnsureListener(ptr: *anyopaque) !void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         try self.ensureLifecycleListenerRegistered();
+    }
+
+    fn catalogProjectionExecutionIndexes(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, revision: u64) ![]u8 {
+        const self: *MetadataService = @ptrCast(@alignCast(ptr));
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return @import("resolver_catalog_read.zig").executionIndexesAlloc(store, alloc, group, name, revision, false);
     }
 
     fn catalogProjectionEpoch(ptr: *anyopaque) u64 {
@@ -8785,12 +8803,19 @@ pub const MetadataHttpService = struct {
             .ensure_listener_registered = catalogProjectionEnsureListener,
             .catalog_epoch = catalogProjectionEpoch,
             .capture_projection = catalogProjectionCapture,
+            .execution_indexes = catalogProjectionExecutionIndexes,
         } };
     }
 
     fn catalogProjectionEnsureListener(ptr: *anyopaque) !void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         try self.ensureLifecycleListenerRegistered();
+    }
+
+    fn catalogProjectionExecutionIndexes(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, revision: u64) ![]u8 {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return @import("resolver_catalog_read.zig").executionIndexesAlloc(store, alloc, group, name, revision, false);
     }
 
     fn catalogProjectionEpoch(ptr: *anyopaque) u64 {

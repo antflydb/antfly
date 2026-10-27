@@ -18,6 +18,9 @@ import type {
   ChunkEmbeddingStreamEvent,
   ChunkResponse,
   ClassificationResult,
+  ContextDiagnostics,
+  ContextPrepareRequest,
+  ContextPrepareResponse,
   DecideRequest,
   DecideResponse,
   EmbedInput,
@@ -43,6 +46,28 @@ import type {
 } from "./inference-types.js";
 import type { components, paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
+
+function validateContextAttestation(
+  request: Omit<GenerateRequest, "stream">,
+  diagnostics: ContextDiagnostics
+): void {
+  if (request.context_management !== undefined) {
+    if (diagnostics.policy !== request.context_management.mode) {
+      throw new Error("Generation server attested a different context policy");
+    }
+    if (request.context_management.checkpoint !== undefined && !diagnostics.checkpoint_applied) {
+      throw new Error("Generation server did not attest the requested checkpoint");
+    }
+  }
+  if (request.kv_cache !== undefined) {
+    if (diagnostics.kv_cache_mode !== request.kv_cache.mode) {
+      throw new Error("Generation server attested a different KV cache policy");
+    }
+    if (diagnostics.kv_cache_version !== (request.kv_cache.version ?? "v1")) {
+      throw new Error("Generation server attested a different KV cache version");
+    }
+  }
+}
 
 const MAX_INFERENCE_JSON_RESPONSE_BYTES = 16 << 20;
 const MAX_GENERATION_RESPONSE_BYTES = MAX_INFERENCE_JSON_RESPONSE_BYTES;
@@ -154,11 +179,52 @@ export class InferenceClient {
     if (truncated) {
       throw new Error(`Generation response exceeded ${MAX_GENERATION_RESPONSE_BYTES} bytes`);
     }
+    let result: GenerateResponse;
     try {
-      return JSON.parse(text) as GenerateResponse;
+      result = JSON.parse(text) as GenerateResponse;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`Generation returned invalid JSON: ${detail}`);
+    }
+    if (
+      (request.context_management !== undefined || request.kv_cache !== undefined) &&
+      result.context === undefined
+    ) {
+      throw new Error("Generation server did not attest the requested context policy");
+    }
+    if (result.context !== undefined) validateContextAttestation(request, result.context);
+    return result;
+  }
+
+  /** Inspect or prepare bounded chat context before generation. */
+  async prepareChatContext(
+    request: ContextPrepareRequest,
+    options?: RequestOptions
+  ): Promise<ContextPrepareResponse> {
+    const response = await fetch(`${this.baseUrl}/ai/v1/generate/context/prepare`, {
+      method: "POST",
+      headers: {
+        ...this.headers,
+        Accept: "application/json",
+      },
+      body: JSON.stringify(request),
+      signal: options?.signal,
+    });
+    if (!response.ok) throw await inferenceAPIErrorResponse(response);
+    const { text, truncated } = await readLimitedResponseText(
+      response,
+      MAX_GENERATION_RESPONSE_BYTES
+    );
+    if (truncated) {
+      throw new Error(
+        `Context preparation response exceeded ${MAX_GENERATION_RESPONSE_BYTES} bytes`
+      );
+    }
+    try {
+      return JSON.parse(text) as ContextPrepareResponse;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Context preparation returned invalid JSON: ${detail}`);
     }
   }
 
@@ -191,11 +257,32 @@ export class InferenceClient {
     }
     if (!response.body) throw new Error("Generation stream returned an empty body");
 
+    const requiresContextAttestation =
+      request.context_management !== undefined || request.kv_cache !== undefined;
+    let sawContextAttestation = false;
     for await (const frame of parseSSEFrames(response.body)) {
       if (frame.event === "error") throw new Error(`Generation stream failed: ${frame.data}`);
-      if (frame.data.trim() === "[DONE]") return;
+      if (frame.data.trim() === "[DONE]") {
+        if (requiresContextAttestation && !sawContextAttestation) {
+          throw new Error("Generation server did not attest the requested context policy");
+        }
+        return;
+      }
       try {
-        yield JSON.parse(frame.data) as GenerateChunk;
+        const chunk = JSON.parse(frame.data) as GenerateChunk;
+        if (chunk.context !== undefined) {
+          validateContextAttestation(request, chunk.context);
+          sawContextAttestation = true;
+        } else if (
+          requiresContextAttestation &&
+          !sawContextAttestation &&
+          chunk.choices.length > 0
+        ) {
+          throw new Error(
+            "Generation server emitted content before attesting the requested context policy"
+          );
+        }
+        yield chunk;
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error(`Generation stream returned invalid JSON: ${detail}`);
@@ -545,19 +632,31 @@ export class InferenceClient {
     });
   }
 
+  /** Read images or complete PDF/PPTX documents with a registered reader/composite. */
+  async read(
+    request: components["schemas"]["InferenceReadRequest"]
+  ): Promise<components["schemas"]["InferenceReadResponse"]> {
+    const { data, error, response } = await this.client.POST("/ai/v1/read", { body: request });
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("Read failed: unexpected empty response");
+    return data;
+  }
+
   /**
    * Run the canonical schema-driven extraction API.
    */
   async extractRaw(request: ExtractRequest): Promise<ExtractResponse> {
     const expectedModel = request.model;
     const expectedIds =
-      request.schema_version === 2 ? request.inputs.map((input) => input.id) : undefined;
+      request.schema_version === 2
+        ? (request.inputs ?? request.documents)?.map((input) => input.id)
+        : undefined;
     const { data, error, response } = await this.client.POST("/ai/v1/extract", {
       body: request,
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Extract failed: unexpected empty response");
-    if (expectedIds !== undefined) {
+    if (request.schema_version === 2) {
       validateExtractionV2Response(data, expectedModel, expectedIds);
     }
     return data;
@@ -810,7 +909,7 @@ export class InferenceClient {
 function validateExtractionV2Response(
   response: unknown,
   expectedModel: string,
-  expectedIds: readonly (string | undefined)[]
+  expectedIds?: readonly (string | undefined)[]
 ): void {
   if (typeof response !== "object" || response === null || Array.isArray(response)) {
     throw new Error("Invalid extraction v2 response: expected an extraction object");
@@ -822,17 +921,23 @@ function validateExtractionV2Response(
   if (envelope.model !== expectedModel) {
     throw new Error("Invalid extraction v2 response: model mismatch");
   }
-  if (!Array.isArray(envelope.data) || envelope.data.length !== expectedIds.length) {
+  if (
+    !Array.isArray(envelope.data) ||
+    (expectedIds !== undefined && envelope.data.length !== expectedIds.length)
+  ) {
     throw new Error("Invalid extraction v2 response: item cardinality");
   }
-  for (let index = 0; index < expectedIds.length; index++) {
+  for (let index = 0; index < envelope.data.length; index++) {
     const row: unknown = envelope.data[index];
     if (typeof row !== "object" || row === null || Array.isArray(row)) {
       throw new Error(`Invalid extraction v2 response: item ${index} must be an object`);
     }
     const item = row as Record<string, unknown>;
     const hasId = Object.getOwnPropertyDescriptor(item, "id") !== undefined;
-    if ((hasId && typeof item.id !== "string") || item.id !== expectedIds[index]) {
+    if (
+      (hasId && typeof item.id !== "string") ||
+      (expectedIds !== undefined && item.id !== expectedIds[index])
+    ) {
       throw new Error(`Invalid extraction v2 response: item ${index} id mismatch`);
     }
   }

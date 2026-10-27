@@ -10,6 +10,7 @@ from ..models.inference_role import InferenceRole
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_generate_message_extra_content import InferenceGenerateMessageExtraContent
     from ..models.tool_call import ToolCall
 
 
@@ -20,7 +21,9 @@ T = TypeVar("T", bound="InferenceGenerateMessage")
 class InferenceGenerateMessage:
     """
     Attributes:
-        role (InferenceRole): Role of the message sender in a generation/chat conversation
+        role (InferenceRole): Chat message role, including developer instructions preserved by context management.
+        extra_content (InferenceGenerateMessageExtraContent | Unset): Opaque provider message metadata. Preserve
+            unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         content (None | str | Unset): The generated message content (null when tool_calls is present)
         reasoning_content (None | str | Unset): Model reasoning emitted on a private reasoning channel, separate from
             public content
@@ -29,6 +32,7 @@ class InferenceGenerateMessage:
     """
 
     role: InferenceRole
+    extra_content: InferenceGenerateMessageExtraContent | Unset = UNSET
     content: None | str | Unset = UNSET
     reasoning_content: None | str | Unset = UNSET
     tool_calls: list[ToolCall] | Unset = UNSET
@@ -36,6 +40,10 @@ class InferenceGenerateMessage:
 
     def to_dict(self) -> dict[str, Any]:
         role = self.role.value
+
+        extra_content: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.extra_content, Unset):
+            extra_content = self.extra_content.to_dict()
 
         content: None | str | Unset
         if isinstance(self.content, Unset):
@@ -63,6 +71,8 @@ class InferenceGenerateMessage:
                 "role": role,
             }
         )
+        if extra_content is not UNSET:
+            field_dict["extra_content"] = extra_content
         if content is not UNSET:
             field_dict["content"] = content
         if reasoning_content is not UNSET:
@@ -74,10 +84,18 @@ class InferenceGenerateMessage:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_generate_message_extra_content import InferenceGenerateMessageExtraContent
         from ..models.tool_call import ToolCall
 
         d = dict(src_dict)
         role = InferenceRole(d.pop("role"))
+
+        _extra_content = d.pop("extra_content", UNSET)
+        extra_content: InferenceGenerateMessageExtraContent | Unset
+        if isinstance(_extra_content, Unset):
+            extra_content = UNSET
+        else:
+            extra_content = InferenceGenerateMessageExtraContent.from_dict(_extra_content)
 
         def _parse_content(data: object) -> None | str | Unset:
             if data is None:
@@ -108,6 +126,7 @@ class InferenceGenerateMessage:
 
         inference_generate_message = cls(
             role=role,
+            extra_content=extra_content,
             content=content,
             reasoning_content=reasoning_content,
             tool_calls=tool_calls,

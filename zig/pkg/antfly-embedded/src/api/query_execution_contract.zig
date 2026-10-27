@@ -26,6 +26,16 @@ const db_mod = @import("../storage/db/control_root.zig");
 
 pub const algebraic_ir = db_mod.algebraic.ir;
 
+/// Bind private document controls after selecting a physical route, before
+/// encoding either a compiled-owner call or a remote shard request.
+pub fn bindDocumentAuthorityToGroup(req: db_mod.types.SearchRequest, group_id: u64) !db_mod.types.SearchRequest {
+    if (req.document_authority_mode == .none) return req;
+    if (group_id == 0 or (req.document_authority_group != 0 and req.document_authority_group != group_id)) return error.InvalidQueryRequest;
+    var scoped = req;
+    scoped.document_authority_group = group_id;
+    return scoped;
+}
+
 pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
     if (req.cancellation) |value| {
         if (value.isCancelled()) return error.Cancelled;
@@ -3501,6 +3511,10 @@ pub fn encodeQueryRequestWithGraphWireMode(
         );
     } else if (req.full_text) |full_text| {
         try appendTextQueryField(alloc, &out, &first, "full_text_search", full_text);
+    } else if (req.document_authority_mode == .lookup and req.query == .match_all) {
+        // Exact-ID primary hydration has no scoring relation. Encoding its
+        // implicit match-all as full_text_search would normalize into an
+        // explicit text query, which the primary-only lookup gate rejects.
     } else if ((dense_queries.len > 0 or sparse_queries.len > 0) and req.query == .match_all) {
         // The storage request defaults to match-all, but a vector-only query
         // has no text retrieval component. Serializing that default would make
@@ -4902,6 +4916,8 @@ const RemoteSearchParser = struct {
         try self.expect(.object_begin);
         var wire: metadata_openapi.QueryHit = .{ ._id = "", ._score = 0 };
         var stored: ?[]u8 = null;
+        var computed: ?[]u8 = null;
+        errdefer if (computed) |value| self.alloc.free(value);
         var pending: ?db_mod.types.document_authority.Pending = null;
         errdefer if (stored) |value| self.alloc.free(value);
         var seen: u64 = 0;
@@ -4912,6 +4928,11 @@ const RemoteSearchParser = struct {
                     var captured: db_mod.types.document_authority.Pending = .{};
                     if (try rawObjectSourceRange(&self.source_workspace, &self.scanner, self.options, .{ .ctx = &captured, .member_fn = db_mod.types.document_authority.Pending.observe }) != null) pending = captured;
                 } else stored = try self.source();
+            } else if (std.mem.eql(u8, name, "_computed")) {
+                // Retain validated lexical spans directly, including exact
+                // numbers and escaped payloads, just like stored source.
+                computed = try self.source();
+                if (computed) |value| _ = try @import("antfly-json").RawObject.init(value);
             } else try self.member(metadata_openapi.QueryHit, &wire, i, a);
         }
         if (!required(metadata_openapi.QueryHit, "_id", seen) or !required(metadata_openapi.QueryHit, "_score", seen)) return error.MissingField;
@@ -4930,7 +4951,8 @@ const RemoteSearchParser = struct {
         if (self.authority_group != null) try self.pending_sources.append(self.alloc, pending);
         hit.stored_data = stored;
         stored = null;
-        if (wire._computed) |computed| hit.computed_json = try std.json.Stringify.valueAlloc(self.alloc, computed, .{});
+        hit.computed_json = computed;
+        computed = null;
         return hit;
     }
     fn rows(self: *@This()) !void {
@@ -5156,7 +5178,7 @@ pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8
 /// Decode private sources only for an admitted internal request. Both HTTP
 /// workers and compiled storage owners serialize the same authority envelope.
 pub fn restoreDocumentAuthority(alloc: std.mem.Allocator, scratch: std.mem.Allocator, group_id: u64, mode: db_mod.types.document_authority.Mode, result: *db_mod.types.SearchResult) !void {
-    if (mode == .none) return;
+    if (mode == .none or mode == .lookup) return;
     if (result.document_authority_version != 1) return error.StorageReadTemporarilyUnavailable;
     for (result.hits) |*hit| {
         if (hit.document_authority != null) return error.InvalidRemoteResponse;
@@ -7468,4 +7490,17 @@ test "public graph metric borrowed wire source scan rejects invalid authority en
         defer a.free(wire);
         try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResultWithAuthority(a, a, wire, 7, null));
     }
+}
+
+test "api query contract worker computed spans preserve numbers and reject malformed objects" {
+    const a = std.testing.allocator;
+    const prefix = "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"a\",\"_score\":1,\"_computed\":";
+    const suffix = "}]},\"status\":200,\"table\":\"docs\",\"took\":0}]}";
+    const body = prefix ++ "{\"integer\":9007199254740993,\"decimal\":1e0,\"text\":\"\\u03bb\\n\"}" ++ suffix;
+    var result = try parseRemoteSearchResult(a, body);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("{\"integer\":9007199254740993,\"decimal\":1e0,\"text\":\"\\u03bb\\n\"}", result.hits[0].computed_json.?);
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "[]" ++ suffix));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "{\"x\":1,\"x\":2}" ++ suffix));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "{\"x\":NaN}" ++ suffix));
 }

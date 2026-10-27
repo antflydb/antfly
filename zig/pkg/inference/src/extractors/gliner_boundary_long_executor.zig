@@ -551,10 +551,17 @@ fn prepareTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, 
     for (item.compiled.schema.relations) |relation| if (relation.description != null) {
         composed = true;
     };
-    if (!composed) return prepareDocument(backend, allocator, config, item, options);
-    options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, 1024);
+    const qualified_context = switch (backend) {
+        .native, .wasm => policy.maxQualifiedWindowTokens(options.identity, .native),
+        .metal => policy.maxQualifiedWindowTokens(options.identity, .metal),
+        .cuda => policy.maxQualifiedWindowTokens(options.identity, .cuda),
+        else => null,
+    };
+    if (!composed and qualified_context == null) return prepareDocument(backend, allocator, config, item, options);
+    const context_limit = if (composed) @min(@as(usize, 1024), qualified_context orelse 1024) else qualified_context.?;
+    options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, context_limit);
     options.processor.max_batch_tokens = @max(options.processor.max_batch_tokens, options.processor.max_sequence_tokens);
-    options.limits.plan.max_window_body_words = @min(options.limits.plan.max_window_body_words, 1024);
+    options.limits.plan.max_window_body_words = @min(options.limits.plan.max_window_body_words, context_limit);
     while (true) {
         var planned = try prepareDocument(backend, allocator, config, item, options);
         errdefer planned.document.deinit();

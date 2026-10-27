@@ -5270,6 +5270,8 @@ pub const HierarchyArtifact = struct {
     name: []const u8,
     kind: []const u8,
     chunk_id: ?u32 = null,
+    /// Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
+    window_index: ?u32 = null,
     unit_id: ?[]const u8 = null,
     source: ?HierarchyArtifactSource = null,
 
@@ -5278,6 +5280,7 @@ pub const HierarchyArtifact = struct {
         .{ "name", "name", false },
         .{ "kind", "kind", false },
         .{ "chunk_id", "chunk_id", true },
+        .{ "window_index", "window_index", true },
         .{ "unit_id", "unit_id", true },
         .{ "source", "source", true },
     };
@@ -5300,6 +5303,10 @@ pub const HierarchyArtifact = struct {
             try jw.objectField("chunk_id");
             try jw.write(value);
         }
+        if (self.window_index) |value| {
+            try jw.objectField("window_index");
+            try jw.write(value);
+        }
         if (self.unit_id) |value| {
             try jw.objectField("unit_id");
             try jw.write(value);
@@ -5316,6 +5323,8 @@ pub const HierarchyArtifactSource = struct {
     name: []const u8,
     kind: []const u8,
     chunk_id: ?u32 = null,
+    /// Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
+    window_index: ?u32 = null,
     unit_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -5323,6 +5332,7 @@ pub const HierarchyArtifactSource = struct {
         .{ "name", "name", false },
         .{ "kind", "kind", false },
         .{ "chunk_id", "chunk_id", true },
+        .{ "window_index", "window_index", true },
         .{ "unit_id", "unit_id", true },
     };
 
@@ -5342,6 +5352,10 @@ pub const HierarchyArtifactSource = struct {
         try jw.write(self.kind);
         if (self.chunk_id) |value| {
             try jw.objectField("chunk_id");
+            try jw.write(value);
+        }
+        if (self.window_index) |value| {
+            try jw.objectField("window_index");
             try jw.write(value);
         }
         if (self.unit_id) |value| {
@@ -7283,7 +7297,7 @@ pub const PathFindResult = antfly_indexes_openapi.PathFindResult;
 
 pub const PathFindWeightMode = antfly_indexes_openapi.PathFindWeightMode;
 
-/// Exactly one expression node: literal, field, ref, param, call with args, case with optional else, cast, or a binary operator. Pure expressions lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider calls remain in evaluate, never execute implicitly in select. value_identity(field) returns an opaque identity for a present logical value (including JSON null); missing has no identity. is_missing(field) distinguishes missing from present null. Identity reads require the same authorization and retained source revision as value reads. Metadata may accelerate them; unsupported/old metadata falls back to ordinary reads. Untaken CASE branches do not load fields or evaluate erroring calls. Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from, is_not_distinct_from, and, or, add, subtract, multiply, divide and concat. Expressions are limited to depth 64 and 8192 nodes per request.
+/// Exactly one expression node: literal, field, ref, param, call with args, case with optional else, cast, or a binary operator. Pure expressions lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider calls remain in evaluate, never execute implicitly in select. value_identity(field) returns an opaque identity for a present logical value (including JSON null); missing has no identity. is_missing(field) distinguishes missing from present null. Identity reads require the same authorization and retained source revision as value reads. Metadata may accelerate them; unsupported/old metadata falls back to ordinary reads. Untaken CASE branches do not load fields or evaluate erroring calls. Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from, is_not_distinct_from, and, or, add, subtract, multiply, divide and concat. Expressions are limited to depth 64 including referenced aliases, and 8192 nodes per request. Alias dependencies are acyclic; each alias is a requested output and is evaluated once per row.
 pub const ProjectionExpression = std.json.Value;
 
 /// Statistics from token-based document pruning
@@ -7874,7 +7888,7 @@ pub const QueryHit = struct {
     /// Source table provenance for composed query hits; equal IDs from union inputs remain distinct.
     _table: ?[]const u8 = null,
     /// Named query-time computed values, separate from stored source.
-    _computed: ?std.json.ArrayHashMap(std.json.Value) = null,
+    _computed: ?@import("antfly-json").RawObject = null,
     /// ID of the record.
     _id: []const u8,
     /// Relevance score of the hit, normalized so higher values always rank first.
@@ -13641,6 +13655,73 @@ pub const ScanKeysRequest = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Merge within explicit exclusive key bounds. Records and retained IDs must be inside the range and after last_merged_id. Overlapping writers still require external serialization. Upsert pages normally set delete_missing=false. After a complete authoritative inventory has been written and verified, an empty-record page with retain_ids reconciles the entire bounded range without retransmitting document content.
+pub const ScopedLinearMergePage = struct {
+    key_range: std.json.Value,
+    records: std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)),
+    /// Valid only with empty records. Keep these already-written IDs while reconciling the bounded range. Missing retained records abort the request before any mutation. Use an empty list for an empty corpus.
+    retain_ids: ?[]const []const u8 = null,
+    /// Exclusive page cursor within key_range; defaults to key_range.from.
+    last_merged_id: ?[]const u8 = null,
+    /// Explicitly authorize deletion of records absent from this page or retain_ids.
+    delete_missing: ?bool = null,
+    dry_run: ?bool = null,
+    sync_level: ?SyncLevel = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key_range", "key_range", false },
+        .{ "records", "records", false },
+        .{ "retain_ids", "retain_ids", true },
+        .{ "last_merged_id", "last_merged_id", true },
+        .{ "delete_missing", "delete_missing", true },
+        .{ "dry_run", "dry_run", true },
+        .{ "sync_level", "sync_level", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key_range");
+        try jw.write(self.key_range);
+        try jw.objectField("records");
+        try jw.write(self.records);
+        if (self.retain_ids) |value| {
+            try jw.objectField("retain_ids");
+            try jw.write(value);
+        }
+        if (self.last_merged_id) |value| {
+            try jw.objectField("last_merged_id");
+            try jw.write(value);
+        }
+        if (self.delete_missing) |value| {
+            try jw.objectField("delete_missing");
+            try jw.write(value);
+        }
+        if (self.dry_run) |value| {
+            try jw.objectField("dry_run");
+            try jw.write(value);
+        }
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Bounded LinearMerge v1 envelope. Legacy servers reject this envelope before mutation because it has no top-level records field. Never fall back to an unbounded merge when a server rejects this request.
+pub const ScopedLinearMergeRequest = struct {
+    scoped_merge: ScopedLinearMergePage,
 };
 
 pub const SecretEntry = struct {

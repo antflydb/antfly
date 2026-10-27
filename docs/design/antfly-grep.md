@@ -274,15 +274,147 @@ numbers, bounding boxes, OCR precision, or detection confidence. Model scores ar
 relevance estimates, not proof. In image mode counts refer to matching units.
 An error after a successful unit preserves its completed output as partial results.
 
-### Colony / Antfly Cloud delivery
+### Portable sources and Cloud delivery
 
-Cloud work is specified in [Colony #790](https://github.com/antflydb/colony/issues/790),
-not implemented in this repository. Colony owns OAuth/refresh secrets, Drive change
-cursors, effective ACL normalization, group membership, sync/reconciliation,
-private original/export/render storage, atomic publication and deletion/retention.
-`antfly-cloud` owns login, connections, source discovery and short-lived scoped
-sessions; `antfly-grep` consumes those authorized tables and the inference gateway.
-Users should not copy Drive tokens or manually reconstruct table schemas.
+A source is an existing Colony import job with `mode: source`. Existing
+provider-auth connections hold acquisition credentials; existing import-job
+endpoints own configuration, scheduling, runs, retries, pause/resume and archive.
+The job ID is the stable source ID. There is no parallel Cloud source-management
+or discovery API. [Colony #790](https://github.com/antflydb/colony/issues/790) tracks
+the hosted experience and remaining qualification.
+
+The public [sources module](../../go/pkg/sources/README.md) owns acquisition,
+revision-bound export/normalization, stable identities and provider absence
+checks. It supports GitHub code/collaboration, Drive Docs/Slides text exports,
+GCS and S3. Colony injects its credential/installation adapters and supplies
+PostgreSQL jobs, scheduling, private staging, access policy and hosted retention.
+The standalone `antfly-source sync` runtime uses the same providers and normalizer
+with a durable filesystem inventory and ownership journal; it needs no Colony or
+Cloud account. It can run from an external scheduler independently of grep.
+
+| Responsibility | Hosted runtime | Self-hosted runtime |
+| --- | --- | --- |
+| Connection/source management | Existing connection/import-job API/UI/CLI | Source profile or application API |
+| Secret resolution | Encrypted Cloud credentials/current installation access | Injected resolver; runner references environment variables |
+| Acquisition and canonical text | Shared sources module | Shared sources module |
+| Jobs/checkpoints/reconciliation | Colony jobs, staging and ownership ledger | Runner lock, pinned inventory and ownership journal |
+| Storage/query | Ordinary Antfly tables and query snapshots | Ordinary Antfly tables and query snapshots |
+| Search configuration | Ordinary catalog queries with Cloud session | Ordinary catalog queries or file export with table credentials |
+
+Grep owns catalog/profile loading, source aliases and selection, authentication
+adapters, exact matching and evidence evaluation. It does not own provider refresh
+secrets, background synchronization, or Cloud source-management state. A convenient
+indexing command delegates to the shared ingestion runtime rather than embedding
+a second connector/extraction pipeline into the search process.
+
+The durable searchable-source catalog lives in an ordinary Antfly table named
+`antfly_sources` by default (configurable for self-hosted profiles). It is shared
+infrastructure for hosted and self-hosted ingestion, not Cloud-specific storage or
+a new core database API. One version-1 `source_catalog` record per stable source
+ID contains its v2 search binding, provider kind, document version, published
+revision, readiness, freshness lease and explicit sharing metadata. It contains
+no credentials, provider selection/configuration, session readers or job checkpoints.
+
+The shared catalog writer verifies a snapshot-visible `syncing` record before
+content mutation and publishes `searchable` only after content and reconciliation
+are query-visible. Each standalone publication has a unique `published_revision`
+fence, also included in file-export bindings. After acquiring its first content
+snapshot, a self-hosted reader re-reads the current binding and requires the same
+searchable publication and unexpired lease before consuming any rows. A sync
+that starts before the snapshot therefore fails closed; a later sync can safely
+coexist with continuations on the already pinned snapshot. Cloud additionally
+checks current policy before execution and rechecks the job attempt/catalog
+publication after acquiring query snapshots, before releasing any response bytes.
+The selected query returns `X-Antfly-Source-Publication`; grep requires and pins it
+alongside the access proof, and sends it as a continuation precondition. Job
+attempt identity fences even a completed sync with an unchanged inventory.
+There is no cross-table transaction: interruption leaves a
+non-searchable record or a bounded prior lease, and retry repairs publication.
+Both ingestion runtimes use the shared canonical query barrier. It compares a
+canonical digest of version, URI, path, revision, indexing time, permissions and
+all metadata (including the content SHA), rather than treating a provider revision
+as the identity of normalized output. Metadata-only changes must be query-visible
+before publication. Cached GCS bytes are authorized against their selected
+`generation` with a matching generation precondition, never against the live
+replacement's ACL. S3 inventories likewise persist `version_id`; prefix listings
+resolve each selected entry with HEAD and reject an intervening ETag/size change.
+Downloads and cache authorization request the exact version (including literal
+`null`) and validate the returned version, ETag and size. Versionless legacy
+snapshots fail closed on versioned responses, even for identical replacement
+bytes; operators must enumerate a new snapshot. Unversioned objects retain
+conditional ETag/size checks. Cache authorization uses the GET content data plane,
+including SSE-KMS decryption, rather than metadata HEAD. It requests one byte for
+nonempty objects, validates the complete-object size from Content-Range, and uses
+an ordinary GET for empty objects. Ignored ranges still consume at most one byte.
+
+MCP trusted-principal tokens retain their broad read scope and add concrete
+`table_operations` write/admin grants for allowed application tables. Create/restore
+requests add their concrete destinations only after intersection with current
+Cloud grants and reservations. The signed `mcp_creation_discovery` hint exposes
+creation tools on empty instances without granting invocation authority. Reserved
+catalog/source tables receive no write grants. Wildcard writers use the current
+table catalog to bound the request's write scope; missing scope cannot become a
+wildcard grant. Older Antfly runtimes ignore the additive claim and retain only
+the read scope, so a mixed-version rollout fails closed.
+
+The ingestion runtime owns catalog writes. Server authentication and row policy
+control catalog visibility as well as content; sharing metadata is descriptive,
+not a grant. In Cloud, current connection/sharing/table policy overrides retained
+catalog rows and snapshots, and non-admin catalog mutations are blocked. The Cloud gateway rejects
+row-filtered lookups, scans, graph and artifact routes whose contracts cannot
+consume the injected security filter; those readers must use supported query
+routes. Drive Docs/Slides exports have unknown lengths: staging enforces each
+export's byte ceiling and charges actual bytes atomically with its checkpoint
+against the run budget, preserving the charge across retries. S3 canonical URIs
+escape each key path component while acquisition/ownership use the raw key;
+literal `%`, `?` and `#` characters never alter URI identity.
+
+`antfly-grep --source-endpoint URL --source NAME` reads the catalog through normal
+table queries with bounded snapshot pagination. `--source-table` selects a custom
+catalog table. Provider secrets are not needed by grep. Cloud applies current policy on these same table queries. PostgreSQL remains
+operational configuration/jobs, not a substitute for searchable catalog publication. File catalogs remain explicit exports/configuration.
+
+Portable file exports use catalog version 2, independently of table configuration,
+durable record and document versions. Files contain an absolute Antfly API
+`endpoint`, `sources` bindings and optional explicit reader hints. The
+[file schema](../../zig/pkg/antfly-grep/schema/sources-v2.json) contains no provider
+or query credentials. Both table-record discovery and file loading adapt to the
+same internal indexed-table configuration; a server never chooses a credential
+destination through a catalog record.
+
+Cloud grep gets its instance endpoint and short-lived data-plane credential from
+`antfly-cloud context --json`, then uses the same catalog/table query implementation
+as self-hosted grep. There is no `/cloud/v1/{instance}/sources` route. Catalog
+traversal uses the ordinary query snapshot and ID cursor, bounded independently of
+content search. Cloud returns `X-Antfly-Subject` and `X-Antfly-Catalog-Access` on
+catalog queries; continuation requests pin the policy digest and fail explicitly
+if visibility, effective table row policy or identity changes.
+
+Content and parent/asset projections use existing table queries with
+`X-Antfly-Source-ID`. The first successful selected-source query returns its
+`X-Antfly-Source-Access` policy proof. Grep pins it across all later pages and
+asset projections, including after token renewal. The proof binds current source
+sharing, principal/group context and effective row policy, not unrelated source
+sync state. Cloud checks current authorization and readiness on every request.
+These headers grant no authority and do not introduce a database endpoint.
+
+Cloud queries rely on gateway-enforced document ACLs. Grep does not consume or
+union a separately exposed Cloud reader list, avoiding stale client reader hints
+that could silently omit newly authorized rows. It accepts Cloud rows only after
+verifying the authenticated subject and policy response headers. Self-hosted/file
+catalogs retain the additional explicit local principal checks.
+
+Self-hosted deployments retain their normal Antfly authentication/row-policy
+boundary; catalogs and permission metadata cannot replace server authorization.
+
+Colony retains effective ACL normalization, group membership, private
+original/export/render storage, atomic publication and deletion/retention. The
+standalone text runner does not implement browser consent, provider-native ACL
+mirroring, distributed scheduling, binary/visual extraction or Cloud enrollment.
+Use separate tables/keys or a trusted row-policy gateway when self-hosting shared
+private content. Both runtimes keep provider, data-plane and inference credentials
+separate. Live-provider and visual qualification remain required before claiming
+all of #790's acceptance criteria.
 
 Drive stable file IDs survive moves. A source revision must bind the native
 provider version and exact exported bytes; derived pages/slides bind renderer
@@ -683,8 +815,8 @@ full-value CPU saving. Ordinary source delivery without expressions is a separat
 control: 24.92 ms CPU / 21.45 ms elapsed. General computed full-value delivery
 still incurs additional VM/JSON serialization work. This is not a universal
 speedup, zero-cost execution, a release throughput claim, or evidence for changing
-the document format. Reducing cold `_computed` serialization copies remains a
-measured future optimization; it must preserve strict JSON and expression semantics.
+the document format. The follow-up qualification below removes repeated
+`_computed` parsing and serialization while preserving strict JSON and expression semantics.
 
 The reproducible driver is `zig/e2e/antfly/bench_source_projection.py`; run with
 `--rounds 3 --queries-per-phase 5 --documents 8 --value-bytes 262144 --metadata-updates 2`. Raw reports and logs stay ignored under `output/`.
@@ -694,3 +826,62 @@ contracts, gateway suites, 353 Python query round trips, the Go SDK suite, and
 and multi-shard final-page evaluation, default/wildcard/exclusion source masks,
 NULL/missing, retained revisions, authorization and grouped image reads. Fixtures
 establish orchestration, not live-provider relevance or production Cloud ACL quality.
+
+
+### Projection review fixes and serialization follow-up (2026-10-26)
+
+The projection compiler now resolves aliases iteratively, counts depth across
+references, and evaluates requested aliases in dependency order without recursive
+VM entry. Array operands resolve against original positions before output masks;
+nested user keys such as `metadata._type` are accepted. Normalized local/worker
+responses validate completed outputs before restoring source-finalization
+receipts, so a source mask is applied once across both single- and multi-shard
+routes. The API wire shape remains unchanged and ASCH25 is unchanged.
+
+Computed output stays as validated JSON spans through worker decoding and final
+serialization. Native scalar reads parse their authenticated row views directly;
+growing encoding buffers use reclaimable scratch before exact output ownership.
+This removes repeated payload DOMs and unescaping/re-escaping. SQL semantics,
+lazy CASE, strict duplicate/malformed JSON rejection, original numeric lexemes,
+revision proofs and authorization remain enforced. See the shared
+[projection execution contract](logical-field-queries.md#projection-execution-and-ownership).
+
+The paired driver compared baseline `f8aae9f09f1a` with candidate `1fde63794362`
+on the same shared macOS ARM64 host (14 logical CPUs), using Debug builds, eight
+256 KiB target values, three alternating rounds and five reads per phase. Two
+metadata updates also verify unchanged-value identities. Mixed data includes
+escaped strings, Unicode, numbers, wide objects, opaque arrays and small values.
+The driver verifies result digests across variants and phases. Filesystem and
+storage caches are warm after ingestion; full delivery means a client identity
+miss, not a cold disk read. The candidate also includes the origin/main merge.
+
+| Workload | Full computed CPU, before → after | Full elapsed, before → after | Known-identity CPU, before → after |
+|---|---:|---:|---:|
+| Ascii | 100.50 → 59.87 ms | 91.72 → 55.57 ms | 6.49 → 7.02 ms |
+| Mixed | 110.77 → 68.26 ms | 99.45 → 61.87 ms | 11.14 → 11.66 ms |
+
+Full computed CPU decreased about 38–40%. Ordinary stored-source controls were
+20.48 → 21.81 ms CPU for ASCII and 22.86 → 23.39 ms for mixed data. Known-identity
+reads were about 0.5 ms slower in these runs. Full computed output still costs
+about 2.7–2.9 times ordinary source delivery; these results are not a universal
+speedup or a zero-cost claim.
+
+Process RSS was not consistently lower: full-phase medians were 336 → 378 MiB
+for ASCII and 284 → 285 MiB for mixed data. These whole-process, sampled figures
+include the main merge and background allocation/reclamation; they do not isolate
+this patch's allocation costs and are not allocation bounds. Production builds,
+other hosts and storage/cache conditions require separate qualification.
+
+Reproduce with `zig/e2e/antfly/bench_source_projection.py BINARY --baseline BASELINE
+--rounds 3 --queries-per-phase 5 --documents 8 --value-bytes 262144
+--metadata-updates 2 --output REPORT`; repeat with `--workload mixed`. Both
+executables should retain the name `antfly` for the native API fixture. Raw
+reports/logs remain ignored under `output/review-1263/`.
+
+Validation: 190 focused native query/worker contracts, the compiled native-array
+source regression, 293 CLI cases (two optional skips), 32 indexed native-server
+cases (eight optional profiling skips), 353 Python round trips, the Go SDK suite,
+and OpenAPI/specification/license-boundary checks. Native tests cover small/large
+array rows in one and two shards, nested underscore keys, rejected oversized alias
+depth, and a legal 64-alias chain. Fixtures establish behavior, not live-provider
+quality or an independent Linux hardware result.

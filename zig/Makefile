@@ -10,7 +10,7 @@ INFERENCE_BIN ?= ./zig-out/bin/antfly
 # Build
 # ====================================================================================
 
-.PHONY: build test unit-test antfly-unit-test
+.PHONY: build test unit-test unit-test-ownership-check antfly-unit-test
 
 build: ## Build the Antfly runtime; optional inference dependencies are provisioned explicitly.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly $(ZIG_BUILD_FLAGS)
@@ -20,7 +20,12 @@ test: ## Run the default Zig test aggregate with bounded scheduler memory.
 
 # PR CI uses reusable workflows from main: keep timings and disposable-cache
 # policy in the checked-out command so the PR can validate them before merge.
-unit-test: ## Run the existing repository unit gate across libraries, Antfly, and inference.
+# Catch label/rule drift before compiling the large aggregate. The fixture uses
+# the same compiler and production ownership rule, with a negative control.
+unit-test-ownership-check:
+	ZIG="$(ZIG)" python3 tools/test_local_test_partitions.py LocalTestPartitions.test_shared_root_name_preserves_single_execution
+
+unit-test: unit-test-ownership-check ## Run the existing repository unit gate across libraries, Antfly, and inference.
 	@unit_cache_flags=; \
 	build_args=($(ZIG_BUILD_FLAGS)); \
 	unit_cache_dir="$${ZIG_LOCAL_CACHE_DIR:-}"; \
@@ -79,8 +84,12 @@ tls-compat-check: ## Verify the checked-in Zig TLS compatibility patch has not d
 openapi-generate: mcp-schema-fragments-generate
 	$(ZIG) build regen-openapi $(ZIG_BUILD_FLAGS)
 
-openapi-check: mcp-schema-fragments-check
+openapi-check: memory-contracts-check mcp-schema-fragments-check
 	$(ZIG) build check-openapi $(ZIG_BUILD_FLAGS)
+
+.PHONY: memory-contracts-check
+memory-contracts-check:
+	$(SCRIPTS_PY) ../scripts/generate_memory_openapi.py --zig $(ZIG) --check
 
 mcp-schema-fragments-generate:
 	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py

@@ -70,14 +70,40 @@ pub const JsonSource = struct {
         var current = root;
         var parts = std.mem.splitScalar(u8, path, '.');
         while (parts.next()) |part| {
-            if (current != .object) return null;
-            current = current.object.get(part) orelse return null;
+            current = switch (current) {
+                .object => |object| object.get(part) orelse return null,
+                .array => |items| blk: {
+                    const index = std.fmt.parseInt(usize, part, 10) catch return null;
+                    if (index >= items.items.len) return null;
+                    break :blk items.items[index];
+                },
+                else => return null,
+            };
         }
         return current;
     }
+    fn resolve(a: A, root: V, path: []const u8, depth: usize) anyerror!?V {
+        if (depth >= 256) return error.DecisionLimitExceeded;
+        if (path.len == 0) return root;
+        const dot = std.mem.indexOfScalar(u8, path, '.') orelse path.len;
+        const head = path[0..dot];
+        const tail = if (dot < path.len) path[dot + 1 ..] else "";
+        return switch (root) {
+            .object => |object| if (object.get(head)) |value| try resolve(a, value, tail, depth + 1) else null,
+            .array => |array| blk: {
+                if (std.fmt.parseInt(usize, head, 10)) |index| {
+                    break :blk if (index < array.items.len) try resolve(a, array.items[index], tail, depth + 1) else null;
+                } else |_| {}
+                var values: std.ArrayList(V) = .empty;
+                for (array.items) |item| if (try resolve(a, item, path, depth + 1)) |value| try values.append(a, value);
+                break :blk if (values.items.len == 0) null else V{ .array = .fromOwnedSlice(a, try values.toOwnedSlice(a)) };
+            },
+            else => null,
+        };
+    }
     fn read(raw: *anyopaque, a: A, path: []const u8, kind: sql.ColumnRead) !sql.Datum {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        const value = if (std.mem.eql(u8, path, "_id")) V{ .string = self.id } else at(self.root, path);
+        const value = if (std.mem.eql(u8, path, "_id")) V{ .string = self.id } else try resolve(a, self.root, path, 0);
         return switch (kind) {
             .missing => sql.Datum.json(.{ .bool = value == null }),
             .identity => if (value) |present| sql.Datum.json(.{ .string = try a.dupe(u8, &(try @import("../common/value_identity.zig").identity(present))) }) else .{},
@@ -132,12 +158,13 @@ pub const Source = struct {
     read: *const fn (*anyopaque, A, []const u8, sql.ColumnRead) anyerror!sql.Datum,
 };
 const Dependency = union(enum) { field: []const u8, binding: usize };
-const Binding = struct { name: []const u8, expression: V, state: enum { unseen, visiting, ready } = .unseen, program: ?sql.Program = null, dependencies: []const Dependency = &.{} };
+const Binding = struct { name: []const u8, expression: V, state: enum { unseen, visiting, ready } = .unseen, program: ?sql.Program = null, dependencies: []const Dependency = &.{}, height: usize = 0 };
 pub const Plan = struct {
     arena: *std.heap.ArenaAllocator,
     source_fields: []const []const u8 = &.{},
     required_fields: std.StringHashMapUnmanaged(void) = .empty,
     bindings: []Binding = &.{},
+    evaluation_order: []const usize = &.{},
     parameters: std.ArrayList(V) = .empty,
     hints: std.ArrayList(?ast.ColumnType) = .empty,
     params: V = .null,
@@ -173,7 +200,51 @@ pub const Plan = struct {
         };
         self.source_fields = fields.items;
         self.bindings = bindings.items;
-        for (0..self.bindings.len) |i| try self.compileBinding(i);
+        // Resolve aliases before compiling expressions. This worklist never
+        // nests compiler frames through references, even for adversarial DAGs.
+        var edges: [64]u64 = @splat(0);
+        var visited: usize = 0;
+        for (self.bindings, 0..) |binding, i| {
+            var pending: std.ArrayList(V) = .empty;
+            try pending.append(a, binding.expression);
+            while (pending.pop()) |value| {
+                visited += 1;
+                if (visited > 65536) return error.DecisionLimitExceeded;
+                switch (value) {
+                    .array => |array| try pending.appendSlice(a, array.items),
+                    .object => |object| {
+                        // Literal JSON is data, including any nested ref keys.
+                        if (object.contains("literal")) continue;
+                        if (object.get("ref")) |name| {
+                            if (name != .string) return error.InvalidFunctionExpression;
+                            const target = for (self.bindings, 0..) |other, j| {
+                                if (std.mem.eql(u8, other.name, name.string)) break j;
+                            } else return error.UnknownFunctionBinding;
+                            edges[i] |= @as(u64, 1) << @intCast(target);
+                        }
+                        var members = object.iterator();
+                        while (members.next()) |member| try pending.append(a, member.value_ptr.*);
+                    },
+                    else => {},
+                }
+            }
+        }
+        var order: std.ArrayList(usize) = .empty;
+        var ready: u64 = 0;
+        var remaining = self.bindings.len;
+        while (remaining != 0) {
+            const before = remaining;
+            for (0..self.bindings.len) |i| {
+                const bit = @as(u64, 1) << @intCast(i);
+                if (ready & bit != 0 or edges[i] & ~ready != 0) continue;
+                try self.compileBinding(i);
+                try order.append(a, i);
+                ready |= bit;
+                remaining -= 1;
+            }
+            if (before == remaining) return error.CyclicFunctionBinding;
+        }
+        self.evaluation_order = order.items;
         return self;
     }
     pub fn deinit(self: *Plan) void {
@@ -196,6 +267,7 @@ pub const Plan = struct {
             error.OutOfMemory => return err,
             else => return error.InvalidFunctionExpression,
         };
+        self.bindings[index].height = compiler.height;
         self.bindings[index].dependencies = compiler.dependencies.items;
         self.bindings[index].state = .ready;
     }
@@ -207,6 +279,56 @@ pub const Plan = struct {
         for (self.bindings) |binding| if (!value.object.contains(binding.name)) return false;
         return true;
     }
+    /// Validate worker output and keep selected values as lexical spans. No
+    /// payload DOM, string unescaping/re-escaping, or numeric coercion is needed.
+    /// Receipts attest execution only, never source access or authorization.
+    pub fn wireOutput(self: *const Plan, a: A, bytes: []const u8, transport: bool) !?@import("antfly-json").RawObject {
+        const json = @import("antfly-json");
+        const Observer = struct {
+            plan: *const Plan,
+            writer: std.Io.Writer.Allocating,
+            transport: bool,
+            seen: u64 = 0,
+            matched: bool = false,
+            has_marker: bool = false,
+            count: usize = 0,
+            fn member(raw: *anyopaque, name: []const u8, value: []const u8) !void {
+                const ctx: *@This() = @ptrCast(@alignCast(raw));
+                if (std.mem.eql(u8, name, marker)) {
+                    ctx.has_marker = true;
+                    const fingerprint = try std.json.parseFromSlice(V, ctx.writer.allocator, value, .{});
+                    defer fingerprint.deinit();
+                    ctx.matched = fingerprint.value == .string and std.mem.eql(u8, fingerprint.value.string, &ctx.plan.fingerprint);
+                    if (!ctx.transport) return;
+                }
+                for (ctx.plan.bindings, 0..) |binding, i| if (std.mem.eql(u8, name, binding.name)) {
+                    ctx.seen |= @as(u64, 1) << @intCast(i);
+                };
+                if (!ctx.transport) {
+                    if (ctx.count != 0) try ctx.writer.writer.writeByte(',');
+                    try std.json.Stringify.value(name, .{}, &ctx.writer.writer);
+                    try ctx.writer.writer.writeByte(':');
+                    try ctx.writer.writer.writeAll(value);
+                    ctx.count += 1;
+                }
+            }
+        };
+        const scratch = @import("antfly_platform").allocator.reclaimingScratch(a);
+        var observer: Observer = .{ .plan = self, .writer = .init(scratch), .transport = transport };
+        defer observer.writer.deinit();
+        if (!transport) try observer.writer.writer.writeByte('{');
+        var scanner = json.Scanner.initCompleteInput(scratch, bytes);
+        defer scanner.deinit();
+        if (try scanner.peekNextTokenType() != .object_begin) return error.InvalidQueryResponse;
+        try json.scanValue(scratch, &scanner, bytes.len, .{ .ctx = &observer, .member_fn = Observer.member });
+        if (try scanner.next() != .end_of_document) return error.InvalidQueryResponse;
+        const expected = if (self.bindings.len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(self.bindings.len)) - 1;
+        if (observer.has_marker and (!observer.matched or observer.seen != expected)) return error.InvalidQueryResponse;
+        if (!observer.has_marker) return null;
+        if (transport) return .{ .bytes = bytes };
+        try observer.writer.writer.writeByte('}');
+        return .{ .bytes = try a.dupe(u8, observer.writer.written()) };
+    }
     pub fn evaluate(self: *const Plan, a: A, source: Source, previous: ?V, limits: sql.EvalLimits) !V {
         if (limits.checkpoint) |poll| try poll(limits.checkpoint_context);
         if (self.hasOutputs(previous)) return previous.?;
@@ -215,15 +337,19 @@ pub const Plan = struct {
         @memset(values, null);
         var row: Row = .{ .plan = self, .a = a, .source = source, .values = values, .limits = limits };
         var output: std.json.ObjectMap = if (previous) |value| if (value == .object) value.object else return error.InvalidQueryResponse else .empty;
+        for (self.bindings) |binding| if (output.contains(binding.name)) return error.InvalidQueryRequest;
         var output_bytes: usize = 0;
-        for (self.bindings, 0..) |binding, i| {
+        // Every binding is a requested output. Evaluate in dependency order so
+        // references only load memoized values, never recursively enter VMs.
+        for (self.evaluation_order) |i| {
             if (limits.checkpoint) |poll| try poll(limits.checkpoint_context);
-            if (output.contains(binding.name)) return error.InvalidQueryRequest;
             const value = try row.binding(i);
             output_bytes +|= try @import("../sql/operators.zig").datumBytes(value);
             if (output_bytes > limits.output_bytes) return error.DecisionLimitExceeded;
-            // SQL jsonb projection preserves present JSON null; absent source
-            // members become NULL only at the output boundary, not in the VM.
+        }
+        // Preserve the caller's alias order at the public output boundary.
+        for (self.bindings, 0..) |binding, i| {
+            const value = row.values[i].?;
             try output.put(a, binding.name, binding.program.?.resultJson(a, value, limits) catch |err| return scalarFailure(err));
         }
         try output.put(a, marker, .{ .string = try a.dupe(u8, &self.fingerprint) });
@@ -232,6 +358,7 @@ pub const Plan = struct {
 };
 const Compiler = struct {
     plan: *Plan,
+    height: usize = 0,
     columns: std.ArrayList(sql.Column) = .empty,
     dependencies: std.ArrayList(Dependency) = .empty,
     fn node(self: *@This(), value: ast.Scalar) !*const ast.Scalar {
@@ -263,6 +390,7 @@ const Compiler = struct {
     fn expression(self: *@This(), value: V, depth: usize) anyerror!*const ast.Scalar {
         self.plan.nodes += 1;
         if (depth >= 64 or self.plan.nodes > 8192) return error.DecisionLimitExceeded;
+        self.height = @max(self.height, depth + 1);
         if (value != .object) return error.InvalidFunctionExpression;
         const object = value.object;
         if (object.get("literal")) |literal| {
@@ -285,7 +413,10 @@ const Compiler = struct {
         if (object.get("ref")) |name| {
             if (object.count() != 1 or name != .string) return error.InvalidFunctionExpression;
             for (self.plan.bindings, 0..) |binding, i| if (std.mem.eql(u8, binding.name, name.string)) {
-                try self.plan.compileBinding(i);
+                std.debug.assert(self.plan.bindings[i].state == .ready);
+                const height = depth + 1 + self.plan.bindings[i].height;
+                if (height > 64) return error.DecisionLimitExceeded;
+                self.height = @max(self.height, height);
                 return self.column(.{ .binding = i }, self.plan.bindings[i].program.?.output_type);
             };
             return error.UnknownFunctionBinding;
@@ -331,7 +462,9 @@ pub fn validPath(path: []const u8) bool {
     if (std.mem.eql(u8, path, "_id")) return true;
     if (path.len == 0 or path.len > 1024 or std.mem.indexOfAny(u8, path, "*?[]\x00") != null) return false;
     var parts = std.mem.splitScalar(u8, path, '.');
-    while (parts.next()) |part| if (part.len == 0 or part[0] == '_' or part[0] == '-') return false;
+    const root = parts.next().?;
+    if (root.len == 0 or root[0] == '_' or root[0] == '-') return false;
+    while (parts.next()) |part| if (part.len == 0) return false;
     return true;
 }
 const Row = struct {
@@ -349,7 +482,7 @@ const Row = struct {
             return switch (dependency) {
                 .field => |path| self.row.source.read(self.row.source.context, self.row.a, path, kind),
                 .binding => |index| blk: {
-                    const value = try self.row.binding(index);
+                    const value = self.row.values[index] orelse return error.InvalidQueryResponse;
                     break :blk switch (kind) {
                         .value => value,
                         .missing => sql.Datum.json(.{ .bool = value.missing }),
@@ -474,4 +607,81 @@ test "api query contract projection owns its compilation under allocation failur
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "api query contract projection bounds dependency depth before recursive compilation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fields: std.ArrayList(V) = .empty;
+    for (0..64) |i| {
+        var expr = try std.json.parseFromSliceLeaky(V, a, if (i == 63) "{\"literal\":1}" else try std.fmt.allocPrint(a, "{{\"ref\":\"x{d}\"}}", .{i + 1}), .{});
+        for (0..40) |_| {
+            var branch: std.json.ObjectMap = .empty;
+            try branch.put(a, "when", try std.json.parseFromSliceLeaky(V, a, "{\"literal\":true}", .{}));
+            try branch.put(a, "then", expr);
+            var branches: std.ArrayList(V) = .empty;
+            try branches.append(a, .{ .object = branch });
+            var object: std.json.ObjectMap = .empty;
+            try object.put(a, "case", .{ .array = .fromOwnedSlice(a, try branches.toOwnedSlice(a)) });
+            expr = .{ .object = object };
+        }
+        var field: std.json.ObjectMap = .empty;
+        try field.put(a, "name", .{ .string = try std.fmt.allocPrint(a, "x{d}", .{i}) });
+        try field.put(a, "expression", expr);
+        try fields.append(a, .{ .object = field });
+    }
+    try std.testing.expectError(error.DecisionLimitExceeded, Plan.init(std.testing.allocator, .{ .fields = fields.items }));
+    // The maximum legal alias chain remains usable and evaluates once per
+    // binding; unrelated literal JSON never creates graph dependencies.
+    fields.clearRetainingCapacity();
+    for (0..64) |i| {
+        var field: std.json.ObjectMap = .empty;
+        try field.put(a, "name", .{ .string = try std.fmt.allocPrint(a, "x{d}", .{i}) });
+        try field.put(a, "expression", try std.json.parseFromSliceLeaky(V, a, if (i == 63) "{\"literal\":1}" else try std.fmt.allocPrint(a, "{{\"ref\":\"x{d}\"}}", .{i + 1}), .{}));
+        try fields.append(a, .{ .object = field });
+    }
+    var chain = try Plan.init(std.testing.allocator, .{ .fields = fields.items });
+    defer chain.deinit();
+    var source: JsonSource = .{ .id = "x", .root = .null };
+    const values = try chain.evaluate(a, source.source(), null, .{});
+    try std.testing.expectEqual(@as(i64, 1), values.object.get("x0").?.integer);
+    // Literal JSON with a ref member is data, not a dependency edge.
+    var literal = try decode(std.testing.allocator, "{\"fields\":[{\"name\":\"x\",\"expression\":{\"literal\":{\"ref\":\"x\"}}}]}");
+    defer literal.deinit();
+}
+
+test "api query contract projection resolves original array indexes and nested user keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source: JsonSource = .{ .id = "x", .root = try std.json.parseFromSliceLeaky(V, a, "{\"arr\":[{\"n\":1},{\"n\":2}],\"metadata\":{\"_type\":\"image\"}}", .{}) };
+    const value = try source.source().read(&source, a, "arr.1.n", .value);
+    try std.testing.expectEqual(@as(i64, 2), value.value.integer);
+    try std.testing.expect(!(try source.source().read(&source, a, "arr.1.n", .missing)).value.bool);
+    try std.testing.expect((try source.source().read(&source, a, "arr.9.n", .missing)).value.bool);
+    const all = try source.source().read(&source, a, "arr.n", .value);
+    try std.testing.expectEqual(@as(usize, 2), all.value.array.items.len);
+    try std.testing.expect(validPath("metadata._type"));
+    try std.testing.expect(!validPath("_private.n"));
+}
+
+test "api query contract projection wire spans validate receipts and preserve lexical values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plan = try decode(std.testing.allocator, "{\"fields\":[{\"name\":\"n\",\"expression\":{\"literal\":1}}]}");
+    defer plan.deinit();
+    const bytes = try std.fmt.allocPrint(a, "{{\"n\":9007199254740993,\"extra\":\"quote\\\"\\n\\u03bb\",\"{s}\":\"{s}\"}}", .{ marker, plan.fingerprint });
+    const public = (try plan.wireOutput(a, bytes, false)).?;
+    try std.testing.expect(std.mem.indexOf(u8, public.bytes, "9007199254740993") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public.bytes, "\\u03bb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public.bytes, marker) == null);
+    const transport = (try plan.wireOutput(a, bytes, true)).?;
+    try std.testing.expect(transport.bytes.ptr == bytes.ptr);
+    try std.testing.expectError(error.InvalidQueryResponse, plan.wireOutput(a, "{\"__antfly_projection\":\"wrong\"}", false));
+    const missing = try std.fmt.allocPrint(a, "{{\"{s}\":\"{s}\"}}", .{ marker, plan.fingerprint });
+    try std.testing.expectError(error.InvalidQueryResponse, plan.wireOutput(a, missing, false));
+    try std.testing.expect((try plan.wireOutput(a, "{\"unrelated\":true}", false)) == null);
+    try std.testing.expectError(error.DuplicateField, plan.wireOutput(a, "{\"n\":1,\"n\":2}", false));
 }

@@ -18,6 +18,8 @@ const Allocator = std.mem.Allocator;
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const doc_set = @import("doc_set.zig");
+const ExecutionControl = @import("../../search/execution_control.zig").ExecutionControl;
+const roaring = @import("../../encoding/roaring.zig");
 const namespace_contract = @import("doc_identity_namespace.zig");
 
 pub const DocOrdinal = doc_set.DocOrdinal;
@@ -1616,6 +1618,16 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
     store: *docstore_mod.DocStore,
     generation: ?u64,
 ) !?doc_set.ResolvedDocSet {
+    return visiblePrimaryDocSetIfCompleteFromStoreAllocControlled(alloc, store, generation, .{});
+}
+
+pub fn visiblePrimaryDocSetIfCompleteFromStoreAllocControlled(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    generation: ?u64,
+    control: ExecutionControl,
+) !?doc_set.ResolvedDocSet {
+    try control.check();
     // Three bulk range scans joined through hash maps instead of two LSM point
     // lookups per document. Intermediate state lives in one arena.
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -1624,10 +1636,14 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
 
     const StatesScan = struct {
         arena: Allocator,
+        control: ExecutionControl,
+        scanned: usize = 0,
         states: std.AutoHashMapUnmanaged(DocOrdinal, OrdinalState) = .empty,
 
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (state.scanned % 256 == 0) try state.control.check();
+            state.scanned += 1;
             const ordinal = internal_keys.parseIdentityOrdinalKey(key, internal_keys.identity_ordinal_state_kind) orelse return .@"continue";
             const ordinal_state = decodeOrdinalState(value) catch return .@"continue";
             try state.states.put(state.arena, ordinal, ordinal_state);
@@ -1636,15 +1652,19 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
     };
     const state_lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_state_kind };
     const state_upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_state_kind + 1 };
-    var states_scan = StatesScan{ .arena = arena };
+    var states_scan = StatesScan{ .arena = arena, .control = control };
     try store.scanWithContext(state_lower[0..], state_upper[0..], .{}, &states_scan, StatesScan.scanEntry);
 
     const OrdinalsScan = struct {
         arena: Allocator,
+        control: ExecutionControl,
+        scanned: usize = 0,
         ordinals_by_doc: std.StringHashMapUnmanaged(DocOrdinal) = .empty,
 
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (state.scanned % 256 == 0) try state.control.check();
+            state.scanned += 1;
             if (value.len != @sizeOf(u32)) return error.InvalidDocIdentity;
             const ordinal = std.mem.readInt(u32, value[0..4], .big);
             const doc_id = try parseIdentityDocToOrdinalKeyAlloc(state.arena, key);
@@ -1654,7 +1674,7 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
     };
     const doc_lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind };
     const doc_upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind + 1 };
-    var ordinals_scan = OrdinalsScan{ .arena = arena };
+    var ordinals_scan = OrdinalsScan{ .arena = arena, .control = control };
     try store.scanWithContext(doc_lower[0..], doc_upper[0..], .{}, &ordinals_scan, OrdinalsScan.scanEntry);
 
     // Drive off the primary documents so the result keeps the original
@@ -1663,15 +1683,19 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
     // makes the whole derivation inconclusive (null).
     const PrimaryScan = struct {
         arena: Allocator,
+        control: ExecutionControl,
+        scanned: usize = 0,
         ordinals_by_doc: *const std.StringHashMapUnmanaged(DocOrdinal),
         states: *const std.AutoHashMapUnmanaged(DocOrdinal, OrdinalState),
         generation: ?u64,
-        ordinals: std.ArrayListUnmanaged(DocOrdinal) = .empty,
+        ordinals: roaring.RoaringBitmap,
         inconclusive: bool = false,
 
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             _ = value;
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (state.scanned % 256 == 0) try state.control.check();
+            state.scanned += 1;
             const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.arena, key)) orelse return .@"continue";
             const ordinal = state.ordinals_by_doc.get(doc_id) orelse {
                 state.inconclusive = true;
@@ -1686,7 +1710,7 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
                 state.inconclusive = true;
                 return .stop;
             }
-            try state.ordinals.append(state.arena, ordinal);
+            try state.ordinals.add(ordinal);
             return .@"continue";
         }
     };
@@ -1694,14 +1718,20 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
     const upper = [_]u8{internal_keys.user_namespace + 1};
     var primary_scan = PrimaryScan{
         .arena = arena,
+        .control = control,
+        .ordinals = roaring.RoaringBitmap.init(alloc),
         .ordinals_by_doc = &ordinals_scan.ordinals_by_doc,
         .states = &states_scan.states,
         .generation = generation,
     };
+    errdefer primary_scan.ordinals.deinit();
     try store.scanWithContext(lower[0..], upper[0..], .{}, &primary_scan, PrimaryScan.scanEntry);
-    if (primary_scan.inconclusive) return null;
-
-    return try doc_set.fromOrdinalsAlloc(alloc, primary_scan.ordinals.items);
+    try control.check();
+    if (primary_scan.inconclusive) {
+        primary_scan.ordinals.deinit();
+        return null;
+    }
+    return .{ .ordinal_bitmap = primary_scan.ordinals };
 }
 
 pub const default_max_nonvisible_doc_set_entries: usize = 65536;
@@ -4546,4 +4576,45 @@ test "namespace reassignment initializes an empty owner's live directory atomica
     try reassignNamespaceAlloc(alloc, &store, replacement);
     try std.testing.expectEqualDeep(replacement, (try loadNamespaceFromStore(&store)).?);
     try validateStoreAlloc(alloc, &store);
+}
+
+test "controlled live primary scans cancel within each phase and recover without leaks" {
+    const mem_backend = @import("../mem_backend.zig");
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const docs = try arena.allocator().alloc([]const u8, 1024);
+    for (docs, 0..) |*doc, i| doc.* = try std.fmt.allocPrint(arena.allocator(), "doc:{d}", .{i});
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(a, &writes);
+    try appendBatchIdentityMetadataAlloc(a, &store, 0, 0, 10, &writes, docs, &.{}, null);
+    for (docs) |doc| try appendPrimaryDocWrite(a, &writes, doc);
+    try store.putBatchWithReplay(null, writes.items, &.{}, null);
+    const Cancel = struct {
+        remaining: usize,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return error.Canceled;
+            self.remaining -= 1;
+        }
+    };
+    // Entry + four checks per 1024-row scan: interrupt states, doc mapping,
+    // then primary rows after partial output allocation respectively.
+    for ([_]usize{ 2, 6, 10 }) |budget| {
+        var cancel: Cancel = .{ .remaining = budget };
+        try std.testing.expectError(error.Canceled, visiblePrimaryDocSetIfCompleteFromStoreAllocControlled(a, &store, 10, .{
+            .cancellation = .{ .ptr = &cancel, .check_fn = Cancel.check },
+        }));
+        try std.testing.expectEqual(@as(usize, 0), cancel.remaining);
+    }
+    try std.testing.expectError(error.Timeout, visiblePrimaryDocSetIfCompleteFromStoreAllocControlled(a, &store, 10, .{ .deadline_ns = 0 }));
+    var result = (try visiblePrimaryDocSetIfCompleteFromStoreAllocControlled(a, &store, 10, .{})).?;
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(?usize, docs.len), result.estimatedCardinality());
 }

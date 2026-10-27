@@ -86,11 +86,11 @@ const PageWarm = struct {
         self.count += 1;
     }
     pub fn record(_: *PageWarm, _: []const u8, _: []const u8) !void {}
-    fn read(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, _: u64, length: usize, _: [32]u8, token: Token, budget: *u64) ![]u8 {
+    fn read(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: [32]u8, token: Token, budget: *u64) ![]u8 {
         const self: *PageWarm = @ptrCast(@alignCast(raw));
         try self.cached.context.ensureActive();
         try stores.chargeReadBudget(budget, length);
-        return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
     }
     fn run(self: *PageWarm) anyerror!void {
         try self.cached.context.ensureActive();
@@ -217,19 +217,29 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     } else publication.declarations;
     var roots: [max_pages]Navigation = undefined;
     var count: usize = 0;
+    if (publication.row_identity) |ref| {
+        const identity = try @import("lake_row_identity.zig").load(state.arena.allocator(), store.artifactStore(), ref, token, cached);
+        var identity_pages = @import("lake_row_identity.zig").dependencies(identity);
+        identity_roots: while (identity_pages.next()) |page| {
+            for (roots[0..count]) |prior| if (std.mem.eql(u8, &prior.domain, &identity.domain) and prior.ref.eql(page)) continue :identity_roots;
+            if (count == roots.len) break;
+            roots[count] = .{ .domain = identity.domain, .ref = page };
+            count += 1;
+        }
+    }
     for (declarations) |declaration| {
         try context.ensureActive();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const sa = arena.allocator();
         var domain: [32]u8 = undefined;
-        var selected: [10]?tree.Ref = @splat(null);
+        var selected: [11]?tree.Ref = @splat(null);
         if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == @import("lake_index_native_text.zig").metadata_version) {
             const metadata = try @import("lake_index_decoded_metadata.zig").acquire(@import("lake_index_native_text.zig").Directory, cached, store.artifactStore(), declaration.artifact, token, @import("lake_index_native_text.zig").loadDirectory);
             defer metadata.release();
             const root = metadata.value.root;
             domain = root.domain;
-            selected = .{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.segments, root.directories.files, root.serving_routes, root.segment_files, root.source_routes, root.tie_bounds };
+            selected = .{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.ordered, root.directories.segments, root.directories.files, root.serving_routes, root.segment_files, root.source_routes, root.tie_bounds };
         } else if (declaration.artifact.kind == .ordered_row_index) {
             const root = try @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, token, cached);
             domain = root.domain;

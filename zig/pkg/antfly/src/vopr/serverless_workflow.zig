@@ -1156,12 +1156,15 @@ test "serverless workflow service rates compose and heal across publish and comp
 }
 
 test "complete serverless workflow VOPR exact replays claim build compact publish and recovery" {
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     const backend_ids = vopr.vopr_io.artifactBackendIds();
     for (Scenario.mode_ids) |mode_id| {
         var scripted = vopr.choice.Scripted{ .selections = &.{mode_id} };
         var recorded = try vopr.runner.run(
             Scenario,
-            std.testing.allocator,
+            alloc,
             scripted.source(),
             .{
                 .system = "antfly",
@@ -1175,7 +1178,7 @@ test "complete serverless workflow VOPR exact replays claim build compact publis
         defer recorded.deinit();
         try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
         for (0..10) |_| {
-            var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
+            var replayed = try vopr.replay.exact(Scenario, alloc, &recorded);
             replayed.deinit();
         }
     }

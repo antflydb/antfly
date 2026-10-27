@@ -20,10 +20,17 @@ const std = @import("std");
 const source_owner = @import("../embedded/source_owner.zig");
 const paths = @import("source_paths.zig");
 const support = @import("test_support.zig");
+const runtime_memory = @import("../../pkg/antfly/build/runtime_memory.zig");
 
 var processed: std.AutoHashMapUnmanaged(*std.Build.Step.Run, void) = .empty;
 var expanded_audits: std.AutoHashMapUnmanaged(*std.Build.Step.Run, void) = .empty;
 var partitions: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, *std.Build.Step.Compile) = .empty;
+var memory_profiles: std.AutoHashMapUnmanaged(*std.Build, runtime_memory.TestPartitionProfile) = .empty;
+
+/// Set before source-owner finalization; dependency builds keep their own profile.
+pub fn setMemoryProfile(b: *std.Build, profile: runtime_memory.TestPartitionProfile) void {
+    memory_profiles.put(b.allocator, b, profile) catch @panic("OOM");
+}
 
 fn testObject(artifact: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     if (artifact.kind == .@"test" or artifact.kind == .test_obj) return artifact;
@@ -211,7 +218,18 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
 fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     const tests = testObject(executable) orelse return null;
     const max_rss = if (tests.step.max_rss != 0) tests.step.max_rss else executable.step.max_rss;
-    const partition_max_rss = if (max_rss >= 12 * 1024 * 1024 * 1024 and max_rss < 14 * 1024 * 1024 * 1024) 14 * 1024 * 1024 * 1024 else max_rss;
+    // A consumer's reservation is not evidence for its physical partition.
+    // Apply independently measured partition claims only to qualified profiles;
+    // other configurations keep the inherited floor and stable labels.
+    const partition_name = b.fmt("{s}-local", .{tests.name});
+    const partition_max_rss = runtime_memory.testPartitionCompileMaxRss(
+        partition_name,
+        b.graph.host.result,
+        tests.root_module.resolved_target.?.result,
+        tests.root_module.optimize,
+        if (max_rss >= 12 * 1024 * 1024 * 1024 and max_rss < 14 * 1024 * 1024 * 1024) 14 * 1024 * 1024 * 1024 else max_rss,
+        memory_profiles.get(b) orelse .{},
+    );
     if (partitions.get(tests)) |existing| {
         if (existing.step.max_rss == 0) existing.step.max_rss = partition_max_rss;
         return existing;
@@ -236,7 +254,7 @@ fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Ste
         }
     }
     const artifact = b.addTest(.{
-        .name = b.fmt("{s}-local", .{tests.name}),
+        .name = partition_name,
         .root_module = root,
         .filters = tests.filters,
         .max_rss = partition_max_rss,

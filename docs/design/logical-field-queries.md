@@ -241,6 +241,19 @@ For example, a logical text source with one sortable keyword view is exposed as:
 }
 ```
 
+For a sortable field that intentionally includes missing or null values, set
+`"missing_null_policy": "nulls_ordered"` in its `x-antfly-field` mapping (or
+sortable exact subfield). Ascending order places those values first; descending
+order places them last. Responses include JSON `null` in the corresponding
+`_sort` component; pass the tuple unchanged to `search_after` or
+`search_before`. For lake queries, include the returned `remote_snapshot` token
+to retain the same publication while paging. The default `missing_rejected` continues to reject native sorting
+and null cursors for fields with live missing/null values. Nullable native
+acceleration requires producer-verified layout completeness for that field; a
+declared `index_sort` publishes this proof during refresh. Older unverified
+sparse layouts must be rebuilt before using it. Count and aggregate semantics for
+missing values do not change.
+
 MCP raw-query discovery exposes the same `execution.value_verification` budgets and
 `remote_snapshot` cursor control as REST. Sequential `hierarchy.children`
 traversal accepts its retained snapshot token and rejects value-search policy,
@@ -889,3 +902,37 @@ Authorization and query membership precede delivery. See [the grep design](antfl
 for limits, worker transport, verified-image reuse and gateway batching. The
 unreleased `source_projection` / `_source_projection` API is replaced by this
 shared expression surface. No on-disk document format migration is required.
+
+### Projection execution and ownership
+
+Projection admission resolves alias dependencies with a bounded, iterative
+worklist. Cycles are rejected before compilation. The 64-level expression limit
+includes referenced expressions, rather than resetting at each alias; each
+binding is compiled once. Requested outputs evaluate in dependency order with
+memoized row values, so aliases never recursively enter scalar VMs. Public alias
+order is preserved, and lazy CASE still avoids reading untaken operands.
+
+Dotted scalar field paths support numeric array indexes (`items.1.name`) and
+array traversal (`items.name`, collecting present values). They resolve against
+the original source positions, before output masks compact arrays. Internal
+field restrictions apply at the root; nested user keys such as `metadata._type`
+remain accessible. `fields` and `select` are independent: adding a computed
+constant must not change the selected `_source`.
+
+Native scalar reads parse authenticated range views directly. Row-scoped values
+remain pinned until the row retires, borrowing input where the parser supports it. A local source-finalization receipt identifies the exact
+masked byte allocation, preventing a second mask application. Normalized query
+responses cannot copy this pointer receipt: hydration and final serialization
+re-establish it only after validating the request-bound execution fingerprint
+and all selected outputs. Validation happens before source masking, and the
+prepared computed output is reused during serialization. Existing retained
+revision and authorization proofs remain mandatory.
+
+Computed results retain validated JSON spans through worker hydration and final
+HTTP encoding. This avoids repeated DOM construction, unescaping/re-escaping and
+numeric conversion. Duplicate keys, malformed JSON and incomplete or mismatched
+execution receipts fail closed. Public encoding strips the private execution
+marker while preserving selected value lexemes. Growing serialization buffers
+use independently reclaimable scratch (preserving quota wrappers); only exact
+result bytes remain in the response owner. The public JSON shape stays
+`_computed: object`; the raw representation is an internal Zig wire optimization.

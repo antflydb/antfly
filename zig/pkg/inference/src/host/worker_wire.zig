@@ -17,12 +17,12 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 5;
+pub const version: u32 = 6;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
 pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8 };
-pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache };
+pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache, document_store };
 pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = "" };
 pub const Event = struct {
     kind: enum { progress, stream_start, stream_write, stream_close },
@@ -175,6 +175,7 @@ pub const AttachmentRef = struct {
     page_number: ?u32,
 };
 pub const Provider = struct {
+    document_store: ?[16]u8 = null,
     operation: c_int,
     deadline_ns: ?u64,
     numeric: bool,
@@ -266,6 +267,7 @@ pub const ProviderOutput = struct {
 };
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Http = struct {
+    document_store: ?[16]u8 = null,
     streaming_body: bool = false,
     route: []const u8,
     method: http.HttpMethod,
@@ -274,7 +276,16 @@ pub const Http = struct {
     headers: []const Header,
     params: []const Header,
     has_body: bool,
+    stream_body: bool = false,
 };
+
+pub const native_checkpoint_upload_limit: usize = 2 * 1024 * 1024 * 1024 + 2 * 1024 * 1024 + 128;
+
+pub fn nativeCheckpointResume(method: http.HttpMethod, path: []const u8) bool {
+    return method == .post and (std.mem.eql(u8, path, bridge.ai_api_prefix ++ "/generate/context/resume") or
+        std.mem.eql(u8, path, bridge.public_api_prefix ++ "/generate/context/resume"));
+}
+
 pub const HttpResponse = struct { status: u16, headers: []const Header };
 pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmounts };
 pub const Observation = struct { key: usize, previous: u64, next: u64 };
@@ -393,4 +404,15 @@ fn checkNumericRoundTrip(alloc: std.mem.Allocator) !void {
 
 test "inference worker typed numeric responses preserve ownership under allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkNumericRoundTrip, .{});
+}
+
+pub const DocumentStoreRequest = struct { capability: [16]u8, metadata: []const u8 };
+test "native checkpoint worker streaming stays limited to exact POST resume routes" {
+    inline for (.{ bridge.ai_api_prefix, bridge.public_api_prefix }) |prefix| {
+        try std.testing.expect(nativeCheckpointResume(.post, prefix ++ "/generate/context/resume"));
+        try std.testing.expect(!nativeCheckpointResume(.get, prefix ++ "/generate/context/resume"));
+        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/resume/"));
+        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/checkpoint"));
+        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/chat/completions"));
+    }
 }

@@ -1148,6 +1148,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
     errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
+    var policy_schema: storage_schema.TableSchema = .{ .full_text_documents = full_text_documents };
+    try bindTextProjectionPolicies(alloc, &policy_schema, schema);
 
     const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
     errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
@@ -1170,13 +1172,23 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     // Reject unsupported key types/collations before the metadata API accepts
     // a schema, using the same compiler as physical index publication.
-    if (schema.relational_indexes != null) {
+    const logical_keys = if (schema.external_base_source) |source| source.binding.row_identity else null;
+    if (schema.relational_indexes != null or logical_keys != null) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const index_schema = storage_schema.TableSchema{ .version = schema.version, .storage_mode = .relational, .relational_columns = relational_columns };
         var layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, index_schema);
         defer layout.deinit();
-        for ((try schema.relationalIndexDefinitions(arena.allocator())).?) |definition| {
+        if (logical_keys) |adapter| {
+            const keys = try arena.allocator().alloc(@import("../storage/relational_index.zig").RelationalIndexKey, adapter.key_columns.len);
+            for (adapter.key_columns, keys) |column, *key| key.* = .{ .column = column };
+            var tuple = @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, index_schema, &layout, keys) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidSchemaUpdateRequest,
+            };
+            tuple.deinit();
+        }
+        for ((try schema.relationalIndexDefinitions(arena.allocator())) orelse &.{}) |definition| {
             var tuple = @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, index_schema, &layout, definition.keys) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidSchemaUpdateRequest,
@@ -1391,6 +1403,26 @@ fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.Dyn
             .analyzer = try alloc.dupe(u8, template.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
         },
     };
+}
+
+pub fn bindTextProjectionPolicies(alloc: std.mem.Allocator, runtime: *storage_schema.TableSchema, schema: ParsedTableSchema) !void {
+    if (runtime.full_text_documents.len <= 1) return;
+    for (@constCast(runtime.full_text_documents)) |*document| {
+        if (document.physical_exact_fields != null) continue;
+        const declaration = for (schema.document_schemas) |candidate| {
+            if (std.mem.eql(u8, candidate.name, document.name)) break candidate;
+        } else return error.InvalidSchemaUpdateRequest;
+        var fields: std.ArrayListUnmanaged(storage_schema.ExactField) = .empty;
+        errdefer {
+            freeRuntimeExactFieldItems(alloc, fields.items);
+            fields.deinit(alloc);
+        }
+        var paths: std.StringHashMapUnmanaged(usize) = .empty;
+        defer paths.deinit(alloc);
+        try appendRuntimeDocumentSchemaExactFields(alloc, &fields, &paths, declaration);
+        std.mem.sort(storage_schema.ExactField, fields.items, {}, exactFieldLessThan);
+        document.physical_exact_fields = try fields.toOwnedSlice(alloc);
+    }
 }
 
 fn deriveRuntimeExactDocumentFields(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.ExactField {
@@ -1881,6 +1913,7 @@ fn defaultDynamicTemplateAnalyzer(field_type: storage_schema.AntflyType) []const
 fn freeRuntimeFullTextDocuments(alloc: std.mem.Allocator, docs: []storage_schema.FullTextDocument) void {
     for (docs) |doc| {
         alloc.free(doc.name);
+        if (doc.physical_exact_fields) |fields| freeRuntimeExactFields(alloc, @constCast(fields));
         for (doc.fields) |field| {
             alloc.free(field.path);
             alloc.free(field.emitted_name);
@@ -3351,4 +3384,20 @@ test "external lake schema binding survives durable serialization and preserves 
     const text_schema = try storage_schema.deserializeSchema(alloc, projection);
     defer storage_schema.freeSchema(alloc, text_schema);
     try std.testing.expect(text_schema.external_base_source == null);
+}
+
+test "external lake logical key adapters validate native typed schema columns" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "id", "missing", "payload" }, 0..) |key, ordinal| {
+        const json = try std.fmt.allocPrint(a,
+            \\{{"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","row_identity":{{"key_columns":["{s}"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"integer"}},"payload":{{"type":"object"}}}},"additionalProperties":false}}}}}}}}
+        , .{key});
+        defer a.free(json);
+        var parsed = try parseValidatedTableSchema(a, json);
+        defer parsed.deinit(a);
+        if (ordinal == 0) {
+            const runtime = try deriveRuntimeTableSchema(a, parsed);
+            @import("../storage/schema.zig").freeSchema(a, runtime);
+        } else try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(a, parsed));
+    }
 }

@@ -22,6 +22,8 @@ pub const object_storage = embedded.object_storage;
 pub const lsm_backend = embedded.lsm_backend;
 pub const storage_backend = embedded.storage_backend;
 pub const db_types = embedded.db_types;
+pub const memory = embedded.memory;
+pub const memory_engine = embedded.memory_engine;
 
 test "pkg antfly embedded root compiles" {
     _ = db;
@@ -31,6 +33,8 @@ test "pkg antfly embedded root compiles" {
     _ = lsm_backend;
     _ = storage_backend;
     _ = db_types;
+    _ = memory.Service;
+    _ = memory_engine.Routed;
     _ = db.Capabilities;
     _ = db.InferenceOpenOptions;
     _ = db.InferenceStatus;

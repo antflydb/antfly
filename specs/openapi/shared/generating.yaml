@@ -10,8 +10,11 @@ components:
     GeneratorProvider:
       type: string
       enum:
+        - cloudflare
         - gemini
         - vertex
+        - bedrock
+        - anthropic
         - ollama
         - openai
         - chatgpt
@@ -25,8 +28,11 @@ components:
         A unified configuration for a generative AI provider.
       allOf:
         - oneOf:
+            - $ref: "#/components/schemas/CloudflareGeneratorConfig"
             - $ref: "#/components/schemas/GoogleGeneratorConfig"
             - $ref: "#/components/schemas/VertexGeneratorConfig"
+            - $ref: "#/components/schemas/BedrockGeneratorConfig"
+            - $ref: "#/components/schemas/AnthropicGeneratorConfig"
             - $ref: "#/components/schemas/OllamaGeneratorConfig"
             - $ref: "#/components/schemas/AntflyGeneratorConfig"
             - $ref: "#/components/schemas/ChatGPTGeneratorConfig"
@@ -34,6 +40,12 @@ components:
             - $ref: "#/components/schemas/OpenRouterGeneratorConfig"
             - $ref: "#/components/schemas/AppleGeneratorConfig"
         - properties:
+            max_image_input_tokens:
+              x-go-type-skip-optional-pointer: false
+              type: integer
+              format: int64
+              minimum: 1
+              description: Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
             rate_limit:
               x-go-type-skip-optional-pointer: false
               $ref: "./provider.yaml#/components/schemas/RateLimitConfig"
@@ -298,6 +310,10 @@ components:
             - function
         function:
           $ref: "#/components/schemas/ToolCallFunction"
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider tool metadata, including Google thought signatures. Preserve it unchanged when replaying assistant tool calls.
 
     ToolCallFunction:
       type: object
@@ -319,6 +335,10 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         role:
           $ref: "#/components/schemas/ChatMessageRole"
         content:
@@ -334,6 +354,54 @@ components:
         name:
           type: string
           description: "Optional tool name for tool messages when model templates need it."
+
+    CloudflareGeneratorConfig:
+      type: object
+      description: Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum: [cloudflare]
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        frequency_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+        presence_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+      required: [provider, account_id, model]
 
     GoogleGeneratorConfig:
       type: object
@@ -583,15 +651,27 @@ components:
     BedrockGeneratorConfig:
       type: object
       description: |
-        Configuration for the AWS Bedrock generative AI provider.
+        AWS Bedrock Converse generation, including image inputs and tools for
+        models that support them. Uses the AWS default credential chain unless
+        an explicit Bedrock API key is configured. Image capability is declared
+        per target through inference_capabilities; model IDs are not allowlisted.
       properties:
+        provider:
+          type: string
+          enum: [bedrock]
+        url:
+          type: string
+          description: Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint.
+        api_key:
+          type: string
+          description: Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests and the default credential chain.
         model:
           type: string
           description: "The Bedrock model ID to use."
           example: "anthropic.claude-sonnet-4-5-20250929-v1:0"
         region:
           type: string
-          description: "The AWS region for the Bedrock service."
+          description: AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
         temperature:
           type: number
           format: float
@@ -607,10 +687,8 @@ components:
           description: "Nucleus sampling parameter."
           minimum: 0.0
           maximum: 1.0
-        top_k:
-          type: integer
-          description: "Top-k sampling parameter."
       required:
+        - provider
         - model
 
     AnthropicGeneratorConfig:
@@ -618,6 +696,12 @@ components:
       description: |
         Configuration for the Anthropic generative AI provider.
       properties:
+        provider:
+          type: string
+          enum: [anthropic]
+        workspace_id:
+          type: string
+          description: Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
         model:
           type: string
           description: "The full model ID of the Anthropic model to use."
@@ -626,11 +710,11 @@ components:
         api_key:
           type: string
           writeOnly: true
-          description: "The Anthropic API key."
+          description: "Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY."
         url:
           type: string
           format: uri
-          description: "The URL of the Anthropic API endpoint."
+          description: "Messages API base URL. Defaults to https://api.anthropic.com/v1."
         temperature:
           type: number
           format: float
@@ -650,6 +734,7 @@ components:
           type: integer
           description: "Top-k sampling parameter."
       required:
+        - provider
         - model
 
     CohereGeneratorConfig:

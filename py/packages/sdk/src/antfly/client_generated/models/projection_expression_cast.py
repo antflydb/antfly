@@ -31,7 +31,9 @@ class ProjectionExpressionCast:
             Untaken CASE branches do not load fields or evaluate erroring calls.
             Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
             is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
-            Expressions are limited to depth 64 and 8192 nodes per request.
+            Expressions are limited to depth 64 including referenced aliases, and
+            8192 nodes per request. Alias dependencies are acyclic; each alias is a
+            requested output and is evaluated once per row.
     """
 
     type_: ProjectionExpressionCastType

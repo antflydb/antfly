@@ -2872,6 +2872,8 @@ pub const SparseIndex = struct {
         max_segments: usize = 128,
         scratch: ?@import("../spill_sort.zig").Options = null,
         background_publication: bool = false,
+        size_tiered: bool = false,
+        exact_forward_weights: bool = false,
     };
 
     pub const SegmentCompactionSource = struct {
@@ -2902,6 +2904,7 @@ pub const SparseIndex = struct {
         snapshot: ?backend_erased.ReadTxn = null,
         scratch: ?@import("../spill_sort.zig").Options = null,
         generation: ?u64 = null,
+        exact_forward_weights: bool = false,
         // The maintenance owner pins the store lifecycle; this copy remains
         // stable if the IndexManager's sparse entry array moves during apply.
         store: ?backend_erased.Store = null,
@@ -2999,6 +3002,27 @@ pub const SparseIndex = struct {
         var snapshot_transferred = false;
         defer if (!snapshot_transferred) txn.abort();
 
+        // Geometric tiers avoid rewriting the historical base for every small
+        // append. Only compact a pressured cohort of similarly sized roots.
+        var preferred: [2]?usize = .{ null, null };
+        if (options.size_tiered) for ([_]u8{ key_segment, key_docmap_segment }, 0..) |tag, kind| {
+            var sizes: [32]usize = @splat(0);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var next = try cursor.seekAtOrAfter(&.{tag});
+            while (next) |entry| {
+                if (entry.key.len == 0 or entry.key[0] != tag) break;
+                sizes[try compactionTier(entry.value, kind == 1)] += 1;
+                next = try cursor.next();
+            }
+            for (sizes, 0..) |count, tier| if (count >= min_segments) {
+                preferred[kind] = tier;
+                break;
+            };
+        };
+        if (options.size_tiered and preferred[0] == null and preferred[1] == null) return null;
+        if (options.exact_forward_weights and options.scratch == null) return error.InvalidSparseSegment;
+
         // Preflight borrows immutable source bytes; reserve before any source
         // clone, hash table, decoded posting array or captured ID allocation.
         var preflight_bytes: u64 = 0;
@@ -3010,6 +3034,10 @@ pub const SparseIndex = struct {
             var entry_opt = try preflight.seekAtOrAfter(&prefix);
             while (entry_opt) |entry| {
                 if (entry.key.len == 0 or entry.key[0] != tag) break;
+                if (options.size_tiered and (preferred[kind] == null or try compactionTier(entry.value, kind == 1) != preferred[kind].?)) {
+                    entry_opt = try preflight.next();
+                    continue;
+                }
                 const bytes = if (options.scratch != null and try immutableVersion(entry.value) == SEGMENT_FORMAT_VERSION)
                     @as(u64, entry.value.len) * 4 + posting_pages.max_block_bytes + 256 * 1024
                 else
@@ -3035,6 +3063,10 @@ pub const SparseIndex = struct {
         var maybe_segment = try cur.seekAtOrAfter(taggedPrefix(key_segment));
         while (maybe_segment) |entry| {
             if (entry.key.len == 0 or entry.key[0] != key_segment) break;
+            if (options.size_tiered and (preferred[0] == null or try compactionTier(entry.value, false) != preferred[0].?)) {
+                maybe_segment = try cur.next();
+                continue;
+            }
             const id = segmentIdFromKey(entry.key) orelse return error.InvalidSparseSegment;
             const data = try alloc.dupe(u8, entry.value);
             var transferred = false;
@@ -3061,6 +3093,10 @@ pub const SparseIndex = struct {
         while (maybe_docmap) |entry| {
             if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
             if (entry.key.len != 9) return error.InvalidSparseDocMapSegment;
+            if (options.size_tiered and (preferred[1] == null or try compactionTier(entry.value, true) != preferred[1].?)) {
+                maybe_docmap = try docmap_cur.next();
+                continue;
+            }
             const id = std.mem.readInt(u64, entry.key[1..9], .big);
             const data = try alloc.dupe(u8, entry.value);
             var transferred = false;
@@ -3103,10 +3139,81 @@ pub const SparseIndex = struct {
             .generation = generation,
             .store = self.store,
             .scratch = options.scratch,
+            .exact_forward_weights = options.exact_forward_weights,
             .sources = owned_sources,
             .docmaps = owned_docmaps,
             .buffer_reservation = reservation,
         };
+    }
+
+    fn compactionTier(data: []const u8, docmap: bool) !usize {
+        const bytes: u64 = if (docmap and pagedDocMap(data)) @as(u64, std.mem.readInt(u32, data[12..16], .little)) * 128 else if (!docmap and posting_pages.paged(data)) try posting_pages.materializedSize(data) else data.len;
+        return @min(31, std.math.log2_int(u64, @max(1, bytes / (64 * 1024))) / 2);
+    }
+    /// Rebuild each selected posting from its exact retained forward vector.
+    /// One bounded external sort orders (term, ordinal); repeated compactions
+    /// never feed dequantized weights into another quantization generation.
+    fn compactExactForwardWeights(alloc: Allocator, task: *SegmentCompactionTask, builder: *posting_pages.Builder, chunk_size: usize) !u64 {
+        const sort_mod = @import("../spill_sort.zig");
+        var sorter = try sort_mod.Sorter.init(alloc, task.scratch orelse return error.InvalidSparseSegment);
+        defer sorter.deinit();
+        const txn = &task.snapshot.?;
+        for (task.sources) |source| {
+            const count = if (source.proofs) |disk| disk.count() else source.incarnations.len;
+            for (0..count) |i| {
+                if (task.scratch.?.cancellation) |token| try token.check();
+                const captured: CapturedIncarnation = if (source.proofs) |disk| blk: {
+                    const entry = try disk.at(i);
+                    break :blk .{ .doc_num = entry.doc_num, .epoch = entry.epoch, .live = entry.live };
+                } else source.incarnations[i];
+                if (!captured.live) continue;
+                var reverse: [9]u8 = undefined;
+                const id = try txn.get(revKey(&reverse, captured.doc_num));
+                var key: [256]u8 = undefined;
+                const forward_key = try fwdKeyWithScratch(alloc, &key, id);
+                defer if (forward_key.ptr != &key) alloc.free(forward_key);
+                const forward = txn.get(forward_key) catch |err| switch (err) {
+                    error.NotFound => (try locatedForwardBytes(alloc, txn, id)) orelse return error.InvalidSparseDocMapSegment,
+                    else => return err,
+                };
+                const vector = try decodeFwdEntry(alloc, forward);
+                defer alloc.free(vector.term_ids);
+                defer alloc.free(vector.weights);
+                if (vector.doc_num != captured.doc_num) return error.InvalidSparseDocMapSegment;
+                for (vector.term_ids, vector.weights) |term, weight| {
+                    var payload: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &payload, @bitCast(weight), .little);
+                    try sorter.add((@as(u64, term) << 32) | captured.doc_num, &payload);
+                }
+            }
+        }
+        const range = try sorter.finish() orelse return 0;
+        var cursor = sort_mod.Cursor.init(alloc, sorter.run, range);
+        defer cursor.deinit();
+        var chunk: std.ArrayListUnmanaged(BulkPosting) = .empty;
+        defer chunk.deinit(alloc);
+        var previous: ?u64 = null;
+        var previous_weight: u32 = 0;
+        var count: u64 = 0;
+        while (try cursor.next()) |entry| {
+            if (entry.payload.len != 4) return error.InvalidSparseSegment;
+            const bits = std.mem.readInt(u32, entry.payload[0..4], .little);
+            if (previous != null and previous.? == entry.key) {
+                if (bits != previous_weight) return error.InvalidSparseSegment;
+                continue;
+            }
+            const term: u32 = @intCast(entry.key >> 32);
+            if (chunk.items.len != 0 and (chunk.items[0].term_id != term or chunk.items.len >= chunk_size)) {
+                try appendCompactionBlock(alloc, builder, chunk.items);
+                chunk.clearRetainingCapacity();
+            }
+            try chunk.append(alloc, .{ .term_id = term, .doc_num = @truncate(entry.key), .weight = @bitCast(bits), .doc_id = "" });
+            previous = entry.key;
+            previous_weight = bits;
+            count += 1;
+        }
+        if (chunk.items.len != 0) try appendCompactionBlock(alloc, builder, chunk.items);
+        return count;
     }
 
     pub fn executeSegmentCompactionTask(
@@ -3154,7 +3261,9 @@ pub const SparseIndex = struct {
         defer chunk.deinit(alloc);
         const output_chunk_size = @min(@max(1, chunk_size), 65536);
         var posting_count: u64 = 0;
-        while (true) {
+        if (task.exact_forward_weights) {
+            posting_count = try compactExactForwardWeights(alloc, task, &builder, output_chunk_size);
+        } else while (true) {
             var term: ?u32 = null;
             for (term_heads) |head| if (head) |entry| {
                 const candidate = std.mem.readInt(u32, entry[0..4], .little);
@@ -8283,6 +8392,11 @@ test "sparse streamed compaction keeps input pages pinned across competing publi
 }
 
 test "sparse streamed compaction releases snapshots blocks and scratch on allocation failures" {
+    // Fault injection and leak checks stay enabled; per-allocation stack
+    // unwinding is unrelated to the ownership contract exercised below.
+    var checked_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked_allocator.deinit() != 0) @panic("sparse allocation fixture leaked allocations");
+    const a = checked_allocator.allocator();
     const Probe = struct {
         var nonce: u64 = 0;
         fn random(_: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
@@ -8290,7 +8404,7 @@ test "sparse streamed compaction releases snapshots blocks and scratch on alloca
             std.mem.writeInt(u64, bytes[0..8], nonce, .little);
             nonce += 1;
         }
-        fn run(output: Allocator) !void {
+        fn run(output: Allocator, fixture: Allocator) !void {
             // Private scratch filenames must repeat across fault-injection
             // runs: random formatting lengths change allocator growth counts.
             nonce = 0;
@@ -8298,14 +8412,14 @@ test "sparse streamed compaction releases snapshots blocks and scratch on alloca
             var vtable = io.vtable.*;
             vtable.randomSecure = random;
             io.vtable = &vtable;
-            const a = std.testing.allocator;
-            var index = try SparseIndex.open(a, "unused", .{ .backend = .mem, .chunk_size = 1 });
+            const fixture_alloc = fixture;
+            var index = try SparseIndex.open(fixture_alloc, "unused", .{ .backend = .mem, .chunk_size = 1 });
             defer index.close();
             const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
             try index.batchWithOptions(&.{.{ .doc_id = "a", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 2, -3 } } }}, &.{}, bulk);
             try index.batchWithOptions(&.{.{ .doc_id = "b", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 5, -7 } } }}, &.{}, bulk);
-            var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = io, .directory = "/tmp" } })).?;
-            defer task.deinit(a);
+            var task = (try index.beginSegmentCompactionTask(fixture_alloc, .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = io, .directory = "/tmp" } })).?;
+            defer task.deinit(fixture_alloc);
             var result = try SparseIndex.executeSegmentCompactionTask(output, &task, 1);
             defer result.deinit(output);
             try std.testing.expect(task.snapshot == null);
@@ -8314,12 +8428,12 @@ test "sparse streamed compaction releases snapshots blocks and scratch on alloca
     };
     // Force grow/copy allocation paths instead of address-dependent in-place
     // remaps, so each fault index denotes the same allocation on every run.
-    var vtable = std.testing.allocator.vtable.*;
+    var vtable = a.vtable.*;
     vtable.resize = Allocator.noResize;
     vtable.remap = Allocator.noRemap;
-    const backing: Allocator = .{ .ptr = std.testing.allocator.ptr, .vtable = &vtable };
-    try Probe.run(backing);
-    try std.testing.checkAllAllocationFailures(backing, Probe.run, .{});
+    const backing: Allocator = .{ .ptr = a.ptr, .vtable = &vtable };
+    try Probe.run(backing, a);
+    try std.testing.checkAllAllocationFailures(backing, Probe.run, .{a});
 }
 
 test "sparse staged generations hide partial output recover intents and retain old readers" {
@@ -8473,7 +8587,12 @@ test "sparse physical translation borrows one map block instead of retaining poi
 }
 
 test "sparse background directory pages stage routes before activation and reclaim abandoned output" {
-    const a = std.testing.allocator;
+    // This allocation-heavy paging fixture tests ownership and routing, not
+    // stack unwinding. Keep canaries and leak checks without capturing a stack
+    // for each temporary cursor/page allocation.
+    var checked_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked_allocator.deinit() != 0) @panic("sparse directory fixture leaked allocations");
+    const a = checked_allocator.allocator();
     var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
     defer index.close();
     var terms: [130]u32 = undefined;
@@ -8531,12 +8650,19 @@ test "sparse background directory pages stage routes before activation and recla
 }
 
 test "sparse locator refresh stops after a generation retires between bounded batches" {
-    const a = std.testing.allocator;
+    // Retain checked ownership across the full 257-record retirement race
+    // without collecting a diagnostic stack for every temporary allocation.
+    var checked_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked_allocator.deinit() != 0) @panic("sparse locator fixture leaked allocations");
+    const a = checked_allocator.allocator();
     var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
     defer index.close();
     const vector: SparseVector = .{ .indices = &.{1}, .values = &.{2} };
-    var ids: [512][16]u8 = undefined;
-    var writes: [512]SparseWrite = undefined;
+    // One complete 256-record refresh quantum plus one record is enough to
+    // prove retirement between batches. A second full quantum only repeats
+    // corpus construction and locator verification without another boundary.
+    var ids: [257][16]u8 = undefined;
+    var writes: [257]SparseWrite = undefined;
     for (&writes, &ids, 0..) |*write, *id, i| write.* = .{ .doc_id = try std.fmt.bufPrint(id, "doc-{d:0>4}", .{i}), .vec = vector };
     const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
     try index.batchWithOptions(writes[0..256], &.{}, bulk);
@@ -8550,6 +8676,7 @@ test "sparse locator refresh stops after a generation retires between bounded ba
     try index.batchWithOptions(&.{.{ .doc_id = "later", .vec = vector }}, &.{}, bulk);
     const Gate = struct {
         index: *SparseIndex,
+        alloc: Allocator,
         enters: usize = 0,
         leaves: usize = 0,
         fn enter(raw: *anyopaque) !void {
@@ -8557,23 +8684,23 @@ test "sparse locator refresh stops after a generation retires between bounded ba
             self.enters += 1;
             // A competing compaction fully installs the newer locators after
             // the first 256 old records have been refreshed.
-            if (self.enters == 2) try std.testing.expect(try self.index.compactSegmentsWithOptions(std.testing.allocator, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } }));
+            if (self.enters == 2) try std.testing.expect(try self.index.compactSegmentsWithOptions(self.alloc, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } }));
         }
         fn leave(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.leaves += 1;
         }
     };
-    var gate: Gate = .{ .index = &index };
+    var gate: Gate = .{ .index = &index, .alloc = a };
     try SparseIndex.completeSegmentCompactionTask(a, &task, &result, .{ .ptr = &gate, .enter = Gate.enter, .leave = Gate.leave });
     try std.testing.expectEqual(@as(usize, 2), gate.enters);
     try std.testing.expectEqual(gate.enters, gate.leaves);
     var read = try index.beginReadTxn();
     defer read.abort();
     for (writes) |write| {
-        const locator = (try readLocator(std.testing.allocator, &read, write.doc_id)).?;
+        const locator = (try readLocator(a, &read, write.doc_id)).?;
         try std.testing.expect(locator.segment != result.generation.?);
-        try std.testing.expect((try locatedForwardBytes(std.testing.allocator, &read, write.doc_id)) != null);
+        try std.testing.expect((try locatedForwardBytes(a, &read, write.doc_id)) != null);
     }
 }
 

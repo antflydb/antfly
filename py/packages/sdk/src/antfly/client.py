@@ -5,6 +5,7 @@ import json
 import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, TypeAlias, cast
 from urllib.parse import quote
 
@@ -46,11 +47,15 @@ from antfly.client_generated.models import (
     GraphTraverseQuery,
     IndexMaintenanceRequest,
     IndexMaintenanceResponse,
+    InferenceContextPrepareRequest,
+    InferenceContextPrepareResponse,
     InferenceDecideRequest,
     InferenceDecideResponse,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
+    InferenceReadRequest,
+    InferenceReadResponse,
     OllamaEmbedderConfig,
     OpenAIEmbedderConfig,
     QueryResponses,
@@ -67,7 +72,7 @@ from antfly.client_generated.models import (
 from antfly.client_generated.models import (
     EmbedderProvider as EmbedderProvider,
 )
-from antfly.client_generated.types import UNSET
+from antfly.client_generated.types import UNSET, Unset
 
 from .exceptions import (
     AntflyException,
@@ -79,6 +84,7 @@ from .exceptions import (
 from .graph_queries import require_graph_identifier as _require_graph_identifier
 from .graph_results import decode_query_responses
 from .index_config import validate_create_index_request_relationships
+from .native_kv import NativeKvCheckpoint
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
@@ -398,16 +404,16 @@ def _validate_extraction_v2_response(payload: dict[str, Any], request: dict[str,
         raise ValueError("version 2 response has an invalid schema version")
     if not isinstance(payload.get("model"), str) or payload["model"] != request.get("model"):
         raise ValueError("version 2 response model does not match the request")
-    inputs = request.get("inputs", [])
+    inputs = request.get("inputs", request.get("documents"))
     rows = payload.get("data")
-    if not isinstance(rows, list) or len(rows) != len(inputs):
+    if not isinstance(rows, list) or (inputs is not None and len(rows) != len(inputs)):
         raise ValueError("version 2 response has an invalid item cardinality")
-    for index, (item, row) in enumerate(zip(inputs, rows, strict=True)):
+    for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise ValueError(f"version 2 response item {index} must be an object")
         if "id" in row and not isinstance(row["id"], str):
             raise ValueError(f"version 2 response item {index} id must be a string")
-        if row.get("id") != item.get("id"):
+        if inputs is not None and row.get("id") != inputs[index].get("id"):
             raise ValueError(f"version 2 response item {index} id does not match the request")
 
 
@@ -521,20 +527,50 @@ def _iter_sse_frames(response: Response) -> Iterator[tuple[str, str]]:
         yield event, "\n".join(data)
 
 
-def _iter_generation_chunks(response: Response) -> Iterator[InferenceGenerateChunk]:
+def _iter_generation_chunks(
+    response: Response, *, request: InferenceGenerateRequest | None = None
+) -> Iterator[InferenceGenerateChunk]:
+    saw_context_attestation = False
     for event, data in _iter_sse_frames(response):
         if event == "error":
             raise AntflyException(f"generation stream failed: {data}")
         if data.strip() == "[DONE]":
+            if request is not None and not saw_context_attestation:
+                raise AntflyException("generation server did not attest the requested context policy")
             return
         try:
             payload = json.loads(data)
             if not isinstance(payload, dict):
                 raise ValueError("event data must be a JSON object")
-            yield InferenceGenerateChunk.from_dict(payload)
+            chunk = InferenceGenerateChunk.from_dict(payload)
+            if chunk.context is not UNSET:
+                if request is not None:
+                    _validate_context_attestation(request, chunk.context)
+                saw_context_attestation = True
+            elif request is not None and not saw_context_attestation and chunk.choices:
+                raise AntflyException("generation server emitted content before attesting the requested context policy")
+            yield chunk
         except (KeyError, TypeError, ValueError) as exc:
             raise AntflyException(f"generation stream returned invalid JSON: {exc}") from exc
     raise AntflyException("generation stream ended before [DONE]")
+
+
+def _managed_generation(request: InferenceGenerateRequest) -> bool:
+    return not isinstance(request.context_management, Unset) or not isinstance(request.kv_cache, Unset)
+
+
+def _validate_context_attestation(request: InferenceGenerateRequest, diagnostics: Any) -> None:
+    if not isinstance(request.context_management, Unset):
+        if diagnostics.policy.value != request.context_management.mode.value:
+            raise AntflyException("generation server attested a different context policy")
+        if request.context_management.checkpoint is not UNSET and not diagnostics.checkpoint_applied:
+            raise AntflyException("generation server did not attest the requested checkpoint")
+    if not isinstance(request.kv_cache, Unset):
+        if diagnostics.kv_cache_mode is UNSET or diagnostics.kv_cache_mode.value != request.kv_cache.mode.value:
+            raise AntflyException("generation server attested a different KV cache policy")
+        expected_version = "v1" if isinstance(request.kv_cache.version, Unset) else request.kv_cache.version.value
+        if diagnostics.kv_cache_version is UNSET or diagnostics.kv_cache_version.value != expected_version:
+            raise AntflyException("generation server attested a different KV cache version")
 
 
 def _iter_chunk_embeddings(
@@ -794,6 +830,9 @@ class AntflyClient:
                 timeout=Timeout(timeout),
                 httpx_args=httpx_args,
             )
+        from .memory import MemoryOperations
+
+        self.memory = MemoryOperations(self)
         self.indexes = IndexOperations(self)
         from .resolvers import CurationProposalOperations, EntityOperations, ResolverOperations
 
@@ -955,6 +994,25 @@ class AntflyClient:
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 raise AntflyException(f"decision returned invalid JSON: {exc}") from exc
 
+    def read(self, request: InferenceReadRequest | Mapping[str, Any]) -> InferenceReadResponse:
+        """Read images or complete documents with a registered reader/composite."""
+        body = request.to_dict() if isinstance(request, InferenceReadRequest) else dict(request)
+        with self._client.get_httpx_client().stream(
+            "POST", "/ai/v1/read", json=body, headers={"Accept": "application/json"}
+        ) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                _raise_inference_error(response)
+            raw, truncated = _read_limited_response(response, self.max_json_response_bytes)
+            if truncated:
+                raise AntflyException(f"read response exceeded {self.max_json_response_bytes} bytes")
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict) or payload.get("object") != "list":
+                    raise ValueError("response must be a canonical read list")
+                return InferenceReadResponse.from_dict(payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise AntflyException(f"read returned invalid JSON: {exc}") from exc
+
     def extract(
         self, request: ExtractionRequest | GeneratedExtractionRequest | Mapping[str, Any]
     ) -> ExtractionResponse:
@@ -1015,9 +1073,35 @@ class AntflyClient:
                 payload = json.loads(raw)
                 if not isinstance(payload, dict):
                     raise ValueError("response must be a JSON object")
-                return InferenceGenerateResponse.from_dict(payload)
+                result = InferenceGenerateResponse.from_dict(payload)
+                if _managed_generation(request) and result.context is UNSET:
+                    raise AntflyException("generation server did not attest the requested context policy")
+                if result.context is not UNSET:
+                    _validate_context_attestation(request, result.context)
+                return result
             except (KeyError, TypeError, ValueError) as exc:
                 raise AntflyException(f"generation returned invalid JSON: {exc}") from exc
+
+    def prepare_chat_context(self, request: InferenceContextPrepareRequest) -> InferenceContextPrepareResponse:
+        """Inspect, window, or compact chat context using the server's declared capabilities."""
+        with self._client.get_httpx_client().stream(
+            "POST",
+            "/ai/v1/generate/context/prepare",
+            json=request.to_dict(),
+            headers={"Accept": "application/json"},
+        ) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                _raise_inference_error(response)
+            raw, truncated = _read_limited_response(response, MAX_GENERATION_RESPONSE_BYTES)
+            if truncated:
+                raise AntflyException(f"context preparation response exceeded {MAX_GENERATION_RESPONSE_BYTES} bytes")
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError("response must be a JSON object")
+                return InferenceContextPrepareResponse.from_dict(payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise AntflyException(f"context preparation returned invalid JSON: {exc}") from exc
 
     @contextmanager
     def generate_stream(self, request: InferenceGenerateRequest) -> Iterator[Iterator[InferenceGenerateChunk]]:
@@ -1035,6 +1119,96 @@ class AntflyClient:
             content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
             if content_type != "text/event-stream":
                 raise AntflyException(f"generation stream returned content type {content_type!r}")
+            yield _iter_generation_chunks(
+                response,
+                request=request if _managed_generation(request) else None,
+            )
+
+    def prepare_native_kv_checkpoint(
+        self, request: InferenceGenerateRequest, destination: str | Path, *, encoding: str = "f16"
+    ) -> NativeKvCheckpoint:
+        """Stream a same-model KV checkpoint to disk and publish it atomically.
+
+        The client timeout must cover prompt ingestion and compaction. An
+        unchanged fallback is reported in the returned metadata. Failed or
+        truncated transfers leave an existing destination intact.
+        """
+        from .native_kv import CHUNK_BYTES, CONTENT_TYPE, ChunkReader, receive_checkpoint
+
+        if encoding not in ("f32", "f16", "fp8", "rotated4"):
+            raise ValueError("checkpoint encoding must be f32, f16, fp8, or rotated4")
+
+        body = request.to_dict()
+        body["stream"] = False
+        with self._client.get_httpx_client().stream(
+            "POST",
+            "/ai/v1/generate/context/checkpoint",
+            json=body,
+            headers={"Accept": CONTENT_TYPE, "X-Antfly-KV-Encoding": encoding},
+            follow_redirects=False,
+        ) as response:
+            if response.status_code != 200:
+                _raise_inference_error(response)
+            content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+            if content_type != CONTENT_TYPE:
+                raise AntflyException(f"checkpoint export returned content type {content_type!r}")
+            try:
+                return receive_checkpoint(ChunkReader(response.iter_bytes(CHUNK_BYTES)), destination, request.model)
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise AntflyException(f"invalid or incomplete checkpoint export: {exc}") from exc
+
+    @contextmanager
+    def _native_kv_resume_response(
+        self, request: InferenceGenerateRequest, checkpoint: str | Path | NativeKvCheckpoint, *, stream: bool
+    ) -> Iterator[Response]:
+        from .native_kv import CONTENT_TYPE, checkpoint_upload
+
+        path = checkpoint.path if isinstance(checkpoint, NativeKvCheckpoint) else Path(checkpoint)
+        body = request.to_dict()
+        body["stream"] = stream
+        try:
+            with path.open("rb") as source:
+                length, chunks = checkpoint_upload(source, body)
+                with self._client.get_httpx_client().stream(
+                    "POST",
+                    "/ai/v1/generate/context/resume",
+                    content=chunks,
+                    headers={
+                        "Content-Type": CONTENT_TYPE,
+                        "Content-Length": str(length),
+                        "Accept": "text/event-stream" if stream else "application/json",
+                    },
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code != 200:
+                        _raise_inference_error(response)
+                    expected = "text/event-stream" if stream else "application/json"
+                    content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+                    if content_type != expected:
+                        raise AntflyException(f"checkpoint resume returned content type {content_type!r}")
+                    yield response
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise AntflyException(f"invalid or incomplete checkpoint resume: {exc}") from exc
+
+    def resume_native_kv_checkpoint(
+        self, request: InferenceGenerateRequest, checkpoint: str | Path | NativeKvCheckpoint
+    ) -> InferenceGenerateResponse:
+        """Resume using full messages whose rendered tokens extend the saved prefix."""
+        with self._native_kv_resume_response(request, checkpoint, stream=False) as response:
+            raw, truncated = _read_limited_response(response, MAX_GENERATION_RESPONSE_BYTES)
+            if truncated:
+                raise AntflyException(f"generation response exceeded {MAX_GENERATION_RESPONSE_BYTES} bytes")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise AntflyException("checkpoint resume must return a JSON object")
+            return InferenceGenerateResponse.from_dict(payload)
+
+    @contextmanager
+    def resume_native_kv_checkpoint_stream(
+        self, request: InferenceGenerateRequest, checkpoint: str | Path | NativeKvCheckpoint
+    ) -> Iterator[Iterator[InferenceGenerateChunk]]:
+        """Stream a continuation; leaving the context closes the response and file."""
+        with self._native_kv_resume_response(request, checkpoint, stream=True) as response:
             yield _iter_generation_chunks(response)
 
     def chunk_and_embed(self, request: Mapping[str, Any]) -> ChunkEmbeddingResponse:

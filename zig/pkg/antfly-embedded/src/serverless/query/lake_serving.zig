@@ -382,6 +382,48 @@ pub const ServingSource = struct {
         }
     };
 
+    /// Query-owned translation for one verified, publication-bound index cut.
+    /// Parallel views borrow it until they have joined their parent source.
+    /// Operation-owned allowance shared by optional coordinate conversions.
+    /// Required execution retains its own admission and remaining read reserve.
+    pub const TranslationAllowance = struct {
+        remaining_rows: u64 = 4096,
+        remaining_reads: u64 = 16 * 1024 * 1024,
+        required_reserve: u64 = 32 * 1024 * 1024,
+    };
+    /// Publication-bound public-ID traversal, returning coordinates in the
+    /// bound index space. The caller owns the cursor and each bounded tile.
+    pub const PublicRowsCursor = struct {
+        /// Exclusive cursor and inclusive competitive endpoint in public-ID
+        /// order. Both must belong to the pinned publication's identity domain.
+        pub const Range = struct { reverse: bool = false, cursor: ?[]const u8 = null, stop_at: ?[]const u8 = null };
+        pub const Batch = struct { rows: []const @import("../../storage/rowsource/types.zig").RowRef, scanned: usize, exhausted: bool };
+        next: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror!Batch,
+        ptr: *anyopaque,
+        close: *const fn (*anyopaque) void,
+    };
+    pub const RowResolver = struct {
+        ptr: *anyopaque,
+        source: []const u8,
+        snapshot: []const u8,
+        current_source: []const u8,
+        current_snapshot: []const u8,
+        rows: u64,
+        from_index: *const fn (*anyopaque, std.mem.Allocator, @import("../../storage/rowsource/types.zig").RowRef) anyerror!@import("../../storage/rowsource/types.zig").RowRef,
+        to_index: *const fn (*anyopaque, std.mem.Allocator, @import("../../storage/rowsource/types.zig").RowRef) anyerror!@import("../../storage/rowsource/types.zig").RowRef,
+        file: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?[]const u8,
+        digest: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]const u8,
+        tie_rank: *const fn (*anyopaque, std.mem.Allocator, @import("../../storage/rowsource/types.zig").RowRef) anyerror!u64,
+        tie_ranks: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, []u64) anyerror!void = null,
+        translate_many: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
+        translate_many_bounded: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool, *TranslationAllowance) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
+        bind_index: ?*const fn (*anyopaque, []const u8) anyerror!RowResolver = null,
+        open_public_rows: ?*const fn (*anyopaque, std.mem.Allocator, PublicRowsCursor.Range) anyerror!?PublicRowsCursor = null,
+        relocated: bool = true,
+        /// Authenticated identity for compressed index-space intersections.
+        coordinate_space: ?[32]u8 = null,
+        close: *const fn (*anyopaque) void,
+    };
     pub const FileVersions = struct { etag: []u8, version_id: []u8 };
     /// Query-owned authenticated selector pages retain independent native
     /// reader authority until source teardown. Caches contain data only.
@@ -391,6 +433,11 @@ pub const ServingSource = struct {
         close: *const fn (*anyopaque) void,
     };
     file_navigation: ?FileNavigation = null,
+    row_resolver: ?RowResolver = null,
+    repair_hint: ?struct {
+        ptr: *anyopaque,
+        report: *const fn (*anyopaque, u64, u64, [16]u8) void,
+    } = null,
     planner_statistics: []const external_source_api.types.ColumnStatistics = &.{},
     statistics_owner: ?struct { ptr: *anyopaque, close: *const fn (*anyopaque) void } = null,
     deferred_snapshot: ?DeferredSnapshot = null,
@@ -433,6 +480,39 @@ pub const ServingSource = struct {
     prepared_deletes: ?*@import("lake_prepared_deletes.zig").Prepared = null,
     delete_qualification: ?*@import("lake_delete_qualification.zig").Qualification = null,
     delete_qualification_owned: bool = false,
+
+    pub fn isCurrentCut(self: *const ServingSource, source: []const u8, snapshot: []const u8) bool {
+        return std.mem.eql(u8, source, self.inventory.source_id) and std.mem.eql(u8, snapshot, self.inventory.snapshot_id);
+    }
+    pub fn acceptsIndexCut(self: *const ServingSource, source: []const u8, snapshot: []const u8) bool {
+        if (self.isCurrentCut(source, snapshot)) return true;
+        if (self.row_resolver) |resolver| {
+            return std.mem.eql(u8, source, resolver.source) and std.mem.eql(u8, snapshot, resolver.snapshot);
+        }
+        return false;
+    }
+    pub fn resolverForIndex(self: *const ServingSource, name: []const u8) !?RowResolver {
+        const resolver = self.row_resolver orelse return null;
+        return if (resolver.bind_index) |bind| try bind(resolver.ptr, name) else resolver;
+    }
+    pub fn fromIndex(self: *const ServingSource, a: std.mem.Allocator, ref: @import("../../storage/rowsource/types.zig").RowRef) !@import("../../storage/rowsource/types.zig").RowRef {
+        if (self.row_resolver) |resolver| return resolver.from_index(resolver.ptr, a, ref);
+        return ref;
+    }
+    pub fn toIndex(self: *const ServingSource, a: std.mem.Allocator, ref: @import("../../storage/rowsource/types.zig").RowRef) !@import("../../storage/rowsource/types.zig").RowRef {
+        if (self.row_resolver) |resolver| return resolver.to_index(resolver.ptr, a, ref);
+        return ref;
+    }
+
+    pub fn translateMany(self: *const ServingSource, a: std.mem.Allocator, refs: []const @import("../../storage/rowsource/types.zig").RowRef, forward: bool) ![]const @import("../../storage/rowsource/types.zig").RowRef {
+        if (self.row_resolver) |resolver| {
+            if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, forward);
+            const result = try a.alloc(@import("../../storage/rowsource/types.zig").RowRef, refs.len);
+            for (refs, result) |ref, *target| target.* = if (forward) try resolver.from_index(resolver.ptr, a, ref) else try resolver.to_index(resolver.ptr, a, ref);
+            return result;
+        }
+        return refs;
+    }
 
     /// Parent remains pinned and quiescent until every view joins. Immutable
     /// inventory/deletes/selector authority are borrowed; mutable version maps
@@ -1158,6 +1238,7 @@ pub const ServingSource = struct {
             self.alloc.destroy(reader);
         }
         if (self.verified_selector) |selector| selector.close(selector.ptr);
+        if (self.row_resolver) |resolver| resolver.close(resolver.ptr);
         if (self.plan_lease) |lease| lease.release() else if (self.private_snapshot == null) if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
         if (self.partition_rules) |*rules| rules.deinit();
         if (self.iceberg_schema) |*value| value.deinit();

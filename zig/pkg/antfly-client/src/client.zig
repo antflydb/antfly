@@ -42,6 +42,9 @@ pub const ApiError = struct {
 pub const AntflyClient = struct {
     inner: openapi.Client,
     allocator: std.mem.Allocator,
+    /// Optional transport diagnostic sink. CLI policy owns presentation; SDKs
+    /// keep their existing behavior and never depend on CLI configuration.
+    error_reporter: ?*const fn (u16, ?[]const u8) void = null,
     /// Borrowed explicit scope for table operations; table names stay literal.
     catalog_scope: ?struct { database: []const u8 = "default", namespace: []const u8 = "public" } = null,
 
@@ -898,7 +901,10 @@ pub const AntflyClient = struct {
     // --- Helpers ---
 
     fn apiErrorFromResponse(self: *AntflyClient, resp: anytype) error{ ApiError, OutOfMemory } {
-        _ = self;
+        if (self.error_reporter) |report| {
+            report(resp.status_code, resp.err_body);
+            return error.ApiError;
+        }
         const msg = resp.err_body orelse "unknown error";
         std.debug.print("API error {d}: {s}\n", .{ resp.status_code, msg });
         return error.ApiError;
