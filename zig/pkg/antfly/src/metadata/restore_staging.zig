@@ -1372,7 +1372,19 @@ pub fn progressKey(buf: []u8, metadata_group_id: u64, id: Id) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:progress:{s}", .{ metadata_group_id, std.fmt.bytesToHex(id, .lower) });
 }
 
+pub fn populationProgressKey(buf: []u8, metadata_group_id: u64, id: Id, table_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:population:{s}:{d}", .{ metadata_group_id, std.fmt.bytesToHex(id, .lower), table_id });
+}
+pub const PopulationProgress = struct { source_rows: u64, rows: u64 = 0, owners: u32 = 0 };
+
 pub const OwnerReceipt = struct {
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "population") and self.population == null;
+    }
+    pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
+    }
+    population: ?@import("antfly_local_sources").storage_db_relational_population_contract.Cursor = null,
     group_id: u64,
     range_id: u64,
     plan_digest: Digest,
@@ -1421,6 +1433,10 @@ pub const Command = struct {
         const needs_receipt = self.action == .imported or self.action == .validated or self.action == .source_handoff_checked or self.action == .old_fenced or self.action == .canceled or self.action == .parent_fenced or self.action == .parent_activated or self.action == .target_admissions_activated;
         if (needs_receipt != (self.receipt != null)) return error.InvalidRestoreStaging;
         if (self.receipt) |receipt| {
+            if (receipt.population) |cursor| {
+                if (self.action != .imported or !cursor.sealed) return error.InvalidRestoreStaging;
+                try cursor.validate();
+            }
             if (receipt.group_id == 0 or receipt.range_id == 0 or std.mem.allEqual(u8, &receipt.plan_digest, 0) or
                 std.mem.allEqual(u8, &receipt.completion_digest, 0)) return error.InvalidRestoreStaging;
         }
@@ -1766,6 +1782,7 @@ test "relational integrity restore staging query population derives owner scopes
     const schema_digest = try runtimeSchemaDigestForTable(a, schema);
     const capture: local.storage_db_relational_population_contract.Capture = .{
         .capture_id = @splat(1),
+        .expires_at_ms = 9000000000000,
         .definition = @splat(2),
         .source_definition = @splat(3),
         .target_schema = schema_digest,

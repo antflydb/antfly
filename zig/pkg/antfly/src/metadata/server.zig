@@ -1088,6 +1088,7 @@ fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []co
 
 fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try service.ensureQueryPopulationDecoderWithContext(svc, plan_json, .{});
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").coordinated_lifecycle_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();

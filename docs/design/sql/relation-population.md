@@ -55,16 +55,41 @@ Incapable stores and destination collisions cannot reserve a job or raise that
 floor. Ordinary coordinated operations retain their v2 admission semantics;
 ordinary restore plans retain their previous optional-field encoding and digest.
 
+Query-produced generations now have a private purpose in the shared durable
+job store. Job/name admission commits atomically, and query jobs accept only
+fresh destinations. The capture carries an immutable producer expiry. A worker
+uses read-indexed owner status, never backup import or query evaluation: it waits
+for the request's seal, cancels expired incomplete output, and sends sealed
+output through ordinary global validation and atomic publication. Sealed output
+remains recoverable after producer expiry. Verified EOF releases source cursors,
+snapshots and spill resources before waiting for destination publication.
+
+Metadata validates each owner's cursor binding and common source count atomically
+with its import receipt. A per-target durable accumulator rejects inconsistent counts,
+double-counted replies and incomplete totals before entering validation. This
+uses constant work per receipt rather than rescanning the full owner cohort.
+Voter capability activation is observed durably before compound admission;
+readiness checks alone do not satisfy the apply-side floor.
+
+The recovery campaign runs actual SQL producers through metadata Raft and native
+LSM owners with lost replies and cold reopen. It checks complete typed postimages
+and SQL-null provenance for populated output, empty `WITH NO DATA` publication,
+and hidden partial-output cancellation. Separate metadata tests qualify compound
+admission collisions, unsupported data owners and exact count accumulation
+across reopen. These are lifecycle component tests, not mounted public case
+closure evidence.
+
 ## Activation still required
 
 The public catalog adapter deliberately rejects population commands until the
 complete lifecycle is integrated. Parser and component coverage do not close
 original parity cases. In particular, the following are unfinished:
 
-- Public job/name admission and placement checks,
-  request-owned producer admission, and durable expiry/cancellation of
-  interrupted producers. Recovery must never reconstruct a query from a row
-  count and run it against a fresh snapshot.
+- Public destination planning, transaction participation, namespace/tablespace
+  and placement checks,
+  conditional-create semantics, and connecting the request-owned producer to
+  compound admission. A retry must inspect the persisted capture nonce before
+  adopting output; it must never attach a new evaluation to an existing job.
 - Materialized definitions, bound dependencies and owner authority in the
   existing view catalog; atomic backing-generation publication and retirement;
   unpopulated-read errors; refresh isolation, MAINTAIN checks and concurrent

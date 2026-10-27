@@ -61,7 +61,17 @@ fn restoreRetryDelayMs(job_id: u64, attempt_id: u64) u64 {
 }
 
 pub const Scope = enum { table, cluster };
-pub const SourceKind = enum { table_snapshot, cluster_cohort, schema_rewrite, empty_generation };
+pub const SourceKind = enum {
+    table_snapshot,
+    cluster_cohort,
+    schema_rewrite,
+    empty_generation,
+    query_population,
+
+    pub fn compoundStaging(self: SourceKind) bool {
+        return self == .schema_rewrite or self == .empty_generation or self == .query_population;
+    }
+};
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
 pub const AttemptState = enum { active, cancelled, fenced };
 pub const StagingResolution = enum { active, published, canceled };
@@ -1030,7 +1040,7 @@ pub const Store = struct {
         self.lock();
         defer self.mutex.unlock();
         const now_for_prune = nowMillis();
-        if ((req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) and self.replicated == null) return error.AsyncRestoreUnavailable;
+        if (req.source_kind.compoundStaging() and self.replicated == null) return error.AsyncRestoreUnavailable;
         if (now_for_prune >= self.next_prune_at_ms) {
             const more_expired = try self.pruneExpiredLocked(now_for_prune, restore_job_prune_batch_size);
             self.next_prune_at_ms = if (more_expired) now_for_prune else now_for_prune +| restore_job_prune_interval_ms;
@@ -1134,8 +1144,8 @@ pub const Store = struct {
             .enqueue_sequence = enqueue_sequence,
             .dispatch_sequence = dispatch_sequence,
             .not_before_ms = now,
-            .attempt_id = if (req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) 1 else 0,
-            .staging_attempt_id = if (req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) 1 else 0,
+            .attempt_id = if (req.source_kind.compoundStaging()) 1 else 0,
+            .staging_attempt_id = if (req.source_kind.compoundStaging()) 1 else 0,
             .scope = req.scope,
             .source_kind = req.source_kind,
             .table_name = req.table_name,
@@ -1438,7 +1448,7 @@ pub const Store = struct {
     }
 
     pub fn existingGenerationAdmission(self: *Store, alloc: std.mem.Allocator, req: StartRequest) !?[]u8 {
-        if (req.source_kind != .schema_rewrite and req.source_kind != .empty_generation) return error.InvalidRestoreJobScope;
+        if (!req.source_kind.compoundStaging()) return error.InvalidRestoreJobScope;
         const key = req.idempotency_key orelse return null;
         const id = try jobIdForIdempotency(alloc, req.idempotency_namespace, key);
         const encoded = (try self.load(alloc, id)) orelse return null;
@@ -2485,9 +2495,9 @@ pub const Store = struct {
 
 fn validateStartRequest(req: StartRequest) !void {
     if (req.rewrite_plan_json != null and req.generation_plan_json != null) return error.InvalidRestoreJobScope;
-    if ((req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) != (req.rewrite_plan_json != null or req.generation_plan_json != null)) return error.InvalidRestoreJobScope;
-    if (req.source_kind == .empty_generation and req.generation_plan_json == null) return error.InvalidRestoreJobScope;
-    if ((req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) and (req.scope != .cluster or !std.mem.eql(u8, req.restore_mode, "overwrite"))) return error.InvalidRestoreJobScope;
+    if (req.source_kind.compoundStaging() != (req.rewrite_plan_json != null or req.generation_plan_json != null)) return error.InvalidRestoreJobScope;
+    if ((req.source_kind == .empty_generation or req.source_kind == .query_population) and req.generation_plan_json == null) return error.InvalidRestoreJobScope;
+    if (req.source_kind.compoundStaging() and (req.scope != .cluster or !std.mem.eql(u8, req.restore_mode, if (req.source_kind == .query_population) "fail_if_exists" else "overwrite"))) return error.InvalidRestoreJobScope;
     if (req.backup_id.len == 0 or req.backup_id.len > max_restore_string_bytes or
         req.location.len == 0 or req.location.len > max_restore_string_bytes or
         req.connection.len == 0 or req.connection.len > max_restore_string_bytes or
@@ -2896,6 +2906,7 @@ fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
     if (req.source_kind == .cluster_cohort) hash.update("antfly:restore:cluster-cohort:v1\x00");
     if (req.source_kind == .schema_rewrite) hash.update("antfly:restore:schema-rewrite:v1\x00");
     if (req.source_kind == .empty_generation) hash.update("antfly:restore:empty-generation:v1\x00");
+    if (req.source_kind == .query_population) hash.update("antfly:restore:query-population:v1\x00");
     hash.update(canonical);
     hash.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
@@ -3187,7 +3198,7 @@ test "restore jobs compound staging persistence transports plan separately and f
 }
 
 test "restore jobs compound staging persistence schema rewrite admission survives lost reply and rejects changed requests" {
-    for ([_]SourceKind{ .schema_rewrite, .empty_generation }) |kind| {
+    for ([_]SourceKind{ .schema_rewrite, .empty_generation, .query_population }) |kind| {
         const alloc = std.testing.allocator;
         const Fixture = struct {
             fn create(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, term: u64) ![]u8 {
@@ -3213,12 +3224,12 @@ test "restore jobs compound staging persistence schema rewrite admission survive
             .backup_id = "schema-digest",
             .location = "metadata://schema-rewrite",
             .connection = "internal",
-            .restore_mode = "overwrite",
+            .restore_mode = if (kind == .query_population) "fail_if_exists" else "overwrite",
             .table_names = &.{"child"},
             .idempotency_namespace = "basic:operator:schema:child",
             .idempotency_key = "rewrite-1",
             .rewrite_plan_json = if (kind == .schema_rewrite) "separately-validated-staging-plan" else null,
-            .generation_plan_json = if (kind == .empty_generation) "separately-validated-staging-plan" else null,
+            .generation_plan_json = if (kind != .schema_rewrite) "separately-validated-staging-plan" else null,
         };
         var store = Store.initWithIo(alloc, std.testing.io);
         defer store.deinit();

@@ -49,7 +49,7 @@ pub const Source = struct {
     failed: bool = false,
 
     /// The parent execution owns compiled syntax, parameters and schema bytes.
-    /// Source itself owns its result leases and scratch until deinit().
+    /// Source owns result leases and scratch; completion releases read resources.
     pub fn init(a: A, backend: catalog.Backend, compiled: *const compiler.Compiled, intent: ast.RelationPopulation, parameters: []const std.json.Value, limits: runtime.Limits) !*Source {
         const query = intent.query orelse return error.InvalidSqlBackendResponse;
         var read = compiled.*;
@@ -95,9 +95,14 @@ pub const Source = struct {
         self.* = .{ .allocator = a, .schema_json = schema, .definition = digest, .source_definition = try sourceIdentity(bound), .columns = columns, .output = bound.columns, .backend = statement_backend, .compiled = read, .parameters = parameters, .limits = limits, .with_data = intent.with_data, .exhausted = !intent.with_data, .scratch = .init(a) };
         return self;
     }
-    pub fn deinit(self: *Source) void {
+    fn releaseReadResources(self: *Source) void {
         if (self.pending) |*page| page.deinit();
+        self.pending = null;
         if (self.stream) |stream| stream.close();
+        self.stream = null;
+    }
+    pub fn deinit(self: *Source) void {
+        self.releaseReadResources();
         self.scratch.deinit();
         self.allocator.destroy(self);
     }
@@ -115,6 +120,9 @@ pub const Source = struct {
     fn finish(raw: *anyopaque) !void {
         const self: *Source = @ptrCast(@alignCast(raw));
         if (self.failed or !self.exhausted) return error.SourceSnapshotIncomplete;
+        // Output is owned by the delivery lane now. Publication/validation can
+        // outlive evaluation; do not retain its snapshots, cursors or spills.
+        defer self.releaseReadResources();
         try self.backend.vtable.checkpoint(self.backend.ptr);
     }
     fn next(raw: *anyopaque, max_rows: u32) anyerror!?[]const delivery.Row {
@@ -607,6 +615,7 @@ test "SQL relation population encoded JSON remains lazy and preserves exact toke
     var fixture: Encoded = .{};
     const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Encoded.resolve, .scan = Encoded.scan, .open_scan = Encoded.open, .mutate = Encoded.mutate, .checkpoint = Encoded.checkpoint, .ddl = Encoded.ddl } };
     const source = try Source.init(arena.allocator(), backend, &compiled, compiled.statement.catalog_ddl.population.?, &.{}, .{ .execution_batch_rows = 7 });
+    defer source.deinit();
     const producer = source.iface();
     var count: usize = 0;
     while (try producer.next(producer.ptr, 5)) |rows| for (rows) |row| {
@@ -622,8 +631,8 @@ test "SQL relation population encoded JSON remains lazy and preserves exact toke
         count += 1;
     };
     try producer.finish(producer.ptr);
-    source.deinit();
     try std.testing.expectEqual(@as(usize, 19), count);
     try std.testing.expectEqual(@as(usize, 0), fixture.materialized);
+    // Completion releases the native cursor before request teardown.
     try std.testing.expect(fixture.closed);
 }

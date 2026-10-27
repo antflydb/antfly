@@ -4118,6 +4118,15 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
     return 0;
 }
 
+/// Captured query plans must survive restart before their producer starts.
+/// Readiness alone is insufficient: apply also checks the durable voter floor.
+/// Existing restore/rewrite plans keep their original admission contract.
+pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const u8, context: api_operation.RequestContext) !void {
+    try context.ensureActive();
+    if (@import("schema_reader_wire.zig").requiresPopulation(bytes))
+        try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_population_version);
+}
+
 /// Capability observation alone does not install the apply-side barrier. Own
 /// and observe its durable receipt before admitting the user's guarded write.
 fn ensureDurableDecoderActivation(service: anytype, context: api_operation.RequestContext, required_version: u16) !void {

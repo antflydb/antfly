@@ -32603,7 +32603,7 @@ pub const RaftApplyStore = struct {
         };
         defer header.deinit();
         if (header.value.job_id == 0 or header.value.attempt_id != 1 or header.value.staging_attempt_id != 1 or header.value.cancel_requested or
-            (!std.mem.eql(u8, header.value.source_kind, "schema_rewrite") and !std.mem.eql(u8, header.value.source_kind, "empty_generation")) or !std.mem.eql(u8, header.value.phase, "queued")) return;
+            (!std.mem.eql(u8, header.value.source_kind, "schema_rewrite") and !std.mem.eql(u8, header.value.source_kind, "empty_generation") and !std.mem.eql(u8, header.value.source_kind, "query_population")) or !std.mem.eql(u8, header.value.phase, "queued")) return;
         var expected_key_buf: [128]u8 = undefined;
         const expected_key = try std.fmt.bufPrint(&expected_key_buf, "{s}{x:0>16}", .{ restore_job_logical_prefix, header.value.job_id });
         if (!std.mem.eql(u8, record.key, expected_key)) return;
@@ -32614,8 +32614,9 @@ pub const RaftApplyStore = struct {
         defer plan.deinit();
         const expected_id = try restore_staging.idForAttempt(header.value.job_id, 1);
         const empty_generation = std.mem.eql(u8, header.value.source_kind, "empty_generation");
-        if (!std.mem.eql(u8, &plan.value.id, &expected_id) or plan.value.preparing_sources == empty_generation) return;
-        for (plan.value.targets) |target| if (target.empty_generation != empty_generation) return;
+        const query_population = std.mem.eql(u8, header.value.source_kind, "query_population");
+        if (!std.mem.eql(u8, &plan.value.id, &expected_id) or plan.value.preparing_sources != (!empty_generation and !query_population)) return;
+        for (plan.value.targets) |target| if (target.empty_generation != empty_generation or (target.population != null) != query_population) return;
         const reserve: restore_staging.Command = .{ .id = expected_id, .action = .reserve, .plan = plan.value };
         reserve.validate(self.alloc) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -32993,6 +32994,35 @@ pub const RaftApplyStore = struct {
                     var receipt_buf: [256]u8 = undefined;
                     const receipt_key = try restore_staging.receiptKey(&receipt_buf, group_id, command.id, next.state, receipt.group_id);
                     if (try stagingGet(txn, receipt_key) != null) return;
+                    if (command.action == .imported) {
+                        const population_target = outer: for (job.value.plan.targets) |target| {
+                            for (target.ranges) |range| if (range.group_id == receipt.group_id) break :outer target;
+                        } else return;
+                        if (population_target.population) |capture| {
+                            const cursor = receipt.population orelse return;
+                            const owner_range = for (population_target.ranges) |range| {
+                                if (range.group_id == receipt.group_id) break range;
+                            } else return;
+                            const binding = capture.forPartition(metadata_table_manager.rangeDocIdentityShardId(owner_range));
+                            if (!cursor.sealed or !std.mem.eql(u8, &cursor.binding, &(binding.digest() catch return))) return;
+                            var population_key_buf: [256]u8 = undefined;
+                            const population_key = try restore_staging.populationProgressKey(&population_key_buf, group_id, command.id, population_target.table.table_id);
+                            var summary: restore_staging.PopulationProgress = .{ .source_rows = cursor.source_rows.? };
+                            if (try stagingGet(txn, population_key)) |raw| {
+                                const population_summary = try std.json.parseFromSlice(restore_staging.PopulationProgress, self.alloc, raw, .{});
+                                defer population_summary.deinit();
+                                summary = population_summary.value;
+                            }
+                            if (summary.source_rows != cursor.source_rows.?) return;
+                            summary.rows = std.math.add(u64, summary.rows, cursor.rows) catch return;
+                            summary.owners = std.math.add(u32, summary.owners, 1) catch return;
+                            if (summary.rows > summary.source_rows or summary.owners > population_target.ranges.len or
+                                (summary.owners == population_target.ranges.len and summary.rows != summary.source_rows)) return;
+                            const encoded = try std.json.Stringify.valueAlloc(self.alloc, summary, .{});
+                            defer self.alloc.free(encoded);
+                            try txn.put(population_key, encoded);
+                        } else if (receipt.population != null) return;
+                    }
                     try txn.put(receipt_key, &receipt.completion_digest);
                     next.completed_owners += 1;
                     if (command.action == .imported and next.completed_owners == total) {
@@ -55716,25 +55746,29 @@ test "relational integrity restore staging population atomically raises data own
     defer a.free(schema);
     const target: restore_staging.Target = .{
         .source_table_id = 0,
-        .population = .{ .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = try restore_staging.runtimeSchemaDigestForTable(a, schema), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 7 },
-        .table = .{ .table_id = 11, .name = "population_storage", .schema_json = schema },
+        .population = .{ .expires_at_ms = 9000000000000, .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = try restore_staging.runtimeSchemaDigestForTable(a, schema), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 7 },
+        .table = .{ .table_id = 11, .name = "population_storage", .schema_json = schema, .min_ranges = 2 },
         .catalog_binding = .{ .kind = .table, .id = 11, .parent_id = system_catalog.default_namespace_id, .name = "populated", .storage_name = "population_storage" },
-        .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }},
+        .ranges = &.{ .{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "", .end_key = "8" }, .{ .table_id = 11, .group_id = 702, .range_id = 702, .doc_identity_shard_id = 702, .doc_identity_range_id = 702, .start_key = "8" } },
     };
-    const plan: restore_staging.Plan = .{ .id = @splat(7), .cohort_digest = @splat(9), .targets = &.{target} };
+    const plan: restore_staging.Plan = .{ .id = try restore_staging.idForAttempt(91, 1), .cohort_digest = @splat(9), .targets = &.{target} };
     try plan.validate(a);
+    const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
+    defer a.free(plan_json);
+    const logical_key = restore_job_logical_prefix ++ "000000000000005b";
+    const logical_job = "{\"job_id\":91,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"query_population\",\"phase\":\"queued\"}";
     var key_buf: [512]u8 = undefined;
     const job_key = try a.dupe(u8, try restore_staging.jobKey(&key_buf, group, plan.id));
     defer a.free(job_key);
     const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_population_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
     defer a.free(activation);
-    var data: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .relational_topology_protocol_version = metadata_table_manager.coordinated_integrity_protocol_version };
+    var data: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current, .relational_topology_protocol_version = metadata_table_manager.coordinated_integrity_protocol_version };
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&key_buf, group), activation);
         _ = try store.writeStoreComponentsTxn(&txn, group, data.store_id, data, false, null, null);
-        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        try applyRestoreTransitionForTest(&store, &txn, group, .{ .create_restore_job_with_staging = .{ .key = logical_key, .value = logical_job, .plan_json = plan_json } });
         try std.testing.expectError(error.NotFound, txn.get(job_key));
         try txn.commit();
     }
@@ -55750,7 +55784,7 @@ test "relational integrity restore staging population atomically raises data own
         const encoded = try encodeTableRecord(a, target.table);
         defer a.free(encoded);
         try txn.put(table_key, encoded);
-        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        try applyRestoreTransitionForTest(&store, &txn, group, .{ .create_restore_job_with_staging = .{ .key = logical_key, .value = logical_job, .plan_json = plan_json } });
         try std.testing.expectError(error.NotFound, txn.get(job_key));
         try txn.delete(try tableKeyForGroup(&key_buf, group, target.table.table_id));
         try txn.commit();
@@ -55759,7 +55793,7 @@ test "relational integrity restore staging population atomically raises data own
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
-        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        try applyRestoreTransitionForTest(&store, &txn, group, .{ .create_restore_job_with_staging = .{ .key = logical_key, .value = logical_job, .plan_json = plan_json } });
         _ = try txn.get(job_key);
         try txn.commit();
     }
@@ -55781,4 +55815,44 @@ test "relational integrity restore staging population atomically raises data own
         data.relational_topology_protocol_version = metadata_table_manager.query_population_protocol_version;
         try std.testing.expect(try admitSchemaAndTopologyStoreTxn(&txn, group, data));
     }
+    // Exact sealed counts, not receipt cardinality alone, gate global validation.
+    const population = local.storage_db_relational_population_contract;
+    var first = try population.Cursor.init(target.population.?.forPartition(701));
+    const rows = [_]population.Row{.{ .ordinal = 0, .document = "{\"n\":1}" }};
+    first = (try first.admit(.{ .binding = first.binding, .sequence = 0, .first_row = 0, .previous = first.chain, .rows = &rows })).apply;
+    first = try first.seal(first.completionForSource(2));
+    var second = try population.Cursor.init(target.population.?.forPartition(702));
+    second = try second.seal(second.completionForSource(2));
+    const digest = try plan.digest(a);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        // Missing query proof cannot count an ordinary opaque restore receipt.
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .expected_revision = 1, .action = .imported, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(7) } });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .expected_revision = 1, .action = .imported, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(7), .population = first } });
+        // Exact replay cannot increment either the owner or row counters.
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .expected_revision = 1, .action = .imported, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(7), .population = first } });
+        // Sealed but incomplete global output must not admit the final receipt.
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .expected_revision = 1, .action = .imported, .receipt = .{ .group_id = 702, .range_id = 702, .plan_digest = digest, .completion_digest = @splat(8), .population = second } });
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(u32, 1), (try store.loadRestoreStagingProgress(a, group, plan.id)).?.completed_owners);
+    store.deinit();
+    live = false;
+    store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    live = true;
+    second = try population.Cursor.init(target.population.?.forPartition(702));
+    const tail = [_]population.Row{.{ .ordinal = 1, .document = "{\"n\":2}" }};
+    second = (try second.admit(.{ .binding = second.binding, .sequence = 0, .first_row = 0, .previous = second.chain, .rows = &tail })).apply;
+    second = try second.seal(second.completionForSource(2));
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var changed = second;
+        changed.binding = first.binding;
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .expected_revision = 1, .action = .imported, .receipt = .{ .group_id = 702, .range_id = 702, .plan_digest = digest, .completion_digest = @splat(8), .population = changed } });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .expected_revision = 1, .action = .imported, .receipt = .{ .group_id = 702, .range_id = 702, .plan_digest = digest, .completion_digest = @splat(8), .population = second } });
+        try txn.commit();
+    }
+    try std.testing.expectEqual(restore_staging.State.validating, (try store.loadRestoreStagingProgress(a, group, plan.id)).?.state);
 }

@@ -1367,5 +1367,6 @@ test "restore owner SQL population query delivery resolves lost ACKs and refuses
 
 test {
     _ = @import("../api/sql_population_delivery.zig");
+    _ = @import("../api/sql_population_recovery.zig");
     _ = @import("sql_population_cohort_test.zig");
 }

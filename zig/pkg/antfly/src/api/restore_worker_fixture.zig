@@ -505,9 +505,16 @@ const RewritePersistence = struct {
     fn createWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, term: u64) ![]u8 {
         try std.testing.expectEqual(@as(u64, 1), term);
         const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-        try svc.proposeTransitionCommand(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan } });
+        try metadata_service.ensureQueryPopulationDecoderWithContext(svc, plan, .{});
+        svc.proposeTransitionCommand(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan } }) catch |err| {
+            std.debug.print("compound staging fixture proposal: {s}\n", .{@errorName(err)});
+            return err;
+        };
         try svc.runRound();
-        return (try get(ptr, alloc, key)) orelse error.RestoreJobCommitNotApplied;
+        return (try get(ptr, alloc, key)) orelse {
+            std.debug.print("compound staging fixture did not admit the plan\n", .{});
+            return error.RestoreJobCommitNotApplied;
+        };
     }
 };
 
@@ -1272,5 +1279,181 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         var active_result = try target.search(alloc, .{ .index_name = "full_text_index_v1", .full_text = .{ .term = .{ .field = "name", .term = "Old Mapping" } }, .limit = 1 });
         defer active_result.deinit();
         try std.testing.expectEqual(@as(u32, 1), active_result.total_hits);
+    }
+}
+
+/// One request-owned SQL producer, real Raft metadata admission, native LSM
+/// output and the same recovery/validation/publication worker as backups.
+pub const PopulationScenario = enum { populated, no_data, abandoned };
+
+pub fn runPopulation(comptime Driver: type, scenario: PopulationScenario) !void {
+    const abandoned = scenario == .abandoned;
+    const row_count: usize = if (scenario == .no_data) 0 else 129;
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io });
+    defer runtime.deinit();
+    var api_runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io, .borrowed_io = .{ .general = std.testing.io, .api = std.testing.io } });
+    defer api_runtime.deinit();
+    var raft = raft_engine.core.MemoryStorage.init(alloc);
+    defer raft.deinit();
+    var fixture: Fixture = .{ .alloc = alloc, .raft = &raft, .runtime = &runtime, .owner_count = 1, .restart_after_commit = true, .root = root, .facts_alloc = a, .non_raft = false };
+    var allocated: usize = 0;
+    defer {
+        for (fixture.dbs[0..allocated], 0..) |target, i| {
+            if (fixture.target_open[i]) target.close();
+            alloc.destroy(target);
+        }
+    }
+    var svc = try metadata_service.MetadataService.init(alloc, .{ .host = .{ .local_node_id = 1, .metadata_group_id = 1988, .replica_root_dir = try std.fmt.allocPrint(a, "{s}/metadata", .{root}), .replica_catalog_path = try std.fmt.allocPrint(a, "{s}/metadata-catalog", .{root}) } }, .{ .host = .{ .host = .{ .descriptor_factory = .{ .ptr = &fixture, .vtable = &.{ .build_descriptor = Fixture.descriptor, .free_descriptor = Fixture.freeDescriptor } } } } }, .{});
+    defer svc.deinit();
+    _ = try svc.ensureMetadataReplica(.{ .group_id = 1988, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
+    try svc.campaignMetadataGroup();
+    try svc.runRound();
+    const source = http.StatusSource.fromMetadataService(&svc);
+    fixture.source = source;
+    var node_config = try Driver.nodeConfig(alloc);
+    defer node_config.deinit();
+    fixture.node_config = &node_config;
+    var server = http.ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .backend_runtime = &api_runtime, .node_config = &node_config, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.sourceIo }, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } } }, source, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.sourceLookup, .lookup_group_local = Fixture.destinationLookup, .scan = Fixture.scan, .query = Fixture.query } }, .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.sourceBatch } });
+    defer server.deinit();
+    server.restore_job_store.deinit();
+    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, std.testing.io);
+    try server.restore_job_store.attachReplicated(restore_jobs.ReplicatedPersistence.fromLocal(&svc, .{ .load = RewritePersistence.load, .get = RewritePersistence.get, .put = RewritePersistence.put, .delete = RewritePersistence.delete, .delete_many = RewritePersistence.deleteMany, .create_with_staging = RewritePersistence.createWithStaging }));
+    try server.restore_job_store.prepareReplicatedLeadership(alloc, 1);
+    server.restore_leadership_term.store(1, .release);
+
+    const local = @import("antfly_local_sources");
+    const sql = local.sql_catalog;
+    const population = local.storage_db_relational_population_contract;
+    const Backend = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: local.sql_ast.Name, _: sql.Action) !sql.Table {
+            return error.TableNotFound;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: sql.Table, _: sql.Scan) !sql.Page {
+            return error.UnexpectedRowScan;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: sql.Table, _: []const sql.Mutation) !sql.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn ddl(_: *anyopaque, _: sql.DdlAllocators, _: sql.Ddl) !sql.DdlOutcome {
+            return error.UnexpectedMutation;
+        }
+    };
+    var unused: u8 = 0;
+    const backend: sql.Backend = .{ .ptr = &unused, .execution_io = std.testing.io, .vtable = &.{ .resolve = Backend.resolve, .scan = Backend.scan, .mutate = Backend.mutate, .checkpoint = Backend.checkpoint, .ddl = Backend.ddl } };
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    try text.writer.writeAll("CREATE TABLE parent(n,j) AS VALUES ");
+    for (0..129) |i| {
+        if (i != 0) try text.writer.writeByte(',');
+        try text.writer.print("({d}::BIGINT,{s}::JSONB)", .{ i, if (i % 2 == 0) "'null'" else "NULL" });
+    }
+    if (scenario == .no_data) try text.writer.writeAll(" WITH NO DATA");
+    var compiled = try local.sql_compiler.compile(a, text.written(), .{});
+    defer compiled.deinit();
+    const producer = try local.sql_relation_population.Source.init(a, backend, &compiled, compiled.statement.catalog_ddl.population.?, &.{}, .{ .result_rows = 1 });
+    defer producer.deinit();
+    const job_id = try restore_jobs.jobIdForIdempotency(a, "population-worker", "one");
+    const plan_id = try stages.idForAttempt(job_id, 1);
+    const capture: population.Capture = .{ .capture_id = @splat(1), .definition = producer.definition, .source_definition = producer.source_definition, .target_schema = try stages.runtimeSchemaDigestForTable(a, producer.schema_json), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 42, .expires_at_ms = if (abandoned) 1 else 9000000000000 };
+    const target: stages.Target = .{ .source_table_id = 0, .population = capture, .table = .{ .table_id = 19, .name = "parent", .schema_json = producer.schema_json, .indexes_json = "{}" }, .catalog_binding = .{ .kind = .table, .id = 19, .parent_id = local.system_catalog_domain.default_namespace_id, .name = "parent", .storage_name = "parent" }, .ranges = &.{.{ .table_id = 19, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }} };
+    const plan: stages.Plan = .{ .id = plan_id, .cohort_digest = producer.definition, .targets = &.{target} };
+    const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
+    try svc.upsertStore(.{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .schema_reader = tables.SchemaReaderCapabilities.current, .relational_topology_protocol_version = tables.query_population_protocol_version });
+    try svc.runRound();
+    var registered = (try source.adminSnapshot()).?;
+    try std.testing.expectEqual(@as(usize, 1), registered.stores.len);
+    try std.testing.expectEqual(tables.query_population_protocol_version, registered.stores[0].relational_topology_protocol_version);
+    source.freeAdminSnapshot(&registered);
+    // Resolve the same built-in default namespace that ordinary SQL DDL
+    // uses; no test-only catalog writes.
+    _ = try source.systemCatalog(a, .{}, .{ .resolve_many = .{} });
+    _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = .query_population, .backup_id = "population", .location = "metadata://query-population", .connection = "internal", .idempotency_namespace = "population-worker", .idempotency_key = "one", .table_names = &.{"parent"}, .destination_authorization_principal = local.api_stored_destination_authorization.auth_disabled_principal, .generation_plan_json = plan_json });
+    const scope = try stages.ownerScope(a, plan, try plan.digest(a), target, target.ranges[0]);
+    fixture.scopes[0] = scope;
+    fixture.target_paths[0] = try std.fmt.allocPrint(a, "{s}/population", .{root});
+    fixture.cache_paths[0] = try std.fmt.allocPrint(a, "{s}/decoder", .{root});
+    fixture.dbs[0] = try alloc.create(db.DB);
+    allocated = 1;
+    fixture.dbs[0].* = try db.DB.open(alloc, fixture.target_paths[0], .{ .backend_runtime = &runtime, .identity_namespace = scope.target_namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+    fixture.target_open[0] = true;
+    try fixture.dbs[0].setSchemaJson(alloc, target.table.schema_json);
+    try fixture.dbs[0].reserveRestoreStagingScoped(alloc, scope);
+    try fixture.dbs[0].installRestoreStagingBootstrap(alloc, try stages.ownerBootstrapForRangeIndex(alloc, plan, try plan.digest(a), target, 0));
+    const Interrupted = struct {
+        source: sql.PopulationSource,
+        pulls: usize = 0,
+        fn next(ptr: *anyopaque, max_rows: u32) !?[]const population.Row {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.pulls != 0) return error.Cancelled;
+            self.pulls += 1;
+            return self.source.next(self.source.ptr, max_rows);
+        }
+        fn finish(_: *anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var interrupted: Interrupted = .{ .source = producer.iface() };
+    var input = producer.iface();
+    if (abandoned) {
+        input.ptr = &interrupted;
+        input.next = Interrupted.next;
+        input.finish = Interrupted.finish;
+    }
+    const delivery = @import("sql_population_delivery.zig");
+    const delivered = delivery.deliver(alloc, .{ .port = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .table = "parent", .group = 701, .scope = scope }, input, .{});
+    if (abandoned) try std.testing.expectError(error.Cancelled, delivered) else {
+        const cursor = try delivered;
+        try std.testing.expect(cursor.sealed);
+        try std.testing.expectEqual(@as(u64, @intCast(row_count)), cursor.rows);
+    }
+    const producer_imports = fixture.imports;
+    var hidden = (try source.adminSnapshot()).?;
+    try std.testing.expectEqual(@as(usize, 0), hidden.tables.len);
+    source.freeAdminSnapshot(&hidden);
+    for (0..600) |_| {
+        try Driver.work(&server, job_id);
+        const bytes = (try server.restore_job_store.load(a, job_id)).?;
+        const state = try std.json.parseFromSlice(restore_jobs.JobState, a, bytes, .{});
+        if (restore_jobs.isTerminal(state.value.phase)) {
+            try std.testing.expectEqual(if (abandoned) restore_jobs.Phase.failed else .succeeded, state.value.phase);
+            try std.testing.expectEqual(if (abandoned) restore_jobs.StagingResolution.canceled else .published, state.value.staging_resolution);
+            break;
+        }
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    } else {
+        std.debug.print("population worker stalled: {s}\n", .{(try server.restore_job_store.load(a, job_id)).?});
+        return error.PopulationWorkerDidNotComplete;
+    }
+    // Recovery never issues a backup read or another query import request.
+    try std.testing.expectEqual(producer_imports, fixture.imports);
+    try std.testing.expectEqual(@as(usize, 0), fixture.source_operations);
+    var visible = (try source.adminSnapshot()).?;
+    defer source.freeAdminSnapshot(&visible);
+    try std.testing.expectEqual(@as(usize, if (abandoned) 0 else 1), visible.tables.len);
+    if (!abandoned) {
+        var reader = try fixture.dbs[0].beginRelationalRows(alloc, .{ .fields = &.{ "n", "j" } });
+        defer reader.deinit();
+        var count: usize = 0;
+        while (true) {
+            var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+            defer page.deinit();
+            for (page.rows) |row| {
+                const ordinal = try std.fmt.parseInt(u64, row.key[row.key.len - 16 ..], 16);
+                try std.testing.expectEqualSlices(u8, &population.rowKey(capture.capture_id, ordinal), row.key);
+                try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.typed.?.object.get("n").?.integer);
+                try std.testing.expectEqualSlices(bool, &.{ false, ordinal % 2 != 0 }, row.sql_nulls.?);
+                count += 1;
+            }
+            if (!page.more) break;
+        }
+        try std.testing.expectEqual(row_count, count);
     }
 }

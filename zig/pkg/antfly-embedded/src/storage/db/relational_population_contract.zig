@@ -69,10 +69,14 @@ pub const Capture = struct {
     catalog_revision: u64,
     write_version: u64,
 
+    /// Durable producer lease. Expiry cancels incomplete output; it never permits reevaluation.
+    expires_at_ms: u64,
+
     pub fn forPartition(self: Capture, partition: u64) Binding {
         return .{ .capture_id = self.capture_id, .definition = self.definition, .source_definition = self.source_definition, .target_schema = self.target_schema, .principal_instance = self.principal_instance, .catalog_revision = self.catalog_revision, .write_version = self.write_version, .partition = partition };
     }
     pub fn validate(self: Capture) !void {
+        if (self.expires_at_ms == 0 or self.expires_at_ms > std.math.maxInt(i64)) return error.InvalidRelationPopulation;
         try self.forPartition(1).validate();
     }
 };

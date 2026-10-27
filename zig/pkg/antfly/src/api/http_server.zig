@@ -2651,6 +2651,7 @@ pub const StatusSource = struct {
                 var command = try @import("../metadata/restore_staging.zig").parseCommand(alloc, command_json);
                 defer command.deinit();
                 const svc = cast(ptr);
+                try metadata_service.ensureQueryPopulationDecoderWithContext(svc, command_json, request);
                 try metadata_service.ensureCoordinatedDecoderWithContext(svc, .{ .apply_restore_staging = command_json }, request);
                 const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_restore_staging = command_json });
                 try svc.waitForTransitionAppliedWithContext(receipt, request);
@@ -19461,7 +19462,7 @@ pub const ApiHttpServer = struct {
             if (target.rewrite) |rewrite| if (rewrite.column_transforms.len != 0) break true;
         } else false;
         if (!failed and !worker_state.value.cancel_requested and job.value.state != .published and job.value.state != .canceled) {
-            if (worker_state.value.source_kind == .empty_generation) {
+            if (worker_state.value.source_kind == .empty_generation or worker_state.value.source_kind == .query_population) {
                 (self.requireEmptyGenerationAuthority(worker_state.value.destination_authorization_principal, worker_state.value.table_names orelse return zig017_failure: {
                     zig017_return_error = error.CorruptRestoreJobStore;
                     break :zig017_failure error.CorruptRestoreJobStore;
@@ -20316,13 +20317,13 @@ pub const ApiHttpServer = struct {
                     return zig017_err;
                 });
             var request: owners.Request = .{ .scope = scope, .action = switch (phase) {
-                .importing => if (target.empty_generation) .begin else .import_page,
+                .importing => if (target.population != null) .status else if (target.empty_generation) .begin else .import_page,
                 .validating => .validate,
                 .published => .publish,
                 .canceling => .cancel,
                 else => unreachable,
             } };
-            if (phase == .importing and !target.empty_generation) {
+            if (phase == .importing and !target.empty_generation and target.population == null) {
                 const artifact = for (target.source_artifacts) |item| {
                     if (item.target_group_id == range.group_id) break item;
                 } else return zig017_failure: {
@@ -20355,6 +20356,12 @@ pub const ApiHttpServer = struct {
                 zig017_return_error = err;
                 return err;
             };
+            if (phase == .importing and target.population != null) {
+                @import("sql_population_recovery.zig").requireSealed(target.population.?, scope.target_namespace.shard_id, result, platform_time.realtimeNs() / std.time.ns_per_ms) catch |err| {
+                    zig017_return_error = err;
+                    return err;
+                };
+            }
             if (phase == .importing and result.phase == .importing) continue;
             // Index readiness is a bounded owner job, not a single-call
             // transition. Keep the imported generation hidden while it builds.
@@ -20371,15 +20378,20 @@ pub const ApiHttpServer = struct {
                 break :zig017_failure error.RestoreStagingScopeChanged;
             };
             if (phase != .published) {
+                const before_owners = job.value.completed_owners;
                 (self.stagingCommand(&job, switch (phase) {
                     .importing => .imported,
                     .validating => .validated,
                     .canceling => .canceled,
                     else => unreachable,
-                }, .{ .group_id = range.group_id, .range_id = if (range.range_id == 0) range.group_id else range.range_id, .plan_digest = job.value.plan_digest, .completion_digest = result.receipt }, context) catch |zig017_err| {
+                }, .{ .group_id = range.group_id, .range_id = if (range.range_id == 0) range.group_id else range.range_id, .plan_digest = job.value.plan_digest, .completion_digest = result.receipt, .population = if (phase == .importing) result.population else null }, context) catch |zig017_err| {
                     zig017_return_error = zig017_err;
                     return zig017_err;
                 });
+                if (phase == .importing and target.population != null and job.value.state == .importing and job.value.completed_owners == before_owners) {
+                    zig017_return_error = error.RestoreStagingScopeChanged;
+                    return error.RestoreStagingScopeChanged;
+                }
             }
             owner_cursor += 1;
         }
@@ -20761,7 +20773,7 @@ pub const ApiHttpServer = struct {
             error.RestoreJobFenced, error.NotLeader => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
             error.RestoreDependencyMissing, error.InvalidRestoreMode, error.InvalidRestoreStaging, error.InvalidRestoreMigrationState, error.InvalidRequest, error.StoreRegistrationRequired => error.InvalidRequest,
-            error.BackupIntegrityFailure, error.BackupArtifactIntegrityMismatch, error.RestoreStagingScopeChanged, error.RestoreStagingFailed => error.BackupIntegrityFailure,
+            error.BackupIntegrityFailure, error.BackupArtifactIntegrityMismatch, error.RestoreStagingScopeChanged, error.RestoreStagingFailed, error.SourceSnapshotIncomplete => error.BackupIntegrityFailure,
             error.RestoreDestinationReauthorizationRequired, error.StoredDestinationAuthorizationRevoked => error.RestoreDestinationReauthorizationRequired,
             error.RestoreNewAdmissionGuarded => error.PortableForeignKeyRestoreUnavailable,
             else => blk: {
@@ -20789,6 +20801,7 @@ pub const ApiHttpServer = struct {
             error.StoredDestinationAuthorizationRevoked,
             error.RestoreNewAdmissionGuarded,
             error.UnsupportedEmptyGenerationAuthority,
+            error.SourceSnapshotIncomplete,
             => true,
             else => false,
         };
@@ -24805,7 +24818,7 @@ pub const ApiHttpServer = struct {
             self.alloc.free(failed);
             return;
         }
-        if (state.staging_attempt_id != 0 and (state.source_kind == .schema_rewrite or state.source_kind == .empty_generation or state.cancel_requested or state.staging_failure.len != 0 or state.staging_resolution == .published)) {
+        if (state.staging_attempt_id != 0 and (state.source_kind.compoundStaging() or state.cancel_requested or state.staging_failure.len != 0 or state.staging_resolution == .published)) {
             // Owner cleanup/publication never requires source repository
             // credentials or availability after a staging attempt exists.
             const result = self.resolveStagedRestoreWithoutSource(state) catch |err| {
@@ -25184,7 +25197,7 @@ pub const ApiHttpServer = struct {
         // not the whole cluster. Polling/listing/cancellation must use that same
         // scope, and must stop being available after any table permission is
         // revoked. Ordinary cluster restores still require cluster admin.
-        if ((state.source_kind == .schema_rewrite or state.source_kind == .empty_generation) and state.scope == .cluster) {
+        if (state.source_kind.compoundStaging() and state.scope == .cluster) {
             const names = state.table_names orelse return false;
             if (names.len == 0) return false;
             for (names) |name| if (!permissionsAllow(identity.permissions, .table, try catalog_names.resolve(name), .admin)) return false;
@@ -60430,4 +60443,9 @@ test "httpx inference gateway document authority recovery does not block existin
     const migrated = (try backend.capability().get(a, "documents/legacy")).?;
     defer a.free(migrated);
     try std.testing.expect(migrated.len > 0);
+}
+
+test "staged restore worker query population publishes sealed SQL output and retires abandoned evaluations" {
+    const fixture = @import("restore_worker_fixture.zig");
+    for ([_]fixture.PopulationScenario{ .populated, .no_data, .abandoned }) |scenario| try fixture.runPopulation(RestoreWorkerTestDriver, scenario);
 }

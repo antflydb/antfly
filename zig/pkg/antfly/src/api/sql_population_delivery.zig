@@ -257,7 +257,7 @@ const CohortFixture = struct {
     row: [1]contract.Row = undefined,
     fn init(self: *@This()) void {
         const alphabet = "0123456789abcdef";
-        const capture: contract.Capture = .{ .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = @splat(4), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 7 };
+        const capture: contract.Capture = .{ .expires_at_ms = 9000000000000, .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = @splat(4), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 7 };
         for (&self.destinations, 0..) |*destination, i| {
             const binding = capture.forPartition(i + 1);
             destination.* = .{ .port = .{ .ptr = self, .execute_fn = execute }, .table = "dst", .group = i + 1, .range = .{ .start = if (i == 0) "" else alphabet[i..][0..1], .end = if (i + 1 == count) "" else alphabet[i + 1 ..][0..1] }, .scope = .{ .plan_id = @splat(8), .plan_digest = @splat(9), .source_artifact_digest = binding.fingerprint(), .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 }, .target_namespace = .{ .table_id = 31, .shard_id = i + 1, .range_id = i + 1 }, .target_schema_digest = capture.target_schema, .population = binding } };
