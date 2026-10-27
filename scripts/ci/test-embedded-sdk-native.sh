@@ -63,7 +63,11 @@ if [[ "$sdk" == rust || "$sdk" == all ]]; then
     --features antfly-embedded/libantfly,antfly-embedded/sqlx ${rust_args[@]+"${rust_args[@]}"}
 fi
 if [[ "$sdk" == python || "$sdk" == all ]]; then
-  python_args=()
+  python_args=(--durations=25 --durations-min=1)
+  if [[ -n "${ANTFLY_SDK_NATIVE_REPORT_DIR:-}" ]]; then
+    mkdir -p "$ANTFLY_SDK_NATIVE_REPORT_DIR"
+    python_args+=(--junitxml="$ANTFLY_SDK_NATIVE_REPORT_DIR/python.xml")
+  fi
   if [[ "$inference" == 0 ]]; then python_args+=(--ignore=tests/test_inference.py); fi
   (cd "$repo_root/py/packages/embedded" && uv run --locked pytest -q ${python_args[@]+"${python_args[@]}"})
 fi

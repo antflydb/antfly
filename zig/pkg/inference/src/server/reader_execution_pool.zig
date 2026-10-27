@@ -27,6 +27,35 @@ pub const Pool = struct {
     joins: usize = 0,
     max_epoch_joins: usize = 64,
     destroy_fn: ?*const fn (*anyopaque) void = null,
+    waiters: ?*Waiter = null,
+    event_waits: std.atomic.Value(usize) = .init(0),
+    poll_waits: std.atomic.Value(usize) = .init(0),
+
+    const Waiter = struct {
+        next: ?*Waiter = null,
+        io: ?std.Io,
+        ready: std.Io.Event = .unset,
+    };
+
+    fn detach(self: *Pool, waiter: *Waiter) void {
+        var link = &self.waiters;
+        while (link.*) |current| {
+            if (current == waiter) {
+                link.* = current.next;
+                waiter.next = null;
+                return;
+            }
+            link = &current.next;
+        }
+        unreachable;
+    }
+
+    fn wakeWaiters(self: *Pool) void {
+        var next = self.waiters;
+        while (next) |waiter| : (next = waiter.next) {
+            if (waiter.io) |io| waiter.ready.set(io);
+        }
+    }
 
     pub const Lease = struct {
         owner: *Pool,
@@ -43,6 +72,9 @@ pub const Pool = struct {
                 self.owner.joins = 0;
                 self.owner.max_epoch_joins = 64;
             }
+            // A release makes room or finishes a bounded epoch. Wake queued
+            // joins under the same mutex that protects their event reset.
+            self.owner.wakeWaiters();
         }
     };
 
@@ -52,6 +84,13 @@ pub const Pool = struct {
 
     pub fn joinBounded(self: *Pool, control: Control, capacity: usize, max_epoch_joins: usize, factory: *anyopaque, create: *const fn (*anyopaque) anyerror!*anyopaque, destroy: *const fn (*anyopaque) void) !Lease {
         if (capacity == 0 or capacity > max_capacity or max_epoch_joins < capacity or max_epoch_joins > 256) return error.InvalidReaderCapacity;
+        var waiter = Waiter{ .io = control.io };
+        var attached = false;
+        defer if (attached) {
+            platform.sync.lockYielding(&self.mutex);
+            self.detach(&waiter);
+            self.mutex.unlock();
+        };
         while (true) {
             try control.lock(&self.mutex);
             if (self.context != null and self.max_epoch_joins != max_epoch_joins) {
@@ -71,13 +110,40 @@ pub const Pool = struct {
                 }
                 self.users += 1;
                 self.joins += 1;
+                if (attached) {
+                    self.detach(&waiter);
+                    attached = false;
+                }
                 const result = Lease{ .owner = self, .context = self.context.? };
                 self.mutex.unlock();
                 return result;
             }
+            if (control.io != null) {
+                if (!attached) {
+                    waiter.next = self.waiters;
+                    self.waiters = &waiter;
+                    attached = true;
+                }
+                waiter.ready.reset();
+                _ = self.event_waits.fetchAdd(1, .monotonic);
+            }
             self.mutex.unlock();
             try control.check();
-            platform.time.sleepNs(100 * std.time.ns_per_us);
+            if (control.io) |io| {
+                // Release wakes immediately. A bounded timeout also observes
+                // callback cancellation without a separate Io wake signal.
+                const remaining = if (control.deadline_ns) |deadline|
+                    @min(10 * std.time.ns_per_ms, deadline -| platform.time.monotonicNs())
+                else
+                    10 * std.time.ns_per_ms;
+                waiter.ready.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(remaining)), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    else => return err,
+                };
+            } else {
+                _ = self.poll_waits.fetchAdd(1, .monotonic);
+                platform.time.sleepNs(100 * std.time.ns_per_us);
+            }
         }
     }
 };
@@ -131,6 +197,96 @@ test "LightOnOCR3 shared reader pool rejects canceled joins and unwinds failed c
     try std.testing.expectError(error.OutOfMemory, pool.join(.{}, 1, &value, Fake.create, Fake.destroy));
     try std.testing.expect(pool.context == null and pool.users == 0);
     try std.testing.expectError(error.Timeout, pool.join(.{ .deadline_ns = 0 }, 1, &value, Fake.create, Fake.destroy));
+}
+
+test "LightOnOCR3 shared reader pool parks joins and wakes on slot or epoch retirement" {
+    const Fake = struct {
+        created: usize = 0,
+        destroyed: usize = 0,
+        fn create(raw: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.created += 1;
+            return raw;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.destroyed += 1;
+        }
+        fn join(pool: *Pool, fake: *@This(), capacity: usize, limit: usize) !void {
+            var lease = try pool.joinBounded(.{ .io = std.testing.io }, capacity, limit, fake, create, destroy);
+            lease.release();
+        }
+        fn waitQueued(pool: *Pool) !void {
+            const deadline = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (true) {
+                platform.sync.lockYielding(&pool.mutex);
+                const queued = pool.waiters != null;
+                pool.mutex.unlock();
+                if (queued) return;
+                if (platform.time.monotonicNs() >= deadline) return error.Timeout;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    // The refill must join the live epoch; a bounded full epoch must instead
+    // retire before its waiter can create the next one.
+    for ([_]bool{ false, true }) |retire_epoch| {
+        var fake = Fake{};
+        var pool = Pool{};
+        const capacity: usize = if (retire_epoch) 1 else 2;
+        const limit: usize = if (retire_epoch) 1 else 4;
+        var held = try pool.joinBounded(.{}, capacity, limit, &fake, Fake.create, Fake.destroy);
+        var held_live = true;
+        defer if (held_live) held.release();
+        var short: ?Pool.Lease = if (retire_epoch) null else try pool.joinBounded(.{}, capacity, limit, &fake, Fake.create, Fake.destroy);
+        defer if (short) |*lease| lease.release();
+        var worker = try std.testing.io.concurrent(Fake.join, .{ &pool, &fake, capacity, limit });
+        defer worker.cancel(std.testing.io) catch {};
+        try Fake.waitQueued(&pool);
+        if (short) |*lease| {
+            lease.release();
+            short = null;
+        } else {
+            held.release();
+            held_live = false;
+        }
+        try worker.await(std.testing.io);
+        try std.testing.expect(pool.waiters == null);
+        try std.testing.expect(pool.event_waits.load(.monotonic) > 0);
+        try std.testing.expectEqual(@as(usize, 0), pool.poll_waits.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, if (retire_epoch) 2 else 1), fake.created);
+        if (held_live) {
+            held.release();
+            held_live = false;
+        }
+        try std.testing.expectEqual(fake.created, fake.destroyed);
+        try std.testing.expect(pool.context == null and pool.users == 0);
+    }
+}
+
+test "LightOnOCR3 shared reader pool removes cancelled and expired parked joins" {
+    const Fake = struct {
+        checks: usize = 0,
+        fn create(raw: *anyopaque) !*anyopaque {
+            return raw;
+        }
+        fn destroy(_: *anyopaque) void {}
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= 6) return error.Cancelled;
+        }
+    };
+    var fake = Fake{};
+    var pool = Pool{};
+    var held = try pool.join(.{}, 1, &fake, Fake.create, Fake.destroy);
+    defer held.release();
+    try std.testing.expectError(error.Cancelled, pool.join(.{ .io = std.testing.io, .ptr = &fake, .check_fn = Fake.check }, 1, &fake, Fake.create, Fake.destroy));
+    try std.testing.expect(pool.waiters == null and pool.users == 1);
+    try std.testing.expect(pool.event_waits.load(.monotonic) > 0);
+    try std.testing.expectError(error.Timeout, pool.join(.{ .io = std.testing.io, .deadline_ns = platform.time.monotonicNs() + std.time.ns_per_ms }, 1, &fake, Fake.create, Fake.destroy));
+    try std.testing.expect(pool.waiters == null and pool.users == 1);
+    try std.testing.expectEqual(@as(usize, 0), pool.poll_waits.load(.monotonic));
 }
 
 /// One serialized workspace peak held until the shared runtime is destroyed.

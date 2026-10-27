@@ -2311,9 +2311,13 @@ static int batch_gate_up_check(termite_metal_decode_runtime *r, size_t rows, siz
                             return 72;
                     } else
                         setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS", "1", 1);
-                    if (termite_metal_decode_runtime_apply_bf16_gate_up_device(
-                            r, 0, 1, (__bridge void *)x, 16, rows, in, out, (__bridge void *)y, 16))
+                    const int gate_up_rc = termite_metal_decode_runtime_apply_bf16_gate_up_device(
+                        r, 0, 1, (__bridge void *)x, 16, rows, in, out, (__bridge void *)y, 16);
+                    if (gate_up_rc != 0) {
+                        fprintf(stderr, "batch_gate_up_dispatch rows=%zu in=%zu out=%zu mode=%zu rc=%d\n",
+                                rows, in, out, mode, gate_up_rc);
                         return 10;
+                    }
                     if (mode == 1 && termite_metal_decode_runtime_end_planned_compute_scope(r))
                         return 73;
                     if (mode == 2)
@@ -4636,15 +4640,21 @@ int main(int argc, const char **argv) {
         const size_t prefill_seqs[]={127,128,432,554,662};
         for(size_t i=0;i<5;i++)for(size_t vh=16;vh<=32;vh+=16)if(prefill_columns_check(r,prefill_seqs[i],vh))return 123;
         if(ocr_residency_check(r))return 121;
-        if (!r->f16_encoder_mpp_pipeline) return 116;
         if (termite_metal_f16_encoder_mpp_shape(127,128,512) || termite_metal_f16_encoder_mpp_shape(524289,128,512) || termite_metal_f16_encoder_mpp_shape(128,129,512)) return 117;
         const bool f16_benchmark = argc == 2 && strcmp(argv[1],"--benchmark-f16-encoder") == 0;
-        for (size_t width=128;width<=1024;width*=2) {
-            if(f16_encoder_check(r,129,width,width,16,false) || f16_encoder_check(r,129,width,width*3,16,false) || f16_encoder_check(r,129,width,width*4,16,false) || f16_encoder_check(r,129,width*4,width,16,false)) return 118;
+        // Florence's F16 encoder rollout remains M4 Max-only.
+        if ([r->device.name isEqualToString:@"Apple M4 Max"]) {
+            if (!r->f16_encoder_mpp_pipeline) return 116;
+            for (size_t width=128;width<=1024;width*=2) {
+                if(f16_encoder_check(r,129,width,width,16,false) || f16_encoder_check(r,129,width,width*3,16,false) || f16_encoder_check(r,129,width,width*4,16,false) || f16_encoder_check(r,129,width*4,width,16,false)) return 118;
+            }
+            if(f16_encoder_check(r,578,768,768,16,false) || f16_encoder_check(r,578,3072,768,16,false) || f16_encoder_check(r,129,1024,768,16,false) || f16_encoder_check(r,127,128,512,16,false) || f16_encoder_check(r,129,128,512,4,false)) return 119;
+            if(f16_encoder_check(r,25088,128,512,16,f16_benchmark) || f16_encoder_check(r,578,768,3072,16,f16_benchmark) || f16_encoder_check(r,2304,512,2048,16,f16_benchmark)) return 120;
+            if(f16_benchmark)return 0;
+        } else {
+            fprintf(stderr, "SKIP: Florence F16 encoder MPP is not qualified on %s\n", r->device.name.UTF8String);
+            if (f16_benchmark) return 77;
         }
-        if(f16_encoder_check(r,578,768,768,16,false) || f16_encoder_check(r,578,3072,768,16,false) || f16_encoder_check(r,129,1024,768,16,false) || f16_encoder_check(r,127,128,512,16,false) || f16_encoder_check(r,129,128,512,4,false)) return 119;
-        if(f16_encoder_check(r,25088,128,512,16,f16_benchmark) || f16_encoder_check(r,578,768,3072,16,f16_benchmark) || f16_encoder_check(r,2304,512,2048,16,f16_benchmark)) return 120;
-        if(f16_benchmark)return 0;
         if (!r->lightonocr3_four_row_segment_pipeline || !r->lightonocr3_mpp_four_row_pipeline) return 114;
         id<MTLComputePipelineState> saved_four_segment = r->lightonocr3_four_row_segment_pipeline;
         id<MTLComputePipelineState> saved_four_mpp = r->lightonocr3_mpp_four_row_pipeline;

@@ -42,8 +42,16 @@ cmp "$pkg_root/src/ops/cuda/lighton_attention.ptx" "$output_dir/lighton_attentio
   --artifact "$output_dir/lighton_attention.ptx" \
   --output "$output_dir/qualification.json"
 
-if [[ "${ANTFLY_LIGHTON_CUDA_CHECK_CHUNK128:-0}" == 1 ]]; then
-  "${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_attention.py" \
-    --artifact "$output_dir/lighton_attention.ptx" --chunk128 \
-    --output "$output_dir/chunk128-qualification.json"
-fi
+"${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_attention.py" \
+  --artifact "$output_dir/lighton_attention.ptx" --chunk128 \
+  --output "$output_dir/chunk128-qualification.json"
+"${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_attention.py" \
+  --artifact "$output_dir/lighton_attention.ptx" --grouped \
+  --output "$output_dir/grouped-qualification.json"
+"${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_attention.py" \
+  --artifact "$output_dir/lighton_attention.ptx" --grouped --chunk128 \
+  --output "$output_dir/grouped-chunk128-qualification.json"
+
+"${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_decode_graph.py" \
+  --artifact "$output_dir/lighton_attention.ptx" \
+  --output "$output_dir/decoder-graph-qualification.json"

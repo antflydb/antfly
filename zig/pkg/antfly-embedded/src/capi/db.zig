@@ -936,7 +936,7 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
             };
         } else connection.gate.mutex.lockUncancelable(handleLockIo());
         guard.connection_gate_held = true;
-        const root = (if (pinned) connection.pin() else connection.refresh()) catch |err| {
+        const root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease)) catch |err| {
             guard.entry_error = capi.mapError(err);
             return guard;
         };

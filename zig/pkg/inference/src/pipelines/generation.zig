@@ -644,9 +644,9 @@ pub fn kvPoolConfig(
     };
 }
 
-/// Request-local CUDA managers track logical pages; the separately attached
-/// KvStorageRuntime owns all cache bytes. Avoid a second full host KV allocation
-/// in the manager. Shared prompt-cache pools keep their existing ownership.
+/// CUDA logical owners do not need host KV mirrors when their numerical
+/// storage uses a device hook. This applies to request managers and both
+/// shared reader-epoch pools. Shared prompt-cache pools retain their ownership.
 pub fn requestKvManagerPoolConfig(storage_config: runtime.kv.pool.KvPoolConfig) runtime.kv.pool.KvPoolConfig {
     var config = storage_config;
     if (config.backend == .cuda) config.store_cpu_bytes = false;
@@ -2533,6 +2533,13 @@ fn shouldUseCudaPrefillGreedyToken(
         config.grammar == null;
 }
 
+fn shouldUsePreparedQwenPrefillGreedyToken(backend: ops.BackendKind, model: gpt_mod.Config, config: GenerationConfig, allow: bool, needs_host_logits: bool, enabled: bool) bool {
+    return !needs_host_logits and model.hasQwen35VisionArchitectureContract() and
+        config.token_observer == null and config.kv_cache_mode == .exact_hybrid and config.cache_compaction_ratio == null and
+        gpt_arch.canUseFastGreedyArgmaxForConfig(model) and
+        shouldUseCudaPrefillGreedyToken(backend, config, allow, model.suppressTokenIds().len != 0, enabled);
+}
+
 fn directPrefillExecutionMutex(
     prepared_multimodal: bool,
     use_cuda_prefill_greedy_token: bool,
@@ -3375,10 +3382,16 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn appendGeneratedToken(self: *NativeDecodeState) !void {
+        const lock = if (self.isPaged()) self.lockPagedKv() else null;
+        defer if (lock) |mutex| mutex.unlock();
+        try self.appendGeneratedTokenWithKvLockHeld();
+    }
+
+    /// The graph owner takes the common KV lock before its own mutex and
+    /// retains both through readback. Page retirement uses that same order.
+    fn appendGeneratedTokenWithKvLockHeld(self: *NativeDecodeState) !void {
         self.total_tokens += 1;
         if (self.isPaged()) {
-            const lock = self.lockPagedKv();
-            defer if (lock) |mutex| mutex.unlock();
             try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, 1);
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
@@ -3829,6 +3842,27 @@ pub fn buildOwnedMixedBatchDecodeContext(
     return buildOwnedMixedBatchDecodeContextWithMrope(allocator, items, null);
 }
 
+/// Wide graph steps retain the packed builder's explicit-position contract.
+/// `lengths` belongs to the caller for the lifetime of the returned context;
+/// positions are copied into its owned metadata before this helper returns.
+fn buildOwnedLightOnGraphDecodeContext(
+    allocator: std.mem.Allocator,
+    items: []const MixedBatchDecodeItem,
+    lengths: []const usize,
+) !OwnedBatchDecodeContext {
+    if (items.len > gpt_arch.max_packed_qwen_items or lengths.len != items.len) return error.InvalidPackedQueryShape;
+    for (items, lengths) |item, len| if (len != 1 or item.query_sequence_len != 1) return error.InvalidPackedQueryShape;
+    if (items.len <= 64) return buildOwnedMixedBatchDecodeContext(allocator, items);
+    var positions: [3 * gpt_arch.max_packed_qwen_items]u32 = undefined;
+    for (items, 0..) |item, row| {
+        var decode = BorrowedDecodeStateRuntime.init(item.state);
+        const context = decode.makeDecodeContext(item.total_sequence_len, 1);
+        const axes = context.mrope_positions orelse return error.Qwen3VlMropePositionsRequired;
+        for (0..3) |axis| positions[axis * items.len + row] = axes[axis];
+    }
+    return buildOwnedMixedBatchDecodeContextLayout(allocator, items, positions[0 .. 3 * items.len], lengths);
+}
+
 fn buildOwnedMixedBatchDecodeContextWithMrope(
     allocator: std.mem.Allocator,
     items: []const MixedBatchDecodeItem,
@@ -4097,7 +4131,7 @@ pub const PreEncodedPrompt = struct {
 /// Runs autoregressive decoding: tokenize → loop(gpt_arch.forward → sample → append).
 pub const QwenPrefillBatchHook = struct {
     ptr: *anyopaque,
-    run_fn: *const fn (*anyopaque, *NativeGenerationPipeline, *qwen3vl_projector.PreparedPrompt, usize, *NativeDecodeState) anyerror!?[]f32,
+    run_fn: *const fn (*anyopaque, *NativeGenerationPipeline, *qwen3vl_projector.PreparedPrompt, usize, *NativeDecodeState, bool) anyerror!NativeGenerationPipeline.PrefillOutput,
 };
 
 pub const QwenVisionBatchHook = struct {
@@ -4163,6 +4197,9 @@ pub const NativeGenerationPipeline = struct {
     prepared_lighton_decode: bool = false,
     single_frame_lighton_decode: bool = false,
     gpu_token_burst_lighton_decode: bool = false,
+    lighton_cuda_execution_id: u64 = 0,
+    lighton_graph_attempts: u64 = 0,
+    lighton_graph_declines: [8]u64 = @splat(0),
     gpu_token_burst_width: u8 = 2,
     packed_prefill_items: u8 = 1,
     /// Zero retains whole-prefix prefill; captured by the owning reader epoch.
@@ -5387,6 +5424,8 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         query_seq_len: usize,
         wants_last_logits: bool,
+        wants_greedy: bool = false,
+        greedy_token: ?u32 = null,
         allow_shared_kv_prefill: bool = false,
         logits: ?[]f32 = null,
         failure: ?anyerror = null,
@@ -5852,7 +5891,7 @@ pub const NativeGenerationPipeline = struct {
                     // before taking the GPU lock. Prompt assembly stays under
                     // the ordinary lock after projected outputs return.
                     var batched: ?qwen3vl_projector.ProjectedImages = null;
-                    errdefer if (batched) |*value| value.deinit();
+                    errdefer if (batched) |*value| self.retireBatchedProjectedImages(value);
                     if (config.qwen3vl_parity_json_path == null) if (self.qwen_vision_batch) |hook| {
                         batched = try hook.encode_fn(hook.ptr, allocator, images, vision_limits);
                     };
@@ -6115,7 +6154,14 @@ pub const NativeGenerationPipeline = struct {
         const prefill_output = if (self.checkpoint_resume) |request|
             try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
         else if (prepared_qwen3vl_prompt) |*prepared|
-            PrefillOutput{ .last_logits = try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state) }
+            try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state, shouldUsePreparedQwenPrefillGreedyToken(
+                self.cb.kind(),
+                self.gpt_config,
+                config,
+                allow_prefill_greedy_token and !use_speculative and !has_any_grammar,
+                self.checkpoint_prepare != null or config.qwen3vl_parity_json_path != null or config.qwen3vl_parity_logits_path != null or firstTokenTopKTraceCount() > 0 or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE"),
+                enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken(),
+            ))
         else if (prepared_multimodal_prompt) |*prepared|
             try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden)
         else
@@ -7147,7 +7193,7 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
-    const PrefillOutput = struct {
+    pub const PrefillOutput = struct {
         last_logits: ?[]f32 = null,
         greedy_token: ?usize = null,
         last_hidden: ?ops.CT = null,
@@ -8235,7 +8281,8 @@ pub const NativeGenerationPipeline = struct {
         prepared: *qwen3vl_projector.PreparedPrompt,
         seq_len: usize,
         decode_state: *NativeDecodeState,
-    ) !?[]f32 {
+        wants_greedy: bool,
+    ) !PrefillOutput {
         if (prepared.plan.tokenCount() != seq_len or !decode_state.isPaged()) return error.InvalidPreparedPrompt;
         // A chunk-sized epoch workspace cannot admit the direct full-prefix
         // fallback. Reject unsupported routing before cache or GPU mutation.
@@ -8244,7 +8291,7 @@ pub const NativeGenerationPipeline = struct {
         try decode_state.ensureQwen35LinearCache(self.gpt_config);
         decode_state.resetQwen35LinearCache();
         if (self.qwen_prefill_batch) |hook| if (prepared.deepstack_layer_count == 0) {
-            return hook.run_fn(hook.ptr, self, prepared, seq_len, decode_state);
+            return hook.run_fn(hook.ptr, self, prepared, seq_len, decode_state, wants_greedy);
         };
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var direct_prefill_turn_acquired = false;
@@ -8292,7 +8339,7 @@ pub const NativeGenerationPipeline = struct {
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
         }
-        return logits;
+        return .{ .last_logits = logits };
     }
 
     const DecodeResult = struct {
@@ -12818,8 +12865,21 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn retireBatchedProjectedImages(self: *NativeGenerationPipeline, projected: *qwen3vl_projector.ProjectedImages) void {
+        const device = projected.device_embeddings != null;
+        if (device) if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
+        defer if (device) if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        projected.deinit();
+    }
+
     pub fn deinit(self: *NativeGenerationPipeline) void {
-        _ = self;
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3") and self.lighton_cuda_execution_id != 0 and
+            platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"))
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_attempts={d} declines={any}\n", .{ self.lighton_graph_attempts, self.lighton_graph_declines });
+        if (comptime build_options.enable_cuda) {
+            if (self.lighton_cuda_execution_id != 0)
+                @import("../ops/cuda/cuda_compute.zig").CudaCompute.endLightOnDecodeGraphEpoch(&self.cb, self.lighton_cuda_execution_id);
+        }
         // ComputeBackend and tokenizer are borrowed — caller manages their lifetime.
     }
 
@@ -13033,7 +13093,7 @@ pub const NativeGenerationPipeline = struct {
 
     /// Queue a resident visual prefix alongside ordinary decode work. The
     /// scheduler owns the stack-backed work until it publishes completion.
-    pub fn runScheduledPreparedQwenPrefill(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize) ![]f32 {
+    pub fn runScheduledPreparedQwenPrefill(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize, wants_greedy: bool) !PrefillOutput {
         const scheduler = self.scheduler orelse return error.InvalidBatchDecodeState;
         const lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState;
         const io = self.io orelse return error.MissingIo;
@@ -13048,7 +13108,7 @@ pub const NativeGenerationPipeline = struct {
             const final = end == seq;
             var decode_runtime = BorrowedDecodeStateRuntime.init(state);
             const context = decode_runtime.makeDecodeContext(end, query);
-            var work = PendingPrefillBatchWork{ .allocator = self.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .prepared_prompt = prepared };
+            var work = PendingPrefillBatchWork{ .allocator = self.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .wants_greedy = final and wants_greedy, .prepared_prompt = prepared };
             defer if (work.logits) |logits| work.allocator.free(logits);
             try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), end, query, context.kv_sequence_len, context.kv_position_offset, pendingWorkOptionsFromState(state, query));
             defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
@@ -13060,9 +13120,13 @@ pub const NativeGenerationPipeline = struct {
             if (state.total_tokens != end) return error.InvalidBatchDecodeState;
             scheduler.notePrefillProgress(lease, end, seq);
             if (final) {
+                if (work.greedy_token) |token| {
+                    if (!wants_greedy or work.logits != null or token >= self.gpt_config.vocab_size) return error.InvalidBatchDecodeState;
+                    return .{ .greedy_token = token };
+                }
                 const logits = work.logits orelse return error.InvalidBatchDecodeState;
                 work.logits = null;
-                return logits;
+                return .{ .last_logits = logits };
             }
             processed = end;
         }
@@ -13072,9 +13136,17 @@ pub const NativeGenerationPipeline = struct {
     /// Output of a successful step forward pass: the heap-allocated logits row
     /// buffer and the maximum query sequence length used to size each row.
     /// Caller owns the logits buffer.
+    const packed_head_rows = @import("packed_head_rows.zig");
+    const PrefixLogitsLayout = packed_head_rows.PrefixLogitsLayout;
+
+    fn prefillHasHostRow(work: *const PendingPrefillBatchWork, layout: PrefixLogitsLayout) bool {
+        return !work.wants_greedy and (layout == .all_host_rows or work.wants_last_logits);
+    }
+
     const StepForwardResult = struct {
         greedy_tokens: ?[]u32 = null,
         packed_greedy_tokens: ?[]u32 = null,
+        prefix_logits_layout: PrefixLogitsLayout = .all_host_rows,
         // Additional outputs, step-major: (steps - 1) * cohort rows.
         second_greedy_tokens: ?[]u32 = null,
         logits: ?[]f32,
@@ -13246,6 +13318,43 @@ pub const NativeGenerationPipeline = struct {
         return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = rest, .max_query_seq_len = 1 };
     }
 
+    fn tryLightOnCudaTokenBurst(
+        self: *NativeGenerationPipeline,
+        claimed: []const runtime.scheduler.native_generate.StepItem,
+        items: []MixedBatchDecodeItem,
+        input_ids: []const i64,
+        first_context: *gpt_arch.DecodeContext,
+    ) !?StepForwardResult {
+        if (!self.gpu_token_burst_lighton_decode or self.execution_lock == null) return null;
+
+        var steps: usize = std.math.clamp(@as(usize, self.gpu_token_burst_width), 2, max_gpu_token_burst_width);
+        const eligible = eligible: {
+            for (claimed) |item| {
+                const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                const sequence = work.sequence orelse break :eligible false;
+                if (sequence.generated >= sequence.max_tokens or sequence.max_tokens - sequence.generated < 2 or
+                    sequence.seq_len.* > sequence.token_ids.len or sequence.token_ids.len - sequence.seq_len.* < 2) break :eligible false;
+                steps = @min(steps, @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*));
+            }
+            break :eligible true;
+        };
+        if (eligible) {
+            const embedding = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+            defer self.cb.free(embedding);
+            const head = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
+            defer self.cb.free(head);
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.beginLightOnTokenBurst(&self.cb, embedding, claimed.len, steps, self.gpt_config.hidden_size, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds())) |prepared| {
+                var burst = prepared;
+                defer burst.deinit();
+                // No fallback is permitted after this first forward
+                // has changed any independent recurrent/KV state.
+                return try self.finishLightOnCudaTokenBurst(claimed, items, input_ids, first_context, head, &burst);
+            }
+        }
+
+        return null;
+    }
+
     /// Queue a bounded chain of dependent CUDA tokens without a host read
     /// between forwards. Existing publication handles EOS, cancellation and
     /// the reserved KV count only after the entire claimed chain has drained.
@@ -13269,9 +13378,30 @@ pub const NativeGenerationPipeline = struct {
         errdefer self.allocator.free(first);
         const rest = try self.allocator.alloc(u32, (burst.steps - 1) * claimed.len);
         errdefer self.allocator.free(rest);
+        const wide = claimed.len > 64;
+        var recurrent_groups: usize = 0;
+        var recurrent_rows: usize = 0;
+        var attention_groups: usize = 0;
+        var attention_rows: usize = 0;
+        const original_recurrent_groups = first_context.packed_recurrent_groups;
+        const original_recurrent_rows = first_context.packed_recurrent_rows;
+        const original_attention_groups = first_context.packed_attention_groups;
+        const original_attention_rows = first_context.packed_attention_rows;
+        if (wide) {
+            first_context.packed_recurrent_groups = &recurrent_groups;
+            first_context.packed_recurrent_rows = &recurrent_rows;
+            first_context.packed_attention_groups = &attention_groups;
+            first_context.packed_attention_rows = &attention_rows;
+        }
+        defer {
+            first_context.packed_recurrent_groups = original_recurrent_groups;
+            first_context.packed_recurrent_rows = original_recurrent_rows;
+            first_context.packed_attention_groups = original_attention_groups;
+            first_context.packed_attention_rows = original_attention_rows;
+        }
         try self.cb.checkExecutionControl();
         {
-            const hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(&self.cb, self.allocator, self.gpt_config, input_ids, claimed.len, 1, first_context, "gpt.cuda_token_burst");
+            const hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(&self.cb, self.allocator, self.gpt_config, input_ids, if (wide) 1 else claimed.len, if (wide) claimed.len else 1, first_context, "gpt.cuda_token_burst");
             defer self.cb.free(hidden);
             const logits = try self.cb.linearNoBias(hidden, head, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
             defer self.cb.free(logits);
@@ -13289,26 +13419,304 @@ pub const NativeGenerationPipeline = struct {
                 item.kv_sequence_len = context.kv_sequence_len;
                 item.kv_position_offset = context.kv_position_offset;
             }
-            const metadata_bytes = 64 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
+            const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
             var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&metadata);
-            var context = try buildOwnedMixedBatchDecodeContext(fba.allocator(), items);
+            const lengths: [128]usize = @splat(1);
+            var context = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), items, lengths[0..items.len]);
             defer context.deinit();
             context.context.prepared_lighton_decode = true;
+            if (wide) {
+                context.context.packed_recurrent_groups = &recurrent_groups;
+                context.context.packed_recurrent_rows = &recurrent_rows;
+                context.context.packed_attention_groups = &attention_groups;
+                context.context.packed_attention_rows = &attention_rows;
+            }
             const embedded = try burst.embedding(step - 1);
-            const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(&self.cb, self.allocator, self.gpt_config, embedded, .{}, claimed.len, 1, &context.context, null);
+            const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(&self.cb, self.allocator, self.gpt_config, embedded, .{}, if (wide) 1 else claimed.len, if (wide) claimed.len else 1, &context.context, null);
             defer self.cb.free(hidden.hidden);
             const logits = try self.cb.linearNoBias(hidden.hidden, head, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
             defer self.cb.free(logits);
             try burst.argmax(logits, step);
         }
-        var host: [max_gpu_token_burst_width * 64]u32 = undefined;
-        try burst.read(host[0 .. burst.steps * claimed.len]);
+        var host: [max_gpu_token_burst_width * 128]u32 = undefined;
+        try self.readLightOnCudaBurst(burst, host[0 .. burst.steps * claimed.len]);
         try self.cb.checkExecutionControl();
         @memcpy(first, host[0..claimed.len]);
         @memcpy(rest, host[claimed.len .. burst.steps * claimed.len]);
         burst.noteCompleted();
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+            std.debug.print("LIGHTONOCR3 cuda_token_burst_rows={d} steps={d}\n", .{ claimed.len, burst.steps });
+            if (wide) {
+                std.debug.print("LIGHTONOCR3 packed_step_prefill_items=0 packed_step_decode_items={d} packed_step_query_rows={d}\n", .{ claimed.len, claimed.len });
+                std.debug.print("LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows={d}\n", .{self.prepared_qwen_prefill_chunk_rows});
+                std.debug.print("LIGHTONOCR3 packed_recurrent_groups={d} packed_recurrent_rows={d}\n", .{ recurrent_groups, recurrent_rows });
+                std.debug.print("LIGHTONOCR3 packed_attention_groups={d} packed_attention_rows={d}\n", .{ attention_groups, attention_rows });
+            }
+        }
         return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = rest, .max_query_seq_len = 1 };
+    }
+
+    /// Every queued consumer and its claimed pages remain owned while the
+    /// lane admits independent vision/prompt work. Cleanup reacquires the lane
+    /// even for cancellation or a CUDA error before retiring any resource.
+    fn waitOutsideLightOnExecution(self: *NativeGenerationPipeline, pending: anytype) !void {
+        const mutex = self.execution_lock orelse return error.InvalidBatchDecodeState;
+        self.unlockExecution(mutex);
+        const waited = pending.wait();
+        self.lockExecutionForCleanup(mutex);
+        try waited;
+    }
+
+    fn readLightOnCudaBurst(self: *NativeGenerationPipeline, burst: anytype, output: []u32) !void {
+        if (try burst.beginRead(output.len)) |queued| {
+            var pending = queued;
+            defer pending.deinit();
+            const before = burst.owner.ctx.stats.kernel_launches;
+            try self.waitOutsideLightOnExecution(&pending);
+            try pending.copy(std.mem.sliceAsBytes(output));
+            burst.noteReadCompleted(before);
+        } else try burst.read(output);
+    }
+
+    /// Execute only inside the reader epoch's model lane. The two-step graph
+    /// returns through the existing bounded-burst publication contract.
+    fn declineLightOnGraph(self: *NativeGenerationPipeline, reason: u3) ?StepForwardResult {
+        self.lighton_graph_declines[reason] += 1;
+        return null;
+    }
+
+    fn tryLightOnCudaDecodeGraph(
+        self: *NativeGenerationPipeline,
+        claimed: []const runtime.scheduler.native_generate.StepItem,
+        items: []MixedBatchDecodeItem,
+        input_ids: []const i64,
+        first_context: *gpt_arch.DecodeContext,
+    ) !?StepForwardResult {
+        const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+        if (!C.lightOnDecodeGraphEnabled(&self.cb) or claimed.len < 2 or claimed.len > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or first_context.mrope_positions == null)
+            return self.tryOrderedLightOnCudaDecodeGraph(claimed, items, input_ids, first_context);
+        std.debug.assert(items.len == claimed.len and input_ids.len == claimed.len);
+        var sequences: [128]u64 = undefined;
+        var order: [128]usize = undefined;
+        for (items, 0..) |item, i| sequences[i] = item.state.sequence_id orelse
+            return self.tryOrderedLightOnCudaDecodeGraph(claimed, items, input_ids, first_context);
+        try @import("../ops/cuda/lighton_decode_graph.zig").canonicalOrder(sequences[0..claimed.len], order[0..claimed.len]);
+        var identity = true;
+        for (order[0..claimed.len], 0..) |original, row| identity = identity and original == row;
+        if (identity) return self.tryOrderedLightOnCudaDecodeGraph(claimed, items, input_ids, first_context);
+        var ordered_claims: [128]runtime.scheduler.native_generate.StepItem = undefined;
+        var ordered_items: [128]MixedBatchDecodeItem = undefined;
+        var ordered_ids: [128]i64 = undefined;
+        for (order[0..claimed.len], 0..) |original, row| {
+            ordered_claims[row] = claimed[original];
+            ordered_items[row] = items[original];
+            ordered_ids[row] = input_ids[original];
+        }
+        const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
+        var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&metadata);
+        const lengths: [128]usize = @splat(1);
+        var context = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), ordered_items[0..claimed.len], lengths[0..claimed.len]);
+        defer context.deinit();
+        context.context.prepared_lighton_decode = true;
+        const result = (try self.tryOrderedLightOnCudaDecodeGraph(ordered_claims[0..claimed.len], ordered_items[0..claimed.len], ordered_ids[0..claimed.len], &context.context)) orelse return null;
+        const first = result.greedy_tokens.?;
+        const second = result.second_greedy_tokens.?;
+        std.debug.assert(first.len == claimed.len and second.len == claimed.len);
+        var first_original: [128]u32 = undefined;
+        var second_original: [128]u32 = undefined;
+        for (order[0..claimed.len], 0..) |original, row| {
+            first_original[original] = first[row];
+            second_original[original] = second[row];
+        }
+        @memcpy(first, first_original[0..claimed.len]);
+        @memcpy(second, second_original[0..claimed.len]);
+        return result;
+    }
+
+    fn tryOrderedLightOnCudaDecodeGraph(
+        self: *NativeGenerationPipeline,
+        claimed: []const runtime.scheduler.native_generate.StepItem,
+        items: []MixedBatchDecodeItem,
+        input_ids: []const i64,
+        first_context: *gpt_arch.DecodeContext,
+    ) !?StepForwardResult {
+        const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+        self.lighton_graph_attempts += 1;
+        if (self.lighton_cuda_execution_id == 0 or self.execution_lock == null or !C.lightOnDecodeGraphEnabled(&self.cb) or
+            claimed.len < 2 or claimed.len > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or self.gpt_config.suppressTokenIds().len != 0) return self.declineLightOnGraph(0);
+        if (claimed.len > 64 and claimed.len % 64 == 1) return self.declineLightOnGraph(0);
+        try self.cb.checkExecutionControl();
+        const Key = struct {
+            words: [24576]u64 = undefined,
+            len: usize = 0,
+            fn add(key: *@This(), word: u64) !void {
+                if (key.len == key.words.len) return error.InvalidShape;
+                key.words[key.len] = word;
+                key.len += 1;
+            }
+        };
+        var key = Key{};
+        const storage = items[0].state.kv_storage orelse return self.declineLightOnGraph(1);
+        const manager = items[0].state.kv_manager orelse return self.declineLightOnGraph(1);
+        const positions = first_context.mrope_positions orelse return self.declineLightOnGraph(1);
+        if (positions.len != claimed.len * 3) return self.declineLightOnGraph(1);
+        const kv_lock = items[0].state.kv_lock orelse return self.declineLightOnGraph(1);
+        for (items) |item| if (item.state.kv_lock != kv_lock) return self.declineLightOnGraph(1);
+        platform.sync.lockYielding(kv_lock);
+        defer kv_lock.unlock();
+        var future: [128]usize = undefined;
+        var max_future: usize = 0;
+        for (claimed, items, 0..) |item, mixed, i| {
+            const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+            const sequence = work.sequence orelse return self.declineLightOnGraph(2);
+            if (item.phase != .decode or item.query_sequence_len != 1 or !work.wants_greedy or
+                sequence.generated >= sequence.max_tokens or sequence.max_tokens - sequence.generated < 2 or
+                sequence.seq_len.* > sequence.token_ids.len or sequence.token_ids.len - sequence.seq_len.* < 2 or
+                mixed.state.kv_manager != manager or mixed.state.kv_storage != storage or mixed.state.sequence_id == null or
+                mixed.state.force_full_recompute or mixed.state.kv_compacted or mixed.state.allow_swa_ring or
+                mixed.kv_position_offset != 0 or mixed.kv_sequence_len != mixed.total_sequence_len or
+                mixed.state.qwen35_linear_cache == null) return self.declineLightOnGraph(2);
+            const remaining = @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*);
+            future[i] = try std.math.add(usize, item.total_sequence_len, remaining);
+            if (future[i] > 1024) return self.declineLightOnGraph(3);
+            if (storage.storage.config.sliding_window_size) |window|
+                if (future[i] > window) return self.declineLightOnGraph(3);
+            max_future = @max(max_future, future[i]);
+        }
+        const embedding = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(embedding);
+        const head = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(head);
+        const embedding_pointer = C.lightOnGraphWeightPointer(&self.cb, embedding) orelse return self.declineLightOnGraph(4);
+        const head_pointer = C.lightOnGraphWeightPointer(&self.cb, head) orelse return self.declineLightOnGraph(4);
+        try key.add(self.lighton_cuda_execution_id);
+        try key.add(claimed.len);
+        try key.add(self.gpt_config.hidden_size);
+        try key.add(self.gpt_config.vocab_size);
+        try key.add(embedding_pointer);
+        try key.add(head_pointer);
+        try key.add(C.lightOnGraphWorkspacePointer(&self.cb));
+        var attention_layers: [128]usize = undefined;
+        var attention_count: usize = 0;
+        const first_cache = &items[0].state.qwen35_linear_cache.?;
+        for (first_cache.layers, 0..) |*layer, layer_index| {
+            if (!self.gpt_config.layerUsesQwen35LinearAttention(layer_index)) {
+                if (attention_count == attention_layers.len) return self.declineLightOnGraph(5);
+                // Native attention addresses the compact full-attention KV
+                // layers; recurrent decoder layers have no KV storage slot.
+                attention_layers[attention_count] = self.gpt_config.compactQwen35KvStorageLayerIndex(layer_index) orelse return self.declineLightOnGraph(5);
+                attention_count += 1;
+                continue;
+            }
+            for (items, 0..) |item, row| {
+                const cache = &item.state.qwen35_linear_cache.?;
+                if (cache.layers.len != first_cache.layers.len) return self.declineLightOnGraph(5);
+                const state = &cache.layers[layer_index].cuda_device;
+                if (!C.lightOnGraphStateOwned(&self.cb, state)) return self.declineLightOnGraph(5);
+                if (row % 64 == 0) for (state.weights) |weight| try key.add(weight.ptr);
+                // BF16 convolution filters are widened into independently
+                // owned page copies. The batch kernel already uses the first
+                // page's copy for all peers; prove the immutable source IDs,
+                // while the key above retains the actual captured pointers.
+                for (state.weight_sources, layer.cuda_device.weight_sources) |source, expected|
+                    if (source == 0 or source != expected) return self.declineLightOnGraph(6);
+                try key.add(state.recurrent.ptr);
+                try key.add(state.history[0].ptr);
+                try key.add(state.history[1].ptr);
+            }
+        }
+        // Reserve only the originally authorized remaining generation budget.
+        // This adds physical capacity without making a future token visible.
+        for (items, 0..) |item, i| {
+            const state = item.state;
+            const sequence = state.sequence_id.?;
+            const table = storage.blockTable(sequence) orelse return self.declineLightOnGraph(1);
+            if (table.shared_prefix_blocks != 0) return self.declineLightOnGraph(3);
+            try manager.reserveTokenCapacity(sequence, future[i]);
+            try storage.reserveDeviceTokenCapacity(sequence, future[i], future[i]);
+            const blocks = try storage.logicalBlocksWithReservations(sequence);
+            if (blocks.len == 0 or blocks.len > 64) return self.declineLightOnGraph(3);
+            try key.add(sequence);
+            try key.add(future[i]);
+            try key.add(blocks.len);
+            for (blocks) |block| try key.add(block);
+        }
+        var kv_words: [193]u64 = undefined;
+        const kv_count = try C.lightOnGraphKvWords(&self.cb, storage, items[0].state.sequence_id.?, max_future, attention_layers[0..attention_count], &kv_words);
+        for (kv_words[0..kv_count]) |word| try key.add(word);
+        const prepared = (try C.beginLightOnDecodeGraph(&self.cb, self.lighton_cuda_execution_id, key.words[0..key.len], positions, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size, max_future, attention_count, self.gpt_config.num_hidden_layers - attention_count)) orelse return self.declineLightOnGraph(7);
+        var graph = prepared;
+        defer graph.deinit();
+        errdefer {
+            for (items) |item| if (item.state.qwen35_linear_cache) |cache| for (cache.layers) |*layer| {
+                layer.cuda_device.failed = true;
+            };
+            graph.compute.lighton_decode_graph.clear(&graph.compute.ctx) catch {};
+        }
+        var burst = try graph.burst(embedding, self.gpt_config.vocab_size);
+        defer burst.deinit();
+        const first = try self.allocator.alloc(u32, claimed.len);
+        errdefer self.allocator.free(first);
+        const second = try self.allocator.alloc(u32, claimed.len);
+        errdefer self.allocator.free(second);
+        const embedded = try self.cb.embeddingLookup(embedding, input_ids, claimed.len, self.gpt_config.hidden_size);
+        defer self.cb.free(embedded);
+        try graph.setInput(embedded);
+        const Render = struct {
+            pipeline: *NativeGenerationPipeline,
+            items: []MixedBatchDecodeItem,
+            max_tokens: usize = 0,
+            burst: *C.LightOnTokenBurst,
+            head: ops.CT,
+            fn advanceCpu(render: *@This()) !void {
+                for (render.items) |*item| {
+                    try item.state.appendGeneratedTokenWithKvLockHeld();
+                    item.total_sequence_len += 1;
+                    var decode = BorrowedDecodeStateRuntime.init(item.state);
+                    const context = decode.makeDecodeContext(item.total_sequence_len, 1);
+                    item.kv_sequence_len = context.kv_sequence_len;
+                    item.kv_position_offset = context.kv_position_offset;
+                    render.max_tokens = @max(render.max_tokens, item.kv_sequence_len);
+                }
+            }
+            fn run(raw: *anyopaque, claim: *C.LightOnGraphClaim) !void {
+                const render: *@This() = @ptrCast(@alignCast(raw));
+                const pipeline = render.pipeline;
+                for (0..2) |step| {
+                    try pipeline.cb.checkExecutionControl();
+                    if (step == 1) try render.advanceCpu();
+                    const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
+                    var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
+                    var fba = std.heap.FixedBufferAllocator.init(&metadata);
+                    const lengths: [128]usize = @splat(1);
+                    var context = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), render.items, lengths[0..render.items.len]);
+                    defer context.deinit();
+                    context.context.prepared_lighton_decode = true;
+                    claim.beginStep(step);
+                    const input = if (step == 0) try claim.input() else try render.burst.embedding(0);
+                    const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(&pipeline.cb, pipeline.allocator, pipeline.gpt_config, input, .{}, if (render.items.len > 64) 1 else render.items.len, if (render.items.len > 64) render.items.len else 1, &context.context, null);
+                    defer pipeline.cb.free(hidden.hidden);
+                    const logits = try claim.projectHead(&pipeline.cb, hidden.hidden, render.head);
+                    defer pipeline.cb.free(logits);
+                    try render.burst.argmax(logits, step);
+                    try claim.advance();
+                }
+            }
+        };
+        var render = Render{ .pipeline = self, .items = items, .burst = &burst, .head = head };
+        if (graph.compute.lighton_decode_graph.phase == .replay) try render.advanceCpu();
+        try self.cb.checkExecutionControl();
+        try graph.run(&render, Render.run);
+        graph.noteKvTokens(storage, render.max_tokens);
+        var host: [256]u32 = undefined;
+        try graph.read(&burst, host[0 .. 2 * claimed.len]);
+        try self.cb.checkExecutionControl();
+        @memcpy(first, host[0..claimed.len]);
+        @memcpy(second, host[claimed.len .. 2 * claimed.len]);
+        burst.noteCompleted();
+        return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = second, .max_query_seq_len = 1 };
     }
 
     fn checkPreparedQwenContinuation(self: *const NativeGenerationPipeline) !void {
@@ -13396,6 +13804,29 @@ pub const NativeGenerationPipeline = struct {
         const wide_cuda_decode = cuda_packed and claimed.len > 64 and
             platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128");
         if ((prefill_count == 0 and !wide_cuda_decode) or prefill_count > self.packed_prefill_items or try gpt_arch.packedQueryRowCount(lengths[0..claimed.len]) != total) return error.InvalidPackedQueryShape;
+        if (comptime build_options.enable_cuda) {
+            // all_decode_greedy describes decode peers even in a mixed
+            // prefill claim. Only a completely decoded cohort may replay.
+            if (wide_cuda_decode and prefill_count == 0 and all_decode_greedy and self.lighton_cuda_execution_id != 0) {
+                var ids: [gpt_arch.max_packed_qwen_items]i64 = undefined;
+                for (claimed, 0..) |item, i| {
+                    const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                    ids[i] = work.token_id;
+                }
+                const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
+                var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
+                var fba = std.heap.FixedBufferAllocator.init(&metadata);
+                var context = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), mixed[0..claimed.len], lengths[0..claimed.len]);
+                defer context.deinit();
+                context.context.prepared_lighton_decode = true;
+                if (try self.tryLightOnCudaDecodeGraph(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context.context)) |result| return result;
+                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraph(&self.cb);
+                // Eager decode introduces shapes absent from a mixed prefix
+                // frame; reserve bounded plan slots before enqueueing them.
+                try @import("../ops/cuda/cuda_compute.zig").CudaCompute.prepareLightOnMatmulFrame(&self.cb);
+                if (try self.tryLightOnCudaTokenBurst(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context.context)) |result| return result;
+            }
+        }
         // The combined CPU logits and independent result copies coexist during
         // publication. Admit that complete lifetime before allocating metadata.
         var gpu_choices = false;
@@ -13403,16 +13834,47 @@ pub const NativeGenerationPipeline = struct {
             if (all_decode_greedy and prefill_count < claimed.len and !cb.decoderRuntimeHasActiveFrame())
                 gpu_choices = @import("../ops/metal_compute.zig").MetalCompute.reserveLightOnFrameArgmax(cb, claimed.len, cfg.vocab_size);
         }
-        if (cuda_packed) gpu_choices = all_decode_greedy and prefill_count < claimed.len;
+        var greedy_prefills: usize = 0;
+        for (claimed) |item| if (item.phase == .prefill) {
+            const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+            if (work.wants_greedy) greedy_prefills += 1;
+        };
+        if (cuda_packed) gpu_choices = all_decode_greedy and (prefill_count < claimed.len or greedy_prefills > 0);
+        const prefix_logits_layout: PrefixLogitsLayout = if (cuda_packed and gpu_choices) .final_host_rows else .all_host_rows;
+        var host_prefills: usize = 0;
+        var active_heads: [packed_head_rows.capacity]bool = @splat(true);
+        for (claimed, 0..) |item, index| if (item.phase == .prefill) {
+            const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+            host_prefills += @intFromBool(prefillHasHostRow(work, prefix_logits_layout));
+            if (cuda_packed and gpu_choices) active_heads[index] = work.wants_last_logits;
+        };
+        const head_rows = try packed_head_rows.Plan.init(active_heads[0..claimed.len]);
+        const needs_logits = scheduledStepNeedsLogits(claimed);
         const shared_frame = !cuda_packed and self.packed_shared_frame and gpu_choices;
         const trace_frame = platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3");
         const before_submits = if (trace_frame) cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits else 0;
-        // Greedy decode returns token IDs. Only prefills retain independent
-        // vocabulary rows, so admission follows the actual output lifetime.
-        const host_rows = if (gpu_choices) prefill_count else claimed.len;
+        // Device-greedy rows return token IDs. Only host-sampled prefixes
+        // retain vocabulary rows and their independent publication copies.
+        const host_rows = if (!needs_logits) 0 else if (gpu_choices) host_prefills else claimed.len;
         const logits_bytes = try std.math.mul(usize, try std.math.mul(usize, host_rows, cfg.vocab_size), 2 * @sizeOf(f32));
         const positions_bytes = try std.math.mul(usize, total, 3 * @sizeOf(u32));
-        const host_bytes = try std.math.add(usize, try std.math.add(usize, logits_bytes, positions_bytes), (if (claimed.len > 64) @as(usize, 64) else 32) * 1024);
+        const head_metadata_bytes = @sizeOf(packed_head_rows.Plan) + @sizeOf(@TypeOf(active_heads)) + claimed.len * @sizeOf(u32);
+        const host_bytes = try std.math.add(usize, try std.math.add(usize, logits_bytes, positions_bytes), (if (claimed.len > 64) @as(usize, 64) else 32) * 1024 + head_metadata_bytes);
+        var recurrent_groups: usize = 0;
+        var recurrent_rows: usize = 0;
+        var attention_groups: usize = 0;
+        var attention_rows: usize = 0;
+        var forward_completed = false;
+        defer if (forward_completed) {
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_items={d} packed_step_decode_items={d} packed_step_query_rows={d}\n", .{ prefill_count, claimed.len - prefill_count, total });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_starts={d} packed_step_prefill_finishes={d} prepared_prefill_chunk_rows={d}\n", .{ prefix_starts, prefix_finishes, self.prepared_qwen_prefill_chunk_rows });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_recurrent_groups={d} packed_recurrent_rows={d}\n", .{ recurrent_groups, recurrent_rows });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_attention_groups={d} packed_attention_rows={d}\n", .{ attention_groups, attention_rows });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_input_frames={d} packed_cuda_steps={d}\n", .{ @intFromBool(!cuda_packed), @intFromBool(cuda_packed) });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_decode_rows={d} packed_cpu_logit_rows={d} packed_standalone_wide_heads={d}\n", .{ if (needs_logits and gpu_choices) claimed.len - prefill_count else 0, host_rows, @intFromBool(needs_logits and !gpu_choices and claimed.len > 16) });
+            if (trace_frame) std.debug.print("LIGHTONOCR3 packed_shared_frame={d} packed_forward_submissions={d}\n", .{ @intFromBool(shared_frame), cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits -| before_submits });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_prefill_rows={d} packed_skipped_prefix_heads={d}\n", .{ if (needs_logits and gpu_choices) greedy_prefills else 0, if (!needs_logits) prefill_count else claimed.len - head_rows.count });
+        };
         const session = self.session orelse return error.InvalidBatchDecodeState;
         var host_lease = try session.admitHostPreprocess(host_bytes);
         errdefer host_lease.deinit();
@@ -13435,10 +13897,6 @@ pub const NativeGenerationPipeline = struct {
         }
         var owned = try buildOwnedMixedBatchDecodeContextLayout(a, mixed[0..claimed.len], positions, lengths[0..claimed.len]);
         defer owned.deinit();
-        var recurrent_groups: usize = 0;
-        var recurrent_rows: usize = 0;
-        var attention_groups: usize = 0;
-        var attention_rows: usize = 0;
         owned.context.packed_recurrent_groups = &recurrent_groups;
         owned.context.packed_recurrent_rows = &recurrent_rows;
         owned.context.packed_attention_groups = &attention_groups;
@@ -13486,11 +13944,16 @@ pub const NativeGenerationPipeline = struct {
         const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(cb, a, cfg, combined, .{}, 1, total, &owned.context, null);
         defer cb.free(hidden.hidden);
         if (hidden.total_rows != total) return error.InvalidTensorShape;
-        // One gather selects every page's final row. In the shared-frame path
-        // the model borrows the producer frame, which is still active here.
+        forward_completed = true;
+        if (!needs_logits) return .{ .logits = null, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
+
+        // Intermediate prefix rows update KV/state but never produce a
+        // choice. Exclude them from the head and restore scheduler order
+        // after argmax. Metal retains its established complete-row layout.
+        if (head_rows.count == 0) return error.InvalidBatchDecodeState;
         var last_indices: [gpt_arch.max_packed_qwen_items]i64 = undefined;
-        for (claimed, 0..) |_, row| last_indices[row] = @intCast(offsets[row] + lengths[row] - 1);
-        const last = try cb.embeddingLookup(hidden.hidden, last_indices[0..claimed.len], claimed.len, cfg.hidden_size);
+        for (head_rows.items[0..head_rows.count], 0..) |item, row| last_indices[row] = @intCast(offsets[item] + lengths[item] - 1);
+        const last = try cb.embeddingLookup(hidden.hidden, last_indices[0..head_rows.count], head_rows.count, cfg.hidden_size);
         defer cb.free(last);
         const head = try gpt_arch.getLmHeadWeight(cb, cfg);
         defer cb.free(head);
@@ -13510,17 +13973,17 @@ pub const NativeGenerationPipeline = struct {
             }
             try cb.decoderRuntimeSetActiveFrameRegime(.decode);
         }
-        const logits = try cb.linearNoBias(last, head, claimed.len, cfg.hidden_size, cfg.vocab_size);
+        const logits = try cb.linearNoBias(last, head, head_rows.count, cfg.hidden_size, cfg.vocab_size);
         defer cb.free(logits);
         // Gather prefix logits before argmax closes the borrowed frame. Only
         // host arrays escape this forward; all device views retire below.
         var gathered_prefix_logits: ?ops.CT = null;
         defer if (gathered_prefix_logits) |tensor| cb.free(tensor);
-        if (shared_frame) {
+        if (shared_frame and host_rows != 0) {
             var rows: [gpt_arch.max_packed_qwen_items]i64 = undefined;
             var count: usize = 0;
-            for (claimed, 0..) |item, index| if (item.phase == .prefill) {
-                rows[count] = @intCast(index);
+            for (claimed, 0..) |item, index| if (item.phase == .prefill and prefillHasHostRow(@ptrCast(@alignCast(item.work_ptr)), prefix_logits_layout)) {
+                rows[count] = @intCast(head_rows.row_by_item[index]);
                 count += 1;
             };
             gathered_prefix_logits = try cb.embeddingLookup(logits, rows[0..count], count, cfg.vocab_size);
@@ -13536,19 +13999,25 @@ pub const NativeGenerationPipeline = struct {
             }
         }
         if (cuda_packed and gpu_choices) {
-            // Keep decode logits on the CUDA stream. Prefix rows retain the
-            // existing independently admitted F32 sampling/publication path.
-            tokens = try cb.argmaxRowsSuppress(logits, 0, claimed.len, cfg.vocab_size, cfg.suppressTokenIds(), a) orelse return error.ResidentImageOperationUnavailable;
-            if (tokens.?.len != claimed.len) return error.InvalidBatchDecodeState;
+            // Greedy prefix and decode rows share the existing suppressed
+            // device argmax. Sampled prefixes retain admitted F32 logits.
+            const compact = try cb.argmaxRowsSuppress(logits, 0, head_rows.count, cfg.vocab_size, cfg.suppressTokenIds(), a) orelse return error.ResidentImageOperationUnavailable;
+            if (head_rows.count == claimed.len) {
+                tokens = compact;
+                if (compact.len != claimed.len) return error.InvalidBatchDecodeState;
+            } else {
+                defer a.free(compact);
+                tokens = try head_rows.scatter(a, compact, cfg.vocab_size);
+            }
         }
-        // A pure decode packet has no prefix rows to sample on the CPU.
+        // A fully device-greedy packet has no vocabulary rows for the CPU.
         // Keep an owned empty slice for the existing publication contract;
         // do not dispatch an embedding gather with zero rows.
-        const host = if (gpu_choices and prefill_count == 0) try a.alloc(f32, 0) else if (gathered_prefix_logits) |tensor| try cb.toFloat32(tensor, a) else if (gpu_choices) blk: {
+        const host = if (gpu_choices and host_rows == 0) try a.alloc(f32, 0) else if (gathered_prefix_logits) |tensor| try cb.toFloat32(tensor, a) else if (gpu_choices) blk: {
             var rows: [gpt_arch.max_packed_qwen_items]i64 = undefined;
             var count: usize = 0;
-            for (claimed, 0..) |item, index| if (item.phase == .prefill) {
-                rows[count] = @intCast(index);
+            for (claimed, 0..) |item, index| if (item.phase == .prefill and prefillHasHostRow(@ptrCast(@alignCast(item.work_ptr)), prefix_logits_layout)) {
+                rows[count] = @intCast(head_rows.row_by_item[index]);
                 count += 1;
             };
             const prefix_logits = try cb.embeddingLookup(logits, rows[0..count], count, cfg.vocab_size);
@@ -13556,20 +14025,30 @@ pub const NativeGenerationPipeline = struct {
             break :blk try cb.toFloat32(prefix_logits, a);
         } else try cb.toFloat32(logits, a);
         gpt_arch.applyFinalLogitSoftcapInPlace(cfg, host);
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_items={d} packed_step_decode_items={d} packed_step_query_rows={d}\n", .{ prefill_count, claimed.len - prefill_count, total });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_starts={d} packed_step_prefill_finishes={d} prepared_prefill_chunk_rows={d}\n", .{ prefix_starts, prefix_finishes, self.prepared_qwen_prefill_chunk_rows });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_recurrent_groups={d} packed_recurrent_rows={d}\n", .{ recurrent_groups, recurrent_rows });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_attention_groups={d} packed_attention_rows={d}\n", .{ attention_groups, attention_rows });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_input_frames={d} packed_cuda_steps={d}\n", .{ @intFromBool(!cuda_packed), @intFromBool(cuda_packed) });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_decode_rows={d} packed_cpu_logit_rows={d} packed_standalone_wide_heads={d}\n", .{ if (gpu_choices) claimed.len - prefill_count else 0, host_rows, @intFromBool(!gpu_choices and claimed.len > 16) });
-        if (trace_frame) std.debug.print("LIGHTONOCR3 packed_shared_frame={d} packed_forward_submissions={d}\n", .{ @intFromBool(shared_frame), cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits -| before_submits });
-        return .{ .logits = host, .packed_greedy_tokens = tokens, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
+        return .{ .logits = host, .packed_greedy_tokens = tokens, .prefix_logits_layout = prefix_logits_layout, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
     }
 
     fn forwardScheduledStep(
         self: *NativeGenerationPipeline,
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) !StepForwardResult {
+        if (comptime build_options.enable_cuda) {
+            if (self.lighton_cuda_execution_id != 0) {
+                var pure_decode = claimed.len >= 2 and claimed.len <= (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64);
+                for (claimed) |item| {
+                    pure_decode = pure_decode and item.phase == .decode and item.query_sequence_len == 1;
+                    if (item.phase == .decode) {
+                        const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                        pure_decode = pure_decode and work.wants_greedy;
+                    }
+                }
+                if (!pure_decode) {
+                    const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+                    C.invalidateLightOnDecodeGraph(&self.cb);
+                    try C.prepareLightOnMatmulFrame(&self.cb);
+                }
+            }
+        }
         for (claimed) |item| if (item.phase == .prefill) {
             const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
             if (work.prepared_prompt != null) return self.forwardPackedScheduledQwenStep(claimed);
@@ -13697,32 +14176,12 @@ pub const NativeGenerationPipeline = struct {
         }
         if (all_greedy) {
             if (comptime build_options.enable_cuda) {
-                if (cuda_lighton and self.gpu_token_burst_lighton_decode and self.execution_lock != null) {
-                    var steps: usize = std.math.clamp(@as(usize, self.gpu_token_burst_width), 2, max_gpu_token_burst_width);
-                    const eligible = eligible: {
-                        for (claimed) |item| {
-                            const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                            const sequence = work.sequence orelse break :eligible false;
-                            if (sequence.generated >= sequence.max_tokens or sequence.max_tokens - sequence.generated < 2 or
-                                sequence.seq_len.* > sequence.token_ids.len or sequence.token_ids.len - sequence.seq_len.* < 2) break :eligible false;
-                            steps = @min(steps, @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*));
-                        }
-                        break :eligible true;
-                    };
-                    if (eligible) {
-                        const embedding = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
-                        defer self.cb.free(embedding);
-                        const head = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
-                        defer self.cb.free(head);
-                        if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.beginLightOnTokenBurst(&self.cb, embedding, claimed.len, steps, self.gpt_config.hidden_size, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds())) |prepared| {
-                            var burst = prepared;
-                            defer burst.deinit();
-                            // No fallback is permitted after this first forward
-                            // has changed any independent recurrent/KV state.
-                            return self.finishLightOnCudaTokenBurst(claimed, items, input_ids, &owned_ctx.context, head, &burst);
-                        }
-                    }
+                if (cuda_lighton and self.lighton_cuda_execution_id != 0) {
+                    if (try self.tryLightOnCudaDecodeGraph(claimed, items, input_ids, &owned_ctx.context)) |result| return result;
+                    @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraph(&self.cb);
                 }
+                if (cuda_lighton) try @import("../ops/cuda/cuda_compute.zig").CudaCompute.prepareLightOnMatmulFrame(&self.cb);
+                if (cuda_lighton) if (try self.tryLightOnCudaTokenBurst(claimed, items, input_ids, &owned_ctx.context)) |result| return result;
             }
             if (comptime build_options.enable_metal) {
                 const M = @import("../ops/metal_compute.zig").MetalCompute;
@@ -13859,6 +14318,7 @@ pub const NativeGenerationPipeline = struct {
         vocab_size: usize,
         greedy_tokens: ?[]const u32 = null,
         packed_greedy_tokens: ?[]const u32 = null,
+        prefix_logits_layout: PrefixLogitsLayout = .all_host_rows,
         second_greedy_tokens: ?[]const u32 = null,
         logits: ?[]const f32,
         max_query_seq_len: usize,
@@ -13873,7 +14333,7 @@ pub const NativeGenerationPipeline = struct {
                 }
             };
             if (self.packed_greedy_tokens) |tokens| {
-                dispatchPackedGreedyResults(self.vocab_size, claimed, self.logits, tokens);
+                dispatchPackedGreedyResultsWithLayout(self.vocab_size, claimed, self.logits, tokens, self.prefix_logits_layout);
                 return;
             }
             if (self.greedy_tokens) |tokens| {
@@ -13977,6 +14437,7 @@ pub const NativeGenerationPipeline = struct {
             .second_greedy_tokens = result.second_greedy_tokens,
             .max_query_seq_len = result.max_query_seq_len,
             .last_rows_only = result.last_rows_only,
+            .prefix_logits_layout = result.prefix_logits_layout,
         });
     }
 
@@ -14082,15 +14543,30 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn dispatchPackedGreedyResults(vocab_size: usize, claimed: []const runtime.scheduler.native_generate.StepItem, logits: ?[]const f32, tokens: []const u32) void {
+        dispatchPackedGreedyResultsWithLayout(vocab_size, claimed, logits, tokens, .all_host_rows);
+    }
+
+    fn dispatchPackedGreedyResultsWithLayout(vocab_size: usize, claimed: []const runtime.scheduler.native_generate.StepItem, logits: ?[]const f32, tokens: []const u32, layout: PrefixLogitsLayout) void {
         var prefills: usize = 0;
         var valid = tokens.len == claimed.len;
         for (claimed) |item| switch (item.phase) {
-            .prefill => prefills += 1,
+            .prefill => {
+                const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                if (work.wants_greedy) {
+                    valid = valid and work.wants_last_logits;
+                } else if (prefillHasHostRow(work, layout)) prefills += 1;
+            },
             .decode => {
                 const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                 valid = valid and work.wants_greedy;
             },
             .waiting => valid = false,
+        };
+        if (valid) for (claimed, tokens) |item, token| {
+            if (item.phase == .prefill) {
+                const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                if (work.wants_greedy and token >= vocab_size) valid = false;
+            }
         };
         const expected = std.math.mul(usize, prefills, vocab_size) catch {
             markStepFailed(claimed, error.InvalidBatchDecodeState);
@@ -14105,13 +14581,15 @@ pub const NativeGenerationPipeline = struct {
             .decode => publishGreedyToken(@ptrCast(@alignCast(item.work_ptr)), token),
             .prefill => {
                 const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                if (work.wants_last_logits) {
+                if (work.wants_greedy) {
+                    work.greedy_token = token;
+                } else if (work.wants_last_logits) {
                     work.logits = work.allocator.dupe(f32, logits.?[row * vocab_size ..][0..vocab_size]) catch |err| blk: {
                         work.failure = err;
                         break :blk null;
                     };
                 }
-                row += 1;
+                row += @intFromBool(prefillHasHostRow(work, layout));
                 work.ready.store(true, .release);
             },
             .waiting => unreachable,
@@ -19927,10 +20405,10 @@ test "LightOnOCR3 bounded chunk workspace rejects direct fallback before cache m
     var visual = [_]bool{true};
     var prompt = qwen3vl_projector.PreparedPrompt{ .allocator = a, .token_ids = &ids, .input_embeddings = null, .plan = .{ .allocator = a, .mrope_positions = &axes, .causal_positions = &causal, .visual_token_mask = &visual, .visual_spans = &.{}, .mrope_position_delta = 0 }, .deepstack_embeddings = &.{}, .deepstack_layer_count = 0 };
     var pipeline = NativeGenerationPipeline{ .allocator = a, .cb = undefined, .gpt_config = .{}, .tokenizer = undefined, .prepared_qwen_prefill_chunk_rows = 128 };
-    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state));
+    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state, false));
     try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
     prompt.deepstack_layer_count = 1;
-    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state));
+    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state, false));
     try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
 }
 
@@ -19985,4 +20463,268 @@ test "LightOnOCR3 CUDA packed prefix capacity preserves legacy limits and total 
     try std.testing.expectEqual(@as(usize, 8), NativeGenerationPipeline.packedQwenPrefillItemLimit(.metal, true));
     try std.testing.expectEqual(@as(usize, 8), NativeGenerationPipeline.packedQwenPrefillItemLimit(.native, true));
     try std.testing.expectEqual(@as(usize, 4096), NativeGenerationPipeline.max_prepared_qwen_prefill_rows);
+}
+
+test "LightOnOCR3 CUDA wide graph contexts own explicit unequal page positions through tail execution" {
+    const a = std.testing.allocator;
+    const config = runtime.kv.pool.KvPoolConfig{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    };
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    var states: [128]NativeDecodeState = undefined;
+    var initialized: usize = 0;
+    defer for (states[0..initialized]) |*state| state.deinit();
+    var items: [128]MixedBatchDecodeItem = undefined;
+    const lengths: [128]usize = @splat(1);
+    for (&states, &items, 0..) |*state, *item, i| {
+        state.* = NativeDecodeState.initPaged(a, &manager, pool, null);
+        state.kv_storage = &storage;
+        initialized += 1;
+        const tokens = 4 + i % 3;
+        try state.notePrefill(tokens);
+        state.qwen3vl_mrope_position_delta = @as(i64, @intCast(100 + i));
+        item.* = .{ .state = state, .total_sequence_len = tokens, .query_sequence_len = 1, .kv_sequence_len = tokens, .kv_position_offset = 0, .attention_mode = .paged_decode };
+    }
+    try std.testing.expectError(error.InvalidPackedQueryShape, buildOwnedMixedBatchDecodeContextLayout(a, &items, null, &lengths));
+    for ([_]usize{ 66, 128 }) |rows| {
+        const bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
+        var metadata: [bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&metadata);
+        var owned = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), items[0..rows], lengths[0..rows]);
+        defer owned.deinit();
+        try std.testing.expectEqual(rows, owned.context.query_sequence_len);
+        try std.testing.expectEqual(rows, owned.context.kv_batch.?.len);
+        try std.testing.expectEqualSlices(usize, lengths[0..rows], owned.context.packed_query_lengths.?);
+        for (0..3) |axis| for (0..rows) |i| {
+            try std.testing.expectEqual(@as(u32, @intCast(4 + i % 3 - 1 + 100 + i)), owned.context.mrope_positions.?[axis * rows + i]);
+        };
+        @memset(&states[0].qwen3vl_decode_positions, 99999);
+        try std.testing.expectEqual(@as(u32, 103), owned.context.mrope_positions.?[0]);
+    }
+}
+
+test "LightOnOCR3 CUDA prepared prefill greedy eligibility preserves sampled constrained and raw output requests" {
+    const model = try gpt_mod.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config.json"));
+    try std.testing.expect(shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, .{}, true, false, true));
+    for ([_]ops.BackendKind{ .native, .metal }) |backend| try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(backend, model, .{}, true, false, true));
+    for ([_]GenerationConfig{ .{ .temperature = 0.2 }, .{ .grammar = "json" }, .{ .repetition_penalty = 1.1 }, .{ .presence_penalty = 1 }, .{ .kv_cache_mode = .select_v1 }, .{ .cache_compaction_ratio = 0.5 } }) |config| try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, config, true, false, true));
+    try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, .{}, false, false, true));
+    try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, .{}, true, true, true));
+    try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, .{}, true, false, false));
+    var softcap = model;
+    softcap.final_logit_softcapping = 10;
+    try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, softcap, .{}, true, false, true));
+}
+
+test "LightOnOCR3 packed prefix publication separates device choices host logits and intermediate chunks" {
+    const P = NativeGenerationPipeline;
+    const a = std.testing.allocator;
+    // Per-work host allocation failure must not erase a completed GPU choice
+    // or leave an intermediate chunk waiting. Invalid GPU IDs fail the whole
+    // claim before any result is published.
+    for ([_]u8{ 0, 1, 2, 3 }) |mode| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var sampled = P.PendingPrefillBatchWork{ .allocator = if (mode == 1) failing.allocator() else a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = true };
+        defer if (sampled.logits) |values| sampled.allocator.free(values);
+        var greedy = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = mode != 3, .wants_greedy = true };
+        var middle = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = false };
+        var decode = P.PendingDecodeBatchWork{ .allocator = a, .decode_state = undefined, .token_id = 0, .seq_len = 1, .wants_greedy = true };
+        const Item = runtime.scheduler.native_generate.StepItem;
+        const items = [_]Item{
+            .{ .work_ptr = &sampled, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+            .{ .work_ptr = &decode, .phase = .decode, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+            .{ .work_ptr = &greedy, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+            .{ .work_ptr = &middle, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+        };
+        const logits = [_]f32{ 0.3, 0.2, 0.1, 111, 222, 333 };
+        P.dispatchPackedGreedyResults(3, &items, &logits, &.{ 99, 1, if (mode == 2) 3 else 2, 99 });
+        try std.testing.expect(sampled.ready.load(.acquire) and greedy.ready.load(.acquire) and middle.ready.load(.acquire) and decode.ready.load(.acquire));
+        if (mode >= 2) {
+            try std.testing.expectEqual(error.InvalidBatchDecodeState, sampled.failure.?);
+            try std.testing.expectEqual(error.InvalidBatchDecodeState, greedy.failure.?);
+            try std.testing.expectEqual(error.InvalidBatchDecodeState, middle.failure.?);
+            try std.testing.expectEqual(error.InvalidBatchDecodeState, decode.failure.?);
+            try std.testing.expect(greedy.greedy_token == null and decode.greedy_token == null and sampled.logits == null);
+            continue;
+        }
+        try std.testing.expectEqual(@as(?u32, 2), greedy.greedy_token);
+        try std.testing.expectEqual(@as(?u32, 1), decode.greedy_token);
+        try std.testing.expect(greedy.logits == null and middle.logits == null and middle.greedy_token == null);
+        if (mode == 1) {
+            try std.testing.expectEqual(error.OutOfMemory, sampled.failure.?);
+        } else {
+            try std.testing.expectEqualSlices(f32, logits[0..3], sampled.logits.?);
+            try std.testing.expect(sampled.failure == null);
+        }
+    }
+}
+
+test "LightOnOCR3 CUDA final prefix logits layout skips intermediate rows and preserves sampled peer bytes" {
+    const P = NativeGenerationPipeline;
+    const a = std.testing.allocator;
+    var sampled = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = true };
+    defer if (sampled.logits) |values| a.free(values);
+    var greedy = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = true, .wants_greedy = true };
+    var middle = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = false };
+    const Item = runtime.scheduler.native_generate.StepItem;
+    const items = [_]Item{
+        .{ .work_ptr = &middle, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+        .{ .work_ptr = &greedy, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+        .{ .work_ptr = &sampled, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+    };
+    var logits = [_]f32{ 0.3, 0.2, 0.1 };
+    const publisher = P.SuccessfulStepPublisher{ .vocab_size = 3, .logits = &logits, .max_query_seq_len = 1, .packed_greedy_tokens = &.{ 0, 2, 1 }, .prefix_logits_layout = .final_host_rows };
+    publisher.publish(&items);
+    try std.testing.expect(middle.ready.load(.acquire) and greedy.ready.load(.acquire) and sampled.ready.load(.acquire));
+    try std.testing.expect(middle.failure == null and greedy.failure == null and sampled.failure == null);
+    try std.testing.expect(middle.logits == null and middle.greedy_token == null and greedy.logits == null);
+    try std.testing.expectEqual(@as(?u32, 2), greedy.greedy_token);
+    try std.testing.expectEqualSlices(f32, &logits, sampled.logits.?);
+    @memset(&logits, 999);
+    try std.testing.expectEqual(@as(f32, 0.3), sampled.logits.?[0]);
+}
+
+test "LightOnOCR3 CUDA reader epoch logical pools retain positions across growth and reset without host mirrors" {
+    const allocator = std.testing.allocator;
+    for ([_]runtime.kv.pool.BackendKind{ .cuda, .metal }) |backend| {
+        const config = requestKvManagerPoolConfig(kvPoolConfig(backend, .f16, .{
+            .family = .gemma,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 2,
+            .num_key_value_heads = 1,
+            .attention_head_dim = 8,
+        }, false));
+        var manager = runtime.kv.manager.KvManager.init(allocator);
+        defer manager.deinit();
+        const pool = try manager.addPool(config);
+        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, config);
+        defer storage.deinit();
+        for (0..2) |_| {
+            var state = NativeDecodeState.initPaged(allocator, &manager, pool, null);
+            state.kv_storage = &storage;
+            defer state.deinit();
+            try state.notePrefill(17);
+            for (0..40) |_| try state.appendGeneratedToken();
+            const sequence = state.sequence_id.?;
+            try std.testing.expectEqual(@as(?usize, 57), manager.tokenCount(sequence));
+            try std.testing.expectEqual(@as(?usize, 57), storage.tokenCount(sequence));
+            try std.testing.expectEqual(@as(usize, 57), state.kvView().?.token_count);
+            for ([_]*runtime.kv.pool.KvPool{ manager.pools.items[pool].hostPool().?, storage.storage.hostPool().? }) |owner| {
+                try std.testing.expect(owner.blocks.items.len >= 4);
+                for (owner.blocks.items) |page| {
+                    if (backend == .cuda) {
+                        try std.testing.expectEqual(@as(usize, 0), page.k_data.len);
+                        try std.testing.expectEqual(@as(usize, 0), page.v_data.len);
+                    } else {
+                        try std.testing.expect(page.k_data.len > 0 and page.v_data.len > 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "LightOnOCR3 CUDA burst readback releases the execution lane and reacquires for cancelled cleanup" {
+    const Fake = struct {
+        mutex: *std.atomic.Mutex,
+        fail: bool,
+        waited: bool = false,
+        fn wait(self: *@This()) !void {
+            try std.testing.expect(self.mutex.tryLock());
+            self.mutex.unlock();
+            self.waited = true;
+            if (self.fail) return error.Cancelled;
+        }
+        fn cancel(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    for ([_]bool{ false, true }) |event_gate| for ([_]bool{ false, true }) |fail| {
+        var mutex: std.atomic.Mutex = .unlocked;
+        var gate: execution_control_mod.ExecutionLane = .{};
+        var pipeline: NativeGenerationPipeline = undefined;
+        pipeline.execution_lock = &mutex;
+        pipeline.execution_gate = if (event_gate) &gate else null;
+        pipeline.execution_phase_waiters = null;
+        pipeline.execution_control = null;
+        pipeline.execution_contention_wait_ns = 100 * std.time.ns_per_us;
+        pipeline.io = std.testing.io;
+        try pipeline.lockExecution(&mutex);
+        defer pipeline.unlockExecution(&mutex);
+        pipeline.execution_control = .{ .check_fn = Fake.cancel };
+        var pending = Fake{ .mutex = &mutex, .fail = fail };
+        if (fail) {
+            try std.testing.expectError(error.Cancelled, pipeline.waitOutsideLightOnExecution(&pending));
+        } else try pipeline.waitOutsideLightOnExecution(&pending);
+        try std.testing.expect(pending.waited);
+        try std.testing.expect(!mutex.tryLock());
+    };
+}
+
+test "LightOnOCR3 device vision cancellation retires independent page features once under the execution lane" {
+    const Probe = struct {
+        mutex: *std.atomic.Mutex,
+        markers: [2]usize = .{ 7, 9 },
+        freed: [2]bool = .{ false, false },
+        fn free(raw: *anyopaque, tensor: ops.CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.mutex.tryLock());
+            for (&self.markers, 0..) |*marker, i| if (tensor == @as(ops.CT, @ptrCast(marker))) {
+                std.debug.assert(!self.freed[i]);
+                self.freed[i] = true;
+                return;
+            };
+            unreachable;
+        }
+        fn cancel(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    for ([_]bool{ false, true }) |event_gate| {
+        var mutex: std.atomic.Mutex = .unlocked;
+        var gate: execution_control_mod.ExecutionLane = .{};
+        var probe = Probe{ .mutex = &mutex };
+        var table = @import("../ops/native_compute.zig").vtable_impl;
+        table.freeTensor = Probe.free;
+        const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
+        var pipeline: NativeGenerationPipeline = undefined;
+        pipeline.execution_lock = &mutex;
+        pipeline.execution_gate = if (event_gate) &gate else null;
+        pipeline.execution_phase_waiters = null;
+        pipeline.execution_control = .{ .check_fn = Probe.cancel };
+        pipeline.execution_contention_wait_ns = 100 * std.time.ns_per_us;
+        pipeline.io = std.testing.io;
+        var pages: [2]qwen3vl_projector.ProjectedImages = undefined;
+        for (&pages, 0..) |*page, i| page.* = .{
+            .allocator = std.testing.allocator,
+            .embeddings = &.{},
+            .device_embeddings = @ptrCast(&probe.markers[i]),
+            .device_backend = .{ .ptr = cb.ptr, .release_fn = cb.vtable.freeTensor },
+            .deepstack_embeddings = &.{},
+            .tokens_per_image = &.{},
+            .grids = &.{},
+            .preprocess_evidence = &.{},
+            .preprocess_spatial_patches = &.{},
+            .hidden_size = 1,
+            .deepstack_layer_count = 0,
+        };
+        // This models a completed broker value whose receiver was cancelled
+        // before it could acquire the ordinary prompt-assembly lane.
+        pipeline.retireBatchedProjectedImages(&pages[0]);
+        try std.testing.expect(probe.freed[0] and !probe.freed[1]);
+        try std.testing.expect(pages[0].device_embeddings == null and pages[1].device_embeddings != null);
+        pipeline.retireBatchedProjectedImages(&pages[1]);
+        try std.testing.expect(probe.freed[1]);
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
+    }
 }
