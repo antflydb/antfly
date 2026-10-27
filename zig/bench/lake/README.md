@@ -942,3 +942,37 @@ git show 3b1675bd94:zig/pkg/antfly/src/serverless/graph_segment/page_tree.zig > 
   -Mbefore=.benchmark-results/lake/compact-metadata-probes/before.zig \
   -Mafter=zig/pkg/antfly/src/serverless/graph_segment/page_tree.zig
 ```
+
+The [compact-probe observation](native-compact-metadata-probes-v1-observation.json)
+retains raw kernel samples, source/executable/input hashes and all query medians.
+Across 24 primary paired real Parquet pages, complete hits (including scores,
+sources and sort keys), totals and work counters match exactly:
+
+| Query | Cache mode | Reviewed median | Final median |
+|---|---|---:|---:|
+| Wide unused suffix | Warm | 79.30 ms | 76.96 ms |
+| Wide unused suffix | Process restarted | 127.30 ms | 141.01 ms |
+| Wide predicate bounds | Warm | 193.78 ms | 184.72 ms |
+| Wide predicate bounds | Process restarted | 214.75 ms | 239.25 ms |
+| Native forward | Warm | 18.96 ms | 17.94 ms |
+| Native forward | Process restarted | 109.09 ms | 135.22 ms |
+| Native reverse | Warm | 18.86 ms | 17.67 ms |
+| Native reverse | Process restarted | 103.30 ms | 130.60 ms |
+
+The final binary includes the main integration, and these sequential samples do
+not isolate its changes from compact probes or host variation. The slower
+restart observations prompted an additional traced control in reverse binary
+order. Reviewed/final restart medians then measured 123.59/124.25 ms forward and
+137.51/129.35 ms reverse. Those 12 diagnostic pairs also preserve complete hits,
+totals and work. Every traced query is one successful HTTP request with no retry;
+collector times are lower in the final binary, while total first-query time
+varies outside the collector. These opposing observations leave startup latency
+unqualified and do not justify a startup-policy change. All results are retained.
+
+After merging main `031742c340`, the production CLI build, 364 native checks and
+all 35 real Parquet/Iceberg E2Es pass, with one declared native benchmark skip,
+zero E2E skips and zero native leaks/failures. The wide Parquet regression now
+also checks long predicate bounds in both directions before and after restart.
+Benchmark tooling's 19 tests and storage-audit tooling's 24 tests pass using the
+pinned compiler and worktree caches. Formatting, license and Apache-boundary
+checks pass. No build or E2E work from this task overlaps measured query runs.
