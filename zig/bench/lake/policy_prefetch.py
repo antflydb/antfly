@@ -19,10 +19,12 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import statistics
 import sys
 import time
+from urllib.parse import urlsplit
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -171,6 +173,7 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+os.environ["ANTFLY_BENCH_QUERY_PROFILE_EVERY"] = "1"
 binary_hash = sha(binary)
 samples = []
 with bench.managed_server(
@@ -184,9 +187,27 @@ with bench.managed_server(
     try:
         client.call("POST", f"/tables/{bench.TABLE}", definition)
         client.ready(bench.readiness_indexes({"definition": definition}))
+        requests = []
+        original_request = client.session.request
+
+        def trace(method, url, **kwargs):
+            started = time.perf_counter_ns()
+            response = original_request(method, url, **kwargs)
+            requests.append(
+                {
+                    "method": method,
+                    "path": urlsplit(url).path,
+                    "status": response.status_code,
+                    "elapsed_ns": time.perf_counter_ns() - started,
+                }
+            )
+            return response
+
+        client.session.request = trace
         for sample in range(3):
             server.restart()
             for name, query, expected in queries:
+                request_start = len(requests)
                 start = time.perf_counter_ns()
                 response = client.query({"request": query})
                 elapsed = time.perf_counter_ns() - start
@@ -208,6 +229,7 @@ with bench.managed_server(
                         "sample": sample,
                         "query_name": name,
                         "elapsed_ns": elapsed,
+                        "http_requests": requests[request_start:],
                         "hits": hits,
                         "total": response["hits"]["total"],
                         "profile": response.get("profile"),

@@ -1134,3 +1134,96 @@ checks pass. All 36 selected real Parquet/Iceberg E2Es pass without skips agains
 the final frozen executable (286.39 seconds), including the expanded nine-field
 projection regression. Production source and installed executable hashes match
 the frozen final binary; main `a507489e93d8` is merged.
+
+### Projection-independent caching, source prefetch and phrase costing
+
+Required successful decoded stripes now share one immutable, interpretation- and
+scope-bound cache entry across query workspace limits. Every reader checks the
+retained footprint against its own allowance. Optional cached size-decline values
+retain their policy key; failed required loads publish no value. The native
+regression acquires the same value under three allowances with **one successful
+decode**, rejects a smaller warm allowance, and retries a failed cold decode under
+a larger limit. Covering queries alternate projections and 256/128/512 KiB limits
+with raw and physical cache residency disabled: successful decoded entry count
+stays constant and the later queries make **zero additional pack-range reads**.
+
+Stored-source cursors use their authenticated chunk directory to hint only chunks
+containing upcoming selected rows. A chunk transition examines at most **64
+selection entries**, schedules at most **four range hints** and accounts at most
+**1 MiB of compressed hint bytes**. A binary jump skips repeated selected IDs in
+a chunk; a range exceeding the remaining allowance stops lookahead. The existing
+query-owned native source queue retains its physical-block granularity, shared
+scheduler admission, deduplication and cancellation/join ownership. Hint byte
+counts are distinct from physical traffic and total query memory. Legacy and
+oversized chunks retain ordinary required reads. The native test verifies four
+exact small ranges (84 bytes), one 716,827-byte range in the larger-value case,
+64-probe sparse termination, unchanged decoded cursor state, zero demand reads
+during hinting and allocation-failure cleanup.
+
+Phrase driver costing unions document-frequency ceilings within each alternative
+position, then takes the minimum across required positions. Unknown statistics
+retain the full collection ceiling. Positional matching, scoring and cursor proof
+continue through the normal consumers. The native example bounds 10,000 documents
+at 20 candidates for a rare term position, 50 for its alternatives, and 10,000
+when statistics are unknown. The new real-Parquet phrase case verifies both sort
+directions and restart, requiring at most 64 candidates/scanned entries. The
+source E2E uses incompressible projected values spanning actual native transport
+blocks, plus nullable exact integers, hidden highlights and an unavailable original
+Parquet object.
+
+Reproduce the comparisons with separately frozen executables:
+
+```sh
+zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/policy_prefetch.py source LABEL /path/to/immutable-antfly SOURCE_COMMIT
+zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/policy_prefetch.py cover LABEL /path/to/immutable-antfly SOURCE_COMMIT
+zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/policy_prefetch.py phrase LABEL /path/to/immutable-antfly SOURCE_COMMIT
+```
+
+Source and cover cases use 256 rows and alternate two-field narrow and ten-field
+covering/eleven-field source projections, then repeat both after each of three
+restarts. Source includes deterministic incompressible 4 KiB notes. The phrase
+case uses 8,192 rows, 64 phrase matches, a broad metadata predicate and 20 returned
+hits; it exercises both favorable and opposing metadata prefixes. Every report
+records exact hits, totals, profiles, HTTP attempts and source/executable/runner/
+input hashes. Timers include application retries, if any. Restarts retain OS and
+persistent caches and readiness warming. These local Debug observations do not
+qualify Release, empty-cache, real-cloud or archive-scale performance.
+
+
+The [policy/prefetch/phrase observation](native-policy-prefetch-phrase-v1-observation.json)
+records same-main control `c532409d1c86` and final `04c923a48b6f` binaries, both
+including main `ff2c66bd7ba6`. The control uses recorded reversible production-source
+overrides; its build metadata reports the later HEAD and dirty overlay. Final
+production source and installed executable hashes match the frozen final binary.
+
+Initial paired local medians (milliseconds; query order is preserved per restart):
+
+| Case | Query | Control | Final |
+|---|---|---:|---:|
+| source | narrow | 79.98 | 82.69 |
+| source | broad | 82.60 | 79.19 |
+| source | narrow_repeat | 46.58 | 45.89 |
+| source | broad_repeat | 77.08 | 78.07 |
+| cover | narrow | 76.01 | 76.78 |
+| cover | broad | 71.97 | 71.61 |
+| cover | narrow_repeat | 62.48 | 62.92 |
+| cover | broad_repeat | 68.86 | 69.23 |
+| phrase | pulsar_asc | 149.34 | 150.26 |
+| phrase | quasar_desc | 30.37 | 31.12 |
+| phrase | quasar_asc | 27.24 | 27.96 |
+| phrase | pulsar_desc | 28.36 | 27.70 |
+
+All 36 initial paired pages preserve complete hits, including source, scores and
+sort keys, as well as totals. All 72 measured responses use one successful HTTP
+request without application retry. Mixed projection/source timings are close;
+they do not qualify an additional large end-to-end latency gain. The analyzed
+`match_phrase` controls already choose postings in both versions, so those runs
+do not demonstrate the ordered phrase costing change. All controls, including
+slower observations, are retained.
+
+The CLI builds; 270 affected native checks pass with one declared benchmark skip,
+zero failures and zero leaks. The final source-lookahead owner revalidation passes
+144 checks. All 37 selected real Parquet/Iceberg E2Es pass without skips in 297.76
+seconds against the final frozen executable, including the incompressible source
+fixture. The benchmark tooling's 19 tests, Apache boundary (2,555 sources), license,
+formatting and whitespace checks pass. Real-provider qualification remains deferred.
