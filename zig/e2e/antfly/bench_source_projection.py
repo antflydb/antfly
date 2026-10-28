@@ -101,6 +101,12 @@ def main():
         default=1,
         help="repeat reads on each fresh server; keep parsing outside timings",
     )
+    parser.add_argument("--shards", type=int, default=1)
+    parser.add_argument(
+        "--residual-filter",
+        action="store_true",
+        help="retain a neutral residual filter to measure sparse-ID routing independently of predicate cost",
+    )
     parser.add_argument("--documents", type=int, default=8)
     parser.add_argument("--value-bytes", type=int, default=262144)
     parser.add_argument("--output", required=True, type=Path)
@@ -129,7 +135,8 @@ def main():
     )
     args = parser.parse_args()
     if (
-        not 1 <= args.documents <= 64
+        not 1 <= args.shards <= 32
+        or not 1 <= args.documents <= 64
         or not 16384 <= args.value_bytes <= 1048576
         or not 0 <= args.metadata_updates <= 100
         or not 0 <= args.metadata_outputs <= 60
@@ -200,7 +207,9 @@ def main():
                 try:
                     session = requests.Session()
                     base = server.api_url + "/tables/identity_bench"
-                    created = session.post(base, json={"num_shards": 1}, timeout=60)
+                    created = session.post(
+                        base, json={"num_shards": args.shards}, timeout=60
+                    )
                     created.raise_for_status()
                     deadline = time.monotonic() + 30
                     while session.get(base, timeout=5).status_code != 200:
@@ -242,6 +251,8 @@ def main():
                         "select": conditional_select("payload.large"),
                         "params": {"known": {}},
                     }
+                    if args.residual_filter:
+                        request["filter_query"] = {"match_all": {}}
                     request["select"].update(
                         {
                             f"extra_{j}": {"field": f"metadata.extra_{j}"}
@@ -486,7 +497,9 @@ def main():
         "schema_version": 2,
         "workload": args.workload,
         "mask": args.mask,
-        "scope": "Native single-shard JSON tables, synthetic varied source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
+        "shards": args.shards,
+        "residual_filter": args.residual_filter,
+        "scope": "Native JSON tables with the recorded shard count, synthetic varied source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
         "platform": platform.platform(),
         "machine": platform.machine(),
         "cpu_count": os.cpu_count(),
