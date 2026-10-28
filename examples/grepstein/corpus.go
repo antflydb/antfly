@@ -636,7 +636,7 @@ func corpusLoadCmd(args []string) error {
 	model := flags.String("embedding-model", DefaultEmbeddingModel, fmt.Sprintf("Embedding model (%d dimensions; use embedder-config for another dimension)", DefaultEmbeddingDims))
 	embedderPath := flags.String("embedder-config", "", "Native embedder JSON including provider, model, project/location and dimension")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
-	language := flags.String("reader-config", "", "Native OCR reader JSON file (florence-reader.example.json for hosted inference); empty disables OCR")
+	language := flags.String("reader-config", "", "Native OCR reader JSON file (lightonocr-reader.example.json for hosted inference); empty disables OCR")
 	numShards := flags.Int("num-shards", 1, "Number of shards when creating the table")
 	if err := flags.Parse(args); err != nil {
 		return err
