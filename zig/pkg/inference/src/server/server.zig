@@ -1234,6 +1234,10 @@ pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
     return std.math.mul(usize, mib, 1024 * 1024) catch error.InvalidHttpBodyLimit;
 }
 
+/// Deployment ceilings narrow the manifest's executor contract. They apply to
+/// linked/direct execution as well as HTTP and discovery; zero is invalid.
+pub const RequestLimits = platform.resource_policy.InferenceRequestLimits;
+
 pub const NodeConfig = struct {
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
@@ -1244,6 +1248,9 @@ pub const NodeConfig = struct {
     keep_alive_ms: u64 = 300_000,
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
+    /// Weighted media/work capacity, independent of request-count permits.
+    /// Null preserves the legacy request-count-derived capacity.
+    max_work_units: ?usize = null,
     /// Transport concurrency is bounded independently from inference work.
     /// Keep enough connection headroom for health, discovery, and idle
     /// keep-alive clients without allowing retained Threaded workers to grow
@@ -1267,6 +1274,7 @@ pub const NodeConfig = struct {
     process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     resource_ownership: model_manager_mod.ResourceOwnership = .local,
     generation_budget_overrides: BudgetOverrides = .{},
+    request_limits: RequestLimits = .{},
     generation_batching: GenerationBatchingConfig = .{},
     /// Maximum queueing delay used only by resolved native executor batches.
     /// Serial compatibility paths bypass the broker and never pay this delay.
@@ -1315,11 +1323,7 @@ test "standalone inference bind is loopback-only unless explicitly overridden" {
     try validateStandaloneBind("0.0.0.0", true);
 }
 
-pub const GenerationBatchingMode = enum {
-    off,
-    auto,
-    on,
-};
+pub const GenerationBatchingMode = @FieldType(platform.inference_settings.GenerationBatching, "mode");
 
 fn cudaDecodeGraphReplayRequested(raw_opt: ?[]const u8) bool {
     const raw = raw_opt orelse return false;
@@ -1339,6 +1343,14 @@ pub const GenerationBatchingConfig = struct {
     max_step_query_tokens: usize = 512,
     max_decode_wait_us: u32 = 1_000,
     max_idle_prefill_chunk_size: usize = 2048,
+
+    pub fn fromSettings(settings: platform.inference_settings.GenerationBatching) @This() {
+        var out: @This() = .{};
+        inline for (comptime std.meta.fieldNames(platform.inference_settings.GenerationBatching)) |field| {
+            @field(out, field) = @field(settings, field);
+        }
+        return out;
+    }
 
     pub fn enabledForBackend(self: @This(), backend: backends_mod.BackendType) bool {
         if (backend != .cuda) return false;
@@ -3865,20 +3877,23 @@ fn requireLegacyClassification(manifest: manifest_mod.ModelManifest) !void {
     if (requiresQualifiedSpanClassification(manifest)) return error.UnsupportedClassificationExtraction;
 }
 
-fn spanV2BackendSupported(config: span_v2_executor.EncoderConfig, backend: backends_mod.BackendType) bool {
+fn spanV2BackendSupported(config: span_v2_executor.EncoderConfig, backend: backends_mod.BackendType, qualified_variant: ?gliner_decide_qualification.QualifiedVariant) bool {
     return switch (backend) {
         .native, .metal => true,
-        .cuda => config == .modern_bert,
+        .cuda => config == .modern_bert or qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8,
         else => false,
     };
 }
 
-test "GLiNER span backend selection preserves the DeBERTa CUDA exclusion" {
-    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .native));
-    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .metal));
-    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda));
-    try std.testing.expect(spanV2BackendSupported(.{ .modern_bert = .{} }, .cuda));
-    try std.testing.expect(!spanV2BackendSupported(.{ .modern_bert = .{} }, .pjrt));
+test "GLiNER span backend selection requires exact DeBERTa CUDA qualification" {
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .native, null));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .metal, null));
+    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda, null));
+    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda, .decide_1b));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .cuda, .decide_deberta));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .cuda, .decide_deberta_q8));
+    try std.testing.expect(spanV2BackendSupported(.{ .modern_bert = .{} }, .cuda, null));
+    try std.testing.expect(!spanV2BackendSupported(.{ .modern_bert = .{} }, .pjrt, null));
 }
 
 test "GLiNER span identity gate preserves ordinary DeBERTa classification" {
@@ -4121,6 +4136,7 @@ pub const Node = struct {
     pub fn init(allocator: std.mem.Allocator, supplied_config: NodeConfig) !Node {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
+        try config.request_limits.validate();
         if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
             return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
@@ -4169,7 +4185,7 @@ pub const Node = struct {
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
-            .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
+            .inference_admission = inference_admission_mod.InferenceAdmission.initWithLimits(config.max_concurrent_requests, config.max_work_units orelse config.max_concurrent_requests),
             .transcription_sessions = transcription_sessions.Registry.init(allocator),
             .compatibility_cache = .empty,
             .hard_cancellation_watchdog = hard_cancellation_watchdog,
@@ -4214,8 +4230,8 @@ pub const Node = struct {
         self: *const Node,
         backend: runtime.tier.memory.BackendClass,
     ) runtime.tier.memory.Limits {
-        return runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            backend,
+        return backends_mod.defaultMemoryLimits(
+            if (backend == .gpu and backends_mod.cudaDeviceMemoryBytes(.cuda) != 0) .cuda else if (backend == .gpu) .metal else .native,
             self.config.process_memory_limit_bytes,
         );
     }
@@ -7365,7 +7381,7 @@ pub const Node = struct {
             total_bytes = std.math.add(usize, total_bytes, shapes[i].bytes) catch return error.InferenceEncodedBytesExceeded;
             total_pixels = std.math.add(u64, total_pixels, shapes[i].pixels) catch return error.InferenceDecodedPixelsExceeded;
         }
-        try validateInferenceExecutorInvocation(contract, .{ .item_count = count, .encoded_media_bytes = if (raw) 0 else total_bytes, .decoded_pixels = total_pixels, .media_parts_per_item = 1, .has_image = true });
+        try validateInferenceExecutorInvocation(contract, .{ .internal_microbatch = true, .item_count = count, .encoded_media_bytes = if (raw) 0 else total_bytes, .decoded_pixels = total_pixels, .media_parts_per_item = 1, .has_image = true });
         const Probe = struct {
             fn canceled(ptr: *const anyopaque) bool {
                 const c: *const InferenceExecutionControl = @ptrCast(@alignCast(ptr));
@@ -8464,6 +8480,7 @@ pub const Node = struct {
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend);
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
         const estimate = try countPromptTokens(a, model_path, model, cfg, &messages, max_tokens, false, false);
+        try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(max_tokens));
         const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
         var local_budget = runtime.tier.memory.RunBudget.init(limits);
         const components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{ .backend = backend, .kv_dtype = kv_dtype, .config = cfg, .workspace_capacity = model.session.generationWorkspaceCapacity() }};
@@ -8932,6 +8949,7 @@ pub const Node = struct {
             const payload = item.payloadAs(LightOnReadPayload);
             const messages = [_]generation.Message{.{ .role = "user", .content = payload.prompt, .image_bytes = &.{payload.image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = payload.prompt } } }};
             const estimate = try countPromptTokens(allocator, payload.model_path, model, cfg, &messages, payload.max_tokens, false, false);
+            try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(payload.max_tokens));
             // countPromptTokens owns no retained encode; it only returns shape.
             const components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{ .backend = backend, .kv_dtype = kv_dtype, .config = cfg, .workspace_capacity = model.session.generationWorkspaceCapacity() }};
             // One execution lock owns CUDA decoder scratch. Choose each
@@ -9024,7 +9042,9 @@ pub const Node = struct {
         allow_incomplete: bool,
     ) ![]Qwen3VlReadResult {
         try control.update(.loading_model, 0, 1);
-        const max_tokens: i32 = @intCast(requested_max_tokens orelse default_read_admission_max_tokens);
+        const contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "read");
+        const max_tokens: i32 = @intCast(boundedReadOutputTokens(requested_max_tokens, default_read_admission_max_tokens, contract.batch.max_output_tokens_per_item));
+        try validateInferenceExecutorInvocation(contract, .{ .item_count = image_datas.len, .output_tokens_per_item = @intCast(max_tokens), .has_image = true });
         // Keep one handle alive across the serial batch so another request
         // cannot evict the resident decoder/projector between page images.
         // generateMessagesDirectPrepared acquires a short-lived execution
@@ -9407,8 +9427,8 @@ pub const Node = struct {
             defer manifest.deinit();
             if (isGenerativeReadModel(&manifest)) {
                 const prompt = try resolveGenerativeReadPrompt(&manifest, request.prompt);
-                const output_tokens = max_tokens orelse default_read_admission_max_tokens;
                 const contract = try resolvedInferenceExecutorContract(self, "read", &manifest);
+                const output_tokens = boundedReadOutputTokens(max_tokens, default_read_admission_max_tokens, contract.batch.max_output_tokens_per_item);
                 const image_datas = try allocator.alloc([]const u8, request.images.len);
                 defer allocator.free(image_datas);
                 for (request.images, 0..) |image, index| {
@@ -9511,6 +9531,20 @@ pub const Node = struct {
         defer broker_fence.deinit();
         const broker_manifest = broker_fence.manifest();
         const broker_contract = try resolvedInferenceExecutorContract(self, "read", broker_manifest);
+        var request_bytes: usize = 0;
+        var request_pixels: u64 = 0;
+        for (request.images) |image| {
+            request_bytes = std.math.add(usize, request_bytes, image.bytes.len) catch return error.InferenceEncodedBytesExceeded;
+            request_pixels = std.math.add(u64, request_pixels, try measureExecutorDecodedImages(broker_manifest, &.{image.bytes})) catch return error.InferenceDecodedPixelsExceeded;
+        }
+        try validateInferenceExecutorInvocation(broker_contract, .{
+            .item_count = request.images.len,
+            .decoded_pixels = request_pixels,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .media_parts_per_item = 1,
+            .has_image = true,
+            .encoded_media_bytes = request_bytes,
+        });
         if (broker_contract.batch.mode != .native or broker_contract.batch.max_items <= 1)
             return null;
 
@@ -9771,6 +9805,15 @@ pub const Node = struct {
         var broker_fence = acquired_fence;
         defer broker_fence.deinit();
         const broker_contract = try resolvedInferenceExecutorContract(self, "read", broker_fence.manifest());
+        var request_pixels: u64 = 0;
+        for (request.images) |image| request_pixels = std.math.add(u64, request_pixels, try image.pixels()) catch return error.InferenceDecodedPixelsExceeded;
+        try validateInferenceExecutorInvocation(broker_contract, .{
+            .item_count = request.images.len,
+            .decoded_pixels = request_pixels,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
         if (!broker_contract.accepts_borrowed_rasters or
             broker_contract.batch.mode != .native or
             broker_contract.batch.max_items <= 1)
@@ -10200,7 +10243,7 @@ pub const Node = struct {
         model_path: []const u8,
         rasters: []const readers_api.RasterImage,
         prompt: ?[]const u8,
-        max_tokens: ?usize,
+        requested_max_tokens: ?usize,
         source_fingerprint: ?[]const u8,
         execution_fence: ?*const readers_mod.ExecutionFence,
         result_allocators: ?[]const std.mem.Allocator,
@@ -10219,6 +10262,7 @@ pub const Node = struct {
             break :blk &owned_admission_manifest.?;
         };
         const executor_contract = try resolvedInferenceExecutorContract(self, "read", admission_manifest);
+        var max_tokens = requested_max_tokens;
         if (!executor_contract.accepts_borrowed_rasters)
             return error.BorrowedRasterUnsupported;
         const normalized_prompt = normalizeReadPrompt(prompt);
@@ -10229,6 +10273,7 @@ pub const Node = struct {
                 return error.InferenceDecodedPixelsExceeded;
         }
         try validateInferenceExecutorInvocation(executor_contract, .{
+            .internal_microbatch = execution_fence != null,
             .item_count = rasters.len,
             .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
             .output_tokens_per_item = max_tokens orelse 0,
@@ -10252,12 +10297,14 @@ pub const Node = struct {
             );
         defer reader.deinit();
         try control.check();
+        max_tokens = try reader.resolveMaxTokens(requested_max_tokens, executor_contract.batch.max_output_tokens_per_item);
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
         });
         try validateInferenceExecutorInvocation(executor_contract, .{
+            .internal_microbatch = execution_fence != null,
             .item_count = rasters.len,
             .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
             .input_tokens_per_item = exact_prompt_tokens,
@@ -10334,7 +10381,7 @@ pub const Node = struct {
         image_datas: []const []const u8,
         encoded_images: ?[]const readers_api.EncodedImage,
         prompt: ?[]const u8,
-        max_tokens: ?usize,
+        requested_max_tokens: ?usize,
         source_fingerprint: ?[]const u8,
         execution_fence: ?*const readers_mod.ExecutionFence,
         result_allocators: ?[]const std.mem.Allocator,
@@ -10353,6 +10400,7 @@ pub const Node = struct {
             break :blk &owned_admission_manifest.?;
         };
         const executor_contract = try resolvedInferenceExecutorContract(self, "read", admission_manifest);
+        var max_tokens = requested_max_tokens;
         const normalized_prompt = normalizeReadPrompt(prompt);
         var encoded_media_bytes: usize = 0;
         for (image_datas, 0..) |image_data, index| {
@@ -10362,6 +10410,7 @@ pub const Node = struct {
         }
         const decoded_pixels = try measureExecutorDecodedImages(admission_manifest, image_datas);
         try validateInferenceExecutorInvocation(executor_contract, .{
+            .internal_microbatch = execution_fence != null,
             .item_count = image_datas.len,
             .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
             .output_tokens_per_item = max_tokens orelse 0,
@@ -10383,12 +10432,14 @@ pub const Node = struct {
             );
         defer reader.deinit();
         try control.check();
+        max_tokens = try reader.resolveMaxTokens(requested_max_tokens, executor_contract.batch.max_output_tokens_per_item);
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
         });
         try validateInferenceExecutorInvocation(executor_contract, .{
+            .internal_microbatch = execution_fence != null,
             .item_count = image_datas.len,
             .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
             .input_tokens_per_item = exact_prompt_tokens,
@@ -11424,16 +11475,20 @@ pub const Node = struct {
         // Reject an unmeasured backend or request cardinality before parsing
         // model inputs. Sequence geometry is checked again after exact planning.
         if (qualified_identity) |identity|
-            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, 1, 1);
+            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, request.items.len, 1);
         const session_config = try session_factory.getGlinerSpanConfig(loaded.session);
         const config: span_v2_executor.EncoderConfig = switch (session_config) {
             .deberta => |value| .{ .deberta = value },
             .modern_bert => |value| .{ .modern_bert = value },
         };
-        if (!spanV2BackendSupported(config, backend)) return error.UnsupportedExtractionBackend;
+        if (!spanV2BackendSupported(config, backend, qualified_variant)) return error.UnsupportedExtractionBackend;
         // The executor's generic DeBERTa default is 512. An exact qualified
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
+        if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
+            options.cuda_batch_items = gliner_decide_qualification.cuda_batch_items;
+            options.max_sequences_per_item = 1;
+        }
         const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
         const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
         options.processor.max_sequence_tokens = max_sequence;
@@ -11475,13 +11530,20 @@ pub const Node = struct {
         failure.* = .{ .stage = "model" };
         observer.emit(.{ .phase = .model });
 
+        // CUDA batches reserve their complete physical workspace only at the
+        // front of the model lane. Concurrent waiters retain bounded host state,
+        // without each reserving another batch's otherwise serialized workspace.
+        const cuda_admission = if (backend == .cuda) &loaded.gliner_boundary_admission_lock else null;
+        if (cuda_admission) |mutex| try (control orelse InferenceExecutionControl{}).lock(mutex);
+        defer if (cuda_admission) |mutex| mutex.unlock();
+
         // Metal work is admitted like the boundary route: a GPU run budget
         // and a process-wide backend-scratch lease, acquired before the
         // execution lock because admission can evict other models.
         var device_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (device_lease) |*owned| owned.release();
         if (backend == .metal or backend == .cuda) {
-            const device_bytes = try span_v2_executor.deviceScratchUpperBound(config, longest);
+            const device_bytes = try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), @min(options.cuda_batch_items, request.items.len));
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
                 self.config.generation_budget_overrides.scratch_limit_bytes,
@@ -11653,7 +11715,8 @@ pub const Node = struct {
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
-            .reader_admission = .{ .ptr = &reader_admission, .validate = ExtractionReaderAdmission.validate },
+            .reader_admission = .{ .ptr = &reader_admission, .resolve_limits = ExtractionReaderAdmission.resolveLimits },
+            .reader_request_limits = self.config.request_limits,
             .gliner_pipeline_factory = .{ .ptr = self, .create = createGlinerPipeline },
             .execution_control = execution_control,
         };
@@ -17263,6 +17326,8 @@ pub const Node = struct {
         if (body.requests.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'requests' must not be empty" });
         }
+        self.config.request_limits.validateItemCount(body.requests.len) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
         if (body.requests.len > max_generate_batch_items) {
             return ctx.status(413).json(.{
                 .@"error" = "BATCH_TOO_LARGE",
@@ -20686,7 +20751,7 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "every framed attachment must be referenced exactly once",
             });
-        const max_tokens = validateReadMaxTokens(body.max_tokens) catch
+        var max_tokens = validateReadMaxTokens(body.max_tokens) catch
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "'max_tokens' must be between 1 and 1024",
@@ -20950,6 +21015,8 @@ pub const Node = struct {
         };
         defer reader.deinit();
 
+        max_tokens = reader.resolveMaxTokens(max_tokens, executor_contract.batch.max_output_tokens_per_item) catch |err|
+            return inferenceFailureResponse(ctx, err);
         const exact_prompt_tokens = reader.inputTokenCount(.{
             .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
@@ -24369,6 +24436,7 @@ pub const Node = struct {
                         false,
                         "compatible",
                         false,
+                        self.config.request_limits,
                     );
                     try listed_model_names.put(a, name, {});
                     model_count += 1;
@@ -24418,6 +24486,7 @@ pub const Node = struct {
                     chat_template_failed,
                     listing.compatibility_level,
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, entry.path),
+                    self.config.request_limits,
                 );
                 try appendModelMetadata(&body, a, &listing.manifest, task);
                 if (isOpenAiListTask(task)) {
@@ -24476,6 +24545,7 @@ pub const Node = struct {
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, listing.canonical_model_dir),
+                    self.config.request_limits,
                 );
                 try appendModelMetadata(&body, a, &model.manifest, task);
                 if (isOpenAiListTask(task)) {
@@ -25788,7 +25858,6 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.UnsupportedClassificationExtraction,
         error.UnsupportedInput,
         error.UnsupportedRelationExtraction,
-        error.UnsupportedGlinerDecisionGeometry,
         error.InvalidMaxTokens,
         => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
         error.GlinerDecisionArtifactMismatch,
@@ -25802,6 +25871,7 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.ConstrainedInputTooLarge,
         error.GeneratedExtractionLimitExceeded,
         error.ReadBatchTooLarge,
+        error.UnsupportedGlinerDecisionGeometry,
         error.InferenceBatchTooLarge,
         error.InferenceMediaPartLimitExceeded,
         error.StreamTooLong,
@@ -27229,6 +27299,7 @@ fn appendModelInfo(
     compatibility_level: []const u8,
     /// REBEL emits generic ENTITY nodes and accepts untyped relation names.
     untyped_entities: bool,
+    request_limits: RequestLimits,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_zero_shot = zero_shot_classification and !model_caps.hasCapability(capabilities, "zero_shot");
@@ -27367,6 +27438,7 @@ fn appendModelInfo(
         accepts_audio,
         accepts_document,
         accepts_video,
+        request_limits,
     );
     if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
     if (compatibility_level.len > 0) {
@@ -27511,6 +27583,7 @@ test "REBEL catalog advertises generic entity schema independently of model name
         false,
         "compatible",
         true,
+        .{},
     );
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -27544,6 +27617,7 @@ test "reranker catalog advertises rerank documents" {
         false,
         "compatible",
         false,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -27574,6 +27648,7 @@ test "fixed chunk catalog advertises its multimodal transport truth" {
         false,
         "compatible",
         false,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -27605,13 +27680,14 @@ fn appendResolvedInferenceCapabilities(
     accepts_audio: bool,
     accepts_document: bool,
     accepts_video: bool,
+    request_limits: RequestLimits,
 ) !void {
     // Kept in lockstep with antfly inference.work.MimeTypes' bounded native
     // capability representation. The wire catalog may contain any validated
     // essence, but no node may publish more extensions than a peer can retain.
     const resolved_task = normalizedInferenceTask(task) orelse return;
     if (!accepts_text and !accepts_image and !accepts_audio and !accepts_document and !accepts_video) return;
-    const resolved = try resolveInferenceBatchCapabilities(
+    var resolved = request_limits.narrow(try resolveInferenceBatchCapabilities(
         resolved_task,
         manifest_capabilities,
         resolvedExecutorBatchImplementation(resolved_task, executor_kind),
@@ -27620,8 +27696,12 @@ fn appendResolvedInferenceCapabilities(
         accepts_image,
         accepts_audio,
         accepts_document,
-    );
+    ));
 
+    if (request_limits.max_items_per_request) |limit| {
+        resolved.max_items = @min(resolved.max_items, limit);
+        resolved.preferred_items = @min(resolved.preferred_items, resolved.max_items);
+    }
     try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"version\":4,\"task\":");
     try jsonEncodeString(buf, allocator, resolved_task);
     try buf.appendSlice(allocator, ",\"input_modalities\":[");
@@ -28433,6 +28513,7 @@ test "unified multimodal embedding contract admits bounded ordered media parts" 
 /// planner's resource and modality checks.
 const ResolvedInferenceExecutorContract = struct {
     task: []const u8,
+    max_items_per_request: ?usize = null,
     batch: ResolvedInferenceBatchCapabilities,
     accepts_text: bool,
     accepts_image: bool,
@@ -28444,6 +28525,7 @@ const ResolvedInferenceExecutorContract = struct {
 };
 
 const InferenceExecutorInvocationShape = struct {
+    internal_microbatch: bool = false,
     item_count: usize = 1,
     text_bytes_per_item: usize = 0,
     input_tokens_per_item: usize = 0,
@@ -28493,18 +28575,30 @@ fn resolvedInferenceExecutorContract(
         );
     }
     const max_images = if (modalities.image) executorMaxImages(resolved_task) else 0;
+    var implementation = resolvedExecutorBatchImplementation(resolved_task, executor_kind);
+    if (build_options.enable_cuda and node.session_manager.required_backend == .cuda and
+        std.mem.eql(u8, resolved_task, "extract") and
+        manifest.gliner_classification_head == .label_marker_mlp and manifest.gliner_span_encoder_family == .deberta)
+    {
+        // Legacy Decide has one uniform CUDA classification envelope. Boundary
+        // discovery stays conservative: its single-window batches and one-item
+        // long-document profiles cannot share an unconditional batch promise.
+        // Listing metadata never substitutes for exact live artifact checks.
+        implementation = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .per_item_failures = false };
+    }
     return .{
         .task = resolved_task,
-        .batch = try resolveInferenceBatchCapabilities(
+        .max_items_per_request = node.config.request_limits.max_items_per_request,
+        .batch = node.config.request_limits.narrow(try resolveInferenceBatchCapabilities(
             resolved_task,
             manifest.capabilities,
-            resolvedExecutorBatchImplementation(resolved_task, executor_kind),
+            implementation,
             requestMediaMaxBytes(node),
             if (max_images > 0) requestMediaMaxDecodedPixels(node, max_images) else 0,
             modalities.image,
             modalities.audio,
             false,
-        ),
+        )),
         .accepts_text = modalities.text,
         .accepts_image = modalities.image,
         .accepts_audio = modalities.audio,
@@ -28651,6 +28745,9 @@ fn validateInferenceExecutorInvocation(
     contract: ResolvedInferenceExecutorContract,
     shape: InferenceExecutorInvocationShape,
 ) !void {
+    if (!shape.internal_microbatch) {
+        if (contract.max_items_per_request) |limit| if (shape.item_count > limit) return error.InferenceBatchTooLarge;
+    }
     if (shape.item_count == 0 or shape.item_count > contract.batch.max_items)
         return error.InferenceBatchTooLarge;
     if (shape.has_text and !contract.accepts_text)
@@ -28737,7 +28834,7 @@ const ExtractionReaderAdmission = struct {
     node: *Node,
     allocator: std.mem.Allocator,
 
-    fn validate(ptr: *anyopaque, model_path: []const u8, images: []const []const u8, options: readers_mod.ReadOptions) !void {
+    fn resolveLimits(ptr: *anyopaque, model_path: []const u8, images: []const []const u8, options: readers_mod.ReadOptions) !RequestLimits {
         const self: *ExtractionReaderAdmission = @ptrCast(@alignCast(ptr));
         var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
         defer manifest.deinit();
@@ -28754,6 +28851,12 @@ const ExtractionReaderAdmission = struct {
             .media_parts_per_item = 1,
             .has_image = true,
         });
+        return .{
+            .max_items_per_request = contract.max_items_per_request,
+            .max_input_tokens_per_item = contract.batch.max_input_tokens_per_item,
+            .max_output_tokens_per_item = contract.batch.max_output_tokens_per_item,
+            .max_decoded_pixels_per_batch = contract.batch.max_decoded_pixels,
+        };
     }
 };
 
@@ -29087,6 +29190,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
         false,
         "compatible",
         false,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
     defer parsed.deinit();
@@ -29146,6 +29250,7 @@ test "standalone inference catalog validates extensible MIME against executor co
         false,
         false,
         false,
+        .{},
     );
     try body.append(alloc, '}');
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
@@ -29178,6 +29283,7 @@ test "standalone inference catalog validates extensible MIME against executor co
             false,
             false,
             false,
+            .{},
         ),
     );
 
@@ -29336,6 +29442,7 @@ test "normalized inference capabilities cover every model family" {
             false,
             "compatible",
             false,
+            .{},
         );
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
         defer parsed.deinit();
@@ -46945,4 +47052,102 @@ test "model aware media complete speaker timelines borrow pinned cache storage w
     cache.release(state.borrowed.?);
     try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
     try std.testing.expectEqual(@as(usize, 0), admission.controller.snapshot().hostTotalBytes());
+}
+
+test "deployment request limits narrow executor plans without widening manifest bounds" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_items_per_request = 1, .max_input_tokens_per_item = 8192, .max_output_tokens_per_item = 1024, .max_decoded_pixels_per_batch = 4_194_304 } });
+    defer node.deinit();
+    var capabilities = [_][]const u8{"inference.limits.max_input_tokens_per_item=4096"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .generator, .capabilities = &capabilities };
+    const contract = try resolvedInferenceExecutorContract(&node, "generate", &manifest);
+    try std.testing.expectEqual(@as(?usize, 1), contract.max_items_per_request);
+    try std.testing.expectEqual(@as(?usize, 4096), contract.batch.max_input_tokens_per_item);
+    try std.testing.expectEqual(@as(?usize, 1024), contract.batch.max_output_tokens_per_item);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .has_text = true, .input_tokens_per_item = 4097 }));
+    try std.testing.expectError(error.InvalidInferenceConfig, (RequestLimits{ .max_output_tokens_per_item = 0 }).validate());
+}
+
+test "reader media budget admits a full scan independently of single request concurrency" {
+    var node = try Node.init(std.testing.allocator, .{
+        .max_concurrent_requests = 1,
+        .max_work_units = 8,
+        .content_security = .{ .max_image_dimension = 2048, .max_download_size_bytes = 12 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    const admission = readRequestAdmission(&node, 1, 0, 1024);
+    try std.testing.expect(admission.decoded_pixel_cap >= 2048 * 2048);
+    try node.inference_admission.acquireRequestSlot();
+    defer node.inference_admission.releaseRequestSlot();
+    try node.inference_admission.reserveUnits(admission.units);
+    defer node.inference_admission.releaseReservedUnits(admission.units);
+    try std.testing.expectError(error.QueueFull, node.inference_admission.acquireRequestSlot());
+}
+
+/// Only omitted output lengths are narrowed automatically; explicit requests
+/// retain their value so invocation validation can report a policy violation.
+fn boundedReadOutputTokens(requested: ?usize, model_default: usize, ceiling: ?usize) usize {
+    return requested orelse if (ceiling) |limit| @min(model_default, limit) else model_default;
+}
+
+test "omitted reader output tokens resolve before execution and explicit excess is rejected" {
+    try std.testing.expectEqual(@as(usize, 64), boundedReadOutputTokens(null, 256, 64));
+    try std.testing.expectEqual(@as(usize, 64), boundedReadOutputTokens(null, 4096, 64));
+    try std.testing.expectEqual(@as(usize, 256), boundedReadOutputTokens(null, 256, 1024));
+    try std.testing.expectEqual(@as(usize, 65), boundedReadOutputTokens(65, 256, 64));
+    const contract: ResolvedInferenceExecutorContract = .{
+        .task = "read",
+        .max_items_per_request = 1,
+        .batch = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_encoded_media_bytes = 1024, .max_output_tokens_per_item = 64, .max_decoded_pixels = null, .max_media_parts_per_item = 1, .per_item_failures = true },
+        .accepts_text = true,
+        .accepts_image = true,
+        .accepts_audio = false,
+        .accepts_document = false,
+    };
+    try validateInferenceExecutorInvocation(contract, .{ .output_tokens_per_item = boundedReadOutputTokens(null, 4096, 64) });
+    try std.testing.expectError(error.InferenceBatchTooLarge, validateInferenceExecutorInvocation(contract, .{ .item_count = 2 }));
+    try validateInferenceExecutorInvocation(contract, .{ .item_count = 2, .internal_microbatch = true });
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .output_tokens_per_item = boundedReadOutputTokens(65, 4096, 64) }));
+}
+
+fn validateMeasuredReadPrompt(contract: ResolvedInferenceExecutorContract, actual_input_tokens: usize, output_tokens: usize) !void {
+    try validateInferenceExecutorInvocation(contract, .{
+        .input_tokens_per_item = actual_input_tokens,
+        .output_tokens_per_item = output_tokens,
+        .has_image = true,
+    });
+}
+
+test "LightOn measured prompt policy rejects expanded input before page execution" {
+    const contract: ResolvedInferenceExecutorContract = .{
+        .task = "read",
+        .batch = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_encoded_media_bytes = 1024, .max_input_tokens_per_item = 32, .max_output_tokens_per_item = 64, .max_decoded_pixels = null, .max_media_parts_per_item = 1, .per_item_failures = true },
+        .accepts_text = true,
+        .accepts_image = true,
+        .accepts_audio = false,
+        .accepts_document = false,
+    };
+    try validateMeasuredReadPrompt(contract, 32, 64);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, validateMeasuredReadPrompt(contract, 33, 64));
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateMeasuredReadPrompt(contract, 32, 65));
+}
+
+test "generate batch HTTP enforces public cardinality before dispatch" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_items_per_request = 1 } });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/generate/batch");
+    defer request.deinit();
+    try request.setJson(
+        \\{"requests":[{"custom_id":"one","body":{"model":"missing","messages":[]}},{"custom_id":"two","body":{"model":"missing","messages":[]}}]}
+    );
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.generateBatchContent(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "BATCH_TOO_LARGE") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }

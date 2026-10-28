@@ -1,0 +1,229 @@
+openapi: 3.0.3
+info:
+  title: Antfly Resource Policy
+  description: Shared resource policy for database and inference runtimes.
+  version: "0.0.1"
+components:
+  schemas:
+    ResourcesConfig:
+      type: object
+      additionalProperties: false
+      description: Shared node-local resource policy for DB and standalone inference. All memory quantities are bytes.
+      properties:
+        memory:
+          type: object
+          additionalProperties: false
+          properties:
+            max_bytes:
+              type: integer
+              minimum: 0
+              description: Whole-process memory envelope; zero selects automatic cgroup or host detection. Physical capacity always clamps this value.
+        query:
+          type: object
+          additionalProperties: false
+          properties:
+            admission:
+              $ref: "#/components/schemas/QueryAdmissionConfig"
+            request_limits:
+              type: object
+              additionalProperties: false
+              properties:
+                graph:
+                  $ref: "#/components/schemas/GraphExecutionConfig"
+        write:
+          type: object
+          additionalProperties: false
+          properties:
+            admission:
+              $ref: "#/components/schemas/WriteAdmissionConfig"
+        inference:
+          type: object
+          additionalProperties: false
+          properties:
+            memory:
+              $ref: "#/components/schemas/InferenceMemoryConfig"
+            admission:
+              $ref: "#/components/schemas/InferenceAdmissionConfig"
+            request_limits:
+              $ref: "#/components/schemas/InferenceRequestLimitsConfig"
+
+    InferenceMemoryConfig:
+      type: object
+      additionalProperties: false
+      description: Inference memory ceilings in bytes. Omitted or zero values select automatic policy; physical capacity and the process envelope remain authoritative.
+      properties:
+        max_host_bytes:
+          type: integer
+          minimum: 0
+          description: Host memory ceiling.
+        max_device_bytes:
+          type: integer
+          minimum: 0
+          description: Accelerator memory ceiling.
+        max_combined_bytes:
+          type: integer
+          minimum: 0
+          description: Combined host and accelerator ceiling; integrated devices also enforce this across CPU and GPU leases.
+        max_kv_bytes:
+          type: integer
+          minimum: 0
+          description: KV cache memory ceiling.
+        max_scratch_bytes:
+          type: integer
+          minimum: 0
+          description: Scratch memory ceiling.
+
+    InferenceRequestLimitsConfig:
+      type: object
+      additionalProperties: false
+      description: Deployment request ceilings only narrow model capabilities. Applied equally to direct calls, HTTP and discovery. Omitted values retain native limits.
+      properties:
+        max_items_per_request:
+          type: integer
+          minimum: 1
+          description: Maximum items in one public or direct request. Independent callers may still be combined into a larger native execution microbatch.
+        max_input_tokens_per_item:
+          type: integer
+          minimum: 1
+          description: Maximum effective input tokens per item, including expanded image prompts.
+        max_output_tokens_per_item:
+          type: integer
+          minimum: 1
+          description: Maximum generated output tokens per item. Omitted request max_tokens resolves to a bounded effective default.
+        max_decoded_pixels_per_batch:
+          type: integer
+          minimum: 1
+          description: Maximum aggregate decoded image pixels in a request batch; also bounds execution microbatch pixels.
+
+    GraphExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Operator-owned ceilings shared by all named graph operations in one
+        admitted query. Public requests cannot raise these values. Explored
+        work, scanned anchors, and exact-distinct capacity are request-consumptive;
+        intermediate and retained-state ceilings bound simultaneously live state.
+      properties:
+        max_explored_nodes:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: Cumulative node expansions across every named operation and path spur in one request.
+        max_explored_edges:
+          type: integer
+          minimum: 1
+          default: 1000000
+          description: Cumulative edge expansions across every named operation and path spur in one request.
+        max_explored_edge_bytes:
+          type: integer
+          minimum: 1
+          default: 67108864
+          description: Cumulative owned bytes of materialized edges read while executing one request.
+        max_scanned_anchors:
+          type: integer
+          minimum: 1
+          default: 1000000
+          description: Cumulative source anchors scanned by exact MATCH operations in one request.
+        max_intermediate_states:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: Maximum simultaneously live traversal, pathfinding, or MATCH frontier states.
+        max_retained_state_bytes:
+          type: integer
+          minimum: 1
+          default: 67108864
+          description: Maximum simultaneously retained bytes of admitted graph execution state.
+        max_distinct_identities:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: Cumulative exact-distinct identities admitted across all named aggregates in one request.
+        max_distinct_state_bytes:
+          type: integer
+          minimum: 1
+          default: 16777216
+          description: Request-consumptive bytes for exact-distinct identities, indexes, and ownership transfer.
+
+    QueryAdmissionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_concurrent_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 32
+          example: 32
+          x-go-type-skip-optional-pointer: false
+          description: |
+            Maximum concurrent query, search, and retrieval requests in this
+            process. The default is 32. The budget is shared by REST, MCP,
+            retrieval-agent, A2A, and direct API-kernel execution. Full-text,
+            vector, hybrid, graph, aggregation, federated searches, and document
+            scans consume it. Point lookups and operational/control-plane reads
+            remain outside it. Excess HTTP work is rejected immediately with
+            HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure
+            response. Excess work is not queued. Set to 0 to disable query
+            admission. This budget is independent of transport safeguards,
+            write admission, and
+            resources.inference.admission.max_concurrent_requests.
+
+    WriteAdmissionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_concurrent_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 16
+          example: 16
+          x-go-type-skip-optional-pointer: false
+          description: |
+            Maximum concurrent foreground data mutations in this process. The
+            default is 16. Table batch writes, cross-table batches, linear merges,
+            and transaction commits consume this budget. Schema, index, backup,
+            restore, repair, and other administrative operations use dedicated
+            control or background-maintenance paths. Set to 0 to disable write
+            admission.
+
+            Excess HTTP work in either foreground class is rejected immediately
+            with HTTP 429 and Retry-After: 1; asynchronous protocols use their
+            native failure response. Excess work is not queued. Both budgets are
+            independent of transport safeguards and
+            resources.inference.admission.max_concurrent_requests.
+
+    InferenceAdmissionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_work_units:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: Weighted work and media capacity, independent of request count. Omitted derives capacity from concurrency; zero disables weighted accounting.
+
+        max_concurrent_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 32
+          example: 32
+          x-go-type-skip-optional-pointer: false
+          description: |
+            Maximum concurrent inference requests admitted by this process.
+            The budget covers embedded inference routes, direct providers, and
+            public connection inference forwarding. Remote forwarding holds a
+            slot for the full upstream request. The runtime-reserved
+            `local-inference` connection dispatches in process and is admitted
+            once by the destination inference route; configured URLs remain
+            remote boundaries even when they alias the local listener.
+            Embedded standalone uses one shared coordinator for all of those
+            surfaces; API-only runtimes use the same setting as a local forwarding
+            gate. Weighted work/media capacity is controlled independently by
+            max_work_units; when omitted it derives from max_concurrent_requests.
+            Request count zero disables only the request-count gate. An explicit
+            max_work_units remains authoritative. Excess work is rejected with
+            503 and Retry-After; it is not queued.
+

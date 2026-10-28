@@ -1,7 +1,7 @@
 from enum import StrEnum
 
 
-class InferenceRuntimeConfigModelStrategiesAdditionalProperty(StrEnum):
+class RuntimeConfigModelStrategiesAdditionalProperty(StrEnum):
     BOUNDED = "bounded"
     EAGER = "eager"
     LAZY = "lazy"

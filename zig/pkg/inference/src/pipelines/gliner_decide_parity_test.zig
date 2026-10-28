@@ -35,8 +35,20 @@ const Fixture = struct {
 };
 
 test "Decide published checkpoint matches upstream tokenization and logits" {
-    const path = platform.env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
+    try checkpointParity(false);
+}
+
+test "Decide Q8 published bundle matches upstream tokenization and logits" {
+    try checkpointParity(true);
+}
+
+fn checkpointParity(comptime quantized: bool) !void {
+    const source = platform.env.getenv(if (quantized) "ANTFLY_GLINER_DECIDE_Q8_MODEL" else "ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try @import("../models/gliner_decide_qualification_fixture.zig").prepare(a, &temporary, source);
+    defer a.free(path);
     var parsed = try std.json.parseFromSlice(Fixture, a, fixture_bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     var manifest = try manifest_mod.loadFromDir(a, path);
@@ -56,6 +68,16 @@ test "Decide published checkpoint matches upstream tokenization and logits" {
     else
         return error.InvalidDecisionTestBackend;
     defer session.close();
+    try factory.sealGlinerDecisionTokenizerDigest(session, @import("../models/gliner_decide_qualification.zig").Digest.of(tokenizer_bytes));
+    const identity = try factory.getGlinerDecisionIdentity(session);
+    if (quantized) {
+        // Quantization is a distinct artifact profile, including both files.
+        try std.testing.expectEqualStrings("8d9bea7df21ab4a8a17333f51f246faab5280159e5751ebbadd81a85ec96c871", &identity.weight.sha256);
+        const companion = identity.weight_companion orelse return error.MissingQ8Head;
+        try std.testing.expectEqualStrings("52cb6197d3dcfe5ad6276ceb037a3333d2921bbcf3dfb8289aeff82fbd5693dc", &companion.sha256);
+    }
+    _ = try @import("../models/gliner_decide_qualification.zig").require(identity);
+    if (std.mem.eql(u8, selected, "cuda")) try std.testing.expectEqual(.cuda, session.backend());
     var pipeline = gliner.GlinerPipeline{
         .allocator = a,
         .session = session,
@@ -89,10 +111,21 @@ test "Decide published checkpoint matches upstream tokenization and logits" {
         try std.testing.expectEqual(@as(usize, 1), prepared.rows.len);
         try std.testing.expectEqualSlices(i64, case.input_ids, prepared.rows[0].input_ids);
         try std.testing.expectEqualSlices(i64, case.l_marker_positions, prepared.rows[0].marker_positions);
+        const cuda_before = if (comptime @import("build_options").enable_cuda) factory.getCudaRuntimeStats(session) else null;
         const result = try pipeline.decidePrepared(&prepared);
         defer {
             for (result) |*row| row.deinit(a);
             a.free(result);
+        }
+        if (comptime @import("build_options").enable_cuda) {
+            if (cuda_before) |before| {
+                const after = factory.getCudaRuntimeStats(session).?;
+                try std.testing.expect(after.kernel_launches > before.kernel_launches);
+                // Only final label logits may cross the generic tensor readback
+                // boundary; encoder and classifier execution stay on CUDA.
+                try std.testing.expectEqual(before.to_float32_calls + 1, after.to_float32_calls);
+                std.debug.print("decide_cuda case={s} launches={d} logits_readbacks=1\n", .{ case.name, after.kernel_launches - before.kernel_launches });
+            }
         }
         var flat: usize = 0;
         for (tasks) |task| {
@@ -101,7 +134,7 @@ test "Decide published checkpoint matches upstream tokenization and logits" {
             for (task.labels) |label| {
                 const reference = logits.get(label.name).?;
                 const want: f32 = @floatCast(reference.float);
-                try std.testing.expectApproxEqAbs(want, result[0].raw_logits[flat], 0.02);
+                try std.testing.expectApproxEqAbs(want, result[0].raw_logits[flat], if (quantized) 5e-2 else 0.02);
                 flat += 1;
             }
         }

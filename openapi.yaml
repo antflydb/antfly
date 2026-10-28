@@ -13848,7 +13848,8 @@ paths:
 
         to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
 
-        `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+        `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+        (derived from request concurrency when omitted). A zero configured
 
         download limit disables nonempty media. Remote URL byte potential is reserved before
 
@@ -13858,7 +13859,7 @@ paths:
 
         decoded source pixels are admitted at a conservative 16 bytes per pixel against
 
-        the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`;
+        the lower of 512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`;
         a zero
 
         concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
@@ -14279,14 +14280,15 @@ paths:
 
         read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
 
-        `admission.inference.max_concurrent_requests`. Admission happens before model resolution or download.
+        `resources.inference.admission.max_work_units`. Admission happens before model resolution or download.
 
 
         After download, image headers are validated before model loading. Decoded source
 
         pixels are admitted at a conservative 16 bytes per pixel against the lower of
 
-        512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+        512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+        capacity
 
         setting still uses the finite 512 MiB ceiling. The reservation grows atomically
 
@@ -53093,442 +53095,8 @@ components:
         - xla
         - webgpu
         - wasm
-    InferenceModelFormat:
-      type: string
-      description: Optional artifact format preference for loading a model.
-      enum:
-        - gguf
-        - onnx
-        - safetensors
-        - hybrid
-    InferenceModelQuantization:
-      type: string
-      description: Optional quantization preference for loading a model.
-      enum:
-        - q4_k
-        - q8
-        - fp16
-    InferenceA4bResidencyMode:
-      type: string
-      description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime.
-        On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
-      enum:
-        - auto
-        - streamed
-        - resident
-    InferenceBackendPriorityEntry:
-      type: string
-      description: >
-        Backend priority entry for model loading. Use `backend` or `backend:device`,
-
-        where device defaults to `auto`.
-
-
-        Backends:
-
-        - `native` - Native CPU backend
-
-        - `metal` - Apple Metal backend
-
-        - `cuda` - NVIDIA CUDA backend
-
-        - `xla` - PJRT/XLA compiled backend
-
-        - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds
-
-
-        Devices:
-
-        - `auto` - Auto-detect best available (default)
-
-        - `cuda` - NVIDIA CUDA GPU
-
-        - `tpu` - Google TPU (used by XLA)
-
-        - `cpu` - Force CPU only
-      pattern: ^(native|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$
-    InferenceModelRef:
-      type: object
-      additionalProperties: false
-      description: Model reference used by startup preload and model-loading configuration.
-      required:
-        - kind
-        - name
-      properties:
-        kind:
-          $ref: '#/components/schemas/InferenceModelKind'
-        name:
-          type: string
-          description: Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>`
-            format.
-          example: antflydb/gemma-e2b
-        backend:
-          $ref: '#/components/schemas/InferenceModelBackend'
-        cuda_precision:
-          type: string
-          enum:
-            - auto
-            - fp32
-            - fp16
-            - bf16
-          x-go-type-skip-optional-pointer: false
-          description: >
-            Per-model GLiNER CUDA inference precision for extractor preloads. Requires
-
-            CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests
-
-            fail closed until the exact model/profile has release qualification.
-
-            Precision is part of the loaded-session cache identity.
-        format:
-          $ref: '#/components/schemas/InferenceModelFormat'
-        quantization:
-          $ref: '#/components/schemas/InferenceModelQuantization'
-        residency_mode:
-          $ref: '#/components/schemas/InferenceA4bResidencyMode'
-          default: auto
-          description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA
-            runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope
-            fits. Other model geometries reject this field.
-        memory_budget_mb:
-          type: integer
-          format: uint32
-          minimum: 0
-          maximum: 1048576
-          default: 0
-          description: Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB
-            streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too
-            small for full residency. Other model geometries reject this field.
-    InferencePromptCacheConfig:
-      type: object
-      description: Native generator prompt KV cache configuration.
-      properties:
-        enabled:
-          type: boolean
-          description: Enable inference-native prompt KV cache reuse for generator requests. On by default;
-            set false to disable.
-          default: true
-        mode:
-          type: string
-          description: >
-            Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
-
-            full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an
-
-            opt-in page-aligned compressed radix tree with shared-prefix ownership and
-
-            leaf-only LRU eviction; it is currently qualified for native and Metal
-
-            backends. Eligible Metal requests use eager paged attention; explicit compiled
-
-            generation is incompatible with prompt caching. `simple` keeps the linear-scan
-
-            retained-prefix cache and is only suitable for small caches or debugging.
-          enum:
-            - simple
-            - block_hash
-            - radix
-          default: block_hash
-        max_bytes_mb:
-          type: integer
-          minimum: 0
-          maximum: 17592186044415
-          description: >
-            Node-wide target for live prompt-cache entries. The runtime divides it
-
-            across participating model caches and evicts using estimated metadata
-
-            and logical host/device KV bytes. Backend allocators may retain reusable
-
-            capacity, so this is not a hard cap on process or accelerator memory.
-          default: 512
-        min_tokens:
-          type: integer
-          minimum: 0
-          description: Minimum prompt length eligible for prompt KV caching.
-          default: 64
-        ttl_ms:
-          type: integer
-          minimum: 0
-          maximum: 9223372036854775807
-          description: >
-            Idle time-to-live for prompt KV cache entries. Refreshed on every cache
-
-            hit, so only entries left unused for this duration expire.
-          default: 300000
-    InferenceAdmissionConfig:
-      type: object
-      additionalProperties: false
-      description: Process-local foreground request admission settings.
-      properties:
-        inference:
-          $ref: '#/components/schemas/InferenceRequestAdmissionConfig'
-    InferenceRequestAdmissionConfig:
-      type: object
-      additionalProperties: false
-      properties:
-        max_concurrent_requests:
-          type: integer
-          x-go-type-skip-optional-pointer: false
-          description: >
-            Maximum concurrent inference requests in this process. The same
-
-            value also sizes the weighted work budget shared by every executing
-
-            inference endpoint: each request consumes one request slot and at
-
-            least one unit, while request body size, generation workload, and
-
-            image byte/count reservations can consume more than one unit. The
-
-            request count can therefore never exceed this value, while expensive
-
-            requests may exhaust weighted capacity sooner. Read and
-
-            image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB
-
-            per unit and at least one unit per two images. A positive capacity also
-
-            clamps each such request's downloaded-image ceiling to 16 MiB times
-
-            this value. When either ceiling is exhausted, new HTTP requests are
-
-            rejected immediately with 503 Service Unavailable and Retry-After: 1;
-
-            they are not retained
-
-            in an in-process queue. Set to 0 to disable both ceilings, admission
-
-            unit accounting, and the capacity-derived clamp. The default is 32.
-          minimum: 0
-          maximum: 4294967295
-          default: 32
-          example: 32
     InferenceConfig:
-      allOf:
-        - $ref: '#/components/schemas/InferenceRuntimeConfig'
-        - type: object
-          properties:
-            admission:
-              $ref: '#/components/schemas/InferenceAdmissionConfig'
-    InferenceRuntimeConfig:
-      type: object
-      properties:
-        max_concurrent_requests:
-          type: integer
-          minimum: 0
-          maximum: 4294967295
-          deprecated: true
-          description: >
-            Deprecated compatibility alias for
-
-            `admission.inference.max_concurrent_requests`. New configurations
-
-            should use the process-level admission setting. If both spellings
-
-            are supplied, they must have the same value.
-          example: 32
-        api_url:
-          type: string
-          format: uri
-          description: >
-            URL of an out-of-process Antfly inference service that the Antfly
-
-            server should call for embedding, chunking, reranking, and
-
-            generation. Omit it to use the in-process inference runtime
-
-            (the default in standalone mode). `antfly inference run` ignores
-
-            this field; it configures the client side only.
-          example: http://localhost:8080
-        api_key:
-          type: string
-          description: API key used when calling an authenticated shared Antfly inference API.
-        models_dir:
-          type: string
-          description: >
-            Base directory containing model subdirectories. Antfly inference auto-discovers models from:
-
-            - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
-
-            - `{models_dir}/embedders/` - Embedding models
-
-            - `{models_dir}/rerankers/` - Reranking models
-
-            - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-
-            - `{models_dir}/rewriters/` - Seq2Seq rewriter models
-
-
-            Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
-
-            (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
-
-            chunker needs no models.
-          example: ~/.antfly/inference/models
-        ml_dir:
-          type: string
-          description: >
-            Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
-
-            API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
-
-
-            Defaults to ~/.antfly/inference/ml.
-          example: ~/.antfly/inference/ml
-        content_security:
-          $ref: '#/components/schemas/InferenceContentSecurityConfig'
-          description: Configured fields are merged individually over a fail-closed inference baseline.
-            Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts
-            and allowed_paths remain explicit deny-all lists even when another field is configured. Enable
-            remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled,
-            IP literals and every address resolved from an allowlisted DNS hostname must be globally routable,
-            and the connection is pinned to a vetted address. Setting it to false explicitly opts into
-            private and special destinations. Across generate, dense embed, multimodal rerank, and batch
-            generation, downloaded and inline encoded media is capped cumulatively per request at the
-            lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests
-            is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media.
-            Remote URL byte potential is reserved before fetch, while inline sources use their actual
-            encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel
-            admission before model execution. Batch generation accepts bounded image and audio media parts
-            and rejects malformed or unsupported parts before dispatch. Embedded direct transcription
-            and extraction use the configured encoded-media per-call ceiling, and direct dense embedding
-            also applies pre-allocation and decoded-image admission. In unified Antfly configuration,
-            an empty inference policy may first inherit a nonempty remote_content security policy, which
-            is then merged over this baseline.
-        s3_credentials:
-          $ref: '#/components/schemas/InferenceCredentials'
-          description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-        keep_alive:
-          type: string
-          description: >
-            How long to keep models loaded in memory after last use (Ollama-compatible).
-
-            Models are automatically unloaded after this duration of inactivity.
-
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
-
-            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
-
-            still be evicted under resource pressure or to enforce max_loaded_models.
-          default: 5m
-          example: 5m
-        max_loaded_models:
-          type: integer
-          description: >
-            Maximum total models loaded across all registry types (embedders, rerankers,
-
-            generators, chunkers, etc.). When the limit is reached, the least-recently-used
-
-            idle model from any registry is evicted to make room. Set to 0 for unlimited.
-
-            Defaults to 10.
-          default: 10
-          example: 3
-        pool_size:
-          type: integer
-          description: >
-            Legacy compatibility field. The current Zig inference runtime does not
-
-            create per-model pipeline pools from this setting; configuring it has no effect.
-          deprecated: true
-        prompt_cache:
-          $ref: '#/components/schemas/InferencePromptCacheConfig'
-          description: Native generator prompt KV cache settings.
-        backend_priority:
-          type: array
-          items:
-            $ref: '#/components/schemas/InferenceBackendPriorityEntry'
-          description: >
-            Legacy compatibility field. The current Zig inference runtime selects a
-
-            backend from model metadata, explicit preload settings, and compiled capabilities;
-
-            configuring this list has no effect.
-          deprecated: true
-        max_queue_size:
-          type: integer
-          description: >
-            Legacy Go-runtime queue setting. The current Zig runtime does not retain
-
-            excess inference requests in memory and ignores this field.
-          deprecated: true
-        request_timeout:
-          type: string
-          description: >
-            Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
-
-            this field; its HTTP listener applies a separate fixed transport timeout.
-          deprecated: true
-        preload:
-          type: array
-          description: >
-            Models to preload and warm at startup. Generators run a tiny generation
-
-            request so native/Metal weights, KV setup, and kernels use the same
-
-            budgeted path as request-time generation. Other model kinds use the
-
-            best available warm path for that kind.
-          items:
-            $ref: '#/components/schemas/InferenceModelRef'
-          example:
-            - kind: generator
-              name: antflydb/gemma-e2b
-              backend: metal
-              format: gguf
-              quantization: q4_k
-        max_memory_mb:
-          type: integer
-          description: >
-            Legacy compatibility field. The current Zig runtime uses explicit host,
-
-            backend, combined, KV, and scratch budgets instead and ignores this field.
-          deprecated: true
-        model_strategies:
-          type: object
-          additionalProperties:
-            type: string
-            enum:
-              - eager
-              - lazy
-              - bounded
-          description: >
-            Per-model loading strategy overrides. Maps model names to their loading strategy.
-
-            Models not in this map load on demand. keep_alive controls their idle
-
-            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
-
-
-            When a model has strategy "eager" in this map:
-
-            - It is loaded at startup through the same startup warmup path
-
-            - It is never unloaded, even when keep_alive>0 (pinned in memory)
-
-
-            This allows mixing eager and lazy models in the same pool.
-          example:
-            BAAI/bge-small-en-v1.5: eager
-            mirth/chonky-mmbert-small-multilingual-1: lazy
-        allow_downloads:
-          type: boolean
-          description: >
-            Legacy compatibility field controlling whether dashboards show model
-
-            download commands. It defaults to true for standalone deployments;
-
-            managed deployments historically set it to false. Download-command
-
-            availability is a build-time setting in the current Zig runtime, so
-
-            configuring this field has no effect.
-          default: true
-          deprecated: true
-        log:
-          $ref: '#/components/schemas/Inferenceschemas-Config'
+      $ref: '#/components/schemas/InferenceServerConfig'
     InferenceBackendRuntimes:
       type: object
       description: Runtime backends compiled into this inference server.
@@ -53592,121 +53160,6 @@ components:
         frame_delay_ms:
           type: integer
           description: 'Animation: display delay in milliseconds'
-    InferenceContentSecurityConfig:
-      type: object
-      description: Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and
-        S3 content require explicit allowlists; data URIs remain allowed within the configured size budget.
-      properties:
-        allowed_hosts:
-          type: array
-          description: Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit
-            empty list both deny all hosts. With block_private_ips enabled, IP literals and every address
-            resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned
-            to a vetted address.
-          items:
-            type: string
-          example:
-            - 93.184.216.34
-        block_private_ips:
-          type: boolean
-          description: Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast
-            destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy,
-            and the connection is pinned to a vetted address. Set false only as an explicit opt-out that
-            permits private and special destinations.
-          default: true
-        max_download_size_bytes:
-          type: integer
-          description: Maximum size of downloaded content in bytes
-          default: 104857600
-          minimum: 0
-          example: 104857600
-          x-go-type: int64
-        download_timeout_seconds:
-          type: integer
-          description: Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
-          default: 30
-          minimum: 0
-        max_image_dimension:
-          type: integer
-          description: Maximum source-image width or height for accepted inference image inputs, including
-            generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`,
-            and their embedded direct APIs. Headers exceeding this limit are rejected before model execution;
-            images are not resized. Batch generation applies the same image-header admission before model
-            execution. Non-inference scraping consumers do not enforce this setting.
-          minimum: 1
-        allowed_paths:
-          type: array
-          description: Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and
-            an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g.,
-            /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
-          items:
-            type: string
-          example:
-            - /Users/data/
-            - my-bucket/uploads/
-        user_agent:
-          type: string
-          description: User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
-            servers (e.g., Wikipedia) reject requests without a User-Agent.
-          example: AntflyDB/1.0
-    InferenceCredentials:
-      type: object
-      properties:
-        endpoint:
-          type: string
-          description: S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
-          minLength: 1
-          example: s3.amazonaws.com
-        use_ssl:
-          type: boolean
-          description: 'Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)'
-          default: true
-        access_key_id:
-          type: string
-          description: AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID
-            environment variable if not set.
-          example: your-access-key-id
-        secret_access_key:
-          type: string
-          description: AWS secret access key. Supports keystore syntax for secret lookup. Falls back to
-            AWS_SECRET_ACCESS_KEY environment variable if not set.
-          example: your-secret-access-key
-        session_token:
-          type: string
-          description: Optional AWS session token for temporary credentials. Supports keystore syntax
-            for secret lookup.
-          example: your-session-token
-    InferenceLevel:
-      type: string
-      description: Logging verbosity level
-      enum:
-        - debug
-        - info
-        - warn
-        - error
-      default: info
-      example: info
-    InferenceStyle:
-      type: string
-      description: Logging output format style. 'terminal' for colorized console, 'json' for structured
-        JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
-      enum:
-        - terminal
-        - json
-        - logfmt
-        - noop
-      default: terminal
-      example: terminal
-    Inferenceschemas-Config:
-      type: object
-      description: Legacy inference-local logging configuration. The current unified Zig runtime ignores
-        it; configure the top-level `log` object instead.
-      deprecated: true
-      properties:
-        level:
-          $ref: '#/components/schemas/InferenceLevel'
-        style:
-          $ref: '#/components/schemas/InferenceStyle'
     InferenceEmbeddingObject:
       type: object
       description: A single embedding result
@@ -66517,6 +65970,903 @@ components:
           type: integer
           minimum: 0
           description: Zero for classifiers, which generate no tokens.
+    QueryAdmissionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_concurrent_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 32
+          example: 32
+          x-go-type-skip-optional-pointer: false
+          description: >
+            Maximum concurrent query, search, and retrieval requests in this
+
+            process. The default is 32. The budget is shared by REST, MCP,
+
+            retrieval-agent, A2A, and direct API-kernel execution. Full-text,
+
+            vector, hybrid, graph, aggregation, federated searches, and document
+
+            scans consume it. Point lookups and operational/control-plane reads
+
+            remain outside it. Excess HTTP work is rejected immediately with
+
+            HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure
+
+            response. Excess work is not queued. Set to 0 to disable query
+
+            admission. This budget is independent of transport safeguards,
+
+            write admission, and
+
+            resources.inference.admission.max_concurrent_requests.
+    GraphExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: Operator-owned ceilings shared by all named graph operations in one admitted query.
+        Public requests cannot raise these values. Explored work, scanned anchors, and exact-distinct
+        capacity are request-consumptive; intermediate and retained-state ceilings bound simultaneously
+        live state.
+      properties:
+        max_explored_nodes:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: Cumulative node expansions across every named operation and path spur in one request.
+        max_explored_edges:
+          type: integer
+          minimum: 1
+          default: 1000000
+          description: Cumulative edge expansions across every named operation and path spur in one request.
+        max_explored_edge_bytes:
+          type: integer
+          minimum: 1
+          default: 67108864
+          description: Cumulative owned bytes of materialized edges read while executing one request.
+        max_scanned_anchors:
+          type: integer
+          minimum: 1
+          default: 1000000
+          description: Cumulative source anchors scanned by exact MATCH operations in one request.
+        max_intermediate_states:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: Maximum simultaneously live traversal, pathfinding, or MATCH frontier states.
+        max_retained_state_bytes:
+          type: integer
+          minimum: 1
+          default: 67108864
+          description: Maximum simultaneously retained bytes of admitted graph execution state.
+        max_distinct_identities:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: Cumulative exact-distinct identities admitted across all named aggregates in one
+            request.
+        max_distinct_state_bytes:
+          type: integer
+          minimum: 1
+          default: 16777216
+          description: Request-consumptive bytes for exact-distinct identities, indexes, and ownership
+            transfer.
+    WriteAdmissionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_concurrent_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 16
+          example: 16
+          x-go-type-skip-optional-pointer: false
+          description: >
+            Maximum concurrent foreground data mutations in this process. The
+
+            default is 16. Table batch writes, cross-table batches, linear merges,
+
+            and transaction commits consume this budget. Schema, index, backup,
+
+            restore, repair, and other administrative operations use dedicated
+
+            control or background-maintenance paths. Set to 0 to disable write
+
+            admission.
+
+
+            Excess HTTP work in either foreground class is rejected immediately
+
+            with HTTP 429 and Retry-After: 1; asynchronous protocols use their
+
+            native failure response. Excess work is not queued. Both budgets are
+
+            independent of transport safeguards and
+
+            resources.inference.admission.max_concurrent_requests.
+    InferenceMemoryConfig:
+      type: object
+      additionalProperties: false
+      description: Inference memory ceilings in bytes. Omitted or zero values select automatic policy;
+        physical capacity and the process envelope remain authoritative.
+      properties:
+        max_host_bytes:
+          type: integer
+          minimum: 0
+          description: Host memory ceiling.
+        max_device_bytes:
+          type: integer
+          minimum: 0
+          description: Accelerator memory ceiling.
+        max_combined_bytes:
+          type: integer
+          minimum: 0
+          description: Combined host and accelerator ceiling; integrated devices also enforce this across
+            CPU and GPU leases.
+        max_kv_bytes:
+          type: integer
+          minimum: 0
+          description: KV cache memory ceiling.
+        max_scratch_bytes:
+          type: integer
+          minimum: 0
+          description: Scratch memory ceiling.
+    InferenceAdmissionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_work_units:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: Weighted work and media capacity, independent of request count. Omitted derives
+            capacity from concurrency; zero disables weighted accounting.
+        max_concurrent_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 32
+          example: 32
+          x-go-type-skip-optional-pointer: false
+          description: >
+            Maximum concurrent inference requests admitted by this process.
+
+            The budget covers embedded inference routes, direct providers, and
+
+            public connection inference forwarding. Remote forwarding holds a
+
+            slot for the full upstream request. The runtime-reserved
+
+            `local-inference` connection dispatches in process and is admitted
+
+            once by the destination inference route; configured URLs remain
+
+            remote boundaries even when they alias the local listener.
+
+            Embedded standalone uses one shared coordinator for all of those
+
+            surfaces; API-only runtimes use the same setting as a local forwarding
+
+            gate. Weighted work/media capacity is controlled independently by
+
+            max_work_units; when omitted it derives from max_concurrent_requests.
+
+            Request count zero disables only the request-count gate. An explicit
+
+            max_work_units remains authoritative. Excess work is rejected with
+
+            503 and Retry-After; it is not queued.
+    InferenceRequestLimitsConfig:
+      type: object
+      additionalProperties: false
+      description: Deployment request ceilings only narrow model capabilities. Applied equally to direct
+        calls, HTTP and discovery. Omitted values retain native limits.
+      properties:
+        max_items_per_request:
+          type: integer
+          minimum: 1
+          description: Maximum items in one public or direct request. Independent callers may still be
+            combined into a larger native execution microbatch.
+        max_input_tokens_per_item:
+          type: integer
+          minimum: 1
+          description: Maximum effective input tokens per item, including expanded image prompts.
+        max_output_tokens_per_item:
+          type: integer
+          minimum: 1
+          description: Maximum generated output tokens per item. Omitted request max_tokens resolves to
+            a bounded effective default.
+        max_decoded_pixels_per_batch:
+          type: integer
+          minimum: 1
+          description: Maximum aggregate decoded image pixels in a request batch; also bounds execution
+            microbatch pixels.
+    ResourcesConfig:
+      type: object
+      additionalProperties: false
+      description: Shared node-local resource policy for DB and standalone inference. All memory quantities
+        are bytes.
+      properties:
+        memory:
+          type: object
+          additionalProperties: false
+          properties:
+            max_bytes:
+              type: integer
+              minimum: 0
+              description: Whole-process memory envelope; zero selects automatic cgroup or host detection.
+                Physical capacity always clamps this value.
+        query:
+          type: object
+          additionalProperties: false
+          properties:
+            admission:
+              $ref: '#/components/schemas/QueryAdmissionConfig'
+            request_limits:
+              type: object
+              additionalProperties: false
+              properties:
+                graph:
+                  $ref: '#/components/schemas/GraphExecutionConfig'
+        write:
+          type: object
+          additionalProperties: false
+          properties:
+            admission:
+              $ref: '#/components/schemas/WriteAdmissionConfig'
+        inference:
+          type: object
+          additionalProperties: false
+          properties:
+            memory:
+              $ref: '#/components/schemas/InferenceMemoryConfig'
+            admission:
+              $ref: '#/components/schemas/InferenceAdmissionConfig'
+            request_limits:
+              $ref: '#/components/schemas/InferenceRequestLimitsConfig'
+    ContentSecurityConfig:
+      type: object
+      description: >
+        Low-level content download policy. File downloads always require an
+
+        explicit nonempty `allowed_paths` list. In the generic scraper, omitted
+
+        `allowed_hosts` for HTTP(S) and `allowed_paths` for S3 do not restrict
+
+        those sources; explicit empty lists deny them. Consumers may merge this object over a
+
+        stricter baseline before downloading. Antfly inference does so: omitted
+
+        or empty inference policies, and omitted inference allowlists, deny
+
+        HTTP(S), file, and S3 content until explicit allowlists are configured.
+
+        Do not assume omission has identical policy semantics across consumers.
+      properties:
+        allowed_hosts:
+          type: array
+          description: Whitelist for HTTP(S) downloads. With block_private_ips enabled (the default),
+            IP literals and every address resolved from an allowlisted DNS hostname must be globally routable;
+            the connection is pinned to a vetted address. Set block_private_ips to false only to opt into
+            private or special destinations. The generic scraper treats omission as unrestricted subject
+            to that policy and an explicit empty list as deny-all; Antfly inference requires an explicit
+            allowlist.
+          items:
+            type: string
+          example:
+            - 93.184.216.34
+        block_private_ips:
+          type: boolean
+          description: Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast
+            destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy,
+            and the connection is pinned to a vetted address. Set false only as an explicit opt-out that
+            permits private and special destinations.
+          default: true
+        nat64_prefixes:
+          type: array
+          description: RFC 6052 network-specific NAT64 prefixes used by this deployment. Resolved IPv6
+            addresses under these prefixes are decoded and checked against the private IPv4 policy. Prefix
+            length must be 32, 40, 48, 56, 64, or 96.
+          items:
+            type: string
+          example:
+            - 2001:db8:64::/96
+        max_download_size_bytes:
+          type: integer
+          description: Maximum size of downloaded content in bytes
+          default: 104857600
+          minimum: 0
+          example: 104857600
+          x-go-type: int64
+        download_timeout_seconds:
+          type: integer
+          description: Maximum HTTP(S) and S3 download duration in seconds. Defaults to 30. Zero disables
+            this configured ceiling, but a caller-supplied request deadline still applies. A deadline-bound
+            file:// fetch fails closed because portable filesystem I/O does not expose a preemptive timeout.
+          default: 30
+          minimum: 0
+        max_image_dimension:
+          type: integer
+          description: Maximum source-image width or height enforced for accepted inference image inputs,
+            including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image
+            `/extract`, and their embedded direct APIs. Images are rejected rather than resized. Batch
+            generation applies the same image-header admission before model execution; non-inference scraping
+            consumers do not enforce this setting.
+          minimum: 1
+        allowed_paths:
+          type: array
+          description: Whitelist of allowed path prefixes for file:// and s3:// URLs. File downloads require
+            an explicit nonempty path allowlist; omission and an empty list deny local file access. For
+            S3 the generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly
+            inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/).
+            For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+          items:
+            type: string
+          example:
+            - /Users/data/
+            - my-bucket/uploads/
+        user_agent:
+          type: string
+          description: User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
+            servers (e.g., Wikipedia) reject requests without a User-Agent.
+          example: AntflyDB/1.0
+    PromptCacheConfig:
+      type: object
+      description: Native generator prompt KV cache configuration.
+      properties:
+        enabled:
+          type: boolean
+          description: Enable inference-native prompt KV cache reuse for generator requests.
+          default: false
+        mode:
+          type: string
+          description: >
+            Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+
+            full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an
+
+            opt-in page-aligned compressed radix tree with shared-prefix ownership and
+
+            leaf-only LRU eviction; it is currently qualified for native and Metal
+
+            backends. Eligible Metal requests use eager paged attention; explicit compiled
+
+            generation is incompatible with prompt caching. `simple` keeps the linear-scan
+
+            retained-prefix cache and is only suitable for small caches or debugging.
+          enum:
+            - simple
+            - block_hash
+            - radix
+          default: block_hash
+        max_bytes_mb:
+          type: integer
+          minimum: 0
+          maximum: 17592186044415
+          description: >
+            Node-wide target for live prompt-cache entries. The runtime divides it
+
+            across participating model caches and evicts using estimated metadata
+
+            and logical host/device KV bytes. Backend allocators may retain reusable
+
+            capacity, so this is not a hard cap on process or accelerator memory.
+          default: 512
+        min_tokens:
+          type: integer
+          minimum: 0
+          description: Minimum prompt length eligible for prompt KV caching.
+          default: 64
+        ttl_ms:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+          description: >
+            Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+
+            hit, so only entries left unused for this duration expire.
+          default: 300000
+    KernelJitMode:
+      type: string
+      description: >
+        Runtime kernel JIT operating mode. `off` disables compilation. `shadow`
+
+        compiles and validates without dispatching JIT kernels. `on` may activate
+
+        qualified kernels while preserving the production fallback. `required`
+
+        fails model loading when there are no eligible routes or any scoped
+
+        route cannot qualify, rejects sessions that are not direct Metal or
+
+        CUDA sessions, and requires at least one configured startup preload.
+
+        Backend preference remains separately configured; this mode neither
+
+        enables nor selects a backend. Runtime JIT is currently supported on
+
+        Linux and macOS; other platforms reject non-`off` modes rather than
+
+        silently degrading.
+      enum:
+        - 'off'
+        - shadow
+        - 'on'
+        - required
+    KernelJitConfig:
+      type: object
+      description: >
+        Runtime Metal and CUDA kernel JIT configuration. Live compilation and
+
+        GPU qualification run only for models in the configured startup
+
+        `preload` list, before serving begins. A cold dynamic model load never
+
+        benchmarks against an in-use GPU: `on` and `shadow` retain bundled
+
+        kernels, while `required` rejects the load. When runtime JIT is enabled,
+
+        startup also materializes every vision, audio, and projection session
+
+        declared by each preloaded model without running media inference.
+
+        Preload every model that must use runtime-JIT kernels; `required`
+
+        rejects an empty preload list.
+      properties:
+        mode:
+          $ref: '#/components/schemas/KernelJitMode'
+          default: 'off'
+        cache_dir:
+          type: string
+          minLength: 1
+          description: Persistent artifact cache directory on Linux and macOS. Omit to use ~/.antfly/inference/jit
+            when HOME is available.
+        max_cache_bytes_mb:
+          type: integer
+          minimum: 0
+          maximum: 1048576
+          default: 1024
+          description: Persistent cache size limit in MiB. Set to 0 to disable disk persistence.
+        preload_budget_ms:
+          type: integer
+          minimum: 1000
+          maximum: 3600000
+          default: 300000
+          description: >
+            Per direct model session pre-publication start budget for
+
+            best-effort `on` and `shadow` JIT work. A compiler or qualification
+
+            operation already started may overrun the budget. Multimodal model
+
+            preloads may create several direct sessions, each with this budget.
+
+            `required` completes or fails all required routes and may exceed
+
+            this value.
+    ModelKind:
+      type: string
+      description: Model registry kind.
+      enum:
+        - generator
+        - embedder
+        - reranker
+        - chunker
+        - classifier
+        - rewriter
+        - reader
+        - transcriber
+        - extractor
+    ModelBackend:
+      type: string
+      description: >
+        Optional backend preference for model loading or request execution.
+
+        `auto` keeps the node default behavior.
+
+        `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+
+        `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
+
+        `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+
+        `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
+      enum:
+        - auto
+        - native
+        - metal
+        - cuda
+        - xla
+        - webgpu
+        - wasm
+    ModelFormat:
+      type: string
+      description: Optional artifact format preference for loading a model.
+      enum:
+        - gguf
+        - onnx
+        - safetensors
+        - hybrid
+    ModelQuantization:
+      type: string
+      description: Optional quantization preference for loading a model.
+      enum:
+        - q4_k
+        - q8
+        - fp16
+    A4bResidencyMode:
+      type: string
+      enum:
+        - auto
+        - streamed
+        - resident
+      description: >
+        Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0
+
+        Metal or CUDA runtime. On Metal, `auto` chooses full residency only when
+
+        the complete expert set and safety reserves fit the configured budget;
+
+        otherwise it uses bounded streaming. On the qualified SM89 CUDA lane,
+
+        `auto` resolves to resident mode and fails closed unless its envelope fits.
+    ModelRef:
+      type: object
+      additionalProperties: false
+      description: >
+        Model reference used by startup preload and model-loading configuration.
+
+        When a preload selects an explicit backend, that warmed session also
+
+        becomes the model's default in-process session for later `auto`
+
+        requests; callers do not need to repeat the backend on every request.
+      required:
+        - kind
+        - name
+      properties:
+        kind:
+          $ref: '#/components/schemas/ModelKind'
+        name:
+          type: string
+          description: Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>`
+            format.
+          example: antflydb/gemma-e2b
+        backend:
+          $ref: '#/components/schemas/ModelBackend'
+        format:
+          $ref: '#/components/schemas/ModelFormat'
+        quantization:
+          $ref: '#/components/schemas/ModelQuantization'
+        residency_mode:
+          $ref: '#/components/schemas/A4bResidencyMode'
+          default: auto
+          description: >
+            Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0
+
+            Metal or CUDA runtime. On Metal, `auto` chooses full residency only
+
+            when the complete expert set and safety reserves fit the configured
+
+            budget; otherwise it uses bounded streaming. On the qualified SM89
+
+            CUDA lane, `auto` resolves to resident mode and fails closed unless
+
+            its envelope fits. Other model geometries reject this field.
+        memory_budget_mb:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 1048576
+          default: 0
+          description: >
+            Per-model A4B memory envelope in MiB. Zero selects the backend default:
+
+            the conservative 2048 MiB streamed floor on Metal, or the qualified
+
+            16384 MiB resident envelope on CUDA. Explicit values below 2048 fail;
+
+            CUDA also rejects any envelope too small for full residency. Other
+
+            model geometries reject this field.
+    Level:
+      type: string
+      description: Logging verbosity level
+      enum:
+        - debug
+        - info
+        - warn
+        - error
+      default: info
+      example: info
+    Style:
+      type: string
+      description: Logging output format style. 'terminal' for colorized console, 'json' for structured
+        JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
+      enum:
+        - terminal
+        - json
+        - logfmt
+        - noop
+      default: terminal
+      example: terminal
+    Config:
+      type: object
+      description: Logging configuration for Antfly inference services
+      properties:
+        level:
+          $ref: '#/components/schemas/Level'
+        style:
+          $ref: '#/components/schemas/Style'
+    RuntimeConfig:
+      type: object
+      properties:
+        http_max_body_mb:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          default: 10
+          description: Encoded HTTP inference body ceiling in MiB, independent of decoded-media resource
+            policy.
+        api_url:
+          type: string
+          format: uri
+          description: >
+            URL of an out-of-process Antfly inference service that the Antfly
+
+            server should call for embedding, chunking, reranking, and
+
+            generation. Omit it to use the in-process inference runtime
+
+            (the default in standalone mode). `antfly inference run` ignores
+
+            this field; it configures the client side only.
+          example: http://localhost:8080
+        api_key:
+          type: string
+          description: Client-only API key used when calling an authenticated shared Antfly inference
+            API. Both standalone inference executables accept and ignore this field when serving models.
+        models_dir:
+          type: string
+          description: >
+            Base directory containing model subdirectories. Antfly inference auto-discovers models from:
+
+            - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
+
+            - `{models_dir}/embedders/` - Embedding models
+
+            - `{models_dir}/rerankers/` - Reranking models
+
+            - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
+
+            - `{models_dir}/rewriters/` - Seq2Seq rewriter models
+
+
+            Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
+
+            (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
+
+            chunker needs no models.
+          example: ~/.antfly/inference/models
+        ml_dir:
+          type: string
+          description: >
+            Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
+
+            API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
+
+
+            Defaults to ~/.antfly/inference/ml.
+          example: ~/.antfly/inference/ml
+        content_security:
+          $ref: '#/components/schemas/ContentSecurityConfig'
+          description: Configured fields are merged individually over a fail-closed inference baseline.
+            Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts
+            and allowed_paths remain explicit deny-all lists even when another field is configured. Enable
+            remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled,
+            IP literals and every address resolved from an allowlisted DNS hostname must be globally routable,
+            and the connection is pinned to a vetted address. Setting it to false explicitly opts into
+            private and special destinations. Across generate, dense embed, multimodal rerank, and batch
+            generation, downloaded and inline encoded media is capped cumulatively per request at the
+            lower of 100 MiB, max_download_size_bytes, and—when resources.inference.admission.max_work_units
+            is positive—16 MiB times that effective work capacity (which defaults to request concurrency
+            when max_work_units is omitted); zero max_download_size_bytes disables nonempty media. Remote
+            URL byte potential is reserved before fetch, while inline sources use their actual encoded
+            size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel
+            admission before model execution. Batch generation accepts bounded image and audio media parts
+            and rejects malformed or unsupported parts before dispatch. Embedded direct transcription
+            and extraction use the configured encoded-media per-call ceiling, and direct dense embedding
+            also applies pre-allocation and decoded-image admission. In unified Antfly configuration,
+            an empty inference policy may first inherit a nonempty remote_content security policy, which
+            is then merged over this baseline.
+        s3_credentials:
+          $ref: '#/components/schemas/Credentials'
+          description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
+        generation_batching:
+          type: object
+          additionalProperties: false
+          description: Experimental execution batching; mode on explicitly enables qualified CUDA scheduling.
+            Resource and request ceilings still apply.
+          properties:
+            mode:
+              type: string
+              enum:
+                - 'off'
+                - auto
+                - 'on'
+              default: 'off'
+            max_step_items:
+              type: integer
+              minimum: 0
+              default: 2
+            max_step_query_tokens:
+              type: integer
+              minimum: 0
+              default: 512
+            max_decode_wait_us:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              default: 1000
+            max_idle_prefill_chunk_size:
+              type: integer
+              minimum: 0
+              default: 2048
+        keep_alive:
+          type: string
+          description: >
+            How long to keep models loaded in memory after last use (Ollama-compatible).
+
+            Models are automatically unloaded after this duration of inactivity.
+
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+
+            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+
+            still be evicted under resource pressure or to enforce max_loaded_models.
+          default: 5m
+          example: 5m
+        max_loaded_models:
+          type: integer
+          description: >
+            Maximum total models loaded across all registry types (embedders, rerankers,
+
+            generators, chunkers, etc.). When the limit is reached, the least-recently-used
+
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+
+            Defaults to 10.
+          default: 10
+          example: 3
+        pool_size:
+          type: integer
+          description: >
+            Legacy compatibility field. The current Zig inference runtime does not
+
+            create per-model pipeline pools from this setting; configuring it has no effect.
+          deprecated: true
+        prompt_cache:
+          $ref: '#/components/schemas/PromptCacheConfig'
+          description: Native generator prompt KV cache settings.
+        kernel_jit:
+          $ref: '#/components/schemas/KernelJitConfig'
+        backend_priority:
+          type: array
+          items:
+            type: string
+          description: >
+            Legacy compatibility field. The current Zig inference runtime selects a
+
+            backend from model metadata, explicit preload settings, and compiled capabilities;
+
+            configuring this list has no effect.
+          deprecated: true
+        max_queue_size:
+          type: integer
+          description: >
+            Legacy Go-runtime queue setting. The current Zig runtime does not retain
+
+            excess inference requests in memory and ignores this field.
+          deprecated: true
+        request_timeout:
+          type: string
+          description: >
+            Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
+
+            this field; its HTTP listener applies a separate fixed transport timeout.
+          deprecated: true
+        preload:
+          type: array
+          description: >
+            Models to preload and warm at startup. Generators run a tiny generation
+
+            request so native/Metal weights, KV setup, and kernels use the same
+
+            budgeted path as request-time generation. Other model kinds use the
+
+            best available warm path for that kind. When runtime kernel JIT is
+
+            enabled, every vision, audio, and projection session declared by a
+
+            preloaded model is also loaded without running media inference.
+
+            Runtime kernel JIT `required` mode rejects an empty preload list.
+          items:
+            $ref: '#/components/schemas/ModelRef'
+          example:
+            - kind: generator
+              name: antflydb/gemma-e2b
+              backend: metal
+              format: gguf
+              quantization: q4_k
+        max_memory_mb:
+          type: integer
+          description: >
+            Legacy compatibility field. The current Zig runtime uses explicit host,
+
+            backend, combined, KV, and scratch budgets instead and ignores this field.
+          deprecated: true
+        model_strategies:
+          type: object
+          additionalProperties:
+            type: string
+            enum:
+              - eager
+              - lazy
+              - bounded
+          description: >
+            Per-model loading strategy overrides. Maps model names to their loading strategy.
+
+            Models not in this map load on demand. keep_alive controls their idle
+
+            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
+
+
+            When a model has strategy "eager" in this map:
+
+            - It is loaded at startup through the same startup warmup path
+
+            - It is never unloaded, even when keep_alive>0 (pinned in memory)
+
+
+            This allows mixing eager and lazy models in the same pool.
+          example:
+            BAAI/bge-small-en-v1.5: eager
+            mirth/chonky-mmbert-small-multilingual-1: lazy
+        allow_downloads:
+          type: boolean
+          description: >
+            Legacy compatibility field controlling whether dashboards show model
+
+            download commands. It defaults to true for standalone deployments;
+
+            managed deployments historically set it to false. Download-command
+
+            availability is a build-time setting in the current Zig runtime, so
+
+            configuring this field has no effect.
+          default: true
+          deprecated: true
+        log:
+          description: >
+            Legacy inference-local logging field. The current unified Zig runtime
+
+            ignores it; configure the top-level `log` object instead.
+          deprecated: true
+          allOf:
+            - $ref: '#/components/schemas/Config'
+    InferenceServerConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        resources:
+          $ref: '#/components/schemas/ResourcesConfig'
+        inference:
+          $ref: '#/components/schemas/RuntimeConfig'
   responses:
     CommittedMutationAccepted:
       description: >
