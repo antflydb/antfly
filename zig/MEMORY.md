@@ -2688,8 +2688,17 @@ journal. Membership backfill merge-seeks configured nodes and native pin counts,
 with resumable cursors for either sparse direction. Event and per-item lookup
 scratch have separate lifetimes, so large canonical keys do not accumulate
 throughout an event. Exact native-tail terminals reuse the shared bounded routing
-cache under profile and routing-lineage keys; routing changes invalidate reuse
-immediately, while source and final grant fences remain independent. Cold proofs
-and cache denial retain bounded exact fallback. These changes preserve format 5
-and its existing reader floors. See `RESOLUTION.md` for upgrade floors, bounded
-maintenance, measurements and fallback rules.
+cache under profile, journal-origin and source keys. Edited routing sources are
+intersected with published and in-flight profile coverage before walking; all
+routing edits remain journaled so later connections through previously flat
+edges cannot evade the fence. Cached results retain full-SHA path dependencies
+and survive unrelated routing edits after bounded ancestry and changed-key
+validation. Actual dependency changes invalidate reuse immediately. Small-root
+summaries search the sorted change set instead of probing every changed digest
+per root, and every fingerprint hit still requires full-SHA verification.
+Fallback canonicalization decodes each hop in resettable scratch and keeps only
+bounded digest history, so valid long-key paths work with cached membership or
+streaming fallback. Source and final grant fences remain independent. These
+changes preserve projection format 5; the new journal contract advances Lite to
+reader 27, topology to 66, metadata bootstrap to v19 and Lite enrollment to v7.
+See `RESOLUTION.md` for bounded maintenance, measurements and fallback rules.

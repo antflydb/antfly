@@ -64,7 +64,14 @@ pub const NodeIndex = struct {
     }
 };
 pub const Route = struct { root: []const u8, component: []const u8 };
+pub const CanonicalProof = struct {
+    sequence: u64,
+    graph: [32]u8,
+    routing: [32]u8,
+    dependencies: []const [32]u8,
+};
 pub const Graph = struct {
+    canonical: ?CanonicalProof = null,
     routes: []const Route = &.{},
     aliases: []const resolver.KeyAlias = &.{},
     base: ?Lease = null,
@@ -92,6 +99,7 @@ pub const Redirects = struct {
     }
 };
 pub const Context = struct {
+    canonical: ?CanonicalProof = null,
     references: std.atomic.Value(usize) = .init(1),
     dependents: std.atomic.Value(usize) = .init(0),
     base: ?Lease = null,
@@ -216,7 +224,7 @@ pub const Context = struct {
             }
         }
         const result = try owner.create(Context);
-        result.* = .{ .arena = arena, .key = cache_key, .base = base, .shared_profile = graph.shared_profile, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .nodes = nodes, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins, .routes = graph.routes };
+        result.* = .{ .canonical = graph.canonical, .arena = arena, .key = cache_key, .base = base, .shared_profile = graph.shared_profile, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .nodes = nodes, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins, .routes = graph.routes };
         return result;
     }
 };
@@ -288,6 +296,21 @@ pub const Cache = struct {
             current = context.next;
             context.release();
         }
+    }
+    /// Remove only the observed generation. Active leases keep their immutable
+    /// context alive, and a concurrent replacement is never evicted by a stale reader.
+    pub fn invalidate(self: *Cache, key: [32]u8, expected: *const Context) void {
+        self.lock();
+        const current = self.entries.get(key);
+        if (current == null or current.? != expected) {
+            self.mutex.unlock();
+            return;
+        }
+        self.unlink(current.?);
+        _ = self.entries.remove(key);
+        self.bytes -= weight(current.?);
+        self.mutex.unlock();
+        current.?.release();
     }
     pub fn acquire(self: *Cache, key: [32]u8, cacheable: bool, loader: Loader) !Lease {
         std.debug.assert(loader.estimated_bytes == null);
@@ -412,13 +435,16 @@ pub fn tryRouting(key: [32]u8, loader: Loader) !?Lease {
     bounded.estimated_bytes = 12 * 1024 * 1024; // 8 MiB scratch + <=4 MiB frozen data.
     return routing.tryAcquire(key, true, bounded);
 }
-/// Tail loaders use caller-owned bounded scratch and retain only an entry key
-/// and terminal (each at most 16 KiB). Share routing's LRU, coalescing and live
-/// lease accounting, with admission proportional to this smaller frozen result.
+/// Tail loaders use caller-owned scratch and retain an entry key, terminal
+/// (each at most 16 KiB), and at most 16,384 full-SHA path dependencies. Share
+/// routing's LRU, coalescing and live-lease accounting with a 1 MiB reservation.
 pub fn tryTailCanonical(key: [32]u8, loader: Loader) !?Lease {
     var bounded = loader;
-    bounded.estimated_bytes = 256 * 1024;
+    bounded.estimated_bytes = 1024 * 1024;
     return routing.tryAcquire(key, true, bounded);
+}
+pub fn invalidateTailCanonical(key: [32]u8, expected: *const Context) void {
+    routing.invalidate(key, expected);
 }
 pub fn acquire(key: [32]u8, cacheable: bool, loader: Loader) !Lease {
     return shared.acquire(key, cacheable, loader);
@@ -630,4 +656,30 @@ test "native resolver authority overlays share profile ownership through allocat
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "native resolver authority invalidation preserves leases and newer cache generations" {
+    const Empty = struct {
+        fn load(_: *anyopaque, _: A) !Graph {
+            return .{};
+        }
+    };
+    var unused: u8 = 0;
+    const loader: Loader = .{ .ptr = &unused, .load = Empty.load };
+    var cache: Cache = .{ .allocator = std.testing.allocator };
+    defer cache.deinit();
+    const key: [32]u8 = @splat(87);
+    const old = try cache.acquire(key, true, loader);
+    defer old.release();
+    cache.invalidate(key, old.context);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+    try std.testing.expectEqual(@as(usize, 1), old.context.references.load(.acquire));
+    const replacement = try cache.acquire(key, true, loader);
+    defer replacement.release();
+    try std.testing.expect(old.context != replacement.context);
+    cache.invalidate(key, old.context);
+    const hit = try cache.acquire(key, true, loader);
+    defer hit.release();
+    try std.testing.expect(hit.context == replacement.context);
+    try std.testing.expectEqual(@as(usize, 2), cache.builds.load(.monotonic));
 }

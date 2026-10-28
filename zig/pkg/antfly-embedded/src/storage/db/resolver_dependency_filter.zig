@@ -148,6 +148,11 @@ pub const Reader = struct {
     loaded: usize = 0,
     cursor: usize = 0,
     last: ?u64 = null,
+    /// Intersect the smaller side. Small roots search sorted changed hashes;
+    /// large roots retain the bounded streaming query-to-leaf strategy.
+    pub fn intersection(self: *Reader, digests: []const [32]u8) Intersection {
+        return .{ .reader = self, .digests = digests, .small_root = self.meta.distinct < digests.len };
+    }
     /// Sorted full-SHA inputs stream bounded leaf pages. Scalar cached entries
     /// survive reuse of the caller's I/O scratch between successive digests.
     pub fn contains(self: *Reader, a: A, digest: *const [32]u8) !bool {
@@ -173,6 +178,94 @@ pub const Reader = struct {
         const entries = &self.pages[self.cursor].entries;
         const i = entries.find(fp);
         return i < entries.len and entries.items[i].fingerprint == fp;
+    }
+};
+pub const Intersection = struct {
+    reader: *Reader,
+    digests: []const [32]u8,
+    small_root: bool,
+    probes: usize = 0,
+    query: usize = 0,
+    inline_entry: usize = 0,
+    leaf: usize = 0,
+    entry: usize = 0,
+    loaded: usize = 0,
+    after: ?u64 = null,
+    seen: usize = 0,
+    matching: ?u64 = null,
+    fn nextFingerprint(self: *Intersection, frame: *std.heap.FixedBufferAllocator) !?u64 {
+        const r = self.reader;
+        if (r.meta.leaves == 0) {
+            if (self.inline_entry == r.meta.entries.len) return null;
+            const fp = r.meta.entries.items[self.inline_entry].fingerprint;
+            self.inline_entry += 1;
+            return fp;
+        }
+        while (true) {
+            if (self.leaf == self.loaded) {
+                if (self.after == std.math.maxInt(u64)) {
+                    if (self.seen != r.meta.distinct) return error.InvalidCatalogRecord;
+                    return null;
+                }
+                frame.reset();
+                const a = frame.allocator();
+                const cursor = if (self.after) |upper| try std.fmt.allocPrint(a, "{s}{x:0>16}", .{ r.prefix, upper }) else null;
+                const page = try r.backend.scan(r.backend.ptr, a, r.prefix, cursor, @intCast(r.pages.len));
+                if (page.rows.len == 0 or page.rows.len > r.pages.len) return error.InvalidCatalogRecord;
+                for (page.rows, 0..) |row, i| {
+                    const value = try parseLeaf(r.prefix, row);
+                    if ((i == 0 and self.after != null and value.upper <= self.after.?) or (i != 0 and value.upper <= r.pages[i - 1].upper)) return error.InvalidCatalogRecord;
+                    r.pages[i] = .{ .upper = value.upper, .entries = value.entries };
+                }
+                self.after = r.pages[page.rows.len - 1].upper;
+                self.loaded = page.rows.len;
+                self.leaf = 0;
+                self.entry = 0;
+            }
+            const entries = &r.pages[self.leaf].entries;
+            if (self.entry == entries.len) {
+                self.leaf += 1;
+                self.entry = 0;
+                continue;
+            }
+            const fp = entries.items[self.entry].fingerprint;
+            self.entry += 1;
+            self.seen += 1;
+            if (self.seen > r.meta.distinct) return error.InvalidCatalogRecord;
+            return fp;
+        }
+    }
+    pub fn next(self: *Intersection, frame: *std.heap.FixedBufferAllocator) !?*const [32]u8 {
+        if (!self.small_root) {
+            while (self.query < self.digests.len) {
+                const digest = &self.digests[self.query];
+                self.query += 1;
+                self.probes += 1;
+                frame.reset();
+                if (try self.reader.contains(frame.allocator(), digest)) return digest;
+            }
+            return null;
+        }
+        while (true) {
+            if (self.matching) |fp| {
+                if (self.query < self.digests.len and fingerprint(&self.digests[self.query]) == fp) {
+                    const result = &self.digests[self.query];
+                    self.query += 1;
+                    return result;
+                }
+                self.matching = null;
+            }
+            const fp = (try self.nextFingerprint(frame)) orelse return null;
+            self.probes += 1;
+            var lo: usize = 0;
+            var hi = self.digests.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (fingerprint(&self.digests[mid]) < fp) lo = mid + 1 else hi = mid;
+            }
+            self.query = lo;
+            self.matching = fp;
+        }
     }
 };
 pub const Index = struct {

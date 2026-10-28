@@ -2756,23 +2756,38 @@ native redirect, using bounded point reads in the mutation transaction, without
 walking chains or publishing per-profile rows. A latest-version `tails/` index
 and `tail-key/` ownership postings deduplicate these entry points across slots;
 slot expiration removes only descriptors it still owns. Negative dependency
-proofs stream new entries and resolve their current mixed native/configured
-paths. A fixed full-SHA memo shares converging suffixes within one proof. Exact
-tail terminals also share the existing 16-MiB routing LRU, miss coalescing and
-live-lease accounting. Antfly SHA-256 keys include the template, immutable profile,
-native routing lineage and tail key. A routing change or different configured
-profile cannot reuse the old result. Root sets, pin memberships, source proofs
-and authorization decisions are never cached in a terminal entry. Pin-only edits
-can reuse unchanged routing. Retained keys and terminals own their bytes; lookups
-use caller-owned scratch with a 256-KiB frozen-entry admission reservation.
+proofs first intersect edited routing sources with the profile's published
+paths, dirty nodes and active traces. All routing sources, including currently
+flat edges, enter shared `routed-key/` and `routed/` indices; this preserves a
+configured source that first enters an unknown node and later reaches a native
+chain. Small bursts use point coverage checks; larger sets merge-seek the sorted
+source and coverage indices, skipping unrelated gaps on either side. The target
+index remains a cheap trigger, so flat unrelated edits need one empty range scan.
+Both index families expire only versions still owned by the overwritten slot.
+
+A fixed full-SHA memo shares converging suffixes within one proof. Exact terminals
+also share the existing 16-MiB routing LRU, miss coalescing and live-lease accounting.
+Antfly SHA-256 cache keys include the template, immutable profile, journal origin
+and source key. Each immutable result owns its terminal and sorted full-SHA path
+dependencies, including the terminal's absent outgoing edge. Unchanged routing
+can reuse it directly. Otherwise one bounded pass over retained `routed-compact/`
+records builds a sorted changed-key set; only edits newer than the result and
+intersecting its dependencies invalidate reuse. Journal ancestry, barriers and the
+256-event window are checked before accepting that proof. Unrelated edits retain
+warm terminals; edits to a path or terminal immediately require a fresh walk.
+Removal compares the observed cache generation, preserving active leases and
+concurrent replacements. Older snapshots cannot evict newer entries in that lineage.
+Root sets, pin memberships, source proofs and grants are never cached in a terminal
+entry. Retained strings and dependencies own their bytes; bounded caller scratch
+and a 1-MiB reservation cover the largest frozen terminal result.
 
 A proof spends at most 16,384 cold forward steps. Cache hits spend no forward
 steps. A cycle, affected canonical root or exhausted budget selects exact fallback.
 Completed entries survive a later entry exhausting the work budget: the next read
 can finish that entry instead of repeating the completed walks. Cache admission
 and retention are optional; denied entries use the same bounded exact walker.
-Flat unrelated edits require one empty range scan. Tail-index enrollment has its own journal readiness flag and barrier;
-legacy history cannot authorize a scoped projection accidentally.
+Routing-source enrollment has its own readiness flag, origin and barrier; legacy
+history cannot authorize a scoped projection accidentally.
 
 Owner repair expands reverse dependencies from changed routing nodes, rather than
 all members of their old canonical root. It clears and rebuilds only those path
@@ -2817,7 +2832,10 @@ Root summaries contain sorted 64-bit SHA fingerprints with reference counts.
 Small roots fit in one compact binary row; larger roots split into sorted
 interval leaves of at most 128 entries. Inserts, splits, local merges, collapse
 and deletion require at most four native writes per dependency. Readers stream
-up to 128 leaves per page with reusable scalar caches. Empty leaves and exhausted
+up to 128 leaves per page with reusable scalar caches. Intersection searches the
+smaller side: small-root fingerprints binary-search the sorted changed hashes;
+large roots probe the changed hashes through cached leaves. Every full-SHA hash
+sharing a positive 64-bit fingerprint is emitted for exact verification. Empty leaves and exhausted
 roots are reclaimed. Fingerprints are negative proofs only: every hit is checked
 against the full-SHA root dependency posting. Reference counts preserve collisions
 on deletion; latent configured-edge hits also require the native mask to be
@@ -2829,12 +2847,17 @@ roots. All transient journal, native mask and dependency reads use reusable
 scratch rather than the request arena. Old/new redirect targets and the native-tail fence cover
 new incoming paths. Dirty roots retain exact fallback during partial publication.
 A journal gap, oversized event or older projection format also uses exact fallback.
+Fallback canonicalization decodes one hop at a time in resettable 256-KiB
+scratch. Cycle detection retains only full-SHA hashes (64 on the stack, then a
+bounded 640-KiB workspace for at most 16,384 keys), rather than decoded path strings.
+The optional memo has a separate bounded lifetime. Both cached membership and
+streaming fallback accept long keys without accumulating JSON per hop.
 No request advances owner work. Final head, source and authorization fences remain
 independent. Full rebuilding is reserved for initial enrollment, format upgrade,
 oversized invalidations, or ingestion falling behind retained history.
 
-This generation uses Lite reader 26, topology protocol 65, metadata bootstrap v18,
-and Lite query-pin enrollment v6. Legacy v12-v17 declaration/profile proofs remain
+This generation uses Lite reader 27, topology protocol 66, metadata bootstrap v19,
+and Lite query-pin enrollment v7. Legacy v12-v18 declaration/profile proofs remain
 valid during dependency backfill; older pin projections use exact fallback
 until their owner publishes format 5. Older native readers refuse the new floor.
 A profile enrollment epoch also drives bounded retirement cleanup, so replacing
@@ -2975,3 +2998,16 @@ caller-scratch poisoning and exact behavior when routing-cache admission is deni
 The 128-key, maximum escaped canonical-key fixture that formerly exhausted 8 MiB
 after 72 entries now completes with 128-work turns; mixed routing/target events
 also complete with the supported 4,096-work quantum.
+
+Fresh-review regression measurements for the routing-source generation:
+
+- With 64 queried roots, three dependencies each and 16,385 unique invalidations,
+  adaptive intersection makes 192 fingerprint probes, versus 1,048,640 previously.
+  Exact full-SHA checks still fence every positive, including fingerprint collisions.
+- Two unrelated 8,192-edge chains and repeated unrelated routing edits require
+  38–48 reads per public query, versus roughly 16,670 before scoped discovery.
+  Relevant cached chains additionally retain zero forward steps after unrelated
+  edits; changing a downstream dependency forces a fresh walk immediately.
+- A valid 3,647,828-byte namespace (4,194,304-byte default limit), 1,800 native
+  hops and 1,000-byte keys succeeds through cached and streaming membership
+  fallback. Previously the unrelated-root query exhausted scratch.
