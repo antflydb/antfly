@@ -7619,8 +7619,13 @@ pub const Backend = struct {
         };
         if (self.closing.load(.acquire)) return error.BackendClosing;
         const work = frame.foreground_owner.?;
-        try self.prepareWalAppendForPressureLocked(work.record.len);
         work.lock = (try self.tryAcquireWalOperationLockImpl(.exclusive, false)) orelse return error.WriterLocked;
+        work.retention_generation = self.wal_retention.generation;
+        if (self.walRetentionPressureEnabled()) work.retention = .{
+            .hard_bytes = self.options.wal_hard_limit_bytes,
+            .hard_segments = self.options.wal_hard_limit_segments,
+            .cached = if (self.writeStatsNowNs() -| self.wal_retention.primary_ns < wal_retention_cache_ttl_ns) self.wal_retention.primary else null,
+        };
         self.mu.unlock();
         const written = work.drive(self, original);
         written catch {
@@ -7631,7 +7636,30 @@ pub const Backend = struct {
             self.manifest_recovery_required = true;
             self.wal_retention.invalidateAll();
         }
-        try written;
+        if (!work.recovery and self.wal_retention.generation == work.retention_generation) {
+            if (work.operation) |operation| if (operation.retention_snapshot) |stats| {
+                self.wal_retention.primary = stats;
+                self.wal_retention.primary_ns = self.writeStatsNowNs();
+                if (stats.bytes != 0) {
+                    self.wal_retention.primary_empty_proven = false;
+                    self.wal_retention.reset_proven = false;
+                }
+                // Cold inventory can discover retained bytes absent from the
+                // prior observation (including legacy WAL). Charge every known
+                // byte while preserving any conservative replay accounting.
+                const replay_bytes = if (self.wal_retention.replay) |replay| replay.bytes else 0;
+                self.syncTrackedWalRetentionUsageLocked(@max(self.tracked_wal_retention_bytes, stats.bytes +| replay_bytes));
+            };
+        }
+        written catch |cause| {
+            if (cause == error.WalRetentionLimitExceeded) {
+                self.write_stats.wal_pressure_rejections +|= 1;
+                self.wal_pressure_blocked = true;
+                self.scheduleWalCheckpointRetryLocked(.hard_pressure, false);
+            }
+            return cause;
+        };
+        self.wal_pressure_blocked = false;
         // The WAL callback decided publication under original execution. No
         // rejected reentry may split its receipt from this fixed root swap.
         std.debug.assert(work.published);
@@ -10404,6 +10432,21 @@ pub const Backend = struct {
             return error.WalRetentionLimitExceeded;
         }
         self.wal_pressure_blocked = false;
+    }
+
+    /// An admitted append has already sampled retention under the WAL gate.
+    /// Keep post-decision work to metadata; the owned maintenance path performs
+    /// checkpoint IO without borrowing this foreground guard graph.
+    pub fn finishAdmittedWalAppend(self: *Backend) void {
+        if (!self.walRetentionPressureEnabled()) return;
+        const retention = self.wal_retention.primary orelse {
+            self.scheduleWalCheckpointRetryLocked(.soft_pressure, false);
+            return;
+        };
+        self.wal_pressure_blocked = self.walRetentionOverHardLimit(retention);
+        if (self.walRetentionOverSoftLimit(retention)) {
+            self.scheduleWalCheckpointRetryLocked(if (self.wal_pressure_blocked) .hard_pressure else .soft_pressure, false);
+        } else if (self.wal_checkpoint_retry_reason != .checkpoint_failure) self.clearWalCheckpointRetryLocked();
     }
 
     /// Called only after the current transaction is visible in the live LSM.

@@ -472,10 +472,10 @@ pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
-fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, control: ?read_admission.Port, retired_without_commit: *bool) !void {
-    if (incoming.entryCount() == 0) return;
+fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, control: ?read_admission.Port, retired_without_commit: *bool) !bool {
+    if (incoming.entryCount() == 0) return false;
     if (comptime @hasDecl(@TypeOf(backend.*), "publishMutableWithWalAdmission")) if (control) |original| {
-        if (try backend.publishMutableWithWalAdmission(incoming, original, retired_without_commit)) return;
+        if (try backend.publishMutableWithWalAdmission(incoming, original, retired_without_commit)) return true;
     };
     if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
         var candidate = if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
@@ -496,6 +496,7 @@ fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *Acti
         if (@hasDecl(@TypeOf(backend.*), "invalidateMutableReadSnapshot")) backend.invalidateMutableReadSnapshot();
         try state_mod.applyMutableMoveToMutable(&backend.mutable, allocator, incoming);
     }
+    return false;
 }
 
 pub fn enforceMutableWriteAdmission(backend: anytype, incoming: *const ActiveMemTable) !void {
@@ -521,7 +522,11 @@ pub fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
     }
 }
 
-pub fn finishCommittedWalAppend(backend: anytype) void {
+pub fn finishCommittedWalAppend(backend: anytype, admitted: bool) void {
+    if (comptime @hasDecl(@TypeOf(backend.*), "finishAdmittedWalAppend")) if (admitted) {
+        backend.finishAdmittedWalAppend();
+        return;
+    };
     if (@hasDecl(@TypeOf(backend.*), "finishCommittedWalAppend")) {
         backend.finishCommittedWalAppend();
     }
@@ -5265,6 +5270,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             };
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
             var committed_write = direct_ingested_bulk_appends;
+            var admitted_foreground_commit = false;
             const direct_ingested_bulk_state = try self.tryCommitDirectBulkIngest();
             if (!direct_ingested_bulk_state) {
                 const mutated = self.mutable.entryCount() > 0;
@@ -5274,7 +5280,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit);
+                    admitted_foreground_commit = try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -5295,7 +5301,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 committed_write = true;
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
             }
-            if (committed_write) finishCommittedWalAppend(self.backend);
+            if (committed_write) finishCommittedWalAppend(self.backend, admitted_foreground_commit);
             self.backend.finishBatchMode(self.batch_options);
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
@@ -11308,6 +11314,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             };
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
             var committed_write = direct_ingested_bulk_appends;
+            var admitted_foreground_commit = false;
             const direct_ingested_bulk_state = try self.tryCommitDirectBulkIngest();
             if (!direct_ingested_bulk_state) {
                 const mutated = self.mutable.entryCount() > 0;
@@ -11317,7 +11324,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit);
+                    admitted_foreground_commit = try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -11338,7 +11345,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 committed_write = true;
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
             }
-            if (committed_write) finishCommittedWalAppend(self.backend);
+            if (committed_write) finishCommittedWalAppend(self.backend, admitted_foreground_commit);
             self.backend.finishBatchMode(self.batch_options);
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;

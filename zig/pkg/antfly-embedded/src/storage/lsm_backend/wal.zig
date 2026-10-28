@@ -117,6 +117,14 @@ pub const RetentionStats = struct {
     checkpoint_covered_through_segment: u64 = 0,
 };
 
+/// Admission applies to the stable WAL lineage protected by the append gate.
+/// A cache may skip inventory only when the current control and size agree.
+pub const AppendRetentionPolicy = struct {
+    hard_bytes: u64 = 0,
+    hard_segments: u64 = 0,
+    cached: ?RetentionStats = null,
+};
+
 pub const ReplayStreamStats = struct {
     records: u64 = 0,
     bytes: u64 = 0,
@@ -3107,7 +3115,7 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
     return struct {
         const Self = @This();
         pub var test_hook: ?*const fn (*Self, @import("../../common/read_admission.zig").Port) anyerror!void = null;
-        const Stage = enum { current, checkpoint_probe, segment_stat, next_segment_probe, create_directory, directory_parent, current_replace, checkpoint_replace, append, segment_sync, segment_parent, ready, published, failed };
+        const Stage = enum { current, checkpoint_probe, segment_stat, retention_checkpoint, retention_legacy, retention_segment, next_segment_probe, create_directory, directory_parent, current_replace, checkpoint_replace, append, segment_sync, segment_parent, ready, published, failed };
         const Pending = union(enum) { none, read: storage_io.ControlFileReadOperation, physical: storage_io.SyncOperation };
         index: [std.fs.max_path_bytes]u8 = undefined,
         index_len: usize = 0,
@@ -3120,6 +3128,12 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
         record_len: usize,
         bootstrap: bool = false,
         sync_on_commit: bool = true,
+        retention: ?AppendRetentionPolicy = null,
+        retention_snapshot: ?RetentionStats = null,
+        inventory: RetentionStats = .{},
+        inventory_segment: u64 = 0,
+        legacy: [std.fs.max_path_bytes]u8 = undefined,
+        legacy_len: usize = 0,
         create_segment: bool = false,
         mutation_started: bool = false,
         resources: ?storage_io.DurabilityResources = null,
@@ -3140,6 +3154,7 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
             self.prefix_len = prefix.len;
             self.index_len = (std.fmt.bufPrint(&self.index, "{s}{s}", .{ prefix, wal_index_file_name }) catch unreachable).len;
             self.checkpoint_len = (std.fmt.bufPrint(&self.checkpoint, "{s}{s}", .{ prefix, wal_checkpoint_file_name }) catch unreachable).len;
+            self.legacy_len = (std.fmt.bufPrint(&self.legacy, "{s}{s}wal.log", .{ root, separator }) catch return error.NameTooLong).len;
             return self;
         }
 
@@ -3160,6 +3175,47 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
             self.segment_len = self.prefix_len + name.len;
         }
 
+        fn selectAppend(self: *Self, size: u64) !void {
+            if (self.bootstrap) {
+                self.stage = .create_directory;
+                return;
+            }
+            const after = std.math.add(u64, size, self.record_len) catch return self.fail(error.ResourceBudgetExceeded);
+            self.create_segment = size == 0;
+            if (size > 0 and after > self.options.segment_bytes) {
+                const next = std.math.add(u64, self.result.segment, 1) catch return self.fail(error.CorruptLsmWalIndex);
+                self.segmentPath(next);
+                self.create_segment = true;
+                self.stage = .next_segment_probe;
+            } else self.stage = .append;
+        }
+
+        fn admitRetention(self: *Self, observed: RetentionStats) !void {
+            var stats = observed;
+            if (self.bootstrap) {
+                // Inventory probes segment one for orphan evidence, but an
+                // absent current control still describes a legacy-only WAL.
+                stats.current_segment = 0;
+                stats.oldest_retained_segment = 0;
+                stats.checkpoint_covered_through_segment = 0;
+            }
+            self.retention_snapshot = stats;
+            const policy = self.retention.?;
+            const opens = stats.current_segment_bytes == 0 or stats.current_segment_bytes +| self.record_len > self.options.segment_bytes;
+            if ((policy.hard_bytes != 0 and stats.bytes +| self.record_len > policy.hard_bytes) or
+                (policy.hard_segments != 0 and stats.segments +| @intFromBool(opens) > policy.hard_segments))
+                return self.fail(error.WalRetentionLimitExceeded);
+            self.segmentPath(if (self.bootstrap) 1 else stats.current_segment);
+            try self.selectAppend(stats.current_segment_bytes);
+        }
+
+        fn beginRetentionSegments(self: *Self) !void {
+            self.inventory_segment = self.inventory.oldest_retained_segment;
+            if (self.inventory_segment > self.inventory.current_segment) return self.admitRetention(self.inventory);
+            self.segmentPath(self.inventory_segment);
+            self.stage = .retention_segment;
+        }
+
         pub fn waitWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !AppendResult {
             const admission = @import("../../common/read_admission.zig");
             _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
@@ -3170,10 +3226,14 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
                 switch (self.stage) {
                     .ready, .published => return self.result,
                     .failed => return self.failure.?,
-                    .current, .checkpoint_probe, .segment_stat, .next_segment_probe => {
+                    .current, .checkpoint_probe, .segment_stat, .retention_checkpoint, .retention_legacy, .retention_segment, .next_segment_probe => {
                         if (self.pending == .none) {
-                            const path = if (self.stage == .checkpoint_probe) self.checkpoint[0..self.checkpoint_len] else self.segment[0..self.segment_len];
-                            self.pending = .{ .read = try self.resources.?.beginControlRead(path, 1, original) };
+                            const path = switch (self.stage) {
+                                .checkpoint_probe, .retention_checkpoint => self.checkpoint[0..self.checkpoint_len],
+                                .retention_legacy => self.legacy[0..self.legacy_len],
+                                else => self.segment[0..self.segment_len],
+                            };
+                            self.pending = .{ .read = try self.resources.?.beginControlRead(path, if (self.stage == .retention_checkpoint) control_pair_len else 1, original) };
                         }
                         var trace: admission.RejectionTrace = .{};
                         var absent = false;
@@ -3207,19 +3267,50 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
                                 self.stage = .segment_stat;
                             },
                             .segment_stat => {
-                                if (self.bootstrap) {
-                                    if (read.file_size != 0) return self.fail(error.RecoveryRequired);
-                                    self.stage = .create_directory;
+                                if (self.bootstrap and read.file_size != 0) return self.fail(error.RecoveryRequired);
+                                if (!self.bootstrap and absent) return self.fail(error.FileNotFound);
+                                if (self.retention) |policy| {
+                                    if (policy.cached) |cached| {
+                                        if (cached.current_segment == self.result.segment and cached.current_segment_bytes == read.file_size) {
+                                            try self.admitRetention(cached);
+                                            self.retirePending();
+                                            continue;
+                                        }
+                                    }
+                                    self.inventory = .{ .current_segment = self.result.segment, .oldest_retained_segment = 1 };
+                                    self.stage = .retention_checkpoint;
+                                } else try self.selectAppend(read.file_size);
+                            },
+                            .retention_checkpoint => {
+                                if (!absent) {
+                                    if (read.file_size != control_pair_len or read.bytes.len != control_pair_len) return self.fail(error.CorruptLsmWalIndex);
+                                    const data = decodeControl(read.bytes, .checkpoint, 16) catch |cause| return self.fail(cause);
+                                    const oldest = std.mem.readInt(u64, data[0..8], .little);
+                                    const covered = std.mem.readInt(u64, data[8..16], .little);
+                                    if (oldest == 0 or covered +| 1 < oldest) return self.fail(error.CorruptLsmWalIndex);
+                                    self.inventory.oldest_retained_segment = oldest;
+                                    self.inventory.checkpoint_covered_through_segment = covered;
+                                }
+                                self.stage = .retention_legacy;
+                            },
+                            .retention_legacy => {
+                                if (read.file_size != 0) {
+                                    self.inventory.bytes = read.file_size;
+                                    self.inventory.segments = 1;
+                                }
+                                try self.beginRetentionSegments();
+                            },
+                            .retention_segment => {
+                                if (read.file_size != 0) {
+                                    self.inventory.bytes = std.math.add(u64, self.inventory.bytes, read.file_size) catch return self.fail(error.ResourceBudgetExceeded);
+                                    self.inventory.segments +|= 1;
+                                    if (self.inventory_segment == self.inventory.current_segment) self.inventory.current_segment_bytes = read.file_size;
+                                }
+                                if (self.inventory_segment == self.inventory.current_segment) {
+                                    try self.admitRetention(self.inventory);
                                 } else {
-                                    if (absent) return self.fail(error.FileNotFound);
-                                    const size = std.math.add(u64, read.file_size, self.record_len) catch return self.fail(error.ResourceBudgetExceeded);
-                                    self.create_segment = read.file_size == 0;
-                                    if (read.file_size > 0 and size > self.options.segment_bytes) {
-                                        const next = std.math.add(u64, self.result.segment, 1) catch return self.fail(error.CorruptLsmWalIndex);
-                                        self.segmentPath(next);
-                                        self.create_segment = true;
-                                        self.stage = .next_segment_probe;
-                                    } else self.stage = .append;
+                                    self.inventory_segment += 1;
+                                    self.segmentPath(self.inventory_segment);
                                 }
                             },
                             .next_segment_probe => {

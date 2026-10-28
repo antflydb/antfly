@@ -52,6 +52,8 @@ pub const Owner = struct {
     lock: ?Backend.WalOperationLock = null,
     operation: ?Operation = null,
     result: wal.AppendResult = .{},
+    retention: ?wal.AppendRetentionPolicy = null,
+    retention_generation: u64 = 0,
     published: bool = false,
     recovery: bool = false,
     retired: bool = false,
@@ -75,6 +77,7 @@ pub const Owner = struct {
     pub fn drive(self: *@This(), backend: *Backend, original: admission.Port) !void {
         self.operation = try Operation.prepare(backend.root_dir.?, self.record.len, .{ .segment_bytes = backend.options.wal_segment_bytes });
         self.operation.?.sync_on_commit = backend.options.wal_sync_on_commit;
+        self.operation.?.retention = self.retention;
         self.operation.?.start(self.grant.?, .{ .owner = self, .lock = self.lock.? }, original) catch |cause| {
             self.operation = null;
             return cause;

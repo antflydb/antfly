@@ -7819,7 +7819,7 @@ test "physical cache metadata registered flush publication periodic checkpoint p
     try normalAdmittedPeriodicCheckpoint(.plan_partial);
 }
 
-fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, partial, concurrent, namespace_erased, docstore, docstore_gate, guarded, staging_spares, cancel_io, cancel_append, pressure, retirement_resume, prepare_reject }) !void {
+fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, partial, concurrent, namespace_erased, docstore, docstore_gate, guarded, staging_spares, cancel_io, cancel_append, pressure, retirement_resume, prepare_reject, pressure_cold, pressure_cached, pressure_limit, pressure_soft, pressure_rotate, pressure_legacy, pressure_cancel, pressure_stale, pressure_bootstrap }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -7870,15 +7870,27 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
             const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
             return @intFromBool(flag.load(.acquire));
         }
-        fn append(op: *foreground.Operation, _: read_admission.Port) !void {
-            if (selected == .cancel_append and op.stage == .append and !injected.swap(true, .acq_rel)) {
+        fn append(op: *foreground.Operation, original: read_admission.Port) !void {
+            try original.checkpoint();
+            try std.testing.expect(backend.mu.tryLock());
+            backend.mu.unlock();
+            if (op.stage == .retention_checkpoint) retention_scans += 1;
+            if (((selected == .cancel_append and op.stage == .append) or
+                (selected == .pressure_cancel and op.stage == .retention_legacy)) and !injected.swap(true, .acq_rel))
+            {
                 io_mod.NativeSyncTestControl.started.store(false, .release);
                 io_mod.NativeSyncTestControl.release.store(false, .release);
                 io_mod.NativeSyncTestControl.pause.store(true, .release);
             }
         }
+        var retention_scans: usize = 0;
+        var wakes: usize = 0;
+        fn wake(_: *anyopaque) void {
+            wakes += 1;
+        }
         var retire_calls: usize = 0;
         var retire_refused: bool = false;
+        var retire_resumed: bool = false;
         var refused_offset: usize = 0;
         fn retire(owner: *foreground.Owner, original: read_admission.Port) !void {
             try original.checkpoint();
@@ -7887,7 +7899,10 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
             try std.testing.expect(backend.mu.tryLock());
             backend.mu.unlock();
             if (owner.input_index) |index| {
-                if (retire_refused) try std.testing.expect(index.offset >= refused_offset);
+                if (retire_refused) {
+                    try std.testing.expect(index.offset >= refused_offset);
+                    if (index.offset > refused_offset) retire_resumed = true;
+                }
                 if (selected == .retirement_resume and index.offset > 0 and !retire_refused) {
                     refused_offset = index.offset;
                     retire_refused = true;
@@ -7927,8 +7942,11 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     H.backend = handle.ptr();
     H.execution = &state;
     H.calls.store(0, .release);
+    H.retention_scans = 0;
+    H.wakes = 0;
     H.retire_calls = 0;
     H.retire_refused = false;
+    H.retire_resumed = false;
     H.refused_offset = 0;
     foreground.test_retire_hook = H.retire;
     H.joined.store(0, .release);
@@ -7951,7 +7969,42 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     var seed = try handle.ptr().beginWrite();
     defer seed.abort();
     try seed.put(.{}, "seed", "old-value");
-    try seed.commit();
+    if (mode == .pressure_bootstrap) {
+        handle.ptr().options.wal_hard_limit_bytes = 4096;
+        var pass = try local.common_background_execution.Pass.init(state.port(), &io, platform.time.monotonicNs() +| 10 * std.time.ns_per_s, .{});
+        defer pass.deinit();
+        var scope = try pass.admissionScope(io);
+        const payload = scope.payload();
+        try seed.commitWithAdmission(.init(&payload));
+        const physical = try local.storage_lsm_backend_wal.snapshotRetention(native.storage(), a, root);
+        try std.testing.expectEqualDeep(physical, handle.ptr().wal_retention.primary.?);
+    } else try seed.commit();
+    const pressure_mode = mode == .pressure_cold or mode == .pressure_cached or mode == .pressure_limit or mode == .pressure_soft or mode == .pressure_rotate or mode == .pressure_legacy or mode == .pressure_cancel or mode == .pressure_stale or mode == .pressure_bootstrap;
+    if (pressure_mode) {
+        const backend = handle.ptr();
+        backend.options.maintenance_waker = .{ .ptr = backend, .wake_fn = H.wake };
+        backend.options.wal_hard_limit_bytes = if (mode == .pressure_limit) backend.snapshotWriteStats().wal_append_bytes + 32 else 4096;
+        if (mode == .pressure_soft) backend.options.wal_soft_limit_bytes = 1;
+        if (mode == .pressure_rotate) {
+            backend.options.wal_segment_bytes = 1;
+            backend.options.wal_hard_limit_segments = 1;
+        }
+        const wal_mod = local.storage_lsm_backend_wal;
+        backend.wal_retention.primary = try wal_mod.snapshotRetention(native.storage(), a, root);
+        backend.wal_retention.primary_ns = platform.time.monotonicNs();
+        if (mode == .pressure_stale) {
+            backend.wal_retention.primary.?.current_segment_bytes += 1;
+        } else if (mode != .pressure_cached) backend.wal_retention.primary = null;
+        if (mode == .pressure_legacy) {
+            const source = try std.fmt.allocPrint(a, "{s}/wal/00000000000000000001.log", .{root});
+            defer a.free(source);
+            const bytes = try native.storage().readFileAlloc(a, source, 4096);
+            defer a.free(bytes);
+            const legacy = try std.fmt.allocPrint(a, "{s}/wal.log", .{root});
+            defer a.free(legacy);
+            try native.storage().writeFileAbsolute(legacy, bytes);
+        }
+    }
     const before = handle.ptr().snapshotWriteStats();
     const retained_before = resources.resource_manager.sliceStats(.lsm_wal_retention).used_bytes;
     const debt_before = handle.ptr().manifest_unpublished_wire_bytes;
@@ -8004,7 +8057,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         }
     };
     var worker: Worker = .{ .backend = handle.ptr(), .execution = &state, .value = value, .selected = mode };
-    if (mode == .concurrent or mode == .docstore_gate or mode == .cancel_io or mode == .cancel_append) {
+    if (mode == .concurrent or mode == .docstore_gate or mode == .cancel_io or mode == .cancel_append or mode == .pressure_cancel) {
         const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
         var joined = false;
         defer if (!joined) {
@@ -8048,7 +8101,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         var health: scheduler.Execution = .{};
         try health.start(&state.owner.scheduler, .{ .io = io, .native_now_ns = platform.time.monotonicNs }, .control);
         health.finish();
-        if (mode == .cancel_io or mode == .cancel_append) H.cancelled.store(true, .release);
+        if (mode == .cancel_io or mode == .cancel_append or mode == .pressure_cancel) H.cancelled.store(true, .release);
         io_mod.NativeSyncTestControl.release.store(true, .release);
         io_mod.NativeSyncTestControl.pause.store(false, .release);
         thread.join();
@@ -8061,28 +8114,65 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     } else if (mode == .prepare_reject) {
         try std.testing.expectEqual(@as(?anyerror, error.ResourceBudgetExceeded), worker.failure);
         try std.testing.expectEqual(debt_before, handle.ptr().manifest_unpublished_wire_bytes);
-    } else if (mode == .cancel_io or mode == .cancel_append) {
+    } else if (mode == .cancel_io or mode == .cancel_append or mode == .pressure_cancel) {
         try std.testing.expectEqual(@as(?anyerror, error.Canceled), worker.failure);
         try std.testing.expect(H.joined.load(.acquire) >= 1);
         try std.testing.expectEqual(mode == .cancel_append, handle.ptr().manifest_recovery_required);
     } else if (mode == .partial) {
         try std.testing.expect(worker.failure != null);
         try std.testing.expect(handle.ptr().manifest_recovery_required);
+    } else if (mode == .pressure_limit or mode == .pressure_rotate) {
+        try std.testing.expectEqual(@as(?anyerror, error.WalRetentionLimitExceeded), worker.failure);
+        try std.testing.expect(!handle.ptr().manifest_recovery_required);
+        try std.testing.expect(handle.ptr().wal_checkpoint_pending and H.wakes != 0);
     } else if (mode == .pressure) {
         try std.testing.expectEqual(@as(?anyerror, error.WalRecordTooLarge), worker.failure);
     } else if (worker.failure) |cause| return cause;
     if (mode == .guarded) try std.testing.expectEqual(@as(usize, 0), H.calls.load(.acquire)) else if (mode != .pressure) try std.testing.expect(H.calls.load(.acquire) > 0);
     try std.testing.expect(!handle.ptr().foreground_commit_pending and handle.ptr().active_foreground_preparation == null);
     const after = handle.ptr().snapshotWriteStats();
-    const successful = mode != .accepted_reject and mode != .partial and mode != .pressure and mode != .cancel_io and mode != .cancel_append and mode != .prepare_reject;
+    const successful = mode != .accepted_reject and mode != .partial and mode != .pressure and mode != .cancel_io and mode != .cancel_append and mode != .prepare_reject and mode != .pressure_limit and mode != .pressure_rotate and mode != .pressure_cancel;
     try std.testing.expectEqual(before.wal_append_records + @intFromBool(successful), after.wal_append_records);
     try std.testing.expectEqual(before.wal_segment_syncs + @intFromBool(successful and mode == .sync), after.wal_segment_syncs);
     if (successful) try std.testing.expect(resources.resource_manager.sliceStats(.lsm_wal_retention).used_bytes >= retained_before + after.wal_append_bytes - before.wal_append_bytes);
+    if (pressure_mode and mode != .pressure_cancel) {
+        if (mode == .pressure_cached) try std.testing.expectEqual(@as(usize, 0), H.retention_scans) else try std.testing.expect(H.retention_scans != 0);
+        const physical = try local.storage_lsm_backend_wal.snapshotRetention(native.storage(), a, root);
+        try std.testing.expectEqualDeep(physical, handle.ptr().wal_retention.primary.?);
+        const replay_bytes = if (handle.ptr().wal_retention.replay) |replay| replay.bytes else 0;
+        try std.testing.expect(resources.resource_manager.sliceStats(.lsm_wal_retention).used_bytes >= physical.bytes + replay_bytes);
+        if (mode == .pressure_soft) try std.testing.expect(handle.ptr().wal_checkpoint_pending and H.wakes != 0);
+    }
+    if (mode == .pressure_limit) {
+        const until = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
+        while (handle.ptr().wal_checkpoint_pending) {
+            _ = try handle.ptr().runMaintenanceStep();
+            if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        worker.failure = null;
+        worker.run();
+        if (worker.failure) |cause| return cause;
+    }
+    if (mode == .retirement_resume or mode == .prepare_reject) {
+        // Close has a legitimate quiesced fallback. Join the normal admitted
+        // reclamation path first so this case cannot pass through that fallback.
+        const until = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
+        while (true) {
+            platform.sync.lockYielding(&handle.ptr().mu);
+            const pending = handle.ptr().retired_manifest_preparations != null or handle.ptr().manifest_preparation_reclaim_in_flight;
+            handle.ptr().mu.unlock();
+            if (!pending) break;
+            _ = try handle.ptr().runMaintenanceStep();
+            if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
     io_mod.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
     handle.abandonAfterCrash();
     open = false;
     RegisteredOutputFixture.drain(&resources.resource_manager);
-    if (mode == .retirement_resume) try std.testing.expect(H.retire_refused);
+    if (mode == .retirement_resume) try std.testing.expect(H.retire_refused and H.retire_resumed);
     if (mode == .retirement_resume or mode == .prepare_reject) try std.testing.expect(H.retire_calls > 1);
     try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
@@ -8091,7 +8181,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     var read = try reopened.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("old-value", try read.get(.{}, "seed"));
-    if (successful or mode == .cancel_append) try std.testing.expectEqualStrings(value, try read.get(.{}, "first")) else try std.testing.expectError(error.NotFound, read.get(.{}, "first"));
+    if (successful or mode == .cancel_append or mode == .pressure_limit) try std.testing.expectEqualStrings(value, try read.get(.{}, "first")) else try std.testing.expectError(error.NotFound, read.get(.{}, "first"));
 }
 
 test "physical cache metadata registered flush publication foreground WAL uses original caller admission and preserves unsynced policy" {
@@ -8181,4 +8271,40 @@ test "physical cache metadata registered flush publication staging index growth 
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "physical cache metadata registered flush publication foreground WAL cold pressure inventory stays on original admitted IO" {
+    try foregroundAdmittedCommit(.pressure_cold);
+}
+
+test "physical cache metadata registered flush publication foreground WAL fresh pressure cache avoids inventory scan" {
+    try foregroundAdmittedCommit(.pressure_cached);
+}
+
+test "physical cache metadata registered flush publication foreground WAL hard byte pressure schedules maintenance and permits retry after checkpoint" {
+    try foregroundAdmittedCommit(.pressure_limit);
+}
+
+test "physical cache metadata registered flush publication foreground WAL soft pressure schedules checkpoint without foreground filesystem enforcement" {
+    try foregroundAdmittedCommit(.pressure_soft);
+}
+
+test "physical cache metadata registered flush publication foreground WAL hard segment pressure rejects rotation before physical mutation" {
+    try foregroundAdmittedCommit(.pressure_rotate);
+}
+
+test "physical cache metadata registered flush publication foreground WAL cold pressure inventory includes legacy WAL bytes" {
+    try foregroundAdmittedCommit(.pressure_legacy);
+}
+
+test "physical cache metadata registered flush publication foreground WAL pressure cancellation joins exact accepted inventory read" {
+    try foregroundAdmittedCommit(.pressure_cancel);
+}
+
+test "physical cache metadata registered flush publication foreground WAL rejects stale pressure cache against current physical size" {
+    try foregroundAdmittedCommit(.pressure_stale);
+}
+
+test "physical cache metadata registered flush publication foreground WAL pressure inventory bootstraps empty controls without phantom retention" {
+    try foregroundAdmittedCommit(.pressure_bootstrap);
 }
