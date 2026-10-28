@@ -2732,3 +2732,12 @@ and lease accounting, and keeps root decisions, native masks and grants outside
 the cache. Denied admission retains exact streaming behavior. Together with
 borrowed sorted suffix dependencies, this removes repeated journal preparation
 and path-length memo fills while preserving final source and authorization fences.
+
+
+Shared resolver routing proofs also reuse immutable sorted full-SHA routing-change
+plans, including each source's latest mutation sequence, under the existing
+48-MiB decoded-profile budget. Plans are qualified by namespace ancestry and the
+exact sequence window. Recent-source discovery borrows them directly; extension
+for older terminal checkpoints uses private scratch. Root verdicts, source
+coverage, native masks and authorization remain fresh. Cache denial preserves
+bounded streaming fallback; no additional cache budget or durable format is added.

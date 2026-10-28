@@ -78,7 +78,9 @@ pub const CanonicalCheckpoint = struct {
         return .{ .sequence = proof.sequence, .graph = proof.graph, .routing = proof.routing };
     }
 };
+pub const RoutingChange = struct { digest: [32]u8, sequence: u64 };
 pub const Graph = struct {
+    routing_changes: []const RoutingChange = &.{},
     invalidations: []const [32]u8 = &.{},
     canonical: ?CanonicalProof = null,
     routes: []const Route = &.{},
@@ -108,6 +110,7 @@ pub const Redirects = struct {
     }
 };
 pub const Context = struct {
+    routing_changes: []const RoutingChange = &.{},
     invalidations: []const [32]u8 = &.{},
     canonical: ?CanonicalProof = null,
     canonical_mutex: std.atomic.Mutex = .unlocked,
@@ -263,7 +266,7 @@ pub const Context = struct {
             }
         }
         const result = try owner.create(Context);
-        result.* = .{ .invalidations = graph.invalidations, .canonical = graph.canonical, .arena = arena, .key = cache_key, .base = base, .shared_profile = graph.shared_profile, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .nodes = nodes, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins, .routes = graph.routes };
+        result.* = .{ .routing_changes = graph.routing_changes, .invalidations = graph.invalidations, .canonical = graph.canonical, .arena = arena, .key = cache_key, .base = base, .shared_profile = graph.shared_profile, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .nodes = nodes, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins, .routes = graph.routes };
         return result;
     }
 };
@@ -499,6 +502,12 @@ pub fn tryRouting(key: [32]u8, loader: Loader) !?Lease {
 pub fn tryInvalidations(key: [32]u8, loader: Loader) !?Lease {
     var bounded = loader;
     bounded.estimated_bytes = 18 * 1024 * 1024; // <=8 MiB scratch + <=8 MiB frozen arena.
+    return shared.tryAcquire(key, true, bounded);
+}
+/// Immutable sorted routing history uses the existing shared plan budget.
+pub fn tryRoutingChanges(key: [32]u8, loader: Loader) !?Lease {
+    var bounded = loader;
+    bounded.estimated_bytes = 12 * 1024 * 1024; // 8 MiB scratch + <=3 MiB frozen arena.
     return shared.tryAcquire(key, true, bounded);
 }
 /// Tail loaders use caller-owned scratch and retain an entry key, terminal
@@ -822,12 +831,14 @@ test "native resolver authority canonical checkpoints publish coherent concurren
     try std.testing.expectEqual(proof.graph, proof.routing);
 }
 
-test "native resolver authority invalidation plans own leased storage through eviction and allocation failures" {
+test "native resolver authority change plans own leased storage through eviction and allocation failures" {
     const Fixture = struct {
         fn load(_: *anyopaque, a: A) !Graph {
             const values = try a.alloc([32]u8, 128);
             for (values, 0..) |*digest, i| digest.* = @splat(@intCast(i));
-            return .{ .invalidations = values };
+            const changes = try a.alloc(RoutingChange, 128);
+            for (changes, 0..) |*change, i| change.* = .{ .digest = values[i], .sequence = i + 1 };
+            return .{ .invalidations = values, .routing_changes = changes };
         }
         fn run(a: A) !void {
             var cache: Cache = .{ .allocator = a };
@@ -838,6 +849,9 @@ test "native resolver authority invalidation plans own leased storage through ev
             cache.deinit();
             try std.testing.expectEqual(@as(usize, 128), lease.context.invalidations.len);
             try std.testing.expectEqual(@as([32]u8, @splat(127)), lease.context.invalidations[127]);
+            try std.testing.expectEqual(@as(usize, 128), lease.context.routing_changes.len);
+            try std.testing.expectEqual(@as(u64, 128), lease.context.routing_changes[127].sequence);
+            try std.testing.expectEqual(@as([32]u8, @splat(127)), lease.context.routing_changes[127].digest);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});

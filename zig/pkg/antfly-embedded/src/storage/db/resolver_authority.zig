@@ -2169,8 +2169,8 @@ pub const Store = struct {
         }
     };
     const RoutingChanges = struct {
-        const Change = struct { digest: [32]u8, sequence: u64 };
-        entries: []Change = &.{},
+        const Change = query_context.RoutingChange;
+        entries: []const Change = &.{},
         first: ?u64 = null,
         capacity: []Change = &.{},
         storage: []u8,
@@ -2178,9 +2178,12 @@ pub const Store = struct {
             const previous = self.first orelse journal_head.sequence;
             if (since >= previous) return;
             if (since < journal_head.barrier or journal_head.sequence - since > 256) return error.InvalidCatalogRecord;
-            if (self.first == null) {
+            if (self.capacity.len == 0) {
                 var workspace: std.heap.FixedBufferAllocator = .init(self.storage);
                 self.capacity = try workspace.allocator().alloc(Change, 256 * 128);
+                // Extend older checkpoints in private storage. Borrowed plans
+                // remain immutable for the source iterator and other requests.
+                @memcpy(self.capacity[0..self.entries.len], self.entries);
             }
             const items = self.capacity;
             var count = self.entries.len;
@@ -2241,7 +2244,32 @@ pub const Store = struct {
             return false;
         }
     };
+    const RoutingChangesLoader = struct {
+        store: Store,
+        template: []const u8,
+        head: PinEditHead,
+        since: u64,
+        fn load(ptr: *anyopaque, a: A) !query_context.Graph {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const scratch = try query_context.RoutingScratch.init();
+            defer scratch.deinit();
+            var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes[6 * 1024 * 1024 ..]);
+            var changes: RoutingChanges = .{ .storage = scratch.bytes[0 .. 2 * 1024 * 1024] };
+            try changes.load(self.store, self.template, self.head, self.since, &frame);
+            return .{ .routing_changes = try a.dupe(query_context.RoutingChange, changes.entries) };
+        }
+        fn key(prepared: PreparedQuery, head_: PinEditHead, since: u64) ![32]u8 {
+            var buffer: [1024]u8 = undefined;
+            var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
+            try std.json.Stringify.value(.{ "pin-routing-changes-v1", prepared.template, head_.routing_origin, since, head_.sequence, head_.graph, prepared.routing_id }, .{}, &writer.writer);
+            try writer.writer.flush();
+            var digest: [32]u8 = undefined;
+            writer.hasher.final(&digest);
+            return digest;
+        }
+    };
     const RoutingSources = struct {
+        plan: ?query_context.Lease = null,
         store: Store,
         sequence: u64,
         raw_prefix: []const u8,
@@ -2253,6 +2281,9 @@ pub const Store = struct {
         position: usize = 0,
         cursor: [85]u8 = undefined,
         cursor_len: usize = 0,
+        fn deinit(self: @This()) void {
+            if (self.plan) |lease| lease.release();
+        }
         fn init(store: Store, prepared: PreparedQuery, journal_head: PinEditHead, sequence: u64, changes: *RoutingChanges, storage: []u8, frame: *std.heap.FixedBufferAllocator) !@This() {
             const journal = try store.pinEditRoot(prepared.template);
             const prefix = try std.mem.concat(store.a, u8, &.{ journal, "routed/" });
@@ -2268,6 +2299,20 @@ pub const Store = struct {
             // Intersect only recent versions, never the entire retained key
             // index. Freeze this sorted input: cache validation may extend its
             // own changed-key workspace to an older checkpoint during iteration.
+            if (prepared.qualified) {
+                var loader: RoutingChangesLoader = .{ .store = store, .template = prepared.template, .head = journal_head, .since = sequence };
+                result.plan = query_context.tryRoutingChanges(try RoutingChangesLoader.key(prepared, journal_head, sequence), .{ .ptr = &loader, .load = RoutingChangesLoader.load }) catch |err| switch (err) {
+                    error.OutOfMemory => null,
+                    else => return err,
+                };
+                if (result.plan) |lease| {
+                    result.recent = lease.context.routing_changes;
+                    changes.entries = result.recent;
+                    changes.first = sequence;
+                    result.raw = false;
+                    return result;
+                }
+            }
             try changes.load(store, prepared.template, journal_head, sequence, frame);
             var workspace: std.heap.FixedBufferAllocator = .init(storage);
             result.recent = try workspace.allocator().dupe(RoutingChanges.Change, changes.entries);
@@ -2375,6 +2420,7 @@ pub const Store = struct {
         if (gate.rows.len == 0) return true;
         var changes: RoutingChanges = .{ .storage = storage[0 .. 2 * 1024 * 1024] };
         var sources = try RoutingSources.init(self, prepared, journal_head, sequence, &changes, storage[2 * 1024 * 1024 ..], events);
+        defer sources.deinit();
         memo_frame.reset();
         const a = memo_frame.allocator();
         const slots = try a.alloc(u32, 32768);
@@ -5606,6 +5652,7 @@ const OrderedPinMemory = struct {
     reads: usize = 0,
     pin_event_reads: usize = 0,
     test_compact_reads: usize = 0,
+    test_routed_compact_reads: usize = 0,
     scans: usize = 0,
     writes: usize = 0,
     visited: usize = 0,
@@ -5613,6 +5660,7 @@ const OrderedPinMemory = struct {
     fn get(ptr: *anyopaque, a: A, key: []const u8) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.reads += 1;
+        if (std.mem.indexOf(u8, key, "/routed-compact/") != null) self.test_routed_compact_reads += 1;
         if (std.mem.indexOf(u8, key, "/compact/") != null) self.test_compact_reads += 1;
         if (std.mem.indexOf(u8, key, "pin-edits-v1/") != null and std.mem.indexOf(u8, key, "/slot/") != null) self.pin_event_reads += 1;
         return if (self.rows.get(key)) |value| try a.dupe(u8, value) else null;
@@ -8045,6 +8093,10 @@ test "resolver curation dependency recent source input survives older cache vali
     var points: std.heap.FixedBufferAllocator = .init(scratch.bytes[7 * 1024 * 1024 ..]);
     var changes: Store.RoutingChanges = .{ .storage = scratch.bytes[0 .. 2 * 1024 * 1024] };
     var sources = try Store.RoutingSources.init(store, prepared, latest, 1, &changes, scratch.bytes[2 * 1024 * 1024 .. 5 * 1024 * 1024], &events);
+    defer sources.deinit();
+    try std.testing.expect(sources.plan != null);
+    try std.testing.expectEqual(@as(usize, 0), changes.capacity.len);
+    try std.testing.expectEqual(@as(usize, 9), sources.recent.len);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     while (try sources.next(prepared, &events, &points)) |source| {
         try std.testing.expectEqual(@as(u64, 2), source.sequence);
@@ -8055,6 +8107,25 @@ test "resolver curation dependency recent source input survives older cache vali
     }
     try std.testing.expectEqual(@as(usize, 9), seen.count());
     try std.testing.expectEqual(@as(usize, 10), changes.entries.len);
+    try std.testing.expectEqual(@as(usize, 9), sources.recent.len);
+    // Sharing history never freezes profile coverage. Removing all covered
+    // rows must affect the next iterator even while the plan remains leased.
+    for (recent, 0..) |key, i| {
+        const suffix = switch (i % 3) {
+            0 => "path/",
+            1 => "dirty-node/",
+            2 => "trace/",
+            else => unreachable,
+        };
+        try store.backend.remove(store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}{s}{s}", .{ projection, suffix, try hash(a, key) }));
+    }
+    var refreshed: Store.RoutingChanges = .{ .storage = scratch.bytes[0 .. 2 * 1024 * 1024] };
+    const reads = memory.test_routed_compact_reads;
+    var next_sources = try Store.RoutingSources.init(store, prepared, latest, 1, &refreshed, scratch.bytes[2 * 1024 * 1024 .. 5 * 1024 * 1024], &events);
+    defer next_sources.deinit();
+    try std.testing.expect(next_sources.plan != null);
+    try std.testing.expect(try next_sources.next(prepared, &events, &points) == null);
+    try std.testing.expectEqual(reads, memory.test_routed_compact_reads);
 }
 
 test "resolver curation dependency pending canonical memo bounds leases and releases on spill and exit" {
@@ -8386,4 +8457,137 @@ test "resolver curation dependency qualification is bounded read only until publ
     try std.testing.expectEqual(@as(usize, 1), (try store.queryExecutionPrepared(qualified, &.{aliases[0].target}, &.{}, true)).namespace.state.distinct.len);
     rows = memory.rows.iterator();
     while (rows.next()) |row| try validatePortableRow(a, row.key_ptr.*, row.value_ptr.*);
+}
+
+test "resolver curation dependency routing plans reuse immutable history and recover after admission denial" {
+    for ([_]usize{ 16, 128 }) |event_count| {
+        const count: usize = 128;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var memory: OrderedPinMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+        const aliases = try a.alloc(resolver.KeyAlias, count * 2);
+        const pairs = try a.alloc(c.Pair, count);
+        for (pairs, 0..) |*pair, i| {
+            aliases[i] = .{ .key = try std.fmt.allocPrint(a, "entity/pinned-{d}", .{i}), .target = "entity/pinned-root" };
+            aliases[count + i] = .{ .key = try std.fmt.allocPrint(a, "entity/unpinned-{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/unpinned-root-{d}", .{i % 64}) };
+            pair.* = .{ .from = aliases[i].key, .to = try std.fmt.allocPrint(a, "entity/other-{d}", .{i}) };
+        }
+        const template = "entity/{{_key}}";
+        const initial: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = "entity/disjoint-target", .target = "entity/disjoint-terminal" }}, .state = .{ .distinct = pairs } };
+        try store.adoptNamespace(initial);
+        const Txn = struct {
+            memory: *OrderedPinMemory,
+            pub fn get(self: *@This(), k: []const u8) ![]const u8 {
+                return self.memory.rows.get(k) orelse error.NotFound;
+            }
+            pub fn put(self: *@This(), k: []const u8, v: []const u8) !void {
+                return OrderedPinMemory.put(self.memory, self.memory.a, k, v);
+            }
+            pub fn delete(self: *@This(), k: []const u8) !void {
+                return OrderedPinMemory.remove(self.memory, self.memory.a, k);
+            }
+        };
+        var txn: Txn = .{ .memory = &memory };
+        const definition: static_profiles.Definition = .{ .key_template = template, .aliases = aliases };
+        const id = try definition.identity(a);
+        try static_profiles.synchronize(a, &txn, "static-root-profile/", &.{}, &.{definition});
+        var reader: static_profiles.QueryReader = .{ .backend = store.backend, .root = "static-root-profile/", .profile = id, .indexed = true };
+        try std.testing.expect(!try store.queryPinsIndexed(template, id));
+        var turns: usize = 0;
+        while (true) : (turns += 1) {
+            var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer request.deinit();
+            var owner = store;
+            owner.a = request.allocator();
+            const writes = memory.writes;
+            const done = try owner.advanceQueryPins(template, id, reader.lookup(), 128);
+            try std.testing.expect(memory.writes - writes <= 129);
+            try std.testing.expect(turns < (pairs.len * 32 + 111) / 112 + 32);
+            if (done) break;
+        }
+
+        for (0..event_count) |step| {
+            var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer request.deinit();
+            const alloc = request.allocator();
+            var writer = store;
+            writer.a = alloc;
+            const old = (try writer.head(template)).?;
+            var next = old;
+            next.revision += 1;
+            const edits = try alloc.alloc(Edit, count);
+            for (edits, 0..) |*edit, i| {
+                const edge: resolver.KeyAlias = .{ .key = try std.fmt.allocPrint(alloc, "entity/disjoint-edit-{d}-{d}", .{ step, i }), .target = "entity/disjoint-target" };
+                edit.* = .{ .kind = .redirect, .id = edge.key, .value = try parse(std.json.Value, alloc, try encode(alloc, edge)) };
+            }
+            try writer.apply(.{ .expected_revision = old.revision, .next = next, .edits = edits });
+        }
+        const prepared = (try store.prepareQuery(template, .{ .id = id, .lookup = reader.lookup() }, true)).?;
+        defer prepared.release();
+        var roots: [64][]const u8 = undefined;
+        for (&roots, 0..) |*root, i| root.* = try std.fmt.allocPrint(a, "entity/unpinned-root-{d}", .{i});
+        test_pin_summary_probes.store(0, .monotonic);
+        const reads_before = memory.reads;
+        const scans_before = memory.scans;
+        const result = try store.queryExecutionPrepared(prepared, &roots, &.{}, true);
+        const probes = test_pin_summary_probes.load(.monotonic);
+        try std.testing.expectEqual(@as(usize, 0), result.namespace.state.distinct.len);
+        const invalidations = try store.backend.scan(store.backend.ptr, a, try std.mem.concat(a, u8, &.{ try store.pinEditRoot(template), "invalidated/" }), null, 20000);
+        try std.testing.expectEqual(event_count * count + 1, invalidations.rows.len);
+        try std.testing.expect(probes <= roots.len * 3);
+        const compact_reads = memory.test_compact_reads;
+        const steady_reads = memory.reads;
+        const routed_reads = memory.test_routed_compact_reads;
+        const started = @import("antfly_platform").time.monotonicNs();
+        for (0..20) |_| {
+            var request = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer request.deinit();
+            var current = store;
+            current.a = request.allocator();
+            const part = try current.queryExecutionPrepared(prepared, &.{roots[0]}, &.{}, true);
+            try std.testing.expectEqual(@as(usize, 0), part.namespace.state.distinct.len);
+        }
+        try std.testing.expectEqual(@as(usize, 0), memory.test_compact_reads - compact_reads);
+        try std.testing.expectEqual(@as(usize, 0), memory.test_routed_compact_reads - routed_reads);
+        std.debug.print("SHARED ROUTING PLAN events={d} queries=20 routed_compact_reads={d} native_reads={d}\n", .{ event_count, memory.test_routed_compact_reads - routed_reads, memory.reads - steady_reads });
+        std.debug.print("SHARED INVALIDATION PLAN events={d} queries=20 compact_reads={d} native_reads={d} elapsed_us={d}\n", .{ event_count, memory.test_compact_reads - compact_reads, memory.reads - steady_reads, (@import("antfly_platform").time.monotonicNs() - started) / 1000 });
+        if (event_count == 128) {
+            const Pressure = struct {
+                fn load(_: *anyopaque, alloc: A) !query_context.Graph {
+                    const bytes = try alloc.alloc(u8, 49 * 1024 * 1024);
+                    @memset(bytes, 'p');
+                    const result_routes = try alloc.alloc(query_context.Route, 1);
+                    result_routes[0] = .{ .root = bytes, .component = "plan-pressure" };
+                    return .{ .routes = result_routes };
+                }
+            };
+            var marker: u8 = 0;
+            const old_head = (try store.head(template)).?;
+            var next_head = old_head;
+            next_head.revision += 1;
+            const edge: resolver.KeyAlias = .{ .key = "entity/plan-denial-noise", .target = "entity/plan-denial-target" };
+            try store.apply(.{ .expected_revision = old_head.revision, .next = next_head, .edits = &.{.{ .kind = .redirect, .id = edge.key, .value = try parse(std.json.Value, a, try encode(a, edge)) }} });
+            const current_prepared = (try store.prepareQuery(template, .{ .id = id, .lookup = reader.lookup() }, true)).?;
+            defer current_prepared.release();
+            {
+                const pressure = try query_context.acquire(@splat(218), false, .{ .ptr = &marker, .load = Pressure.load });
+                defer pressure.release();
+                const before_compact = memory.test_compact_reads;
+                const before_routed = memory.test_routed_compact_reads;
+                const denied = try store.queryExecutionPrepared(current_prepared, &.{roots[0]}, &.{}, true);
+                try std.testing.expectEqual(@as(usize, 0), denied.namespace.state.distinct.len);
+                try std.testing.expectEqual(event_count + 1, memory.test_compact_reads - before_compact);
+                try std.testing.expectEqual(event_count + 1, memory.test_routed_compact_reads - before_routed);
+            }
+            _ = try store.queryExecutionPrepared(current_prepared, &.{roots[0]}, &.{}, true);
+            const before_warm = memory.test_compact_reads;
+            const before_routed_warm = memory.test_routed_compact_reads;
+            _ = try store.queryExecutionPrepared(current_prepared, &.{roots[0]}, &.{}, true);
+            try std.testing.expectEqual(before_warm, memory.test_compact_reads);
+            try std.testing.expectEqual(before_routed_warm, memory.test_routed_compact_reads);
+        }
+        std.debug.print("ADAPTIVE TINY SUMMARY events={d} queried_roots=64 dependencies_per_root=3 unique_invalidations={d} digest_probes={d} reads={d} scans={d} pairs={d}\n", .{ event_count, invalidations.rows.len, probes, memory.reads - reads_before, memory.scans - scans_before, result.namespace.state.distinct.len });
+    }
 }

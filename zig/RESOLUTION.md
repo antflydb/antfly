@@ -3101,3 +3101,25 @@ Additional deterministic regressions:
 - Repeated two-entry proofs into an 8,192-hop warm path use 13 sorted dependency
   comparisons instead of materializing 8,193 digests per page. Native reads remain
   three and forward steps remain zero. Pending leases remain bounded on spill.
+
+Routing-history preparation uses immutable sorted `(full SHA-256, latest sequence)`
+plans in the same 48-MiB shared decoded-profile lane. Keys include the qualified
+journal origin, namespace template, baseline/current sequence, graph and routing
+fingerprints; profile coverage and root verdicts are never part of the plan.
+The 12-MiB reservation covers 8 MiB of build scratch and a bounded frozen arena,
+with normal miss coalescing, LRU eviction and live-lease accounting. No durable
+format or reader-floor change is required. Unqualified content and denied cache
+admission retain bounded streaming preparation.
+
+Large recent-source intersections borrow these arrays directly. An older cached
+terminal may require additional routing history: that extension copies the plan
+into private scratch before merging, leaving the iterator's leased input intact.
+Path, dirty-node and trace coverage are read afresh, including when a plan is
+already warm. Removing coverage affects the next iterator immediately.
+
+With 128 retained events containing chained targets, 20 identical public queries
+formerly reread 2,560 routing-compact rows and made 2,940 total native reads.
+Warm routing plans use zero routing-compact rereads and 380 native point reads;
+profile-coverage scans remain fresh. Regressions also cover
+private extension to older checkpoints, fresh coverage after deletion, admission
+denial and recovery, and leased data surviving eviction and allocation failures.
