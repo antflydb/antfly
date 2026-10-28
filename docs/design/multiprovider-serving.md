@@ -194,7 +194,11 @@ be called qualified:
   authenticated tracing, epoch barrier and record/receipt/document roots as the
   hosted collector. Reader and in-progress publication protection must remain
   effective across restart and takeover; do not introduce a latest-root-only
-  sweep. Until this is connected, retain WAL pages conservatively.
+  sweep. [The native collection protocol](native-indexed-wal-collection.md)
+  specifies new-prefix activation, persisted bounded root use, matching-ID
+  lifecycle, transactional child continuations, grace and provider-version
+  handling. It is proposed and not implemented. Until this is connected, retain
+  WAL pages conservatively.
 - Migrate each appropriate generic HTTP query entry point to the bounded live
   session interface with its own freshness contract. Existing diagnostic/export
   responses require mutation LSNs and timestamps and cannot use a collapsed
@@ -265,6 +269,38 @@ for other workloads. Read p50 also varies with order. Do not choose only the
 favorable run or infer a cloud SLO from these local populations. Fresh proof
 I/O and kernel queueing remain substantial spans in the slow requests, motivating
 bounded overlap of proof acquisition with execution admission.
+
+The subsequent [proof-admission experiment](metadata-proof-admission.md) passes
+328 Node and 31 workerd tests, but its delayed read-p95 improvement does not
+repeat in reverse order and both zero-delay orders regress. Keep
+`DETACHED_METADATA_PROOFS` off alongside affinity and the document index in the
+live candidate. The feature's lifecycle correctness is separate from whether
+it improves this workload.
+
+## Native HTTP batch adoption
+
+Ordinary public table replacements and deletes now resolve their input without
+opening a current-state query. Previously every batch materialized the entire
+namespace even when no transform needed an existing body. Mutation cloning owns
+its bytes and unwinds each allocation failure.
+
+Native indexed-WAL hosts configure transforms to use one caller-owned bounded
+`LiveSession` per batch. It pins the published base and captures one accepted
+WAL cut; all transform keys read that same cut. The runtime's bounded derived
+cache is reused when enabled. Request cancellation reaches session and transport
+work. Capacity/expired-view errors return retryable backpressure before append;
+integrity and transport failures do not select an unbounded fallback. An older
+published layout without document facts explicitly retains its existing legacy
+materializer. Legacy-WAL hosts retain their existing transform path.
+
+This does not add compare-and-swap isolation to public transforms: a concurrent
+writer can still commit between resolution and ingestion, as in the prior API.
+It does not reinterpret published search or diagnostic/export history as a fresh
+collapsed overlay. Their existing visibility and original-mutation contracts
+remain authoritative. The new memory-backed test covers unpublished transforms,
+pre-append backpressure, publication, multiple keys and an earlier session that
+retains its old cut. Allocation-failure enumeration checks replacement ownership;
+real-provider qualification repeats a published-base transform and full reopen.
 
 Reports, exact role bundles/bindings and failed/intermediate runs remain local
 under `examples/cloudflare-serverless/dist/qualification/multiprovider-lab/`.

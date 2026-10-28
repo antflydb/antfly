@@ -233,6 +233,9 @@ pub const HttpHandler = struct {
     progress: *catalog_mod.ProgressStore,
     query: *query_mod.QueryRuntime,
     query_cache: ?*query_mod.QueryCache = null,
+    /// Native indexed hosts opt into bounded fresh transforms. The stack owns
+    /// only the derived cache; each batch owns its pinned base and WAL cut.
+    live_read_options: ?query_mod.LiveSession.Options = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
     embedding_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -5799,40 +5802,55 @@ pub const HttpHandler = struct {
         return docs;
     }
 
-    fn resolveTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest) ![]api_types.DocumentMutation {
-        const latest_docs = try self.allocLatestDocumentsAlloc(namespace);
+    fn resolveTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest, cancellation: CancellationToken) ![]api_types.DocumentMutation {
+        try cancellation.check();
+        var live: ?*query_mod.LiveSession = null;
+        defer if (live) |session| session.deinit();
+        if (req.transforms.len > 0) if (self.live_read_options) |options| {
+            var configured = options;
+            configured.cancellation = cancellation;
+            configured.io = self.io;
+            live = query_mod.LiveSession.open(self.alloc, self.query, self.api.wal, namespace, configured) catch |err| switch (err) {
+                // Old published layouts retain their original materializer.
+                // Integrity, capacity and transport failures never fall back.
+                error.HostedDocumentFactsRequired => null,
+                else => return err,
+            };
+        };
+        // Full replacements and deletes do not depend on any existing body.
+        const latest_docs = if (req.transforms.len > 0 and live == null)
+            try self.allocLatestDocumentsAlloc(namespace)
+        else
+            try self.alloc.alloc(query_materializer.Document, 0);
         defer query_materializer.freeDocuments(self.alloc, latest_docs);
 
         var deletes = std.ArrayListUnmanaged(api_types.DocumentMutation).empty;
         defer freeDocumentMutationList(self.alloc, &deletes);
         for (req.deletes) |doc_id| {
-            try deletes.append(self.alloc, .{
-                .kind = .delete,
-                .doc_id = try self.alloc.dupe(u8, doc_id),
-                .body = null,
-            });
+            try self.appendClonedBatchMutation(&deletes, .delete, doc_id, null);
         }
 
         var upserts = std.ArrayListUnmanaged(api_types.DocumentMutation).empty;
         defer freeDocumentMutationList(self.alloc, &upserts);
         for (req.writes) |write| {
-            try upserts.append(self.alloc, .{
-                .kind = .upsert,
-                .doc_id = try self.alloc.dupe(u8, write.key),
-                .body = try self.alloc.dupe(u8, write.value),
-            });
+            try self.appendClonedBatchMutation(&upserts, .upsert, write.key, write.value);
         }
 
         for (req.transforms) |transform| {
-            const existing_body = findMaterializedDocumentBody(latest_docs, transform.key);
+            try cancellation.check();
+            const fetched = if (live) |session| try session.lookupAlloc(transform.key) else null;
+            defer if (fetched) |body| self.alloc.free(body);
+            const existing_body = if (live != null) fetched else findMaterializedDocumentBody(latest_docs, transform.key);
             const resolved = try db_transform.resolveDocumentTransform(self.alloc, existing_body, transform) orelse continue;
             errdefer self.alloc.free(resolved);
 
             removeDocumentMutationById(self.alloc, &deletes, transform.key);
             removeDocumentMutationById(self.alloc, &upserts, transform.key);
+            const owned_id = try self.alloc.dupe(u8, transform.key);
+            errdefer self.alloc.free(owned_id);
             try upserts.append(self.alloc, .{
                 .kind = .upsert,
-                .doc_id = try self.alloc.dupe(u8, transform.key),
+                .doc_id = owned_id,
                 .body = resolved,
             });
         }
@@ -5854,6 +5872,14 @@ pub const HttpHandler = struct {
         upserts.clearRetainingCapacity();
 
         return mutations;
+    }
+
+    fn appendClonedBatchMutation(self: *HttpHandler, list: *std.ArrayListUnmanaged(api_types.DocumentMutation), kind: api_types.MutationKind, id: []const u8, body: ?[]const u8) !void {
+        const owned_id = try self.alloc.dupe(u8, id);
+        errdefer self.alloc.free(owned_id);
+        const owned_body = if (body) |bytes| try self.alloc.dupe(u8, bytes) else null;
+        errdefer if (owned_body) |bytes| self.alloc.free(bytes);
+        try list.append(self.alloc, .{ .kind = kind, .doc_id = owned_id, .body = owned_body });
     }
 
     fn tableApi(self: *HttpHandler, cancellation: CancellationToken) public_table_http.TableApi {
@@ -5924,8 +5950,11 @@ pub const HttpHandler = struct {
         };
         defer self.alloc.free(namespace);
 
-        const mutations = self.resolveTableBatchMutationsAlloc(namespace, req) catch |err| switch (err) {
+        const mutations = self.resolveTableBatchMutationsAlloc(namespace, req, request.cancellation) catch |err| switch (err) {
             error.InvalidArgument => return error.InvalidBatchRequest,
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.WalReadBudgetExceeded, error.WalVisibilityUnavailable, error.WalSnapshotExpired => return error.Backpressured,
             else => {
                 std.log.err("serverless public table batch mutation resolution failed table={s} namespace={s} err={}", .{ table_name, namespace, err });
                 return error.InternalFailure;
@@ -9001,6 +9030,28 @@ fn lowerTableIngestMutationsAlloc(
         };
     }
     return mutations;
+}
+
+test "serverless multiprovider replacement batches need no read services and unwind every allocation" {
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            // No query/catalog/WAL service is installed: replacements must
+            // depend only on the admitted request's owned input bytes.
+            var handler: HttpHandler = undefined;
+            handler.alloc = a;
+            handler.live_read_options = null;
+            const mutations = try handler.resolveTableBatchMutationsAlloc("unused", .{
+                .writes = &.{ .{ .key = "a", .value = "{\"v\":1}" }, .{ .key = "b", .value = "{\"v\":2}" } },
+                .deletes = &.{ "c", "d" },
+            }, .none);
+            defer freeDocumentMutations(a, mutations);
+            try std.testing.expectEqual(@as(usize, 4), mutations.len);
+            try std.testing.expectEqual(api_types.MutationKind.delete, mutations[0].kind);
+            try std.testing.expectEqualStrings("c", mutations[0].doc_id);
+            try std.testing.expectEqualStrings("{\"v\":2}", mutations[3].body.?);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless public table mutation admission lowers embedded object documents without copying" {

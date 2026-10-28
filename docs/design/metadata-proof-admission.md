@@ -104,3 +104,26 @@ workerd profile asserts that detached proof acquisition actually runs and stays
 within its input allowance. The passing full log retains the previously
 observed local platform `SQLITE_NOMEM`. Latency and cloud qualification remain
 open at this checkpoint; all failed/intermediate proof tests are preserved.
+
+## Measured selection at source `131a703fed`
+
+The matched actual-workerd runs retain the qualified native modules and vary
+only `DETACHED_METADATA_PROOFS`. Four tenants use 512 documents each, 192 reads
+and 64 writes with fixed 20/100 ms binding delays. Zero-delay runs use 64
+documents per tenant, 96 reads and 32 writes. All completed cases verify exact
+bodies, visibility and counts; detached cases observe 196 or 100 proof calls.
+
+| Population | Existing read/write p95, ms | Detached read/write p95, ms |
+| --- | ---: | ---: |
+| Delayed, existing first | 670 / 1,170 | 572 / 1,177 |
+| Delayed, detached first | 582 / 1,172 | 613 / 1,194 |
+| Zero delay, existing first | 141 / 141 | 255 / 255 |
+| Zero delay, detached first | 236 / 236 | 306 / 306 |
+
+Keep detached proofs **off** in the live candidate. The first-order delayed gain
+does not repeat, and both zero-delay orders regress. This is a correctness-tested
+independent control, not a demonstrated performance improvement. Retain all
+four populations and the failed localhost-listen attempt under
+`dist/qualification/proof-overlap-lab/`; do not discard the unfavorable order.
+The candidate also keeps affinity and the WAL document index off, as selected by
+the separate multiprovider ablation. Live coverage and the gate remain required.

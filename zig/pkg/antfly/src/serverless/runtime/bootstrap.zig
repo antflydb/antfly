@@ -675,6 +675,10 @@ pub const OwnedStack = struct {
         self.runtime.setEnricher(enricher);
         enricher_owned = false;
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
+        if (cfg.indexed_wal) self.handler.live_read_options = .{ .view = .{
+            .state_cache = if (self.read_state_enabled) &self.read_states else null,
+            .cache_allocator = if (self.read_state_enabled) self.alloc else null,
+        } };
         try self.handler.setGraphExecutionLimits(cfg.graph_execution_limits);
         self.handler.setIo(io);
         self.handler.setEmbeddingProviderRuntime(&self.embedding_provider_runtime);
@@ -1558,6 +1562,84 @@ test "serverless multiprovider bootstrap owns indexed WAL and bounded live read 
     try std.testing.expectEqual(@as(u64, 1), try reopened.countDocuments());
 }
 
+test "serverless multiprovider public batches use bounded fresh transforms without charging replacement writes" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var stack: OwnedStack = undefined;
+    try stack.init(a, .{
+        .native_location = .{ .client = client, .bucket = "db", .prefix = "native-batches" },
+        .artifacts_uri = "file:///unused",
+        .manifests_uri = "file:///unused",
+        .wal_uri = "file:///unused",
+        .progress_uri = "file:///unused",
+        .catalog_uri = "file:///unused",
+        .indexed_wal = true,
+        .native_read_state = true,
+    }, std.testing.io);
+    defer stack.deinit();
+    try std.testing.expect(try stack.catalog.ensureTable("docs", 100));
+    const ns = try stack.catalog.resolveTableNamespaceAlloc("docs");
+    defer a.free(ns);
+    // Replacements require no current body, even when no tail read is admitted.
+    stack.handler.live_read_options.?.view.max_records = 0;
+    var written = try stack.handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/batch",
+        .body =
+        \\{"inserts":{"a":{"v":1},"b":{"v":2}}}
+        ,
+    });
+    defer written.deinit(a);
+    try std.testing.expectEqual(@as(u16, 201), written.status);
+    const before = try stack.wal.latestLsn(ns);
+    try std.testing.expectEqual(@as(u64, 2), before);
+    const transform =
+        \\{"transforms":[{"key":"a","operations":[{"op":"$set","path":"v","value":3}]}]}
+    ;
+    var rejected = try stack.handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body = transform });
+    defer rejected.deinit(a);
+    try std.testing.expectEqual(@as(u16, 429), rejected.status);
+    try std.testing.expectEqual(before, try stack.wal.latestLsn(ns));
+    // Restoring the budget admits a complete fresh cut, including unpublished
+    // writes. A failed bounded read must never use the legacy materializer.
+    stack.handler.live_read_options.?.view.max_records = 4096;
+    var accepted = try stack.handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body = transform });
+    defer accepted.deinit(a);
+    try std.testing.expectEqual(@as(u16, 201), accepted.status);
+    try std.testing.expect(stack.read_states.bytes > 0);
+    const live = try stack.openLiveSession(a, ns, .{});
+    defer live.deinit();
+    const body = (try live.lookupAlloc("a")).?;
+    defer a.free(body);
+    try std.testing.expectEqualStrings("{\"v\":3}", body);
+    try std.testing.expectEqual(@as(u64, 2), try live.countDocuments());
+    var published = try stack.catalog.buildTable("docs");
+    defer published.deinit(a);
+    try std.testing.expect(published.published);
+    var after_publication = try stack.handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/batch",
+        .body =
+        \\{"transforms":[{"key":"a","operations":[{"op":"$set","path":"v","value":5}]},{"key":"b","operations":[{"op":"$set","path":"v","value":6}]}]}
+        ,
+    });
+    defer after_publication.deinit(a);
+    try std.testing.expectEqual(@as(u16, 201), after_publication.status);
+    const fresh = try stack.openLiveSession(a, ns, .{});
+    defer fresh.deinit();
+    const fresh_body = (try fresh.lookupAlloc("b")).?;
+    defer a.free(fresh_body);
+    try std.testing.expectEqualStrings("{\"v\":6}", fresh_body);
+    // The earlier session retains its original accepted cut throughout the
+    // publication and subsequent batch instead of silently refreshing it.
+    const old_body = (try live.lookupAlloc("b")).?;
+    defer a.free(old_body);
+    try std.testing.expectEqualStrings("{\"v\":2}", old_body);
+}
+
 test "serverless multiprovider live runtime persists indexed receipts and fresh reads across reopen" {
     const enabled = std.c.getenv("ANTFLY_PROVIDER_LIVE") orelse return error.SkipZigTest;
     if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.SkipZigTest;
@@ -1658,5 +1740,45 @@ test "serverless multiprovider live runtime persists indexed receipts and fresh 
         const body = (try live.lookupAlloc("doc-a")).?;
         defer a.free(body);
         try std.testing.expectEqualStrings("alpha-maintained", body);
+    }
+    {
+        var native_http: OwnedStack = undefined;
+        try native_http.init(a, cfg, std.testing.io);
+        defer native_http.deinit();
+        try std.testing.expect(try native_http.catalog.ensureTable("batches", 200));
+        var inserted = try native_http.handler.handle(.{
+            .method = .post,
+            .path = "/tables/batches/batch",
+            .body =
+            \\{"inserts":{"row":{"v":1}}}
+            ,
+        });
+        defer inserted.deinit(a);
+        try std.testing.expectEqual(@as(u16, 201), inserted.status);
+        var published = try native_http.catalog.buildTable("batches");
+        defer published.deinit(a);
+        try std.testing.expect(published.published);
+        var transformed = try native_http.handler.handle(.{
+            .method = .post,
+            .path = "/tables/batches/batch",
+            .body =
+            \\{"transforms":[{"key":"row","operations":[{"op":"$set","path":"v","value":2}]}]}
+            ,
+        });
+        defer transformed.deinit(a);
+        try std.testing.expectEqual(@as(u16, 201), transformed.status);
+    }
+    {
+        var reopened: OwnedStack = undefined;
+        try reopened.init(a, cfg, std.testing.io);
+        defer reopened.deinit();
+        const ns = try reopened.catalog.resolveTableNamespaceAlloc("batches");
+        defer a.free(ns);
+        const live = try reopened.openLiveSession(a, ns, .{ .io = std.testing.io });
+        defer live.deinit();
+        const body = (try live.lookupAlloc("row")).?;
+        defer a.free(body);
+        try std.testing.expectEqualStrings("{\"v\":2}", body);
+        try std.testing.expectEqual(@as(u64, 1), try live.countDocuments());
     }
 }
