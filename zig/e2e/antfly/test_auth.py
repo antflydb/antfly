@@ -1366,9 +1366,15 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
             },
         )
         deadline = time.monotonic() + 60
+        maintenance_requested = False
         while True:
             try:
-                call("POST", space + "/maintenance", {})
+                # Exercise explicit maintenance once, then observe the resident
+                # worker. Repeated mutations create new receipts and replay
+                # targets while the indexes we are waiting for are rebuilding.
+                if not maintenance_requested:
+                    call("POST", space + "/maintenance", {})
+                    maintenance_requested = True
                 page = call(
                     "POST",
                     space + "/memories/claim-0/supersession-candidates",

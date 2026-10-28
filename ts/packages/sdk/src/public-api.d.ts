@@ -22586,7 +22586,7 @@ export interface components {
              * @description Native HTTP mutations return this progress resource relative to the request URI. Follow its bounded pages for individual consumer proofs.
              */
             progress_url?: string;
-            /** @description Native mutation outcomes, stored once per namespace. Consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries. */
+            /** @description Mutation outcomes, stored once per namespace. Read absorbed keys and dispositions here; consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries. */
             namespaces?: components["schemas"]["EntityNamespaceOutcome"][];
             results: {
                 source_table: string;
@@ -22598,15 +22598,6 @@ export interface components {
                 };
                 /** Format: uint64 */
                 revision?: number;
-                /**
-                 * @deprecated
-                 * @description Legacy per-consumer outcomes; native mutations return namespaces instead.
-                 */
-                absorbed?: {
-                    key: string;
-                    /** @enum {string} */
-                    disposition: "release" | "suppress";
-                }[];
                 changed?: boolean;
                 /** Format: uint64 */
                 replay_sequence?: number;

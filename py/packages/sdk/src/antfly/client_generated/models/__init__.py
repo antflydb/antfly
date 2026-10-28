@@ -406,10 +406,6 @@ from .entity_consumer_progress_page_results_item import EntityConsumerProgressPa
 from .entity_curation_result import EntityCurationResult
 from .entity_curation_result_atomicity import EntityCurationResultAtomicity
 from .entity_curation_result_results_item import EntityCurationResultResultsItem
-from .entity_curation_result_results_item_absorbed_item import EntityCurationResultResultsItemAbsorbedItem
-from .entity_curation_result_results_item_absorbed_item_disposition import (
-    EntityCurationResultResultsItemAbsorbedItemDisposition,
-)
 from .entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
 from .entity_distinct_request import EntityDistinctRequest
 from .entity_merge_request import EntityMergeRequest
@@ -2896,8 +2892,6 @@ __all__ = (
     "EntityCurationResult",
     "EntityCurationResultAtomicity",
     "EntityCurationResultResultsItem",
-    "EntityCurationResultResultsItemAbsorbedItem",
-    "EntityCurationResultResultsItemAbsorbedItemDisposition",
     "EntityCurationResultResultsItemCuration",
     "EntityDistinctRequest",
     "EntityMergeRequest",

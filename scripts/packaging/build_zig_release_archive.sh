@@ -315,7 +315,7 @@ run_zig_build_steps_with_retry() {
   if [ "$product" = embedded ]; then
     run_zig_build_steps_with_retry archive libantfly
   else
-    run_zig_build_steps_with_retry archive antfly libantfly grep
+    run_zig_build_steps_with_retry archive antfly libantfly
   fi
 )
 
@@ -360,10 +360,6 @@ cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSE"
 cp "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
 if [ "$product" = server ]; then
   "$repo_root/scripts/completions.sh" "$stage/completions"
-  # The server generator recreates its output directory. Stage grep assets
-  # afterwards so both commands' completions survive in the archive.
-  python3 "$repo_root/scripts/packaging/package_grep_release.py" \
-    --binary "$prefix/bin/antfly-grep" --stage "$stage"
 fi
 
 python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
@@ -374,13 +370,13 @@ tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 if [ "$product" = server ]; then
   grep -Fx "./antfly" "$work_root/archive-contents.txt" >/dev/null
 fi
-if [ "$product" = server ]; then
-  for entry in antfly-grep completions/antfly-grep.bash completions/antfly-grep.zsh completions/antfly-grep.fish completions/antfly-grep.ps1 share/man/man1/antfly-grep.1 share/antfly-grep/build.json share/antfly-grep/schema/tables-v1.json; do
-    grep -Fx "./$entry" "$work_root/archive-contents.txt" >/dev/null
-  done
-fi
+
 if [ "$product" = embedded ] && grep -Eq '^\./(antfly|antfly-lite|antfly-inference|antfly-inference-worker|antfly-inference-dev)$' "$work_root/archive-contents.txt"; then
   echo "Library archive unexpectedly contains a CLI executable" >&2
+  exit 1
+fi
+if grep -Eq '^\./(antfly-grep|completions/antfly-grep[^/]*|share/antfly-grep(/|$)|share/man/man1/antfly-grep\.1)' "$work_root/archive-contents.txt"; then
+  echo "Grep belongs to its independent release, not a runtime archive" >&2
   exit 1
 fi
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null

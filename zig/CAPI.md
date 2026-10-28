@@ -320,6 +320,26 @@ retains its existing resolver-generation meaning. A curation `wait` releases
 writer admission while observing the captured sources and destination; `applied`
 requires their policy projection and resolution/promotion replay to complete.
 
+Entity mutation and proposal-decision responses report cascaded keys and their
+`release` or `suppress` dispositions in `namespaces[].absorbed`, once per
+namespace. Match a consumer summary in `results` to its outcome using
+`key_template`. Consumer summaries contain replay progress; they do not repeat
+absorbed keys. Direct edit retries report empty absorbed lists when there is no
+new cascade; already-decided proposal retries return their receipt and progress.
+
+For example, collect the unique keys affected across matching namespaces:
+
+```python
+response = db.curate_entity(
+    "default", "concept/note", {"action": "suppress", "absorbed": "suppress"}
+)
+absorbed_keys = sorted({
+    item["key"]
+    for namespace in response.get("namespaces", [])
+    for item in namespace["absorbed"]
+})
+```
+
 This follows SQLite's separation of connection lifetime from writer ownership;
 it does not claim SQLite WAL concurrency or change Antfly SQL's existing
 READ COMMITTED transaction semantics. Low-level storage owners used by the

@@ -7008,6 +7008,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.group_sources.",
             "storage.db.resolver_authority.",
             "storage.db.resolver_curation.",
+            "storage.db.resolver_query_context.",
+            "storage.db.resolver_static_profiles.",
             "storage.db.dense_exact.",
             "storage.db.doc_filter_wire.",
             "storage.db.doc_identity.",

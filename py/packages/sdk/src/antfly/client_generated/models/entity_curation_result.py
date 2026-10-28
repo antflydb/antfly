@@ -32,9 +32,9 @@ class EntityCurationResult:
             Admission without wait is conservative.
         progress_url (str | Unset): Native HTTP mutations return this progress resource relative to the request URI.
             Follow its bounded pages for individual consumer proofs.
-        namespaces (list[EntityNamespaceOutcome] | Unset): Native mutation outcomes, stored once per namespace. Consumer
-            progress rows reference these by key_template. The results array is reserved for inspection and embedded
-            consumer summaries.
+        namespaces (list[EntityNamespaceOutcome] | Unset): Mutation outcomes, stored once per namespace. Read absorbed
+            keys and dispositions here; consumer progress rows reference these by key_template. The results array is
+            reserved for inspection and embedded consumer summaries.
     """
 
     entity_table: str

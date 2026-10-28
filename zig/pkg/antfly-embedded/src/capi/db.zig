@@ -7841,6 +7841,105 @@ test "capi resolver curation waits preserve accepted responses when capture fail
     }
 }
 
+test "capi resolver curation reports absorbed outcomes once per namespace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try TestDirectory.init("resolver-absorbed-response");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    const root = try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const handle = try publishHandle(root);
+    defer antfly_db_close(handle);
+    try @import("tables.zig").create(root, "entities", "{}", false);
+    // Two consumers share one namespace; the third has an overlapping one.
+    for (0..3) |i| try root.db.addResolver(.{
+        .name = try std.fmt.allocPrint(a, "r-{d}", .{i}),
+        .table = "entities",
+        .source_artifact = try std.fmt.allocPrint(a, "source-{d}", .{i}),
+        .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}),
+        .key_template = if (i < 2) "concept/{{_entity.text}}" else "concept/{{_key}}",
+        .aliases = if (i == 2) &.{.{ .key = "concept/annotation", .target = "concept/note" }} else &.{},
+        .promote = false,
+    });
+    var out: capi.Buffer = .{};
+    defer antfly_buffer_free(&out);
+    const Check = struct {
+        fn outcomes(alloc: std.mem.Allocator, buffer: capi.Buffer, disposition: []const u8, count: usize, configured: bool) !void {
+            const response = try std.json.parseFromSliceLeaky(std.json.Value, alloc, buffer.ptr.?[0..buffer.len], .{});
+            const namespaces = response.object.get("namespaces").?.array.items;
+            const rows = response.object.get("results").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), namespaces.len);
+            try std.testing.expectEqual(@as(usize, 3), rows.len);
+            var templates: std.StringHashMapUnmanaged(void) = .empty;
+            for (namespaces) |namespace| {
+                const template = namespace.object.get("key_template").?.string;
+                try std.testing.expect(!(try templates.getOrPut(alloc, template)).found_existing);
+                const absorbed = namespace.object.get("absorbed").?.array.items;
+                const extra: usize = if (count > 0 and configured and std.mem.eql(u8, template, "concept/{{_key}}")) 1 else 0;
+                try std.testing.expectEqual(count + extra, absorbed.len);
+                var keys: std.StringHashMapUnmanaged(void) = .empty;
+                for (absorbed) |item| {
+                    try std.testing.expect(!(try keys.getOrPut(alloc, item.object.get("key").?.string)).found_existing);
+                    try std.testing.expectEqualStrings(disposition, item.object.get("disposition").?.string);
+                }
+                if (count > 0) {
+                    try std.testing.expect(keys.contains("concept/notes"));
+                    try std.testing.expect(keys.contains("concept/noting"));
+                    try std.testing.expectEqual(extra == 1, keys.contains("concept/annotation"));
+                }
+            }
+            for (rows) |row| {
+                try std.testing.expect(!row.object.contains("absorbed"));
+                try std.testing.expect(templates.contains(row.object.get("key_template").?.string));
+            }
+        }
+    };
+    for ([_]struct { disposition: []const u8, reviewed: bool = false, configured: bool = false }{
+        .{ .disposition = "suppress", .configured = true },
+        .{ .disposition = "release" },
+        .{ .disposition = "suppress", .reviewed = true },
+    }) |fixture| {
+        const disposition = fixture.disposition;
+        for ([_]struct { from: []const u8, into: []const u8 }{
+            .{ .from = "concept/notes", .into = "concept/note" },
+            .{ .from = "concept/noting", .into = "concept/notes" },
+        }) |merge| {
+            antfly_buffer_free(&out);
+            const request = try std.fmt.allocPrint(a, "{{\"action\":\"merge\",\"into\":\"{s}\"}}", .{merge.into});
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_curate_entity_json(handle, .fromSlice("entities"), .fromSlice(merge.from), .fromSlice(request), &out));
+        }
+        antfly_buffer_free(&out);
+        const request = try std.fmt.allocPrint(a, "{{\"action\":\"suppress\",\"absorbed\":\"{s}\",\"actor\":\"user\",\"reason\":\"generic\",\"wait\":{{\"timeout_ms\":1000}}}}", .{disposition});
+        var proposal_id: ?[]const u8 = null;
+        if (fixture.reviewed) {
+            const proposal = try std.fmt.allocPrint(a, "{{\"action\":\"suppress\",\"key\":\"concept/note\",\"options\":{{\"absorbed\":\"{s}\"}}}}", .{disposition});
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_propose_curation_json(handle, .fromSlice("entities"), .fromSlice(proposal), &out));
+            const created = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+            proposal_id = created.object.get("id").?.string;
+            antfly_buffer_free(&out);
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_decide_curation_proposal_json(handle, .fromSlice("entities"), .fromSlice(proposal_id.?), .fromSlice("{\"accept\":true}"), &out));
+        } else {
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_curate_entity_json(handle, .fromSlice("entities"), .fromSlice("concept/note"), .fromSlice(request), &out));
+        }
+        try Check.outcomes(a, out, disposition, 2, fixture.configured);
+        antfly_buffer_free(&out);
+        // Retrying has no new cascade to report.
+        if (proposal_id) |id| {
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_decide_curation_proposal_json(handle, .fromSlice("entities"), .fromSlice(id), .fromSlice("{\"accept\":true}"), &out));
+            const retried = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{});
+            for (retried.object.get("results").?.array.items) |row| try std.testing.expect(!row.object.contains("absorbed"));
+        } else {
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_curate_entity_json(handle, .fromSlice("entities"), .fromSlice("concept/note"), .fromSlice(request), &out));
+            try Check.outcomes(a, out, disposition, 0, false);
+        }
+        for ([_][]const u8{ "concept/note", "concept/notes", "concept/noting", "concept/annotation" }) |key| {
+            antfly_buffer_free(&out);
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_curate_entity_json(handle, .fromSlice("entities"), .fromSlice(key), .fromSlice("{\"action\":\"unsuppress\"}"), &out));
+        }
+    }
+}
+
 test "capi resolver curation observation batches policy-free descriptors and fences namespace moves" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -9474,7 +9573,10 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
         }
         fn exercise(self: *@This()) !void {
             var handle: ?*anyopaque = null;
-            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(self.path, &handle));
+            // Exercise all 32 connections and 6,400 writes without paying for
+            // a power-loss barrier on every functional progress assertion.
+            const options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .flags = capi.open_flag_no_sync };
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(self.path, &options, &handle));
             defer antfly_db_close(handle);
             for (0..200) |i| {
                 var request_buffer: [256]u8 = undefined;
@@ -10423,7 +10525,10 @@ test "capi native memory grouped episodes advance without a waiting write in roo
     const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
     defer a.free(path);
     var root: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &root));
+    // This checks background progress across namespaces, not power-loss
+    // durability. Keep real file I/O without syncing each idle-table setup.
+    const options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .flags = capi.open_flag_no_sync };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &root));
     defer antfly_db_close(root);
     try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_create_table_json(root, .fromSlice("history"), .fromSlice("{}")));
     var table: ?*anyopaque = null;

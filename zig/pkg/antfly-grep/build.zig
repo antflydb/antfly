@@ -15,8 +15,12 @@
 
 const std = @import("std");
 
+pub fn releaseVersion(b: *std.Build) []const u8 {
+    return b.option([]const u8, "grep-version", "Standalone grep release version") orelse "0.1.0-dev";
+}
+
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
-    return addConfigured(b, target, optimize, b.option([]const u8, "antfly-version", "Release version") orelse "0.1.0-dev", b.option(bool, "strip", "Strip grep debug information for release archives") orelse false);
+    return addConfigured(b, target, optimize, releaseVersion(b), b.option(bool, "strip", "Strip grep debug information for release archives") orelse false);
 }
 
 pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, release_version: []const u8, strip: bool) void {
