@@ -21863,7 +21863,7 @@ fn appendHighlightFragments(
     fragment_size: u32,
     control: highlight_mod.Control,
     program: *const highlight_mod.Program,
-    cache: *highlight_mod.AnalysisCache,
+    cache: ?*highlight_mod.AnalysisCache,
 ) !void {
     const found = try highlight_mod.highlightPrepared(alloc, scratch, text, matchers, program, cache, analyzer, max_fragments, fragment_size, control);
     defer highlight_mod.freeFragments(alloc, found);
@@ -22332,6 +22332,17 @@ pub const PreparedHighlights = struct {
             if (source_field) |source| {
                 if (!std.mem.eql(u8, field, source) and !(field.len > source.len and std.mem.startsWith(u8, field, source) and field[source.len] == '.')) continue;
             }
+            var bindings: usize = 0;
+            var dynamic = false;
+            for (plans) |document| {
+                if (document) |plan| {
+                    if (plan.field(field)) |mapped| bindings += mapped.bindings.items.len;
+                } else dynamic = true;
+            }
+            // A single static binding cannot reuse tokenization. Keep its
+            // tokens in the kernel's short-lived arena rather than creating a
+            // cache and retaining every field's tokens through the whole row.
+            const source_cache: ?*highlight_mod.AnalysisCache = if (dynamic or bindings > 1) &analyzed else null;
             var source_values = std.ArrayListUnmanaged(HighlightSourceValue).empty;
             try collectHighlightSourceValues(hit_arena, &source_values, parsed, field, null, 0, false);
             if (source_values.items.len == 0) continue;
@@ -22358,7 +22369,7 @@ pub const PreparedHighlights = struct {
                         if (source_value.literal_dotted and !highlightUsesSchemaLessText(indexed)) continue;
                         for (field_plan.bindings.items) |binding| {
                             try self.control.check();
-                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, self.groups[binding.group].matchers(binding.analyzer), queryTextAnalyzer(binding.analyzer), max_fragments, fragment_size, self.control, self.groups[binding.group].program(binding.analyzer), &analyzed);
+                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, self.groups[binding.group].matchers(binding.analyzer), queryTextAnalyzer(binding.analyzer), max_fragments, fragment_size, self.control, self.groups[binding.group].program(binding.analyzer), source_cache);
                         }
                     }
                 } else for (self.groups) |group| {
@@ -22374,7 +22385,7 @@ pub const PreparedHighlights = struct {
                             if (seen) continue;
                             try processed_analyzers.append(hit_arena, contribution.analyzer);
                             try self.control.check();
-                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, group.matchers(contribution.analyzer), queryTextAnalyzer(contribution.analyzer), max_fragments, fragment_size, self.control, group.program(contribution.analyzer), &analyzed);
+                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, group.matchers(contribution.analyzer), queryTextAnalyzer(contribution.analyzer), max_fragments, fragment_size, self.control, group.program(contribution.analyzer), source_cache);
                         }
                     }
                 }

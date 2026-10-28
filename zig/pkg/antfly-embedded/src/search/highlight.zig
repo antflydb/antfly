@@ -506,11 +506,14 @@ fn collectMatchSpans(
     return collectProgramSpans(alloc, tokens, matchers, null, spans, poller);
 }
 fn collectProgramSpans(alloc: Allocator, tokens: []const analysis_mod.Token, matchers: []const Matcher, program: ?*const Program, spans: *std.ArrayListUnmanaged(Span), poller: *Poller) !void {
+    // Tiny clause lists are faster as direct byte comparisons. Compiled
+    // lookups bound larger OR/prefix sets without taxing common one-term queries.
+    const active_program: ?*const Program = if (program) |value| (if (value.terms.count() + value.prefixes.count() + value.patterns.items.len > 8) value else null) else null;
     for (tokens) |tok| {
         // Analyzers may emit several tokens for one surface span (shingles,
         // n-grams); the surface span is what gets highlighted.
-        if (program) |compiled| if (try compiled.matches(tok.term, poller)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
-        for (if (program) |compiled| compiled.patterns.items else matchers) |matcher| {
+        if (active_program) |compiled| if (try compiled.matches(tok.term, poller)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
+        for (if (active_program) |compiled| compiled.patterns.items else matchers) |matcher| {
             try poller.step();
             switch (matcher) {
                 .term => |term| if (std.mem.eql(u8, tok.term, term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
@@ -1339,7 +1342,7 @@ test "highlight prepared programs share analysis and preserve per-query fragment
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const text = "needle cats running needles cat runner needle";
-    const first = [_]Matcher{ .{ .term = "needle" }, .{ .prefix = "run" }, .{ .prefix = "r" }, .{ .prefix = "runnz" } };
+    const first = [_]Matcher{ .{ .term = "needle" }, .{ .prefix = "run" }, .{ .prefix = "r" }, .{ .prefix = "runnz" }, .{ .term = "absent1" }, .{ .term = "absent2" }, .{ .term = "absent3" }, .{ .term = "absent4" }, .{ .term = "absent5" } };
     const second = [_]Matcher{ .{ .term = "cat" }, .{ .wildcard = "r*n" } };
     var cache: AnalysisCache = .{ .a = arena.allocator() };
     for ([_][]const Matcher{ &first, &second }) |matchers| {
