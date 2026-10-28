@@ -163,6 +163,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.UnknownSqlArrayType => .{ .code = "42P18", .message = "The array element type cannot be inferred.", .hint = "Provide an explicit array element type." },
         error.SqlCannotCoerce => .{ .code = "42846", .message = "The source type cannot be cast to the requested type.", .hint = "Use compatible builtin types or an explicit intermediate conversion." },
         error.SqlUndefinedOperator => .{ .code = "42883", .message = "No operator matches the operand types.", .hint = "Use explicit casts to compatible operand types." },
+        error.SqlCommonTypeMismatch => .{ .code = "42804", .message = "The expression types cannot be matched.", .hint = "Use explicit casts to compatible types." },
         error.SqlSetTypeMismatch => .{ .code = "42804", .message = "Set operation columns have incompatible types.", .hint = "Use explicit casts to compatible types in corresponding output columns.", .retryable = false },
         error.SqlSetColumnCountMismatch => .{ .code = "42601", .message = "Each branch of a set operation must have the same number of output columns.", .hint = "Select matching column counts in every UNION, INTERSECT or EXCEPT branch.", .retryable = false },
         error.SqlUndefinedProcedure => .{ .code = "42883", .message = "The procedure or its input-type overload does not exist.", .hint = "Check the procedure name, argument types and active search path." },

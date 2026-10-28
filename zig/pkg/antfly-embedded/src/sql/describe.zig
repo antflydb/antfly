@@ -1221,6 +1221,17 @@ pub fn assignDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, s
 /// Physical assignment keeps the older coarse wrapper and cannot acquire an
 /// interval domain merely because its JSON representation is a string.
 pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, descriptor: @import("scalar.zig").Type) !@import("scalar.zig").Datum {
+    if (descriptor.enum_view) |view| {
+        if (descriptor.kind != .enumeration or descriptor.element_type != null or descriptor.temporal_kind != null) return error.SqlTypeMismatch;
+        try raw.validateTemporal();
+        if (raw.sql_null) return raw;
+        if (raw.enumeration()) |atom| {
+            _ = try view.output(atom);
+            return raw;
+        }
+        if (raw.value != .string or raw.extension != null or raw.array != null or raw.numeric != null) return error.SqlTypeMismatch;
+        return .typedEnum(try view.input(raw.value.string));
+    }
     if (descriptor.temporal_kind orelse (if (descriptor.kind == .datetime) @as(?@import("temporal_value.zig").Kind, .timestamp_tz) else null)) |kind| {
         if (descriptor.kind != .datetime or descriptor.element_type != null) return error.SqlTypeMismatch;
         try raw.validateTemporal();
@@ -1254,7 +1265,7 @@ pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, k
         owned.* = try ranges.parseLeaky(&context, range_kind, raw.value.string);
         return .typedRange(owned);
     }
-    if (raw.range() != null) return error.SqlTypeMismatch;
+    if (raw.range() != null or raw.enumeration() != null) return error.SqlTypeMismatch;
     if (raw.temporal() != null) {
         try raw.validateTemporal();
         if (kind == .datetime and element_type == null and raw.temporal().?.kind() == .timestamp_tz) return raw;
@@ -1326,7 +1337,7 @@ pub fn coerce(raw: Json, kind: ast.ColumnType) !Json {
     if (raw == .null) return .null;
     return switch (kind) {
         .numrange, .daterange, .tsrange, .tstzrange => error.SqlTypeMismatch,
-        .array => error.SqlTypeMismatch,
+        .array, .enumeration => error.SqlTypeMismatch,
         .integer => switch (raw) {
             .integer => raw,
             .number_string, .string => |text| .{ .integer = std.fmt.parseInt(i64, text, 10) catch return error.SqlTypeMismatch },

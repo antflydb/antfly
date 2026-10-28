@@ -83,7 +83,7 @@ pub fn hashRelationalParsedValueWithOrdinals(
         const column = table_schema.relational_columns[ordinal];
         if (isIgnoredSystemField(column.name) or value.object.get(column.name) == null) continue;
         hashBytes(&hasher, column.name);
-        try hashRelationalColumnValue(alloc, &hasher, value.object.get(column.name).?, column);
+        try hashRelationalColumnValue(alloc, &hasher, value.object.get(column.name).?, column, table_schema);
     }
     var digest: Digest = undefined;
     hasher.final(&digest);
@@ -143,10 +143,10 @@ pub fn hashRelationalPreparedValuesCanonicalWithOrdinals(
                 const canonical = canonical_values[ordinal] orelse return error.InvalidBatchRequest;
                 if (table_schema.requires_jsonb_display) try hashCanonicalJsonStorageBytes(alloc, &hasher, canonical) else hashCanonicalJsonBytes(&hasher, canonical);
             } else {
-                try hashRelationalColumnValue(alloc, &hasher, value, column);
+                try hashRelationalColumnValue(alloc, &hasher, value, column, table_schema);
             }
         } else {
-            try hashRelationalColumnValue(alloc, &hasher, value, column);
+            try hashRelationalColumnValue(alloc, &hasher, value, column, table_schema);
         }
     }
     var digest: Digest = undefined;
@@ -940,6 +940,7 @@ fn hashRelationalColumnValue(
     hasher: *std.crypto.hash.Blake3,
     value: std.json.Value,
     column: runtime_schema.RelationalColumn,
+    table_schema: runtime_schema.TableSchema,
 ) !void {
     if (value == .null) {
         hasher.update("n");
@@ -952,6 +953,19 @@ fn hashRelationalColumnValue(
         return;
     }
     switch (column.column_type) {
+        .enumeration => {
+            if (value != .string) return error.InvalidBatchRequest;
+            const record = runtime_schema.namedType(table_schema, column.named_type_id orelse return error.InvalidSchema) orelse return error.InvalidSchema;
+            // The compatibility JSON hash boundary has no prepared row. Native
+            // apply hashes prepared symbols directly; avoid allocating a type
+            // directory merely to validate this bounded fallback label.
+            const symbol = for (record.definition.labels) |label| {
+                if (std.mem.eql(u8, label.text, value.string)) break label.id;
+            } else return error.SqlInvalidTextRepresentation;
+            hasher.update("antfly:sql-enum-symbol:v1\x00");
+            hasher.update(&record.identity.origin_id);
+            hashInt(hasher, u32, symbol);
+        },
         .sql_array => {
             const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
             var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(alloc, kind, value, column.numeric_modifier, .{});

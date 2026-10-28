@@ -96,6 +96,11 @@ test "SQL named enum native rows preserve symbols logical hashes and index ranks
     defer a.free(absent);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, encode(a, table, "{\"state\":\"Z\"}"));
     try std.testing.expectError(error.SqlInvalidTextRepresentation, encode(a, table, "{\"state\":1}"));
+    for ([_][]const u8{ "{\"state\":\"z\"}", "{\"state\":\"a\"}", "{\"state\":\"\"}", "{\"state\":null}", "{}" }, [_][]const u8{ z, a_row, empty, null_row, absent }) |json, row| {
+        const logical = try @import("document_content_hash.zig").hashRelationalJson(a, json, table);
+        try std.testing.expectEqualDeep(try codec.rowSemanticHash(row), logical);
+    }
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, @import("document_content_hash.zig").hashRelationalJson(a, "{\"state\":\"Z\"}", table));
     const z_view = try codec.ordinalRowView(z, table, &layout);
     const a_view = try codec.ordinalRowView(a_row, table, &layout);
     const z_key = try plan.encodeAlloc(a, z_view);

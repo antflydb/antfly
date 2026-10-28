@@ -298,36 +298,53 @@ const JsonPayload = struct {
         return Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, a, self.text.?, .{ .parse_numbers = false }));
     }
 };
-/// Typed extensions share one sparse vector. Both pointed-to values have at
-/// least two-byte alignment, so the low bit retains their kind without growing
-/// every retained column or doubling the existing temporal entry width. These
+/// Typed extensions share one sparse vector. The pointed-to values have at
+/// least four-byte alignment, so two low bits retain their kind without growing
+/// every retained column or the existing temporal entry width. These
 /// addresses are owned by Store.arena and never enter a persisted encoding.
 const Extension = struct {
     bits: usize = 0,
     fn from(value: Datum) Extension {
+        if (value.enumeration()) |atom| {
+            comptime std.debug.assert(@alignOf(@import("../common/sql_enum_value.zig").Value) >= 4);
+            const address = @intFromPtr(atom);
+            std.debug.assert(address & 3 == 0);
+            return .{ .bits = address | 2 };
+        }
         if (value.range()) |range| {
-            comptime std.debug.assert(@alignOf(@import("range_value.zig").Value) >= 2);
+            comptime std.debug.assert(@alignOf(@import("range_value.zig").Value) >= 4);
             const address = @intFromPtr(range);
-            std.debug.assert(address & 1 == 0);
+            std.debug.assert(address & 3 == 0);
             return .{ .bits = address | 1 };
         }
         if (value.temporal()) |temporal| {
-            comptime std.debug.assert(@alignOf(@import("temporal_value.zig").Value) >= 2);
+            comptime std.debug.assert(@alignOf(@import("temporal_value.zig").Value) >= 4);
             const address = @intFromPtr(temporal);
-            std.debug.assert(address & 1 == 0);
+            std.debug.assert(address & 3 == 0);
             return .{ .bits = address };
         }
         return .{};
     }
     fn datum(self: Extension) Datum {
         std.debug.assert(self.bits != 0);
-        return if (self.bits & 1 != 0)
-            Datum.typedRange(@ptrFromInt(self.bits & ~@as(usize, 1)))
-        else
-            Datum.typedTemporal(@ptrFromInt(self.bits));
+        return switch (self.bits & 3) {
+            0 => Datum.typedTemporal(@ptrFromInt(self.bits)),
+            1 => Datum.typedRange(@ptrFromInt(self.bits & ~@as(usize, 3))),
+            2 => Datum.typedEnum(@ptrFromInt(self.bits & ~@as(usize, 3))),
+            else => unreachable,
+        };
     }
 };
 
+const EnumKey = struct {
+    type_id: u64,
+    origin_id: [16]u8,
+    symbol: u32,
+    fn from(atom: *const @import("../common/sql_enum_value.zig").Value) EnumKey {
+        return .{ .type_id = atom.type_id, .origin_id = atom.origin_id, .symbol = atom.symbol };
+    }
+};
+const EnumCache = std.AutoHashMapUnmanaged(EnumKey, *const @import("../common/sql_enum_value.zig").Value);
 const Column = struct {
     const Values = union(enum) {
         unknown,
@@ -347,6 +364,27 @@ const Column = struct {
     arrays: std.ArrayList(?*const @import("array_value.zig").Value) = .empty,
     numerics: std.ArrayList(?*const @import("numeric_value.zig").Value) = .empty,
     extensions: std.ArrayList(Extension) = .empty,
+    /// Sparse directory: all retained occurrences of a symbol share its
+    /// immutable owned payload. Primitive columns allocate no directory.
+    enum_cache: ?*EnumCache = null,
+    fn retainExtension(self: *Column, a: A, owned: A, value: Datum) !Extension {
+        if (value.enumeration()) |atom| {
+            if (self.enum_cache == null) {
+                const cache = try owned.create(EnumCache);
+                cache.* = .empty;
+                self.enum_cache = cache;
+            }
+            const key = EnumKey.from(atom);
+            if (self.enum_cache.?.get(key)) |prior| {
+                _ = try prior.compare(atom.*);
+                return Extension.from(Datum.typedEnum(prior));
+            }
+            const copy = try atom.clone(owned);
+            try self.enum_cache.?.put(a, key, copy);
+            return Extension.from(Datum.typedEnum(copy));
+        }
+        return Extension.from(try @import("operators.zig").cloneDatum(owned, value));
+    }
     fn deinit(self: *Column, a: A) void {
         if (self.fixed) |*fixed| fixed.deinit(a);
         if (self.json_bytes) |bytes| {
@@ -363,6 +401,7 @@ const Column = struct {
         self.arrays.deinit(a);
         self.numerics.deinit(a);
         self.extensions.deinit(a);
+        if (self.enum_cache) |cache| cache.deinit(a);
     }
     fn isNull(self: Column, row: usize) bool {
         return self.nulls.items[row / 64] & (@as(u64, 1) << @as(u6, @intCast(row % 64))) != 0;
@@ -374,7 +413,7 @@ const Column = struct {
             return (if (json.shared) |shared| &shared.cache else self.json_cache.?).materialize(json, a);
         };
         const value: std.json.Value = switch (self.values) {
-            .unknown => return error.InvalidSqlBackendResponse,
+            .unknown => if (self.extensions.items.len != 0 and self.extensions.items[row].bits != 0) .null else return error.InvalidSqlBackendResponse,
             .integers => |v| .{ .integer = v.get(row) },
             .numbers => |v| .{ .float = v.get(row) },
             .booleans => |v| .{ .bool = v.items[row] },
@@ -405,7 +444,7 @@ const Column = struct {
         var referenced: usize = 0;
         for (source.values, remap) |value, id| {
             if (id == std.math.maxInt(u32)) continue;
-            if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null) return false;
+            if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null) return false;
             if (value.sql_null) continue;
             const actual = std.meta.activeTag(value.value);
             if (actual != .integer and actual != .float and actual != .string and actual != .number_string) return false;
@@ -530,17 +569,17 @@ const Column = struct {
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
         try value.validateTemporal();
-        if (self.extensions.items.len != 0 or value.range() != null or value.temporal() != null) {
+        if (self.extensions.items.len != 0 or value.range() != null or value.enumeration() != null or value.temporal() != null) {
             if (self.extensions.items.len == 0) {
                 try self.extensions.resize(a, row);
                 @memset(self.extensions.items, .{});
             }
             const extension = Extension.from(value);
-            try self.extensions.append(a, if (extension.bits != 0) Extension.from(try @import("operators.zig").cloneDatum(owned, value)) else .{});
+            try self.extensions.append(a, if (extension.bits != 0) try self.retainExtension(a, owned, value) else .{});
         }
         if (self.json_bytes) |bytes| try bytes.append(a, null);
         const coefficient = fixedCoefficient(value);
-        if (self.fixed == null and self.json_bytes == null and self.values == .unknown and self.numerics.items.len == 0 and self.arrays.items.len == 0 and self.patterns.items.len == 0 and coefficient != null) {
+        if (self.fixed == null and self.json_bytes == null and self.values == .unknown and self.extensions.items.len == 0 and self.numerics.items.len == 0 and self.arrays.items.len == 0 and self.patterns.items.len == 0 and coefficient != null) {
             const cells = try owned.create(Fixed.Cells);
             cells.* = .empty;
             self.fixed = .{ .cells = cells };
@@ -596,8 +635,8 @@ const Column = struct {
             }
             try self.patterns.append(a, value.patterns());
         }
-        if (self.values == .unknown and !value.sql_null) {
-            self.values = switch (value.value) {
+        if (self.values == .unknown and !value.sql_null and value.enumeration() == null) {
+            self.values = if (self.enum_cache != null) .{ .encoded = .empty } else switch (value.value) {
                 .integer => .{ .integers = .empty },
                 .float => .{ .numbers = .empty },
                 .bool => .{ .booleans = .empty },
@@ -867,7 +906,7 @@ pub const Store = struct {
     pub fn physicalColumn(self: *const Store, _: A, column: usize, begin: usize, count: usize) !?@import("execution_batch.zig").PhysicalColumn {
         if (self.failed or column >= self.columns.len or begin > self.len or count > self.len - begin) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];
-        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0) return null;
+        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0 or stored.extensions.items.len != 0) return null;
         const types = @import("../storage/rowsource/types.zig");
         const values: types.ColumnValues = switch (stored.values) {
             .integers => |v| if (v.encoded) .{ .dictionary_i64 = .{ .values = v.values.items, .indices = v.indices.items[begin..][0..count] } } else .{ .i64 = v.flat.items[begin..][0..count] },
@@ -940,6 +979,10 @@ pub const Store = struct {
         var repeated = false;
         if (!value.sql_null and index < self.columns.len) {
             const column = self.columns[index];
+            if (value.enumeration()) |atom| if (column.enum_cache) |cache| if (cache.get(EnumKey.from(atom))) |prior| {
+                _ = try prior.compare(atom.*);
+                return @sizeOf(Extension) + 1;
+            };
             if (column.fixed != null and fixedCoefficient(value) != null) return 19;
             if (column.fixed != null and fixedCoefficient(value) == null) bytes +|= self.len *| 256;
             if (column.values == .strings and value.value == .string) repeated = column.values.strings.flat == null and column.values.strings.lookup.contains(value.value.string);
@@ -1209,7 +1252,7 @@ pub const Store = struct {
                 if ((try scalar.compareDatums(Datum.typedNumeric(&number), value)) != .eq) return false;
                 continue;
             }
-            if (value.range() != null or value.array != null or value.numeric != null or value.temporal() != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null) or (stored.extensions.items.len != 0 and stored.extensions.items[row_index].bits != 0)) {
+            if (value.range() != null or value.enumeration() != null or value.array != null or value.numeric != null or value.temporal() != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null) or (stored.extensions.items.len != 0 and stored.extensions.items[row_index].bits != 0)) {
                 if ((try scalar.compareDatums(try stored.cell(a, row_index), value)) != .eq) return false;
                 continue;
             }

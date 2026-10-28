@@ -734,8 +734,10 @@ fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, l
     }
     try work.consume(inputs.len);
     const types = try a.dupe(scalar.Type, descriptors);
+    var views: std.AutoHashMapUnmanaged(*const @import("../common/sql_enum_value.zig").View, *const @import("../common/sql_enum_value.zig").View) = .empty;
     for (types) |*descriptor| {
         descriptor.* = try scalar.normalizeParameterType(descriptor.*);
+        descriptor.enum_view = try scalar.ownEnumView(a, &views, descriptor.enum_view);
         if (descriptor.kind == null) return error.UnknownSqlParameterType;
     }
     const values = try a.alloc(scalar.Datum, inputs.len);
@@ -796,7 +798,19 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         owned.* = if (input == .binary) try ranges.decodeInputLeaky(&context, range_kind, raw) else try ranges.parseLeaky(&context, range_kind, raw);
         return scalar.Datum.typedRange(owned);
     };
-    if (input == .datum and input.datum.range() != null) return error.SqlTypeMismatch;
+    if (descriptor.enum_view != null) {
+        const raw: scalar.Datum = switch (input) {
+            .datum => input.datum,
+            .text => .json(.{ .string = input.text }),
+            .binary => .json(.{ .string = input.binary }),
+            .sql_null => .{},
+            else => return error.SqlTypeMismatch,
+        };
+        try work.consume(1);
+        const value = try @import("describe.zig").coerceDatumTyped(a, raw, descriptor);
+        return @import("operators.zig").cloneDatum(a, value);
+    }
+    if (input == .datum and (input.datum.range() != null or input.datum.enumeration() != null)) return error.SqlTypeMismatch;
     if (descriptor.temporal_kind orelse (if (descriptor.kind == .datetime) @as(?@import("temporal_value.zig").Kind, .timestamp_tz) else null)) |temporal_kind| {
         if (input == .array_envelope) return error.SqlTypeMismatch;
         const temporal = @import("temporal_value.zig");

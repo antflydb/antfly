@@ -4838,6 +4838,7 @@ fn valuesEqual(a: Value, b: Value) !bool {
         .string => |bytes| std.mem.eql(u8, bytes, b.string),
         .blob => |bytes| std.mem.eql(u8, bytes, b.blob),
         .numeric, .sql_array, .json, .range => try valueOrder(a, b, false) == .eq,
+        .enumeration => |atom| try atom.compare(b.enumeration.*) == .eq,
         .integer => |value| value == b.integer,
         .number => |value| value == b.number,
         .boolean => |value| value == b.boolean,

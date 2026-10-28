@@ -33,7 +33,7 @@ pub const PatternSet = struct {
 pub const Datum = struct {
     /// Immutable temporal payload owned by the pinned invocation/row region.
     /// The JSON null placeholder is never a temporal value or SQL NULL.
-    extension_kind: enum(u8) { none, patterns, temporal, range } = .none,
+    extension_kind: enum(u8) { none, patterns, temporal, range, enumeration } = .none,
     // One tagged, pointer-sized extension; the discriminator fits existing
     // tail padding. Constructors/accessors are the only interpretation boundary.
     extension: ?*const anyopaque = null,
@@ -64,6 +64,12 @@ pub const Datum = struct {
     pub fn temporal(self: Datum) ?*const @import("temporal_value.zig").Value {
         return if (self.extension_kind == .temporal and self.extension != null) @ptrCast(@alignCast(self.extension.?)) else null;
     }
+    pub fn typedEnum(value: *const @import("../common/sql_enum_value.zig").Value) Datum {
+        return .{ .extension_kind = .enumeration, .extension = value, .sql_null = false };
+    }
+    pub fn enumeration(self: Datum) ?*const @import("../common/sql_enum_value.zig").Value {
+        return if (self.extension_kind == .enumeration and self.extension != null) @ptrCast(@alignCast(self.extension.?)) else null;
+    }
     pub fn typedRange(value: *const @import("range_value.zig").Value) Datum {
         return .{ .extension_kind = .range, .extension = value, .sql_null = false };
     }
@@ -83,6 +89,10 @@ pub const Datum = struct {
     }
     pub fn validateTemporal(self: Datum) !void {
         if ((self.extension_kind == .none) != (self.extension == null)) return error.SqlTypeMismatch;
+        if (self.enumeration()) |value| {
+            if (self.sql_null or self.numeric != null or self.array != null or self.value != .null) return error.SqlTypeMismatch;
+            try value.validate();
+        }
         if (self.range()) |value| {
             if (self.sql_null or self.numeric != null or self.array != null or self.value != .null) return error.SqlTypeMismatch;
             if (value.empty and (value.lower != null or value.upper != null or value.lower_inc or value.upper_inc)) return error.SqlTypeMismatch;
@@ -302,10 +312,53 @@ fn temporalArithmetic(op: ast.Scalar.Binary, left: Type, right: Type) !?Type {
     return .{ .kind = .datetime, .temporal_kind = stamp, .nullable = left.nullable or right.nullable };
 }
 
-pub const Type = struct { kind: ?ast.ColumnType = null, temporal_kind: ?@import("temporal_value.zig").Kind = null, nullable: bool = true, element_type: ?arrays.ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
+pub const EnumReference = struct { id: u64, origin_id: [16]u8, generation: u32 };
+pub const Type = struct {
+    kind: ?ast.ColumnType = null,
+    temporal_kind: ?@import("temporal_value.zig").Kind = null,
+    nullable: bool = true,
+    element_type: ?arrays.ElementType = null,
+    numeric_modifier: ?NumericModifier = null,
+    /// Inference borrows the pinned schema. Bound programs and invocation
+    /// frames capture their own deduplicated immutable directories.
+    enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    const Wire = struct {
+        kind: ?ast.ColumnType = null,
+        temporal_kind: ?@import("temporal_value.zig").Kind = null,
+        nullable: bool = true,
+        element_type: ?arrays.ElementType = null,
+        numeric_modifier: ?NumericModifier = null,
+        named_type: ?EnumReference = null,
+        pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+            return std.mem.eql(u8, field, "named_type") and self.named_type == null;
+        }
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            if (self.named_type != null) return writer.write(.{ .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = self.named_type });
+            return writer.write(.{ .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier });
+        }
+    };
+    pub fn nativeJsonProjection(self: Type) Wire {
+        return .{ .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = if (self.enum_view) |view| .{ .id = view.record.identity.id, .origin_id = view.record.identity.origin_id, .generation = view.record.identity.generation } else null };
+    }
+    pub fn jsonStringify(self: Type, writer: anytype) !void {
+        return writer.write(self.nativeJsonProjection());
+    }
+    pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Type {
+        const wire = try std.json.innerParse(Wire, a, source, options);
+        if (wire.named_type != null or wire.kind == .enumeration) return error.UnexpectedToken;
+        return .{ .kind = wire.kind, .temporal_kind = wire.temporal_kind, .nullable = wire.nullable, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
+    }
+    pub fn jsonParseFromValue(a: Allocator, value: Json, options: std.json.ParseOptions) std.json.ParseFromValueError!Type {
+        const wire = try std.json.innerParseFromValue(Wire, a, value, options);
+        if (wire.named_type != null or wire.kind == .enumeration) return error.UnexpectedToken;
+        return .{ .kind = wire.kind, .temporal_kind = wire.temporal_kind, .nullable = wire.nullable, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
+    }
+};
+
 pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
+    enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
     temporal_kind: ?@import("temporal_value.zig").Kind = null,
     /// This spelling belongs to multiple visible relations. Keep it in the
     /// binding environment so unused ambiguity is harmless; reject only an
@@ -321,7 +374,7 @@ pub const Column = struct {
 /// Canonical SQL identity for both bound expressions and native materialized
 /// inputs. Legacy integer/number declarations use the same default widths.
 pub fn columnType(column: anytype) Type {
-    return .{ .kind = column.type, .temporal_kind = if (@hasField(@TypeOf(column), "temporal_kind")) column.temporal_kind else null, .nullable = if (@hasField(@TypeOf(column), "nullable")) column.nullable else true, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
+    return .{ .kind = column.type, .enum_view = if (@hasField(@TypeOf(column), "enum_view")) column.enum_view else null, .temporal_kind = if (@hasField(@TypeOf(column), "temporal_kind")) column.temporal_kind else null, .nullable = if (@hasField(@TypeOf(column), "nullable")) column.nullable else true, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
 }
 /// Resolve explicit and default scalar widths for expression and recipe identities.
 pub fn columnElementType(kind: ast.ColumnType, element: ?arrays.ElementType) ?arrays.ElementType {
@@ -336,7 +389,7 @@ pub fn assignmentSourceIdentity(kind: ast.ColumnType, element: ?arrays.ElementTy
         .string => .text,
         .uuid => .uuid,
         .json => .jsonb,
-        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange => null,
+        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange, .enumeration => null,
     };
 }
 pub const BindLimits = struct {
@@ -913,6 +966,46 @@ pub const FunctionCall = struct {
     }
 };
 
+pub const Cast = struct {
+    operand: u32,
+    type: ast.ColumnType,
+    temporal_kind: ?@import("temporal_value.zig").Kind = null,
+    element_type: ?arrays.ElementType = null,
+    numeric_modifier: ?NumericModifier = null,
+    enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    const Wire = struct {
+        operand: u32,
+        type: ast.ColumnType,
+        temporal_kind: ?@import("temporal_value.zig").Kind = null,
+        element_type: ?arrays.ElementType = null,
+        numeric_modifier: ?NumericModifier = null,
+        named_type: ?EnumReference = null,
+        pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+            return std.mem.eql(u8, field, "named_type") and self.named_type == null;
+        }
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            if (self.named_type != null) return writer.write(.{ .operand = self.operand, .type = self.type, .temporal_kind = self.temporal_kind, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = self.named_type });
+            return writer.write(.{ .operand = self.operand, .type = self.type, .temporal_kind = self.temporal_kind, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier });
+        }
+    };
+    pub fn nativeJsonProjection(self: Cast) Wire {
+        return .{ .operand = self.operand, .type = self.type, .temporal_kind = self.temporal_kind, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = (Type{ .kind = self.type, .enum_view = self.enum_view }).nativeJsonProjection().named_type };
+    }
+    pub fn jsonStringify(self: Cast, writer: anytype) !void {
+        return writer.write(self.nativeJsonProjection());
+    }
+    pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Cast {
+        const wire = try std.json.innerParse(Wire, a, source, options);
+        if (wire.named_type != null or wire.type == .enumeration) return error.UnexpectedToken;
+        return .{ .operand = wire.operand, .type = wire.type, .temporal_kind = wire.temporal_kind, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
+    }
+    pub fn jsonParseFromValue(a: Allocator, value: Json, options: std.json.ParseOptions) std.json.ParseFromValueError!Cast {
+        const wire = try std.json.innerParseFromValue(Wire, a, value, options);
+        if (wire.named_type != null or wire.type == .enumeration) return error.UnexpectedToken;
+        return .{ .operand = wire.operand, .type = wire.type, .temporal_kind = wire.temporal_kind, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
+    }
+};
+
 pub const Instruction = struct {
     type: Type,
     input_function: bool = false,
@@ -923,7 +1016,7 @@ pub const Instruction = struct {
         unary: struct { op: ast.Scalar.Unary, operand: u32 },
         binary: struct { op: ast.Scalar.Binary, left: u32, right: u32 },
         call: FunctionCall,
-        cast: struct { operand: u32, type: ast.ColumnType, temporal_kind: ?@import("temporal_value.zig").Kind = null, element_type: ?arrays.ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null },
+        cast: Cast,
         case_when: struct { branches: []const Branch, otherwise: ?u32 },
         in_list: struct { operand: u32, values: []const u32, negated: bool },
     },
@@ -1212,6 +1305,11 @@ pub const Program = struct {
             if (ordinal >= self.parameter_descriptors.len) return error.InvalidSqlParameters;
             const actual = frame.descriptors[ordinal];
             const expected = self.parameter_descriptors[ordinal];
+            if ((actual.enum_view == null) != (expected.enum_view == null)) return error.ConflictingSqlParameterTypes;
+            if (actual.enum_view) |view| {
+                const wanted = expected.enum_view.?;
+                if (!view.record.sameValueDomain(wanted.record) or view.record.definition.labels.len != wanted.record.definition.labels.len) return error.ConflictingSqlParameterTypes;
+            }
             if (actual.kind != expected.kind or actual.element_type != expected.element_type or actual.nullable != expected.nullable or
                 (actual.kind == .datetime and (actual.temporal_kind orelse .timestamp_tz) != (expected.temporal_kind orelse .timestamp_tz))) return error.ConflictingSqlParameterTypes;
         }
@@ -1294,6 +1392,7 @@ pub fn inferOutputWithInvocation(alloc: Allocator, expression: *const ast.Scalar
     if (invocation) |owner| {
         try owner.mergeCoarse(parameters);
         @memcpy(binder.parameters[0..owner.descriptors.len], owner.descriptors);
+        for (owner.descriptors) |descriptor| binder.enum_inputs = binder.enum_inputs or descriptor.enum_view != null;
     }
     try binder.registerColumns();
     return binder.infer(expression, 0);
@@ -1339,8 +1438,11 @@ pub fn inferTypedParametersExpected(alloc: Allocator, expression: *const ast.Sca
     var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .allow_unresolved = true, .typed_parameters = true, .assignment_target = expected };
     try binder.registerColumns();
     for (parameters) |descriptor| try validateParameterType(descriptor);
-    for (parameters, binder.parameters[0..parameters.len]) |descriptor, *output| output.* = try normalizeParameterType(descriptor);
-    _ = try binder.compileTypedContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, if (expected) |kind| kind.temporal_kind else null, 0);
+    for (parameters, binder.parameters[0..parameters.len]) |descriptor, *output| {
+        output.* = try normalizeParameterType(descriptor);
+        binder.enum_inputs = binder.enum_inputs or descriptor.enum_view != null;
+    }
+    _ = if (expected != null and expected.?.enum_view != null) try binder.compileOperatorOperand(expression, expected.?, 0) else try binder.compileTypedContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, if (expected) |kind| kind.temporal_kind else null, 0);
     if (binder.parameter_count > parameters.len) return error.InvalidSqlParameters;
     var changed = false;
     for (parameters, binder.parameters[0..parameters.len]) |*output, inferred| {
@@ -1351,6 +1453,8 @@ pub fn inferTypedParametersExpected(alloc: Allocator, expression: *const ast.Sca
 }
 
 pub fn validateParameterType(descriptor: Type) !void {
+    if ((descriptor.kind == .enumeration) != (descriptor.enum_view != null)) return error.InvalidSqlParameters;
+    if (descriptor.enum_view != null and (descriptor.element_type != null or descriptor.temporal_kind != null or descriptor.numeric_modifier != null)) return error.InvalidSqlParameters;
     if (descriptor.temporal_kind != null and (descriptor.kind != .datetime or descriptor.element_type != null)) return error.InvalidSqlParameters;
     if (descriptor.numeric_modifier) |modifier| {
         if ((descriptor.kind != .number and descriptor.kind != .array) or descriptor.element_type != .numeric) return error.InvalidSqlParameters;
@@ -1482,6 +1586,10 @@ pub fn assignText(alloc: Allocator, datum: Datum, source_identity: ?arrays.Eleme
     defer arena.deinit();
     const program: Program = .{ .arena = &arena, .instructions = &.{}, .root = 0, .output_type = .{}, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
     var evaluator: Evaluator = .{ .program = &program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+    if (datum.enumeration()) |atom| {
+        if (atom.text.len > limits.output_bytes) return error.SqlProgramLimitExceeded;
+        return Datum.json(.{ .string = try alloc.dupe(u8, atom.text) });
+    }
     if (datum.range()) |range| {
         var context = evaluator.numericContext();
         return Datum.json(.{ .string = try @import("range_value.zig").formatLeaky(&context, range.*) });
@@ -1546,7 +1654,7 @@ pub fn assignArray(alloc: Allocator, datum: Datum, target: arrays.ElementType, l
 /// without turning an already typed text/JSON value into numeric input.
 pub fn assignNumeric(alloc: Allocator, datum: Datum, source_identity: ?arrays.ElementType, target: arrays.ElementType, limits: EvalLimits) !Datum {
     if (!builtin_cast.integral(target) and !builtin_cast.floating(target) and target != .numeric) return error.SqlAssignmentTypeMismatch;
-    if (datum.array != null or datum.patterns() != null or datum.temporal() != null or datum.range() != null) return error.SqlAssignmentTypeMismatch;
+    if (datum.array != null or datum.patterns() != null or datum.temporal() != null or datum.range() != null or datum.enumeration() != null) return error.SqlAssignmentTypeMismatch;
     if (datum.sql_null) {
         if (datum.value != .null or datum.numeric != null) return error.SqlTypeMismatch;
         return datum;
@@ -1571,10 +1679,18 @@ pub fn assignNumeric(alloc: Allocator, datum: Datum, source_identity: ?arrays.El
 pub fn normalizeParameterType(descriptor: Type) !Type {
     try validateParameterType(descriptor);
     var result = descriptor;
-    if (result.kind != null and result.kind != .datetime and @import("range_value.zig").kindFromType(result.kind.?) == null and result.element_type == null) result.element_type = try parameterElementType(result);
+    if (result.kind != null and result.kind != .datetime and result.kind != .enumeration and @import("range_value.zig").kindFromType(result.kind.?) == null and result.element_type == null) result.element_type = try parameterElementType(result);
     return result;
 }
 
+pub fn ownEnumView(a: Allocator, views: *std.AutoHashMapUnmanaged(*const @import("../common/sql_enum_value.zig").View, *const @import("../common/sql_enum_value.zig").View), source: ?*const @import("../common/sql_enum_value.zig").View) !?*const @import("../common/sql_enum_value.zig").View {
+    const view = source orelse return null;
+    if (views.get(view)) |owned| return owned;
+    const owned = try a.create(@import("../common/sql_enum_value.zig").View);
+    owned.* = try @import("../common/sql_enum_value.zig").View.init(a, try view.record.cloneOwned(a));
+    try views.put(a, view, owned);
+    return owned;
+}
 fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const Type, expected: ?Type, limits: BindLimits, settings: ?*const setting_catalog.View, typed_parameters: bool) !Program {
     if (limits.parameters > 1024 or parameter_hints.len > limits.parameters or limits.nodes == 0) return error.SqlProgramLimitExceeded;
     if (typed_parameters) for (parameter_hints) |descriptor| try validateParameterType(descriptor);
@@ -1586,11 +1702,18 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .settings = settings, .typed_parameters = typed_parameters, .assignment_target = expected };
     try binder.registerColumns();
     @memcpy(binder.parameters[0..parameter_hints.len], parameter_hints);
+    for (parameter_hints) |descriptor| binder.enum_inputs = binder.enum_inputs or descriptor.enum_view != null;
     if (typed_parameters) for (binder.parameters[0..parameter_hints.len]) |*descriptor| {
         descriptor.* = try normalizeParameterType(descriptor.*);
     };
     binder.parameter_count = parameter_hints.len;
-    const root = try binder.compileTypedContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, if (expected) |kind| kind.temporal_kind else null, 0);
+    const root = if (expected != null and expected.?.enum_view != null) try binder.compileOperatorOperand(expression, expected.?, 0) else try binder.compileTypedContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, if (expected) |kind| kind.temporal_kind else null, 0);
+    var views: std.AutoHashMapUnmanaged(*const @import("../common/sql_enum_value.zig").View, *const @import("../common/sql_enum_value.zig").View) = .empty;
+    for (binder.instructions.items) |*instruction| {
+        instruction.type.enum_view = try ownEnumView(binder.alloc, &views, instruction.type.enum_view);
+        if (instruction.operation == .cast) instruction.operation.cast.enum_view = try ownEnumView(binder.alloc, &views, instruction.operation.cast.enum_view);
+    }
+    for (binder.parameters[0..binder.parameter_count]) |*descriptor| descriptor.enum_view = try ownEnumView(binder.alloc, &views, descriptor.enum_view);
     const output_type = binder.instructions.items[root].type;
     const instructions = try binder.instructions.toOwnedSlice(binder.alloc);
     const parameter_descriptors = try binder.alloc.dupe(Type, binder.parameters[0..binder.parameter_count]);
@@ -2489,7 +2612,7 @@ fn arrayElementType(kind: ast.ColumnType) !arrays.ElementType {
         .number => .float64,
         .boolean => .boolean,
         .json => .jsonb,
-        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange => error.UnsupportedSqlShape,
+        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange, .enumeration => error.UnsupportedSqlShape,
     };
 }
 fn arrayScalarType(kind: arrays.ElementType) ast.ColumnType {
@@ -2520,6 +2643,23 @@ fn mixedNumberQuantified(value: arrays.Value, probe: arrays.Element, op: arrays.
 fn uuidTextOperand(expression: *const ast.Scalar) bool {
     return expression.* == .literal and expression.literal == .string;
 }
+fn enumBinaryDomain(binary: anytype, left: Type, right: Type) !?Type {
+    if (left.kind != .enumeration and right.kind != .enumeration) return null;
+    switch (binary.op) {
+        .eq, .neq, .lt, .lte, .gt, .gte, .is_distinct, .is_not_distinct => {},
+        else => return error.SqlUndefinedOperator,
+    }
+    return enumUnknownOperandDomain(left, right, binary.left, binary.right) orelse (common(left, right) catch |err| switch (err) {
+        error.SqlCommonTypeMismatch, error.SqlTypeMismatch => return error.SqlUndefinedOperator,
+        else => return err,
+    });
+}
+fn enumUnknownOperandDomain(left: Type, right: Type, left_expression: *const ast.Scalar, right_expression: *const ast.Scalar) ?Type {
+    const selected = if (left.kind == .enumeration and uuidTextOperand(right_expression)) left else if (right.kind == .enumeration and uuidTextOperand(left_expression)) right else return null;
+    var result = selected;
+    result.nullable = left.nullable or right.nullable;
+    return result;
+}
 fn jsonUnknownOperandDomain(left: Type, right: Type, left_expression: *const ast.Scalar, right_expression: *const ast.Scalar) ?Type {
     if ((left.kind == .json and uuidTextOperand(right_expression)) or
         (right.kind == .json and uuidTextOperand(left_expression)))
@@ -2537,6 +2677,21 @@ pub fn comparisonDomain(left: Type, right: Type) !Type {
 }
 
 fn common(left: Type, right: Type) !Type {
+    if (left.kind == .enumeration or right.kind == .enumeration) {
+        const selected = if (left.kind == .enumeration) left else right;
+        const other = if (left.kind == .enumeration) right else left;
+        const view = selected.enum_view orelse return error.InvalidSqlProgram;
+        if (other.kind != null) {
+            if (other.kind != .enumeration) return error.SqlCommonTypeMismatch;
+            if (!view.record.sameValueDomain((other.enum_view orelse return error.InvalidSqlProgram).record)) return error.SqlCommonTypeMismatch;
+        }
+        var result = selected;
+        if (other.enum_view) |other_view| if (other_view.record.definition.labels.len > view.record.definition.labels.len) {
+            result = other;
+        };
+        result.nullable = left.nullable or right.nullable;
+        return result;
+    }
     if (left.kind == .datetime and right.kind == .datetime and (left.temporal_kind orelse .timestamp_tz) != (right.temporal_kind orelse .timestamp_tz)) return error.SqlTypeMismatch;
     if (left.kind == .array or right.kind == .array) {
         const chosen = if (left.kind == .array) left else right;
@@ -3056,6 +3211,7 @@ const Binder = struct {
     translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
     dependencies: std.ArrayList(u32) = .empty,
     parameters: [1024]Type = @splat(.{}),
+    enum_inputs: bool = false,
     typed_parameters: bool = false,
     parameter_count: usize = 0,
     allow_unresolved: bool = false,
@@ -3111,6 +3267,7 @@ const Binder = struct {
 
     fn registerColumns(self: *Binder) !void {
         for (self.columns, 0..) |column, ordinal| {
+            self.enum_inputs = self.enum_inputs or column.enum_view != null;
             if (column.aliases.len > 3) return error.SqlProgramLimitExceeded;
             try self.registerName(column.name, ordinal);
             for (column.aliases) |alias| try self.registerName(alias, ordinal);
@@ -3142,6 +3299,7 @@ const Binder = struct {
                     if ((column.type != .number and column.type != .array) or column.element_type != .numeric) return error.InvalidSqlProgram;
                     try modifier.validate();
                 }
+                if ((column.type == .enumeration) != (column.enum_view != null)) return error.InvalidSqlProgram;
                 if (column.type == .array and column.element_type == null) return error.InvalidSqlProgram;
                 break :blk columnType(column);
             },
@@ -3154,6 +3312,11 @@ const Binder = struct {
                 if (cast.type == .array) try self.typeArrayConstructors(cast.operand, cast.element_type.?, depth + 1);
                 const source = try self.infer(cast.operand, depth + 1);
                 const target: Type = .{ .kind = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .temporal_kind = cast.temporal_kind };
+                if (source.kind == .enumeration) {
+                    if (cast.type != .string) return error.SqlCannotCoerce;
+                    break :blk .{ .kind = .string, .element_type = .text, .nullable = source.nullable };
+                }
+                if (cast.type == .enumeration) return error.SqlCannotCoerce;
                 const unknown_input = cast.operand.* == .literal and (cast.operand.literal == .string or cast.operand.literal == .null);
                 if (!unknown_input) if (try self.catalogCast(expression, source, target, cast.context)) |function| {
                     var output = function.output;
@@ -3230,7 +3393,7 @@ const Binder = struct {
                 const json_domain = jsonUnknownOperandDomain(left, right, binary.left, binary.right);
                 if (json_domain == null and ((left.kind == .json and right.kind == .string) or
                     (right.kind == .json and left.kind == .string))) return error.SqlUndefinedFunction;
-                const merged = json_domain orelse try common(left, right);
+                const merged = (try enumBinaryDomain(binary, left, right)) orelse json_domain orelse try common(left, right);
                 switch (binary.op) {
                     .add, .subtract, .multiply, .divide, .modulo => {
                         if (merged.kind != null and !numeric(merged.kind)) return error.SqlTypeMismatch;
@@ -3612,9 +3775,16 @@ const Binder = struct {
                     if (actual.kind == .number and actual.element_type != .numeric) return error.SqlUndefinedFunction;
                 };
                 if (function == .nullif) try arrayOperator(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1));
+                if (function == .coalesce or function == .nullif or function == .greatest or function == .least) {
+                    for (call.args) |arg| {
+                        const actual = try self.infer(arg, depth + 1);
+                        if (actual.kind == .enumeration) merged = try common(merged, actual);
+                    }
+                }
                 switch (function) {
                     .@"$single" => merged = try self.infer(call.args[0], depth + 1),
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt, .power, .mod => for (call.args) |arg| {
+                        if (merged.kind == .enumeration and uuidTextOperand(arg)) continue;
                         merged = try common(merged, try self.infer(arg, depth + 1));
                     },
                     else => for (call.args) |arg| {
@@ -3679,6 +3849,9 @@ const Binder = struct {
                     .date_trunc, .to_timestamp => .datetime,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.kind,
                     else => .string,
+                }, .enum_view = switch (function) {
+                    .coalesce, .nullif, .greatest, .least, .@"$single" => merged.enum_view,
+                    else => null,
                 }, .temporal_kind = switch (function) {
                     .coalesce, .nullif, .greatest, .least, .@"$single" => merged.temporal_kind,
                     else => null,
@@ -3692,13 +3865,23 @@ const Binder = struct {
                 }, .nullable = function != .concat and function != .jsonb_build_object };
             },
             .case_when => |case| blk: {
-                var merged: Type = if (case.otherwise) |other| try self.infer(other, depth + 1) else .{};
+                var enum_domain: Type = .{};
+                if (self.enum_inputs) for (case.branches) |branch| {
+                    const actual = try self.infer(branch.value, depth + 1);
+                    if (actual.kind == .enumeration) enum_domain = try common(enum_domain, actual);
+                };
+                if (self.enum_inputs) if (case.otherwise) |other| {
+                    const actual = try self.infer(other, depth + 1);
+                    if (actual.kind == .enumeration) enum_domain = try common(enum_domain, actual);
+                };
+                var merged: Type = if (case.otherwise) |other| if (enum_domain.kind == .enumeration and uuidTextOperand(other)) enum_domain else if (enum_domain.kind == .enumeration) try common(enum_domain, try self.infer(other, depth + 1)) else try self.infer(other, depth + 1) else enum_domain;
                 var modifier = merged.numeric_modifier;
                 for (case.branches) |branch| {
                     const condition = try self.infer(branch.condition, depth + 1);
                     if (condition.kind != null and condition.kind != .boolean) return error.SqlTypeMismatch;
                     const actual = try self.infer(branch.value, depth + 1);
                     if (!@import("../common/sql_builtin_type.zig").NumericModifier.eql(modifier, actual.numeric_modifier)) modifier = null;
+                    if (merged.kind == .enumeration and uuidTextOperand(branch.value)) continue;
                     merged = try common(merged, actual);
                 }
                 if (merged.kind == null) merged.kind = .string;
@@ -3710,7 +3893,7 @@ const Binder = struct {
                 for (list.values) |item| {
                     const item_type = try self.infer(item, depth + 1);
                     try arrayOperator(merged, item_type);
-                    merged = try common(merged, item_type);
+                    merged = enumUnknownOperandDomain(merged, item_type, list.operand, item) orelse try common(merged, item_type);
                 }
                 break :blk .{ .kind = .boolean, .nullable = merged.nullable };
             },
@@ -3802,6 +3985,25 @@ const Binder = struct {
     }
 
     fn compileOperatorOperand(self: *Binder, expression: *const ast.Scalar, domain: Type, depth: usize) anyerror!u32 {
+        if (domain.enum_view) |view| {
+            if (domain.kind != .enumeration) return error.InvalidSqlProgram;
+            const unknown = expression.* == .literal and (expression.literal == .string or expression.literal == .null or expression.literal == .parameter);
+            if (expression.* == .literal and expression.literal == .parameter) {
+                const slot = expression.literal.parameter - 1;
+                if (self.parameters[slot].kind == null) {
+                    self.parameters[slot] = domain;
+                } else {
+                    _ = common(self.parameters[slot], domain) catch return error.ConflictingSqlParameterTypes;
+                }
+            }
+            const source = try self.infer(expression, depth + 1);
+            if (!unknown) _ = try common(source, domain);
+            const index = try self.compileArrayContext(expression, if (unknown) null else domain.kind, null, depth + 1);
+            if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+            const result: u32 = @intCast(self.instructions.items.len);
+            try self.instructions.append(self.alloc, .{ .type = domain, .input_function = expression.* == .literal and expression.literal == .string, .operation = .{ .cast = .{ .operand = index, .type = .enumeration, .enum_view = view } } });
+            return result;
+        }
         if (domain.kind == .json and expression.* == .literal and expression.literal == .string) {
             // PostgreSQL unknown literals use the selected operator's input
             // function. Keep the cast explicit so bounded constant preparation
@@ -3953,7 +4155,7 @@ const Binder = struct {
                     .left = try self.compileTypedContext(binary.left, left_type.kind, left_type.element_type, left_type.temporal_kind, depth + 1),
                     .right = try self.compileTypedContext(binary.right, right_type.kind, right_type.element_type, right_type.temporal_kind, depth + 1),
                 } };
-                const merged = jsonUnknownOperandDomain(left_type, right_type, binary.left, binary.right) orelse try comparisonDomain(left_type, right_type);
+                const merged = (try enumBinaryDomain(binary, left_type, right_type)) orelse jsonUnknownOperandDomain(left_type, right_type, binary.left, binary.right) orelse try comparisonDomain(left_type, right_type);
                 // PostgreSQL's mixed NUMERIC/real operators use float8;
                 // CASE/COALESCE and array common types still select real.
                 const operand_kind: ?ast.ColumnType = switch (binary.op) {
@@ -3963,7 +4165,7 @@ const Binder = struct {
                     .add, .subtract, .multiply, .divide, .modulo => merged.kind orelse expected,
                     else => merged.kind,
                 };
-                const operand_domain: Type = .{ .kind = operand_kind, .element_type = merged.element_type, .nullable = merged.nullable };
+                const operand_domain: Type = .{ .kind = operand_kind, .element_type = merged.element_type, .enum_view = merged.enum_view, .nullable = merged.nullable };
                 break :blk .{ .binary = .{ .op = binary.op, .left = try self.compileOperatorOperand(binary.left, operand_domain, depth + 1), .right = try self.compileOperatorOperand(binary.right, operand_domain, depth + 1) } };
             },
             .call => |call| blk: {
@@ -4210,7 +4412,7 @@ const Binder = struct {
                         out.* = try self.compileArrayContext(coercion, desired, kind.element_type, depth + 1);
                         continue;
                     }
-                    if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
+                    if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(desired == .enumeration and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
                     const element_context: ?arrays.ElementType = if (function == .uuid_extract_version or function == .uuid_extract_timestamp)
                         .uuid
                     else if (function == .@"$record_field" or function == .@"$record_validate")
@@ -4229,7 +4431,7 @@ const Binder = struct {
                         .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
                         else => if (kind.kind == .array or desired == kind.kind) kind.element_type else null,
                     };
-                    out.* = try self.compileTypedContext(arg, desired, element_context, if (desired == .datetime) kind.temporal_kind else null, depth + 1);
+                    out.* = if (kind.kind == .enumeration) try self.compileOperatorOperand(arg, kind, depth + 1) else try self.compileTypedContext(arg, desired, element_context, if (desired == .datetime) kind.temporal_kind else null, depth + 1);
                 }
                 if (function == .translate) {
                     const from = self.instructions.items[args[1]].operation;
@@ -4254,17 +4456,17 @@ const Binder = struct {
                 const branches = try self.alloc.alloc(Instruction.Branch, case.branches.len);
                 for (case.branches, branches) |branch, *out| {
                     if (kind.kind == .uuid and (try self.infer(branch.value, depth + 1)).kind == .string and !uuidTextOperand(branch.value)) return error.SqlTypeMismatch;
-                    out.* = .{ .condition = try self.compile(branch.condition, .boolean, depth + 1), .value = try self.compileTypedContext(branch.value, kind.kind, kind.element_type, kind.temporal_kind, depth + 1) };
+                    out.* = .{ .condition = try self.compile(branch.condition, .boolean, depth + 1), .value = if (kind.kind == .enumeration) try self.compileOperatorOperand(branch.value, kind, depth + 1) else try self.compileTypedContext(branch.value, kind.kind, kind.element_type, kind.temporal_kind, depth + 1) };
                 }
                 if (case.otherwise) |other| if (kind.kind == .uuid and (try self.infer(other, depth + 1)).kind == .string and !uuidTextOperand(other)) return error.SqlTypeMismatch;
-                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (case.otherwise) |other| try self.compileTypedContext(other, kind.kind, kind.element_type, kind.temporal_kind, depth + 1) else null } };
+                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (case.otherwise) |other| if (kind.kind == .enumeration) try self.compileOperatorOperand(other, kind, depth + 1) else try self.compileTypedContext(other, kind.kind, kind.element_type, kind.temporal_kind, depth + 1) else null } };
             },
             .in_list => |list| blk: {
                 var merged = try self.infer(list.operand, depth + 1);
                 for (list.values) |item| {
                     const item_type = try self.infer(item, depth + 1);
                     const numeric_operand = merged.element_type == .numeric or item_type.element_type == .numeric;
-                    merged = try common(merged, item_type);
+                    merged = enumUnknownOperandDomain(merged, item_type, list.operand, item) orelse try common(merged, item_type);
                     if (numeric_operand and merged.kind == .number and merged.element_type == .float32) merged.element_type = .float64;
                 }
                 if (merged.kind == .uuid) {
@@ -4272,8 +4474,8 @@ const Binder = struct {
                     for (list.values) |item| if ((try self.infer(item, depth + 1)).kind == .string and !uuidTextOperand(item)) return error.SqlTypeMismatch;
                 }
                 const values = try self.alloc.alloc(u32, list.values.len);
-                for (list.values, values) |item, *out| out.* = try self.compileArrayContext(item, merged.kind, merged.element_type, depth + 1);
-                break :blk .{ .in_list = .{ .operand = try self.compileArrayContext(list.operand, merged.kind, merged.element_type, depth + 1), .values = values, .negated = list.negated } };
+                for (list.values, values) |item, *out| out.* = try self.compileOperatorOperand(item, merged, depth + 1);
+                break :blk .{ .in_list = .{ .operand = try self.compileOperatorOperand(list.operand, merged, depth + 1), .values = values, .negated = list.negated } };
             },
         };
         if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
@@ -4645,6 +4847,7 @@ const Evaluator = struct {
                 // not PostgreSQL text-format bytes. A JSON string stays a
                 // string even when its contents happen to be valid JSON text.
                 if (instruction.type.kind == .json) break :blk Datum.json(value);
+                if (instruction.type.enum_view != null) break :blk try @import("describe.zig").coerceDatumTyped(self.alloc, Datum.json(value), instruction.type);
                 if (instruction.type.kind != null) if (@import("range_value.zig").kindFromType(instruction.type.kind.?)) |range_kind| {
                     if (value != .string) return error.SqlTypeMismatch;
                     var context = self.numericContext();
@@ -4678,6 +4881,16 @@ const Evaluator = struct {
                 }
                 const datum = try self.runDatum(cast.operand, depth + 1);
                 if (datum.sql_null) break :blk .{};
+                if (cast.enum_view) |view| {
+                    if (cast.type != .enumeration) return error.InvalidSqlProgram;
+                    break :blk try @import("describe.zig").coerceDatumTyped(self.alloc, datum, .{ .kind = .enumeration, .enum_view = view });
+                }
+                if (datum.enumeration()) |atom| {
+                    try datum.validateTemporal();
+                    if (cast.type != .string) return error.SqlCannotCoerce;
+                    try self.charge(atom.text.len);
+                    break :blk Datum.json(.{ .string = try self.alloc.dupe(u8, atom.text) });
+                }
                 if (datum.range()) |range| {
                     if (cast.type == self.program.instructions[cast.operand].type.kind) break :blk datum;
                     if (cast.type != .string) return error.SqlCannotCoerce;
@@ -5527,6 +5740,9 @@ const Evaluator = struct {
         };
         if (!result.sql_null and result.value == .float and instruction.type.element_type == .float32) result.value = .{ .float = try builtin_cast.floatValue(f32, result.value) };
         try result.validateTemporal();
+        if (instruction.type.enum_view != null) {
+            result = try @import("describe.zig").coerceDatumTyped(self.alloc, result, instruction.type);
+        } else if (result.enumeration() != null) return error.SqlTypeMismatch;
         if (instruction.operation == .call and instruction.operation.call.function.volatility() == .@"volatile")
             if (self.limits.volatile_values) |values| {
                 values[index] = result;
@@ -5638,7 +5854,7 @@ const Evaluator = struct {
         if (value == .null) return .null;
         return switch (kind) {
             .numrange, .daterange, .tsrange, .tstzrange => error.InvalidSqlProgram,
-            .array => error.SqlTypeMismatch,
+            .array, .enumeration => error.SqlTypeMismatch,
             .integer => switch (value) {
                 .integer => value,
                 .float => |v| blk: {
@@ -6092,7 +6308,7 @@ const Evaluator = struct {
     /// then exact decimal parsing. JSON numbers have neither a float width
     /// nor NaN/infinity payloads; PostgreSQL represents specials as strings.
     fn sqlJson(self: *Evaluator, datum: Datum, descriptor: Type) !Json {
-        if (datum.range() != null) return .{ .string = try self.sqlText(datum, descriptor) };
+        if (datum.range() != null or datum.enumeration() != null) return .{ .string = try self.sqlText(datum, descriptor) };
         if (datum.temporal() != null) return error.UnsupportedSqlShape; // JSON temporal spelling needs exact type activation
         if (datum.sql_null) return .null;
         if (datum.numeric != null) return self.numericJson(datum);
@@ -6306,6 +6522,11 @@ const Evaluator = struct {
     /// floating object keys are text, so JSON numeric canonicalization would
     /// incorrectly expand exponents and discard the sign of negative zero.
     fn sqlText(self: *Evaluator, datum: Datum, descriptor: Type) ![]const u8 {
+        if (datum.enumeration()) |atom| {
+            try datum.validateTemporal();
+            try self.charge(atom.text.len);
+            return self.alloc.dupe(u8, atom.text);
+        }
         if (datum.range()) |range| {
             var context = self.numericContext();
             const text = try @import("range_value.zig").formatLeaky(&context, range.*);
@@ -6989,6 +7210,14 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
     try left.validateTemporal();
     try right.validateTemporal();
     if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
+    if (left.enumeration()) |value| {
+        const other = right.enumeration() orelse return error.SqlTypeMismatch;
+        // Dense ranks are bounded but variable-width. Account for their
+        // comparison and repeated label validation in the shared work quota.
+        try work.consume(2 * (value.text.len + other.text.len) + @min(value.order_key.len, other.order_key.len) + 1);
+        return value.compare(other.*);
+    }
+    if (right.enumeration() != null) return error.SqlTypeMismatch;
     if (left.range()) |range| {
         var none = std.heap.FixedBufferAllocator.init(&.{});
         var context = work.numericContext(none.allocator());
@@ -7023,6 +7252,11 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
 pub fn semanticHashDatum(value: Datum) anyerror!u64 {
     try value.validateTemporal();
     if (value.sql_null) return 0;
+    if (value.enumeration()) |atom| {
+        var hash = std.hash.Wyhash.init(0);
+        try atom.hash(&hash);
+        return hash.final();
+    }
     if (value.range()) |range| {
         var none = std.heap.FixedBufferAllocator.init(&.{});
         var context: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };

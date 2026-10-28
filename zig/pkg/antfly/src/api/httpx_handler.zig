@@ -6361,6 +6361,7 @@ pub const AntflyApiHandler = struct {
                 const encoded_owner = try std.fmt.bufPrint(&owner_buffer, "{d}", .{self.adapter.server.localSessionNodeId()});
                 const parameter_types = description.arena.allocator().alloc(sql_wire.SQLColumnType, description.binding.parameter_types.len) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 for (description.binding.parameter_types, parameter_types) |kind, *output| output.* = if (kind) |value| switch (value) {
+                    .enumeration => return error.UnsupportedSqlShape,
                     inline else => |tag| @field(sql_wire.SQLColumnType, @tagName(tag)),
                 } else .unknown;
                 const parameter_descriptors = try description.arena.allocator().alloc(sql_wire.SQLParameterDescriptor, parameter_types.len);
@@ -6713,6 +6714,7 @@ pub const AntflyApiHandler = struct {
         for (result.output.columns, columns) |column, *output| output.* = .{
             .name = column.name,
             .type = switch (column.type) {
+                .enumeration => return error.UnsupportedSqlShape,
                 inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
             },
             .element_type = if (column.element_type) |element| switch (element) {

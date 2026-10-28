@@ -248,6 +248,7 @@ fn executeInner(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *c
 pub fn parameterFallbackTypesNative(arena: std.mem.Allocator, parameters: []const Json, cells: ?[]const Datum) ![]const ?ast.ColumnType {
     const native = cells orelse return parameterFallbackTypes(arena, parameters);
     if (native.len != parameters.len) return error.InvalidSqlParameters;
+    for (native) |cell| if (cell.enumeration() != null) return error.UnsupportedSqlShape;
     const kinds = try arena.alloc(?ast.ColumnType, native.len);
     for (native, kinds) |cell, *kind| kind.* = if (cell.sql_null) null else if (cell.array != null) .array else if (cell.numeric != null) .number else if (cell.range()) |range| @import("range_value.zig").typeFromKind(ast.ColumnType, range.kind) else parameterFallbackType(cell.value);
     return kinds;
@@ -823,6 +824,12 @@ pub const Context = struct {
     /// Arrays are owned envelopes and NUMERIC values are exact decimal text,
     /// never their JSON-null placeholders.
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
+        if (datum.enumeration()) |atom| {
+            try datum.validateTemporal();
+            if (kind != .enumeration or element_type != null) return error.SqlTypeMismatch;
+            if (atom.text.len > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
+            return .{ .string = try self.arena.dupe(u8, atom.text) };
+        }
         if (datum.range()) |range| {
             try datum.validateTemporal();
             if (kind == null or @import("range_value.zig").kindFromType(kind.?) != range.kind) return error.SqlTypeMismatch;
@@ -880,7 +887,7 @@ pub const Context = struct {
                 const nanos = temporal.timestamp_tz.unixNanoseconds() orelse return error.UnsupportedSqlShape;
                 return .{ .string = try @import("../datetime.zig").formatDateTimeSignedNsAlloc(self.arena, nanos) };
             }
-            if (datum.array != null or datum.numeric != null or datum.range() != null) return error.UnsupportedSqlShape;
+            if (datum.array != null or datum.numeric != null or datum.range() != null or datum.enumeration() != null) return error.UnsupportedSqlShape;
             return datum.value;
         };
         return coerce(self.arena, self.parameters[index - 1], column.type);
@@ -2369,6 +2376,9 @@ pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalo
 }
 
 pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType, retained_bytes: usize) !Json {
+    // Named SQL column binding must supply a pinned catalog domain before
+    // this coarse compatibility boundary can perform enum assignments.
+    if (datum.enumeration() != null or column.type == .enumeration) return error.UnsupportedSqlShape;
     if (datum.range()) |range| {
         try datum.validateTemporal();
         if (@import("range_value.zig").kindFromType(column.type) != range.kind) return error.SqlTypeMismatch;

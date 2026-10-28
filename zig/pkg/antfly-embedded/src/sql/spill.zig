@@ -593,7 +593,14 @@ const Encoder = struct {
     fn cell(self: *Encoder, value: Datum) anyerror!void {
         try value.validateTemporal();
         try self.append(&.{@intFromBool(value.sql_null)});
-        if (value.range()) |range| {
+        if (value.enumeration()) |atom| {
+            try self.append(&.{14});
+            try self.word(atom.type_id);
+            try self.append(&atom.origin_id);
+            try self.word(atom.symbol);
+            try self.text(atom.text);
+            try self.text(atom.order_key);
+        } else if (value.range()) |range| {
             const ranges = @import("range_value.zig");
             var context: ranges.Context = .{ .alloc = self.scratch orelse self.a, .max_output_bytes = self.limit };
             const size = try ranges.encodedSize(&context, range.*);
@@ -965,7 +972,20 @@ const Decoder = struct {
         for (values) |*value| {
             const flag = try self.byte();
             if (flag > 1) return error.InvalidSqlSpill;
-            if (self.position < self.bytes.len and self.bytes[self.position] == 11) {
+            if (self.position < self.bytes.len and self.bytes[self.position] == 14) {
+                self.position += 1;
+                if (flag != 0) return error.InvalidSqlSpill;
+                const enums = @import("../common/sql_enum_value.zig");
+                const types = @import("../system_catalog/named_types.zig");
+                var atom: enums.Value = .{ .type_id = try self.word(), .origin_id = undefined, .symbol = undefined };
+                @memcpy(&atom.origin_id, try self.take(16));
+                atom.symbol = std.math.cast(u32, try self.word()) orelse return error.InvalidSqlSpill;
+                atom.text = try self.take(try self.count());
+                if (atom.text.len > types.max_label_bytes) return error.InvalidSqlSpill;
+                atom.order_key = try self.take(try self.count());
+                atom.validate() catch return error.InvalidSqlSpill;
+                value.* = Datum.typedEnum(try atom.clone(self.a));
+            } else if (self.position < self.bytes.len and self.bytes[self.position] == 11) {
                 self.position += 1;
                 if (!self.compact_arrays or flag != 0) return error.InvalidSqlSpill;
                 const arrays = @import("array_value.zig");
@@ -2606,7 +2626,7 @@ pub const Sequential = struct {
         return true;
     }
     fn tag(value: Datum) u8 {
-        if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null) return 255;
+        if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null) return 255;
         return switch (value.value) {
             .null => 0,
             .bool => 1,
@@ -2662,7 +2682,7 @@ pub const Sequential = struct {
             for (rows) |row| {
                 const value = (if (keys) row.keys else row.values)[column];
                 try value.validateTemporal();
-                if (value.sql_null or (value.value == .null and value.patterns() == null and value.array == null and value.numeric == null and value.temporal() == null and value.range() == null)) continue;
+                if (value.sql_null or (value.value == .null and value.patterns() == null and value.array == null and value.numeric == null and value.temporal() == null and value.range() == null and value.enumeration() == null)) continue;
                 const actual = tag(value);
                 kind = if (kind == null or kind.? == actual) actual else 255;
             }

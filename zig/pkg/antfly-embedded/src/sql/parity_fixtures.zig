@@ -188,3 +188,5 @@ pub const aggregate_lifecycle_reference = @embedFile("fixtures/sql_aggregate_lif
 pub const cast_reference = @embedFile("fixtures/sql_cast_reference.json");
 
 pub const enum_catalog_reference = @embedFile("fixtures/sql_enum_catalog_reference.json");
+
+pub const enum_execution_reference = @embedFile("fixtures/sql_enum_execution_reference.json");

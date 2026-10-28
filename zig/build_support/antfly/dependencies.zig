@@ -1402,6 +1402,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
     sql_test_mod.addImport("antfly-json", json_mod);
     sql_test_mod.addImport("antfly_platform", platform_mod);
+    sql_test_mod.addImport("antfly_generating", generating_mod);
+    sql_test_mod.addImport("antfly_structured", structured_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     pgwire_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);

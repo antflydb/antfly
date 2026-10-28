@@ -27,6 +27,7 @@ test {
     _ = named_types;
     _ = named_layouts;
     _ = enum_values;
+    _ = @import("enum_execution_test.zig");
     _ = @import("../storage/db/relational_enum_test.zig");
 }
 
@@ -101,7 +102,7 @@ pub const Column = struct {
             .boolean => Kind.boolean,
             .json => Kind.jsonb,
             .datetime, .numrange, .daterange, .tsrange, .tstzrange => null,
-            .array => return error.InvalidSqlBackendResponse,
+            .array, .enumeration => return error.InvalidSqlBackendResponse,
         };
         if (self.numeric_modifier) |modifier| {
             if (identity != .numeric or (self.type != .number and self.type != .array)) return error.InvalidSqlBackendResponse;
@@ -604,6 +605,7 @@ pub const Table = struct {
             .name = column_.name,
             .path = column_.path,
             .column_type = switch (column_.type) {
+                .enumeration => return error.UnsupportedSqlShape,
                 .string, .uuid => .string,
                 .integer => .integer,
                 .number => if (column_.element_type == .numeric) .numeric else .number,

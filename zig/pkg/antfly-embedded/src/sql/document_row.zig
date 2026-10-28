@@ -677,7 +677,7 @@ fn coerce(alloc: std.mem.Allocator, value: Json, kind: ast.ColumnType) !Json {
             var context: ranges.Context = .{ .alloc = alloc };
             break :range .{ .string = try ranges.formatLeaky(&context, try ranges.parseLeaky(&context, ranges.kindFromType(kind).?, value.string)) };
         },
-        .array => error.UnsupportedSqlShape,
+        .array, .enumeration => error.UnsupportedSqlShape,
         .json => typed_json.clone(alloc, value),
         .integer => switch (value) {
             .integer => value,

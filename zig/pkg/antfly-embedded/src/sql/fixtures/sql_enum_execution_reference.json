@@ -1,0 +1,1086 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18+ enum scalar execution",
+  "entries": [
+    {
+      "expression": "v = 'z'",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v = 'a'",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v = ''",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v <> 'z'",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v <> 'a'",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v <> ''",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v < 'z'",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v < 'a'",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v < ''",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v <= 'z'",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v <= 'a'",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v <= ''",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v > 'z'",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v > 'a'",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v > ''",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v >= 'z'",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v >= 'a'",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v >= ''",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "v::text",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "v = v",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v = NULL",
+      "input": "z",
+      "value": null
+    },
+    {
+      "expression": "v IS NULL",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "v IS NOT NULL",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v IS DISTINCT FROM NULL",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v IS NOT DISTINCT FROM 'z'",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v IN ('a', 'z')",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v NOT IN ('a', '')",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v IN ('a', NULL)",
+      "input": "z",
+      "value": null
+    },
+    {
+      "expression": "coalesce(v, NULL)",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "coalesce(NULL, v, 'a')",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "coalesce('a', v)",
+      "input": "z",
+      "value": "a"
+    },
+    {
+      "expression": "greatest(v, v)",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "least(v, v)",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "greatest(v, 'a')",
+      "input": "z",
+      "value": "a"
+    },
+    {
+      "expression": "least('a', v)",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "nullif(v, 'z')",
+      "input": "z",
+      "value": null
+    },
+    {
+      "expression": "CASE WHEN true THEN v ELSE NULL END",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN true THEN v ELSE 'a' END",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN false THEN v ELSE 'a' END",
+      "input": "z",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN true THEN 'a' ELSE v END",
+      "input": "z",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'a' ELSE v END",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "false AND v = 'Z'",
+      "input": "z",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "true OR v = 'Z'",
+      "input": "z",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'Z' ELSE v END",
+      "input": "z",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "coalesce(v, 'Z')",
+      "input": "z",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "false AND v = 'a'",
+      "input": "z",
+      "value": false
+    },
+    {
+      "expression": "true OR v = 'a'",
+      "input": "z",
+      "value": true
+    },
+    {
+      "expression": "v = 'z'::text",
+      "input": "z",
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "v::bigint",
+      "input": "z",
+      "sqlstate": "42846"
+    },
+    {
+      "expression": "v::boolean",
+      "input": "z",
+      "sqlstate": "42846"
+    },
+    {
+      "expression": "v + v",
+      "input": "z",
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "v = 'Z'",
+      "input": "z",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "coalesce(v, 'z'::text)",
+      "input": "z",
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "v = 'z'",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v = 'a'",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v = ''",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v <> 'z'",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v <> 'a'",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v <> ''",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v < 'z'",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v < 'a'",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v < ''",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v <= 'z'",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v <= 'a'",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v <= ''",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v > 'z'",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v > 'a'",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v > ''",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v >= 'z'",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v >= 'a'",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v >= ''",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "v::text",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "v = v",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v = NULL",
+      "input": "a",
+      "value": null
+    },
+    {
+      "expression": "v IS NULL",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v IS NOT NULL",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v IS DISTINCT FROM NULL",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v IS NOT DISTINCT FROM 'z'",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v IN ('a', 'z')",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v NOT IN ('a', '')",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "v IN ('a', NULL)",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "coalesce(v, NULL)",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "coalesce(NULL, v, 'a')",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "coalesce('a', v)",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "greatest(v, v)",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "least(v, v)",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "greatest(v, 'a')",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "least('a', v)",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "nullif(v, 'z')",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN true THEN v ELSE NULL END",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN true THEN v ELSE 'a' END",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN false THEN v ELSE 'a' END",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN true THEN 'a' ELSE v END",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'a' ELSE v END",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "false AND v = 'Z'",
+      "input": "a",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "true OR v = 'Z'",
+      "input": "a",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'Z' ELSE v END",
+      "input": "a",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "coalesce(v, 'Z')",
+      "input": "a",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "false AND v = 'a'",
+      "input": "a",
+      "value": false
+    },
+    {
+      "expression": "true OR v = 'a'",
+      "input": "a",
+      "value": true
+    },
+    {
+      "expression": "v = 'z'::text",
+      "input": "a",
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "v::bigint",
+      "input": "a",
+      "sqlstate": "42846"
+    },
+    {
+      "expression": "v::boolean",
+      "input": "a",
+      "sqlstate": "42846"
+    },
+    {
+      "expression": "v + v",
+      "input": "a",
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "v = 'Z'",
+      "input": "a",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "coalesce(v, 'z'::text)",
+      "input": "a",
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "v = 'z'",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v = 'a'",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v = ''",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v <> 'z'",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v <> 'a'",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v <> ''",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v < 'z'",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v < 'a'",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v < ''",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v <= 'z'",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v <= 'a'",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v <= ''",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v > 'z'",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v > 'a'",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v > ''",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v >= 'z'",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v >= 'a'",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v >= ''",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "v::text",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "v = v",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v = NULL",
+      "input": "",
+      "value": null
+    },
+    {
+      "expression": "v IS NULL",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v IS NOT NULL",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v IS DISTINCT FROM NULL",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v IS NOT DISTINCT FROM 'z'",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v IN ('a', 'z')",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v NOT IN ('a', '')",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "v IN ('a', NULL)",
+      "input": "",
+      "value": null
+    },
+    {
+      "expression": "coalesce(v, NULL)",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "coalesce(NULL, v, 'a')",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "coalesce('a', v)",
+      "input": "",
+      "value": "a"
+    },
+    {
+      "expression": "greatest(v, v)",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "least(v, v)",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "greatest(v, 'a')",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "least('a', v)",
+      "input": "",
+      "value": "a"
+    },
+    {
+      "expression": "nullif(v, 'z')",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "CASE WHEN true THEN v ELSE NULL END",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "CASE WHEN true THEN v ELSE 'a' END",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "CASE WHEN false THEN v ELSE 'a' END",
+      "input": "",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN true THEN 'a' ELSE v END",
+      "input": "",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'a' ELSE v END",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "false AND v = 'Z'",
+      "input": "",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "true OR v = 'Z'",
+      "input": "",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'Z' ELSE v END",
+      "input": "",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "coalesce(v, 'Z')",
+      "input": "",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "false AND v = 'a'",
+      "input": "",
+      "value": false
+    },
+    {
+      "expression": "true OR v = 'a'",
+      "input": "",
+      "value": true
+    },
+    {
+      "expression": "v = 'z'::text",
+      "input": "",
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "v::bigint",
+      "input": "",
+      "sqlstate": "42846"
+    },
+    {
+      "expression": "v::boolean",
+      "input": "",
+      "sqlstate": "42846"
+    },
+    {
+      "expression": "v + v",
+      "input": "",
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "v = 'Z'",
+      "input": "",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "coalesce(v, 'z'::text)",
+      "input": "",
+      "sqlstate": "42804"
+    },
+    {
+      "expression": "v = 'z'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v = 'a'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v = ''",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v <> 'z'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v <> 'a'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v <> ''",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v < 'z'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v < 'a'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v < ''",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v <= 'z'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v <= 'a'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v <= ''",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v > 'z'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v > 'a'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v > ''",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v >= 'z'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v >= 'a'",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v >= ''",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v::text",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v = v",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v = NULL",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v IS NULL",
+      "input": null,
+      "value": true
+    },
+    {
+      "expression": "v IS NOT NULL",
+      "input": null,
+      "value": false
+    },
+    {
+      "expression": "v IS DISTINCT FROM NULL",
+      "input": null,
+      "value": false
+    },
+    {
+      "expression": "v IS NOT DISTINCT FROM 'z'",
+      "input": null,
+      "value": false
+    },
+    {
+      "expression": "v IN ('a', 'z')",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v NOT IN ('a', '')",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "v IN ('a', NULL)",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "coalesce(v, NULL)",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "coalesce(NULL, v, 'a')",
+      "input": null,
+      "value": "a"
+    },
+    {
+      "expression": "coalesce('a', v)",
+      "input": null,
+      "value": "a"
+    },
+    {
+      "expression": "greatest(v, v)",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "least(v, v)",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "greatest(v, 'a')",
+      "input": null,
+      "value": "a"
+    },
+    {
+      "expression": "least('a', v)",
+      "input": null,
+      "value": "a"
+    },
+    {
+      "expression": "nullif(v, 'z')",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "CASE WHEN true THEN v ELSE NULL END",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "CASE WHEN true THEN v ELSE 'a' END",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "CASE WHEN false THEN v ELSE 'a' END",
+      "input": null,
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN true THEN 'a' ELSE v END",
+      "input": null,
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'a' ELSE v END",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "false AND v = 'Z'",
+      "input": null,
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "true OR v = 'Z'",
+      "input": null,
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'Z' ELSE v END",
+      "input": null,
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "coalesce(v, 'Z')",
+      "input": null,
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "false AND v = 'a'",
+      "input": null,
+      "value": false
+    },
+    {
+      "expression": "true OR v = 'a'",
+      "input": null,
+      "value": true
+    },
+    {
+      "expression": "v = 'z'::text",
+      "input": null,
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "v::bigint",
+      "input": null,
+      "sqlstate": "42846"
+    },
+    {
+      "expression": "v::boolean",
+      "input": null,
+      "sqlstate": "42846"
+    },
+    {
+      "expression": "v + v",
+      "input": null,
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "v = 'Z'",
+      "input": null,
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "coalesce(v, 'z'::text)",
+      "input": null,
+      "sqlstate": "42804"
+    }
+  ]
+}

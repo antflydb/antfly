@@ -89,7 +89,7 @@ fn json(alloc: std.mem.Allocator, input: anytype) !Json {
 }
 
 fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Datum) !Json {
-    if (value.temporal() != null) return error.UnsupportedSqlShape;
+    if (value.temporal() != null or value.enumeration() != null or result.kind == .enumeration) return error.UnsupportedSqlShape;
     const kind = result.kind orelse return error.SqlTypeMismatch;
     const identity = result.element_type;
     if (kind == .array) return json(alloc, .{
@@ -200,6 +200,7 @@ pub fn indexInstructionIdentity(alloc: std.mem.Allocator, program: *const scalar
         .column = "",
         .expression = lowered.expression,
         .result_type = switch (lowered.type) {
+            .enumeration => return error.UnsupportedSqlShape,
             .string, .uuid => .string,
             .integer => .integer,
             .number => if (lowered.element_type == .numeric) .numeric else .number,

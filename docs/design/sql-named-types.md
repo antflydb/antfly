@@ -139,8 +139,10 @@ before the original cases receive implementation credit:
 
 1. Bind SQL type-name intents and scalar descriptors to the schema-owned
    definitions. Public JSON schema binding, catalog dependencies and typed-row
-   APIs are implemented; SQL scalar paths still reject enum columns rather
-   than treating symbols as integers or labels as TEXT.
+   APIs are implemented; SQL catalog column discovery still rejects enum columns until named
+   SQL column/result contracts are wired end to end. Bound scalar programs now
+   carry exact enum domains through expression evaluation; this is not public
+   SQL column activation.
 2. Complete enum expression operations, uniqueness/FK type compatibility and
    distributed integrity qualification over those public schemas.
 3. Bind named type intents in SQL columns, scalar casts and parameter/result
@@ -183,8 +185,8 @@ This uses the existing native integrity planner and transaction machinery.
 
 Dependent ADD VALUE and DROP CASCADE still require coordinated owner/schema
 activation. Their explicit activation barrier remains in place, while DROP
-RESTRICT reports dependent objects. SQL scalar/array descriptors, named casts,
-expressions and domain activation remain unfinished. These changes do not
+RESTRICT reports dependent objects. Public SQL column/array descriptors, named cast resolution and domain
+activation remain unfinished. These changes do not
 qualify the original enum/domain cases or change the disposition ledger.
 
 Creation now captures compiler-derived reader contracts before the catalog
@@ -214,3 +216,51 @@ operations and 100,000 JSON-bound preparations took roughly 89 ms and 32 ms,
 respectively, with zero allocations after preparation. These microbenchmarks
 are separate from end-to-end request throughput and do not qualify SQL scalar
 execution or coordinated type activation.
+
+
+## Bound SQL values and retained execution
+
+SQL datums now carry schema-prepared enum atoms in the existing extension slot,
+without growing each ordinary cell. Atoms cache borrowed labels and immutable
+ranks once per type epoch. Equality, ordering and hashing retain local type ID,
+durable origin and symbol; equivalent additive generations share their existing
+symbol/rank history. Common domains select the additive successor when two
+inputs reference different compatible generations.
+
+Bound scalar programs support enum comparisons, unknown literal input, explicit
+text output, NULL/three-valued operators, IN, CASE, COALESCE, NULLIF, LEAST and
+GREATEST. Enum arithmetic, implicit typed-TEXT comparisons, unrelated enums and
+conflicting shared parameters fail during binding. Unknown enum literals use
+the existing mandatory input-preparation lane, so invalid labels fail before
+lazy branch execution and valid constant labels resolve once per program.
+Variable-width rank comparison consumes the shared execution work quota. Programs and parameter frames
+capture deduplicated owned executable directories. PostgreSQL enum binary input
+is a label, not a native four-byte symbol. Serialized descriptors and casts expose
+symbolic identity/generation witnesses, never executable process pointers;
+unbound deserialization rejects those witnesses until catalog rebinding exists.
+
+Graph hash joins, membership, grouping, top-K, MIN/MAX partial transport and
+portable row/column spill retain the same typed atoms. Spill decoding bounds and
+validates identity, labels and ranks before copying. Generic JSON, builtin-array
+and coarse native-mutation paths reject unsupported enum payloads instead of
+interpreting their JSON-null placeholders as SQL NULL.
+
+Retained enum columns intern each distinct (type, origin, symbol) once, own its
+label/rank independently of the producer and retain only one tagged pointer per
+row plus the NULL bitmap. Enum-only columns allocate no placeholder JSON vector.
+A mixed producer widens safely, and primitive physical-vector shortcuts refuse
+extension columns. A Debug campaign retaining 8,192 repeated values used 14
+allocator calls, including vector growth. This is allocation evidence, not an
+end-to-end throughput claim.
+
+The reproducible PostgreSQL 18+ execution oracle contains 216 scalar probes over
+three labels and SQL NULL, checking exact values and SQLSTATEs. Native campaigns
+also cover disk-backed duplicate join fan-out, producer retirement, additive
+common types, malformed/truncated spill, budget failure and exhaustive allocation
+failures. Compatibility JSON hashing now agrees with prepared-row hashing for
+enum labels, empty labels, NULL and absent fields.
+
+These changes establish the shared enum value/expression execution layer. Public SQL type
+name/column/result binding, scalar/array OIDs, named casts, distributed dependent
+schema activation, domains and original enum DDL qualification remain incomplete.
+No original inventory disposition was changed for these runtime probes.

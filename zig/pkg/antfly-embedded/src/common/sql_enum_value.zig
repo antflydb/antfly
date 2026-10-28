@@ -23,6 +23,54 @@ pub const Value = struct {
     type_id: u64,
     origin_id: [16]u8,
     symbol: u32,
+    /// Cached immutable slices belong to the prepared type epoch, not a row.
+    text: []const u8 = &.{},
+    order_key: []const u8 = &.{},
+
+    pub fn validate(self: Value) !void {
+        _ = try types.Identity.init(self.type_id, 1, 1, self.origin_id);
+        if (self.symbol == 0 or self.symbol > types.max_labels) return error.InvalidSqlEnumSymbol;
+        try types.validateLabel(self.text);
+        try @import("sql_enum_order.zig").validate(self.order_key, types.max_order_bytes);
+    }
+    pub fn sameType(self: Value, other: Value) bool {
+        return self.type_id == other.type_id and std.mem.eql(u8, &self.origin_id, &other.origin_id);
+    }
+    pub fn compare(self: Value, other: Value) !std.math.Order {
+        try self.validate();
+        try other.validate();
+        if (!self.sameType(other)) return error.SqlUndefinedOperator;
+        // An executable type never reassigns existing symbol/rank/label pairs.
+        // Reject contradictory retained/spilled witnesses instead of letting
+        // hash grouping and ordered grouping disagree about equality.
+        const order = std.mem.order(u8, self.order_key, other.order_key);
+        if ((order == .eq) != (self.symbol == other.symbol) or
+            (self.symbol == other.symbol and !std.mem.eql(u8, self.text, other.text))) return error.InvalidSqlNamedType;
+        return order;
+    }
+    pub fn hash(self: Value, hasher: anytype) !void {
+        try self.validate();
+        var id: [8]u8 = undefined;
+        var symbol_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u64, &id, self.type_id, .little);
+        std.mem.writeInt(u32, &symbol_bytes, self.symbol, .little);
+        hasher.update("antfly:sql-enum-datum:v1\x00");
+        hasher.update(&id);
+        hasher.update(&self.origin_id);
+        hasher.update(&symbol_bytes);
+    }
+    pub fn clone(self: Value, a: A) !*const Value {
+        try self.validate();
+        const owned = try a.create(Value);
+        errdefer a.destroy(owned);
+        const text = try a.dupe(u8, self.text);
+        errdefer a.free(text);
+        const rank = try a.dupe(u8, self.order_key);
+        owned.* = self;
+        owned.text = text;
+        owned.order_key = rank;
+        return owned;
+    }
 };
 
 /// Borrows the immutable record. Both the record and this owner outlive every
@@ -37,7 +85,7 @@ pub const View = struct {
         var labels = try types.View.init(a, record.definition);
         errdefer labels.deinit(a);
         const symbols = try a.alloc(Value, record.definition.labels.len);
-        for (symbols, record.definition.labels) |*value, label| value.* = .{ .type_id = record.identity.id, .origin_id = record.identity.origin_id, .symbol = label.id };
+        for (symbols, record.definition.labels) |*value, label| value.* = .{ .type_id = record.identity.id, .origin_id = record.identity.origin_id, .symbol = label.id, .text = label.text, .order_key = label.order_key };
         return .{ .record = record, .labels = labels, .symbols = symbols };
     }
     pub fn deinit(self: *View, a: A) void {
@@ -55,7 +103,9 @@ pub const View = struct {
     }
     fn check(self: *const View, value: *const Value) !types.Label {
         if (value.type_id != self.record.identity.id or !std.mem.eql(u8, &value.origin_id, &self.record.identity.origin_id)) return error.SqlTypeMismatch;
-        return self.record.definition.byId(value.symbol);
+        const label = try self.record.definition.byId(value.symbol);
+        if (!std.mem.eql(u8, value.text, label.text) or !std.mem.eql(u8, value.order_key, label.order_key)) return error.InvalidSqlNamedType;
+        return label;
     }
     pub fn output(self: *const View, value: *const Value) ![]const u8 {
         return (try self.check(value)).text;

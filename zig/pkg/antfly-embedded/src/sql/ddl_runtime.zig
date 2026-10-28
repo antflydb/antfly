@@ -545,6 +545,7 @@ pub fn columnProperty(alloc: std.mem.Allocator, column: ast.Column, nullable: bo
     else
         try std.json.Stringify.valueAlloc(alloc, .{
             .type = switch (column.type) {
+                .enumeration => return error.UnsupportedSqlShape,
                 .array => "sql_array",
                 .numrange => "numrange",
                 .daterange => "daterange",
