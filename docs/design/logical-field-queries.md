@@ -999,3 +999,9 @@ and `_computed` are both delivered; public array compaction cannot change scalar
 indexes. A typed borrowed consumer requires eager hydration before its callback
 and cannot opt into spooled/consumed page delivery. Ordinary column-only wire
 encoding continues to stream without an extra source DOM.
+
+An internal consumer should select the narrowest existing projection that
+preserves its semantics. Source masks suffice for object-only path access;
+numeric array selections need scalar binding before source compaction. Identity
+outputs stay separate from source keys. Typed delivery removes response encoding;
+it does not imply that computing every source value again as a scalar is free.

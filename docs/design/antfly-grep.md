@@ -1318,3 +1318,15 @@ Column-backed scalar output also retains requested `_source` values; public arra
 masking and scalar resolution use separate views of original positions. Ordinary
 column wire responses without scalar outputs keep streaming rather than building
 an extra DOM. Owned fallback plans use reclaimable scratch without bypassing quotas.
+
+Media query layout is selected from path structure. Object-only paths use the
+ordinary public source projection and a borrowed typed result; computing a
+second large scalar output adds work without changing path semantics. Any
+numeric path segment conservatively selects flat value/missing bindings so
+array masks cannot compact an index before resolution. Optional identity pins
+use independent computed identity outputs in either layout; projected source
+keys cannot impersonate them. Missing computed pins never downgrade. This
+choice is independent of image size, document IDs and benchmark corpus. A paired
+all-flat implementation regressed large four-image CPU about 41%, motivating
+this structural source/scalar split; that rejected result remains in ignored
+qualification evidence rather than becoming a performance claim.

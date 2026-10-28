@@ -271,6 +271,19 @@ pub fn checkStatus(status: i64) !void {
     };
 }
 pub const Group = struct {
+    /// Numeric source masks compact arrays; resolve those paths before masking.
+    /// Object-only paths can retain the cheaper public source projection.
+    pub fn requiresFlatValues(self: @This()) bool {
+        for (self.fields.items) |path| {
+            var parts = std.mem.splitScalar(u8, path, '.');
+            while (parts.next()) |part| {
+                if (part.len != 0 and for (part) |byte| {
+                    if (!std.ascii.isDigit(byte)) break false;
+                } else true) return true;
+            }
+        }
+        return false;
+    }
     references: std.ArrayList(usize) = .empty,
     ids: std.ArrayList([]const u8) = .empty,
     fields: std.ArrayList([]const u8) = .empty,
