@@ -5309,7 +5309,7 @@ pub const ApiHttpServer = struct {
         }
         fn dispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table: []const u8, body: []const u8, filter: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const result = try self.server.executePublicTableQueryDispatchWithIdentity(alloc, source, table, body, filter, self.identity, deadline, cancellation, null, null, self.resolver);
+            const result = try self.server.executePublicTableQueryDispatchWithIdentity(alloc, source, table, body, filter, self.identity, deadline, cancellation, null, null, self.resolver, null);
             return result.json;
         }
         fn build(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, value: std.json.Value, deadline: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
@@ -5334,6 +5334,7 @@ pub const ApiHttpServer = struct {
             null,
             execution_deadline_ns,
             cancellation,
+            null,
             null,
             null,
             null,
@@ -14701,6 +14702,7 @@ pub const ApiHttpServer = struct {
             null,
             null,
             null,
+            null,
         );
         return response.json;
     }
@@ -14750,6 +14752,7 @@ pub const ApiHttpServer = struct {
                 response_label,
                 bound_join,
                 resolver,
+                resolver.delivery,
             ) catch |err| switch (err) {
                 error.IndexRebuilding,
                 error.DocIdentityNamespaceMismatch,
@@ -14918,6 +14921,7 @@ pub const ApiHttpServer = struct {
             binding.label,
             if (binding.join) |*join| join else null,
             &resolver,
+            null,
         ) catch |err| {
             if (query_api.isPublicQueryValidationError(err)) return error.InvalidRetrievalAgentRequest;
             return err;
@@ -14937,6 +14941,7 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
         catalog_resolver: ?*CatalogQueryResolver,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !query_api.QueryResponse {
         var catalog_arena = std.heap.ArenaAllocator.init(alloc);
         defer catalog_arena.deinit();
@@ -14959,7 +14964,7 @@ pub const ApiHttpServer = struct {
                 cancellation,
                 response_label,
                 resolver,
-                resolver.delivery,
+                delivery,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.InvalidFilterQueryRequest,
@@ -15139,7 +15144,7 @@ pub const ApiHttpServer = struct {
             return .{ .json = try distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources) };
         }
 
-        const result = self.executePlainPublicTableQuery(
+        const result = self.executePlainPublicTableQueryWithDelivery(
             alloc,
             source,
             table_name,
@@ -15151,6 +15156,7 @@ pub const ApiHttpServer = struct {
             cancellation,
             response_label,
             resolver,
+            delivery,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest,
@@ -58156,6 +58162,7 @@ test "api http server executes direct foreign table aggregations through registr
         null,
         null,
         null,
+        null,
     ));
     var unsupported_response = try server.publicQueryOperationErrorResponse("pg_customers", unsupported_body, error.UnsupportedQueryRequest);
     defer unsupported_response.deinit(alloc);
@@ -60349,6 +60356,10 @@ test "httpx inference gateway native delivery preserves retries and source only 
     const Fake = struct {
         attempts: usize = 0,
         legacy: bool = false,
+        expected_prefix: []const u8 = "tenant/",
+        require_prepared: bool = false,
+        allow_wire: bool = false,
+        wire_calls: usize = 0,
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query, .query_with_delivery = queryWithDelivery } };
         }
@@ -60358,14 +60369,23 @@ test "httpx inference gateway native delivery preserves retries and source only 
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
             return error.UnsupportedOperation;
         }
-        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
-            return error.UnexpectedLegacyQuery;
+        fn query(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.wire_calls += 1;
+            if (!self.allow_wire) return error.UnexpectedLegacyQuery;
+            try std.testing.expect(req.field_projection_plan == null);
+            try std.testing.expect(req.field_projection_json.len == 0);
+            return try query_contract.encodeQueryResponses(alloc, table, req, .{}, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 });
         }
         fn queryWithDelivery(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, delivery: ?@import("antfly_local_sources").api_query_response.Delivery) anyerror!?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.attempts += 1;
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
-            try std.testing.expectEqualStrings("tenant/", req.filter_prefix);
+            try std.testing.expectEqualStrings(self.expected_prefix, req.filter_prefix);
+            if (self.require_prepared) {
+                try std.testing.expect(req.field_projection_plan != null);
+                try std.testing.expect(req.field_projection_json.len != 0);
+            }
             if (self.legacy and req.field_projection_json.len != 0) return error.InvalidQueryRequest;
             if (self.legacy) {
                 try std.testing.expect(req.field_projection_plan == null);
@@ -60422,4 +60442,39 @@ test "httpx inference gateway native delivery preserves retries and source only 
     try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetryAndDelivery(a, null, older.source(), "docs", named_req, .read_index, .none, delivery));
     try std.testing.expectEqual(@as(usize, 1), older.attempts);
     try std.testing.expectEqual(@as(usize, 0), sink.count);
+
+    const Status = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Status.status } }, null, null);
+    defer server.deinit();
+    // Exercise dispatch, not only its lower-level retry helper. Query-only
+    // bodies and modern search bodies reach different normalization branches.
+    // Both must preserve the admitted native consumer and source preparation.
+    for ([_][]const u8{
+        "{\"query\":{\"bool\":{\"filter\":{\"ids\":[\"a\"]}}},\"fields\":[\"images.preview\",\"revision\",\"permissions\"],\"limit\":1}",
+        "{\"filter_query\":{\"ids\":[\"a\"]},\"fields\":[\"images.preview\",\"revision\",\"permissions\"],\"limit\":1}",
+    }) |body| {
+        native = .{ .expected_prefix = "", .require_prepared = true };
+        sink = .{};
+        var resolver = ApiHttpServer.CatalogQueryResolver{ .arena = a, .delivery = delivery };
+        var dispatched = try server.executePublicTableQueryDispatchWithIdentity(a, native.source(), "docs", body, null, null, null, null, null, null, &resolver, delivery);
+        defer dispatched.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), native.attempts);
+        try std.testing.expectEqual(@as(usize, 1), sink.count);
+        try std.testing.expectEqual(@as(?usize, 0), dispatched.delivered_bytes);
+        // Nested join/retrieval dispatch must retain its owned response even
+        // while sharing catalog state with an outer native consumer.
+        native = .{ .expected_prefix = "", .allow_wire = true };
+        sink = .{};
+        var nested = try server.executePublicTableQueryDispatchWithIdentity(a, native.source(), "docs", body, null, null, null, null, null, null, &resolver, null);
+        defer nested.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), native.wire_calls);
+        try std.testing.expectEqual(@as(usize, 0), native.attempts);
+        try std.testing.expectEqual(@as(usize, 0), sink.count);
+        try std.testing.expect(nested.json.len != 0);
+        try std.testing.expect(nested.delivered_bytes == null);
+    }
 }

@@ -1029,3 +1029,9 @@ be dropped, and a consumer failure cannot replay a completed result.
 Source-only preparation does not alter retained/cursor or offset planning.
 Consumer-bearing native reads with a retained cut or graph dialect use the
 existing finalized wire path rather than remerging an already-paged response.
+
+Result-consumer ownership is explicit at query dispatch. Query-only and modern
+search bodies preserve the same admitted delivery contract. Nested join and
+retrieval execution may share catalog state, but must request owned responses
+until its parent has assembled the final result; it cannot inherit and invoke
+the parent's consumer merely by sharing that catalog resolver.

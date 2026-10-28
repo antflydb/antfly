@@ -1398,3 +1398,22 @@ their existing physical plan. Media groups estimated below 64 KiB encoded use
 owned-wire delivery; larger groups request the borrowed result view. Estimates
 choose a representation only: actual source/wire budgets, authorization,
 identity, digest, MIME and decoded bounds are enforced in both paths.
+
+Native result delivery is an explicit query-execution option through both the
+query-only and modern-search dispatch branches. Sharing catalog resolution with
+an outer consumer does not give a nested join/retrieval query that consumer:
+internal subqueries retain owned responses until final assembly. Regression
+coverage invokes the dispatcher with both request shapes, requires the native
+consumer and prepared source program, and separately verifies nested wire
+ownership without inheriting the outer consumer. The pre-fix dispatcher test
+failed with `UnexpectedLegacyQuery`, rather than relying on a fixture that
+unconditionally returns a prepared response.
+
+Qualification at `8420bd4f9ccf` passed 57 HTTP cases and retained alias/source CPU
+gains; ordinary Unicode and escaped-string controls returned near their baseline.
+The expanded media suite still regressed large-media CPU about 20–34%, exposing
+a second dispatch branch that discarded delivery for query-only bodies. That
+executable and its reports remain in ignored
+`output/projection-followup/delivery-dispatch-8420/`; it is not the final media
+qualification. The consumer is now passed explicitly through both branches,
+with nested query dispatch explicitly retaining its owned response.
