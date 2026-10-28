@@ -1338,3 +1338,73 @@ pass with zero failures, skips or leaks. All 30 real Parquet archive E2Es and al
 highlights are compared with fully projected output in both directions, after
 restart, and with the original Parquet object unavailable. Subsequent changes
 record benchmark evidence and documentation only.
+
+### Cancellable dense highlight kernels and prepared routing (v1)
+
+`highlight_kernels.py LABEL IMMUTABLE_BINARY SOURCE_COMMIT` measures a real
+Parquet fixture at 2, 8, 32, 64 and 128 KiB with sparse/dense matches, one
+returned hit and at most three snippets. Its second cohort returns 32 dense
+32-KiB bodies with hidden/projected fields and 250-ms/1-ms request budgets.
+`hidden_highlights.py` remains the separate eight-field and narrow control.
+Both runners use three samples per point and run in old/new, then new/old order.
+
+[native-highlight-kernels-v1-observation.json](native-highlight-kernels-v1-observation.json)
+retains all 204 measured HTTP samples, complete-result/total digests, input and
+runner hashes, executable hashes, sources, deadline bodies and slower controls.
+The runtime source is `9efb6f766d665c6eeac865829db5bcebbc7c57b5`, frozen as
+`95fed771fd16d872da973990ef8242d13850f777ca64e1c05d7998025a2369d1`.
+The control is runtime `afcde2f5f55f542a96bcda3eb16ac3fc44660df0`, executable
+`27293d06f21235e7a58c57fd0e3dd8f3734d6fad22fc82d606fa10938e160a16`.
+Main `65a8336d33ad4aecf0687b0d4e5c7620ba8bc6f3` was merged without conflicts;
+its advance changes only the Hacker News example and `.gitignore`, leaving
+runtime/build/test inputs unchanged. Benchmark controls were committed at
+`4b86119e38485335f6dc2b71e10704be31820be3` before measurement.
+
+Dense-field median HTTP latency in milliseconds:
+
+| Field bytes | Primary old → new | Reverse old → new |
+|---|---:|---:|
+| 2 KiB | 12.45 → 11.98 | 13.68 → 12.44 |
+| 8 KiB | 18.89 → 15.48 | 19.79 → 16.34 |
+| 32 KiB | 69.08 → 30.15 | 71.98 → 29.93 |
+| 64 KiB | 202.10 → 48.51 | 204.41 → 48.53 |
+| 128 KiB | 701.83 → 85.90 | 730.37 → 97.08 |
+
+The 128-KiB dense point improves 8.17x/7.52x; 64 KiB improves 4.17x/4.21x.
+Sparse-field controls remain near their original latencies: at 128 KiB they
+are 20.45 → 21.13 ms and 21.79 → 22.00 ms. All ten complete density-case hit
+oracles and the normal 32-row deadline-cohort output agree across both binaries
+and orders. Native reference tests separately cover randomized UTF-8 clipping,
+density ranking, greedy overlap selection, allocation faults and cancellation.
+Equal-density/equal-start windows now have an explicit shortest-end tie rule.
+
+The 250-ms projected deadline control previously returns HTTP 500 after median
+1851.58/1888.69 ms. It now returns the existing HTTP 504 `query_timeout` envelope
+after 252.19/252.10 ms, including its public retry contract. The hidden control
+already stops near the deadline; its erroneous HTTP 500 is likewise corrected.
+All new 1-ms controls return structured HTTP 504. These are cooperative budget
+observations, not a hard wall-clock guarantee.
+
+The broad sparse fixture does **not** establish a general search speedup:
+
+| Control | Primary old → new ms | Reverse old → new ms |
+|---|---:|---:|
+| Eight hidden fields | 284.75 → 293.86 | 281.59 → 293.77 |
+| Eight projected fields | 284.35 → 262.40 | 265.59 → 264.71 |
+| One hidden field | 111.10 → 109.02 | 109.65 → 110.32 |
+
+Wide hidden latency is 3.2%/4.3% slower; its measured highlight phase increases
+from 213.71 → 229.31 ms and 217.90 → 228.61 ms. Projected/narrow controls and every
+individual sample are retained. Routing and kernel changes are measured
+together; these observations do not isolate a benefit from prepared routing.
+The small sparse-control overhead is retained alongside cancellable CPU work
+and separate scratch/result ownership.
+
+The frozen server passes 75 targeted native tests with no failures, skips or
+leaks and all 48 real-data E2Es (32 archive, 16 Iceberg/SQL), without skips.
+New Parquet/Iceberg cases check hidden/projected snippets across restart while
+source Parquet is unavailable, structured deadlines and a healthy request after
+timeout. The Apache boundary check covers 2,555 sources. Measurements use Zig
+0.17.0 Debug, warm local filesystem object storage and synthetic real Parquet.
+No task-owned build, E2E or cleanup overlaps measurement; the host is shared.
+These results do not qualify Release, cloud, empty-cache or archive-scale latency.
