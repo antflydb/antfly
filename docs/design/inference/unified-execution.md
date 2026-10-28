@@ -3341,3 +3341,9 @@ complete attention PTX remains byte-identical.
 [The AM register](unified-execution-am-outcomes.md) records the AL device
 regression, a shared resident-weight ownership guard across four CUDA host
 fast paths and expanded independent ownership and device validation.
+
+### AN shared recurrent Q/K scan
+
+[The AN register](unified-execution-an-outcomes.md) records one padded Q/K
+scan owner across fresh and ragged CUDA recurrence, removing 3,383 maintained
+source bytes with identical expanded tokens and the unchanged complete PTX.

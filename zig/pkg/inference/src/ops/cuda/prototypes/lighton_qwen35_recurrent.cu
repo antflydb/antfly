@@ -388,6 +388,50 @@ extern "C" __global__ void lighton_prefix_batch_recurrent(const __grid_constant_
         p.base.out + page * p.seq * width + head * 128);
 }
 
+// One padded eight-token Q/K scan for fresh and resumed page schedules.
+// Expand in the caller so register lifetimes, barriers and state stores retain
+// their original lexical scope. Initialization and packet admission stay local.
+#define ANTFLY_GDN_SHARED_QK_SCAN(Sequence) \
+for (int base = 0; base < Sequence; base += 8) { \
+    const int d = threadIdx.x; \
+    const int slot = (d / 32) * 33 + d % 32; \
+    _Pragma("unroll") \
+    for (int local = 0; local < 8; ++local) { \
+        const int t = base + local; \
+        qtile[local][slot] = t < Sequence ? conv[t * channels + kh * 128 + d] : 0.f; \
+        ktile[local][slot] = t < Sequence ? conv[t * channels + (kh + p.base.key_heads) * 128 + d] : 0.f; \
+    } \
+    __syncthreads(); \
+    _Pragma("unroll 1") \
+    for (int local = 0; local < 8 && base + local < Sequence; ++local) { \
+        const int t = base + local; \
+        const float decay = gates[t * width]; \
+        const float beta = gates[t * width + 1]; \
+        float prediction = 0; \
+        _Pragma("unroll") \
+        for (int i = 0; i < 32; ++i) { \
+            memory[i] *= decay; \
+            prediction += memory[i] * ktile[local][partition * 33 + i]; \
+        } \
+        prediction += __shfl_xor_sync(0xffffffffu, prediction, 8); \
+        prediction += __shfl_xor_sync(0xffffffffu, prediction, 16); \
+        const float value = conv[t * channels + 2 * p.base.key_heads * 128 + vh * 128 + column]; \
+        const float delta = (value - prediction) * beta; \
+        float result = 0; \
+        _Pragma("unroll") \
+        for (int i = 0; i < 32; ++i) { \
+            memory[i] += ktile[local][partition * 33 + i] * delta; \
+            result += memory[i] * qtile[local][partition * 33 + i]; \
+        } \
+        result += __shfl_xor_sync(0xffffffffu, result, 8); \
+        result += __shfl_xor_sync(0xffffffffu, result, 16); \
+        if (partition == 0) output[t * width + column] = result; \
+    } \
+    __syncthreads(); \
+} \
+_Pragma("unroll") \
+for (int i = 0; i < 32; ++i) p.base.pages[page].state[(vh * 128 + partition * 32 + i) * 128 + column] = memory[i];
+
 // Fresh-prefix Q/K staging preserves the original per-element arithmetic.
 // Padding each 32-key partition avoids shared-memory bank conflicts between
 // the four partitions in a warp. Eight tokens amortize both block barriers.
@@ -408,45 +452,7 @@ extern "C" __global__ void lighton_prefix_batch_recurrent_shared_qk(const __grid
     const float* conv = p.base.conv + page * p.seq * channels;
     const float* gates = p.base.out + page * p.seq * width + vh * 128;
     float* output = p.base.core + page * p.seq * width + vh * 128;
-    for (int base = 0; base < p.seq; base += 8) {
-        const int d = threadIdx.x;
-        const int slot = (d / 32) * 33 + d % 32;
-        #pragma unroll
-        for (int local = 0; local < 8; ++local) {
-            const int t = base + local;
-            qtile[local][slot] = t < p.seq ? conv[t * channels + kh * 128 + d] : 0.f;
-            ktile[local][slot] = t < p.seq ? conv[t * channels + (kh + p.base.key_heads) * 128 + d] : 0.f;
-        }
-        __syncthreads();
-        #pragma unroll 1
-        for (int local = 0; local < 8 && base + local < p.seq; ++local) {
-            const int t = base + local;
-            const float decay = gates[t * width];
-            const float beta = gates[t * width + 1];
-            float prediction = 0;
-            #pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                memory[i] *= decay;
-                prediction += memory[i] * ktile[local][partition * 33 + i];
-            }
-            prediction += __shfl_xor_sync(0xffffffffu, prediction, 8);
-            prediction += __shfl_xor_sync(0xffffffffu, prediction, 16);
-            const float value = conv[t * channels + 2 * p.base.key_heads * 128 + vh * 128 + column];
-            const float delta = (value - prediction) * beta;
-            float result = 0;
-            #pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                memory[i] += ktile[local][partition * 33 + i] * delta;
-                result += memory[i] * qtile[local][partition * 33 + i];
-            }
-            result += __shfl_xor_sync(0xffffffffu, result, 8);
-            result += __shfl_xor_sync(0xffffffffu, result, 16);
-            if (partition == 0) output[t * width + column] = result;
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (int i = 0; i < 32; ++i) p.base.pages[page].state[(vh * 128 + partition * 32 + i) * 128 + column] = memory[i];
+    ANTFLY_GDN_SHARED_QK_SCAN(p.seq)
 }
 
 // Compact page rows; every page keeps its own sequence, initialization and state.
@@ -492,45 +498,7 @@ extern "C" __global__ void lighton_ragged_recurrent_shared_qk(const __grid_const
     const float* conv = p.base.conv + offset * channels;
     const float* gates = p.base.out + offset * width + vh * 128;
     float* output = p.base.core + offset * width + vh * 128;
-    for (int base = 0; base < seq; base += 8) {
-        const int d = threadIdx.x;
-        const int slot = (d / 32) * 33 + d % 32;
-        #pragma unroll
-        for (int local = 0; local < 8; ++local) {
-            const int t = base + local;
-            qtile[local][slot] = t < seq ? conv[t * channels + kh * 128 + d] : 0.f;
-            ktile[local][slot] = t < seq ? conv[t * channels + (kh + p.base.key_heads) * 128 + d] : 0.f;
-        }
-        __syncthreads();
-        #pragma unroll 1
-        for (int local = 0; local < 8 && base + local < seq; ++local) {
-            const int t = base + local;
-            const float decay = gates[t * width];
-            const float beta = gates[t * width + 1];
-            float prediction = 0;
-            #pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                memory[i] *= decay;
-                prediction += memory[i] * ktile[local][partition * 33 + i];
-            }
-            prediction += __shfl_xor_sync(0xffffffffu, prediction, 8);
-            prediction += __shfl_xor_sync(0xffffffffu, prediction, 16);
-            const float value = conv[t * channels + 2 * p.base.key_heads * 128 + vh * 128 + column];
-            const float delta = (value - prediction) * beta;
-            float result = 0;
-            #pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                memory[i] += ktile[local][partition * 33 + i] * delta;
-                result += memory[i] * qtile[local][partition * 33 + i];
-            }
-            result += __shfl_xor_sync(0xffffffffu, result, 8);
-            result += __shfl_xor_sync(0xffffffffu, result, 16);
-            if (partition == 0) output[t * width + column] = result;
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (int i = 0; i < 32; ++i) p.base.pages[page].state[(vh * 128 + partition * 32 + i) * 128 + column] = memory[i];
+    ANTFLY_GDN_SHARED_QK_SCAN(seq)
 }
 
 extern "C" __global__ void lighton_ragged_prefix_conv(const __grid_constant__ RaggedParams p) {
@@ -574,45 +542,7 @@ extern "C" __global__ void lighton_ragged_recurrent_prefix_only(const __grid_con
     const float* conv = p.base.conv + offset * channels;
     const float* gates = p.base.out + offset * width + vh * 128;
     float* output = p.base.core + offset * width + vh * 128;
-    for (int base = 0; base < seq; base += 8) {
-        const int d = threadIdx.x;
-        const int slot = (d / 32) * 33 + d % 32;
-        #pragma unroll
-        for (int local = 0; local < 8; ++local) {
-            const int t = base + local;
-            qtile[local][slot] = t < seq ? conv[t * channels + kh * 128 + d] : 0.f;
-            ktile[local][slot] = t < seq ? conv[t * channels + (kh + p.base.key_heads) * 128 + d] : 0.f;
-        }
-        __syncthreads();
-        #pragma unroll 1
-        for (int local = 0; local < 8 && base + local < seq; ++local) {
-            const int t = base + local;
-            const float decay = gates[t * width];
-            const float beta = gates[t * width + 1];
-            float prediction = 0;
-            #pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                memory[i] *= decay;
-                prediction += memory[i] * ktile[local][partition * 33 + i];
-            }
-            prediction += __shfl_xor_sync(0xffffffffu, prediction, 8);
-            prediction += __shfl_xor_sync(0xffffffffu, prediction, 16);
-            const float value = conv[t * channels + 2 * p.base.key_heads * 128 + vh * 128 + column];
-            const float delta = (value - prediction) * beta;
-            float result = 0;
-            #pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                memory[i] += ktile[local][partition * 33 + i] * delta;
-                result += memory[i] * qtile[local][partition * 33 + i];
-            }
-            result += __shfl_xor_sync(0xffffffffu, result, 8);
-            result += __shfl_xor_sync(0xffffffffu, result, 16);
-            if (partition == 0) output[t * width + column] = result;
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (int i = 0; i < 32; ++i) p.base.pages[page].state[(vh * 128 + partition * 32 + i) * 128 + column] = memory[i];
+    ANTFLY_GDN_SHARED_QK_SCAN(seq)
 }
 
 
@@ -707,3 +637,5 @@ extern "C" __global__ void lighton_ragged_prefix_gated_norm(const __grid_constan
     if(d==0)partial[0]=rsqrtf((partial[0]+partial[1]+partial[2]+partial[3])/128.f+p.base.eps);
     __syncthreads();float z=p.base.z[index];p.base.out[index]=value*partial[0]*p.base.norm_weight[d]*(z/(1.f+expf(-z)));
 }
+
+#undef ANTFLY_GDN_SHARED_QK_SCAN
