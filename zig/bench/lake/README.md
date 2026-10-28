@@ -1631,3 +1631,25 @@ cases pass. Runtime code is unchanged between runs. These cases verify sparse,
 dense and Unicode snippets after removing the original objects and restarting.
 Apache boundary checks cover 2,574 source files; license, lint, formatting and
 whitespace checks pass.
+
+Main advanced after that frozen comparison. The [post-merge validation](dense-source-refinements-postmerge-validation.json)
+records main `f2b7b76d57d2b51bf78171dcef3e8c0ccc582ffa`, merged runtime
+`d4950cdd761802aceef3b4911e7d7716fe2f9f12` and executable SHA-256
+`54415ed80303c5487884c834de978067f208cddbe9ae0779d8ca69ce801b9992`.
+Both owners pass **534 integration and 494 frontier cases**, each with its
+**243-case shared partition**, with zero skips, failures and leaks. All **48
+Parquet/Iceberg E2Es pass in one run**, without skips, in 367.58 seconds on that
+frozen executable. This validation does not extend the earlier timing comparison
+to the newer main revision.
+
+The merge keeps source capture and active document-local token leases ahead of
+main's optional compiled-position cache. A primed-cache probe verifies one
+analysis, one reuse and intact original offsets for both single and grouped
+bindings. After adapting an inherited test's helper arguments, the compiled
+contribution target passes **74 cases plus nine wrapper checks**, with no failures
+or leaks; its opt-in substring benchmark is skipped. The later `d3bcfe751e`
+change only restores shared work to the analyzer profiling interval, and that
+focused target passes again. Apache boundary checks cover **2,582 source files**;
+license, formatting and whitespace checks pass. The validation record preserves
+the initial combined command's test-compilation failure and the successful
+separate rerun instead of treating them as one all-green command.

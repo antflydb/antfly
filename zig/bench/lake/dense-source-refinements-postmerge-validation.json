@@ -1,0 +1,107 @@
+{
+  "captured_at_utc": "2026-10-28T23:51:02.348212+00:00",
+  "runtime_source_commit": "d4950cdd761802aceef3b4911e7d7716fe2f9f12",
+  "test_and_design_followup_commit": "cd0c3ac191",
+  "merged_main": "f2b7b76d57d2b51bf78171dcef3e8c0ccc582ffa",
+  "binary_sha256": "54415ed80303c5487884c834de978067f208cddbe9ae0779d8ca69ce801b9992",
+  "zig": "0.17.0",
+  "optimization": "Debug",
+  "scope": "Post-merge correctness qualification. Performance measurements remain bound to the earlier same-main frozen pair in dense-source-refinements-v1-observation.json; no post-merge timing comparison is claimed.",
+  "merge_resolution": "Retain all projection tests; prioritize original source capture and document-local token leases over the optional process-wide compiled-position cache. Verify a warm compiled cache cannot bypass byte-span capture for single or grouped bindings.",
+  "native_owner_executions": [
+    [
+      243,
+      0,
+      0,
+      0
+    ],
+    [
+      243,
+      0,
+      0,
+      0
+    ],
+    [
+      534,
+      0,
+      0,
+      0
+    ],
+    [
+      494,
+      0,
+      0,
+      0
+    ]
+  ],
+  "native_total_owner_executions": 1514,
+  "unique_native_test_count_claimed": false,
+  "native_failed": 0,
+  "native_skipped": 0,
+  "native_leaked": 0,
+  "combined_build_initial_exit": 1,
+  "combined_build_initial_failure": "The newly inherited substring admission test used the old helper signature. cd0c3ac191 adapts only its calls; no runtime changes. Both lake owners and CLI completed on the merged runtime. The separately rerun contribution target exits 0.",
+  "contribution_rerun_exit": 0,
+  "contribution_rerun_executions": [
+    [
+      74,
+      1,
+      0,
+      0
+    ],
+    [
+      9,
+      0,
+      0,
+      0
+    ]
+  ],
+  "contribution_skip": "Opt-in introducer.substring streaming benchmark; correctness, fault, warm-cache and reclamation cases pass.",
+  "source_analysis_warm_cache_probe": {
+    "single_and_grouped_paths": true,
+    "shared_runs_per_path": 1,
+    "shared_reuses_per_path": 1,
+    "captured_per_path": 1,
+    "source_reuses_per_path": 1,
+    "spilled_bytes_per_path": 110,
+    "compiled_cache_hits_during_capture": 0
+  },
+  "real_file_e2e": {
+    "passed": 48,
+    "failed": 0,
+    "skipped": 0,
+    "seconds": 367.58,
+    "workers": 2,
+    "parquet_archive_cases": 32,
+    "iceberg_sql_cases": 16,
+    "single_complete_run": true,
+    "binary_frozen": true
+  },
+  "static_checks": {
+    "apache_source_files": 2582,
+    "license": "pass",
+    "conflict_resolution_zig_format": "pass",
+    "whitespace": "pass"
+  },
+  "profiling_followup": {
+    "source_commit": "d3bcfe751ee599f4abc3bd1afdef7ef231662f9b",
+    "change": "Only move the single/grouped analyzer profiling start before source-capture/cache acquisition so shared analyzer work is counted. Query/highlight logic and indexing ownership unchanged.",
+    "focused_target_executions": [
+      [
+        74,
+        1,
+        0,
+        0
+      ],
+      [
+        9,
+        0,
+        0,
+        0
+      ]
+    ],
+    "focused_target_and_cli_build_exit": 0,
+    "cli_binary_sha256": "13dabefe664ac0a396b55098468dfc097765731ac53742c1ef498518f4681e4f",
+    "e2e_binary": "The complete E2E run above remains bound to the frozen pre-profiling-followup merged executable."
+  }
+}
