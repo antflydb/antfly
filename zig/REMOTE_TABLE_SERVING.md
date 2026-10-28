@@ -1856,3 +1856,38 @@ The phrase ceiling is the minimum across positions. Unknown statistics retain
 the collection ceiling, and an empty phrase has ceiling zero. This estimate only
 chooses between ordered traversal and text candidates; positional matching,
 residual predicates, authorization, scoring and cursor proofs remain authoritative.
+
+### Prepared highlight routing and cancellable fragment kernels
+
+A lake execution retains one prepared highlight plan through every result batch.
+Positive query clauses are grouped once by query and indexed field, including
+keyword and substring matcher adaptations. Static source/analyzer routes are
+compiled by the same declaration emitter used during indexing and ordinary
+source mapping. The selected document type chooses its own immutable field
+plan. Unknown types and value-dependent mappings retain the shared mapper;
+dynamic inference and selected-field schema-less exact companions keep their
+existing value and byte-length eligibility rules.
+
+Projected and hidden source use the same controlled fragment kernel. Request
+checks run between hits/fields and inside tokenization allocations, matching,
+span normalization, density scoring and selection. Kernel scratch has a separate
+lifetime from returned fragments; partial analyzer output is region-owned on
+allocation failure or cancellation. A timeout cannot leave a partially prepared
+plan or retain token/window buffers as result source.
+
+Normalized, disjoint match spans feed two monotone density frontiers. Each
+frontier advances at most once per span. Candidate windows use an in-place
+priority heap and the existing greedy non-overlap selection, avoiding an
+all-spans rescan for each window and a complete candidate sort. Density and
+source-start ranking remain authoritative; equal-density/equal-start windows
+now choose the shorter UTF-8-clipped end deterministically. Cooperative small
+sorts and merge passes keep span normalization cancellable. Span and candidate
+storage remains linear in matches; fragment count and response limits remain
+unchanged.
+
+Query and aggregation HTTP boundaries classify operation outcomes consistently:
+deadlines use the existing public HTTP 504 `query_timeout` envelope and
+`Retry-After` contract; cancellation returns HTTP 499 `client closed request`.
+Internal faults retain their existing error handling. Real Parquet and Iceberg E2Es compare projected/hidden snippets after
+restart with source data unavailable, check deadline responses, and verify a
+healthy request after a timeout.

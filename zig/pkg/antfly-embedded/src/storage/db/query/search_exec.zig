@@ -21851,6 +21851,7 @@ fn freePendingHighlightFragment(alloc: Allocator, fragment: *PendingHighlightFra
 fn appendHighlightFragments(
     alloc: Allocator,
     fragments: *std.ArrayListUnmanaged(PendingHighlightFragment),
+    scratch: Allocator,
     text: []const u8,
     item: ?u32,
     source_id: usize,
@@ -21858,8 +21859,9 @@ fn appendHighlightFragments(
     analyzer: *const analysis_mod.Analyzer,
     max_fragments: u32,
     fragment_size: u32,
+    control: highlight_mod.Control,
 ) !void {
-    const found = try highlight_mod.highlightMatchers(alloc, text, matchers, analyzer, max_fragments, fragment_size);
+    const found = try highlight_mod.highlightMatchersWithScratch(alloc, scratch, text, matchers, analyzer, max_fragments, fragment_size, control);
     defer highlight_mod.freeFragments(alloc, found);
     fragment_loop: for (found) |fragment| {
         for (fragments.items) |*existing| {
@@ -22018,11 +22020,18 @@ pub fn attachHighlightsWithIndexQueries(
     hits: []types.SearchHit,
     sources: ?[]const ?[]u8,
 ) !void {
-    var prepared = try PreparedHighlights.init(alloc, options, indexed_queries);
+    return attachHighlightsWithIndexQueriesControlled(alloc, options, indexed_queries, hits, sources, .none);
+}
+pub fn attachHighlightsWithIndexQueriesControlled(alloc: Allocator, options: types.HighlightRequest, indexed_queries: []const HighlightQuery, hits: []types.SearchHit, sources: ?[]const ?[]u8, control: highlight_mod.Control) !void {
+    var prepared = try PreparedHighlights.initControlled(alloc, options, indexed_queries, control);
     defer prepared.deinit();
+    return attachPreparedHighlights(alloc, &prepared, hits, sources);
+}
+pub fn attachPreparedHighlights(alloc: Allocator, prepared: *const PreparedHighlights, hits: []types.SearchHit, sources: ?[]const ?[]u8) !void {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     for (hits, 0..) |*hit, index| {
+        try prepared.control.check();
         if (hit.highlights.len != 0) continue;
         _ = scratch.reset(.retain_capacity);
         const a = scratch.allocator();
@@ -22040,6 +22049,28 @@ pub fn attachHighlightsWithIndexQueries(
 /// Query-owned matchers, shared by batched and streaming source consumers.
 /// Index analysis/schema are borrowed until deinit; output owns every fragment.
 pub const PreparedHighlights = struct {
+    const Group = struct {
+        query: usize,
+        field: []const u8,
+        ordinary: []const highlight_mod.Matcher,
+        keyword: []const highlight_mod.Matcher,
+        substring: []const highlight_mod.Matcher,
+        fn matchers(self: Group, analyzer: *const analysis_mod.Analyzer) []const highlight_mod.Matcher {
+            return if (analyzer == &analysis_mod.keyword_analyzer) self.keyword else if (analyzer == &analysis_mod.substring_analyzer) self.substring else self.ordinary;
+        }
+    };
+    const Binding = struct { group: usize, analyzer: *const analysis_mod.Analyzer };
+    const FieldPlan = struct { name: []const u8, bindings: std.ArrayListUnmanaged(Binding) = .empty };
+    const DocumentPlan = struct {
+        fields: std.ArrayListUnmanaged(FieldPlan) = .empty,
+        by_field: std.StringHashMapUnmanaged(usize) = .empty,
+        fn field(self: *const DocumentPlan, name: []const u8) ?*const FieldPlan {
+            return &self.fields.items[self.by_field.get(name) orelse return null];
+        }
+    };
+    control: highlight_mod.Control = .none,
+    groups: []const Group,
+    routing: []const ?[]const DocumentPlan,
     arena: *std.heap.ArenaAllocator,
     entries: []const HighlightMatcherEntry,
     indexed_queries: []const HighlightQuery,
@@ -22047,6 +22078,10 @@ pub const PreparedHighlights = struct {
     /// Null conservatively requires complete source for dynamic mappings.
     source_fields: ?[]const []const u8,
     pub fn init(alloc: Allocator, options: types.HighlightRequest, indexed_queries: []const HighlightQuery) !PreparedHighlights {
+        return initControlled(alloc, options, indexed_queries, .none);
+    }
+    pub fn initControlled(alloc: Allocator, options: types.HighlightRequest, indexed_queries: []const HighlightQuery, control: highlight_mod.Control) !PreparedHighlights {
+        try control.check();
         const owner = try alloc.create(std.heap.ArenaAllocator);
         owner.* = .init(alloc);
         errdefer {
@@ -22056,12 +22091,59 @@ pub const PreparedHighlights = struct {
         const arena = owner.allocator();
         var entries = std.ArrayListUnmanaged(HighlightMatcherEntry).empty;
         for (indexed_queries, 0..) |indexed, index| {
+            try control.check();
             const lowered = try textQueryToSearchQuery(arena, indexed.query, indexed.text_analysis, indexed.runtime_schema);
             const start = entries.items.len;
             try collectHighlightMatchers(arena, lowered, indexed, &entries);
             for (entries.items[start..]) |*entry| entry.query_index = index;
         }
-        return .{ .arena = owner, .entries = entries.items, .indexed_queries = indexed_queries, .options = options, .source_fields = try sourceFields(arena, options, indexed_queries, entries.items) };
+        const GroupBuilder = struct { query: usize, field: []const u8, matchers: std.ArrayListUnmanaged(highlight_mod.Matcher) = .empty };
+        var builders: std.ArrayListUnmanaged(GroupBuilder) = .empty;
+        const by_query = try arena.alloc(std.StringHashMapUnmanaged(usize), indexed_queries.len);
+        @memset(by_query, .empty);
+        for (entries.items) |entry| {
+            try control.check();
+            const result = try by_query[entry.query_index].getOrPut(arena, entry.indexed_field);
+            if (!result.found_existing) {
+                result.value_ptr.* = builders.items.len;
+                try builders.append(arena, .{ .query = entry.query_index, .field = entry.indexed_field });
+            }
+            try builders.items[result.value_ptr.*].matchers.append(arena, entry.matcher);
+        }
+        var groups: std.ArrayListUnmanaged(Group) = .empty;
+        for (builders.items) |builder| {
+            try control.check();
+            const keyword = try arena.alloc(highlight_mod.Matcher, builder.matchers.items.len);
+            const substring = try arena.alloc(highlight_mod.Matcher, builder.matchers.items.len);
+            for (builder.matchers.items, keyword, substring) |matcher, *kw, *sub| {
+                kw.* = highlightMatcherForAnalyzer(matcher, &analysis_mod.keyword_analyzer);
+                sub.* = highlightMatcherForAnalyzer(matcher, &analysis_mod.substring_analyzer);
+            }
+            try groups.append(arena, .{ .query = builder.query, .field = builder.field, .ordinary = builder.matchers.items, .keyword = keyword, .substring = substring });
+        }
+        const routing = try arena.alloc(?[]const DocumentPlan, indexed_queries.len);
+        @memset(routing, null);
+        for (indexed_queries, 0..) |indexed, query_index| if (try mapper_mod.compileHighlightRouting(arena, indexed.text_analysis, indexed.runtime_schema, indexed.selected_field)) |documents| {
+            const plans = try arena.alloc(DocumentPlan, documents.len);
+            @memset(plans, .{});
+            for (documents, plans) |document, *document_plan| for (document.fields) |route| {
+                try control.check();
+                const group_index = by_query[query_index].get(route.indexed_field) orelse continue;
+                const field_index = document_plan.by_field.get(route.source_field) orelse add: {
+                    const index = document_plan.fields.items.len;
+                    try document_plan.fields.append(arena, .{ .name = route.source_field });
+                    try document_plan.by_field.put(arena, route.source_field, index);
+                    break :add index;
+                };
+                const field = &document_plan.fields.items[field_index];
+                const seen = for (field.bindings.items) |binding| {
+                    if (binding.group == group_index and binding.analyzer == route.analyzer) break true;
+                } else false;
+                if (!seen) try field.bindings.append(arena, .{ .group = group_index, .analyzer = route.analyzer });
+            };
+            routing[query_index] = plans;
+        };
+        return .{ .arena = owner, .control = control, .entries = entries.items, .groups = groups.items, .routing = routing, .indexed_queries = indexed_queries, .options = options, .source_fields = try sourceFields(arena, options, indexed_queries, entries.items) };
     }
     fn sourceFields(a: Allocator, options: types.HighlightRequest, queries: []const HighlightQuery, entries: []const HighlightMatcherEntry) !?[]const []const u8 {
         if (options.fields.len != 0) return options.fields;
@@ -22143,25 +22225,33 @@ pub const PreparedHighlights = struct {
         const options = self.options;
         const fragment_size = @max(options.fragment_size, 1);
         const max_fragments = @max(options.max_fragments, 1);
+        try self.control.check();
         const text_fields = try hit_arena.alloc([]const mapper_mod.HighlightTextField, indexed_queries.len);
+        const plans = try hit_arena.alloc(?*const DocumentPlan, indexed_queries.len);
         var fields = std.ArrayListUnmanaged([]const u8).empty;
         if (options.fields.len > 0) try fields.appendSlice(hit_arena, options.fields);
         for (indexed_queries, 0..) |indexed, query_index| {
-            text_fields[query_index] = try mapper_mod.highlightTextFieldsFromValueWithSelectedField(hit_arena, parsed, indexed.text_analysis, indexed.runtime_schema, indexed.selected_field);
-            if (options.fields.len > 0) continue;
-            for (text_fields[query_index]) |contribution| {
-                const referenced = for (self.entries) |entry| {
-                    if (entry.query_index == query_index and std.mem.eql(u8, entry.indexed_field, contribution.indexed_field)) break true;
-                } else false;
-                if (!referenced) continue;
-                const seen = for (fields.items) |existing| {
-                    if (std.mem.eql(u8, existing, contribution.source_field)) break true;
-                } else false;
-                if (!seen) try fields.append(hit_arena, contribution.source_field);
+            try self.control.check();
+            plans[query_index] = null;
+            if (self.routing[query_index]) |documents| if (parsed == .object) if (mapper_mod.highlightDocumentIndex(indexed.runtime_schema.?, parsed.object)) |index| {
+                plans[query_index] = &documents[index];
+            };
+            if (plans[query_index]) |plan| {
+                text_fields[query_index] = &.{};
+                if (options.fields.len == 0) for (plan.fields.items) |field| try appendPath(hit_arena, &fields, field.name);
+            } else {
+                text_fields[query_index] = try mapper_mod.highlightTextFieldsFromValueWithSelectedField(hit_arena, parsed, indexed.text_analysis, indexed.runtime_schema, indexed.selected_field);
+                if (options.fields.len == 0) for (text_fields[query_index]) |contribution| {
+                    const referenced = for (self.groups) |group| {
+                        if (group.query == query_index and std.mem.eql(u8, group.field, contribution.indexed_field)) break true;
+                    } else false;
+                    if (referenced) try appendPath(hit_arena, &fields, contribution.source_field);
+                };
             }
         }
 
         for (fields.items) |field| {
+            try self.control.check();
             if (source_field) |source| {
                 if (!std.mem.eql(u8, field, source) and !(field.len > source.len and std.mem.startsWith(u8, field, source) and field[source.len] == '.')) continue;
             }
@@ -22185,48 +22275,29 @@ pub const PreparedHighlights = struct {
                 for (fragments.items) |*fragment| freePendingHighlightFragment(alloc, fragment);
             }
             for (indexed_queries, 0..) |indexed, query_index| {
-                var processed = std.ArrayListUnmanaged([]const u8).empty;
-                for (self.entries) |entry| {
-                    if (entry.query_index != query_index) continue;
-                    const matches_field = for (text_fields[query_index]) |contribution| {
-                        if (std.mem.eql(u8, contribution.indexed_field, entry.indexed_field) and
-                            std.mem.eql(u8, contribution.source_field, field)) break true;
-                    } else false;
-                    if (!matches_field) continue;
-                    var seen = false;
-                    for (processed.items) |prior| {
-                        if (std.mem.eql(u8, prior, entry.indexed_field)) {
-                            seen = true;
-                            break;
+                if (plans[query_index]) |plan| {
+                    const field_plan = plan.field(field) orelse continue;
+                    for (source_values.items, 0..) |source_value, source_id| {
+                        if (source_value.literal_dotted and !highlightUsesSchemaLessText(indexed)) continue;
+                        for (field_plan.bindings.items) |binding| {
+                            try self.control.check();
+                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, self.groups[binding.group].matchers(binding.analyzer), queryTextAnalyzer(binding.analyzer), max_fragments, fragment_size, self.control);
                         }
                     }
-                    if (seen) continue;
-                    try processed.append(hit_arena, entry.indexed_field);
-
-                    var matchers = std.ArrayListUnmanaged(highlight_mod.Matcher).empty;
-                    for (self.entries) |candidate| {
-                        if (candidate.query_index == query_index and
-                            std.mem.eql(u8, candidate.indexed_field, entry.indexed_field))
-                        {
-                            try matchers.append(hit_arena, candidate.matcher);
-                        }
-                    }
+                } else for (self.groups) |group| {
+                    if (group.query != query_index) continue;
                     for (source_values.items, 0..) |source_value, source_id| {
                         if (source_value.literal_dotted and !highlightUsesSchemaLessText(indexed)) continue;
                         var processed_analyzers = std.ArrayListUnmanaged(*const analysis_mod.Analyzer).empty;
                         for (text_fields[query_index]) |contribution| {
-                            if (!std.mem.eql(u8, contribution.indexed_field, entry.indexed_field) or
-                                !std.mem.eql(u8, contribution.text, source_value.text) or
-                                !std.mem.eql(u8, contribution.source_field, field)) continue;
-                            var seen_analyzer = false;
-                            for (processed_analyzers.items) |prior| {
-                                if (prior == contribution.analyzer) seen_analyzer = true;
-                            }
-                            if (seen_analyzer) continue;
+                            if (!std.mem.eql(u8, contribution.indexed_field, group.field) or !std.mem.eql(u8, contribution.text, source_value.text) or !std.mem.eql(u8, contribution.source_field, field)) continue;
+                            const seen = for (processed_analyzers.items) |prior| {
+                                if (prior == contribution.analyzer) break true;
+                            } else false;
+                            if (seen) continue;
                             try processed_analyzers.append(hit_arena, contribution.analyzer);
-                            const source_matchers = try hit_arena.alloc(highlight_mod.Matcher, matchers.items.len);
-                            for (matchers.items, source_matchers) |matcher, *adapted| adapted.* = highlightMatcherForAnalyzer(matcher, contribution.analyzer);
-                            try appendHighlightFragments(alloc, &fragments, source_value.text, source_value.item, source_id, source_matchers, queryTextAnalyzer(contribution.analyzer), max_fragments, fragment_size);
+                            try self.control.check();
+                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, group.matchers(contribution.analyzer), queryTextAnalyzer(contribution.analyzer), max_fragments, fragment_size, self.control);
                         }
                     }
                 }
@@ -37890,5 +37961,62 @@ test "external lake bounded window profiles streamed highlights preserve aliases
     };
     try Harness.run(std.testing.allocator, true);
     try Harness.run(std.testing.allocator, false);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{true});
+    var stable = @import("../../lite/test_allocator.zig").NoResizeAllocator{ .backing = std.testing.allocator };
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Harness.run, .{true});
+}
+
+test "highlight compiled routing preserves document types aliases arrays field order and fallback ownership" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            const schema: runtime_schema_mod.TableSchema = .{ .default_type = "alpha", .full_text_documents = &.{
+                .{ .name = "alpha", .fields = &.{ .{ .path = "body", .emitted_name = "body_alias", .analyzer = "standard" }, .{ .path = "nested.tags", .emitted_name = "tags_alias", .analyzer = "simple" } } },
+                .{ .name = "beta", .fields = &.{.{ .path = "body", .emitted_name = "body_alias", .analyzer = "keyword" }} },
+            } };
+            const should = [_]types.TextQuery{ .{ .prefix = .{ .field = "tags_alias", .prefix = "ne" } }, .{ .match = .{ .field = "body_alias", .text = "needle" } } };
+            const queries = [_]HighlightQuery{.{ .query = .{ .bool_query = .{ .should = &should } }, .text_analysis = .{}, .runtime_schema = schema }};
+            const values = [_][]const u8{
+                "{\"body\":\"a needle here\",\"nested\":{\"tags\":[\"needle one\",\"needle two\"]}}",
+                "{\"_type\":\"beta\",\"body\":[\"needle\",\"needle here\"]}",
+                "{\"_type\":\"unknown\",\"body\":\"needle\"}",
+                "{\"body\":null,\"nested\":{\"tags\":[[\"needle\"],[\"needle two\",null]]}}",
+                "{\"body\":\"needle\"}",
+            };
+            for ([_]bool{ false, true }) |explicit| {
+                var prepared = try PreparedHighlights.init(a, .{ .fields = if (explicit) &.{ "nested.tags", "body" } else &.{}, .max_fragments = 3 }, &queries);
+                defer prepared.deinit();
+                try std.testing.expect(prepared.routing[0] != null);
+                var fallback = prepared;
+                fallback.routing = &.{null};
+                for (values) |json| {
+                    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+                    defer parsed.deinit();
+                    var left: types.SearchHit = .{ .id = try a.dupe(u8, "one") };
+                    defer left.deinit(a);
+                    var right: types.SearchHit = .{ .id = try a.dupe(u8, "one") };
+                    defer right.deinit(a);
+                    var scratch = std.heap.ArenaAllocator.init(a);
+                    defer scratch.deinit();
+                    try fallback.attachValue(a, scratch.allocator(), &left, parsed.value);
+                    _ = scratch.reset(.retain_capacity);
+                    try prepared.attachValue(a, scratch.allocator(), &right, parsed.value);
+                    const expected = try std.json.Stringify.valueAlloc(a, left.highlights, .{});
+                    defer a.free(expected);
+                    const actual = try std.json.Stringify.valueAlloc(a, right.highlights, .{});
+                    defer a.free(actual);
+                    try std.testing.expectEqualStrings(expected, actual);
+                }
+            }
+            var dynamic = schema;
+            var docs = schema.full_text_documents[0];
+            docs.infer_type_dynamic_paths = &.{"nested"};
+            dynamic.full_text_documents = &.{docs};
+            const dynamic_queries = [_]HighlightQuery{.{ .query = queries[0].query, .text_analysis = .{}, .runtime_schema = dynamic }};
+            var fallback = try PreparedHighlights.init(a, .{}, &dynamic_queries);
+            defer fallback.deinit();
+            try std.testing.expect(fallback.routing[0] == null);
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    var stable = @import("../../lite/test_allocator.zig").NoResizeAllocator{ .backing = std.testing.allocator };
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Harness.run, .{});
 }

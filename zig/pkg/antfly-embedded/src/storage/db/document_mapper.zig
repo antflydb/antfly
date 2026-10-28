@@ -2766,7 +2766,7 @@ fn extractTextFieldsFromValue(
             null;
 
         if (document_schema) |resolved| {
-            try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers);
+            try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers, false);
         }
         try appendDynamicSchemaTextFields(alloc, &fields, &typed_fields, root, runtime, document_schema, text_analysis, observed_field_analyzers);
         try appendSchemaTypedDocValueFields(alloc, &typed_fields, root, runtime);
@@ -2833,6 +2833,36 @@ pub fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
     return false;
 }
 
+/// Static provenance uses the same declaration emitter as indexing and normal
+/// highlighting. Text is not inspected: the empty value is an unused emitter
+/// argument, not a probe used to infer mapping. Dynamic and selected-field
+/// schema-less policies retain their value-dependent mapping path.
+pub const HighlightTextRoute = struct { indexed_field: []const u8, source_field: []const u8, analyzer: *const analysis_mod.Analyzer };
+pub const HighlightDocumentRoutes = struct { fields: []const HighlightTextRoute };
+pub fn compileHighlightRouting(alloc: Allocator, text_analysis: introducer_mod.TextAnalysisConfig, schema: ?runtime_schema.TableSchema, selected_field: ?[]const u8) !?[]const HighlightDocumentRoutes {
+    if (selected_field != null) return null;
+    const table = schema orelse return null;
+    if (!runtimeHasSchemaDrivenText(table) or table.dynamic_templates.len != 0 or table.full_text_documents.len == 0) return null;
+    for (table.full_text_documents) |document| {
+        if (document.dynamic_rules.len != 0 or document.open_dynamic_paths.len != 0 or document.infer_type_dynamic_paths.len != 0) return null;
+        if (document.physical_exact_fields == null) for (table.exact_fields) |field| {
+            const known = runtime_schema.containsPath(document.declared_paths, field.source_field) or for (document.fields) |declared| {
+                if (std.mem.eql(u8, declared.path, field.source_field)) break true;
+            } else false;
+            if (!known) return null;
+        };
+    }
+    const documents = try alloc.alloc(HighlightDocumentRoutes, table.full_text_documents.len);
+    for (table.full_text_documents, documents) |document, *out| {
+        var fields: std.ArrayListUnmanaged(introducer_mod.TextField) = .empty;
+        try appendSchemaTextFields(alloc, &fields, .{ .object = .empty }, table, document, text_analysis, null, true);
+        const routes = try alloc.alloc(HighlightTextRoute, fields.items.len);
+        for (fields.items, routes) |field, *route| route.* = .{ .source_field = field.source_field orelse field.field_name, .indexed_field = field.field_name, .analyzer = introducer_mod.effectiveTextFieldAnalyzer(field, text_analysis) };
+        out.* = .{ .fields = routes };
+    }
+    return documents;
+}
+
 fn appendSchemaTextFields(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
@@ -2841,13 +2871,14 @@ fn appendSchemaTextFields(
     document_schema: runtime_schema.FullTextDocument,
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+    metadata_only: bool,
 ) !void {
     var physical_schema = schema;
     if (document_schema.physical_exact_fields) |rules| physical_schema.exact_fields = rules;
     for (document_schema.fields) |field| {
         var values = std.ArrayListUnmanaged([]const u8).empty;
         defer values.deinit(alloc);
-        try collectFieldValues(alloc, &values, root, field.path);
+        if (metadata_only) try values.append(alloc, "") else try collectFieldValues(alloc, &values, root, field.path);
         if (values.items.len == 0) continue;
 
         // ASCH describes potential sources; immutable logical epochs must keep
@@ -2899,7 +2930,7 @@ fn appendSchemaTextFields(
         } else false) continue;
         var values: std.ArrayListUnmanaged([]const u8) = .empty;
         defer values.deinit(alloc);
-        try collectFieldValues(alloc, &values, root, field.source_field);
+        if (metadata_only) try values.append(alloc, "") else try collectFieldValues(alloc, &values, root, field.source_field);
         for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.source_field, text, physical_schema, text_analysis, observed_field_analyzers);
     }
 }
@@ -3887,21 +3918,24 @@ pub fn schemaLessExactFieldNameAlloc(alloc: Allocator, field: []const u8) ![]u8 
 }
 
 fn resolveFullTextDocument(schema: runtime_schema.TableSchema, root: std.json.ObjectMap) ?runtime_schema.FullTextDocument {
+    return schema.full_text_documents[highlightDocumentIndex(schema, root) orelse return null];
+}
+pub fn highlightDocumentIndex(schema: runtime_schema.TableSchema, root: std.json.ObjectMap) ?usize {
     if (root.get("_type")) |type_value| {
         if (type_value == .string) {
-            for (schema.full_text_documents) |document_schema| {
-                if (std.mem.eql(u8, document_schema.name, type_value.string)) return document_schema;
+            for (schema.full_text_documents, 0..) |document_schema, index| {
+                if (std.mem.eql(u8, document_schema.name, type_value.string)) return index;
             }
             return null;
         }
     }
 
     if (schema.default_type.len > 0) {
-        for (schema.full_text_documents) |document_schema| {
-            if (std.mem.eql(u8, document_schema.name, schema.default_type)) return document_schema;
+        for (schema.full_text_documents, 0..) |document_schema, index| {
+            if (std.mem.eql(u8, document_schema.name, schema.default_type)) return index;
         }
     }
-    if (schema.full_text_documents.len == 1) return schema.full_text_documents[0];
+    if (schema.full_text_documents.len == 1) return 0;
     return null;
 }
 

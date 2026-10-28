@@ -4051,6 +4051,8 @@ pub const HttpHandler = struct {
 
         var execution = self.executePublishedSearch(namespace, null, body, cancellation, null) catch |err| {
             switch (err) {
+                error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
+
                 error.InvalidQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
@@ -4092,6 +4094,8 @@ pub const HttpHandler = struct {
         defer if (aggregations) |*value| deinitJsonValue(self.alloc, value);
         if (aggregations_json) |json| {
             aggregations = encodeServerlessAggregationsValueAlloc(self, execution.session.?.namespace(), &execution, json) catch |err| switch (normalizePublicAggregationError(err)) {
+                error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
+
                 error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
                 error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
                 else => {
@@ -4141,6 +4145,8 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
         var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, null) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
+
             error.InvalidQueryRequest,
             error.EmbeddingIndexNotFound,
             error.InvalidEmbeddingDimensions,
@@ -4166,6 +4172,8 @@ pub const HttpHandler = struct {
         defer if (aggregations) |*value| deinitJsonValue(self.alloc, value);
         if (aggregations_json) |json| {
             aggregations = encodeServerlessAggregationsValueAlloc(self, table_name, &execution, json) catch |err| switch (normalizePublicAggregationError(err)) {
+                error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
+
                 error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
                 error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
                 error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
@@ -10081,9 +10089,11 @@ fn updateJoinedResponseMetadata(
 }
 
 fn jsonResponse(alloc: Allocator, status: u16, value: anytype) !HttpResponse {
+    const content_type = try alloc.dupe(u8, "application/json");
+    errdefer alloc.free(content_type);
     return .{
         .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
+        .content_type = content_type,
         .body = try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
 }
@@ -10334,6 +10344,23 @@ fn unsupportedHierarchyGroupingResponse(alloc: Allocator) !HttpResponse {
 
 fn unsupportedQueryResponse(alloc: Allocator) !HttpResponse {
     return jsonResponse(alloc, 422, public_table_http.UnsupportedQueryError{});
+}
+
+/// Match the existing public query contract at both serverless boundaries.
+fn queryOperationalFailureResponse(alloc: Allocator, err: anyerror) !?HttpResponse {
+    switch (err) {
+        error.Canceled, error.Cancelled => return try textResponse(alloc, 499, "client closed request"),
+        error.Timeout, error.DeadlineExceeded => {},
+        else => return null,
+    }
+    var response = try public_table_http.queryDependencyErrorOwnedResponse(alloc, 504, "query_timeout", "query timed out", true);
+    errdefer response.deinit(alloc);
+    return .{
+        .status = response.status,
+        .content_type = try alloc.dupe(u8, "application/json"),
+        .body = response.body,
+        .retry_after_seconds = response.retry_after_seconds,
+    };
 }
 
 /// Preserve the public distinction between malformed aggregation input and a
@@ -15298,4 +15325,24 @@ test "serverless graph metric compact admission charges actual final backing" {
     try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, small.chargeRetained(partial));
     const zero = try graph_query_mod.GraphQueryEngine.compactMaterializationBytes(0, rows, n);
     try std.testing.expectEqual(@as(usize, 0), zero);
+}
+
+test "highlight query operational errors preserve public deadline and cancellation outcomes" {
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled }) |err| {
+        var response = (try queryOperationalFailureResponse(a, err)).?;
+        defer response.deinit(a);
+        if (err == error.Timeout or err == error.DeadlineExceeded) {
+            try std.testing.expectEqual(@as(u16, 504), response.status);
+            try std.testing.expectEqual(@as(?u32, 1), response.retry_after_seconds);
+            const value = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
+            defer value.deinit();
+            try std.testing.expectEqualStrings("query_timeout", value.value.object.get("code").?.string);
+            try std.testing.expect(value.value.object.get("retryable").?.bool);
+        } else {
+            try std.testing.expectEqual(@as(u16, 499), response.status);
+            try std.testing.expectEqualStrings("client closed request", response.body);
+        }
+    }
+    try std.testing.expect((try queryOperationalFailureResponse(a, error.OutOfMemory)) == null);
 }

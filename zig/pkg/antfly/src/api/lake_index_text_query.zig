@@ -417,6 +417,7 @@ const Execution = struct {
     delivery_locations: @import("lake_text_delivery.zig").Locations = .empty,
     delivery_index: ?[]const u8 = null,
     highlight_queries: ?[]const search.HighlightQuery = null,
+    prepared_highlights: ?search.PreparedHighlights = null,
     arena: A,
     result_allocator: A = std.heap.page_allocator,
     navigation: ?*@import("lake_source_navigation.zig").Resolver = null,
@@ -843,6 +844,7 @@ const Execution = struct {
     }
 
     fn deinit(self: *Execution) void {
+        if (self.prepared_highlights) |*prepared| prepared.deinit();
         self.ordinal_live_rows.deinit(self.result_allocator);
         if (self.vector_include_provider) |*provider| provider.deinit();
         if (self.vector_exclude_provider) |*provider| provider.deinit();
@@ -1098,6 +1100,13 @@ const Execution = struct {
         defer self.active_text = previous;
         return acquire(self, name);
     }
+    fn highlightCheckpoint(raw: *const anyopaque) anyerror!void {
+        const self: *const Execution = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
+    }
+    fn highlightControl(self: *Execution) @import("antfly_cancellation").CancellationToken {
+        return .{ .ptr = self, .check_fn = highlightCheckpoint };
+    }
     fn attachHighlights(self: *Execution, a: A, req: types.SearchRequest, result: *types.SearchResult) !void {
         const options = req.highlight orelse return;
         if (req.defer_hierarchy_child_hydration or result.hits.len == 0) return;
@@ -1107,6 +1116,10 @@ const Execution = struct {
         try self.context.ensureActive();
         try self.planHighlights(req);
         if (self.highlight_queries.?.len == 0) return;
+        // One immutable routing plan for the request, including every streamed
+        // result batch. It borrows this Execution's request-lifetime context.
+        if (self.prepared_highlights == null) self.prepared_highlights = try search.PreparedHighlights.initControlled(self.arena, options, self.highlight_queries.?, self.highlightControl());
+        const prepared = &self.prepared_highlights.?;
         // Highlight the original source even when result shaping projected it
         // away. Hydration keeps the same snapshot, deletes and reader lease.
         var sources: ?[]?[]u8 = null;
@@ -1115,14 +1128,13 @@ const Execution = struct {
             a.free(items);
         };
         if (self.use_stored_highlights) {
-            var prepared = try search.PreparedHighlights.init(a, options, self.highlight_queries.?);
-            defer prepared.deinit();
-            const fields = try self.highlightHydrationFields(a, &prepared);
+            const fields = try self.highlightHydrationFields(a, prepared);
             defer a.free(fields);
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
             var all_covered = true;
             for (result.hits) |*hit| {
+                try self.context.ensureActive();
                 const value = hit.source_value orelse {
                     all_covered = false;
                     continue;
@@ -1138,7 +1150,7 @@ const Execution = struct {
                 try prepared.attachValue(a, scratch.allocator(), hit, value);
             }
             if (!all_covered) {
-                if (self.highlight_locations.count() != 0) try self.attachLocatedHighlights(a, &prepared, result.hits) else try self.attachPinnedHighlights(a, &prepared, result.hits);
+                if (self.highlight_locations.count() != 0) try self.attachLocatedHighlights(a, prepared, result.hits) else try self.attachPinnedHighlights(a, prepared, result.hits);
             }
             try self.context.ensureActive();
             return;
@@ -1148,7 +1160,7 @@ const Execution = struct {
             for (result.hits, keys) |hit, *key| key.* = hit.id;
             sources = try loadManySelected(self, a, keys, self.hydration_fields);
         }
-        try search.attachHighlightsWithIndexQueries(a, options, self.highlight_queries.?, result.hits, sources);
+        try search.attachPreparedHighlights(a, prepared, result.hits, sources);
         try self.context.ensureActive();
     }
     fn attachPinnedHighlights(self: *Execution, a: A, prepared: *const search.PreparedHighlights, hits: []types.SearchHit) !void {

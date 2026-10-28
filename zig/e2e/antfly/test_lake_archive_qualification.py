@@ -1990,3 +1990,164 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                     unavailable.rename(original)
         finally:
             client.session.close()
+
+
+@pytest.mark.parametrize("source_format", ["parquet", "iceberg"])
+def test_dense_highlights_preserve_results_and_structured_deadlines(
+    tmp_path, source_format
+):
+    """Both source paths share exact snippets and cancellable CPU kernels."""
+    import importlib.util
+
+    import conftest as harness
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    spec = importlib.util.spec_from_file_location(
+        "highlight_cpu_e2e",
+        Path(__file__).resolve().parents[2] / "tools" / "benchmark_lake_archive.py",
+    )
+    bench = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench
+    spec.loader.exec_module(bench)
+    count = 32
+    body = "needle " * 9362
+    rows = pa.table({"id": list(range(count)), "body": [body] * count})
+    root = tmp_path / "fixture"
+    if source_format == "parquet":
+        archive = tmp_path / "archive.parquet"
+        pq.write_table(rows, archive, row_group_size=16, use_dictionary=False)
+        uri = bench.import_fixture(root, [archive], "highlight-cpu")["manifest_uri"]
+    else:
+        pytest.importorskip("pyiceberg")
+        pytest.importorskip("fastavro")
+        from pyiceberg.catalog.sql import SqlCatalog
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import LongType, NestedField, StringType
+        from test_iceberg_sql import _export_table
+
+        catalog = SqlCatalog(
+            "highlight_cpu",
+            uri=f"sqlite:///{tmp_path}/catalog.db",
+            warehouse=(tmp_path / "warehouse").as_uri(),
+        )
+        catalog.create_namespace("highlight_cpu")
+        table = catalog.create_table(
+            "highlight_cpu.items",
+            schema=Schema(
+                NestedField(1, "id", LongType(), required=False),
+                NestedField(2, "body", StringType(), required=False),
+            ),
+        )
+        table.append(rows)
+        _export_table(table, root)
+        uri = root.as_uri()
+    definition = {
+        "schema": {
+            "storage_mode": "relational",
+            "default_type": "row",
+            "base_source": {
+                "kind": "external",
+                "format": source_format,
+                "table_id": "highlight-cpu",
+                "object_mutability": "immutable",
+                "uri": uri,
+                "row_identity": {"key_columns": ["id"]},
+            },
+            "document_schemas": {
+                "row": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "integer",
+                                "x-antfly-field": {"type": "number", "sortable": True},
+                            },
+                            "body": {
+                                "type": "string",
+                                "x-antfly-field": {"type": "text"},
+                            },
+                        },
+                    }
+                }
+            },
+            "index_sort": [{"field": name, "order": "asc"} for name in ("id", "_id")],
+        },
+        "indexes": {"text": {"type": "full_text", "store_source": True}},
+    }
+    config = _write_remote_content_e2e_config(tmp_path)
+    with bench.managed_server(
+        harness.StandaloneAntflyServer,
+        binary,
+        config,
+        tmp_path,
+        api_root=harness.ANTFLY_PUBLIC_API_ROOT,
+    ) as server:
+        client = bench.Client(server, 120)
+        try:
+            client.call("POST", f"/tables/{bench.TABLE}", definition)
+            client.ready(bench.readiness_indexes({"definition": definition}))
+            unavailable = []
+            for path in (root / "buckets" / "antfly" / "objects").rglob("*.parquet"):
+                renamed = path.with_suffix(".unavailable")
+                path.rename(renamed)
+                unavailable.append((path, renamed))
+            assert unavailable
+            try:
+                for restarted in (False, True):
+                    if restarted:
+                        server.restart()
+                    base = {
+                        "full_text_search": {"match": "needle", "field": "body"},
+                        "highlight": {
+                            "fields": ["body"],
+                            "max_fragments": 3,
+                            "fragment_size": 100,
+                        },
+                        "order_by": [{"field": "id"}],
+                        "limit": count,
+                    }
+                    projected = client.query(
+                        {"request": dict(base, fields=["id", "body"])}
+                    )["hits"]["hits"]
+                    hidden = client.query({"request": dict(base, fields=["id"])})[
+                        "hits"
+                    ]["hits"]
+                    assert [hit["_source"]["id"] for hit in hidden] == list(
+                        range(count)
+                    )
+                    for visible, other in zip(projected, hidden, strict=True):
+                        assert visible["_source"]["body"] == body
+                        assert set(other["_source"]) == {"id"}
+                        assert {k: v for k, v in visible.items() if k != "_source"} == {
+                            k: v for k, v in other.items() if k != "_source"
+                        }
+                        fragments = other["_highlights"]["body"]
+                        assert 1 <= len(fragments) <= 3
+                    for fields in (["id"], ["id", "body"]):
+                        response = client.session.post(
+                            server.api_url + f"/tables/{bench.TABLE}/query",
+                            json=dict(base, fields=fields, timeout_ms=1),
+                            timeout=30,
+                        )
+                        assert response.status_code == 504, response.text
+                        value = response.json()
+                        assert value["code"] == "query_timeout"
+                        assert value["error"] == "query_timeout"
+                        assert value["retryable"] is True
+                        assert response.headers["Retry-After"] == "1"
+                    # A timed-out request cannot poison the next reader's state.
+                    assert (
+                        client.query({"request": dict(base, fields=["id"])})["hits"][
+                            "hits"
+                        ]
+                        == hidden
+                    )
+            finally:
+                for path, renamed in unavailable:
+                    renamed.rename(path)
+        finally:
+            client.session.close()

@@ -24,6 +24,19 @@ const Allocator = std.mem.Allocator;
 const analysis_mod = @import("analysis.zig");
 const wildcard_mod = @import("wildcard.zig");
 const regex_mod = @import("regex.zig");
+pub const Control = @import("antfly_cancellation").CancellationToken;
+const Poller = struct {
+    control: Control,
+    remaining: usize = 1,
+    fn step(self: *Poller) !void {
+        if (self.control.ptr == null) return;
+        self.remaining -= 1;
+        if (self.remaining == 0) {
+            self.remaining = 256;
+            try self.control.check();
+        }
+    }
+};
 
 pub const Span = struct {
     start: u32,
@@ -99,59 +112,86 @@ pub fn highlightMatchers(
     max_fragments: u32,
     fragment_size: u32,
 ) ![]Fragment {
+    return highlightMatchersControlled(alloc, text, matchers, analyzer, max_fragments, fragment_size, .none);
+}
+/// The token is borrowed for this call. All matching, sorting, density and
+/// selection loops poll it without changing ranking or source byte offsets.
+pub fn highlightMatchersControlled(alloc: Allocator, text: []const u8, matchers: []const Matcher, analyzer: *const analysis_mod.Analyzer, max_fragments: u32, fragment_size: u32, control: Control) ![]Fragment {
+    return highlightMatchersWithScratch(alloc, alloc, text, matchers, analyzer, max_fragments, fragment_size, control);
+}
+/// Scratch is a separate call-scoped capability. Only returned fragments and
+/// their spans use the result allocator; token/window state never becomes
+/// retained result memory when the result owner is monotonic.
+pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: []const u8, matchers: []const Matcher, analyzer: *const analysis_mod.Analyzer, max_fragments: u32, fragment_size: u32, control: Control) ![]Fragment {
+    var workspace = std.heap.ArenaAllocator.init(scratch);
+    defer workspace.deinit();
+    const temporary = workspace.allocator();
+    try control.check();
+    var poller: Poller = .{ .control = control };
     if (text.len == 0 or matchers.len == 0 or max_fragments == 0) return &.{};
 
-    const tokens = try analyzer.analyzeWithSourceOffsets(alloc, text);
-    defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
-
     var spans = std.ArrayListUnmanaged(Span).empty;
-    defer spans.deinit(alloc);
-    try collectMatchSpans(alloc, tokens, matchers, &spans);
+    defer spans.deinit(temporary);
+    {
+        var analysis_arena = std.heap.ArenaAllocator.init(temporary);
+        defer analysis_arena.deinit();
+        var checked: CheckedAllocator = .{ .backing = analysis_arena.allocator(), .poller = &poller };
+        const token_allocator = checked.allocator();
+        const tokens = analyzer.analyzeWithSourceOffsets(token_allocator, text) catch |err| return checked.failure orelse err;
+        if (checked.failure) |err| return err;
+        defer analysis_mod.Analyzer.freeTokens(token_allocator, tokens);
+        try control.check();
 
-    for (matchers) |matcher| {
-        switch (matcher) {
-            .literal => |needle| {
-                if (needle.len > 0 and std.mem.eql(u8, text, needle)) {
-                    try spans.append(alloc, .{ .start = 0, .end = @intCast(text.len) });
-                }
-            },
-            .literal_prefix => |prefix| {
-                if (prefix.len > 0 and std.mem.startsWith(u8, text, prefix)) {
-                    try spans.append(alloc, .{ .start = 0, .end = @intCast(prefix.len) });
-                }
-            },
-            else => {},
+        try collectMatchSpans(temporary, tokens, matchers, &spans, &poller);
+
+        for (matchers) |matcher| {
+            switch (matcher) {
+                .literal => |needle| {
+                    if (needle.len > 0 and std.mem.eql(u8, text, needle)) {
+                        try spans.append(temporary, .{ .start = 0, .end = @intCast(text.len) });
+                    }
+                },
+                .literal_prefix => |prefix| {
+                    if (prefix.len > 0 and std.mem.startsWith(u8, text, prefix)) {
+                        try spans.append(temporary, .{ .start = 0, .end = @intCast(prefix.len) });
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // `contains` matchers come from substring companions, which index every
+        // surface word and every adjacent word pair regardless of the root
+        // field's stop words or stemming. Evaluate them over the plain surface
+        // words so a span can never bridge a word the companion never joined.
+        var has_contains = false;
+        var has_substring_pattern = false;
+        for (matchers) |matcher| {
+            has_contains = has_contains or matcher == .contains;
+            has_substring_pattern = has_substring_pattern or matcher == .substring_term or matcher == .substring_wildcard or
+                matcher == .substring_fuzzy or matcher == .substring_regexp;
+        }
+        if (has_contains or has_substring_pattern) {
+            const words = analysis_mod.substring_query_analyzer.analyze(token_allocator, text) catch |err| return checked.failure orelse err;
+            if (checked.failure) |err| return err;
+            defer analysis_mod.Analyzer.freeTokens(token_allocator, words);
+            if (has_contains) try collectContainsSpans(temporary, text, words, matchers, &spans, &poller);
+            if (has_substring_pattern) try collectSubstringPatternSpans(temporary, words, matchers, &spans, &poller);
         }
     }
-
-    // `contains` matchers come from substring companions, which index every
-    // surface word and every adjacent word pair regardless of the root
-    // field's stop words or stemming. Evaluate them over the plain surface
-    // words so a span can never bridge a word the companion never joined.
-    var has_contains = false;
-    var has_substring_pattern = false;
-    for (matchers) |matcher| {
-        has_contains = has_contains or matcher == .contains;
-        has_substring_pattern = has_substring_pattern or matcher == .substring_term or matcher == .substring_wildcard or
-            matcher == .substring_fuzzy or matcher == .substring_regexp;
-    }
-    if (has_contains or has_substring_pattern) {
-        const words = try analysis_mod.substring_query_analyzer.analyze(alloc, text);
-        defer analysis_mod.Analyzer.freeTokens(alloc, words);
-        if (has_contains) try collectContainsSpans(alloc, text, words, matchers, &spans);
-        if (has_substring_pattern) try collectSubstringPatternSpans(alloc, words, matchers, &spans);
-    }
     if (spans.items.len == 0) return &.{};
-    normalizeSpans(&spans);
+    try normalizeSpans(temporary, &spans, &poller);
 
     // Score windows by match density and select the best non-overlapping ones.
     const text_len: u32 = @intCast(text.len);
     const frag_size = @max(@min(fragment_size, text_len), 1);
 
     var windows = std.ArrayListUnmanaged(ScoredWindow).empty;
-    defer windows.deinit(alloc);
+    defer windows.deinit(temporary);
 
+    var sweep: DensitySweep = .{};
     for (spans.items) |span| {
+        try poller.step();
         // Center the window on this match, snapping to UTF-8 boundaries.
         const center = span.start + (span.end - span.start) / 2;
         var win_start = if (center >= frag_size / 2) center - frag_size / 2 else 0;
@@ -162,35 +202,38 @@ pub fn highlightMatchers(
         win_start = utf8Floor(text, win_start);
         win_end = utf8Ceil(text, win_end);
 
-        var match_count: u32 = 0;
-        for (spans.items) |other| {
-            if (other.start < win_end and other.end > win_start) match_count += 1;
-        }
-        try windows.append(alloc, .{ .start = win_start, .end = win_end, .score = match_count });
+        const match_count = try sweep.count(spans.items, win_start, win_end, &poller);
+        // Clipping at either text boundary can produce identical windows.
+        if (windows.items.len != 0 and windows.items[windows.items.len - 1].start == win_start and windows.items[windows.items.len - 1].end == win_end) continue;
+        try windows.append(temporary, .{ .start = win_start, .end = win_end, .score = match_count });
     }
 
-    std.mem.sort(ScoredWindow, windows.items, {}, struct {
-        fn cmp(_: void, a: ScoredWindow, b: ScoredWindow) bool {
-            if (a.score != b.score) return a.score > b.score;
-            return a.start < b.start;
-        }
-    }.cmp);
-
+    // Heapify in place; inspect only as many ranked candidates as the exact
+    // greedy non-overlap selection needs. No full window sort or second copy.
+    var heap_len = windows.items.len;
+    var parent = heap_len / 2;
+    while (parent > 0) {
+        parent -= 1;
+        try siftWindows(windows.items, heap_len, parent, &poller);
+    }
     var selected = std.ArrayListUnmanaged(ScoredWindow).empty;
-    defer selected.deinit(alloc);
-    for (windows.items) |w| {
-        if (selected.items.len >= max_fragments) break;
-        var overlaps = false;
-        for (selected.items) |s| {
-            if (w.start < s.end and w.end > s.start) {
-                overlaps = true;
-                break;
-            }
+    defer selected.deinit(temporary);
+    while (heap_len != 0 and selected.items.len < max_fragments) {
+        try poller.step();
+        const w = windows.items[0];
+        heap_len -= 1;
+        if (heap_len != 0) {
+            windows.items[0] = windows.items[heap_len];
+            try siftWindows(windows.items, heap_len, 0, &poller);
         }
-        if (!overlaps) try selected.append(alloc, w);
+        const overlaps = for (selected.items) |chosen| {
+            try poller.step();
+            if (w.start < chosen.end and w.end > chosen.start) break true;
+        } else false;
+        if (!overlaps) try selected.append(temporary, w);
     }
 
-    std.mem.sort(ScoredWindow, selected.items, {}, struct {
+    try controlledSort(ScoredWindow, temporary, selected.items, &poller, struct {
         fn cmp(_: void, a: ScoredWindow, b: ScoredWindow) bool {
             return a.start < b.start;
         }
@@ -202,12 +245,17 @@ pub fn highlightMatchers(
         for (fragments[0..initialized]) |fragment| alloc.free(fragment.highlights);
         alloc.free(fragments);
     }
+    var span_at: usize = 0;
     for (selected.items, 0..) |win, fi| {
+        try poller.step();
         var fragment_spans = std.ArrayListUnmanaged(Span).empty;
-        defer fragment_spans.deinit(alloc);
-        for (spans.items) |span| {
+        defer fragment_spans.deinit(temporary);
+        while (span_at < spans.items.len and spans.items[span_at].end <= win.start) : (span_at += 1) try poller.step();
+        for (spans.items[span_at..]) |span| {
+            try poller.step();
+            if (span.start >= win.end) break;
             if (span.start < win.end and span.end > win.start) {
-                try fragment_spans.append(alloc, .{
+                try fragment_spans.append(temporary, .{
                     .start = @max(span.start, win.start) - win.start,
                     .end = @min(span.end, win.end) - win.start,
                 });
@@ -220,7 +268,118 @@ pub fn highlightMatchers(
         };
         initialized += 1;
     }
+    try control.check();
     return fragments;
+}
+
+/// Tokenization is a call-scoped region. Allocation checkpoints make existing
+/// analyzers cancellable without changing their mapping/filter contracts, and
+/// region teardown also owns partial tokenizer/filter output on any failure.
+const CheckedAllocator = struct {
+    backing: Allocator,
+    poller: *Poller,
+    failure: ?anyerror = null,
+    fn allocator(self: *CheckedAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn active(self: *CheckedAllocator) bool {
+        if (self.failure != null) return false;
+        self.poller.step() catch |err| {
+            self.failure = err;
+            return false;
+        };
+        return true;
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CheckedAllocator = @ptrCast(@alignCast(raw));
+        if (!self.active()) return null;
+        return self.backing.rawAlloc(len, alignment, ra);
+    }
+    fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *CheckedAllocator = @ptrCast(@alignCast(raw));
+        if (!self.active()) return false;
+        return self.backing.rawResize(bytes, alignment, len, ra);
+    }
+    fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *CheckedAllocator = @ptrCast(@alignCast(raw));
+        if (!self.active()) return null;
+        return self.backing.rawRemap(bytes, alignment, len, ra);
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *CheckedAllocator = @ptrCast(@alignCast(raw));
+        self.backing.rawFree(bytes, alignment, ra);
+    }
+};
+
+const DensitySweep = struct {
+    first: usize = 0,
+    end: usize = 0,
+    fn count(self: *DensitySweep, spans: []const Span, start: u32, end: u32, poller: *Poller) !u32 {
+        while (self.first < spans.len and spans[self.first].end <= start) : (self.first += 1) try poller.step();
+        self.end = @max(self.end, self.first);
+        while (self.end < spans.len and spans[self.end].start < end) : (self.end += 1) try poller.step();
+        return @intCast(self.end - self.first);
+    }
+};
+fn betterWindow(a: ScoredWindow, b: ScoredWindow) bool {
+    if (a.score != b.score) return a.score > b.score;
+    if (a.start != b.start) return a.start < b.start;
+    return a.end < b.end;
+}
+fn siftWindows(windows: []ScoredWindow, count: usize, first: usize, poller: *Poller) !void {
+    var at = first;
+    while (at < count / 2) {
+        try poller.step();
+        var child = at * 2 + 1;
+        if (child + 1 < count and betterWindow(windows[child + 1], windows[child])) child += 1;
+        if (!betterWindow(windows[child], windows[at])) break;
+        std.mem.swap(ScoredWindow, &windows[at], &windows[child]);
+        at = child;
+    }
+}
+/// Small in-place sorts and cooperative merge passes bound cancellation delay.
+/// Scratch is released before windows are built, so peak span/window storage
+/// stays linear. Callers with no control keep the ordinary in-place sort.
+fn controlledSort(comptime T: type, a: Allocator, values: []T, poller: *Poller, comptime less: fn (void, T, T) bool) !void {
+    try poller.control.check();
+    if (poller.control.ptr == null) {
+        std.mem.sort(T, values, {}, less);
+        return;
+    }
+    const block = 256;
+    var begin: usize = 0;
+    while (begin < values.len) : (begin += block) {
+        try poller.control.check();
+        std.mem.sort(T, values[begin..@min(begin + block, values.len)], {}, less);
+    }
+    if (values.len <= block) return;
+    const scratch = try a.alloc(T, values.len);
+    defer a.free(scratch);
+    var input = values;
+    var output = scratch;
+    var width: usize = block;
+    while (width < values.len) : (width = @min(values.len, width *| 2)) {
+        begin = 0;
+        while (begin < values.len) : (begin += @min(values.len - begin, width *| 2)) {
+            var left = begin;
+            const middle = begin + @min(width, values.len - begin);
+            var right = middle;
+            const end = middle + @min(width, values.len - middle);
+            for (output[begin..end]) |*value| {
+                try poller.step();
+                if (left < middle and (right == end or !less({}, input[right], input[left]))) {
+                    value.* = input[left];
+                    left += 1;
+                } else {
+                    value.* = input[right];
+                    right += 1;
+                }
+            }
+        }
+        std.mem.swap([]T, &input, &output);
+    }
+    if (input.ptr != values.ptr) @memcpy(values, input);
+    try poller.control.check();
 }
 
 fn collectMatchSpans(
@@ -228,11 +387,13 @@ fn collectMatchSpans(
     tokens: []const analysis_mod.Token,
     matchers: []const Matcher,
     spans: *std.ArrayListUnmanaged(Span),
+    poller: *Poller,
 ) !void {
     for (tokens) |tok| {
         // Analyzers may emit several tokens for one surface span (shingles,
         // n-grams); the surface span is what gets highlighted.
         for (matchers) |matcher| {
+            try poller.step();
             switch (matcher) {
                 .term => |term| if (std.mem.eql(u8, tok.term, term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .prefix => |prefix| if (std.mem.startsWith(u8, tok.term, prefix)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
@@ -241,7 +402,7 @@ fn collectMatchSpans(
                     const prefix_len: usize = fuzzy.prefix_len;
                     if (tok.term.len < prefix_len or fuzzy.term.len < prefix_len or
                         !std.mem.eql(u8, tok.term[0..prefix_len], fuzzy.term[0..prefix_len])) continue;
-                    if (try boundedEditDistance(alloc, tok.term, fuzzy.term, fuzzy.max_edits) <= fuzzy.max_edits) {
+                    if (try boundedEditDistance(alloc, tok.term, fuzzy.term, fuzzy.max_edits, poller) <= fuzzy.max_edits) {
                         try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
                     }
                 },
@@ -273,14 +434,16 @@ fn collectSubstringPatternSpans(
     words: []const analysis_mod.Token,
     matchers: []const Matcher,
     spans: *std.ArrayListUnmanaged(Span),
+    poller: *Poller,
 ) !void {
     for (words, 0..) |first, index| {
-        try collectSubstringPatternTermSpans(alloc, first, null, first.term, matchers, spans);
+        try poller.step();
+        try collectSubstringPatternTermSpans(alloc, first, null, first.term, matchers, spans, poller);
         if (index + 1 < words.len) {
             const second = words[index + 1];
             const joined = try std.mem.concat(alloc, u8, &.{ first.term, second.term });
             defer alloc.free(joined);
-            try collectSubstringPatternTermSpans(alloc, first, second, joined, matchers, spans);
+            try collectSubstringPatternTermSpans(alloc, first, second, joined, matchers, spans, poller);
         }
     }
 }
@@ -292,9 +455,11 @@ fn collectSubstringPatternTermSpans(
     term: []const u8,
     matchers: []const Matcher,
     spans: *std.ArrayListUnmanaged(Span),
+    poller: *Poller,
 ) !void {
     var start: usize = 0;
     while (start < term.len) : (start += 1) {
+        try poller.step();
         if ((term[start] & 0xC0) == 0x80) continue;
         const suffix = term[start..];
         if (suffix.len < analysis_mod.substring_min_query_length) break;
@@ -304,6 +469,7 @@ fn collectSubstringPatternTermSpans(
         const indexed_term = suffix[0..length];
 
         for (matchers) |matcher| {
+            try poller.step();
             const matches = switch (matcher) {
                 .substring_term => |needle| std.mem.eql(u8, needle, indexed_term),
                 .substring_wildcard => |pattern| wildcard_mod.match(pattern, indexed_term),
@@ -312,7 +478,7 @@ fn collectSubstringPatternTermSpans(
                     const prefix_len: usize = fuzzy.prefix_len;
                     if (indexed_term.len < prefix_len or fuzzy.term.len < prefix_len or
                         !std.mem.eql(u8, indexed_term[0..prefix_len], fuzzy.term[0..prefix_len])) break :blk false;
-                    break :blk try boundedEditDistance(alloc, indexed_term, fuzzy.term, fuzzy.max_edits) <= fuzzy.max_edits;
+                    break :blk try boundedEditDistance(alloc, indexed_term, fuzzy.term, fuzzy.max_edits, poller) <= fuzzy.max_edits;
                 },
                 else => false,
             };
@@ -341,10 +507,13 @@ fn collectContainsSpans(
     words: []const analysis_mod.Token,
     matchers: []const Matcher,
     spans: *std.ArrayListUnmanaged(Span),
+    poller: *Poller,
 ) !void {
     for (words, 0..) |word, i| {
+        try poller.step();
         const surface = text[word.start_byte..word.end_byte];
         for (matchers) |matcher| {
+            try poller.step();
             const needle = switch (matcher) {
                 .contains => |needle| needle,
                 else => continue,
@@ -352,6 +521,7 @@ fn collectContainsSpans(
             if (needle.len == 0) continue;
             var search_at: usize = 0;
             while (search_at + needle.len <= surface.len) {
+                try poller.step();
                 const relative = indexOfIgnoreCase(surface[search_at..], needle) orelse break;
                 const index = search_at + relative;
                 try spans.append(alloc, .{
@@ -372,6 +542,7 @@ fn collectContainsSpans(
             @memcpy(joined[surface.len..], next_surface);
             search_at = 0;
             while (search_at + needle.len <= joined.len) {
+                try poller.step();
                 const relative = indexOfIgnoreCase(joined[search_at..], needle) orelse break;
                 const joined_index = search_at + relative;
                 if (joined_index < surface.len and joined_index + needle.len > surface.len) {
@@ -396,8 +567,8 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
 }
 
 /// Merge overlapping or touching spans and sort them by start offset.
-fn normalizeSpans(spans: *std.ArrayListUnmanaged(Span)) void {
-    std.mem.sort(Span, spans.items, {}, struct {
+fn normalizeSpans(allocator: Allocator, spans: *std.ArrayListUnmanaged(Span), poller: *Poller) !void {
+    try controlledSort(Span, allocator, spans.items, poller, struct {
         fn cmp(_: void, a: Span, b: Span) bool {
             if (a.start != b.start) return a.start < b.start;
             return a.end > b.end;
@@ -405,6 +576,7 @@ fn normalizeSpans(spans: *std.ArrayListUnmanaged(Span)) void {
     }.cmp);
     var write: usize = 0;
     for (spans.items) |span| {
+        try poller.step();
         if (write > 0 and span.start <= spans.items[write - 1].end) {
             spans.items[write - 1].end = @max(spans.items[write - 1].end, span.end);
             continue;
@@ -428,7 +600,7 @@ fn utf8Ceil(text: []const u8, index: u32) u32 {
 }
 
 /// Levenshtein distance capped at `limit + 1` so long tokens bail out early.
-fn boundedEditDistance(alloc: Allocator, a: []const u8, b: []const u8, limit: u8) !u32 {
+fn boundedEditDistance(alloc: Allocator, a: []const u8, b: []const u8, limit: u8, poller: *Poller) !u32 {
     const cap: u32 = @as(u32, limit) + 1;
     if (std.mem.eql(u8, a, b)) return 0;
     if (a.len > b.len and a.len - b.len > cap) return cap;
@@ -443,9 +615,11 @@ fn boundedEditDistance(alloc: Allocator, a: []const u8, b: []const u8, limit: u8
     var curr = if (heap_curr) |items| items else stack_curr[0..];
     for (0..b.len + 1) |j| prev[j] = @intCast(j);
     for (a, 1..) |ca, i| {
+        try poller.step();
         curr[0] = @intCast(i);
         var row_min: u32 = curr[0];
         for (b, 1..) |cb, j| {
+            try poller.step();
             const cost: u32 = if (ca == cb) 0 else 1;
             curr[j] = @min(@min(prev[j] + 1, curr[j - 1] + 1), prev[j - 1] + cost);
             row_min = @min(row_min, curr[j]);
@@ -826,4 +1000,215 @@ test "highlight suffixes map through camel case elision apostrophe grams truncat
         try std.testing.expectEqual(@as(usize, 1), fragments.len);
         try std.testing.expectEqualStrings(case.expected, fragments[0].text[fragments[0].highlights[0].start..fragments[0].highlights[0].end]);
     }
+}
+
+// Independent quadratic selection oracle retained only for small tests.
+fn referenceHighlightMatchers(
+    alloc: Allocator,
+    text: []const u8,
+    matchers: []const Matcher,
+    analyzer: *const analysis_mod.Analyzer,
+    max_fragments: u32,
+    fragment_size: u32,
+) ![]Fragment {
+    var poller: Poller = .{ .control = .none };
+    if (text.len == 0 or matchers.len == 0 or max_fragments == 0) return &.{};
+
+    const tokens = try analyzer.analyzeWithSourceOffsets(alloc, text);
+    defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+
+    var spans = std.ArrayListUnmanaged(Span).empty;
+    defer spans.deinit(alloc);
+    try collectMatchSpans(alloc, tokens, matchers, &spans, &poller);
+
+    for (matchers) |matcher| {
+        switch (matcher) {
+            .literal => |needle| {
+                if (needle.len > 0 and std.mem.eql(u8, text, needle)) {
+                    try spans.append(alloc, .{ .start = 0, .end = @intCast(text.len) });
+                }
+            },
+            .literal_prefix => |prefix| {
+                if (prefix.len > 0 and std.mem.startsWith(u8, text, prefix)) {
+                    try spans.append(alloc, .{ .start = 0, .end = @intCast(prefix.len) });
+                }
+            },
+            else => {},
+        }
+    }
+
+    // `contains` matchers come from substring companions, which index every
+    // surface word and every adjacent word pair regardless of the root
+    // field's stop words or stemming. Evaluate them over the plain surface
+    // words so a span can never bridge a word the companion never joined.
+    var has_contains = false;
+    var has_substring_pattern = false;
+    for (matchers) |matcher| {
+        has_contains = has_contains or matcher == .contains;
+        has_substring_pattern = has_substring_pattern or matcher == .substring_term or matcher == .substring_wildcard or
+            matcher == .substring_fuzzy or matcher == .substring_regexp;
+    }
+    if (has_contains or has_substring_pattern) {
+        const words = try analysis_mod.substring_query_analyzer.analyze(alloc, text);
+        defer analysis_mod.Analyzer.freeTokens(alloc, words);
+        if (has_contains) try collectContainsSpans(alloc, text, words, matchers, &spans, &poller);
+        if (has_substring_pattern) try collectSubstringPatternSpans(alloc, words, matchers, &spans, &poller);
+    }
+    if (spans.items.len == 0) return &.{};
+    try normalizeSpans(alloc, &spans, &poller);
+
+    // Score windows by match density and select the best non-overlapping ones.
+    const text_len: u32 = @intCast(text.len);
+    const frag_size = @max(@min(fragment_size, text_len), 1);
+
+    var windows = std.ArrayListUnmanaged(ScoredWindow).empty;
+    defer windows.deinit(alloc);
+
+    for (spans.items) |span| {
+        // Center the window on this match, snapping to UTF-8 boundaries.
+        const center = span.start + (span.end - span.start) / 2;
+        var win_start = if (center >= frag_size / 2) center - frag_size / 2 else 0;
+        var win_end = @min(win_start + frag_size, text_len);
+        if (win_end - win_start < frag_size and win_start > 0) {
+            win_start = if (win_end >= frag_size) win_end - frag_size else 0;
+        }
+        win_start = utf8Floor(text, win_start);
+        win_end = utf8Ceil(text, win_end);
+
+        var match_count: u32 = 0;
+        for (spans.items) |other| {
+            if (other.start < win_end and other.end > win_start) match_count += 1;
+        }
+        try windows.append(alloc, .{ .start = win_start, .end = win_end, .score = match_count });
+    }
+
+    std.mem.sort(ScoredWindow, windows.items, {}, struct {
+        fn cmp(_: void, a: ScoredWindow, b: ScoredWindow) bool {
+            if (a.score != b.score) return a.score > b.score;
+            if (a.start != b.start) return a.start < b.start;
+            return a.end < b.end;
+        }
+    }.cmp);
+
+    var selected = std.ArrayListUnmanaged(ScoredWindow).empty;
+    defer selected.deinit(alloc);
+    for (windows.items) |w| {
+        if (selected.items.len >= max_fragments) break;
+        var overlaps = false;
+        for (selected.items) |s| {
+            if (w.start < s.end and w.end > s.start) {
+                overlaps = true;
+                break;
+            }
+        }
+        if (!overlaps) try selected.append(alloc, w);
+    }
+
+    std.mem.sort(ScoredWindow, selected.items, {}, struct {
+        fn cmp(_: void, a: ScoredWindow, b: ScoredWindow) bool {
+            return a.start < b.start;
+        }
+    }.cmp);
+
+    const fragments = try alloc.alloc(Fragment, selected.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fragments[0..initialized]) |fragment| alloc.free(fragment.highlights);
+        alloc.free(fragments);
+    }
+    for (selected.items, 0..) |win, fi| {
+        var fragment_spans = std.ArrayListUnmanaged(Span).empty;
+        defer fragment_spans.deinit(alloc);
+        for (spans.items) |span| {
+            if (span.start < win.end and span.end > win.start) {
+                try fragment_spans.append(alloc, .{
+                    .start = @max(span.start, win.start) - win.start,
+                    .end = @min(span.end, win.end) - win.start,
+                });
+            }
+        }
+        fragments[fi] = .{
+            .text = text[win.start..win.end],
+            .offset = win.start,
+            .highlights = try alloc.dupe(Span, fragment_spans.items),
+        };
+        initialized += 1;
+    }
+    return fragments;
+}
+
+test "highlight density sweep and heap preserve reference density ranking with deterministic UTF8 ties and clipping" {
+    const a = std.testing.allocator;
+    var random = std.Random.DefaultPrng.init(731);
+    const pieces = [_][]const u8{ "a ", "b ", "é ", "😀 ", "needle ", "none ", "éé", "x" };
+    for (0..40) |_| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(a);
+        for (0..80) |_| try text.appendSlice(a, pieces[random.random().uintLessThan(usize, pieces.len)]);
+        for ([_]u32{ 1, 2, 7, 16, 33, 1000 }) |width| for ([_]u32{ 1, 3, 8 }) |limit| {
+            const matchers = [_]Matcher{ .{ .term = "a" }, .{ .term = "b" }, .{ .term = "é" }, .{ .term = "needle" } };
+            const expected = try referenceHighlightMatchers(a, text.items, &matchers, &analysis_mod.simple_analyzer, limit, width);
+            defer freeFragments(a, expected);
+            const actual = try highlightMatchers(a, text.items, &matchers, &analysis_mod.simple_analyzer, limit, width);
+            defer freeFragments(a, actual);
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |left, right| {
+                try std.testing.expectEqual(left.offset, right.offset);
+                try std.testing.expectEqualStrings(left.text, right.text);
+                try std.testing.expectEqualDeep(left.highlights, right.highlights);
+            }
+        };
+    }
+}
+
+test "highlight dense windows advance density frontiers linearly and unwind cancellation" {
+    const a = std.testing.allocator;
+    var spans: [4096]Span = undefined;
+    for (&spans, 0..) |*span, i| span.* = .{ .start = @intCast(i * 7), .end = @intCast(i * 7 + 6) };
+    var poller: Poller = .{ .control = .none };
+    var sweep: DensitySweep = .{};
+    for (spans) |span| {
+        const start = span.start -| 50;
+        const end = start + 100;
+        const expected = forCount: {
+            var count: u32 = 0;
+            for (spans) |other| if (other.start < end and other.end > start) {
+                count += 1;
+            };
+            break :forCount count;
+        };
+        try std.testing.expectEqual(expected, try sweep.count(&spans, start, end, &poller));
+    }
+    try std.testing.expect(sweep.first + sweep.end <= spans.len * 2);
+    const Check = struct {
+        calls: usize = 0,
+        limit: usize = std.math.maxInt(usize),
+        fn checkpoint(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == self.limit) return error.DeadlineExceeded;
+        }
+        fn token(self: *@This()) Control {
+            return .{ .ptr = self, .check_fn = checkpoint };
+        }
+    };
+    var text: [2100]u8 = undefined;
+    for (0..300) |i| @memcpy(text[i * 7 ..][0..7], "needle ");
+    var check: Check = .{};
+    const result = try highlightMatchersControlled(a, &text, &.{.{ .term = "needle" }}, &analysis_mod.simple_analyzer, 3, 100, check.token());
+    freeFragments(a, result);
+    const calls = check.calls;
+    for (1..calls + 1) |limit| {
+        check = .{ .limit = limit };
+        try std.testing.expectError(error.DeadlineExceeded, highlightMatchersControlled(a, &text, &.{.{ .term = "needle" }}, &analysis_mod.simple_analyzer, 3, 100, check.token()));
+    }
+    const Faults = struct {
+        fn run(alloc: Allocator) !void {
+            var control: Check = .{};
+            const fragments = try highlightMatchersControlled(alloc, "a needle here, needle there, é needle", &.{.{ .term = "needle" }}, &analysis_mod.simple_analyzer, 3, 7, control.token());
+            defer freeFragments(alloc, fragments);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Faults.run, .{});
+    std.debug.print("HIGHLIGHT_DENSITY spans={d} frontier_advances={d} cancellation_points={d}\n", .{ spans.len, sweep.first + sweep.end, calls });
 }
