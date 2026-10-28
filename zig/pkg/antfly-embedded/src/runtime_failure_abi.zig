@@ -797,6 +797,7 @@ pub const Status = enum(u32) {
     unsupported_exact_sort = 838,
     invalid_document_checkpoint = 839,
     too_many_active_jobs = 840,
+    hierarchy_cursor_stale = 841,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

@@ -53,6 +53,13 @@ test "metadata head races remain retryable across runtime callbacks" {
     try std.testing.expect(errorHasStableDetail(error.MetadataSnapshotHeadMismatch));
 }
 
+test "hierarchy cursor conflicts retain identity across runtime callbacks" {
+    const transported = statusFromError(error.HierarchyCursorStale);
+    try std.testing.expectEqual(@backingInt(Code.conflict), transported.code);
+    try std.testing.expectEqual(error.HierarchyCursorStale, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.HierarchyCursorStale));
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -931,6 +938,7 @@ pub const Detail = enum(c_int) {
     cloudflare_inference_failed,
     invalid_cloudflare_response,
     document_token_limit_exceeded,
+    hierarchy_cursor_stale,
 };
 
 pub const Status = extern struct {
@@ -1766,6 +1774,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
         error.DocumentExtractionWorkingSetTooLarge => status(.invalid_argument, .document_extraction_working_set_too_large),
         error.DocumentArtifactPublicationFailed => status(.conflict, .document_artifact_publication_failed),
+        error.HierarchyCursorStale => status(.conflict, .hierarchy_cursor_stale),
         error.CrcMismatch => status(.corrupt, .crc_mismatch),
         error.InvalidData => status(.corrupt, .invalid_data),
         error.MappedArtifactUnsupported => status(.unsupported, .mapped_artifact_unsupported),
@@ -1982,6 +1991,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .hierarchy_cursor_stale => "HierarchyCursorStale",
         .crc_mismatch => "CrcMismatch",
         .invalid_data => "InvalidData",
         .mapped_artifact_unsupported => "MappedArtifactUnsupported",
