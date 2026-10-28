@@ -548,7 +548,7 @@ pub const View = struct {
         try view.prepareProjectionValue(selector, policy, root_mode, options, &scanner, raw, @import("antfly_platform").allocator.reclaimingScratch(view.alloc));
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
         if (options.ranges) |ranges| {
-            view.validated_ranges = try ranges.publish(raw, policy == .all);
+            view.validated_ranges = if (raw.len >= 4096) try ranges.publishSyntax(raw, policy == .all) else try ranges.publish(raw, policy == .all);
         }
     }
 

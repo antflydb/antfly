@@ -174,6 +174,7 @@ pub const PathFindResult = types.PathFindResult;
 pub const PathFindWeightMode = types.PathFindWeightMode;
 pub const Permission = types.Permission;
 pub const PermissionType = types.PermissionType;
+pub const ProjectionExpression = types.ProjectionExpression;
 pub const PruneStats = types.PruneStats;
 pub const QueryBuilderRequest = types.QueryBuilderRequest;
 pub const QueryBuilderResult = types.QueryBuilderResult;

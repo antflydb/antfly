@@ -213,9 +213,17 @@ class DecisionHandler(BaseHTTPRequestHandler):
         self.server.index_requests.append(
             (self.path, self.headers.get("Authorization"), body)
         )
-        asset_read = any(
+        asset_read = bool(body.get("select")) or any(
             field.startswith("payloads.") for field in body.get("fields", [])
         )
+        if body.get("select") and getattr(self.server, "select_mode", None) in (
+            "reject",
+            "reject422",
+        ):
+            self.send_response(422 if self.server.select_mode == "reject422" else 400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if (
             not asset_read and body.get("order_by") != [{"field": "_id", "desc": False}]
         ) or (
@@ -351,7 +359,97 @@ class DecisionHandler(BaseHTTPRequestHandler):
                     for part in parts[:-1]:
                         parent = parent.setdefault(part, {})
                     parent[parts[-1]] = value
-            projected.append({**hit, "_source": selected})
+            returned = {**hit, "_source": selected}
+            if body.get("select") and getattr(self.server, "select_mode", None) in (
+                "enabled",
+                "partial",
+            ):
+                computed = {}
+                missing = object()
+
+                def evaluate(expr):
+                    if "literal" in expr:
+                        return expr["literal"]
+                    if "field" in expr:
+                        if expr["field"] == "_id":
+                            return hit["_id"]
+                        value = hit["_source"]
+                        for part in expr["field"].split("."):
+                            value = (
+                                value.get(part, missing)
+                                if isinstance(value, dict)
+                                else missing
+                            )
+                        return value
+                    if "ref" in expr:
+                        return binding(expr["ref"])
+                    if "case" in expr:
+                        for branch in expr["case"]:
+                            if evaluate(branch["when"]) is True:
+                                return evaluate(branch["then"])
+                        return evaluate(expr.get("else", {"literal": None}))
+                    if "is_distinct_from" in expr:
+                        return evaluate(expr["is_distinct_from"][0]) != evaluate(
+                            expr["is_distinct_from"][1]
+                        )
+                    args = [evaluate(x) for x in expr["args"]]
+                    if expr["call"] == "is_missing":
+                        return args[0] is missing
+                    if expr["call"] == "jsonb_extract_path_text":
+                        value = args[0]
+                        for part in args[1:]:
+                            value = value.get(part) if isinstance(value, dict) else None
+                        return value
+                    if expr["call"] == "value_identity":
+                        if args[0] is missing:
+                            return None
+                        canonical = json.dumps(
+                            args[0], ensure_ascii=False, separators=(",", ":")
+                        ).encode()
+                        return (
+                            "sv1-"
+                            + hashlib.sha256(
+                                b"antfly.source.value.v1\0" + canonical
+                            ).hexdigest()
+                        )
+                    raise AssertionError(expr)
+
+                def binding(name):
+                    if name not in computed:
+                        computed[name] = evaluate(body["select"][name])
+                    return computed[name]
+
+                for name in body["select"]:
+                    binding(name)
+                returned["_computed"] = {
+                    key: None if value is missing else value
+                    for key, value in computed.items()
+                }
+                if self.server.select_mode == "partial":
+                    returned["_computed"] = {
+                        name: value
+                        for name, value in returned["_computed"].items()
+                        if not name.endswith("_value")
+                    }
+                self.server.projected_asset_bytes = getattr(
+                    self.server, "projected_asset_bytes", 0
+                ) + sum(
+                    len(value)
+                    for name, value in computed.items()
+                    if name.endswith("_value") and isinstance(value, str)
+                )
+            if asset_read:
+                for field in body["fields"]:
+                    if not field.startswith("payloads."):
+                        continue
+                    value = selected
+                    for part in field.split("."):
+                        value = value.get(part) if isinstance(value, dict) else None
+                    if isinstance(value, str):
+                        self.server.projected_asset_bytes = getattr(
+                            self.server, "projected_asset_bytes", 0
+                        ) + len(value)
+            projected.append(returned)
         hits = projected
         if mode == "cursor" and after:
             hits = self.server.index_documents[:1]
@@ -376,10 +474,27 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 ]
             }
         ).encode()
+        self.server.index_response_bytes = getattr(
+            self.server, "index_response_bytes", 0
+        ) + len(encoded)
         self.send_response(200)
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    @staticmethod
+    def assert_image_evidence(part):
+        source = part.get("source")
+        if source is None:
+            assert part["image_url"].startswith("data:image/")
+            return
+        assert "image_url" not in part
+        assert source["table"] and source["document_id"] and source["field"]
+        assert source["revision"] and source["revision_field"]
+        assert source["identity"].startswith("sv1-")
+        assert re.fullmatch(r"[0-9a-f]{64}", source["sha256"])
+        assert source["mime_type"].startswith("image/")
+        assert source["byte_length"] > 0
 
     def decision(self):
         if "/tables/" in self.path:
@@ -422,7 +537,7 @@ class DecisionHandler(BaseHTTPRequestHandler):
             if visual:
                 parts = [p for message in body["input"] for p in message["content"]]
                 assert [p["type"] for p in parts] == ["input_text", "input_image"]
-                assert parts[1]["image_url"].startswith("data:image/")
+                self.assert_image_evidence(parts[1])
                 text = "TARGET 1: STOP\n" + parts[0]["text"]
             body = {**body, "inputs": [{"id": "single", "input": text}]}
         if any(isinstance(item["input"], list) for item in body.get("inputs", [])):
@@ -431,7 +546,7 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 if isinstance(item["input"], list):
                     parts = [p for message in item["input"] for p in message["content"]]
                     assert [p["type"] for p in parts] == ["input_text", "input_image"]
-                    assert parts[1]["image_url"].startswith("data:image/")
+                    self.assert_image_evidence(parts[1])
                     item["input"] = "TARGET 1: STOP\n" + parts[0]["text"]
         if body.get("context_version") == 1:
             body = json.loads(json.dumps(body))
@@ -2136,6 +2251,9 @@ class CliTests(unittest.TestCase):
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
         self.server.asset_mode = None
+        self.server.select_mode = None
+        self.server.projected_asset_bytes = 0
+        self.server.index_response_bytes = 0
         self.server.asset_blocked = threading.Event()
         self.server.asset_release = threading.Event()
         self.server.observe_provider = None
@@ -3734,7 +3852,9 @@ class CliTests(unittest.TestCase):
         fields = [body["fields"] for _, _, body in self.server.index_requests]
         self.assertNotIn("payloads.preview", fields[0])
         self.assertNotIn("grep.content", fields[0])
-        self.assertIn("payloads.preview", fields[1])
+        self.assertNotIn("payloads.preview", fields[1])
+        self.assertIn("select", self.server.index_requests[1][2])
+        self.assertIn("payloads.preview", fields[-1])
         for _, authorization, body in self.server.index_requests:
             self.assertEqual(authorization, "Bearer independent-table-token")
             self.assertEqual(body["filter_query"], {"ids": ["0"]})
@@ -4125,11 +4245,17 @@ class CliTests(unittest.TestCase):
             ),
             128,
         )
-        # The conservative byte bound admits seven 16-unit parents together,
-        # then the last parent. No unused eight-field preload is issued.
-        self.assertEqual(len(self.server.index_requests), 3)
-        self.assertEqual(self.server.index_requests[1][2]["limit"], 7)
-        self.assertEqual(self.server.index_requests[2][2]["limit"], 1)
+        # Transfer admission is independent of decoded/provider scratch. All
+        # eight tiny-image parents fit one response; the shared 64 MiB working
+        # set gate still bounds processing. Cover all 16 fields in that read.
+        self.assertEqual(len(self.server.index_requests), 2)
+        projection = self.server.index_requests[1][2]
+        self.assertEqual(projection["limit"], 8)
+        self.assertEqual(
+            set(projection["fields"]),
+            {"grep.revision", "grep.permissions"}
+            | {f"payloads.preview{i}" for i in range(16)},
+        )
 
     def test_media_shared_provider_pool_honors_requested_concurrency(self):
         config = self.visual_parents()
@@ -4154,14 +4280,14 @@ class CliTests(unittest.TestCase):
         blocked = threading.Event()
         release = threading.Event()
 
-        def second():
-            blocked.set()
-            release.wait(10)
+        def observe(body):
+            # Provider arrival order can differ from discovery order once jobs
+            # cross page boundaries. Block the actual later parent explicitly.
+            if "image-0001.png" in json.dumps(body):
+                blocked.set()
+                release.wait(10)
 
-        def first():
-            self.server.on_provider = second
-
-        self.server.on_provider = first
+        self.server.observe_provider = observe
         process = subprocess.Popen(
             [
                 BINARY,
@@ -4364,8 +4490,14 @@ class CliTests(unittest.TestCase):
                 process.kill()
                 process.communicate()
 
+    def test_media_completed_lanes_refill_across_manifest_pages(self):
+        self.media_refill_behind_slow_head(page_size=1)
+
     def test_media_completed_lanes_refill_behind_slow_ordered_head(self):
-        config = self.visual_parents(count=24, page_size=32)
+        self.media_refill_behind_slow_head(page_size=32)
+
+    def media_refill_behind_slow_head(self, page_size):
+        config = self.visual_parents(count=24, page_size=page_size)
         blocked, release, refilled = (
             threading.Event(),
             threading.Event(),
@@ -4513,6 +4645,279 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(len(self.server.index_requests), 17)
         self.assertLessEqual(len(self.server.requests), 32)
+
+    def test_media_shape_buckets_preserve_order_without_unioning_unrelated_fields(self):
+        for shapes, point_count in ((1, 1), (2, 2), (8, 8)):
+            with self.subTest(shapes=shapes):
+                config = self.visual_parents(count=8, page_size=8)
+                for i, row in enumerate(self.server.index_documents):
+                    payloads = row["_source"]["payloads"]
+                    field = f"shape{i % shapes}"
+                    payloads[field] = payloads.pop("preview")
+                    row["_source"]["grep"]["evidence"][0]["asset"]["field"] = (
+                        "payloads." + field
+                    )
+                self.server.index_requests.clear()
+                result = self.raw_cli(
+                    *self.decision_args(),
+                    "--media=images",
+                    "--json",
+                    "--no-cache",
+                    "--no-rank",
+                    "--table-config",
+                    config,
+                    "--decision-concurrency=8",
+                )
+                evidence = [
+                    json.loads(line)["data"]
+                    for line in result.stdout.splitlines()
+                    if json.loads(line)["type"] == "evidence"
+                ]
+                self.assertEqual(len(evidence), 8)
+                self.assertEqual(
+                    [e["path"] for e in evidence],
+                    [f"Drive/image-{i:04}.png" for i in range(8)],
+                )
+                points = [
+                    body
+                    for _, _, body in self.server.index_requests
+                    if "order_by" not in body
+                ]
+                self.assertEqual(len(points), point_count)
+                for point in points:
+                    assets = [f for f in point["fields"] if f.startswith("payloads.")]
+                    self.assertEqual(len(assets), 1)
+                if shapes == 2:
+                    # Both independent fetch jobs must retire safely when
+                    # oversized groups fall back or authorization fails.
+                    args = [
+                        *self.decision_args(),
+                        "--media=images",
+                        "--json",
+                        "--no-cache",
+                        "--no-rank",
+                        "--table-config",
+                        config,
+                        "--decision-concurrency=8",
+                    ]
+                    self.server.asset_mode = "oversized_parent_group"
+                    fallback = self.raw_cli(*args)
+                    fallback_paths = [
+                        json.loads(line)["data"]["path"]
+                        for line in fallback.stdout.splitlines()
+                        if json.loads(line)["type"] == "evidence"
+                    ]
+                    self.assertEqual(fallback_paths, [e["path"] for e in evidence])
+                    before = len(self.server.requests)
+                    self.server.asset_mode = "revoked"
+                    denied = self.raw_cli(*args, code=2)
+                    self.assertIn(b"IndexAuthorizationFailed", denied.stderr)
+                    self.assertEqual(len(self.server.requests), before)
+                    self.server.asset_mode = None
+
+    def test_media_gateway_sources_preserve_fresh_identity_checks_without_payload_transfer(
+        self,
+    ):
+        config = self.visual_parents(count=4, page_size=4, units=2)
+        self.server.select_mode = "enabled"
+        args = [
+            *self.decision_args(),
+            "--media=images",
+            "--indexed-media-transport=source",
+            "--json",
+            "--table-config",
+            config,
+            "--no-rank",
+        ]
+        cold = self.raw_cli(*args)
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        self.assertEqual(self.server.projected_asset_bytes, 0)
+        requests = [request for _, _, request in self.server.requests]
+        self.assertTrue(requests)
+        images = [
+            part
+            for request in requests
+            for item in request["inputs"]
+            for message in item["input"]
+            for part in message["content"]
+            if part["type"] == "input_image"
+        ]
+        self.assertTrue(images)
+        self.assertTrue(
+            all("source" in image and "image_url" not in image for image in images)
+        )
+        self.assertTrue(
+            all(image["source"]["identity"].startswith("sv1-") for image in images)
+        )
+        self.assertTrue(
+            all(
+                image["source"]["permissions_field"] == "grep.permissions"
+                for image in images
+            )
+        )
+        warm = self.raw_cli(*args)
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        self.assertEqual(len(self.server.requests), len(requests))
+        self.assertEqual(self.server.projected_asset_bytes, 0)
+        # Caller metadata is not authority: changing only stored bytes must
+        # change the current identity and invalidate the cached decision.
+        row = self.server.index_documents[0]
+        row["_source"]["payloads"]["preview0"] = (
+            "data:image/png;base64,"
+            + base64.b64encode(self.image_fixture(width=999, height=3)).decode()
+        )
+        changed = self.raw_cli(*args)
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertGreater(len(self.server.requests), len(requests))
+        self.assertEqual(self.server.projected_asset_bytes, 0)
+        self.assertTrue(
+            any(
+                bool(query.get("select"))
+                and not any(name.endswith("_value") for name in query["select"])
+                for _, _, query in self.server.index_requests
+            )
+        )
+
+    def test_media_conditional_projection_avoids_warm_images_and_materializes_score_misses(
+        self,
+    ):
+        config = self.visual_parents(count=8, page_size=4, units=2)
+        self.server.select_mode = "enabled"
+        args = [
+            *self.decision_args(),
+            "--media=images",
+            "--json",
+            "--table-config",
+            config,
+            "--no-rank",
+            "--decision-concurrency=8",
+        ]
+        cold = self.raw_cli(*args)
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        self.assertGreater(self.server.projected_asset_bytes, 0)
+        provider_count = len(self.server.requests)
+        self.server.projected_asset_bytes = 0
+        self.server.index_requests.clear()
+        warm = self.raw_cli(*args)
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        self.assertEqual(self.server.projected_asset_bytes, 0)
+        self.assertEqual(len(self.server.requests), provider_count)
+
+        def evidence(result):
+            records = [
+                json.loads(line)
+                for line in result.stdout.splitlines()
+                if json.loads(line)["type"] == "evidence"
+            ]
+
+            # Every read reports its current observation time, including hits.
+            # Compare result content independently of crossing a clock second.
+            for record in records:
+                record["source"].pop("observed_at", None)
+            return records
+
+        self.assertEqual(evidence(cold), evidence(warm))
+        self.assertTrue(
+            any(
+                "sv1-" in json.dumps(request.get("select", {}))
+                for _, _, request in self.server.index_requests
+            )
+        )
+        descriptors = list(self.root.rglob("verified-image-v1-*.bin"))
+        self.assertTrue(descriptors)
+        descriptors[0].write_bytes(b"corrupt")
+        self.server.projected_asset_bytes = 0
+        repaired = self.raw_cli(*args)
+        self.assertEqual(evidence(cold), evidence(repaired))
+        self.assertGreater(self.server.projected_asset_bytes, 0)
+        self.assertEqual(len(self.server.requests), provider_count)
+        # A new question retains validated bytes' identities, but lacks scores.
+        self.server.projected_asset_bytes = 0
+        changed_args = list(args)
+        changed_args[changed_args.index("--ask") + 1] = "find visual error messages"
+        changed_before = len(self.server.index_requests)
+        changed = self.raw_cli(*changed_args)
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertGreater(self.server.projected_asset_bytes, 0)
+        self.assertGreater(len(self.server.requests), provider_count)
+        # Cache planning must preserve grouped full reads for a new question.
+        # Three manifest requests and two grouped asset reads serve eight parents.
+        changed_requests = self.server.index_requests[changed_before:]
+        self.assertEqual(len(changed_requests), 5)
+        self.assertEqual(
+            sum("order_by" not in body for _, _, body in changed_requests), 2
+        )
+        self.assertFalse(
+            any(
+                "sv1-" in json.dumps(body.get("select", {}))
+                for _, _, body in changed_requests
+            )
+        )
+        # An unchanged caller manifest cannot hide a changed stored payload.
+        row = self.server.index_documents[0]
+        row["_source"]["payloads"]["preview0"] = row["_source"]["payloads"]["preview1"]
+        bad = self.raw_cli(*args, code=2)
+        self.assertIn(b"Evidence", bad.stderr)
+        # Current authorization remains mandatory with hot descriptors/scores.
+        self.server.asset_mode = "revoked"
+        before = len(self.server.requests)
+        denied = self.raw_cli(*args, code=2)
+        self.assertIn(b"IndexAuthorizationFailed", denied.stderr)
+        self.assertEqual(len(self.server.requests), before)
+
+    def test_media_conditional_projection_falls_back_to_older_servers(self):
+        config = self.visual_parents(count=2)
+        self.server.select_mode = "reject"
+        result = self.raw_cli(
+            *self.decision_args(), "--media=images", "--json", "--table-config", config
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            sum("select" in body for _, _, body in self.server.index_requests),
+            1,
+        )
+        self.assertNotIn(b"leaked", result.stderr)
+        self.server.index_requests.clear()
+        self.server.requests.clear()
+        limited = self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--json",
+            "--table-config",
+            config,
+            "--max-requests=2",
+            code=2,
+        )
+        self.assertIn(b"RequestBudgetExceeded", limited.stderr)
+        self.assertEqual(len(self.server.index_requests), 2)
+        self.assertEqual(len(self.server.requests), 0)
+
+    def test_media_projection_falls_back_on_partial_and_unsupported_output(self):
+        for mode in ("partial", "reject422"):
+            with self.subTest(mode=mode):
+                config = self.visual_parents(count=2)
+                self.server.select_mode = mode
+                self.server.index_requests.clear()
+                result = self.raw_cli(
+                    *self.decision_args(),
+                    "--media=images",
+                    "--json",
+                    "--table-config",
+                    config,
+                    "--cache-dir",
+                    self.root / mode,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    sum("select" in body for _, _, body in self.server.index_requests),
+                    1,
+                )
+                self.assertTrue(
+                    any(
+                        "payloads.preview" in body["fields"]
+                        for _, _, body in self.server.index_requests
+                    )
+                )
 
     def test_media_default_budget_overlaps_manifest_with_foreground(self):
         config = self.visual_parents(count=2, page_size=1)

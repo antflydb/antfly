@@ -3853,12 +3853,12 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
     // Consumers without an explicit dependency contract retain full source.
     if (requiresEarlySource(req)) return null;
     if (!req.include_stored) return &.{};
-    if (req.fields.len == 0) return if (req.include_all_fields) null else &.{};
+    if (req.fields.len == 0 and req.include_all_fields) return null;
     var positive = false;
     for (req.fields) |field| if (field.len == 0 or field[0] != '-') {
         positive = true;
     };
-    if (!positive) return null;
+    if (req.fields.len != 0 and !positive) return null;
     var names: std.ArrayList([]const u8) = .empty;
     for (table.columns) |column| for (req.fields) |pattern| {
         if (pattern.len == 0 or pattern[0] == '-') continue;
@@ -3867,6 +3867,16 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
             break;
         }
     };
+    // Scalar outputs are independent of the public source mask. Bind once
+    // through the same admitted program and include every potential operand;
+    // archive column hydration remains a conservative provider fallback.
+    const plan_a = local.sql_memory_budget.reclaimingAllocator(a);
+    const lease = try local.api_query_contract.prepareFieldProjection(plan_a, req);
+    defer if (lease) |value| value.deinit(plan_a);
+    if (lease) |value| {
+        var fields = value.plan.required_fields.keyIterator();
+        while (fields.next()) |path| try appendHydrationPath(a, table, &names, path.*);
+    }
     return names.items;
 }
 fn appendHydrationPath(a: A, table: local.sql_catalog.Table, fields: *std.ArrayList([]const u8), path: []const u8) !void {
@@ -5787,4 +5797,26 @@ test "external lake highlight projection reuses small column leases and keeps la
         } else try std.testing.expect(found == null);
         try std.testing.expect((try projectedHighlightSource(&scratch, &hit, &.{"missing"})) == null);
     }
+}
+
+test "external lake scalar outputs hydrate dependencies independently of the public source mask" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{
+        .{ .name = "visible", .path = "visible", .type = .string },
+        .{ .name = "hidden", .path = "hidden", .type = .json },
+        .{ .name = "unused", .path = "unused", .type = .string },
+    } };
+    var req: types.SearchRequest = .{ .include_stored = true, .include_all_fields = false, .fields = &.{"visible"}, .field_projection_json = "{\"fields\":[\"visible\",{\"name\":\"output\",\"expression\":{\"case\":[{\"when\":{\"literal\":true},\"then\":{\"field\":\"hidden.value\"}}],\"else\":{\"literal\":null}}}]}" };
+    const both = (try projectionColumns(a, table, req)).?;
+    try std.testing.expectEqual(@as(usize, 2), both.len);
+    try std.testing.expectEqualStrings("visible", both[0]);
+    try std.testing.expectEqualStrings("hidden", both[1]);
+    req.fields = &.{};
+    const hidden = (try projectionColumns(a, table, req)).?;
+    try std.testing.expectEqual(@as(usize, 1), hidden.len);
+    try std.testing.expectEqualStrings("hidden", hidden[0]);
+    req.field_projection_json = "{\"fields\":[{\"name\":\"one\",\"expression\":{\"literal\":1}}]}";
+    try std.testing.expectEqual(@as(usize, 0), (try projectionColumns(a, table, req)).?.len);
 }
