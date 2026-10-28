@@ -54,6 +54,8 @@ are retained rather than forcing distinct schedules through this owner.
 Acceptance and limits:
 
 - Existing format/routing regressions: **31 passed / one skipped**.
+- The final Q1/Q8/Q8_1 test binary also compiles for baseline x86 Linux.
+  This is a portability compile check; x86 runtime performance is unmeasured.
 - The initial 48-profile Q1/Q8 kernel-owner matrix passes AA/AB/BA on both
   native and portable non-SDOT builds, with exact original-function outputs.
 - The expanded 108-profile matrix includes original Q1 dispatch and scan
