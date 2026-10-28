@@ -81,6 +81,17 @@ pub fn encodePrepared(a: A, fields: []const []const u8, selected: V, params: V) 
         try values.append(temp, .{ .object = object });
     }
     const request: Request = .{ .fields = values.items, .params = params };
+    return prepareRequest(a, request);
+}
+/// Public source delivery uses the same read/projection program with no named
+/// scalar outputs. The completion marker remains private transport metadata.
+pub fn encodeSourcePrepared(a: A, fields: []const []const u8) !Encoding {
+    const values = try a.alloc(V, fields.len);
+    defer a.free(values);
+    for (fields, values) |field, *value| value.* = .{ .string = field };
+    return prepareRequest(a, .{ .fields = values, .params = .{ .object = .empty } });
+}
+fn prepareRequest(a: A, request: Request) !Encoding {
     const checked = try a.create(Plan);
     errdefer a.destroy(checked);
     checked.* = try Plan.init(a, request);
@@ -174,7 +185,10 @@ pub fn requestLimits(request: *const @import("../storage/db/types.zig").SearchRe
 /// Output-only plans can run after local retrieval without changing membership.
 /// Source-dependent operators retain complete afterimages for final evaluation.
 pub fn storageEligible(req: anytype) bool {
-    return req.field_projection_json.len != 0 and req.include_stored and
+    return req.field_projection_json.len != 0 and sourceStorageEligible(req);
+}
+pub fn sourceStorageEligible(req: anytype) bool {
+    return req.include_stored and
         req.document_authority_mode == .none and req.return_mode == .parent and
         !req.hasHitEvaluation() and req.evaluation_json.len == 0 and
         req.reranker == null and req.pruner == null and req.highlight == null and

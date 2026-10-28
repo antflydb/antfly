@@ -4564,6 +4564,7 @@ pub const AntflyApiHandler = struct {
             failure: ?anyerror = null,
             seen: u32 = 0,
             retained: usize = 0,
+            encoded_bytes: usize = 0,
             wire: std.ArrayList(u8),
             fn start(raw: *anyopaque, length: usize) !void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
@@ -4575,17 +4576,23 @@ pub const AntflyApiHandler = struct {
                 if (bytes.len > 32 * 1024 * 1024 -| self.wire.items.len) return error.InferenceRequestTooLarge;
                 try self.wire.appendSlice(self.a, bytes);
             }
-            fn consume(raw: *anyopaque, result: @import("antfly_metadata_openapi").QueryResult) !void {
+            fn consume(raw: *anyopaque, view: @import("antfly_local_sources").api_query_response.ResultView) !void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
-                self.consumeResult(result) catch |err| {
+                self.consumeResult(view) catch |err| {
                     self.failure = err;
                     return error.QueryDeliveryFailed;
                 };
             }
-            fn consumeResult(self: *@This(), result: @import("antfly_metadata_openapi").QueryResult) !void {
+            fn chargeEncoded(self: *@This(), size: usize) !void {
+                if (size > 32 * 1024 * 1024 -| self.encoded_bytes) return error.InferenceRequestTooLarge;
+                self.encoded_bytes += size;
+            }
+            fn consumeResult(self: *@This(), view: @import("antfly_local_sources").api_query_response.ResultView) !void {
+                const result = view.result;
                 try inference_gateway.source_media.checkStatus(result.status);
                 const hits = (result.hits orelse return error.InferenceUpstreamUnavailable).hits orelse return error.InferenceUpstreamUnavailable;
-                for (hits) |hit_| {
+                if (view.encoded_sources.len != 0 and view.encoded_sources.len != hits.len) return error.InferenceUpstreamUnavailable;
+                for (hits, 0..) |hit_, hit_index| {
                     var scratch = std.heap.ArenaAllocator.init(SQLMemoryBudget.reclaimingAllocator(self.a));
                     defer scratch.deinit();
                     const computed: ?std.json.Value = if (!self.legacy and (self.flat or self.group.identity_images.items.len != 0)) value: {
@@ -4593,10 +4600,14 @@ pub const AntflyApiHandler = struct {
                             self.projection_missing = true;
                             return error.QueryDeliveryFailed;
                         }).bytes;
-                        if (bytes.len > 32 * 1024 * 1024) return error.InferenceRequestTooLarge;
+                        try self.chargeEncoded(bytes.len);
                         break :value try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), bytes, .{ .allocate = .alloc_if_needed });
                     } else null;
                     const values = if (!self.legacy and self.flat) computed.? else value: {
+                        if (view.encoded_sources.len != 0) if (view.encoded_sources[hit_index]) |source| {
+                            try self.chargeEncoded(source.bytes.len);
+                            break :value try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), source.bytes, .{ .allocate = .alloc_if_needed });
+                        };
                         const source = hit_._source orelse return error.InferenceSourceUnavailable;
                         break :value std.json.Value{ .object = source.map };
                     };
@@ -20886,14 +20897,14 @@ test "httpx inference gateway typed consumers retain errors and legacy original 
     const hits = [_]@import("antfly_metadata_openapi").QueryHit{.{ ._id = "a", ._score = 0, ._source = .{ .map = root.object } }};
     const result: @import("antfly_metadata_openapi").QueryResult = .{ .status = 200, .took = 0, .hits = .{ .hits = &hits } };
     var consumer: Consumer = .{ .a = a, .references = &references, .group = groups[0], .output = &output, .wire = .empty };
-    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, result));
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = result }));
     try std.testing.expect(consumer.projection_missing);
     consumer = .{ .a = a, .references = &references, .group = groups[0], .output = &output, .wire = .empty, .legacy = true };
-    try Consumer.consume(&consumer, result);
+    try Consumer.consume(&consumer, .{ .result = result });
     try std.testing.expectEqualStrings("correct", output[0]);
     root.object.getPtr("versions").?.array.items[1] = .{ .string = "r2" };
     consumer = .{ .a = a, .references = &references, .group = groups[0], .output = &output, .wire = .empty, .legacy = true };
-    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, result));
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = result }));
     try std.testing.expectEqual(error.InferenceSourceMismatch, consumer.failure.?);
     try std.testing.expect(!consumer.projection_missing);
 
@@ -20911,22 +20922,42 @@ test "httpx inference gateway typed consumers retain errors and legacy original 
     var object_hits = [_]@import("antfly_metadata_openapi").QueryHit{.{ ._id = "a", ._score = 0, ._source = .{ .map = object_root.object } }};
     const object_result: @import("antfly_metadata_openapi").QueryResult = .{ .status = 200, .took = 0, .hits = .{ .hits = &object_hits } };
     consumer = .{ .a = a, .references = &object_references, .group = object_groups[0], .output = &output, .wire = .empty, .flat = false };
-    try Consumer.consume(&consumer, object_result);
+    try Consumer.consume(&consumer, .{ .result = object_result });
     try std.testing.expectEqualStrings("image", output[0]);
     object_references[0].identity = "pinned";
     const pinned_groups = try source_media.groups(a, &object_references);
     consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
-    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, object_result));
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result }));
     try std.testing.expect(consumer.projection_missing);
     consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
     // The wire fallback also calls hit directly; a source key is not a pin.
     try std.testing.expectError(error.InferenceSourceMismatch, consumer.hit("a", object_root, null));
     object_hits[0]._computed = .{ .bytes = "{\"i0\":\"pinned\"}" };
     consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
-    try Consumer.consume(&consumer, object_result);
+    try Consumer.consume(&consumer, .{ .result = object_result });
     try std.testing.expectEqualStrings("image", output[0]);
     object_hits[0]._computed = .{ .bytes = "{\"i0\":\"wrong\"}" };
     consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
-    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, object_result));
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result }));
     try std.testing.expectEqual(error.InferenceSourceMismatch, consumer.failure.?);
+    // A finalized public JSON source can be consumed without constructing a
+    // second producer DOM. The pin still comes only from computed output.
+    const encoded_source = try std.json.Stringify.valueAlloc(a, object_root, .{});
+    const source_views = [_]?ant_json.RawObject{.{ .bytes = encoded_source }};
+    object_hits[0]._source = null;
+    object_hits[0]._computed = .{ .bytes = "{\"i0\":\"pinned\"}" };
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try Consumer.consume(&consumer, .{ .result = object_result, .encoded_sources = &source_views });
+    try std.testing.expectEqualStrings("image", output[0]);
+    object_hits[0]._computed = null;
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result, .encoded_sources = &source_views }));
+    try std.testing.expect(consumer.projection_missing);
+    object_hits[0]._computed = .{ .bytes = "{\"i0\":\"pinned\"}" };
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false, .encoded_bytes = 32 * 1024 * 1024 };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result, .encoded_sources = &source_views }));
+    try std.testing.expectEqual(error.InferenceRequestTooLarge, consumer.failure.?);
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result, .encoded_sources = &.{ source_views[0], source_views[0] } }));
+    try std.testing.expectEqual(error.InferenceUpstreamUnavailable, consumer.failure.?);
 }

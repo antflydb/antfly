@@ -1330,3 +1330,57 @@ choice is independent of image size, document IDs and benchmark corpus. A paired
 all-flat implementation regressed large four-image CPU about 41%, motivating
 this structural source/scalar split; that rejected result remains in ignored
 qualification evidence rather than becoming a performance claim.
+
+The in-process boundary carries a `ResultView` with optional row-aligned
+`encoded_sources`. A non-null encoded source replaces that row's `_source` only
+when the existing public-wire source witness matches the immutable bytes. Native
+JSON rows can therefore bypass producer parsing and cloning; already-typed
+column results retain their `_source` maps. The consumer handles the available
+representation before the same producer lease ends. Caller-parsed JSON and
+unqualified sources cannot acquire this fast path. Graph requests retain normal
+wire delivery. No public response schema or query authority changes.
+
+Gateway decoding charges a cumulative 32 MiB encoded-input limit before parsing
+borrowed sources or computed values, while retained payload, expansion, digest,
+revision, identity and live-policy checks remain independent. Identity output is
+never taken from source keys, including encoded-source and wire fallbacks. A
+1 MiB native source is covered by a contract test with only a 128 KiB preparation
+arena, proving that the adapter does not require a payload-sized parse/clone.
+The column-backed source-mask test explicitly retains typed source delivery.
+
+The intermediate `dfbc59d9de77` release passed 57 HTTP cases but still increased
+large-media CPU 16–32% because ordinary typed-source preparation parsed and
+cloned JSON before consumption. Its executable, manifest and reports are retained
+under ignored `output/projection-followup/structural-dfbc/`. The encoded-source
+view reuses the representation already accepted by the public wire encoder;
+it does not infer a new validation receipt from untrusted payload bytes.
+
+Native table readers forward synchronous result delivery through the same bound,
+provisioned and hosted read callbacks and transient-read retries as wire queries.
+A consumer-bearing query finalizes at that owner instead of escaping through a
+single-shard encoded-response shortcut. Legacy providers without the optional
+callback retain their owned wire response; no process-local consumer enters a
+shard RPC or a new public endpoint.
+
+Source-only public queries use the same private projection IR with zero named
+scalar bindings. This admits source masks to bounded native hydration without
+computing an unused identity. Completion fingerprints remain private worker
+transport metadata; public source-only responses omit `_computed`. Count-only,
+empty-source and unsupported execution shapes retain their existing paths, as
+do source masks beyond the prepared program's metadata bounds. No empty public
+`select` or new source-projection option is introduced.
+
+A source-only response lacking a completion witness cannot certify whether
+numeric array masks were already applied. The coordinator refuses to infer that
+state. An unsupported source-only program can fall back once to the existing
+whole-query read, preserving filters, policy, consistency, retained cut and
+original deadlines. Named scalar expressions never downgrade. Consumer failures
+are normalized to `QueryDeliveryFailed` and cannot trigger this compatibility
+retry; the gateway retains the original failure classification locally.
+
+Implicit source-only preparation leaves ordered, retained/cursor and offset
+queries on their existing projection path. Native consumers with retained cuts
+or graph dialects also retain finalized wire responses, preserving carrier-owned
+continuation and exhaustion semantics. Private worker source programs still
+reconstruct their exact completion fingerprint, including during authenticated
+hydration; public source-only planning does not make a new pagination contract.

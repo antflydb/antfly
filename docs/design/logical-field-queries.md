@@ -1005,3 +1005,25 @@ preserves its semantics. Source masks suffice for object-only path access;
 numeric array selections need scalar binding before source compaction. Identity
 outputs stay separate from source keys. Typed delivery removes response encoding;
 it does not imply that computing every source value again as a scalar is free.
+
+A synchronous internal `ResultView` may carry row-aligned encoded public sources
+instead of constructing `_source` maps. Eligibility uses the same exact-byte
+public-source witness as ordinary wire delivery; absent witnesses retain typed
+preparation and validation. A column-backed source remains typed. Both forms are
+borrowed under the original query lifecycle and cannot outlive the producer.
+Consumers must bound encoded input before parsing it and retain owned copies of
+anything used afterward. Computed identities stay separate from both source
+representations. This changes no public JSON schema or authorization boundary.
+
+A public source mask can compile to the private projection IR with zero named
+outputs. Its worker completion fingerprint attests final source preparation,
+while public `_computed` remains absent. Native synchronous delivery is an
+optional method on the same table-read boundary, not an alternate authorization
+route. Bound, provisioned and hosted readers preserve read cuts and producer
+leases through consumption. Older readers may use one source-only compatibility
+fallback with identical query semantics; an explicit scalar selection cannot
+be dropped, and a consumer failure cannot replay a completed result.
+
+Source-only preparation does not alter retained/cursor or offset planning.
+Consumer-bearing native reads with a retained cut or graph dialect use the
+existing finalized wire path rather than remerging an already-paged response.

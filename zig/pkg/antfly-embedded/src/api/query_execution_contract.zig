@@ -3294,10 +3294,13 @@ pub fn encodeQueryRequestWithGraphWireMode(
         defer arena.deinit();
         const a = arena.allocator();
         const projection = try std.json.parseFromSliceLeaky(@import("field_projection.zig").Request, a, req.field_projection_json, .{});
-        try appendJsonFieldName(alloc, &out, &first, "select");
-        try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, try @import("field_projection.zig").selection(a, projection), .{}));
-        try appendJsonFieldName(alloc, &out, &first, "params");
-        try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, projection.params, .{}));
+        const selected = try @import("field_projection.zig").selection(a, projection);
+        if (selected.object.count() != 0) {
+            try appendJsonFieldName(alloc, &out, &first, "select");
+            try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, selected, .{}));
+            try appendJsonFieldName(alloc, &out, &first, "params");
+            try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, projection.params, .{}));
+        }
         if (!req.include_all_fields) {
             var plan = try @import("field_projection.zig").decode(a, req.field_projection_json);
             defer plan.deinit();

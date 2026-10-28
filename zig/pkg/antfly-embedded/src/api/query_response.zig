@@ -38,6 +38,15 @@ pub const QueryResponse = struct {
     }
 };
 
+/// Borrowed public result. A non-null encoded source replaces `_source` for
+/// that hit and carries the same producer-validated public projection as wire
+/// delivery. Column/other typed producers retain `_source`. Both forms expire
+/// when the synchronous consumer returns; neither grants query authority.
+pub const ResultView = struct {
+    result: @import("antfly_metadata_openapi").QueryResult,
+    encoded_sources: []const ?@import("antfly-json").RawObject = &.{},
+};
+
 /// Synchronous delivery: the producer retains query state until the final write
 /// returns. start runs only after validation and exact byte counting, allowing
 /// transports to reject a response before committing headers. Backpressure and
@@ -48,7 +57,7 @@ pub const Delivery = struct {
     /// borrow ends when consume returns; retain only caller-owned copies.
     typed_result: ?struct {
         ptr: *anyopaque,
-        consume: *const fn (*anyopaque, @import("antfly_metadata_openapi").QueryResult) anyerror!void,
+        consume: *const fn (*anyopaque, ResultView) anyerror!void,
     } = null,
     start_fn: *const fn (*anyopaque, usize) anyerror!void,
     write_fn: *const fn (*anyopaque, []const u8) anyerror!void,

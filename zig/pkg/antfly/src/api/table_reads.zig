@@ -2483,6 +2483,7 @@ pub const BoundTableReadSource = struct {
                 .scan = scan,
                 .scan_stream = scanStream,
                 .query = query,
+                .query_with_delivery = queryWithDelivery,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -2894,6 +2895,20 @@ pub const BoundTableReadSource = struct {
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
+        return queryWithDelivery(ptr, alloc, table_name, req, consistency, null);
+    }
+
+    fn queryWithDelivery(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+        requested_delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+    ) !?query_api.QueryResponse {
+        // Retained carriers and graph dialects keep their finalized wire
+        // response; a typed consumer cannot infer continuation/exhaustion.
+        const delivery = if (req.native_query_cut != null or req.graph_queries.len != 0) null else requested_delivery;
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         try validateDecisionRequest(alloc, req, self.decision_registry);
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
@@ -2970,7 +2985,7 @@ pub const BoundTableReadSource = struct {
         });
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
         const encode_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
-        const response = try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
+        const response = try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, response_req, meta, result, delivery);
         if (phase_profile) {
             const encode_ns = platform_time.monotonicNs() - encode_start_ns;
             const total_ns = platform_time.monotonicNs() - start_ns;
@@ -4125,6 +4140,7 @@ pub const ProvisionedTableReadSource = struct {
                 .scan = scan,
                 .scan_stream = scanStream,
                 .query = query,
+                .query_with_delivery = queryWithDelivery,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
@@ -4843,12 +4859,26 @@ pub const ProvisionedTableReadSource = struct {
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
+        return queryWithDelivery(ptr, alloc, table_name, req, consistency, null);
+    }
+
+    fn queryWithDelivery(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+        requested_delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+    ) !?query_api.QueryResponse {
+        // Retained carriers and graph dialects keep their finalized wire
+        // response; a typed consumer cannot infer continuation/exhaustion.
+        const delivery = if (req.native_query_cut != null or req.graph_queries.len != 0) null else requested_delivery;
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try validateDecisionRequest(alloc, req, self.decision_registry);
         try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
-            return HostedProvisionedTableReadSource.query(&hosted, alloc, table_name, req, consistency);
+            return HostedProvisionedTableReadSource.queryWithDelivery(&hosted, alloc, table_name, req, consistency, delivery);
         }
         const timed_req = graphTimedSearchRequest(req);
         // Graph retries re-run the base scan and every shard fanout. Keep one
@@ -4858,7 +4888,7 @@ pub const ProvisionedTableReadSource = struct {
         var attempt: usize = 0;
         while (attempt < attempt_limit) : (attempt += 1) {
             checkQueryDeadline(req) catch |err| return err;
-            return self.queryAttempt(alloc, table_name, timed_req, consistency) catch |err| switch (err) {
+            return self.queryAttempt(alloc, table_name, timed_req, consistency, delivery) catch |err| switch (err) {
                 error.TopologyChanged => if (attempt + 1 < attempt_limit) continue else return err,
                 error.ResidentDbRetryRequired => if (attempt + 1 < attempt_limit) continue else return error.StorageReadTemporarilyUnavailable,
                 else => return err,
@@ -4873,6 +4903,7 @@ pub const ProvisionedTableReadSource = struct {
         table_name: []const u8,
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
         try distributed_graph.validateIncomingStartIdentities(alloc, self.catalog, table_name, req);
@@ -4893,7 +4924,7 @@ pub const ProvisionedTableReadSource = struct {
         try rejectUnsupportedGraphQueryMode(group_ids.len, req);
         const start_ns = self.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
-            if ((control_only_storage_sources or routed.local_read_source != null) and !queryRequiresCoordinatorFinalization(req)) {
+            if ((control_only_storage_sources or routed.local_read_source != null) and delivery == null and !queryRequiresCoordinatorFinalization(req)) {
                 const local_source = try routed.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation);
                 return local_source.queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), .stale) catch |err| switch (err) {
                     error.ResidentDbRetryRequired => {
@@ -4945,7 +4976,7 @@ pub const ProvisionedTableReadSource = struct {
                     &meta,
                     routed.managedReadRuntimeConfig().forTable(table_name),
                 );
-                return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
+                return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, response_req, meta, result, delivery);
             }
         }
 
@@ -5028,7 +5059,7 @@ pub const ProvisionedTableReadSource = struct {
                 &meta,
                 routed.managedReadRuntimeConfig().forTable(table_name),
             );
-            return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
+            return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
         const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name);
@@ -5066,7 +5097,7 @@ pub const ProvisionedTableReadSource = struct {
             &meta,
             routed.managedReadRuntimeConfig().forTable(table_name),
         );
-        return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
+        return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, req, meta, merged, delivery);
     }
 
     /// Runtime transforms and cross-table aggregates remain coordinator-owned.
@@ -6897,6 +6928,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .scan = scan,
                 .scan_stream = scanStream,
                 .query = query,
+                .query_with_delivery = queryWithDelivery,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
@@ -7339,6 +7371,20 @@ pub const HostedProvisionedTableReadSource = struct {
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
+        return queryWithDelivery(ptr, alloc, table_name, req, consistency, null);
+    }
+
+    fn queryWithDelivery(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+        requested_delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+    ) !?query_api.QueryResponse {
+        // Retained carriers and graph dialects keep their finalized wire
+        // response; a typed consumer cannot infer continuation/exhaustion.
+        const delivery = if (req.native_query_cut != null or req.graph_queries.len != 0) null else requested_delivery;
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try validateDecisionRequest(alloc, req, hosted.decision_registry);
         const timed_req = graphTimedSearchRequest(req);
@@ -7349,7 +7395,7 @@ pub const HostedProvisionedTableReadSource = struct {
         var attempt: usize = 0;
         while (attempt < attempt_limit) : (attempt += 1) {
             checkQueryDeadline(req) catch |err| return err;
-            return hosted.queryAttempt(alloc, table_name, timed_req, consistency) catch |err| switch (err) {
+            return hosted.queryAttempt(alloc, table_name, timed_req, consistency, delivery) catch |err| switch (err) {
                 error.TopologyChanged => if (attempt + 1 < attempt_limit) continue else return err,
                 else => return err,
             };
@@ -7363,6 +7409,7 @@ pub const HostedProvisionedTableReadSource = struct {
         table_name: []const u8,
         requested: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !?query_api.QueryResponse {
         var req = requested;
         try checkQueryDeadline(req);
@@ -7394,7 +7441,7 @@ pub const HostedProvisionedTableReadSource = struct {
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
         try rejectUnsupportedGraphQueryMode(group_ids.len, req);
         const start_ns = self.monotonicNs();
-        if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
+        if (delivery == null and group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
             defer route.deinit(alloc);
 
@@ -7453,7 +7500,7 @@ pub const HostedProvisionedTableReadSource = struct {
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, null, consistency);
             try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
-            return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
+            return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
         const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name);
@@ -7471,7 +7518,7 @@ pub const HostedProvisionedTableReadSource = struct {
         if (collection_req != null) discardAggregationOnlyHits(&merged);
         try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
-        return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
+        return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, req, meta, merged, delivery);
     }
 
     fn preflightQuery(
