@@ -4355,13 +4355,15 @@ fn runResolverNamespaceRound(service: anytype) !void {
     if (!try service.ensureReconcileLease()) return;
     var arena = std.heap.ArenaAllocator.init(service.alloc);
     defer arena.deinit();
+    // This cadence only schedules idempotent catalog work and observes it in
+    // later rounds. Do not retain an exact-term receipt that nobody waits on.
     const table = (try store.pendingResolverNamespaceTable(arena.allocator(), service.metadata_group_id)) orelse {
         const id = (try store.pendingResolverNamespaceDrop(arena.allocator(), service.metadata_group_id)) orelse return;
         const fence = try store.getTableTransitionFence(service.metadata_group_id, id);
-        _ = try service.proposeTransitionCommandWithReceipt(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
+        try service.proposeTransitionCommand(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
         return;
     };
-    _ = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } });
+    try service.proposeTransitionCommand(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } });
 }
 
 fn runRelationReconciliationRound(service: anytype) !void {
