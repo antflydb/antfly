@@ -177,7 +177,13 @@ with bench.managed_server(
             ]
         }
         warm = client.query({"request": query})
-        assert len(warm["hits"]["hits"]) == 32
+        assert [hit["_source"]["id"] for hit in warm["hits"]["hits"]] == list(
+            range(10, count)
+        )
+        assert all(
+            hit["_source"]["body"] == "deadline needle " + "needle " * 4680
+            for hit in warm["hits"]["hits"]
+        )
         for sample in range(3):
             for mode in (
                 ("hidden", "projected") if sample % 2 == 0 else ("projected", "hidden")
@@ -199,6 +205,10 @@ with bench.managed_server(
                             {k: v for k, v in h.items() if k != "_source"}
                             for h in warm["hits"]["hits"]
                         ]
+                        assert [hit["_source"] for hit in hits] == [
+                            {field: hit["_source"][field] for field in fields}
+                            for hit in warm["hits"]["hits"]
+                        ]
                     record = {
                         "sample": sample,
                         "mode": mode,
@@ -219,6 +229,11 @@ report = {
     "runner_sha256": sha(__file__),
     "parquet_sha256": sha(archive),
     "rows": rows,
+    "deadline_warm_hits_sha256": hashlib.sha256(
+        json.dumps(warm["hits"], sort_keys=True).encode()
+    ).hexdigest(),
+    "python": sys.version,
+    "pyarrow": pa.__version__,
     "deadlines": deadlines,
     "qualification": "Warm local Debug, three samples per point, real synthetic Parquet. One hit and at most three snippets for each density point; 32 hits for deadline controls. No task-owned builds, E2E or cleanup overlap; shared host. Compare immutable binaries in both orders. No Release, cloud, empty-cache or archive-scale claim.",
 }
