@@ -482,12 +482,23 @@ fn prepareCommitManifestCredit(backend: anytype, incoming: *const ActiveMemTable
     return 0;
 }
 
-fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, control: ?read_admission.Port, retired_without_commit: *bool) !bool {
+const RetiredPublication = struct {
+    state: *ActiveMemTable,
+    credit: *@import("../resource_manager.zig").Reservation,
+};
+
+fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, control: ?read_admission.Port, retired_without_commit: *bool, retired_publication: ?RetiredPublication) !bool {
     if (incoming.entryCount() == 0) return false;
     if (comptime @hasDecl(@TypeOf(backend.*), "publishMutableWithWalAdmission")) if (control) |original| {
         if (try backend.publishMutableWithWalAdmission(incoming, original, retired_without_commit)) return true;
     };
     if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
+        if (retired_publication) |owned| {
+            // Fund retained staging and the old live root before either WAL
+            // acceptance or root publication can make retirement mandatory.
+            const bytes = try std.math.add(u64, backend.mutable.estimatedMemoryBytes(), incoming.estimatedMemoryBytes());
+            try owned.credit.growBoundedOversized(bytes, 1);
+        }
         var candidate = if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
             try backend.prepareAndAppendWalForMutable(incoming)
         else blk: {
@@ -499,8 +510,17 @@ fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *Acti
         defer candidate.deinit(allocator);
         if (@hasDecl(@TypeOf(backend.*), "invalidateMutableReadSnapshot")) backend.invalidateMutableReadSnapshot();
         backend.mutable.publishPrepared(&candidate);
-        incoming.deinit(allocator);
-        incoming.* = .{ .ordered_enabled = false };
+        if (retired_publication) |owned| {
+            // A guarded commit keeps CPU, but its old root and complete
+            // staging batch still belong to the prepaid cleanup owner.
+            // Preserve incoming until transaction finalization adopts both.
+            std.debug.assert(owned.state.entryCount() == 0);
+            owned.state.* = candidate;
+            candidate = .{};
+        } else {
+            incoming.deinit(allocator);
+            incoming.* = .{ .ordered_enabled = false };
+        }
     } else {
         try backend.appendWalForMutable(incoming);
         if (@hasDecl(@TypeOf(backend.*), "invalidateMutableReadSnapshot")) backend.invalidateMutableReadSnapshot();
@@ -5186,6 +5206,7 @@ fn WriteRetirement(comptime Txn: type, comptime BackendType: type) type {
         backend: *BackendType,
         txn: ?Txn = null,
         mutable: ?ActiveMemTable.Reclaimer = null,
+        published_base: ?ActiveMemTable.Reclaimer = null,
         bulk: ?State.Reclaimer = null,
         prefix: ?ActiveMemTable.Reclaimer = null,
         overlay: ?State.Reclaimer = null,
@@ -5207,6 +5228,7 @@ fn WriteRetirement(comptime Txn: type, comptime BackendType: type) type {
             self.txn = source.*;
             const owned = &self.txn.?;
             self.mutable = .init(owned.mutable);
+            self.published_base = .init(owned.publication_retired);
             self.bulk = .init(owned.bulk_appends);
             if (owned.prefix_index.state) |state| self.prefix = .init(state);
             if (owned.cursor_overlay) |state| self.overlay = .init(state);
@@ -5215,7 +5237,7 @@ fn WriteRetirement(comptime Txn: type, comptime BackendType: type) type {
                 self.base = .init(snapshot.state.*);
                 owned.cursor_base_mutable = null;
             };
-            inline for (.{ "mutable", "bulk_appends", "bulk_index", "prefix_index", "held_values", "batch_scratch", "probe_scratch" }) |field| {
+            inline for (.{ "mutable", "publication_retired", "bulk_appends", "bulk_index", "prefix_index", "held_values", "batch_scratch", "probe_scratch" }) |field| {
                 if (@hasField(Txn, field)) @field(source, field) = .{};
             }
             if (@hasField(Txn, "held_blocks")) source.held_blocks = .empty;
@@ -5270,6 +5292,14 @@ fn WriteRetirement(comptime Txn: type, comptime BackendType: type) type {
                 try self.check(original);
                 switch (self.stage) {
                     0, 1, 2, 3, 4 => {
+                        if (self.stage == 0) if (self.published_base) |*base| {
+                            var part: usize = 1;
+                            const done = base.step(a, &part);
+                            credits.* -= 1 - part;
+                            if (!done) continue;
+                            self.published_base = null;
+                            if (credits.* == 0) return false;
+                        };
                         var part: usize = 1;
                         const done = switch (self.stage) {
                             0 => self.mutable.?.step(a, &part),
@@ -5449,6 +5479,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         backend: *BackendType,
         namespace: backend_types.Namespace,
         mutable: ActiveMemTable,
+        publication_retired: ActiveMemTable = .{},
         bulk_appends: State = .{},
         bulk_index: BulkAppendIndex = .{},
         prefix_index: WriterPrefixIndex = .{},
@@ -5568,7 +5599,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    admitted_foreground_commit = try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit);
+                    admitted_foreground_commit = try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit, if (self.retirement) |frame| .{ .state = &self.publication_retired, .credit = &frame.credit } else null);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -11499,6 +11530,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         metadata_allocator: Allocator,
         backend: *BackendType,
         mutable: ActiveMemTable,
+        publication_retired: ActiveMemTable = .{},
         bulk_appends: State = .{},
         bulk_index: BulkAppendIndex = .{},
         prefix_index: WriterPrefixIndex = .{},
@@ -11626,7 +11658,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    admitted_foreground_commit = try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit);
+                    admitted_foreground_commit = try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit, if (self.retirement) |frame| .{ .state = &self.publication_retired, .credit = &frame.credit } else null);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
