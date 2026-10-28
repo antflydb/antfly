@@ -34940,7 +34940,7 @@ fn extractSourceText(
     defer parsed.deinit();
     if (parsed.value != .object) return null;
     const source = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
-    if (source != .string) return null;
+    if (source != .string or source.string.len == 0) return null;
     return try alloc.dupe(u8, source.string);
 }
 
@@ -38355,6 +38355,27 @@ test "extractSourceText without template returns null for missing field" {
     };
     const result = try extractSourceText(alloc, .{}, doc, request);
     try std.testing.expect(result == null);
+}
+
+test "enrichment extractSourceText empty fields and templates share no output while preserving whitespace" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", "{{body}}" }) |template_| {
+        const request: enrichment_types.GeneratedEnrichmentRequest = .{
+            .kind = .dense_embedding,
+            .index_name = "idx",
+            .doc_key = "doc:1",
+            .source_field = "body",
+            .source_template = template_,
+        };
+        for ([_][]const u8{ "{\"body\":\"\"}", "{}", "{\"body\":null}" }) |doc| {
+            const result = try extractSourceText(alloc, .{}, doc, request);
+            defer if (result) |text| alloc.free(text);
+            try std.testing.expect(result == null);
+        }
+        const whitespace = (try extractSourceText(alloc, .{}, "{\"body\":\" \\t\\n\"}", request)).?;
+        defer alloc.free(whitespace);
+        try std.testing.expectEqualStrings(" \t\n", whitespace);
+    }
 }
 
 test "extractSourceText with template skips _embeddings field" {
