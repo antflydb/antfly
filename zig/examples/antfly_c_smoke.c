@@ -182,11 +182,16 @@ static int run_signal_lifetime_smoke(void) {
     snprintf(second_path, sizeof(second_path), "%s/second.aflite.lock", directory);
     remove(first_path);
     remove(second_path);
+    /* Maintenance leaves this coordination inode in place so concurrent owners
+     * cannot acquire different locks. Both owners are closed and this fixture
+     * owns the entire directory, so it is now safe to remove the guard. */
+    snprintf(first_path, sizeof(first_path), "%s/.aflite-lease-publication.lock", directory);
+    remove(first_path);
     if (rmdir(directory) != 0) {
         fprintf(stderr, "signal smoke directory cleanup failed: %s\n", strerror(errno));
         failed = 1;
     }
-    if (failed) fprintf(stderr, "foreign executor signal lifetime was not retained/restored\n");
+    if (failed) fprintf(stderr, "foreign executor signal smoke failed\n");
     return failed;
 #else
     return 0;
