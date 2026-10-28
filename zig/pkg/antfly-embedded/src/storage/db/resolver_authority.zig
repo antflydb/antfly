@@ -6048,7 +6048,11 @@ test "resolver curation incremental repairs coalesce routing edits and journal g
     for (&pairs, 0..) |*pair, i| pair.* = .{ .from = names[i], .to = names[24 + i] };
     var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = &pairs } };
     try store.adoptNamespace(namespace);
-    while (!try store.advanceQueryPins(template, id, lookup, 128)) {}
+    // Bound owner work, rather than wall time: a stalled bootstrap must fail
+    // this regression instead of consuming the entire unit-suite watchdog.
+    var bootstrap_turns: usize = 0;
+    while (!try store.advanceQueryPins(template, id, lookup, 128)) : (bootstrap_turns += 1)
+        try std.testing.expect(bootstrap_turns < 128);
     var native: [24]?resolver.KeyAlias = @splat(null);
     var removed: [24]bool = @splat(false);
     var rng = std.Random.DefaultPrng.init(98144);

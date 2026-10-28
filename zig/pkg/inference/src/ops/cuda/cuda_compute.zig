@@ -2211,7 +2211,7 @@ const OcrTempScanProfile = struct {
     const Sample = struct { wall: u64, cpu: ?u64 };
     enabled: bool = false,
     sections: [4]Section = .{ .{}, .{}, .{}, .{} },
-    lock_sequences: [2]std.atomic.Value(u64) = .{ std.atomic.Value(u64).init(0), std.atomic.Value(u64).init(0) },
+    lock_sequences: [2]platform.atomic.Value(u64) = .{ platform.atomic.Value(u64).init(0), platform.atomic.Value(u64).init(0) },
 
     fn begin(self: *@This(), section: usize) ?Sample {
         if (!self.enabled) return null;
