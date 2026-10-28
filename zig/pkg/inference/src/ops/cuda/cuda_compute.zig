@@ -2830,6 +2830,146 @@ pub const CudaCompute = struct {
             ((!self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active) or lightOnOwnedDecodeCapture(self));
     }
 
+    pub fn lightOnProjectionResidualEnabled(cb: *const ops.ComputeBackend) bool {
+        if (!lightOnFfnBlockEnabled(cb)) return false;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.cublaslt != null and cudaCublasLtEnabled() and
+            !self.lighton_bf16_decode_outputs and !self.lighton_bf16_projection_outputs and
+            self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1;
+    }
+
+    /// Keep the ordinary GEMM algorithm and combine its separately rounded
+    /// F32 bias and residual additions. Bias epilogues select slower GEMMs for
+    /// the large vision shapes on SM12.1.
+    pub fn lightOnVisionOutputResidual(cb: *const ops.ComputeBackend, input_ct: CT, weight_ct: CT, bias_ct: CT, residual_ct: CT, rows: usize, hidden: usize) !?CT {
+        if (cb.kind() != .cuda) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.capability_profile != .lightonocr3 or !self.lighton_fused_vision_qkv_enabled or
+            self.resident_training_cache or self.lazy_host_store != null or self.lighton_precision != .f32 or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
+            !cudaCublasLtEnabled() or self.cublaslt == null or self.cublaslt_bf16_tuning_profile != .off or
+            rows < 256 or rows > 65536 or (hidden != 768 and hidden != 1024)) return null;
+        const input = tensorFromCt(input_ct);
+        const weight = tensorFromCt(weight_ct);
+        const bias = tensorFromCt(bias_ct);
+        const residual = tensorFromCt(residual_ct);
+        if (weight.dtype != .bf16 or weight.quant_type != null or input.strict_resident_training or
+            weight.strict_resident_training or bias.strict_resident_training or residual.strict_resident_training) return null;
+        try ensureF32(input);
+        try ensureF32(bias);
+        try ensureF32(residual);
+        const count = try checkedMul(rows, hidden);
+        const tensors = [_]*const CudaTensor{ input, weight, bias, residual };
+        const counts = [_]usize{ count, try checkedMul(hidden, hidden), hidden, count };
+        for (tensors, counts, 0..) |tensor, n, i| {
+            try ensureCount(tensor, n);
+            if (tensor.buffer.ptr == 0 or tensor.buffer.len < try checkedMul(n, if (i == 1) @as(usize, 2) else 4)) return error.InvalidShape;
+        }
+        const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
+        const output = try self.allocLightOnF32Tensor(rows, hidden);
+        errdefer cb.free(output);
+        errdefer self.ctx.synchronize() catch {};
+        try self.lighton_vision_fused.init(&self.ctx);
+        self.cublaslt.?.matmulBf16WeightF32Out(&self.ctx, tensorFromCt(output).buffer, staged, weight.buffer, cublasLtWorkspace(self), rows, hidden, hidden) catch |err| switch (err) {
+            error.CublasLtUnsupported => {
+                cb.free(output);
+                return null;
+            },
+            else => return err,
+        };
+        try self.lighton_vision_fused.residual(&self.ctx, .{ tensorFromCt(output).buffer.ptr, tensorFromCt(output).buffer.ptr, bias.buffer.ptr, residual.buffer.ptr }, @intCast(count), @intCast(hidden));
+        self.stats.bf16_cublaslt_linear_calls += 1;
+        self.lighton_vision_output_residual_calls += 1;
+        return output;
+    }
+
+    fn allocLightOnF32Tensor(self: *CudaCompute, rows: usize, width: usize) !CT {
+        const shape = try allocShape2(self.allocator, rows, width);
+        errdefer self.allocator.free(shape);
+        var output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, width), 4));
+        errdefer releaseDeviceBuffer(self, &output);
+        return createTensor(self, output, shape, rows * width);
+    }
+
+    pub const LightOnAttentionInputs = struct { query: CT, key: CT, gate: CT };
+
+    pub fn lightOnAttentionInputs(cb: *const ops.ComputeBackend, query_gate: CT, key: CT, query_weight: CT, key_weight: CT, positions: []const u32, rows: usize, query_heads: usize, key_heads: usize) !?LightOnAttentionInputs {
+        if (!lightOnProjectionResidualEnabled(cb) or rows == 0 or rows > 8192 or
+            !((query_heads == 8 and key_heads == 2) or (query_heads == 16 and key_heads == 4))) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (positions.len != rows * 3) return error.InvalidShape;
+        const inputs = [_]*const CudaTensor{ tensorFromCt(query_gate), tensorFromCt(key), tensorFromCt(query_weight), tensorFromCt(key_weight) };
+        const counts = [_]usize{ rows * query_heads * 512, rows * key_heads * 256, 256, 256 };
+        for (inputs, counts) |input, count| {
+            if (input.strict_resident_training or input.dtype != .f32 or input.quant_type != null) return null;
+            try ensureCount(input, count);
+            if (input.buffer.ptr == 0 or input.buffer.len < count * 4) return error.InvalidShape;
+        }
+        // Reuse the existing admitted position cache (or graph-owned positions).
+        // A declined cache uses the ordinary unfused path without new storage.
+        const position_buffer = (try cachedLightOnMropePositions(self, positions)) orelse return null;
+        const q_count = rows * query_heads * 256;
+        const k_count = rows * key_heads * 256;
+        const query = try self.allocLightOnF32Tensor(rows, query_heads * 256);
+        errdefer cb.free(query);
+        const output_key = try self.allocLightOnF32Tensor(rows, key_heads * 256);
+        errdefer cb.free(output_key);
+        const gate = try self.allocLightOnF32Tensor(rows, query_heads * 256);
+        errdefer cb.free(gate);
+        errdefer self.ctx.synchronize() catch {};
+        try self.lighton_attention_inputs.run(&self.ctx, .{
+            .query_gate = inputs[0].buffer,
+            .key = inputs[1].buffer,
+            .query_weight = inputs[2].buffer,
+            .key_weight = inputs[3].buffer,
+            .positions = position_buffer,
+            .query_out = tensorFromCt(query).buffer,
+            .key_out = tensorFromCt(output_key).buffer,
+            .gate_out = tensorFromCt(gate).buffer,
+            .rows = rows,
+            .query_heads = query_heads,
+            .key_heads = key_heads,
+            .theta = 10000000,
+            .frequency_scale = 1,
+            .epsilon = 1e-6,
+        });
+        std.debug.assert(tensorFromCt(query).elem_count == q_count and tensorFromCt(output_key).elem_count == k_count);
+        return .{ .query = query, .key = output_key, .gate = gate };
+    }
+
+    /// Fuse only the F32 attention output projection's final residual add.
+    /// The existing norm, BF16 GEMM input and recurrent/KV state are unchanged.
+    pub fn lightOnProjectionResidual(cb: *const ops.ComputeBackend, input_ct: CT, weight_ct: CT, residual_ct: CT, rows: usize, in_dim: usize, hidden: usize) !?CT {
+        if (!lightOnProjectionResidualEnabled(cb) or rows == 0 or rows > 8192 or
+            !((hidden == 1024 and in_dim == 2048) or (hidden == 2560 and in_dim == 4096))) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const input = tensorFromCt(input_ct);
+        const weight = tensorFromCt(weight_ct);
+        const residual = tensorFromCt(residual_ct);
+        if (weight.dtype != .bf16 or weight.quant_type != null or input.strict_resident_training or
+            weight.strict_resident_training or residual.strict_resident_training) return null;
+        try ensureF32(input);
+        try ensureF32(residual);
+        try ensureCount(input, try checkedMul(rows, in_dim));
+        try ensureCount(weight, try checkedMul(hidden, in_dim));
+        try ensureCount(residual, try checkedMul(rows, hidden));
+        if (input.buffer.ptr == 0 or weight.buffer.ptr == 0 or residual.buffer.ptr == 0 or
+            input.buffer.len < try checkedMul(try checkedMul(rows, in_dim), 4) or
+            weight.buffer.len < try checkedMul(try checkedMul(hidden, in_dim), 2) or
+            residual.buffer.len < try checkedMul(try checkedMul(rows, hidden), 4)) return error.InvalidShape;
+        const staged = (try stageBf16ActivationForCublasLt(self, input, rows, in_dim)) orelse return null;
+        const shape = try allocShape2(self.allocator, rows, hidden);
+        errdefer self.allocator.free(shape);
+        var output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, hidden), 4));
+        errdefer releaseDeviceBuffer(self, &output);
+        errdefer self.ctx.synchronize() catch {};
+        try self.cublaslt.?.matmulBf16WeightResidualF32Out(&self.ctx, output, staged, weight.buffer, residual.buffer, cublasLtWorkspace(self), rows, in_dim, hidden);
+        self.stats.bf16_cublaslt_linear_calls += 1;
+        self.lighton_projection_residual_calls += 1;
+        return createTensor(self, output, shape, rows * hidden);
+    }
+
     pub const LightOnFfnBlockRequest = struct {
         input: CT,
         norm: CT,
@@ -3866,6 +4006,7 @@ pub const CudaCompute = struct {
     lighton_vision_fused: @import("lighton_vision.zig").Module = .{},
     lighton_precision: @import("lighton_vision_bf16.zig").Precision = .f32,
     lighton_vision_bf16: @import("lighton_vision_bf16.zig").Module = .{},
+    lighton_attention_inputs: @import("lighton_attention_inputs.zig").Module = .{},
     florence_bart_ffn_enabled: bool = false,
     florence_bart_ffn_calls: usize = 0,
     florence_fused_append_enabled: bool = false,
@@ -3884,6 +4025,8 @@ pub const CudaCompute = struct {
     // Tensor ABI and recurrent state remain F32; this is not full BF16 execution.
     lighton_bf16_projection_outputs: bool = false,
     lighton_vision_bias_epilogue_calls: usize = 0,
+    lighton_projection_residual_calls: usize = 0,
+    lighton_vision_output_residual_calls: usize = 0,
     lighton_vision_norm_qkv_calls: usize = 0,
     lighton_bf16_prefill_ffn: bool = false,
     lighton_bf16_prefill_ffn_calls: usize = 0,
@@ -5061,6 +5204,9 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_fused_vision_mlp_calls={d}\n", .{self.lighton_vision_fused.calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_bf16_vision_blocks={d} precision_profile={s}\n", .{ self.lighton_vision_bf16.blocks, @tagName(self.lighton_precision) });
+        std.debug.print("LIGHTONOCR3 cuda_attention_input_fusions={d}\n", .{self.lighton_attention_inputs.calls});
+        std.debug.print("LIGHTONOCR3 cuda_projection_residual_calls={d}\n", .{self.lighton_projection_residual_calls});
+        std.debug.print("LIGHTONOCR3 cuda_vision_output_residual_calls={d}\n", .{self.lighton_vision_output_residual_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_vision_bias_epilogue_calls={d}\n", .{self.lighton_vision_bias_epilogue_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
@@ -5088,6 +5234,7 @@ pub const CudaCompute = struct {
         self.lighton_decode_graph.invalidate(&self.ctx);
         self.lighton_activation.deinit(&self.ctx);
         self.lighton_vision_bf16.deinit(&self.ctx);
+        self.lighton_attention_inputs.deinit(&self.ctx);
         self.lighton_vision_fused.deinit(&self.ctx);
 
         self.florence_fused.deinit(&self.ctx);
@@ -35629,4 +35776,237 @@ test "LightOnOCR3 CUDA BF16 vision projection retains bias dtype, readonly input
     try std.testing.expectEqualSlices(u16, &x, &actual_x);
     try std.testing.expectEqualSlices(u16, &weight, &actual_weight);
     try std.testing.expectEqualSlices(u16, &bias, &actual_bias);
+}
+
+test "LightOnOCR3 CUDA attention projection residual preserves original F32 outputs readonly inputs and prelaunch bounds" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_][2]usize{ .{ 2048, 1024 }, .{ 4096, 2560 } }) |dims| {
+        const in_dim, const hidden = dims;
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        compute.capability_profile = .lightonocr3;
+        compute.lighton_ffn_block_enabled = true;
+        compute.lighton_ffn_bf16_inputs = true;
+        compute.lighton_bf16_decode_outputs = false;
+        compute.lighton_bf16_projection_outputs = false;
+        const cb = compute.computeBackend();
+        const matrix = try a.alloc(u16, in_dim * hidden);
+        defer a.free(matrix);
+        for (matrix, 0..) |*value, i| value.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 1024)) >> 16);
+        const shape = [_]i64{ @intCast(hidden), @intCast(in_dim) };
+        const host_weight = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &shape, .name = "projection-residual.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+        try compute.insertBf16WeightFromTensor(try a.dupe(u8, host_weight.name), &host_weight);
+        try compute.ctx.synchronize();
+        const weight = try cb.getWeight(host_weight.name);
+        defer cb.free(weight);
+        for ([_]usize{ 1, 7, 21, 64, 85, 128, 256, 2316 }) |rows| {
+            const values = try a.alloc(f32, rows * in_dim);
+            defer a.free(values);
+            const prior = try a.alloc(f32, rows * hidden);
+            defer a.free(prior);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.013) * 0.1;
+            for (prior, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.017) * 0.3;
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(in_dim) });
+            defer cb.free(input);
+            const residual = try cb.fromFloat32Shape(prior, &.{ @intCast(rows), @intCast(hidden) });
+            defer cb.free(residual);
+            const projected = try cb.linearNoBias(input, weight, rows, in_dim, hidden);
+            defer cb.free(projected);
+            const original = try cb.add(projected, residual);
+            defer cb.free(original);
+            const fused = (try CudaCompute.lightOnProjectionResidual(&cb, input, weight, residual, rows, in_dim, hidden)) orelse return error.TestUnexpectedResult;
+            defer cb.free(fused);
+            const expected = try cb.toFloat32(original, a);
+            defer a.free(expected);
+            const actual = try cb.toFloat32(fused, a);
+            defer a.free(actual);
+            for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+            const input_after = try cb.toFloat32(input, a);
+            defer a.free(input_after);
+            const residual_after = try cb.toFloat32(residual, a);
+            defer a.free(residual_after);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(input_after));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(prior), std.mem.sliceAsBytes(residual_after));
+            const launches = compute.ctx.stats.kernel_launches;
+            var truncated = tensorFromCt(residual).*;
+            truncated.buffer.len = rows * hidden * 4 - 4;
+            try std.testing.expectError(error.InvalidShape, CudaCompute.lightOnProjectionResidual(&cb, input, weight, @ptrCast(&truncated), rows, in_dim, hidden));
+            compute.resident_training_cache = true;
+            try std.testing.expect((try CudaCompute.lightOnProjectionResidual(&cb, input, weight, residual, rows, in_dim, hidden)) == null);
+            compute.resident_training_cache = false;
+            compute.lighton_bf16_projection_outputs = true;
+            try std.testing.expect((try CudaCompute.lightOnProjectionResidual(&cb, input, weight, residual, rows, in_dim, hidden)) == null);
+            compute.lighton_bf16_projection_outputs = false;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+        try std.testing.expectEqual(@as(usize, 8), compute.lighton_projection_residual_calls);
+        const unchanged = try a.alloc(u16, matrix.len);
+        defer a.free(unchanged);
+        try tensorFromCt(weight).buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(unchanged));
+        try compute.ctx.synchronize();
+        try std.testing.expectEqualSlices(u16, matrix, unchanged);
+    }
+}
+
+test "LightOnOCR3 CUDA fused attention inputs preserve original F32 partial Mrope gates and readonly inputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_ffn_block_enabled = true;
+    compute.lighton_cached_mrope_enabled = true;
+    compute.lighton_bf16_decode_outputs = false;
+    compute.lighton_bf16_projection_outputs = false;
+    const cb = compute.computeBackend();
+    var norm_host: [256]f32 = undefined;
+    for (&norm_host, 0..) |*v, i| v.* = 1 + @sin(@as(f32, @floatFromInt(i)) * 0.2) * 0.2;
+    const norm = try cb.fromFloat32Shape(&norm_host, &.{256});
+    defer cb.free(norm);
+    for ([_][2]usize{ .{ 8, 2 }, .{ 16, 4 } }) |heads| {
+        for ([_]usize{ 1, 2, 7, 21, 85, 128, 662, 2316 }) |rows| {
+            const qh, const kh = heads;
+            const values = try a.alloc(f32, rows * qh * 512);
+            defer a.free(values);
+            const keys = try a.alloc(f32, rows * kh * 256);
+            defer a.free(keys);
+            const positions = try a.alloc(u32, rows * 3);
+            defer a.free(positions);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i % 65536)) * 0.013) * 3;
+            for (keys, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i % 65536)) * 0.017) * 2;
+            for (positions, 0..) |*v, i| v.* = @intCast((i * 17 + i / rows * 43) % 1024);
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(qh * 512) });
+            defer cb.free(input);
+            const key = try cb.fromFloat32Shape(keys, &.{ @intCast(rows), @intCast(kh * 256) });
+            defer cb.free(key);
+            const split = try cb.splitPerHeadGate(input, rows, qh, 256);
+            defer cb.free(split.query);
+            defer cb.free(split.gate);
+            const q_flat = (try cb.reshape2d(split.query, rows * qh, 256)) orelse return error.TestUnexpectedResult;
+            defer cb.free(q_flat);
+            const k_flat = (try cb.reshape2d(key, rows * kh, 256)) orelse return error.TestUnexpectedResult;
+            defer cb.free(k_flat);
+            const q_norm = try cb.rmsNorm(q_flat, norm, 256, 1e-6);
+            defer cb.free(q_norm);
+            const k_norm = try cb.rmsNorm(k_flat, norm, 256, 1e-6);
+            defer cb.free(k_norm);
+            const q_reshaped = (try cb.reshape2d(q_norm, rows, qh * 256)) orelse return error.TestUnexpectedResult;
+            defer cb.free(q_reshaped);
+            const k_reshaped = (try cb.reshape2d(k_norm, rows, kh * 256)) orelse return error.TestUnexpectedResult;
+            defer cb.free(k_reshaped);
+            const q_rope = (try cb.partialMrope(q_reshaped, rows, qh, 256, 10000000, 1, positions, .{ 11, 11, 10 })) orelse return error.TestUnexpectedResult;
+            defer cb.free(q_rope);
+            const k_rope = (try cb.partialMrope(k_reshaped, rows, kh, 256, 10000000, 1, positions, .{ 11, 11, 10 })) orelse return error.TestUnexpectedResult;
+            defer cb.free(k_rope);
+            const sigmoid_expected = try cb.sigmoid(split.gate);
+            defer cb.free(sigmoid_expected);
+            const fused = (try CudaCompute.lightOnAttentionInputs(&cb, input, key, norm, norm, positions, rows, qh, kh)) orelse return error.TestUnexpectedResult;
+            defer cb.free(fused.query);
+            defer cb.free(fused.key);
+            defer cb.free(fused.gate);
+            for ([_]CT{ q_rope, k_rope, sigmoid_expected }, [_]CT{ fused.query, fused.key, fused.gate }) |original, actual| {
+                const expected = try cb.toFloat32(original, a);
+                defer a.free(expected);
+                const observed = try cb.toFloat32(actual, a);
+                defer a.free(observed);
+                for (expected, observed) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+            }
+            const input_after = try cb.toFloat32(input, a);
+            defer a.free(input_after);
+            const keys_after = try cb.toFloat32(key, a);
+            defer a.free(keys_after);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(input_after));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(keys), std.mem.sliceAsBytes(keys_after));
+            const launches = compute.ctx.stats.kernel_launches;
+            var truncated = tensorFromCt(input).*;
+            truncated.buffer.len = values.len * 4 - 4;
+            try std.testing.expectError(error.InvalidShape, CudaCompute.lightOnAttentionInputs(&cb, @ptrCast(&truncated), key, norm, norm, positions, rows, qh, kh));
+            try std.testing.expectError(error.InvalidShape, CudaCompute.lightOnAttentionInputs(&cb, input, key, norm, norm, positions[0 .. positions.len - 1], rows, qh, kh));
+            compute.resident_training_cache = true;
+            try std.testing.expect((try CudaCompute.lightOnAttentionInputs(&cb, input, key, norm, norm, positions, rows, qh, kh)) == null);
+            compute.resident_training_cache = false;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 16), compute.lighton_attention_inputs.calls);
+    const norm_after = try cb.toFloat32(norm, a);
+    defer a.free(norm_after);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&norm_host), std.mem.sliceAsBytes(norm_after));
+}
+
+test "LightOnOCR3 CUDA vision output residual preserves original F32 biased projection and readonly inputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]usize{ 768, 1024 }) |hidden| {
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        compute.capability_profile = .lightonocr3;
+        compute.lighton_fused_vision_qkv_enabled = true;
+        compute.lighton_precision = .f32;
+        const cb = compute.computeBackend();
+        const matrix = try a.alloc(u16, hidden * hidden);
+        defer a.free(matrix);
+        for (matrix, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 1024)) >> 16);
+        const shape = [_]i64{ @intCast(hidden), @intCast(hidden) };
+        const host_weight = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &shape, .name = "vision-output-residual.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+        try compute.insertBf16WeightFromTensor(try a.dupe(u8, host_weight.name), &host_weight);
+        try compute.ctx.synchronize();
+        const weight = try cb.getWeight(host_weight.name);
+        defer cb.free(weight);
+        const bias_values = try a.alloc(f32, hidden);
+        defer a.free(bias_values);
+        for (bias_values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.07) * 0.15;
+        const bias = try cb.fromFloat32Shape(bias_values, &.{@intCast(hidden)});
+        defer cb.free(bias);
+        for ([_]usize{ 256, 432, 2316, 17280, 20736 }) |rows| {
+            const values = try a.alloc(f32, rows * hidden);
+            defer a.free(values);
+            const prior = try a.alloc(f32, values.len);
+            defer a.free(prior);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i % 65536)) * 0.013) * 0.3;
+            for (prior, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i % 65536)) * 0.017) * 0.5;
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(hidden) });
+            defer cb.free(input);
+            const residual = try cb.fromFloat32Shape(prior, &.{ @intCast(rows), @intCast(hidden) });
+            defer cb.free(residual);
+            const projected = try cb.linear(input, weight, bias, rows, hidden, hidden);
+            defer cb.free(projected);
+            const original = try cb.add(projected, residual);
+            defer cb.free(original);
+            const fused = (try CudaCompute.lightOnVisionOutputResidual(&cb, input, weight, bias, residual, rows, hidden)) orelse return error.TestUnexpectedResult;
+            defer cb.free(fused);
+            const expected = try cb.toFloat32(original, a);
+            defer a.free(expected);
+            const actual = try cb.toFloat32(fused, a);
+            defer a.free(actual);
+            for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+            const input_after = try cb.toFloat32(input, a);
+            defer a.free(input_after);
+            const residual_after = try cb.toFloat32(residual, a);
+            defer a.free(residual_after);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(input_after));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(prior), std.mem.sliceAsBytes(residual_after));
+            const launches = compute.ctx.stats.kernel_launches;
+            var truncated = tensorFromCt(bias).*;
+            truncated.buffer.len = hidden * 4 - 4;
+            try std.testing.expectError(error.InvalidShape, CudaCompute.lightOnVisionOutputResidual(&cb, input, weight, @ptrCast(&truncated), residual, rows, hidden));
+            compute.lighton_precision = .bf16_vision;
+            try std.testing.expect((try CudaCompute.lightOnVisionOutputResidual(&cb, input, weight, bias, residual, rows, hidden)) == null);
+            compute.lighton_precision = .f32;
+            compute.resident_training_cache = true;
+            try std.testing.expect((try CudaCompute.lightOnVisionOutputResidual(&cb, input, weight, bias, residual, rows, hidden)) == null);
+            compute.resident_training_cache = false;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+        try std.testing.expectEqual(@as(usize, 5), compute.lighton_vision_output_residual_calls);
+        const bias_after = try cb.toFloat32(bias, a);
+        defer a.free(bias_after);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(bias_values), std.mem.sliceAsBytes(bias_after));
+        const weight_after = try a.alloc(u16, matrix.len);
+        defer a.free(weight_after);
+        try tensorFromCt(weight).buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(weight_after));
+        try compute.ctx.synchronize();
+        try std.testing.expectEqualSlices(u16, matrix, weight_after);
+    }
 }

@@ -6412,9 +6412,13 @@ fn decoderBlockImpl(
     // Q, K, V projections
     const attn_qkv_started_at = monotonicNowNs();
     if (config.layerUsesQwen35LinearAttention(layer)) {
-        const attn_out = try qwen35LinearAttention(cb, allocator, config, normed, batch, query_seq_len, layer, decode_context, &name_buf);
-        defer cb.free(attn_out);
-        const attn_res = try cb.add(attn_out, hidden);
+        const fuse_residual = if (comptime build_options.enable_cuda)
+            trace_sink == null and config.hasQwen35VisionArchitectureContract() and @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidualEnabled(cb)
+        else
+            false;
+        const attn_out = try qwen35LinearAttentionWithResidual(cb, allocator, config, normed, batch, query_seq_len, layer, decode_context, &name_buf, if (fuse_residual) hidden else null);
+        defer if (!fuse_residual) cb.free(attn_out);
+        const attn_res = if (fuse_residual) attn_out else try cb.add(attn_out, hidden);
         errdefer cb.free(attn_res);
 
         compute_region_scope.deinit();
@@ -6599,6 +6603,8 @@ fn decoderBlockImpl(
         k: CT,
         v_omitted: bool = false,
         v: CT,
+        prepared_rope: bool = false,
+        gate_sigmoid: bool = false,
     };
     const projected: AttentionProjectionSet = if (fused_qkv_override_active) blk: {
         const fused_qkv = layer0_fused_qkv_override.?;
@@ -6678,11 +6684,8 @@ fn decoderBlockImpl(
             })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, @intCast(q_projection_dim), layer, "q", &name_buf)
         else
             try attnProject(cb, allocator, config, normed, total, hidden_size, @intCast(q_projection_dim), layer, "q", &name_buf);
-        const q, const q_gate: ?CT = if (q_projection_dim == q_dim) .{ q_projected, null } else split_q: {
-            defer cb.free(q_projected);
-            const split = try cb.splitPerHeadGate(q_projected, total, num_heads, head_dim);
-            break :split_q .{ split.query, split.gate };
-        };
+        var q_projected_owned = true;
+        defer if (q_projected_owned) cb.free(q_projected);
         const k: CT, const v_omitted_local: bool, const v_local: CT = if (shares_kv)
             .{ try createZeroCT(cb, allocator, total * kv_dim), false, try createZeroCT(cb, allocator, total * kv_dim) }
         else if (attn_k_slot != null and attn_v_slot != null and (config.family == .qwen3 or config.family == .qwen3_vl)) blk_kv: {
@@ -6740,6 +6743,25 @@ fn decoderBlockImpl(
                     return err,
                 else => return err,
             };
+        };
+        errdefer cb.free(k);
+        errdefer if (!v_omitted_local) cb.free(v_local);
+        if (comptime @import("build_options").enable_cuda) {
+            if (trace_sink == null and !shares_kv and !v_omitted_local and q_projection_dim == q_dim * 2 and
+                !config.layerUsesSlidingAttention(layer))
+            {
+                if (try tryLightOnAttentionInputs(cb, allocator, config, q_projected, k, total, num_heads, num_kv_heads, head_dim, layer, decode_context)) |prepared| {
+                    cb.free(k);
+                    break :blk .{ .q = prepared.query, .k = prepared.key, .q_gate = prepared.gate, .v = v_local, .prepared_rope = true, .gate_sigmoid = true };
+                }
+            }
+        }
+        const q, const q_gate: ?CT = if (q_projection_dim == q_dim) transfer_q: {
+            q_projected_owned = false;
+            break :transfer_q .{ q_projected, null };
+        } else split_q: {
+            const split = try cb.splitPerHeadGate(q_projected, total, num_heads, head_dim);
+            break :split_q .{ split.query, split.gate };
         };
         break :blk .{ .q = q, .q_gate = q_gate, .k = k, .v_omitted = v_omitted_local, .v = v_local };
     };
@@ -6800,7 +6822,7 @@ fn decoderBlockImpl(
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "k_raw", layer, K, num_kv_heads * head_dim);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_norm", layer, V_normed, num_kv_heads * head_dim);
 
-    var qk_already_roped = false;
+    var qk_already_roped = projected.prepared_rope;
     var fused_q_rope: ?CT = null;
     var fused_k_rope: ?CT = null;
     if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and batch == 1) fused_blk: {
@@ -6820,7 +6842,9 @@ fn decoderBlockImpl(
         qk_already_roped = true;
     }
 
-    const Q_attn = if (fused_q_rope) |roped_q|
+    const Q_attn = if (projected.prepared_rope)
+        Q
+    else if (fused_q_rope) |roped_q|
         roped_q
     else if (try maybeApplyQKHeadNorm(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf)) |normed_q|
         normed_q
@@ -6829,7 +6853,9 @@ fn decoderBlockImpl(
     defer if (Q_attn != Q) cb.free(Q_attn);
 
     // Shared KV layers skip K head norm (K is read from the donor layer's cache).
-    const K_attn = if (fused_k_rope) |roped_k|
+    const K_attn = if (projected.prepared_rope)
+        K
+    else if (fused_k_rope) |roped_k|
         roped_k
     else if (!shares_kv)
         if (try maybeApplyQKHeadNorm(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, &name_buf)) |normed_k|
@@ -7077,8 +7103,8 @@ fn decoderBlockImpl(
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-raw", attn_out, num_heads * head_dim);
         const gated_attn_out = if (q_gate) |gate| blk_gate: {
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "gate", gate, num_heads * head_dim);
-            const sigmoid_gate = try cb.sigmoid(gate);
-            defer cb.free(sigmoid_gate);
+            const sigmoid_gate = if (projected.gate_sigmoid) gate else try cb.sigmoid(gate);
+            defer if (sigmoid_gate != gate) cb.free(sigmoid_gate);
             break :blk_gate try cb.multiply(attn_out, sigmoid_gate);
         } else attn_out;
         defer if (gated_attn_out != attn_out) cb.free(gated_attn_out);
@@ -7103,6 +7129,18 @@ fn decoderBlockImpl(
 
         // Output projection
         const attn_out_proj_started_at = monotonicNowNs();
+        if (comptime build_options.enable_cuda) {
+            if (trace_sink == null and config.hasQwen35VisionArchitectureContract() and @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidualEnabled(cb)) {
+                const output_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
+                const output_weight = try getModelWeight(cb, config, output_name);
+                defer cb.free(output_weight);
+                if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidual(cb, attn_proj_input, output_weight, hidden, total, num_heads * head_dim, hidden_size)) |fused| {
+                    debug_timing_stats.attention_out_proj_nanos += @intCast(monotonicNowNs() - attn_out_proj_started_at);
+                    debug_timing_stats.attention_nanos += @intCast(monotonicNowNs() - attn_started_at);
+                    break :blk fused;
+                }
+            }
+        }
         const proj = if (attn_out_proj_linear_slot != null)
             (try cb.decoderRuntimeApplyLinear(&.{
                 .slot = attn_out_proj_linear_slot.?,
@@ -7609,6 +7647,45 @@ pub fn debugGemmaFfnPostNorm(
     buf: *[256]u8,
 ) !CT {
     return applyGemmaFfnPostNorm(cb, allocator, config, hidden, layer, buf);
+}
+
+fn tryLightOnAttentionInputs(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    query_gate: CT,
+    key: CT,
+    rows: usize,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    layer: usize,
+    dc: ?*const DecodeContext,
+) !?@import("../ops/cuda/cuda_compute.zig").CudaCompute.LightOnAttentionInputs {
+    const cuda = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    if (cb.kind() != .cuda or !config.hasQwen35VisionArchitectureContract() or
+        !cuda.lightOnProjectionResidualEnabled(cb) or head_dim != 256 or config.norm_eps != 1e-6 or
+        config.layerRopeActiveDim(layer) != 64 or config.layerRopeEffectiveTheta(layer) != 10000000 or
+        config.rope_freq_scale != 1 or !std.mem.eql(u32, &config.mrope_section, &.{ 11, 11, 10 })) return null;
+    const positions = if (dc) |context| context.mrope_positions orelse return null else return null;
+    var buf: [256]u8 = undefined;
+    const q_name = std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_norm.weight", .{layer}) catch return error.NameTooLong;
+    const q_base = getModelWeight(cb, config, q_name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return null,
+        else => return err,
+    };
+    defer cb.free(q_base);
+    const k_name = std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer}) catch return error.NameTooLong;
+    const k_base = getModelWeight(cb, config, k_name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return null,
+        else => return err,
+    };
+    defer cb.free(k_base);
+    const qw = try maybeAdjustNormWeight(cb, allocator, config, q_base, head_dim);
+    defer if (qw != q_base) cb.free(qw);
+    const kw = try maybeAdjustNormWeight(cb, allocator, config, k_base, head_dim);
+    defer if (kw != k_base) cb.free(kw);
+    return cuda.lightOnAttentionInputs(cb, query_gate, key, qw, kw, positions, rows, heads, kv_heads);
 }
 
 pub fn maybeApplyQKHeadNorm(
@@ -8472,6 +8549,33 @@ pub fn qwen35LinearAttention(
     decode_context: ?*const DecodeContext,
     name_buf: *[256]u8,
 ) !CT {
+    return qwen35LinearAttentionWithResidual(cb, allocator, config, input, physical_batch, seq_len, layer, decode_context, name_buf, null);
+}
+
+fn qwen35OutputProjection(cb: *const ComputeBackend, core: CT, weight: CT, residual: ?CT, rows: usize, in_dim: usize, hidden: usize) !CT {
+    if (residual) |prior| {
+        if (comptime build_options.enable_cuda) {
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidual(cb, core, weight, prior, rows, in_dim, hidden)) |fused| return fused;
+        }
+        const projected = try cb.linearNoBias(core, weight, rows, in_dim, hidden);
+        defer cb.free(projected);
+        return cb.add(projected, prior);
+    }
+    return cb.linearNoBias(core, weight, rows, in_dim, hidden);
+}
+
+fn qwen35LinearAttentionWithResidual(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input: CT,
+    physical_batch: usize,
+    seq_len: usize,
+    layer: usize,
+    decode_context: ?*const DecodeContext,
+    name_buf: *[256]u8,
+    residual: ?CT,
+) !CT {
     const packed_lengths = if (decode_context) |dc| dc.packed_query_lengths else null;
     if (packed_lengths) |lengths| {
         if (physical_batch != 1 or try packedQueryRowCount(lengths) != seq_len) return error.InvalidPackedQueryShape;
@@ -8575,7 +8679,7 @@ pub fn qwen35LinearAttention(
                 const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
                 const out_weight = try getModelWeight(cb, config, out_name);
                 defer cb.free(out_weight);
-                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+                return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
             };
         }
     }
@@ -8627,7 +8731,7 @@ pub fn qwen35LinearAttention(
                 const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
                 const out_weight = try getModelWeight(cb, config, out_name);
                 defer cb.free(out_weight);
-                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+                return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
             };
         }
     }
@@ -8664,7 +8768,7 @@ pub fn qwen35LinearAttention(
                 const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
                 const out_weight = try getModelWeight(cb, config, out_name);
                 defer cb.free(out_weight);
-                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+                return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
             };
         }
     }
@@ -8674,7 +8778,7 @@ pub fn qwen35LinearAttention(
         const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
         const out_weight = try getModelWeight(cb, config, out_name);
         defer cb.free(out_weight);
-        return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+        return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
     }
     if (packed_lengths == null and batch == 1) {
         const state = if (decode_context) |dc| if (dc.qwen35_linear_cache) |cache| cache.layerState(layer) else null else null;
@@ -8683,7 +8787,7 @@ pub fn qwen35LinearAttention(
         const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
         const out_weight = try getModelWeight(cb, config, out_name);
         defer cb.free(out_weight);
-        return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+        return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
     }
     // Batch the weight-heavy projections; each page keeps its own DeltaNet
     // history. Device row slices and core assembly never read state to the host.
@@ -8779,7 +8883,7 @@ pub fn qwen35LinearAttention(
     const out_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
     const out_w = try getModelWeight(cb, config, out_w_name);
     defer cb.free(out_w);
-    return cb.linearNoBias(assembled.?, out_w, total, value_dim, hidden_size);
+    return qwen35OutputProjection(cb, assembled.?, out_w, residual, total, value_dim, hidden_size);
 }
 
 // Dense projections already span the complete packed tensor. Warm adjacent
@@ -9753,6 +9857,12 @@ pub fn applyPreparedAttention(
     attention.skip_kv_write = skip_kv_write;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
     if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
+    if (config.hasQwen35VisionArchitectureContract() and attention.sliding_window == 0) {
+        if (decode_context) |dc| if (dc.packed_query_lengths) |lengths| {
+            if (batch != 1 or try packedQueryRowCount(lengths) != attention.query_sequence_len) return error.InvalidPackedQueryShape;
+            return runPackedQwenAttention(cb, Q, K, V, attention, .{}, lengths, num_heads, num_kv_heads, head_dim, dc);
+        };
+    }
     if (attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
         const gqa_started_at = monotonicNowNs();
         const result = try cb.gqaCausalAttention(Q, K, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);

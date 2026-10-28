@@ -257,14 +257,15 @@ fixtures, not broad document accuracy or an SLO.
 | M4 Max, LightOn 0.8B | 4.725–4.736 | vLLM 4.097–4.102 |
 | M4 Max, LightOn 4B | 1.210–1.211 | vLLM 1.1517–1.1518 |
 | M4 Max, Florence | 5.306–5.309 | MLX proxy 5.131–5.138 |
-| DGX Spark, LightOn 0.8B, BF16 vision and optional prefill | 13.582–13.584 | vLLM 14.474–14.497 |
-| DGX Spark, LightOn 4B, optional prefill/attention | 4.145–4.167 | vLLM 4.538–4.608 |
+| DGX Spark, LightOn 0.8B, BF16 vision and optional prefill | 13.995–14.154 | vLLM 14.354–14.522 |
+| DGX Spark, LightOn 4B, optional prefill/attention | 4.308–4.330 | vLLM 4.620–4.626 |
 | DGX Spark, Florence FP16 | 25.347–25.758 | vLLM 25.340–25.348 |
 
 The Metal comparisons are paired. Latest LightOn CUDA runs use 256 warmup
 requests and two 256-request measurements, with four-token chains, GPU-resident
-vision features and asynchronous token readback for both models. The CUDA
-reference is a separate isolated run. LightOn CUDA parity remains outstanding.
+vision features, fused attention preparation and asynchronous token readback for
+both models. The CUDA reference is a fresh separate isolated run; raw output text
+matches on all three fixtures. LightOn CUDA parity remains outstanding.
 Metal Florence uses Q4_K weights and
 an F16 encoder versus an FP16 MLX proxy. Encoded-image, decoded-image and HTTP
 frontends have different overheads. These are not fully precision-matched runs.

@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "scope": "Draft PR1331 selected CUDA follow-up. Three synthetic pages; separate isolated native/vLLM measurements. No vLLM parity, full BF16 decoder, representative OCR accuracy, or Metal throughput claim. Raw experiment logs/binaries remain outside tracked source.",
+  "schema_version": 2,
+  "scope": "Draft PR1331 selected CUDA follow-up. Three synthetic pages; separate isolated native/vLLM measurements. Parity remains outstanding for both models. No full BF16 decoder, representative OCR accuracy or Metal GPU throughput claim. Raw experiments remain outside tracked source.",
   "hardware": {
     "gpu": "NVIDIA GB10, DGX Spark, SM12.1",
     "driver": "580.178.04",
@@ -29,9 +29,9 @@
     },
     "prefix_and_processor_cache_reuse": false,
     "isolation_audits": {
-      "native507_foreign_processes": 0,
-      "vllm498_foreign_processes": 0,
-      "block506_foreign_processes": 0
+      "native561_foreign_processes": 0,
+      "vllm560_foreign_processes": 0,
+      "independent_checks_run_serially_within_native561": true
     },
     "fixtures": [
       {
@@ -48,22 +48,30 @@
       }
     ]
   },
+  "selected_changes": [
+    "BF16 vision blocks for 0.8B; F32 vision for 4B; original F32 projection outputs/recurrent state and existing optional BF16 prefill retained",
+    "Fused F32 Q/K norm, partial interleaved Mrope and query sigmoid; no KV/state writes or inactive rows",
+    "Attention output projection/residual fusion, both language paths",
+    "F32 vision output uses ordinary GEMM followed by the existing combined bias/residual kernel, preserving original F32 addition order"
+  ],
   "results": [
     {
       "model": "08",
       "precision_profile": "bf16_vision",
       "native_measured_pages_per_second": [
-        13.5842,
-        13.5823
+        14.1538,
+        13.9947
       ],
       "vllm_measured_pages_per_second": [
-        14.496870871559043,
-        14.474025298068133
+        14.353634720055675,
+        14.521819613202918
       ],
       "native_warmup_pages_per_second": [
-        12.5328
+        13.519
       ],
+      "speedup_required_for_vllm_mean_parity": 0.02582568638679139,
       "native_serial_byte_parity": true,
+      "vllm_raw_text_parity": true,
       "vllm_normalized_complete_content_parity": true,
       "actual_burst_widths": [
         [
@@ -76,25 +84,32 @@
           4
         ]
       ],
-      "plan_cache_entries": 687,
+      "plan_cache_entries": 481,
       "plan_cache_capacity": 1024,
-      "uncached_and_scalar_fallbacks": 0
+      "uncached_and_scalar_fallbacks": 0,
+      "raw_output_sha256": [
+        "611ae602abe1559e096702fb4c19e9e40432f5962b032306b8afde25c6dd64d1",
+        "7c69e4da78d4fb2d68c8e57b49550a48660c3554e13d1dab4c10653b71d0062c",
+        "847aa607a10956c05a992a4015cdabc15da5d12fb0d59d77fe287935e7a1d1fa"
+      ]
     },
     {
       "model": "4b",
       "precision_profile": "f32",
       "native_measured_pages_per_second": [
-        4.1449,
-        4.1669
+        4.3075,
+        4.3297
       ],
       "vllm_measured_pages_per_second": [
-        4.537649409795433,
-        4.608095582711677
+        4.619776838421241,
+        4.625818114614052
       ],
       "native_warmup_pages_per_second": [
-        4.1344
+        4.2097
       ],
+      "speedup_required_for_vllm_mean_parity": 0.07043890995175439,
       "native_serial_byte_parity": true,
+      "vllm_raw_text_parity": true,
       "vllm_normalized_complete_content_parity": true,
       "actual_burst_widths": [
         [
@@ -107,9 +122,14 @@
           4
         ]
       ],
-      "plan_cache_entries": 859,
+      "plan_cache_entries": 893,
       "plan_cache_capacity": 1024,
-      "uncached_and_scalar_fallbacks": 0
+      "uncached_and_scalar_fallbacks": 0,
+      "raw_output_sha256": [
+        "611ae602abe1559e096702fb4c19e9e40432f5962b032306b8afde25c6dd64d1",
+        "7c69e4da78d4fb2d68c8e57b49550a48660c3554e13d1dab4c10653b71d0062c",
+        "2617ebf5c95a13cbacd178c858f300c4128c8945c039e1dfd91ae696267b38cf"
+      ]
     }
   ],
   "qualification": {
@@ -143,13 +163,13 @@
       "default_F32_oracles": "Unchanged and separately qualified; this is a distinct BF16 activation profile."
     },
     "default_F32_regression": {
-      "selected": 271,
-      "passed": 257,
+      "selected": 275,
+      "passed": 261,
       "skipped": 14
     },
     "wide_regression": {
-      "selected": 101,
-      "passed": 100,
+      "selected": 104,
+      "passed": 103,
       "skipped": 1
     },
     "real_default_F32_models": [
@@ -164,13 +184,42 @@
       8,
       16
     ],
-    "Metal": "Compilation and 7 focused CPU tests passed; no new Metal GPU measurements."
+    "Metal": "Native Metal-enabled build562 and seven CPU pool/epoch ownership tests passed. No new Metal GPU measurements.",
+    "attention_inputs": {
+      "oracle": "Transformers Qwen3_5RMSNorm, Qwen3_5TextRotaryEmbedding and apply_rotary_pos_emb with real checkpoint norms",
+      "checker_sha256": "b812c538502e959db5bc4a5c62d60142370009d4319d421cb6b960e8a4dff7c4",
+      "reference_source_sha256": "aac2a1bcca88829afc6dbdf83f97155ebf64d800ee9d703af3802a9aebcfcd18",
+      "cases": 40,
+      "all_checkpoint_norm_pairs_covered": true,
+      "fixed_abs_tolerance": 0.0002,
+      "max_abs_error": 1.9073486328125e-06,
+      "readonly_and_canaries": true,
+      "rows": [
+        1,
+        2,
+        7,
+        21,
+        64,
+        85,
+        128,
+        256,
+        662,
+        2316
+      ],
+      "previous_checker_sha256": "f36a55025a9d5e18ddbd2ef079f6b84204ffb021294527f475159339434c430e"
+    },
+    "new_F32_differentials": [
+      "attention projection/residual against separate F32 primitives, both model widths",
+      "Q/K norm, partial Mrope and sigmoid against original F32 operations",
+      "vision output against original F32 biased projection plus residual, including large vision rows",
+      "prelaunch bounds, aliasing, profile/training fallback and readonly weights/inputs; original 2e-4 tolerance retained"
+    ]
   },
   "reproduction": {
-    "runtime_build_base_commit": "8f2d6ab60b22510f356cf87601f38d92df4a9991",
-    "runtime_binary_sha256": "e65753d4c239cc7ea3bc7880b31b0ecf1bc0518bf66b5e04e3c7db1a1cbfc594",
+    "runtime_build_base_commit": "3ac0bed9e17630332af2682ff80cebf8de2334a1",
+    "runtime_binary_sha256": "e37c217d167a97424e6cfcfebb6b4fcaa38e11e8c833d78e061040e0cfb4a03a",
     "runtime_build_command": [
-      "zig",
+      "/Users/ajroetker/bin/zig-0.17.0/zig",
       "build",
       "test-bin",
       "-Dtarget=aarch64-linux.7.0...7.0-gnu.2.39",
@@ -186,12 +235,12 @@
       "zig/pkg/inference/build/runtime.zig": "ab746106497ba472ca2fc4e0b4ebce97fd5451b1a4cb75d9eaf402832de0bb8a",
       "zig/pkg/inference/build/tests.zig": "3ebd7564f8f0894c5196b3f6f34299dd1c6c63fcbfdd867d7ff20843aa7c739e",
       "zig/pkg/inference/src/architectures/florence.zig": "9c1c49e74869a4533e7bb2b5e194c70cb87031dd5f311144da039219c9151b9c",
-      "zig/pkg/inference/src/architectures/gpt.zig": "d07a09d5f0cf6031c1d527c9bdc855f529a7459ad0968f12e1441030e5e7d501",
-      "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "b945c249e06a17ee336f6ddc7fa0bcd7c1e6370128c754c81937067699f77e13",
+      "zig/pkg/inference/src/architectures/gpt.zig": "4b776b40ef58ab3ff0461f7a8726fb3a6befde3385f4a8f2f2029d40a293e824",
+      "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "c0a9324c36588af3ac031e34909c4f3399b4f9eb0aee499ef9098932357a9e0b",
       "zig/pkg/inference/src/architectures/session_factory.zig": "a343a52332aa523c52aeee6d41b83236e8bf310fa60d512a87be77f7fcbb56eb",
       "zig/pkg/inference/src/models/gpt.zig": "648f016723da1b985f83ae134e555afd00009ad7c92fda1d7ccb118d5d3cecd4",
       "zig/pkg/inference/src/ops/cuda/cublaslt.zig": "5957dd8062f97e260bb3204273737a8bcb750eb0c2d2a695a598631c1975debc",
-      "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "09cbbc462fec6d6e90347ca6a1579e16f76708302bd4397ccfb84258d80fbecf",
+      "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "e2ab34315d076ae576aec876d09da7f8d2cfb226a999a8a3b6c770e833987c97",
       "zig/pkg/inference/src/ops/cuda/cudnn_conv.zig": "98902ea34fd935aaffde6f52be43937f8997c03b9d14f3015705949b5294c765",
       "zig/pkg/inference/src/ops/cuda/cudnn_sdpa.zig": "d732dd69e38f67325707e8f53862de0f50c5786a3053c89bc0d959cf7135e29f",
       "zig/pkg/inference/src/ops/cuda/florence_fused.ptx": "d4f91e70390ffb1e571526c14370582584cc5c657d316245106ab576d0a0a5f8",
@@ -238,48 +287,128 @@
       "zig/pkg/inference/src/ops/cuda/pinned_input_arena.zig": "17c8cb1e5e8683fca96a0901811b2b9a580f09c43ac93c869e9f2896a9cd7aa7",
       "zig/pkg/inference/src/ops/cuda/buffer.zig": "522126f2efd853d23793cf8da50aec5e3a5241fe7f6de60473f2393d4f8e3619",
       "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.zig": "f5a2179e9b7e5b33a6f13eb570416b7b30b89a553853e83afa631570daec6dfe",
-      "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx": "43b0814e68ac61d94dafc54ca06c2745f83f0a5319a13178421b2e6090617c60",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx": "b00eaff6ca8720442e85a81bc840f3a9c11aded2c89e9fa24dcac89aed397583",
       "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_bf16.cu": "d4bb2ae275a04bf8425d1d9bd9596a51c155af6a0d9340e232b92dc851727f09",
       "zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py": "e1b2adfb5e49e3e071e31f28cd09c37e3ab4655a89a994c9ee785c726fbcee83",
-      "zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py": "e1613b8f0a6274aa3ed90040c30c504bf044de9055b40aa7246e487022c01770"
+      "zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py": "e1613b8f0a6274aa3ed90040c30c504bf044de9055b40aa7246e487022c01770",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.zig": "a140a134ff1dac27decfe78c583404027b753d6748a0f8e1b4f896cd92f7079b",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.ptx": "2c3ea7b5bd403ce186a17bce7a1e8703a34c4d627fd29db2cfe2ba71186e2f97",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_attention_inputs.cu": "77a6844922a7a1e5b91c0f0dd55b127f4d28c86654065b01fbff908f16d953fc"
     },
-    "qualification_helper_sha256": "32a97c96e510b89a6c2cef86ebdf1d8d885b4f2f3a8ea74dd28608f16ae70504",
-    "qualification_checker_sha256": "0acb5c01cbd12ad5ae4b55e3bdd5ff4cd6802be907a63dbfef3aaf7ead89debd",
-    "qualification_library_sha256": "42a89d08cd8b4cfdfbd1f6ddbf2834fc98b262b20312c5152d02d9eadce7e91d",
-    "kernel_generation": {
+    "runtime_source_identity": "Snapshot565 includes the complete Apache license headers. Its rebuilt stripped CUDA binary is byte-identical to snapshot559 used for all native561 qualification and performance runs. Every listed source matches565. PTX was normalized before building. Private graph, workspace, joined-FFN and async-greedy experiments are excluded.",
+    "report_sha256": {
+      "native08": "fa9f9083edcd4c46d890e64c4e59414f65c7178e752c447c33d83b2d4e58875d",
+      "vllm08": "2ec3a0c0e65ffbb1ad3f65a2adf527eaf56feaafd8add586579fab17f7df6d78",
+      "native4b": "5fcf44e5fdba246953f22083041c478009edc0ebddcd464e7ebdf743abf22f9b",
+      "vllm4b": "307eec789e9daaddfb92f0a485404711e1cb92c41ba7ce684c47148c98284fe6"
+    },
+    "raw_report_bundles": [
+      {
+        "scope": "native561 qualification/performance and isolation",
+        "sha256": "6e2641e8e1e2c3d71f3b8b8b635e76dce66a6701a545cf65fe02da5cc4975db8"
+      },
+      {
+        "scope": "fresh actual vLLM560 and isolation",
+        "sha256": "7aa05665e2fa2924e476cbd928d36cc3c1e5d9daf5bb0d83daee089c321a40d9"
+      }
+    ],
+    "raw_report_bundle_location": "Retained outside Git; not yet published. Commands and fixture definitions are retained in source.",
+    "attention_kernel_generation": {
       "command": [
-        "/usr/local/cuda/bin/nvcc",
-        "-ptx",
-        "-arch=sm_80",
+        "nvcc",
+        "--ptx",
+        "-arch=compute_75",
         "-O3",
         "--fmad=false",
         "-std=c++17",
-        ".cache/vision500/lighton_vision_bf16.cu",
+        "zig/pkg/inference/src/ops/cuda/prototypes/lighton_attention_inputs.cu",
         "-o",
-        ".cache/vision500/lighton_vision_bf16.ptx"
+        "zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.ptx"
       ],
-      "source_sha256": "d4bb2ae275a04bf8425d1d9bd9596a51c155af6a0d9340e232b92dc851727f09",
-      "ptx_sha256": "43b0814e68ac61d94dafc54ca06c2745f83f0a5319a13178421b2e6090617c60",
-      "published_ptx_sha256": "b00eaff6ca8720442e85a81bc840f3a9c11aded2c89e9fa24dcac89aed397583",
-      "postprocess": "Remove trailing blank lines and append one LF."
+      "postprocess": "Remove trailing blank lines and append one LF before building and qualifying.",
+      "abi_bytes": 104
     },
-    "report_sha256": {
-      "native08": "c48e520dc2b22e84fa677f381bbff2d589faed518128fdfd3c0ba6ca292e59ae",
-      "vllm08": "b34c682f78c4032bb8305e484d99d3fb7b4bd82140eacdc67572cf62def56d68",
-      "native4b": "52d558800cad591db0fbe22d1c19a90b1024778f6ff99e40fa4a260e00f480fd",
-      "vllm4b": "10fb9d7e50ddb2bbe29f6aab4a9a6f37ebb2001c826506c37b123b0a9c06da50",
-      "checkpoint_block_qualification": "c42ca20b70c85fec6ee47b14fe9c1864e99de5b419f41671e13aca19c0c9d069"
+    "independent_attention_checker_sha256": "b812c538502e959db5bc4a5c62d60142370009d4319d421cb6b960e8a4dff7c4",
+    "metal_build_binary_sha256": "31fa9201c8de6db4fb026d9184cc829bdbc915a93a26a3e28b5d9ec0fe14b299",
+    "metal_build_command": [
+      "/Users/ajroetker/bin/zig-0.17.0/zig",
+      "build",
+      "test-bin",
+      "-Dcuda=false",
+      "-Dmetal=true",
+      "-Doptimize=ReleaseFast",
+      "-Dstrip=true",
+      "-Dtest-filter=LightOnOCR3"
+    ],
+    "metal_CPU_tests": {
+      "status": "ok",
+      "tests": [
+        {
+          "name": "pool",
+          "result": "4 selected; 4 passed; 0 skipped."
+        },
+        {
+          "name": "epochs",
+          "result": "2 selected; 2 passed; 0 skipped."
+        },
+        {
+          "name": "physical128",
+          "result": "1 selected; 1 passed; 0 skipped."
+        }
+      ],
+      "count": 7,
+      "scope": "Native Metal-enabled build; these seven tests use CPU ownership/scheduler hooks. No Metal GPU throughput claim."
     },
-    "raw_report_bundle_sha256": "ae7568b3259e5dd83159deda13fc101de0c668d71fe82eb4240a0cfceae7505e",
-    "raw_report_bundle_location": "Retained locally outside the source tree; not yet published. Reproduction commands are in README.md.",
-    "published_source_normalizations": {
-      "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx": {
-        "qualified_raw_sha256": "43b0814e68ac61d94dafc54ca06c2745f83f0a5319a13178421b2e6090617c60",
-        "published_sha256": "b00eaff6ca8720442e85a81bc840f3a9c11aded2c89e9fa24dcac89aed397583",
-        "rule": "Remove trailing blank lines from NVCC output and append one LF; all PTX instructions/directives remain byte-identical."
-      }
+    "unchanged_BF16_vision_qualification": {
+      "qualification_helper_sha256": "32a97c96e510b89a6c2cef86ebdf1d8d885b4f2f3a8ea74dd28608f16ae70504",
+      "qualification_checker_sha256": "0acb5c01cbd12ad5ae4b55e3bdd5ff4cd6802be907a63dbfef3aaf7ead89debd",
+      "qualification_library_sha256": "42a89d08cd8b4cfdfbd1f6ddbf2834fc98b262b20312c5152d02d9eadce7e91d",
+      "kernel_generation": {
+        "command": [
+          "/usr/local/cuda/bin/nvcc",
+          "-ptx",
+          "-arch=sm_80",
+          "-O3",
+          "--fmad=false",
+          "-std=c++17",
+          ".cache/vision500/lighton_vision_bf16.cu",
+          "-o",
+          ".cache/vision500/lighton_vision_bf16.ptx"
+        ],
+        "source_sha256": "d4bb2ae275a04bf8425d1d9bd9596a51c155af6a0d9340e232b92dc851727f09",
+        "ptx_sha256": "43b0814e68ac61d94dafc54ca06c2745f83f0a5319a13178421b2e6090617c60",
+        "published_ptx_sha256": "b00eaff6ca8720442e85a81bc840f3a9c11aded2c89e9fa24dcac89aed397583",
+        "postprocess": "Remove trailing blank lines and append one LF."
+      },
+      "published_source_normalizations": {
+        "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx": {
+          "qualified_raw_sha256": "43b0814e68ac61d94dafc54ca06c2745f83f0a5319a13178421b2e6090617c60",
+          "published_sha256": "b00eaff6ca8720442e85a81bc840f3a9c11aded2c89e9fa24dcac89aed397583",
+          "rule": "Remove trailing blank lines from NVCC output and append one LF; all PTX instructions/directives remain byte-identical."
+        }
+      },
+      "qualification_checker_qualified_sha256": "dd529cdf12e4903b0430de436fe570d381027e797504faaadb8670cd8d527c5c",
+      "qualification_checker_formatting": "Repository pre-commit formatter normalized parentheses; Python AST is identical to the qualified checker.",
+      "report_sha256": "c42ca20b70c85fec6ee47b14fe9c1864e99de5b419f41671e13aca19c0c9d069",
+      "scope": "Unchanged BF16 vision-block qualification from the preceding selected build. Serving vision module/CUDA source bytes are unchanged; the recorded PTX normalization preserves every instruction/directive."
     },
-    "qualification_checker_qualified_sha256": "dd529cdf12e4903b0430de436fe570d381027e797504faaadb8670cd8d527c5c",
-    "qualification_checker_formatting": "Repository pre-commit formatter normalized parentheses; Python AST is identical to the qualified checker."
+    "license_header_rebuild": {
+      "qualified_snapshot": 559,
+      "current_source_snapshot": 565,
+      "qualified_binary_sha256": "e37c217d167a97424e6cfcfebb6b4fcaa38e11e8c833d78e061040e0cfb4a03a",
+      "rebuilt_binary_sha256": "e37c217d167a97424e6cfcfebb6b4fcaa38e11e8c833d78e061040e0cfb4a03a",
+      "byte_identical": true,
+      "source_changes": [
+        "zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.zig",
+        "zig/pkg/inference/src/ops/cuda/prototypes/lighton_attention_inputs.cu"
+      ],
+      "scope": "Only Apache license comments changed; current licensed independent checker rerun separately in574."
+    },
+    "independent_attention_licensed_rerun": {
+      "report_sha256": "83907146e70a60e8b95f99fd326fac7888e27935d1759bd2dd8c6693103fd839",
+      "isolation_sha256": "2f5da94be6e45fd1ff8f4657b1e99caa5c134df5592141053571ea3addca7fe5",
+      "foreign_processes": 0,
+      "scope": "Current licensed checker against unchanged measured production attention PTX; both real checkpoints."
+    }
   }
 }

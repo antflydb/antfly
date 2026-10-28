@@ -46,6 +46,9 @@ rare CUDA Florence receipt mismatch is not definitively root-caused.
 
 [Follow-up #1331](https://github.com/antflydb/antfly/pull/1331) keeps 0.8B vision-block
 activations BF16 on SM12.1 and avoids the 4B joined-projection split copies.
+It also fuses F32 language attention preparation and projection/residual operations.
+The F32 vision output retains the ordinary GEMM and combines bias/residual in one
+pass, avoiding the slower large-shape cuBLASLt bias epilogue.
 Patch embedding, the final vision merger, decoder projection outputs and recurrent
 state remain F32. The 4B preset retains F32 vision because BF16 vision did not
 produce a repeatable throughput gain. `ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=f32`
@@ -53,17 +56,18 @@ selects the original vision path.
 
 | Model | Native pages/s | Actual vLLM pages/s | Selected vision |
 | --- | ---: | ---: | --- |
-| LightOn 0.8B | 13.5842 / 13.5823 | 14.4969 / 14.4740 | BF16 blocks |
-| LightOn 4B | 4.1449 / 4.1669 | 4.5376 / 4.6081 | F32 |
+| LightOn 0.8B | 14.1538 / 13.9947 | 14.3536 / 14.5218 | BF16 blocks |
+| LightOn 4B | 4.3075 / 4.3297 | 4.6198 / 4.6258 | F32 |
 
 These are separate isolated runs on DGX Spark GB10: 256 warmup requests and two
 256-request measurements, 128 physical native slots and at most 128 active vLLM
-sequences. Native timed outputs match independent native serial bytes and complete
-normalized vLLM content on three synthetic pages. Both use actual wide four-token
+sequences. Native timed outputs match independent native serial bytes and raw vLLM text
+on three synthetic pages. Native uses actual wide four-token
 chains, unchanged operator byte limits, a 1,024-entry cuBLAS plan bound and zero
 uncached/scalar fallbacks. The optional BF16 FFN/recurrent prefill and F16-query,
 F32-output paged prefill extensions remain enabled. This is a partial precision
-profile. LightOn CUDA parity and representative OCR accuracy remain outstanding.
+profile. Reaching the fresh vLLM means still requires about 2.6% more throughput
+for 0.8B and 7.0% for 4B. CUDA parity and representative OCR accuracy remain outstanding.
 
 The [compact manifest](followup-1331.json) records source, binary, checkpoint,
 fixture and report hashes. The cleaned vision block matches the independent
@@ -72,8 +76,11 @@ checkpoint layer, batches up to 16 and 65,536 rows. Wrong-row, cross-image,
 alias and alignment controls are rejected. These checks qualify the matching
 cuDNN backend; they do not establish Flash Attention equivalence.
 
-Default F32 CUDA regression: 271 selected, 257 passed, 14 skips; wide regression:
-101 selected, 100 passed, one skip. Both original real-checkpoint feature/prompt
+Default F32 CUDA regression: 275 selected, 261 passed, 14 skips; wide regression:
+104 selected, 103 passed, one skip. The new attention-input PTX also passes 40
+independent Transformers cases using every checkpoint Q/K norm pair and text/image
+coordinates. Maximum error is below 2e-6 against the unchanged 2e-4 bound; inputs
+and output canaries remain unchanged. Both original real-checkpoint feature/prompt
 checks pass at batch sizes 1, 2, 3, 8 and 16. Metal compilation and seven focused
 CPU ownership/admission/profile checks pass; no new Metal GPU speed is claimed.
 Raw follow-up reports remain outside the source tree and are not yet published.
@@ -109,6 +116,9 @@ the user guide. Build a ReleaseFast inference test executable with Zig 0.17 and
   through the qualification-only C ABI below. Its PyTorch oracle uses original
   checkpoint weights and independent Transformers operators. It preserves the
   fixed error bounds and records full checkpoint fingerprints.
+- `check_cuda_lighton_attention_inputs.py` loads the serving PTX and checks its
+  Q/K normalization, partial M-RoPE and sigmoid against independent Transformers
+  operators with real checkpoint norm weights, readonly inputs and output canaries.
 - `verify_cuda_florence.sh --schedule-stress` adds the F64 cross-attention oracle
   with delayed warp scheduling, preserving the original numerical tolerance.
 - `verify_cuda_{recurrent,attention,activations,vision,florence}.sh` reproduce the
@@ -157,3 +167,23 @@ p = Path("zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx")
 p.write_bytes(p.read_bytes().rstrip() + b"\n")
 PYGEN
 ```
+
+For the F32 attention-input kernel, use the pinned NVCC version in the compact
+manifest and normalize its final newline before building:
+
+```sh
+nvcc --ptx -arch=compute_75 -O3 --fmad=false -std=c++17 \
+  zig/pkg/inference/src/ops/cuda/prototypes/lighton_attention_inputs.cu \
+  -o zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.ptx
+python3 - <<'PYGEN'
+from pathlib import Path
+p = Path("zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.ptx")
+p.write_bytes(p.read_bytes().rstrip() + b"\n")
+PYGEN
+python3 zig/pkg/inference/scripts/lightonocr3/check_cuda_lighton_attention_inputs.py \
+  --runtime-root . --ptx zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.ptx \
+  --model-08 "$MODEL_08" --model-4b "$MODEL_4B" --output "$NEW_REPORT_JSON"
+```
+
+This check uses the fixed F32 numerical budget. It does not allocate or access KV
+or recurrent state, pad inactive request rows, or measure OCR throughput.
