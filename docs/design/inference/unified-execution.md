@@ -3297,3 +3297,9 @@ machine-code controls and explicitly changed projection resource bounds.
 merge, Q4/Q5 sharing across eight/sixteen-column panels, Q6 panel16 rows and
 K16 four-column block traversal, with post-merge baselines and separate
 source/performance accounting.
+
+### AG shared ordinary and packed Q4/Q5 subblocks
+
+[The AG outcome register](unified-execution-ag-outcomes.md) records one native
+arithmetic owner across ordinary panels and packed QKV, fixed-extent pointer
+views, removal of packed-specific helpers and shared projection traversal.

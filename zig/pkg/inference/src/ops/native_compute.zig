@@ -17290,9 +17290,14 @@ inline fn writeQ4Q5KPreparedQ8KPackedQKVPanel16MR4ProjectionWithSums(
                 const x_scale1 = activation_scales1[block_idx];
                 const x_scale2 = activation_scales2[block_idx];
                 const x_scale3 = activation_scales3[block_idx];
-                accumulateQ4Q5KPackedQKVPanel16NR16MR4Projection(qsub0, qsub1, qsub2, qsub3, x_scale0, x_scale1, x_scale2, x_scale3, activation_sum0, activation_sum1, activation_sum2, activation_sum3, block, sub, 0, &acc_a0_lo, &acc_a0_hi, &acc_a1_lo, &acc_a1_hi, &acc_a2_lo, &acc_a2_hi, &acc_a3_lo, &acc_a3_hi);
-                accumulateQ4Q5KPackedQKVPanel16NR16MR4Projection(qsub0, qsub1, qsub2, qsub3, x_scale0, x_scale1, x_scale2, x_scale3, activation_sum0, activation_sum1, activation_sum2, activation_sum3, block, sub, 1, &acc_b0_lo, &acc_b0_hi, &acc_b1_lo, &acc_b1_hi, &acc_b2_lo, &acc_b2_hi, &acc_b3_lo, &acc_b3_hi);
-                accumulateQ4Q5KPackedQKVPanel16NR16MR4Projection(qsub0, qsub1, qsub2, qsub3, x_scale0, x_scale1, x_scale2, x_scale3, activation_sum0, activation_sum1, activation_sum2, activation_sum3, block, sub, 2, &acc_c0_lo, &acc_c0_hi, &acc_c1_lo, &acc_c1_hi, &acc_c2_lo, &acc_c2_hi, &acc_c3_lo, &acc_c3_hi);
+                const packed_accumulators = .{
+                    .{ .{ &acc_a0_lo, &acc_a1_lo, &acc_a2_lo, &acc_a3_lo }, .{ &acc_a0_hi, &acc_a1_hi, &acc_a2_hi, &acc_a3_hi } },
+                    .{ .{ &acc_b0_lo, &acc_b1_lo, &acc_b2_lo, &acc_b3_lo }, .{ &acc_b0_hi, &acc_b1_hi, &acc_b2_hi, &acc_b3_hi } },
+                    .{ .{ &acc_c0_lo, &acc_c1_lo, &acc_c2_lo, &acc_c3_lo }, .{ &acc_c0_hi, &acc_c1_hi, &acc_c2_hi, &acc_c3_hi } },
+                };
+                inline for (0..3) |projection| {
+                    q4q5PanelSubAccumulate(16, 4, .ready, true, .{ qsub0, qsub1, qsub2, qsub3 }, .{ x_scale0, x_scale1, x_scale2, x_scale3 }, .{ activation_sum0, activation_sum1, activation_sum2, activation_sum3 }, packedQKVPanel16SubProjectionView(block, sub, projection), packed_accumulators[projection]);
+                }
             }
         }
     } else {
@@ -17324,9 +17329,14 @@ inline fn writeQ4Q5KPreparedQ8KPackedQKVPanel16MR4ProjectionWithSums(
                 const activation_sum1: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r1, sub))));
                 const activation_sum2: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r2, sub))));
                 const activation_sum3: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r3, sub))));
-                accumulateQ4Q5KPackedQKVPanel16NR16MR4Projection(qsub0, qsub1, qsub2, qsub3, x_scale0, x_scale1, x_scale2, x_scale3, activation_sum0, activation_sum1, activation_sum2, activation_sum3, block, sub, 0, &acc_a0_lo, &acc_a0_hi, &acc_a1_lo, &acc_a1_hi, &acc_a2_lo, &acc_a2_hi, &acc_a3_lo, &acc_a3_hi);
-                accumulateQ4Q5KPackedQKVPanel16NR16MR4Projection(qsub0, qsub1, qsub2, qsub3, x_scale0, x_scale1, x_scale2, x_scale3, activation_sum0, activation_sum1, activation_sum2, activation_sum3, block, sub, 1, &acc_b0_lo, &acc_b0_hi, &acc_b1_lo, &acc_b1_hi, &acc_b2_lo, &acc_b2_hi, &acc_b3_lo, &acc_b3_hi);
-                accumulateQ4Q5KPackedQKVPanel16NR16MR4Projection(qsub0, qsub1, qsub2, qsub3, x_scale0, x_scale1, x_scale2, x_scale3, activation_sum0, activation_sum1, activation_sum2, activation_sum3, block, sub, 2, &acc_c0_lo, &acc_c0_hi, &acc_c1_lo, &acc_c1_hi, &acc_c2_lo, &acc_c2_hi, &acc_c3_lo, &acc_c3_hi);
+                const packed_accumulators = .{
+                    .{ .{ &acc_a0_lo, &acc_a1_lo, &acc_a2_lo, &acc_a3_lo }, .{ &acc_a0_hi, &acc_a1_hi, &acc_a2_hi, &acc_a3_hi } },
+                    .{ .{ &acc_b0_lo, &acc_b1_lo, &acc_b2_lo, &acc_b3_lo }, .{ &acc_b0_hi, &acc_b1_hi, &acc_b2_hi, &acc_b3_hi } },
+                    .{ .{ &acc_c0_lo, &acc_c1_lo, &acc_c2_lo, &acc_c3_lo }, .{ &acc_c0_hi, &acc_c1_hi, &acc_c2_hi, &acc_c3_hi } },
+                };
+                inline for (0..3) |projection| {
+                    q4q5PanelSubAccumulate(16, 4, .ready, true, .{ qsub0, qsub1, qsub2, qsub3 }, .{ x_scale0, x_scale1, x_scale2, x_scale3 }, .{ activation_sum0, activation_sum1, activation_sum2, activation_sum3 }, packedQKVPanel16SubProjectionView(block, sub, projection), packed_accumulators[projection]);
+                }
             }
         }
     }
@@ -17403,9 +17413,14 @@ inline fn writeQ4Q5KPreparedQ8KPackedQKVPanel16MR8ProjectionPreparedSums(
                 x_scales[row] = activation_scales[row][block_idx];
                 sums[row] = activation_sums[row][block_idx][sub];
             }
-            accumulateQ4Q5KPackedQKVPanel16NR16MR8ProjectionView(qsubs, x_scales, sums, packedQKVPanel16SubProjectionView(block, sub, 0), &acc_a_lo, &acc_a_hi);
-            accumulateQ4Q5KPackedQKVPanel16NR16MR8ProjectionView(qsubs, x_scales, sums, packedQKVPanel16SubProjectionView(block, sub, 1), &acc_b_lo, &acc_b_hi);
-            accumulateQ4Q5KPackedQKVPanel16NR16MR8ProjectionView(qsubs, x_scales, sums, packedQKVPanel16SubProjectionView(block, sub, 2), &acc_c_lo, &acc_c_hi);
+            const packed_accumulators = .{
+                q4q5PanelAccumulatorPointers(8, &acc_a_lo, &acc_a_hi),
+                q4q5PanelAccumulatorPointers(8, &acc_b_lo, &acc_b_hi),
+                q4q5PanelAccumulatorPointers(8, &acc_c_lo, &acc_c_hi),
+            };
+            inline for (0..3) |projection| {
+                q4q5PanelSubAccumulate(16, 8, .ready, true, qsubs, x_scales, sums, packedQKVPanel16SubProjectionView(block, sub, projection), packed_accumulators[projection]);
+            }
         }
     }
 
@@ -17629,9 +17644,14 @@ inline fn writeQ4Q5KPreparedQ8KPackedQKVPanel16MR2Projection(
             const q_off = sub * 32;
             const activation_sum0: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r0, sub))));
             const activation_sum1: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r1, sub))));
-            accumulateQ4Q5KPackedQKVPanel16NR16MR2(qx0, qx1, q_off, x_scale0, x_scale1, activation_sum0, activation_sum1, block, sub, 0, &acc_a0_lo, &acc_a0_hi, &acc_a1_lo, &acc_a1_hi);
-            accumulateQ4Q5KPackedQKVPanel16NR16MR2(qx0, qx1, q_off, x_scale0, x_scale1, activation_sum0, activation_sum1, block, sub, 1, &acc_b0_lo, &acc_b0_hi, &acc_b1_lo, &acc_b1_hi);
-            accumulateQ4Q5KPackedQKVPanel16NR16MR2(qx0, qx1, q_off, x_scale0, x_scale1, activation_sum0, activation_sum1, block, sub, 2, &acc_c0_lo, &acc_c0_hi, &acc_c1_lo, &acc_c1_hi);
+            const packed_accumulators = .{
+                .{ .{ &acc_a0_lo, &acc_a1_lo }, .{ &acc_a0_hi, &acc_a1_hi } },
+                .{ .{ &acc_b0_lo, &acc_b1_lo }, .{ &acc_b0_hi, &acc_b1_hi } },
+                .{ .{ &acc_c0_lo, &acc_c1_lo }, .{ &acc_c0_hi, &acc_c1_hi } },
+            };
+            inline for (0..3) |projection| {
+                q4q5PanelSubAccumulate(16, 2, .ready, true, .{ qx0[q_off..][0..32], qx1[q_off..][0..32] }, .{ x_scale0, x_scale1 }, .{ activation_sum0, activation_sum1 }, packedQKVPanel16SubProjectionView(block, sub, projection), packed_accumulators[projection]);
+            }
         }
     }
 
@@ -17677,9 +17697,14 @@ inline fn writeQ4Q5KPreparedQ8KPackedQKVPanel16MR1ProjectionWithSums(
             for (0..8) |sub| {
                 const q_off = sub * 32;
                 const activation_sum = activation_sums[block_idx][sub];
-                accumulateQ4Q5KPackedQKVPanel16NR16MR1(qx, q_off, x_scale, activation_sum, block, sub, 0, &acc_a_lo, &acc_a_hi);
-                accumulateQ4Q5KPackedQKVPanel16NR16MR1(qx, q_off, x_scale, activation_sum, block, sub, 1, &acc_b_lo, &acc_b_hi);
-                accumulateQ4Q5KPackedQKVPanel16NR16MR1(qx, q_off, x_scale, activation_sum, block, sub, 2, &acc_c_lo, &acc_c_hi);
+                const packed_accumulators = .{
+                    .{ .{&acc_a_lo}, .{&acc_a_hi} },
+                    .{ .{&acc_b_lo}, .{&acc_b_hi} },
+                    .{ .{&acc_c_lo}, .{&acc_c_hi} },
+                };
+                inline for (0..3) |projection| {
+                    q4q5PanelSubAccumulate(16, 1, .ready, true, .{qx[q_off..][0..32]}, .{x_scale}, .{activation_sum}, packedQKVPanel16SubProjectionView(block, sub, projection), packed_accumulators[projection]);
+                }
             }
         }
     } else {
@@ -17695,9 +17720,14 @@ inline fn writeQ4Q5KPreparedQ8KPackedQKVPanel16MR1ProjectionWithSums(
             for (0..8) |sub| {
                 const q_off = sub * 32;
                 const activation_sum: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block, sub))));
-                accumulateQ4Q5KPackedQKVPanel16NR16MR1(qx, q_off, x_scale, activation_sum, block, sub, 0, &acc_a_lo, &acc_a_hi);
-                accumulateQ4Q5KPackedQKVPanel16NR16MR1(qx, q_off, x_scale, activation_sum, block, sub, 1, &acc_b_lo, &acc_b_hi);
-                accumulateQ4Q5KPackedQKVPanel16NR16MR1(qx, q_off, x_scale, activation_sum, block, sub, 2, &acc_c_lo, &acc_c_hi);
+                const packed_accumulators = .{
+                    .{ .{&acc_a_lo}, .{&acc_a_hi} },
+                    .{ .{&acc_b_lo}, .{&acc_b_hi} },
+                    .{ .{&acc_c_lo}, .{&acc_c_hi} },
+                };
+                inline for (0..3) |projection| {
+                    q4q5PanelSubAccumulate(16, 1, .ready, true, .{qx[q_off..][0..32]}, .{x_scale}, .{activation_sum}, packedQKVPanel16SubProjectionView(block, sub, projection), packed_accumulators[projection]);
+                }
             }
         }
     }
@@ -30582,6 +30612,52 @@ inline fn q4q5PanelDotRows(comptime separate_rows: bool, comptime mr: usize, com
     return dotI8I8Block8MR4RowsVec(inputs[0], inputs[1], inputs[2], inputs[3], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 }
 
+/// Fixed extents make the physical subblock descriptor pointer-only.
+fn Q4Q5PanelSubView(comptime nr: usize) type {
+    return struct {
+        values: [nr / 8]*const [8 * 32]u8,
+        dsc: [nr / 8]*const [32]u8,
+        dmn: [nr / 8]*const [32]u8,
+    };
+}
+
+inline fn q4q5PanelAccumulatorPointers(comptime mr: usize, low: *[mr]F32x8, high: *[mr]F32x8) [2][mr]*F32x8 {
+    var outputs: [2][mr]*F32x8 = undefined;
+    inline for (0..mr) |row| {
+        outputs[0][row] = &low.*[row];
+        outputs[1][row] = &high.*[row];
+    }
+    return outputs;
+}
+
+const Q4Q5SubSums = enum { block, cached, ready };
+
+/// Share arithmetic while retaining dot tiles, coefficient reads and store order.
+inline fn q4q5PanelSubAccumulate(comptime nr: usize, comptime mr: usize, comptime sums_kind: Q4Q5SubSums, comptime contiguous: bool, queries: anytype, scales: [mr]F32x8, sum_source: anytype, view: Q4Q5PanelSubView(nr), accumulators: [nr / 8][mr]*F32x8) void {
+    const tile_rows = @min(mr, 4);
+    const fields = [_][]const u8{ "r0", "r1", "r2", "r3" };
+    var dots: [mr / tile_rows][nr / 8]PanelDotResult(tile_rows, 32) = undefined;
+    inline for (0..mr / tile_rows) |tile| {
+        var q: [tile_rows]*const [32]u8 = undefined;
+        inline for (0..tile_rows) |row| q[row] = if (sums_kind == .ready) queries[tile * tile_rows + row] else queries[tile * tile_rows + row][4 + sum_source.sub * 32 ..][0..32];
+        inline for (0..nr / 8) |half| dots[tile][half] = q4q5PanelDotRows(nr == 8, tile_rows, contiguous, q, view.values[half]);
+    }
+    var sums: [mr]F32x8 = undefined;
+    if (comptime nr == 8 and mr == 1 and sums_kind == .block) sums[0] = @splat(@as(f32, @floatFromInt(q8KBlockSum(queries[0], sum_source.sub))));
+    var dsc: [nr / 8]F32x8 = undefined;
+    var dmn: [nr / 8]F32x8 = undefined;
+    inline for (0..nr / 8) |half| dsc[half] = readF32x8Le(view.dsc[half]);
+    inline for (0..nr / 8) |half| dmn[half] = readF32x8Le(view.dmn[half]);
+    if (comptime sums_kind == .block and !(nr == 8 and mr == 1)) inline for (0..mr) |row| {
+        sums[row] = @splat(@as(f32, @floatFromInt(q8KBlockSum(queries[row], sum_source.sub))));
+    };
+    inline for (0..nr / 8) |half| inline for (0..mr) |row| {
+        const dot = if (tile_rows == 1) dots[0][half] else @field(dots[row / tile_rows][half], fields[row % tile_rows]);
+        const sum = if (sums_kind == .block) sums[row] else if (sums_kind == .ready) sum_source[row] else sum_source.cached_sums[row].*[sum_source.sub];
+        accumulators[half][row].* += scales[row] * (dsc[half] * @as(F32x8, @floatFromInt(dot)) - dmn[half] * sum);
+    };
+}
+
 /// Preserve per-subblock dot order, coefficient loads and low-before-high stores.
 inline fn q4q5PanelAccumulate(comptime nr: usize, comptime mr: usize, comptime cache: Q4Q5PanelCache, comptime contiguous: bool, inputs: [mr][]const u8, cached_sums: [mr]*const [8]F32x8, cached_scales: [mr]F32x8, panel: []const u8, accumulators: [nr / 8][mr]*F32x8) void {
     comptime std.debug.assert(nr == 8 or nr == 16);
@@ -30593,33 +30669,17 @@ inline fn q4q5PanelAccumulate(comptime nr: usize, comptime mr: usize, comptime c
     const dmn_offset = if (nr == 8) prepared_k_panel8_dmn_offset else prepared_k_panel16_dmn_offset;
     var scales: [mr]F32x8 = undefined;
     inline for (0..mr) |row| scales[row] = if (cache == .sums_and_scales) cached_scales[row] else @as(F32x8, @splat(readF32Le(inputs[row][0..4])));
-    const tile_rows = @min(mr, 4);
-    const fields = [_][]const u8{ "r0", "r1", "r2", "r3" };
     const traversal = if (nr == 8 and mr == 1) 8 else 1;
     inline for (0..traversal) |tile_index| {
         for (0..8 / traversal) |step| {
             const sub = tile_index + step;
-            const base = values_offset + sub * nr * 32;
-            var dots: [mr / tile_rows][nr / 8]PanelDotResult(tile_rows, 32) = undefined;
-            inline for (0..mr / tile_rows) |tile| {
-                var q: [tile_rows]*const [32]u8 = undefined;
-                inline for (0..tile_rows) |row| q[row] = inputs[tile * tile_rows + row][4 + sub * 32 ..][0..32];
-                inline for (0..nr / 8) |half| dots[tile][half] = q4q5PanelDotRows(nr == 8, tile_rows, contiguous, q, panel[base + half * 8 * 32 ..][0 .. 8 * 32]);
+            var view: Q4Q5PanelSubView(nr) = undefined;
+            inline for (0..nr / 8) |half| {
+                view.values[half] = panel[values_offset + (sub * nr + half * 8) * 32 ..][0 .. 8 * 32];
+                view.dsc[half] = panel[dsc_offset + (sub * nr + half * 8) * 4 ..][0..32];
+                view.dmn[half] = panel[dmn_offset + (sub * nr + half * 8) * 4 ..][0..32];
             }
-            var sums: [mr]F32x8 = undefined;
-            if (comptime nr == 8 and mr == 1) sums[0] = @splat(@as(f32, @floatFromInt(q8KBlockSum(inputs[0], sub))));
-            var dsc: [nr / 8]F32x8 = undefined;
-            var dmn: [nr / 8]F32x8 = undefined;
-            inline for (0..nr / 8) |half| dsc[half] = readF32x8Le(panel[dsc_offset + (sub * nr + half * 8) * 4 ..][0..32]);
-            inline for (0..nr / 8) |half| dmn[half] = readF32x8Le(panel[dmn_offset + (sub * nr + half * 8) * 4 ..][0..32]);
-            if (comptime cache == .direct and !(nr == 8 and mr == 1)) inline for (0..mr) |row| {
-                sums[row] = @splat(@as(f32, @floatFromInt(q8KBlockSum(inputs[row], sub))));
-            };
-            inline for (0..nr / 8) |half| inline for (0..mr) |row| {
-                const dot = if (tile_rows == 1) dots[0][half] else @field(dots[row / tile_rows][half], fields[row % tile_rows]);
-                const sum = if (cache == .direct) sums[row] else cached_sums[row].*[sub];
-                accumulators[half][row].* += scales[row] * (dsc[half] * @as(F32x8, @floatFromInt(dot)) - dmn[half] * sum);
-            };
+            q4q5PanelSubAccumulate(nr, mr, if (cache == .direct) .block else .cached, contiguous, inputs, scales, .{ .cached_sums = cached_sums, .sub = sub }, view, accumulators);
         }
     }
 }
@@ -30721,12 +30781,7 @@ inline fn accumulateQ4Q5KPreparedQ8KPanel16MR8BlockPreparedSums(
     acc_lo: *[8]F32x8,
     acc_hi: *[8]F32x8,
 ) void {
-    var outputs: [2][8]*F32x8 = undefined;
-    inline for (0..8) |row| {
-        outputs[0][row] = &acc_lo.*[row];
-        outputs[1][row] = &acc_hi.*[row];
-    }
-    q4q5PanelAccumulate(16, 8, .sums_and_scales, true, q8_blocks, activation_sums, x_scales, panel_block, outputs);
+    q4q5PanelAccumulate(16, 8, .sums_and_scales, true, q8_blocks, activation_sums, x_scales, panel_block, q4q5PanelAccumulatorPointers(8, acc_lo, acc_hi));
 }
 
 inline fn dotQ4Q5KPreparedQ8KPanel16MR2PreparedSums(
@@ -30843,241 +30898,21 @@ inline fn q4q5KTriplePanel16Block(panel_a: []const u8, panel_b: []const u8, pane
     };
 }
 
-const PackedQKVPanel16SubProjectionView = struct {
-    dsc_lo: []const u8,
-    dsc_hi: []const u8,
-    dmn_lo: []const u8,
-    dmn_hi: []const u8,
-    values_lo: []const u8,
-    values_hi: []const u8,
-};
+const PackedQKVPanel16SubProjectionView = Q4Q5PanelSubView(16);
 
 inline fn packedQKVPanel16SubProjectionViewFromLaneBase(block: []const u8, lane_base: usize) PackedQKVPanel16SubProjectionView {
     const meta_base = lane_base * 4;
     const values_base = lane_base * 32;
     return .{
-        .dsc_lo = block[prepared_k_qkv_panel16_dsc_offset + meta_base ..][0..32],
-        .dsc_hi = block[prepared_k_qkv_panel16_dsc_offset + meta_base + 8 * 4 ..][0..32],
-        .dmn_lo = block[prepared_k_qkv_panel16_dmn_offset + meta_base ..][0..32],
-        .dmn_hi = block[prepared_k_qkv_panel16_dmn_offset + meta_base + 8 * 4 ..][0..32],
-        .values_lo = block[prepared_k_qkv_panel16_values_offset + values_base ..][0 .. 8 * 32],
-        .values_hi = block[prepared_k_qkv_panel16_values_offset + values_base + 8 * 32 ..][0 .. 8 * 32],
+        .dsc = .{ block[prepared_k_qkv_panel16_dsc_offset + meta_base ..][0..32], block[prepared_k_qkv_panel16_dsc_offset + meta_base + 8 * 4 ..][0..32] },
+        .dmn = .{ block[prepared_k_qkv_panel16_dmn_offset + meta_base ..][0..32], block[prepared_k_qkv_panel16_dmn_offset + meta_base + 8 * 4 ..][0..32] },
+        .values = .{ block[prepared_k_qkv_panel16_values_offset + values_base ..][0 .. 8 * 32], block[prepared_k_qkv_panel16_values_offset + values_base + 8 * 32 ..][0 .. 8 * 32] },
     };
 }
 
 inline fn packedQKVPanel16SubProjectionView(block: []const u8, sub: usize, comptime proj: usize) PackedQKVPanel16SubProjectionView {
     const lane_base = (sub * prepared_k_qkv_panel16_proj + proj) * prepared_k_panel16_nr;
     return packedQKVPanel16SubProjectionViewFromLaneBase(block, lane_base);
-}
-
-inline fn accumulateQ4Q5KPackedQKVPanel16NR16MR1(
-    qx: []const u8,
-    q_off: usize,
-    x_scale: F32x8,
-    activation_sum: F32x8,
-    block: []const u8,
-    sub: usize,
-    comptime proj: usize,
-    acc_lo: *F32x8,
-    acc_hi: *F32x8,
-) void {
-    const view = packedQKVPanel16SubProjectionView(block, sub, proj);
-    const dots_lo = dotI8I8Block8ContiguousVec(qx[q_off..][0..32], view.values_lo);
-    const dots_hi = dotI8I8Block8ContiguousVec(qx[q_off..][0..32], view.values_hi);
-    const dsc_lo = readF32x8Le(view.dsc_lo);
-    const dsc_hi = readF32x8Le(view.dsc_hi);
-    const dmn_lo = readF32x8Le(view.dmn_lo);
-    const dmn_hi = readF32x8Le(view.dmn_hi);
-    acc_lo.* += x_scale * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo)) - dmn_lo * activation_sum);
-    acc_hi.* += x_scale * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi)) - dmn_hi * activation_sum);
-}
-
-inline fn accumulateQ4Q5KPackedQKVPanel16NR16MR2(
-    qx0: []const u8,
-    qx1: []const u8,
-    q_off: usize,
-    x_scale0: F32x8,
-    x_scale1: F32x8,
-    activation_sum0: F32x8,
-    activation_sum1: F32x8,
-    block: []const u8,
-    sub: usize,
-    comptime proj: usize,
-    acc0_lo: *F32x8,
-    acc0_hi: *F32x8,
-    acc1_lo: *F32x8,
-    acc1_hi: *F32x8,
-) void {
-    const view = packedQKVPanel16SubProjectionView(block, sub, proj);
-    const dots_lo = dotI8I8Block8MR2RowsContiguousVec(qx0[q_off..][0..32], qx1[q_off..][0..32], view.values_lo);
-    const dots_hi = dotI8I8Block8MR2RowsContiguousVec(qx0[q_off..][0..32], qx1[q_off..][0..32], view.values_hi);
-    const dsc_lo = readF32x8Le(view.dsc_lo);
-    const dsc_hi = readF32x8Le(view.dsc_hi);
-    const dmn_lo = readF32x8Le(view.dmn_lo);
-    const dmn_hi = readF32x8Le(view.dmn_hi);
-    acc0_lo.* += x_scale0 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r0)) - dmn_lo * activation_sum0);
-    acc1_lo.* += x_scale1 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r1)) - dmn_lo * activation_sum1);
-    acc0_hi.* += x_scale0 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r0)) - dmn_hi * activation_sum0);
-    acc1_hi.* += x_scale1 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r1)) - dmn_hi * activation_sum1);
-}
-
-inline fn accumulateQ4Q5KPackedQKVPanel16NR16MR4ProjectionView(
-    qsub0: *const [32]u8,
-    qsub1: *const [32]u8,
-    qsub2: *const [32]u8,
-    qsub3: *const [32]u8,
-    x_scale0: F32x8,
-    x_scale1: F32x8,
-    x_scale2: F32x8,
-    x_scale3: F32x8,
-    activation_sum0: F32x8,
-    activation_sum1: F32x8,
-    activation_sum2: F32x8,
-    activation_sum3: F32x8,
-    view: PackedQKVPanel16SubProjectionView,
-    acc0_lo: *F32x8,
-    acc0_hi: *F32x8,
-    acc1_lo: *F32x8,
-    acc1_hi: *F32x8,
-    acc2_lo: *F32x8,
-    acc2_hi: *F32x8,
-    acc3_lo: *F32x8,
-    acc3_hi: *F32x8,
-) void {
-    const dots_lo = dotI8I8Block8MR4RowsContiguousVec(
-        qsub0,
-        qsub1,
-        qsub2,
-        qsub3,
-        view.values_lo,
-    );
-    const dots_hi = dotI8I8Block8MR4RowsContiguousVec(
-        qsub0,
-        qsub1,
-        qsub2,
-        qsub3,
-        view.values_hi,
-    );
-    const dsc_lo = readF32x8Le(view.dsc_lo);
-    const dsc_hi = readF32x8Le(view.dsc_hi);
-    const dmn_lo = readF32x8Le(view.dmn_lo);
-    const dmn_hi = readF32x8Le(view.dmn_hi);
-    acc0_lo.* += x_scale0 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r0)) - dmn_lo * activation_sum0);
-    acc1_lo.* += x_scale1 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r1)) - dmn_lo * activation_sum1);
-    acc2_lo.* += x_scale2 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r2)) - dmn_lo * activation_sum2);
-    acc3_lo.* += x_scale3 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r3)) - dmn_lo * activation_sum3);
-    acc0_hi.* += x_scale0 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r0)) - dmn_hi * activation_sum0);
-    acc1_hi.* += x_scale1 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r1)) - dmn_hi * activation_sum1);
-    acc2_hi.* += x_scale2 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r2)) - dmn_hi * activation_sum2);
-    acc3_hi.* += x_scale3 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r3)) - dmn_hi * activation_sum3);
-}
-
-inline fn accumulateQ4Q5KPackedQKVPanel16NR16MR8ProjectionView(
-    qsubs: [8]*const [32]u8,
-    x_scales: [8]F32x8,
-    activation_sums: [8]F32x8,
-    view: PackedQKVPanel16SubProjectionView,
-    acc_lo: *[8]F32x8,
-    acc_hi: *[8]F32x8,
-) void {
-    const dots_lo_0123 = dotI8I8Block8MR4RowsContiguousVec(
-        qsubs[0],
-        qsubs[1],
-        qsubs[2],
-        qsubs[3],
-        view.values_lo,
-    );
-    const dots_hi_0123 = dotI8I8Block8MR4RowsContiguousVec(
-        qsubs[0],
-        qsubs[1],
-        qsubs[2],
-        qsubs[3],
-        view.values_hi,
-    );
-    const dots_lo_4567 = dotI8I8Block8MR4RowsContiguousVec(
-        qsubs[4],
-        qsubs[5],
-        qsubs[6],
-        qsubs[7],
-        view.values_lo,
-    );
-    const dots_hi_4567 = dotI8I8Block8MR4RowsContiguousVec(
-        qsubs[4],
-        qsubs[5],
-        qsubs[6],
-        qsubs[7],
-        view.values_hi,
-    );
-    const dsc_lo = readF32x8Le(view.dsc_lo);
-    const dsc_hi = readF32x8Le(view.dsc_hi);
-    const dmn_lo = readF32x8Le(view.dmn_lo);
-    const dmn_hi = readF32x8Le(view.dmn_hi);
-    acc_lo.*[0] += x_scales[0] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_0123.r0)) - dmn_lo * activation_sums[0]);
-    acc_lo.*[1] += x_scales[1] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_0123.r1)) - dmn_lo * activation_sums[1]);
-    acc_lo.*[2] += x_scales[2] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_0123.r2)) - dmn_lo * activation_sums[2]);
-    acc_lo.*[3] += x_scales[3] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_0123.r3)) - dmn_lo * activation_sums[3]);
-    acc_lo.*[4] += x_scales[4] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_4567.r0)) - dmn_lo * activation_sums[4]);
-    acc_lo.*[5] += x_scales[5] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_4567.r1)) - dmn_lo * activation_sums[5]);
-    acc_lo.*[6] += x_scales[6] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_4567.r2)) - dmn_lo * activation_sums[6]);
-    acc_lo.*[7] += x_scales[7] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_4567.r3)) - dmn_lo * activation_sums[7]);
-    acc_hi.*[0] += x_scales[0] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_0123.r0)) - dmn_hi * activation_sums[0]);
-    acc_hi.*[1] += x_scales[1] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_0123.r1)) - dmn_hi * activation_sums[1]);
-    acc_hi.*[2] += x_scales[2] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_0123.r2)) - dmn_hi * activation_sums[2]);
-    acc_hi.*[3] += x_scales[3] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_0123.r3)) - dmn_hi * activation_sums[3]);
-    acc_hi.*[4] += x_scales[4] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_4567.r0)) - dmn_hi * activation_sums[4]);
-    acc_hi.*[5] += x_scales[5] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_4567.r1)) - dmn_hi * activation_sums[5]);
-    acc_hi.*[6] += x_scales[6] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_4567.r2)) - dmn_hi * activation_sums[6]);
-    acc_hi.*[7] += x_scales[7] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_4567.r3)) - dmn_hi * activation_sums[7]);
-}
-
-inline fn accumulateQ4Q5KPackedQKVPanel16NR16MR4Projection(
-    qsub0: *const [32]u8,
-    qsub1: *const [32]u8,
-    qsub2: *const [32]u8,
-    qsub3: *const [32]u8,
-    x_scale0: F32x8,
-    x_scale1: F32x8,
-    x_scale2: F32x8,
-    x_scale3: F32x8,
-    activation_sum0: F32x8,
-    activation_sum1: F32x8,
-    activation_sum2: F32x8,
-    activation_sum3: F32x8,
-    block: []const u8,
-    sub: usize,
-    comptime proj: usize,
-    acc0_lo: *F32x8,
-    acc0_hi: *F32x8,
-    acc1_lo: *F32x8,
-    acc1_hi: *F32x8,
-    acc2_lo: *F32x8,
-    acc2_hi: *F32x8,
-    acc3_lo: *F32x8,
-    acc3_hi: *F32x8,
-) void {
-    accumulateQ4Q5KPackedQKVPanel16NR16MR4ProjectionView(
-        qsub0,
-        qsub1,
-        qsub2,
-        qsub3,
-        x_scale0,
-        x_scale1,
-        x_scale2,
-        x_scale3,
-        activation_sum0,
-        activation_sum1,
-        activation_sum2,
-        activation_sum3,
-        packedQKVPanel16SubProjectionView(block, sub, proj),
-        acc0_lo,
-        acc0_hi,
-        acc1_lo,
-        acc1_hi,
-        acc2_lo,
-        acc2_hi,
-        acc3_lo,
-        acc3_hi,
-    );
 }
 
 inline fn dotQ4Q5KPreparedQ8KTriplePanel16MR2(
@@ -51369,6 +51204,181 @@ test "K16 block row families independent oracle and benchmark" {
             for (&samples) |*sample| sample.* = state.measure(profile);
             std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
             std.debug.print("k16_block profile={d} mr={d} kind={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=1001\n", .{ profile, profiles[profile].mr, profiles[profile].kind, @as(f64, @floatFromInt(samples[10])) / 1001.0, @as(f64, @floatFromInt(samples[19])) / 1001.0, samples[10], samples[19] });
+        }
+    }
+}
+
+test "packed QKV row families independent oracle and benchmark" {
+    @setEvalBranchQuota(500_000);
+    const Module = @This();
+    const old_interface = @sizeOf(PackedQKVPanel16SubProjectionView) == 6 * @sizeOf([]const u8);
+    const profiles = .{
+        .{ .mr = 1, .mode = 0 },
+        .{ .mr = 1, .mode = 1 },
+        .{ .mr = 1, .mode = 2 },
+        .{ .mr = 1, .mode = 3 },
+        .{ .mr = 1, .mode = 4 },
+        .{ .mr = 2, .mode = 0 },
+        .{ .mr = 2, .mode = 1 },
+        .{ .mr = 2, .mode = 2 },
+        .{ .mr = 2, .mode = 3 },
+        .{ .mr = 2, .mode = 4 },
+        .{ .mr = 4, .mode = 0 },
+        .{ .mr = 4, .mode = 1 },
+        .{ .mr = 4, .mode = 2 },
+        .{ .mr = 4, .mode = 3 },
+        .{ .mr = 4, .mode = 4 },
+        .{ .mr = 8, .mode = 0 },
+        .{ .mr = 8, .mode = 1 },
+        .{ .mr = 8, .mode = 2 },
+        .{ .mr = 8, .mode = 3 },
+        .{ .mr = 8, .mode = 4 },
+    };
+    const State = struct {
+        inputs: [8][256]u8 align(64) = @splat(@splat(0)),
+        qinput: [8 * 292]u8 align(64) = @splat(0),
+        biases: [3][16]f32 = undefined,
+        panel: [prepared_k_qkv_panel16_block_bytes]u8 align(64) = @splat(0),
+        scales: [8]F32x8 = undefined,
+        sums: [8][8]F32x8 = undefined,
+        fn bias(projection: usize, half: usize, row: usize, lane: usize) f32 {
+            return @as(f32, @floatFromInt(@as(i32, @intCast((projection * 7 + half * 3 + row * 5 + lane) % 9)) - 4)) * 0.125;
+        }
+        fn initialize(self: *@This(), seed: usize) void {
+            for (&self.inputs, 0..) |*input, row| {
+                for (0..256) |i| {
+                    const x: i8 = if (seed == 0) 0 else if (seed == 1) (if ((i + row) % 2 == 0) -128 else 127) else @intCast(@as(i32, @intCast((i * 17 + row * 37 + seed * 11) % 256)) - 128);
+                    input[i] = @bitCast(x);
+                }
+                inline for (0..8) |lane| self.scales[row][lane] = if (seed == 3) (if (lane % 2 == 0) 0.125 else -0.25) else (if ((seed + row) % 2 == 0) 0.125 else -0.25);
+                for (0..8) |sub| {
+                    var sum: i32 = 0;
+                    for (0..32) |i| sum += @as(i8, @bitCast(input[sub * 32 + i]));
+                    inline for (0..8) |lane| self.sums[row][sub][lane] = @floatFromInt(sum + (if (seed == 3) @as(i32, lane) - 3 else 0));
+                }
+            }
+            for (0..8) |row| {
+                const dest = self.qinput[row * 292 ..][0..292];
+                const scale: f32 = if ((seed + row) % 2 == 0) 0.125 else -0.25;
+                std.mem.writeInt(u32, dest[0..4], @bitCast(scale), .little);
+                @memcpy(dest[4..260], &self.inputs[row]);
+                for (0..16) |sub| {
+                    var sum: i16 = 0;
+                    for (0..16) |i| sum += @as(i8, @bitCast(self.inputs[row][sub * 16 + i]));
+                    std.mem.writeInt(i16, dest[260 + sub * 2 ..][0..2], sum, .little);
+                }
+            }
+            for (0..3) |proj| for (0..16) |col| {
+                self.biases[proj][col] = bias(proj, col / 8, 0, col % 8);
+            };
+            for (0..8) |sub| for (0..3) |proj| for (0..16) |col| {
+                const lane = (sub * 3 + proj) * 16 + col;
+                const dsc: f32 = if ((sub + proj + col + seed) % 2 == 0) 0.015625 else -0.0078125;
+                const dmn: f32 = if ((sub + proj + col + seed) % 3 == 0) 0.00390625 else -0.001953125;
+                std.mem.writeInt(u32, self.panel[lane * 4 ..][0..4], @bitCast(dsc), .little);
+                std.mem.writeInt(u32, self.panel[8 * 3 * 16 * 4 + lane * 4 ..][0..4], @bitCast(dmn), .little);
+                for (0..32) |i| self.panel[16 * 3 * 16 * 4 + lane * 32 + i] = @intCast((i * 7 + sub * 11 + proj * 19 + col * 13 + seed * 17) % (if (seed % 2 == 0) @as(usize, 16) else 32));
+            };
+        }
+        noinline fn run(self: *@This(), comptime profile: usize) [if (profiles[profile].mode >= 3) 3 else 1][2][profiles[profile].mr]F32x8 {
+            const mr = profiles[profile].mr;
+            const mode = profiles[profile].mode;
+            const projections = if (mode >= 3) 3 else 1;
+            if (comptime mode == 4) {
+                var outputs: [3][mr * 16]f32 = undefined;
+                linearQ4Q5KPreparedQ8KActivationTriplePanel16Range(self.qinput[0 .. mr * 292], &.{}, &.{}, &self.biases[0], &outputs[0], &.{}, &.{}, &self.biases[1], &outputs[1], &.{}, &.{}, &self.biases[2], &outputs[2], &self.panel, true, mr == 8, mr, 256, 16, 0, 16);
+                var result: [3][2][mr]F32x8 = undefined;
+                inline for (0..3) |proj| inline for (0..2) |half| inline for (0..mr) |row| inline for (0..8) |lane| {
+                    result[proj][half][row][lane] = outputs[proj][row * 16 + half * 8 + lane];
+                };
+                return result;
+            }
+            var acc: [projections][2][mr]F32x8 = undefined;
+            inline for (0..projections) |index| inline for (0..2) |half| inline for (0..mr) |row| inline for (0..8) |lane| {
+                acc[index][half][row][lane] = bias(if (mode >= 3) index else mode, half, row, lane);
+            };
+            var scales: [mr]F32x8 = undefined;
+            inline for (0..mr) |row| scales[row] = self.scales[row];
+            for (0..8) |sub| {
+                var q: [mr]*const [32]u8 = undefined;
+                var sums: [mr]F32x8 = undefined;
+                inline for (0..mr) |row| {
+                    q[row] = self.inputs[row][sub * 32 ..][0..32];
+                    sums[row] = self.sums[row][sub];
+                }
+                inline for (0..projections) |index| {
+                    const proj = if (mode >= 3) index else mode;
+                    const view = packedQKVPanel16SubProjectionView(&self.panel, sub, proj);
+                    if (comptime old_interface) {
+                        if (mr == 1) Module.accumulateQ4Q5KPackedQKVPanel16NR16MR1(&self.inputs[0], sub * 32, scales[0], sums[0], &self.panel, sub, proj, &acc[index][0][0], &acc[index][1][0]);
+                        if (mr == 2) Module.accumulateQ4Q5KPackedQKVPanel16NR16MR2(&self.inputs[0], &self.inputs[1], sub * 32, scales[0], scales[1], sums[0], sums[1], &self.panel, sub, proj, &acc[index][0][0], &acc[index][1][0], &acc[index][0][1], &acc[index][1][1]);
+                        if (mr == 4) Module.accumulateQ4Q5KPackedQKVPanel16NR16MR4ProjectionView(q[0], q[1], q[2], q[3], scales[0], scales[1], scales[2], scales[3], sums[0], sums[1], sums[2], sums[3], view, &acc[index][0][0], &acc[index][1][0], &acc[index][0][1], &acc[index][1][1], &acc[index][0][2], &acc[index][1][2], &acc[index][0][3], &acc[index][1][3]);
+                        if (mr == 8) Module.accumulateQ4Q5KPackedQKVPanel16NR16MR8ProjectionView(q, scales, sums, view, &acc[index][0], &acc[index][1]);
+                    } else {
+                        var outputs: [2][mr]*F32x8 = undefined;
+                        inline for (0..2) |half| inline for (0..mr) |row| {
+                            outputs[half][row] = &acc[index][half][row];
+                        };
+                        Module.q4q5PanelSubAccumulate(16, mr, .ready, true, q, scales, sums, view, outputs);
+                    }
+                }
+            }
+            return acc;
+        }
+        noinline fn measure(self: *@This(), comptime profile: usize) u64 {
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..1001) |_| {
+                self.scales[0] = -self.scales[0];
+                self.qinput[3] ^= 0x80;
+                std.mem.doNotOptimizeAway(self.run(profile));
+            }
+            return @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - start);
+        }
+    };
+    var state: State = .{};
+    for (0..4) |seed| {
+        state.initialize(seed);
+        inline for (0..profiles.len) |profile| {
+            const mr = profiles[profile].mr;
+            const mode = profiles[profile].mode;
+            const output = state.run(profile);
+            inline for (0..if (mode >= 3) 3 else 1) |index| {
+                const proj = if (mode >= 3) index else mode;
+                for (0..2) |half| for (0..mr) |row| for (0..8) |lane| {
+                    const col = half * 8 + lane;
+                    var expected: f64 = if (mode == 4) 0 else State.bias(proj, half, row, lane);
+                    const scale: f64 = if (mode == 4) readF32Le(state.qinput[row * 292 ..][0..4]) else f32x8ToArray(state.scales[row])[lane];
+                    for (0..8) |sub| {
+                        const weight_lane = (sub * 3 + proj) * 16 + col;
+                        var dot: i64 = 0;
+                        var input_sum: i32 = 0;
+                        for (0..32) |i| {
+                            const x: i8 = @bitCast(state.inputs[row][sub * 32 + i]);
+                            dot += @as(i64, x) * @as(i64, state.panel[16 * 3 * 16 * 4 + weight_lane * 32 + i]);
+                            input_sum += x;
+                        }
+                        const dsc: f64 = readF32Le(state.panel[weight_lane * 4 ..][0..4]);
+                        const dmn: f64 = readF32Le(state.panel[8 * 3 * 16 * 4 + weight_lane * 4 ..][0..4]);
+                        const sum: f64 = if (mode == 4) @floatFromInt(input_sum) else f32x8ToArray(state.sums[row][sub])[lane];
+                        expected += scale * (dsc * @as(f64, @floatFromInt(dot)) - dmn * sum);
+                    }
+                    if (mode == 4) expected += state.biases[proj][col];
+                    const want: f32 = @floatCast(expected);
+                    try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(f32x8ToArray(output[index][half][row])[lane])));
+                };
+            }
+        }
+    }
+    std.debug.print("packed_qkv_descriptor bytes={d}\n", .{@sizeOf(PackedQKVPanel16SubProjectionView)});
+    if (platform.env.getenvBool("ANTFLY_PACKED_QKV_BENCH")) {
+        state.initialize(2);
+        inline for (0..profiles.len) |profile| {
+            const warmup_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            while (std.Io.Clock.awake.now(std.testing.io).nanoseconds - warmup_start < 25_000_000) _ = state.measure(profile);
+            var samples: [21]u64 = undefined;
+            for (&samples) |*sample| sample.* = state.measure(profile);
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            std.debug.print("packed_qkv profile={d} mr={d} mode={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=1001\n", .{ profile, profiles[profile].mr, profiles[profile].mode, @as(f64, @floatFromInt(samples[10])) / 1001.0, @as(f64, @floatFromInt(samples[19])) / 1001.0, samples[10], samples[19] });
         }
     }
 }
