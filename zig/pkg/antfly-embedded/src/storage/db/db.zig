@@ -92803,6 +92803,76 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     try std.testing.expectEqual(@as(usize, 0), stale_sparse_result.hits.len);
 }
 
+test "db generated enrichment recovery skips empty fields and advances coverage across reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const indexes = [_]types.IndexConfig{
+        .{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\"}}" },
+        .{ .name = "sparse", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\"}}" },
+    };
+    var target: u64 = 0;
+    {
+        // Leave durable replay for the next process: it must not interpret a
+        // missing artifact as permission to send an empty source to inference.
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addEnrichment(.{ .name = "body_chunks", .kind = .chunk, .field = "body", .chunk_size = 512 });
+        try db.addIndex(.{ .name = "chunk_text", .kind = .full_text, .config_json = "{\"chunk_name\":\"body_chunks\"}" });
+        for (indexes) |index| try db.addIndex(index);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "empty", .value = "{\"body\":\"\"}" },
+                .{ .key = "missing", .value = "{}" },
+                .{ .key = "null", .value = "{\"body\":null}" },
+                .{ .key = "whitespace", .value = "{\"body\":\" \\t\\n\"}" },
+                .{ .key = "full", .value = "{\"body\":\"portable databases\"}" },
+            },
+            .sync_level = .write,
+        });
+        target = db.pendingWorkStats().derived_target_sequence;
+    }
+    var dense: CountingDenseEmbedder = .{};
+    var sparse: CountingSparseEmbedder = .{};
+    // Repeat the reopen after recovery to prove the empty source stays covered
+    // without inference, rather than being retried whenever a handle opens.
+    for (0..2) |_| {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .enrichment = .{ .owner_id = "recovery", .dense_embedder = dense.interface(), .sparse_embedder = sparse.interface() },
+        });
+        defer db.close();
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(usize, 2), dense.calls);
+        try std.testing.expectEqual(@as(usize, 2), sparse.calls);
+        const pending = db.pendingWorkStats();
+        try std.testing.expectEqual(pending.enrichment.target_sequence, pending.enrichment.applied_sequence);
+        try std.testing.expect(pending.enrichment.applied_sequence >= target);
+        for (indexes) |index| {
+            try std.testing.expect((try db.core.loadAppliedSequence(alloc, index.name)) >= target);
+            for ([_][]const u8{ "empty", "missing", "null", "whitespace", "full" }) |key| {
+                const artifact = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, key, index.name);
+                defer alloc.free(artifact);
+                const value = db.core.store.get(alloc, artifact) catch |err| switch (err) {
+                    error.NotFound => {
+                        try std.testing.expect(!std.mem.eql(u8, key, "whitespace") and !std.mem.eql(u8, key, "full"));
+                        continue;
+                    },
+                    else => return err,
+                };
+                defer alloc.free(value);
+                try std.testing.expect(std.mem.eql(u8, key, "whitespace") or std.mem.eql(u8, key, "full"));
+            }
+        }
+    }
+}
+
 test "db sparse enrichment skips unchanged source hash" {
     const alloc = std.testing.allocator;
 

@@ -45,11 +45,44 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", choices=data["profiles"])
     parser.add_argument("--print-env", action="store_true")
+    parser.add_argument(
+        "--bf16-prefill-ffn",
+        action="store_true",
+        help="Experimental BF16 FFN intermediates for large LightOn prefills; F32 decode/state remain unchanged.",
+    )
+    parser.add_argument(
+        "--bf16-recurrent-prefill",
+        type=Path,
+        metavar="LIBRARY",
+        help="Optional SM12.1 native BF16 recurrent prefill library; F32 state and decode remain unchanged.",
+    )
+    parser.add_argument(
+        "--decode-graph",
+        action="store_true",
+        help="Experimental two-token native decoder graph within an owned LightOn reader epoch.",
+    )
     argv = sys.argv[1:]
     delimiter = argv.index("--") if "--" in argv else len(argv)
     command = argv[delimiter + 1 :]
     args = parser.parse_args(argv[:delimiter])
+    if (
+        args.bf16_prefill_ffn or args.bf16_recurrent_prefill
+    ) and args.profile == "florence":
+        parser.error("BF16 prefill options apply only to the LightOn models")
+    if args.decode_graph and args.profile == "florence":
+        parser.error("Decoder graphs apply only to LightOn models")
     defaults = profile_environment(data["profiles"], args.profile)
+    if args.profile != "florence":
+        defaults["ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"] = (
+            "1" if args.decode_graph else "0"
+        )
+        defaults["ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN"] = (
+            "1" if args.bf16_prefill_ffn else "0"
+        )
+    if args.bf16_recurrent_prefill:
+        defaults["ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY"] = str(
+            args.bf16_recurrent_prefill.resolve()
+        )
     env = os.environ.copy()
     for key, value in defaults.items():
         env.setdefault(key, value)

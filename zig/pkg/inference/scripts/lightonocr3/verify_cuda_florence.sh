@@ -38,6 +38,12 @@ p = Path(sys.argv[1])
 p.write_bytes(p.read_bytes().rstrip(b"\n") + b"\n")
 PY
 cmp "$pkg_root/src/ops/cuda/florence_fused.ptx" "$output_dir/florence_fused.ptx"
+# Optional independent F64 regression under adversarial warp scheduling.
+# PyTorch is needed only for this qualification mode, never by the runtime.
+if [[ "${1:-}" == "--schedule-stress" ]]; then
+  "${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_florence_schedule.py" \
+    --output-dir "$output_dir/schedule" --nvcc "$nvcc"
+fi
 # Numeric, ownership and model-isolation checks are in the focused native
 # `LightOnOCR3 CUDA` suite. An already built binary can be checked here too.
 if [[ -n "${ANTFLY_FLORENCE_CUDA_TEST_BINARY:-}" ]]; then
