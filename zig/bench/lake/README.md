@@ -1408,3 +1408,77 @@ timeout. The Apache boundary check covers 2,555 sources. Measurements use Zig
 0.17.0 Debug, warm local filesystem object storage and synthetic real Parquet.
 No task-owned build, E2E or cleanup overlaps measurement; the host is shared.
 These results do not qualify Release, cloud, empty-cache or archive-scale latency.
+
+### Independently readable source pages and native result leases (v1)
+
+`source_pages.py LABEL IMMUTABLE_BINARY SOURCE_COMMIT` measures one snippet from
+an 8-MiB string, with matches at either end of independently written real Parquet.
+Each large value has its own row group, respecting the existing Parquet page
+limit. It records normal requests and 25-ms/50-ms deadline controls, with exact
+complete-hit digests for every successful response. Run old/new, then new/old.
+`highlight_kernels.py` supplies the separate density/deadline cohort;
+`hidden_highlights.py` supplies wide hidden/projected and narrow controls.
+
+Native stored-source recipe v5 (reader protocol 91) separates large string pages
+and analyzer vectors from compact source navigation. Both payloads decode in
+64-KiB blocks. Original-offset vectors are fenced by the complete analyzer
+fingerprint and copied with their source pages through compaction. Compatible
+highlights decode only selected snippet pages. Unsupported mappings and patterns
+retain controlled analysis. Native result columns retain decoded leases through
+encoding, avoiding source-object deep copies. Small projected fields, single
+static bindings, and tiny matcher lists retain direct paths; scan cancellation
+uses one byte budget across successive short tokens.
+
+The measurements below are whole-server warm local Debug comparisons on a shared
+host. The control predates main's embedded resolver, enum lifecycle, runtime-memory,
+resolver repair/dependency-proof, SDK and CI updates; timings include those changes.
+Three samples per point and order are retained. Builds, E2Es and cache cleanup do
+not overlap measured requests. Release, cloud, empty-cache and archive-scale
+behavior require separate qualification. The persisted vectors add publication
+storage and build work; structured values continue to use typed AJV1 storage.
+
+[native-source-pages-v1-observation.json](native-source-pages-v1-observation.json)
+retains all 276 measured requests, complete-result digests, deadlines, inputs,
+runner hashes, executable hashes, slower controls and both binary orders. The
+runtime source is `d178035ab486795afc8271bab147ac2feac947ff`, including main
+`4db533991dcb4ea9fd7ee7813139a45ed31f36e0`, frozen as
+`1f988437c49caa1cd6a99cd02d1056e62594e249d80a16c3f29148a75b449953`.
+The control is runtime `9efb6f766d665c6eeac865829db5bcebbc7c57b5`, executable
+`95fed771fd16d872da973990ef8242d13850f777ca64e1c05d7998025a2369d1`.
+
+Median HTTP latency in milliseconds:
+
+| Query shape | Primary old → new | Reverse old → new |
+|---|---:|---:|
+| 8-MiB field, matches at start | 95.06 → 8.95 | 100.61 → 8.98 |
+| 8-MiB field, matches at end | 95.00 → 9.16 | 93.96 → 9.13 |
+| 128-KiB field, dense matches | 82.33 → 20.44 | 83.37 → 20.25 |
+| Eight small hidden fields, 256 hits | 283.54 → 305.14 | 281.68 → 293.39 |
+| Eight small projected fields, 256 hits | 255.52 → 284.84 | 257.21 → 279.24 |
+| One small hidden field, 256 hits | 109.37 → 108.96 | 108.32 → 110.73 |
+
+The 8-MiB cases improve 10.29–11.21x and the dense 128-KiB case improves
+4.03–4.12x. All twelve new 25-ms sparse-field requests and twelve 50-ms requests
+complete successfully. The 32-hit dense cohort completes all twelve 250-ms
+controls; every 1-ms control returns the structured HTTP 504 `query_timeout`
+envelope. Successful deadline requests exercise the benchmark's public response
+envelope handling and compare the complete hits with the normal request.
+
+The small/wide controls retain a measured tradeoff: hidden-wide latency increases
+4.2–7.6%, and projected-wide increases 8.6–11.5%. The narrow control varies from
+0.4% faster to 2.2% slower; the 2-KiB density points also retain small mixed
+changes. These are whole-server comparisons that include the main changes listed
+above. The raw observations preserve these regressions alongside the large-field
+wins. Native tests separately prove tokenization reuse, lookup equivalence,
+byte-budget amortization, allocation cleanup and selected source-page reads.
+The sparse Unicode test reads 7,946 bytes from a 14,100-byte compressed source
+column representing 262,144 original bytes. Source/vector metadata remains scoped
+to its authenticated publication and analyzer pipeline.
+
+Validation on the merged runtime: 85 native tests, zero failures/leaks; all 32
+real Parquet archive E2Es and 16 real Iceberg SQL E2Es pass without skips. The
+extended Parquet/Iceberg case removes original Parquet objects, restarts the
+server, retrieves an 8-MiB-field snippet inside a 50-ms budget, compares hidden
+and projected dense fragments, verifies deadline envelopes, and confirms a
+healthy request after cancellation. The Apache product boundary covers 2,557
+source files. Later commits record documentation and measurements only.

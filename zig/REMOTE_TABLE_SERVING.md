@@ -1934,3 +1934,13 @@ replacement and hydrator teardown release their references without invalidating
 results. The existing ColumnSource encoder handles these pages without an owned
 JSON source-object copy. Mixed Parquet/native projections retain the shared
 hydration fallback. Fragment and response-size limits continue to apply.
+
+Small-query selection remains cost aware. Byte-scan checkpoints share one
+4-KiB budget across successive short token runs. A single static field binding
+uses kernel-local token scratch; bindings that can share analysis use the
+value-scoped cache. Tiny matcher lists use direct comparisons, while larger
+clause lists use compiled term/prefix lookups, including duplicate clauses.
+Already projected small fields borrow their column page for shared highlighting;
+large scalar fields retain stored-offset selection. This keeps the native
+result lease path from forcing a second field-major hydration of small projected
+values. The benchmark controls cover both small/wide and large/dense shapes.
