@@ -28,12 +28,22 @@ const execution = @import("../../common/background_execution.zig");
 const Comparison = @import("run_comparison.zig").Cursor;
 const platform = @import("antfly_platform");
 const Run = repository.Run;
+const storage_io = @import("storage_io.zig");
 pub const checkpoint_publication = @import("normal_checkpoint_publication.zig");
 pub var test_hook: ?*const fn (admission.Port) anyerror!void = null;
+pub var test_append_hook: ?*const fn (*Frame, admission.Port) anyerror!void = null;
+pub var test_append_join_hook: ?*const fn (admission.Port) anyerror!void = null;
 pub var test_retirement_hook: ?*const fn (admission.Port) anyerror!void = null;
 
 pub const Frame = struct {
     credit: resources.Reservation,
+    append_grant: ?storage_io.DurabilityResources = null,
+    append_pending: ?storage_io.SyncOperation = null,
+    append_started: bool = false,
+    append_phase: enum { prepare, append, sync, complete } = .prepare,
+    append_path: [std.fs.max_path_bytes]u8 = undefined,
+    append_path_len: usize = 0,
+    deadline_ns: u64 = 0,
     checkpoint_owner: ?*checkpoint_publication.Owner = null,
     checkpoint_retirement_offset: usize = 0,
     next: ?*Frame = null,
@@ -80,6 +90,7 @@ pub const Frame = struct {
     pub fn prepare(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, root: []const u8, sequence: u64, next_id: u64) !void {
         const io = owner.io() orelse return error.ExecutionWaitUnsupported;
         const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+        self.deadline_ns = deadline;
         {
             var pass = try execution.Pass.init(owner.runnableOwner(), &io, deadline, .{ .context = backend, .is_cancelled = cancelled });
             defer pass.deinit();
@@ -107,6 +118,71 @@ pub const Frame = struct {
         self.encoded = try allocate(u8, backend.allocator, self.wire, original);
         if (comptime @import("builtin").is_test) if (test_hook) |hook| try hook(original);
         try manifest.encodeJournalFrameIntoWithAdmission(self.encoded, sequence, false, self.removed, self.removed_paths, .{ .next_run_id = next_id, .runs = self.added, .obsolete_paths = self.added_paths }, original);
+    }
+    fn observeAppend(self: *Frame, original: admission.Port) !void {
+        var trace: admission.RejectionTrace = .{};
+        self.append_pending.?.waitWithAdmission(trace.bind(original).?) catch |cause| {
+            if (trace.failure) |rejected| return rejected;
+            self.append_pending.?.deinit();
+            self.append_pending = null;
+            return cause;
+        };
+        self.append_pending.?.deinit();
+        self.append_pending = null;
+    }
+    fn driveAppend(self: *Frame, backend: anytype, root: []const u8, segment: u64, original: admission.Port) !void {
+        self.append_path_len = (try std.fmt.bufPrint(&self.append_path, "{s}/manifest-{d}.journal", .{ root, segment })).len;
+        self.append_grant = (try backend.storage.?.tryPrepareAppendWithAdmission(self.encoded, original)) orelse return error.ResourceBudgetExceeded;
+        if (comptime @import("builtin").is_test) if (test_append_hook) |hook| try hook(self, original);
+        self.append_pending = try self.append_grant.?.beginPreparedAppend(self.append_path[0..self.append_path_len], false, original);
+        self.append_started = true;
+        self.append_phase = .append;
+        if (comptime @import("builtin").is_test) if (test_append_hook) |hook| try hook(self, original);
+        try self.observeAppend(original);
+        self.append_pending = try self.append_grant.?.beginSyncContents(self.append_path[0..self.append_path_len], original);
+        self.append_phase = .sync;
+        if (comptime @import("builtin").is_test) if (test_append_hook) |hook| try hook(self, original);
+        try self.observeAppend(original);
+        self.append_phase = .complete;
+    }
+    fn joinAppendIndependently(self: *Frame, owner: *@import("../background_runtime.zig").BackendRuntime) !void {
+        const io = owner.io() orelse return error.ExecutionWaitUnsupported;
+        // An accepted append keeps the publication lane until physical join.
+        // Each refusal releases cleanup CPU before its retry/backoff; ordinary
+        // closure does not revoke this protected completion authority.
+        while (self.append_pending != null) {
+            const attempt = blk: {
+                var pass = execution.Pass.initWithOptions(owner.runnableOwner(), &io, platform.time.monotonicNs() +| 100 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true }) catch |cause| break :blk @as(anyerror!void, cause);
+                defer pass.deinit();
+                var scope = pass.admissionScope(io) catch |cause| break :blk @as(anyerror!void, cause);
+                const payload = scope.payload();
+                const original = admission.Port.init(&payload);
+                if (comptime @import("builtin").is_test) if (test_append_join_hook) |hook| hook(original) catch |cause| break :blk @as(anyerror!void, cause);
+                break :blk self.observeAppend(original);
+            };
+            attempt catch |cause| {
+                if (self.append_pending == null) return; // Physical failure was joined.
+                switch (cause) {
+                    error.Timeout, error.DeadlineExceeded, error.ResourceBudgetExceeded, error.ParentMemoryBusy, error.CapacityUnavailable, error.OutOfMemory, error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable => try io.sleep(.fromMilliseconds(1), .awake),
+                    else => return cause,
+                }
+            };
+        }
+    }
+    pub fn appendWithExecution(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, root: []const u8, segment: u64) !void {
+        const io = owner.io() orelse return error.ExecutionWaitUnsupported;
+        try self.credit.growBoundedOversized(try backend.storage.?.appendResourceBytes(self.encoded.len), 1);
+        const written = blk: {
+            var pass = execution.Pass.init(owner.runnableOwner(), &io, self.deadline_ns, .{ .context = backend, .is_cancelled = cancelled }) catch |cause| break :blk @as(anyerror!void, cause);
+            defer pass.deinit();
+            var scope = pass.admissionScope(io) catch |cause| break :blk @as(anyerror!void, cause);
+            const payload = scope.payload();
+            break :blk self.driveAppend(backend, root, segment, .init(&payload));
+        };
+        written catch |cause| {
+            if (self.append_pending != null) self.joinAppendIndependently(owner) catch {};
+            return cause;
+        };
     }
     pub fn prepareCheckpoint(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, root: []const u8, id: u64, next_id: u64) !void {
         const io = owner.io() orelse return error.ExecutionWaitUnsupported;
@@ -230,6 +306,18 @@ pub const Frame = struct {
     }
     pub fn stepWithAdmission(self: *Frame, a: std.mem.Allocator, credits: *usize, original: ?admission.Port) !bool {
         if (comptime @import("builtin").is_test) if (original) |port| if (test_retirement_hook) |hook| try hook(port);
+        if (self.append_pending != null) {
+            if (original) |port| self.observeAppend(port) catch |cause| {
+                if (self.append_pending != null) return cause;
+            } else {
+                self.append_pending.?.deinit();
+                self.append_pending = null;
+            }
+        }
+        if (self.append_grant) |*grant| {
+            if (original) |port| try grant.retireWithAdmission(port) else grant.deinit();
+            self.append_grant = null;
+        }
         if (self.checkpoint_owner) |checkpoint| {
             if (credits.* == 0) return false;
             credits.* -= 1;

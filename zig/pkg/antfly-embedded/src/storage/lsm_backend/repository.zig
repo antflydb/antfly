@@ -1309,16 +1309,29 @@ pub const ManifestJournal = struct {
         if (total > max_manifest_read_bytes) return error.ManifestEditTooLarge;
         const started = backend.writeStatsNowNs();
         runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+        const controlled_append = backend.storage.?.vtable.try_prepare_append_with_admission != null;
         const written = blk: {
-            if (comptime @import("builtin").is_test) if (publication_test_hook) |hook| hook.run(hook.context) catch |cause| break :blk @as(anyerror!?manifest_set.Descriptor, cause);
-            break :blk writePublicationFiles(backend.allocator, backend.storage.?, root, self.active_segment, false, frame.encoded);
+            if (comptime @import("builtin").is_test) if (publication_test_hook) |hook| hook.run(hook.context) catch |cause| {
+                frame.append_started = true; // Existing physical-boundary fault fixture.
+                break :blk @as(anyerror!void, cause);
+            };
+            if (controlled_append) break :blk frame.appendWithExecution(backend, owner, root, self.active_segment);
+            _ = writePublicationFiles(backend.allocator, backend.storage.?, root, self.active_segment, false, frame.encoded) catch |cause| break :blk @as(anyerror!void, cause);
+            break :blk @as(anyerror!void, {});
         };
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
         backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(started);
         _ = written catch |cause| {
-            self.sequence = null; // Only physical append uncertainty invalidates lineage.
+            if (frame.append_started or !controlled_append) self.sequence = null;
+            // A broken cleanup capability must retain exclusion rather than
+            // release a live journal to another publisher before physical join.
+            if (frame.append_pending != null) backend.manifest_recovery_required = true;
             return cause;
         };
+        if (backend.manifest_recovery_required) {
+            self.sequence = null;
+            return error.RecoveryRequired;
+        }
         self.sequence = sequence;
         std.mem.swap(ObsoleteLedger, &self.obsolete, &frame.obsolete.?.value);
         self.bytes = total;

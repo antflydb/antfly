@@ -3071,6 +3071,7 @@ pub const NativeSyncTestControl = struct {
     pub var metadata: std.atomic.Value(usize) = .init(0);
     pub var control_failure_after_rename: std.atomic.Value(bool) = .init(false);
     pub var delete_failure: std.atomic.Value(bool) = .init(false);
+    pub var append_retirement_refuse_once: std.atomic.Value(bool) = .init(false);
     pub var append_failure_after: std.atomic.Value(usize) = .init(std.math.maxInt(usize));
     pub var sync_path_hashes: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
     fn observe(read: bool, path: []const u8) void {
@@ -3235,6 +3236,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     result: ControlFileResult = .{ .file_size = 0, .bytes = &.{} },
     failure: ?anyerror = null,
     append_bytes: ?[]u8 = null,
+    append_retirement_offset: usize = 0,
     append_create: bool = false,
     invalidation_pending: bool = false,
     private_owned: bool = false, // Caller only; blocks unrelated commands.
@@ -3273,9 +3275,11 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .permit = permit };
         if (append_bytes) |bytes| {
-            self.append_bytes = try allocator.alloc(u8, bytes.len);
+            // Copying below checkpoints every physical chunk. Avoid a whole
+            // buffer Debug poison before the first controlled copy.
+            self.append_bytes = if (bytes.len == 0) &.{} else (allocator.rawAlloc(bytes.len, .of(u8), @returnAddress()) orelse return error.OutOfMemory)[0..bytes.len];
         }
-        errdefer if (self.append_bytes) |bytes| allocator.free(bytes);
+        errdefer if (self.append_bytes) |bytes| if (bytes.len != 0) allocator.rawFree(bytes, .of(u8), @returnAddress());
         if (append_bytes) |bytes| {
             var offset: usize = 0;
             while (offset < bytes.len) {
@@ -3653,6 +3657,17 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
             try boundary.end(boundary.ptr);
         }
         try original.checkpoint();
+        if (self.append_bytes) |bytes| {
+            while (self.append_retirement_offset < bytes.len) {
+                try original.checkpoint();
+                const end = @min(bytes.len, self.append_retirement_offset + 16 * 1024);
+                @memset(bytes[self.append_retirement_offset..end], undefined);
+                self.append_retirement_offset = end;
+                if (builtin.is_test and NativeSyncTestControl.append_retirement_refuse_once.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+            }
+            if (bytes.len != 0) self.allocator.rawFree(bytes, .of(u8), @returnAddress());
+            self.append_bytes = null;
+        }
         // The caller retains the storage owner until this grant retires, so
         // permit release cannot tear down the executor under admitted CPU.
         if (self.permit.state.refs.load(.acquire) <= 1) return error.ExecutionWaitUnsupported;
@@ -3662,7 +3677,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     fn destroy(self: *NativeDurabilityResources) void {
         const allocator = self.allocator;
         var permit = self.permit;
-        if (self.append_bytes) |bytes| allocator.free(bytes);
+        if (self.append_bytes) |bytes| if (bytes.len != 0) allocator.rawFree(bytes, .of(u8), @returnAddress());
         allocator.destroy(self);
         permit.release();
     }

@@ -30034,8 +30034,42 @@ reopen without close repairing their publication. Existing owned-writer fixtures
 provide finer rejection-point coverage; this is not full DB/server or cross-engine
 overload qualification.
 
+Normal incremental journal publication now also prepares a funded frozen append
+grant, appends to the existing linked segment, and syncs its contents under shared
+background execution outside `Backend.mu`. The original preparation deadline
+covers encoding, grant preparation and I/O. Physical waits park CPU. A refused
+wait retains the exact accepted operation and the manifest publication lane;
+fresh protected cleanup execution joins it before the lane is released. Cleanup
+refusal backs off outside CPU/service guards. Broken cleanup authority preserves
+the operation and fences recovery instead of allowing another publisher to race
+an unjoined journal write.
+
+Refusal before append preserves journal lineage. Once an append has been accepted,
+failure invalidates lineage and the existing completion owner selects a replacement
+checkpoint without replaying the append or rebuilding its SST. Native append
+grants copy bytes in 16 KiB chunks without whole-buffer Debug poisoning and retain
+their funding through independent, resumable 16 KiB buffer retirement. Constructor
+rollback and joined fallback use a single raw deallocation rather than repeating
+an unbounded Debug poison. Providers without prepared-append capability keep their
+legacy append path. Private native/owner ABI versions 159/219 reject older append
+owners before relying on bounded retirement; public wire and durable formats
+are unchanged.
+
+[`journal-production-v8-debug.json`](qualification/workload-pooling/receipts/2026-10-10/child-outbox-capture-retirement-cumulative-integration/journal-production-v8-debug.json)
+records final focused Debug qualification: 49 native publication cases, five
+prepared-append provider checks, six metadata retirement checks, 12 maintenance
+dispatch cases, the local owner check and actual C API/provider semantic
+compilation pass. The new normal-path cases verify grant refusal without a new
+checkpoint, independent joins after rejected append/sync waits, recovery after an
+actual partial native write, long metadata with partial grant retirement, peer
+commit while journal I/O parks CPU, and cancellation followed by controlled close.
+They crash/reopen without close repairing publication and check that SSTs are not
+rebuilt. The separate provider cases cover copied-byte ownership and constructor,
+capacity, accepted-write and partial-tail failures; `antfly-prepared-append-test`
+selects those existing checks without running the full physical-sync suite.
+
 The bounded-publication milestone remains open for checkpoint retirement-path
-planning under the metadata mutex, periodic checkpoint rotation, incremental
-journal append/WAL operations, and compaction construction/remaining metadata
-operations. Callers without the eligible detached runtime retain their legacy
-publication path. The full design remains open.
+planning under the metadata mutex, periodic checkpoint rotation, WAL operations,
+and compaction construction/remaining metadata operations. Callers without the
+eligible detached runtime retain their legacy publication path. This is not full
+DB/server or cross-engine overload qualification. The full design remains open.

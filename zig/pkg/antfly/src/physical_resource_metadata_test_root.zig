@@ -6975,3 +6975,270 @@ test "physical cache metadata registered flush publication close joins accepted 
     defer read.abort();
     try std.testing.expectEqualStrings("wal-durable", try read.get(.{}, "accepted"));
 }
+
+fn normalAdmittedJournal(mode: enum { prepare_retry, wait_retry, sync_retry, partial_retry, large, interleave, cancel_close }) !void {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const io_mod = local.storage_lsm_backend_storage_io;
+    const preparation = local.storage_lsm_backend_compaction_publication.manifest_edit_preparation;
+    const owners = @import("api/runnable_owner_execution.zig");
+    const platform = @import("antfly_platform");
+    const scheduler = local.common_request_admission.runnable_scheduler;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
+    defer state.owner.deinit();
+    var resources = try Resources.initWithBudgets(a, budgets_mod.smartResourceBudgetsForTotal(128 << 20));
+    defer resources.deinit();
+    resources.attachResourceManager();
+    defer RegisteredOutputFixture.drain(&resources.resource_manager);
+    var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
+    defer pool.deinit();
+    var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/normal-journal", .{tmp.sub_path});
+    defer a.free(root);
+    const second_key: []const u8 = if (mode == .large) try a.alloc(u8, 48 * 1024 + 23) else "second";
+    defer if (mode == .large) a.free(second_key);
+    if (mode == .large) @memset(@constCast(second_key), 'j');
+    var handle = try lsm.BackendHandle.openWithConfig(a, root, .{
+        .storage = native.storage(),
+        .resource_manager = &resources.resource_manager,
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 128,
+        .immutable_flush_window_max_memtables = 1,
+        .compact_threshold_runs = 1000,
+        .l0_soft_limit_runs = 1000,
+        .l0_hard_limit_runs = 2000,
+    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = state.port() } });
+    var open = true;
+    const H = struct {
+        var selected: @TypeOf(mode) = .prepare_retry;
+        var backend: *lsm.Backend = undefined;
+        var execution: *owners.State = undefined;
+        var calls: std.atomic.Value(usize) = .init(0);
+        var append_hits: std.atomic.Value(usize) = .init(0);
+        var sync_hits: std.atomic.Value(usize) = .init(0);
+        var joined: std.atomic.Value(usize) = .init(0);
+        var retired: std.atomic.Value(usize) = .init(0);
+        var injected: std.atomic.Value(bool) = .init(false);
+        var hold_cleanup: bool = false;
+        fn unlocked() !void {
+            while (!backend.mu.tryLock()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            backend.mu.unlock();
+        }
+        fn append(frame: *preparation.Frame, original: read_admission.Port) !void {
+            try original.checkpoint();
+            const stats = execution.owner.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots - stats.control_slots);
+            try unlocked();
+            if (frame.append_phase == .prepare) {
+                _ = calls.fetchAdd(1, .monotonic);
+                if ((selected == .wait_retry or selected == .interleave or selected == .cancel_close) and !injected.swap(true, .acq_rel)) {
+                    io_mod.NativeSyncTestControl.started.store(false, .release);
+                    io_mod.NativeSyncTestControl.release.store(false, .release);
+                    io_mod.NativeSyncTestControl.pause.store(true, .release);
+                }
+                if (selected == .prepare_retry and !injected.swap(true, .acq_rel)) return error.ResourceBudgetExceeded;
+                if (selected == .partial_retry) io_mod.NativeSyncTestControl.append_failure_after.store(8, .release);
+            }
+            if (frame.append_phase == .append) _ = append_hits.fetchAdd(1, .monotonic);
+            if (frame.append_phase == .sync) _ = sync_hits.fetchAdd(1, .monotonic);
+            if (frame.append_phase == .append and selected == .wait_retry) return error.ResourceBudgetExceeded;
+            if (frame.append_phase == .sync and selected == .sync_retry) return error.ResourceBudgetExceeded;
+        }
+        fn join(original: read_admission.Port) !void {
+            const call = joined.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().cleanup_runnable_slots);
+            try unlocked();
+            try std.testing.expect(backend.manifest_publish_in_flight);
+            if (selected == .wait_retry and call == 0) return error.ResourceBudgetExceeded;
+            io_mod.NativeSyncTestControl.release.store(true, .release);
+        }
+        fn retirement(original: read_admission.Port) !void {
+            const call = retired.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().cleanup_runnable_slots);
+            if (hold_cleanup) return error.ResourceBudgetExceeded;
+            // The actual append has failed and retained its publication debt.
+            // Restore storage so the independently selected replacement can run.
+            if (selected == .partial_retry) io_mod.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
+            if (selected == .large) {
+                while (!backend.mu.tryLock()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                defer backend.mu.unlock();
+                const frame = backend.retired_manifest_preparations.?;
+                if (call <= 1) try std.testing.expect(frame.append_grant != null and frame.append_pending == null);
+                try std.testing.expect(frame.encoded.len > 64 * 1024);
+                try std.testing.expect(backend.options.resource_manager.?.sliceStats(.lsm_table_builder_working_set).used_bytes >= 2 * frame.encoded.len);
+                if (call == 0) io_mod.NativeSyncTestControl.append_retirement_refuse_once.store(true, .release);
+            }
+        }
+        fn quiet(b: *lsm.Backend) bool {
+            return b.activeImmutableMemtableCount() == 0 and !b.immutable_flush_job_in_flight and !b.immutable_flush_build_in_flight and
+                !b.flush_completion_pending and !b.maintenance_job_in_flight and b.active_manifest_preparation == null and
+                b.retired_manifest_preparations == null and !b.manifest_preparation_reclaim_in_flight;
+        }
+    };
+    defer {
+        io_mod.NativeSyncTestControl.release.store(true, .release);
+        io_mod.NativeSyncTestControl.pause.store(false, .release);
+        io_mod.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
+        io_mod.NativeSyncTestControl.append_retirement_refuse_once.store(false, .release);
+        H.hold_cleanup = false;
+        if (open) handle.close();
+        preparation.test_append_hook = null;
+        preparation.test_append_join_hook = null;
+        preparation.test_retirement_hook = null;
+    }
+    var first = try handle.ptr().beginWrite();
+    defer first.abort();
+    try first.put(.{}, "first", "old");
+    try first.commit();
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    while (true) {
+        const backend = handle.ptr();
+        while (!backend.mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+        const done = H.quiet(backend);
+        backend.mu.unlock();
+        if (done) break;
+        if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const before = handle.ptr().snapshotWriteStats();
+    const appends_before = io_mod.NativeSyncTestControl.appends.load(.acquire);
+    H.selected = mode;
+    H.backend = handle.ptr();
+    H.execution = &state;
+    H.calls.store(0, .release);
+    H.append_hits.store(0, .release);
+    H.sync_hits.store(0, .release);
+    H.joined.store(0, .release);
+    H.retired.store(0, .release);
+    H.injected.store(false, .release);
+    io_mod.NativeSyncTestControl.started.store(false, .release);
+    io_mod.NativeSyncTestControl.release.store(true, .release);
+    io_mod.NativeSyncTestControl.pause.store(false, .release);
+    H.hold_cleanup = mode == .cancel_close;
+    preparation.test_append_hook = H.append;
+    preparation.test_append_join_hook = H.join;
+    if (mode == .large or mode == .cancel_close or mode == .partial_retry) preparation.test_retirement_hook = H.retirement;
+    var write = try handle.ptr().beginWrite();
+    defer write.abort();
+    try write.put(.{}, second_key, "journal-durable");
+    try write.commit();
+    if (mode == .interleave or mode == .cancel_close) {
+        while (H.append_hits.load(.acquire) == 0 or !io_mod.NativeSyncTestControl.started.load(.acquire)) {
+            if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        if (mode == .interleave) {
+            while (true) {
+                const stats = state.owner.scheduler.stats();
+                if (stats.runnable_slots == stats.control_slots) break;
+                if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            var read = try handle.ptr().beginRead();
+            try std.testing.expectEqualStrings("journal-durable", try read.get(.{}, second_key));
+            read.abort();
+            var peer = try handle.ptr().beginWrite();
+            defer peer.abort();
+            try peer.put(.{}, "third", "concurrent");
+            try peer.commit();
+        } else handle.ptr().closing.store(true, .release);
+        io_mod.NativeSyncTestControl.release.store(true, .release);
+        io_mod.NativeSyncTestControl.pause.store(false, .release);
+    }
+    if (mode == .cancel_close) {
+        const backend = handle.ptr();
+        backend.background_executor.drain();
+        try std.testing.expectEqual(@as(u64, 0), backend.active_readers);
+        try std.testing.expect(!backend.manifest_publish_in_flight and !backend.manifest_recovery_required);
+        if (backend.manifest_journal.sequence != null or !backend.flush_completion_pending) std.debug.print("journal cancel: calls={d} append={d} sync={d} joined={d} sequence={any} completion={} frames={}\n", .{ H.calls.load(.acquire), H.append_hits.load(.acquire), H.sync_hits.load(.acquire), H.joined.load(.acquire), backend.manifest_journal.sequence, backend.flush_completion_pending, backend.retired_manifest_preparations != null });
+        try std.testing.expect(backend.manifest_journal.sequence == null and backend.flush_completion_pending);
+        var frame = backend.retired_manifest_preparations;
+        while (frame != null and frame.?.append_grant == null) frame = frame.?.next;
+        try std.testing.expect(frame != null and frame.?.append_pending == null);
+        try std.testing.expect(H.joined.load(.acquire) >= 1);
+        H.hold_cleanup = false;
+        {
+            var pass = try local.common_background_execution.Pass.initWithOptions(state.port(), &io, platform.time.monotonicNs() +| 200 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true });
+            defer pass.deinit();
+            var scope = try pass.admissionScope(io);
+            const payload = scope.payload();
+            var close: lsm.Backend.QuiescedClosePreparation = .{};
+            try close.resumeWithAdmission(backend, io, .init(&payload));
+            try std.testing.expect(backend.retired_manifest_preparations == null);
+        }
+        try std.testing.expectEqual(before.wal_resets, backend.snapshotWriteStats().wal_resets);
+    } else {
+        while (true) {
+            const backend = handle.ptr();
+            while (!backend.mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+            const done = H.quiet(backend);
+            backend.mu.unlock();
+            if (done) break;
+            if (platform.time.monotonicNs() >= deadline) {
+                while (!backend.mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+                defer backend.mu.unlock();
+                const stats = state.owner.scheduler.stats();
+                std.debug.print("journal timeout {t}: calls={d} append={d} sync={d} joined={d} sequence={any} completion={} recovery={} immutable={d} flushjob={} build={} maintenance={} activeframe={} frames={} framecleanup={} cpu={d} cleanup={d} operations={d}\n", .{ mode, H.calls.load(.acquire), H.append_hits.load(.acquire), H.sync_hits.load(.acquire), H.joined.load(.acquire), backend.manifest_journal.sequence, backend.flush_completion_pending, backend.manifest_recovery_required, backend.activeImmutableMemtableCount(), backend.immutable_flush_job_in_flight, backend.immutable_flush_build_in_flight, backend.maintenance_job_in_flight, backend.active_manifest_preparation != null, backend.retired_manifest_preparations != null, backend.manifest_preparation_reclaim_in_flight, stats.runnable_slots, stats.cleanup_runnable_slots, stats.operations });
+                return error.TestUnexpectedResult;
+            }
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        const after = handle.ptr().snapshotWriteStats();
+        const extra: u64 = if (mode == .interleave) 2 else 1;
+        try std.testing.expectEqual(before.immutable_flushes + extra, after.immutable_flushes);
+        try std.testing.expectEqual(before.flushes + extra, after.flushes);
+        const replaced = mode == .wait_retry or mode == .sync_retry or mode == .partial_retry;
+        try std.testing.expectEqual(before.manifest_checkpoints + @intFromBool(replaced), after.manifest_checkpoints);
+        if (!replaced) try std.testing.expectEqual(before.manifest_edits + extra, after.manifest_edits);
+        try std.testing.expectEqual(appends_before + @as(usize, @intCast(extra)), io_mod.NativeSyncTestControl.appends.load(.acquire));
+        try std.testing.expect(H.calls.load(.acquire) >= (if (mode == .prepare_retry) @as(usize, 2) else 1));
+        if (mode == .wait_retry) try std.testing.expect(H.joined.load(.acquire) >= 2);
+        if (mode == .sync_retry) try std.testing.expect(H.joined.load(.acquire) >= 1);
+        if (mode == .large) {
+            try std.testing.expect(H.retired.load(.acquire) >= 2);
+            try std.testing.expect(!io_mod.NativeSyncTestControl.append_retirement_refuse_once.load(.acquire));
+        }
+    }
+    handle.abandonAfterCrash();
+    open = false;
+    RegisteredOutputFixture.drain(&resources.resource_manager);
+    try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("old", try read.get(.{}, "first"));
+    try std.testing.expectEqualStrings("journal-durable", try read.get(.{}, second_key));
+    if (mode == .interleave) try std.testing.expectEqualStrings("concurrent", try read.get(.{}, "third"));
+}
+
+test "physical cache metadata registered flush publication journal grant refusal retries without checkpoint or SST rebuild" {
+    try normalAdmittedJournal(.prepare_retry);
+}
+test "physical cache metadata registered flush publication accepted journal append retains lane through refused cleanup join" {
+    try normalAdmittedJournal(.wait_retry);
+}
+test "physical cache metadata registered flush publication accepted journal sync joins before lineage replacement" {
+    try normalAdmittedJournal(.sync_retry);
+}
+test "physical cache metadata registered flush publication partial native journal append replaces lineage without replay" {
+    try normalAdmittedJournal(.partial_retry);
+}
+test "physical cache metadata registered flush publication long journal frame retains funding through partial grant retirement" {
+    try normalAdmittedJournal(.large);
+}
+test "physical cache metadata registered flush publication journal IO parks shared CPU and permits concurrent commit" {
+    try normalAdmittedJournal(.interleave);
+}
+test "physical cache metadata registered flush publication canceled journal waiter joins accepted IO before controlled close" {
+    try normalAdmittedJournal(.cancel_close);
+}

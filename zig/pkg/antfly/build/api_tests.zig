@@ -4677,6 +4677,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-physical-sync-test", "Verify owning physical durability operations and controlled retry without synchronous fallback")
         .dependOn(&physical_sync_run.step);
 
+    // The prepared-append provider is shared by WAL and journal callers. Keep
+    // its ownership/fault regressions runnable without the full sync suite.
+    const prepared_append_tests = b.addTest(.{
+        .name = "prepared-append-tests",
+        .root_module = physical_sync_root,
+        .filters = &.{"controlled physical sync prepared append"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const prepared_append_run = b.addRunArtifact(prepared_append_tests);
+    prepared_append_run.addArgs(&.{ "--test-filter", "controlled physical sync prepared append", "--require-no-skips" });
+    b.step("antfly-prepared-append-test", "Verify native prepared append ownership, failed copies, accepted IO and partial-write recovery")
+        .dependOn(&prepared_append_run.step);
+
     const state_merge_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/state_merge_test_root.zig"),
         .target = target,
