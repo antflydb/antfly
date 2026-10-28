@@ -6823,9 +6823,20 @@ test "sort cursor contract classifies arity separately from type" {
         .order_by = &order_by,
         .search_after = &bad_id_cursor,
     })).?);
-    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, (try sortCursorContractRejectionReason(.{
+    // Missing ordinary field values are replayable; only the score and id
+    // positions require a numeric score and a string identity respectively.
+    try std.testing.expect((try sortCursorContractRejectionReason(.{
         .order_by = &order_by,
         .search_after = &null_cursor,
+    })) == null);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, (try sortCursorContractRejectionReason(.{
+        .order_by = &score_order,
+        .search_after = &null_cursor,
+    })).?);
+    const null_id_cursor = [_]std.json.Value{ .{ .integer = 1 }, .null };
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, (try sortCursorContractRejectionReason(.{
+        .order_by = &order_by,
+        .search_before = &null_id_cursor,
     })).?);
     try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, (try sortCursorContractRejectionReason(.{
         .order_by = &order_by,
@@ -33498,8 +33509,8 @@ test "match_all rejects invalid sort cursor contract" {
         .{ .integer = 9 },
     };
     const bad_null_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
         .null,
-        .{ .string = "doc:b" },
     };
     const bad_non_finite_cursor = [_]std.json.Value{
         .{ .number_string = "nan" },

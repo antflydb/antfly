@@ -123,6 +123,16 @@ unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
 export ANTFLY_TEST_LOG_DIR="${RUNNER_TEMP:-/tmp}/antfly-zig-test-logs"
 mkdir -p "$ANTFLY_TEST_LOG_DIR"
 
+# Reject incomplete or overlapping shard inventories before launching unrelated
+# compilation. Otherwise one cheap audit failure still burns the whole unit
+# watchdog budget while the independent build branches continue.
+(
+  cd zig
+  taskset -c "${1:?CPU affinity is required}" \
+    python3 tools/run_bounded_zig_build.py --zig "${ZIG:-zig}" -- build \
+    unit-storage-test-audit --maxrss "${2:?Scheduler memory budget is required}" --summary all
+) 2>&1 | tee -a "$unit_log"
+
 (
   set +e
   taskset -c "${1:?CPU affinity is required}" make zig-unit-test ZIG_BUILD_FLAGS="--maxrss ${2:?Scheduler memory budget is required} --summary all" 2>&1 | tee -a "$unit_log"
