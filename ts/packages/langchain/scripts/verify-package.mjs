@@ -27,6 +27,13 @@ for (const name of ["sdk", "langchain", "langgraph-store"])
     ["pack", "--out", resolve(artifacts, `${name}.tgz`)],
     resolve(root, `ts/packages/${name}`)
   );
+for (const name of ["langchain", "langgraph-store"]) {
+  const entries = run("tar", ["-tzf", resolve(artifacts, `${name}.tgz`)])
+    .trim()
+    .split("\n");
+  if (entries.some((path) => !/^package\/(dist\/.*|README\.md|LICENSE|package\.json)$/.test(path)))
+    throw new Error("Unexpected package contents: " + entries.join(","));
+}
 const core =
   process.env.LANGCHAIN_CORE_VERSION ??
   createRequire(import.meta.url)("@langchain/core/package.json").version;

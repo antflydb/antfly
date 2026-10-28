@@ -18,7 +18,7 @@ export function createAntflyGraphTools(graph: AntflyGraphStore) {
       description: "Inspect the configured graph schema and JSON dialect.",
       schema: z.object({}).strict(),
       func: async () => {
-        await graph.refreshSchema();
+        if (!graph.structuredSchema.discovery_complete) await graph.refreshSchema();
         return graph.getSchema();
       },
     }),

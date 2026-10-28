@@ -21,9 +21,7 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE",
-    "VALIDATION.md",
-    "validation"
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsup",

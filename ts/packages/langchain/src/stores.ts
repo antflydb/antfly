@@ -125,7 +125,7 @@ export class AntflyJSONStore<V = JSONValue> extends BaseStore<string, V> {
       options
     );
   }
-  async *yieldKeys(prefix = ""): AsyncGenerator<string> {
+  protected async *scan(prefix = ""): AsyncGenerator<[string, Record<string, unknown>]> {
     let cursor: TableQueryRequest["search_after"];
     let snapshot: TableQueryRequest["remote_snapshot"];
     const encoded = this.key(prefix);
@@ -147,7 +147,7 @@ export class AntflyJSONStore<V = JSONValue> extends BaseStore<string, V> {
         const hex = hit._id.slice(this.prefix.length);
         const decoded = Buffer.from(hex, "hex").toString();
         if (this.key(decoded) !== hit._id) throw new Error("Invalid store key encoding");
-        yield decoded;
+        yield [decoded, hit];
       }
       if (!page.length) return;
       const next = page.at(-1)?._sort as typeof cursor;
@@ -156,6 +156,19 @@ export class AntflyJSONStore<V = JSONValue> extends BaseStore<string, V> {
         return;
       }
       cursor = next;
+    }
+  }
+  async *yieldKeys(prefix = ""): AsyncGenerator<string> {
+    for await (const [key] of this.scan(prefix)) yield key;
+  }
+  /** Decode values directly from query pages; no per-key lookup requests. */
+  async *entries(prefix = ""): AsyncGenerator<[string, V]> {
+    for await (const [key, hit] of this.scan(prefix)) {
+      const row = record(hit._source, "store row");
+      const codec = record(row.codec, "store codec");
+      if (codec.version !== 1 || codec.kind !== this.kind || row.key !== key)
+        throw new Error("Incompatible store codec or key");
+      yield [key, this.decode(row.value)];
     }
   }
 }

@@ -48,18 +48,36 @@ export class AntflyMultimodalCorpus {
       mimeType: image.mimeType,
     }));
     const childIds = source.summaries.map((_, i) => `${source.id}/${revision}/summary/${i}`);
-    await this.media.mset(source.images.map((image, i) => [refs[i].key, image.bytes]));
-    // Parent is committed before its searchable children. Missing/corrupt media always fails closed.
+    // Persist the complete cleanup journal before touching any revision resources.
+    // Retain it across retries (including a retry with a different revision).
+    const cleanupChildIds = [
+      ...new Set<string>([
+        ...(previous?.metadata.cleanupChildIds ?? []),
+        ...(previous?.metadata.childIds ?? []),
+      ]),
+    ].filter((id) => !childIds.includes(id));
+    const cleanupMediaKeys = [
+      ...new Set<string>([
+        ...(previous?.metadata.cleanupMediaKeys ?? []),
+        ...(previous?.metadata.media ?? []).map((ref: { key: string }) => ref.key),
+      ]),
+    ].filter((key) => !refs.some((ref) => ref.key === key));
+    const parent = new Document({
+      id: source.id,
+      pageContent: source.text,
+      metadata: { ...source.metadata, media: refs, childIds, revision },
+    });
     await this.parents.mset([
       [
         source.id,
         new Document({
           id: source.id,
           pageContent: source.text,
-          metadata: { ...source.metadata, media: refs, childIds, revision },
+          metadata: { ...parent.metadata, cleanupChildIds, cleanupMediaKeys },
         }),
       ],
     ]);
+    await this.media.mset(source.images.map((image, i) => [refs[i].key, image.bytes]));
     await this.vectors.addDocuments(
       source.summaries.map(
         (text, i) =>
@@ -71,20 +89,28 @@ export class AntflyMultimodalCorpus {
       ),
       { ids: childIds }
     );
-    if (previous) {
-      const stale = (previous.metadata.childIds as string[]).filter((id) => !childIds.includes(id));
-      if (stale.length) await this.vectors.delete({ ids: stale });
-      const staleMedia = (previous.metadata.media as typeof refs).filter(
-        (ref) => !refs.some((next) => next.key === ref.key)
-      );
-      await this.media.mdelete(staleMedia.map((ref) => ref.key));
-    }
+    if (cleanupChildIds.length) await this.vectors.delete({ ids: cleanupChildIds });
+    if (cleanupMediaKeys.length) await this.media.mdelete(cleanupMediaKeys);
+    await this.parents.mset([[source.id, parent]]);
   }
+
   async delete(id: string): Promise<void> {
     const [parent] = await this.parents.mget([id]);
     if (!parent) return;
-    await this.vectors.delete({ ids: parent.metadata.childIds });
-    await this.media.mdelete(parent.metadata.media.map((ref: { key: string }) => ref.key));
+    await this.vectors.delete({
+      ids: [
+        ...new Set<string>([
+          ...parent.metadata.childIds,
+          ...(parent.metadata.cleanupChildIds ?? []),
+        ]),
+      ],
+    });
+    await this.media.mdelete([
+      ...new Set<string>([
+        ...parent.metadata.media.map((ref: { key: string }) => ref.key),
+        ...(parent.metadata.cleanupMediaKeys ?? []),
+      ]),
+    ]);
     await this.parents.mdelete([id]);
   }
   async evidence(query: string, k = 4): Promise<Document[]> {

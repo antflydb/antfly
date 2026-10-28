@@ -24,9 +24,7 @@ only for the initial run.
 The adapter supports component-safe namespaces, ordered mixed batches, get/put/
 delete, search filters, pagination, namespace prefix/suffix wildcards, timestamps
 and index controls. A mixed batch is sequential, not an atomic transaction. Later
-reads see completed earlier writes. Concurrent writes to the same item are last
-writer wins; serialize them if preserving the original creation timestamp is
-essential. No per-item TTL or execution checkpointing is implemented.
+reads see completed earlier writes. Concurrent value writes to the same item are last writer wins. No per-item TTL or execution checkpointing is implemented.
 
 Configure `index: { embeddings, dims, fields: ["$"] }` for semantic search using
 any LangChain embeddings implementation. Paths support nested properties,
@@ -35,11 +33,17 @@ indexing; a path list overrides default fields. Multiple fields produce separate
 vectors; the best cosine similarity ranks each item. Filters apply before
 pagination. Supported operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`.
 
-Semantic search currently scans scoped persisted items and computes exact cosine
-similarity in Node. It is intended for bounded agent memories, not large vector
-corpora; use `AntflyVectorStore` for server-indexed retrieval. Namespace listing
-also scans matching storage. Vectors are validated against configured dimensions.
-Changing the embedding model requires reindexing memory values.
+Like the Python reference, single-field namespaces use Antfly's native cosine
+index with server-side namespace and value filters. Once a namespace contains a
+multi-field item, a persistent marker selects exact paginated maximum-cosine
+pooling. Markers remain after updates/deletes for cross-process correctness.
+This fallback costs O(namespace records); query pages contain the values, so
+there is no lookup request per item. Namespace listing likewise reads pages.
+`create` provisions the external cosine index (`indexName`, default
+`memory_vectors`). For tables created by the earlier unindexed prototype,
+explicitly provision that index and re-put all memories before semantic search.
+Changing embedding models requires reindexing values. Atomic transforms preserve
+creation timestamps and monotonic update times, following Python's behavior.
 
 Build/test from `ts`: `pnpm --filter @antfly/langgraph-store... build`, then
 `pnpm --filter @antfly/langgraph-store test`. Set `ANTFLY_LIVE=1` and `ANTFLY_URL`

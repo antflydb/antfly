@@ -1,4 +1,3 @@
-import { AntflyJSONStore } from "@antfly/langchain";
 import { AntflyClient } from "@antfly/sdk";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AntflyStore } from "../src/index.js";
@@ -16,22 +15,88 @@ const store = () =>
 beforeEach(() => {
   rows.clear();
   vi.clearAllMocks();
-  vi.spyOn(AntflyJSONStore.prototype, "mget").mockImplementation(
-    async (keys) => keys.map((key) => rows.get(key)) as never
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init),
+        url = new URL(req.url);
+      const body = req.method === "POST" ? await req.clone().json() : {};
+      const json = (v: unknown, status = 200) =>
+        new Response(JSON.stringify(v), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (url.pathname.includes("/documents/")) {
+        const id = decodeURIComponent(url.pathname.split("/documents/")[1]);
+        return rows.has(id) ? json(rows.get(id)) : json({}, 404);
+      }
+      if (url.pathname.endsWith("/batch")) {
+        for (const t of body.transforms ?? []) {
+          const row: any = rows.get(t.key) ?? {};
+          for (const op of t.operations) {
+            const parts = op.path.slice(2).split(".");
+            let obj = row;
+            for (const part of parts.slice(0, -1)) obj = obj[part] ??= {};
+            const name = parts.at(-1)!;
+            if (
+              op.op === "$set" ||
+              (op.op === "$setOnInsert" && obj[name] === undefined) ||
+              (op.op === "$max" && (obj[name] === undefined || obj[name] < op.value))
+            )
+              obj[name] = op.value;
+          }
+          rows.set(t.key, row);
+        }
+        for (const id of body.deletes ?? []) rows.delete(id);
+        return json({ status: "committed" });
+      }
+      if (url.pathname.endsWith("/query")) {
+        const get = (obj: any, path: string) =>
+          path
+            .slice(1)
+            .split("/")
+            .reduce((v, k) => v?.[k], obj);
+        const match = (obj: any, q: any): boolean =>
+          !q ||
+          q.conjuncts?.every((c: any) => match(obj, c)) ||
+          q.disjuncts?.some((c: any) => match(obj, c)) ||
+          (q.term && JSON.stringify(get(obj, q.term.path)) === JSON.stringify(q.term.value)) ||
+          (q.range &&
+            Object.entries(q.range).every(([path, ops]: any) =>
+              Object.entries(ops).every(([op, x]: any) => {
+                const v = get(obj, path);
+                return op === "gt" ? v > x : op === "gte" ? v >= x : op === "lt" ? v < x : v <= x;
+              })
+            ));
+        let found = [...rows]
+          .filter(
+            ([id, row]) =>
+              id.startsWith(body.filter_prefix ?? "") &&
+              match(row, body.filter_query) &&
+              (!body.exclusion_query || !match(row, body.exclusion_query))
+          )
+          .map(([id, row]: any) => ({
+            _id: id,
+            _source: row,
+            _sort: [id],
+            _distance: row.value?.vectors?.[0]?.[0] === 1 ? 0 : 1,
+          }));
+        if (body.embeddings) found = found.sort((a, b) => a._distance - b._distance);
+        else
+          found = found
+            .sort((a, b) => a._id.localeCompare(b._id))
+            .filter((h) => !body.search_after || h._id > body.search_after[0]);
+        return json({ responses: [{ hits: { hits: found.slice(0, body.limit ?? 100) } }] });
+      }
+      return json({});
+    })
   );
-  vi.spyOn(AntflyJSONStore.prototype, "mset").mockImplementation(async (pairs) => {
-    for (const [key, value] of pairs) rows.set(key, structuredClone(value));
-  });
-  vi.spyOn(AntflyJSONStore.prototype, "mdelete").mockImplementation(async (keys) => {
-    for (const key of keys) rows.delete(key);
-  });
-  vi.spyOn(AntflyJSONStore.prototype, "yieldKeys").mockImplementation(async function* (
-    prefix = ""
-  ) {
-    for (const key of [...rows.keys()].sort()) if (key.startsWith(prefix)) yield key;
-  });
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
 it("extracts whole values, wildcard nested arrays and negative array indices", async () => {
   const memory = store();
   await memory.put(["user", "a"], "k", { parts: [{ text: "apple" }, { text: "pear" }] }, [
@@ -93,4 +158,26 @@ it("lists prefix/suffix wildcards and collapses maximum depth", async () => {
   expect(await memory.listNamespaces({ prefix: ["users", "*", "prefs"] })).toEqual([
     ["users", "a", "prefs"],
   ]);
+});
+it("uses native scoped search until a persistent multifield marker selects exact pooling", async () => {
+  const memory = store();
+  await memory.put(["a"], "one", { food: "apple" });
+  await memory.search(["a"], { query: "q" });
+  const requests = () =>
+    vi
+      .mocked(fetch)
+      .mock.calls.map(([r]) => r as Request)
+      .filter((r) => r instanceof Request && r.url.endsWith("/query"));
+  expect(
+    (await Promise.all(requests().map((r) => r.clone().json()))).some((b) => b.embeddings)
+  ).toBe(true);
+  await memory.put(["a"], "two", { parts: ["pear", "apple"] }, ["parts[*]"]);
+  vi.mocked(fetch).mockClear();
+  expect(await store().search(["a"], { query: "q" })).toHaveLength(2);
+  expect(
+    (await Promise.all(requests().map((r) => r.clone().json()))).some((b) => b.embeddings)
+  ).toBe(false);
+  expect(
+    vi.mocked(fetch).mock.calls.some(([r]) => r instanceof Request && r.url.includes("/documents/"))
+  ).toBe(false);
 });

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { type AntflyClient, AntflyHTTPError, type TableQueryRequest } from "@antfly/sdk";
 import { Document, type DocumentInterface } from "@langchain/core/documents";
 import { jsonCopy } from "./stores.js";
-import { count, hits, record, WriteOutcomeError } from "./utils.js";
+import { count, hits, mapConcurrent, record, WriteOutcomeError } from "./utils.js";
 
 export interface GraphNode {
   id: string | number;
@@ -96,14 +96,17 @@ export class AntflyGraphStore {
       throw new TypeError("Invalid graph entity identity");
     return `${this.prefix}n/${encode(type)}/${encode(JSON.stringify(id))}`;
   }
-  private async read(key: string): Promise<{ row: ObjectValue; version: string }> {
+  private async read(
+    key: string,
+    checkTable = true
+  ): Promise<{ row: ObjectValue; version: string }> {
     const { data, error, response } = await this.client
       .getRawClient()
       .GET("/db/v1/tables/{tableName}/documents/{key}", {
         params: { path: { tableName: this.table, key }, query: { consistency: "read_index" } },
       });
     if (response.status === 404) {
-      await this.client.tables.get(this.table);
+      if (checkTable) await this.client.tables.get(this.table);
       return { row: {}, version: "0" };
     }
     if (error) throw new AntflyHTTPError("Graph read failed", response.status, error);
@@ -125,8 +128,9 @@ export class AntflyGraphStore {
       const read_set = [{ table: this.table, key: manifest, version: old.version }];
       const inserts: Record<string, any> = {};
       const deletes: string[] = [];
-      for (const key of keys) {
-        const prior = await this.read(key);
+      const priorRows = await mapConcurrent(keys, 8, (key) => this.read(key, false));
+      for (const [i, key] of keys.entries()) {
+        const prior = priorRows[i];
         read_set.push({ table: this.table, key, version: prior.version });
         const owners: Record<string, ObjectValue> = { ...prior.row.contributions };
         if (contributions?.[key])
@@ -202,6 +206,7 @@ export class AntflyGraphStore {
           [],
           outcome
         );
+      this.structuredSchema.discovery_complete = false;
       return;
     }
     throw new Error(
@@ -501,15 +506,19 @@ export class AntflyGraphStore {
       relationships = new Set<string>();
     const properties: Record<string, Set<string>> = {};
     let cursor: TableQueryRequest["search_after"];
+    let snapshot: TableQueryRequest["remote_snapshot"];
     while (true) {
-      const page = hits(
-        await this.client.tables.query(this.table, {
-          filter_prefix: `${this.prefix}n/`,
-          limit: this.maxResults,
-          order_by: [{ field: "_id", desc: false }],
-          search_after: cursor,
-        })
-      );
+      const response = await this.client.tables.query(this.table, {
+        filter_prefix: `${this.prefix}n/`,
+        limit: this.maxResults,
+        order_by: [{ field: "_id", desc: false }],
+        search_after: cursor,
+        remote_snapshot: snapshot,
+      });
+      const page = hits(response);
+      const body = record(response);
+      const first = Array.isArray(body.responses) ? record(body.responses[0]) : body;
+      snapshot = (first.remote_snapshot as typeof snapshot) ?? snapshot;
       for (const hit of page) {
         const row = record(hit._source) as ObjectValue;
         types.add(row.graph_type);

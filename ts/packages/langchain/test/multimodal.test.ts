@@ -73,3 +73,56 @@ it("rejects uncited and invented citations, permits explicit abstention", async 
       .answer
   ).toBe("Insufficient evidence.");
 });
+it.each([
+  "summaries",
+  "cleanup",
+  "finalize",
+])("resumes failed replacement at %s without losing old resources", async (phase) => {
+  const { corpus, parents, media } = fixture();
+  const documents = new Map<string, Document>(),
+    images = new Map<string, Uint8Array>(),
+    children = new Map<string, Document>();
+  vi.mocked(parents.mget).mockImplementation(async (ids) => ids.map((id) => documents.get(id)));
+  vi.spyOn(parents, "mset").mockImplementation(async (pairs) => {
+    for (const [id, doc] of pairs) documents.set(id, doc);
+  });
+  vi.mocked(media.mget).mockImplementation(async (ids) => ids.map((id) => images.get(id)));
+  vi.spyOn(media, "mset").mockImplementation(async (pairs) => {
+    for (const [id, value] of pairs) images.set(id, value);
+  });
+  vi.spyOn(media, "mdelete").mockImplementation(async (ids) => {
+    for (const id of ids) images.delete(id);
+  });
+  vi.spyOn(corpus.vectors, "addDocuments").mockImplementation(async (docs) => {
+    for (const doc of docs) children.set(doc.id!, doc as Document);
+    return docs.map((d) => d.id!);
+  });
+  vi.spyOn(corpus.vectors, "delete").mockImplementation(async ({ ids }) => {
+    for (const id of ids) children.delete(id);
+  });
+  vi.mocked(corpus.vectors.similaritySearch).mockImplementation(async () => [...children.values()]);
+  const source = (text: string) => ({
+    id: "source",
+    text,
+    summaries: [text],
+    images: [{ bytes: Buffer.from(text), mimeType: "image/png" as const }],
+  });
+  await corpus.ingest(source("A"));
+  if (phase === "summaries")
+    vi.mocked(corpus.vectors.addDocuments).mockRejectedValueOnce(new Error("interrupted"));
+  if (phase === "cleanup") vi.mocked(media.mdelete).mockRejectedValueOnce(new Error("interrupted"));
+  if (phase === "finalize") {
+    const original = parents.mset.bind(parents);
+    vi.mocked(parents.mset)
+      .mockImplementationOnce(async (pairs) => {
+        for (const [id, doc] of pairs) documents.set(id, doc);
+      })
+      .mockRejectedValueOnce(new Error("interrupted"));
+    void original;
+  }
+  await expect(corpus.ingest(source("B"))).rejects.toThrow("interrupted");
+  await corpus.ingest(source("B"));
+  expect(children.size).toBe(1);
+  expect(images.size).toBe(1);
+  expect((await corpus.evidence("q"))[0].pageContent).toBe("B");
+});

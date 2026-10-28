@@ -396,3 +396,50 @@ it("factory input validation precedes resource creation", async () => {
   ).rejects.toThrow();
   expect(calls).toEqual([]);
 });
+it("caches read metadata and supports explicit validation refresh", async () => {
+  const s = store();
+  await s.similaritySearch("first", 1);
+  const before = calls.length;
+  await s.similaritySearch("second", 1);
+  expect(
+    calls
+      .slice(before)
+      .filter((c) => c.path.endsWith("/indexes/vectors") || c.path.endsWith("/tables/test"))
+  ).toHaveLength(0);
+  await s.validate();
+  expect(calls.at(-1)?.path).toContain("/indexes/vectors");
+});
+it("runs embedding batches concurrently within the configured bound", async () => {
+  let active = 0,
+    peak = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init),
+        body = await request.json();
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active--;
+      return json({
+        data: body.input.map((text: string, index: number) => ({
+          index,
+          embedding: [Number(text), 1],
+        })),
+      });
+    })
+  );
+  const e = new AntflyEmbeddings({
+    client: inference(),
+    model: "test",
+    batchSize: 1,
+    maxConcurrency: 2,
+  });
+  expect(await e.embedDocuments(["1", "2", "3", "4"])).toEqual([
+    [1, 1],
+    [2, 1],
+    [3, 1],
+    [4, 1],
+  ]);
+  expect(peak).toBe(2);
+});

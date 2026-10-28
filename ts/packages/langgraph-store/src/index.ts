@@ -1,5 +1,11 @@
 import { isDeepStrictEqual } from "node:util";
-import { AntflyJSONStore, type AntflyStoreOptions, jsonCopy } from "@antfly/langchain";
+import {
+  AntflyJSONStore,
+  type AntflyStoreOptions,
+  jsonCopy,
+  WriteOutcomeError,
+} from "@antfly/langchain";
+import type { BatchRequest, TableQueryRequest } from "@antfly/sdk";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import {
   BaseStore,
@@ -12,6 +18,7 @@ import {
 } from "@langchain/langgraph-checkpoint";
 
 export interface AntflyMemoryOptions extends AntflyStoreOptions {
+  indexName?: string;
   index?: { embeddings: EmbeddingsInterface; dims: number; fields?: string[] };
 }
 interface StoredItem {
@@ -20,6 +27,8 @@ interface StoredItem {
   value: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
+  updatedAtUs?: number;
+  indexed?: boolean;
   vectors: number[][];
 }
 const encoded = (value: string) => {
@@ -29,6 +38,175 @@ const encoded = (value: string) => {
 };
 const prefix = (ns: string[]) => ns.map((p) => `${encoded(p)}/`).join("");
 const key = (ns: string[], id: string) => `${prefix(ns)}!${encoded(id)}`;
+function queryHits(response: unknown): Record<string, unknown>[] {
+  const body = response as {
+    responses?: { status?: number; error?: unknown; hits?: { hits?: Record<string, unknown>[] } }[];
+  };
+  if (body?.responses?.length !== 1) throw new Error("Expected one memory query response");
+  const result = body.responses[0];
+  if (
+    result.error ||
+    (result.status !== undefined && result.status !== 200) ||
+    !Array.isArray(result.hits?.hits)
+  )
+    throw new Error("Invalid memory query response");
+  return result.hits.hits;
+}
+const markerPrefix = (scope: string, ns: string[]) => `lgm1/${encoded(scope)}/${prefix(ns)}`;
+class MemoryRecords extends AntflyJSONStore<StoredItem> {
+  constructor(
+    options: AntflyStoreOptions,
+    private readonly vectorIndex?: string
+  ) {
+    super(options);
+  }
+  async mset(pairs: [string, StoredItem][]): Promise<void> {
+    // Match Python: transforms preserve original creation and monotonic update time,
+    // and the sticky multifield marker is committed with its owning memory.
+    const transforms: NonNullable<BatchRequest["transforms"]> = [];
+    for (const [key, row] of pairs) {
+      jsonCopy(row);
+      const fields = {
+        namespace: row.namespace,
+        key: row.key,
+        value: row.value,
+        vectors: row.vectors,
+        indexed: row.vectors.length > 0,
+      };
+      const operations: NonNullable<BatchRequest["transforms"]>[number]["operations"] = [
+        { op: "$setOnInsert", path: "$.value.createdAt", value: row.createdAt },
+        { op: "$max", path: "$.value.updatedAtUs", value: Date.parse(row.updatedAt) * 1000 },
+        { op: "$set", path: "$.codec", value: { version: 1, kind: "json" } },
+        { op: "$set", path: "$.key", value: key },
+        ...Object.entries(fields).map(([name, value]) => ({
+          op: "$set" as const,
+          path: `$.value.${name}`,
+          value,
+        })),
+      ];
+      if (this.vectorIndex)
+        operations.push({
+          op: "$set",
+          path: `$._embeddings.${this.vectorIndex}`,
+          value: row.vectors[0] ?? null,
+        });
+      transforms.push({ key: this.key(key), upsert: true, operations });
+      if (row.vectors.length > 1)
+        transforms.push({
+          key: `${markerPrefix(this.namespace, row.namespace)}!`,
+          upsert: true,
+          operations: [{ op: "$set", path: "$.multifield", value: true }],
+        });
+    }
+    if (!transforms.length) return;
+    let result: Awaited<ReturnType<typeof this.client.tables.batchWithOptions>>;
+    try {
+      result = await this.client.tables.batchWithOptions(this.table, {
+        transforms,
+        sync_level: "full_index",
+      });
+    } catch (error) {
+      throw new WriteOutcomeError(
+        "unknown",
+        pairs.map(([key]) => key),
+        [],
+        error
+      );
+    }
+    if (result.status !== "committed")
+      throw new WriteOutcomeError(
+        result.status ?? "unknown",
+        pairs.map(([key]) => key),
+        [],
+        result
+      );
+  }
+  async hasMultifield(ns: string[]): Promise<boolean> {
+    return (
+      queryHits(
+        await this.client.tables.query(this.table, {
+          filter_prefix: markerPrefix(this.namespace, ns),
+          limit: 1,
+        })
+      ).length > 0
+    );
+  }
+  async nativeSearch(
+    ns: string[],
+    vector: number[],
+    limit: number,
+    filter: Record<string, unknown> = {}
+  ): Promise<(Item & { score: number })[]> {
+    if (!this.vectorIndex) throw new Error("Semantic search requires index embeddings");
+    const predicates: unknown[] = [{ term: { path: "/value/indexed", value: true } }],
+      exclusions: unknown[] = [];
+    for (const [name, condition] of Object.entries(filter)) {
+      const path =
+        "/value/value/" +
+        name
+          .split(".")
+          .map((p) => p.replaceAll("~", "~0").replaceAll("/", "~1"))
+          .join("/");
+      if (
+        condition &&
+        typeof condition === "object" &&
+        !Array.isArray(condition) &&
+        Object.keys(condition).some((k) => k.startsWith("$"))
+      ) {
+        for (const [op, value] of Object.entries(condition)) {
+          if (op === "$eq") predicates.push({ term: { path, value } });
+          else if (op === "$ne") exclusions.push({ term: { path, value } });
+          else if (["$gt", "$gte", "$lt", "$lte"].includes(op))
+            predicates.push({ range: { [path]: { [op.slice(1)]: value } } });
+          else throw new TypeError(`Unsupported filter operator ${op}`);
+        }
+      } else predicates.push({ term: { path, value: condition } });
+    }
+    const request: TableQueryRequest = {
+      filter_prefix: this.key(prefix(ns)),
+      indexes: [this.vectorIndex],
+      embeddings: { [this.vectorIndex]: vector },
+      limit,
+      filter_query: { conjuncts: predicates } as NonNullable<TableQueryRequest["filter_query"]>,
+      ...(exclusions.length
+        ? {
+            exclusion_query: { disjuncts: exclusions } as NonNullable<
+              TableQueryRequest["exclusion_query"]
+            >,
+          }
+        : {}),
+    };
+    return queryHits(await this.client.tables.query(this.table, request)).map((hit) => {
+      if (
+        typeof hit._id !== "string" ||
+        !hit._id.startsWith(this.key(prefix(ns))) ||
+        typeof hit._distance !== "number" ||
+        !Number.isFinite(hit._distance)
+      )
+        throw new Error("Invalid scoped memory vector result");
+      const source = hit._source as {
+        codec?: { kind: string; version: number };
+        value: StoredItem;
+      };
+      if (
+        source.codec?.kind !== "json" ||
+        source.codec.version !== 1 ||
+        !ns.every((part, i) => source.value.namespace[i] === part)
+      )
+        throw new Error("Memory result escaped namespace or codec");
+      return { ...memoryItem(source.value), score: 1 - hit._distance };
+    });
+  }
+}
+function memoryItem(row: StoredItem): Item {
+  return {
+    namespace: [...row.namespace],
+    key: row.key,
+    value: jsonCopy(row.value),
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAtUs === undefined ? row.updatedAt : row.updatedAtUs / 1000),
+  };
+}
 function integer(value: number, minimum = 0): number {
   if (!Number.isSafeInteger(value) || value < minimum)
     throw new TypeError("Expected a bounded nonnegative integer");
@@ -87,20 +265,40 @@ function matches(value: Record<string, unknown>, filter: Record<string, unknown>
 }
 /** Ordered, durable batches. Not a checkpointer or a multi-operation transaction. */
 export class AntflyStore extends BaseStore {
-  private readonly storage: AntflyJSONStore<StoredItem>;
+  private readonly storage: MemoryRecords;
   private readonly options: AntflyMemoryOptions;
   constructor(options: AntflyMemoryOptions) {
     super();
     this.options = options;
-    this.storage = new AntflyJSONStore({
-      ...options,
-      namespace: `langgraph/${options.namespace ?? ""}`,
-    });
+    this.storage = new MemoryRecords(
+      {
+        ...options,
+        namespace: `langgraph/${options.namespace ?? ""}`,
+      },
+      options.index ? (options.indexName ?? "memory_vectors") : undefined
+    );
+    if (!(options.indexName ?? "memory_vectors") || (options.indexName ?? "").includes("."))
+      throw new TypeError("indexName must be nonempty and contain no dots");
     if (options.index) integer(options.index.dims, 1);
   }
   static async create(options: AntflyMemoryOptions): Promise<AntflyStore> {
-    await options.client.tables.create(options.table, {});
-    return new AntflyStore(options);
+    const store = new AntflyStore(options);
+    await options.client.tables.create(
+      options.table,
+      options.index
+        ? {
+            indexes: {
+              [options.indexName ?? "memory_vectors"]: {
+                type: "embeddings",
+                external: true,
+                dimension: options.index.dims,
+                distance_metric: "cosine",
+              },
+            },
+          }
+        : {}
+    );
+    return store;
   }
   private vector(v: number[]): number[] {
     if (
@@ -112,20 +310,14 @@ export class AntflyStore extends BaseStore {
     return v;
   }
   private item(row: StoredItem): Item {
-    return {
-      namespace: [...row.namespace],
-      key: row.key,
-      value: jsonCopy(row.value),
-      createdAt: new Date(row.createdAt),
-      updatedAt: new Date(row.updatedAt),
-    };
+    return memoryItem(row);
   }
   private async *rows(ns: string[] = []): AsyncGenerator<StoredItem> {
-    for await (const id of this.storage.yieldKeys(prefix(ns))) {
-      const [row] = await this.storage.mget([id]);
-      if (row && ns.every((part, i) => row.namespace[i] === part)) yield row;
+    for await (const [, row] of this.storage.entries(prefix(ns))) {
+      if (ns.every((part, i) => row.namespace[i] === part)) yield row;
     }
   }
+
   private async searchItems(op: SearchOperation): Promise<(Item & { score?: number })[]> {
     validateNamespace(op.namespacePrefix, { allowEmpty: true });
     const offset = integer(op.offset ?? 0),
@@ -136,6 +328,18 @@ export class AntflyStore extends BaseStore {
       op.query === undefined
         ? undefined
         : this.vector(await this.options.index!.embeddings.embedQuery(op.query));
+    if (!limit) return [];
+    if (query && !(await this.storage.hasMultifield(op.namespacePrefix))) {
+      const native = await this.storage.nativeSearch(
+        op.namespacePrefix,
+        query,
+        offset + limit,
+        op.filter
+      );
+      // Match Python's second check for a concurrent first multifield write.
+      if (!(await this.storage.hasMultifield(op.namespacePrefix)))
+        return native.slice(offset, offset + limit);
+    }
     const result: (Item & { score?: number })[] = [];
     for await (const row of this.rows(op.namespacePrefix)) {
       if (!matches(row.value, op.filter)) continue;
@@ -155,6 +359,14 @@ export class AntflyStore extends BaseStore {
           )
         : undefined;
       result.push({ ...this.item(row), ...(score === undefined ? {} : { score }) });
+      if (query) {
+        result.sort(
+          (a, b) =>
+            (b.score ?? 0) - (a.score ?? 0) ||
+            key(a.namespace, a.key).localeCompare(key(b.namespace, b.key))
+        );
+        result.splice(offset + limit);
+      } else if (result.length >= offset + limit) break;
     }
     if (query)
       result.sort(
@@ -201,7 +413,6 @@ export class AntflyStore extends BaseStore {
             const value = jsonCopy(op.value);
             if (!value || Array.isArray(value) || typeof value !== "object")
               throw new TypeError("Memory value must be an object");
-            const [old] = await this.storage.mget([id]);
             const texts =
               op.index === false || !this.options.index
                 ? []
@@ -222,7 +433,7 @@ export class AntflyStore extends BaseStore {
                   namespace: [...op.namespace],
                   key: op.key,
                   value,
-                  createdAt: old?.createdAt ?? now,
+                  createdAt: now,
                   updatedAt: now,
                   vectors,
                 },

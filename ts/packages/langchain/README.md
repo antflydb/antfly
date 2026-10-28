@@ -220,8 +220,7 @@ The caller is responsible for choosing trusted tenant scopes.
 image bytes. It uses deterministic revision IDs, checks image hashes before
 generation, rejects missing/stale references, and supports replacement/deletion.
 Multi-store ingestion is not atomic: after interruption rerun the same source;
-concurrent writes to one source must be serialized by the application. Orphaned
-records from an interrupted revision can require application cleanup.
+concurrent writes to one source must be serialized by the application. Retry the interrupted source to complete cleanup.
 `AntflyEmbeddings.embedMultimodal` additionally supports native multimodal models;
 select and install a capable model explicitly.
 
@@ -251,3 +250,17 @@ package because LangGraph's BaseStore has a different contract.
 
 Chat-model adapters, execution checkpointing, per-item TTL, arbitrary PDF parsing,
 and embedded-runtime support are outside this release.
+
+Metadata must be lossless, acyclic JSON: `undefined`, `Date`, nonfinite numbers,
+functions and sparse arrays are rejected. Normalize loader metadata explicitly.
+Graph expansion needs `metadata.graph_node_key`, an explicit `seedKeys` mapping,
+or document IDs already produced by `graph.nodeKey`; ordinary vector IDs are
+not graph identities. Call `refreshSchema()` after external graph changes; schema
+tools reuse the discovered schema. Explicit `vectorStore.validate()` refreshes
+metadata; ordinary read queries reuse successful validation until a query error.
+
+Local package checks deliberately include the development SDK tarball. Before a
+release, run `node scripts/verify-release.mjs langchain` (or `langgraph-store`).
+That separate gate requires dependencies from npm and checks SDK exports/types.
+Release order is SDK 0.2.0 foundations, LangChain, then LangGraph store. The SDK
+is currently declared 0.2.0 locally; its behavioral changes are in its changelog.

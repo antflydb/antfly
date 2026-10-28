@@ -107,7 +107,11 @@ export class WriteOutcomeError extends Error {
     this.name = "WriteOutcomeError";
   }
   get committed(): boolean | undefined {
-    return this.status.startsWith("committed") ? true : undefined;
+    return this.status.startsWith("committed")
+      ? true
+      : this.status === "aborted"
+        ? false
+        : undefined;
   }
 }
 export async function write(
@@ -151,4 +155,32 @@ export async function write(
     }
     committed.push(...keys);
   }
+}
+
+/** Bounded workers preserve input order and stop scheduling after a failure. */
+export async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const result: R[] = new Array(items.length);
+  let next = 0,
+    failed = false;
+  await Promise.all(
+    Array.from(
+      { length: Math.min(count(concurrency, "concurrency", 1), items.length) },
+      async () => {
+        while (!failed && next < items.length) {
+          const index = next++;
+          try {
+            result[index] = await fn(items[index], index);
+          } catch (error) {
+            failed = true;
+            throw error;
+          }
+        }
+      }
+    )
+  );
+  return result;
 }

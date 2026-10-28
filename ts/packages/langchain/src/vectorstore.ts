@@ -61,6 +61,7 @@ export class AntflyVectorStore extends VectorStore {
   private readonly options: AntflyVectorStoreOptions;
   private dimension?: number;
   private provision = false;
+  private validated = false;
   private provisioning?: Promise<void>;
   constructor(embeddings: EmbeddingsInterface, options: AntflyVectorStoreOptions) {
     super(embeddings, { table: options.table, index: options.index });
@@ -120,7 +121,7 @@ export class AntflyVectorStore extends VectorStore {
     const store = new AntflyVectorStore(embeddings, options);
     await store.client.tables.create(store.table);
     store.provision = true;
-    if (store.dimension) await store.validate(store.dimension);
+    if (store.dimension) await store.ensureValidated(store.dimension);
     return store;
   }
   private async ensure(dimension?: number): Promise<void> {
@@ -179,12 +180,19 @@ export class AntflyVectorStore extends VectorStore {
     this.provision = false;
   }
   async validate(dimension?: number): Promise<void> {
+    await this.ensureValidated(dimension, true);
+  }
+  private async ensureValidated(dimension?: number, refresh = false): Promise<void> {
     // Serialize resource creation within this instance; conflicting external creators are checked after 409.
     while (this.provisioning) await this.provisioning;
+    if (!refresh && this.validated && (dimension === undefined || dimension === this.dimension))
+      return;
+    this.validated = false;
     const pending = this.ensure(dimension);
     this.provisioning = pending;
     try {
       await pending;
+      this.validated = !this.provision;
     } finally {
       this.provisioning = undefined;
     }
@@ -192,14 +200,14 @@ export class AntflyVectorStore extends VectorStore {
   async embedQuery(query: string, options?: OperationOptions): Promise<number[]> {
     options ??= operationContext.getStore();
     options?.signal?.throwIfAborted();
-    await this.validate();
+    await this.ensureValidated();
     const vector =
       this.embeddings instanceof AntflyEmbeddings
         ? await this.embeddings.embedQuery(query, options)
         : await this.embeddings.embedQuery(query);
     options?.signal?.throwIfAborted();
     vectors([vector], 1, this.dimension);
-    await this.validate(vector.length);
+    await this.ensureValidated(vector.length);
     return vector;
   }
   async addDocuments(
@@ -210,7 +218,7 @@ export class AntflyVectorStore extends VectorStore {
     this.ids(documents, options?.ids);
     if (!documents.length) return [];
     options?.signal?.throwIfAborted();
-    await this.validate();
+    await this.ensureValidated(undefined, true);
     const size = this.options.batchSize ?? 64;
     const embedded: number[][] = [];
     for (let i = 0; i < documents.length; i += size) {
@@ -242,7 +250,7 @@ export class AntflyVectorStore extends VectorStore {
     vectors(values, documents.length, this.dimension);
     if (!documents.length) return [];
     options?.signal?.throwIfAborted();
-    await this.validate(values[0].length);
+    await this.ensureValidated(values[0].length, true);
     const rows: [string, unknown][] = documents.map((doc, i) => [
       ids[i],
       {
@@ -287,7 +295,7 @@ export class AntflyVectorStore extends VectorStore {
     if (!k) return [];
     options?.signal?.throwIfAborted();
     vectors([vector], 1, this.dimension);
-    await this.validate(vector.length);
+    await this.ensureValidated(vector.length);
     const request: TableQueryRequest = {
       embeddings: { [this.index]: vector },
       indexes: [this.index],
@@ -295,7 +303,12 @@ export class AntflyVectorStore extends VectorStore {
       fields: [this.contentField, this.metadataField, ...(includeVectors ? ["_embeddings"] : [])],
       filter_query: intersect(this.filter, filter),
     };
-    return hits(await this.client.tables.query(this.table, request, options));
+    try {
+      return hits(await this.client.tables.query(this.table, request, options));
+    } catch (error) {
+      this.validated = false;
+      throw error;
+    }
   }
   async similaritySearchVectorWithScore(
     vector: number[],
@@ -329,6 +342,7 @@ export class AntflyVectorStore extends VectorStore {
     const result: DocumentInterface[] = [];
     if (!ids.length) return result;
     await this.client.tables.get(this.table);
+    let missing = false;
     for (const id of new Set(ids)) {
       if (this.filter) {
         const found = hits(
@@ -349,10 +363,11 @@ export class AntflyVectorStore extends VectorStore {
           );
         } catch (error) {
           if (!isStatus(error, 404)) throw error;
-          await this.client.tables.get(this.table);
+          missing = true;
         }
       }
     }
+    if (missing) await this.client.tables.get(this.table);
     return result;
   }
   async maxMarginalRelevanceSearch(

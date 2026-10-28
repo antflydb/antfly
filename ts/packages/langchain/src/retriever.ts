@@ -26,6 +26,7 @@ export interface AntflyRetrieverCallOptions extends RunnableConfig {
   filter?: AntflyFilter;
 }
 export class AntflyRetriever extends BaseRetriever {
+  private managedValidation?: Promise<void>;
   lc_namespace = ["antfly", "retrievers"];
   private readonly options: AntflyRetrieverOptions;
   private readonly callContext = new AsyncLocalStorage<AntflyRetrieverCallOptions>();
@@ -73,14 +74,20 @@ export class AntflyRetriever extends BaseRetriever {
       request.indexes = [index];
       if (store) request.embeddings = { [index]: await store.embedQuery(query, config) };
       else {
-        const info = await client.indexes.get(table, index);
-        const indexConfig = record(info.config);
-        if (indexConfig.type !== "embeddings" || indexConfig.sparse || indexConfig.external)
-          throw new Error(
-            "Native semantic retrieval requires a managed dense index; supply vectorStore for external vectors"
-          );
-        if (indexConfig.field && indexConfig.field !== contentField)
-          throw new Error("Managed index content field mismatch");
+        this.managedValidation ??= (async () => {
+          const info = await client.indexes.get(table, index);
+          const indexConfig = record(info.config);
+          if (indexConfig.type !== "embeddings" || indexConfig.sparse || indexConfig.external)
+            throw new Error(
+              "Native semantic retrieval requires a managed dense index; supply vectorStore for external vectors"
+            );
+          if (indexConfig.field && indexConfig.field !== contentField)
+            throw new Error("Managed index content field mismatch");
+        })().catch((error) => {
+          this.managedValidation = undefined;
+          throw error;
+        });
+        await this.managedValidation;
         request.semantic_search = query;
       }
     }
@@ -89,7 +96,13 @@ export class AntflyRetriever extends BaseRetriever {
       request.full_text_index = opts.fullTextIndex;
     }
     if (mode === "hybrid") request.merge_config = { strategy: "rrf" };
-    const found = hits(await client.tables.query(table, request, { signal: config?.signal }));
+    const found = await client.tables
+      .query(table, request, { signal: config?.signal })
+      .then(hits)
+      .catch((error) => {
+        this.managedValidation = undefined;
+        throw error;
+      });
     const documents = found.map((hit) => document(hit, contentField, metadataField, true));
     return (
       opts.reranker
