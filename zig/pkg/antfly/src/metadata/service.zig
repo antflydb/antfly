@@ -4959,9 +4959,8 @@ fn runResolverNamespaceRound(service: anytype) !void {
     if (!try service.ensureReconcileLease()) return;
     var arena = std.heap.ArenaAllocator.init(service.alloc);
     defer arena.deinit();
-    // Replay is observed through its durable queue/CAS on the next round.
-    // No caller waits on an exact receipt; tracking one here would retain an
-    // unowned compaction proof for every page and exhaust mutation admission.
+    // This cadence only schedules idempotent catalog work and observes it in
+    // later rounds. Do not retain an exact-term receipt that nobody waits on.
     const table = (try store.pendingResolverNamespaceTable(arena.allocator(), service.metadata_group_id)) orelse {
         const id = (try store.pendingResolverNamespaceDrop(arena.allocator(), service.metadata_group_id)) orelse return;
         const fence = try store.getTableTransitionFence(service.metadata_group_id, id);

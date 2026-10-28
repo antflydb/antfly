@@ -106,7 +106,13 @@ class ZigValidationScopeTests(unittest.TestCase):
         )
 
         def selected(
-            job, *, full=False, pr="7", event="workflow_dispatch", **overrides
+            job,
+            *,
+            full=False,
+            pr="7",
+            event="workflow_dispatch",
+            matrix=False,
+            **overrides,
         ):
             values = {
                 "inputs.full_validation": full,
@@ -129,7 +135,14 @@ class ZigValidationScopeTests(unittest.TestCase):
                 "needs.e2e-full-build.result": "skipped" if pr else "success",
             }
             values.update(overrides)
-            condition = blocks[job].split("${{", 1)[1].split("}}", 1)[0]
+            condition = (
+                blocks[job]
+                .split("include: >-", 1)[1]
+                .split("fromJSON(", 1)[1]
+                .split(") }}", 1)[0]
+                if matrix
+                else blocks[job].split("${{", 1)[1].split("}}", 1)[0]
+            )
             condition = re.sub(
                 r"\b(?:inputs|github|needs)\.[\w.-]+",
                 lambda m: repr(values[m[0]]),
@@ -145,7 +158,68 @@ class ZigValidationScopeTests(unittest.TestCase):
                 .replace("&&", " and ")
                 .replace("||", " or ")
             )
-            return bool(eval(" ".join(condition.split()), {"__builtins__": {}}))
+            result = eval(" ".join(condition.split()), {"__builtins__": {}})
+            return json.loads(result) if matrix else bool(result)
+
+        # Grep selects one profile for the same admitted suite as its gate.
+        # Full validation must not rerun the base compile/test job as well.
+        grep_profiles = (
+            ({}, "base", 500),
+            ({"full": True}, "full", 5000),
+            ({"pr": "", "event": "push"}, "full", 5000),
+            ({"pr": "", "event": "merge_group"}, "full", 5000),
+            ({"pr": ""}, "full", 5000),
+            (
+                {"pr": "", "event": "schedule", "github.event.schedule": "0 8 * * *"},
+                "full",
+                5000,
+            ),
+            (
+                {"pr": "", "event": "schedule", "github.event.schedule": "0 3 * * 0"},
+                "base",
+                500,
+            ),
+        )
+        for context, suite, count in grep_profiles:
+            with self.subTest(grep_context=context):
+                self.assertTrue(selected("grep-qualification", **context))
+                self.assertEqual(
+                    selected("grep-qualification", matrix=True, **context),
+                    [{"suite": suite, "cases": count}],
+                )
+        for context in (
+            {"needs.admission.result": "failure"},
+            {"github.run_attempt": 2},
+            {
+                "needs.changes.outputs.zig_tests": "false",
+                "needs.changes.outputs.model_check": "false",
+                "needs.changes.outputs.trace_validate": "false",
+            },
+            {"pr": "", "inputs.validation_scope": "inference-e2e"},
+            {"pr": "", "event": "push", "github.ref": "refs/heads/other"},
+        ):
+            with self.subTest(grep_skipped=context):
+                self.assertFalse(selected("grep-qualification", **context))
+        grep = blocks["grep-qualification"]
+        self.assertIn("name: zig-${{ matrix.suite }} / grep", grep)
+        self.assertIn("needs: [admission, changes]", grep)
+        self.assertIn("DIFFERENTIAL_CASES: ${{ matrix.cases }}", grep)
+        self.assertIn('--cases "$DIFFERENTIAL_CASES"', grep)
+        self.assertIn("grep grep-test", grep)
+        self.assertIn("test_grep_packaging.py", grep)
+        benchmarks = grep.split(
+            "      - name: Benchmark native CPU and cache configurations\n", 1
+        )[1].split("\n      - ", 1)[0]
+        self.assertIn("if: matrix.suite == 'full'", benchmarks)
+        self.assertIn("--extended --codecs", benchmarks)
+        self.assertIn("for jobs in 1 2 4 8;", benchmarks)
+        self.assertIn("name: zig-${{ matrix.suite }}-grep", grep)
+        for gate in ("zig-base", "zig-full"):
+            self.assertIn("grep-qualification]", blocks[gate])
+            self.assertIn(
+                "GREP_RESULT: ${{ needs.grep-qualification.result }}", blocks[gate]
+            )
+            self.assertIn('test "$GREP_RESULT" = "success"', blocks[gate])
 
         full_jobs = [
             "zig-full-tests",

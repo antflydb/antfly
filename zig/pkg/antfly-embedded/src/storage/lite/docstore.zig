@@ -4755,6 +4755,48 @@ test "lite native docstore runtime scans ordered snapshot" {
     try std.testing.expectEqualStrings("doc:c", seek.key);
 }
 
+test "lite resolver consumer bootstrap discards stale projections without reading external values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "resolver-bootstrap.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    const consumers = @import("resolver_consumers.zig");
+    const stale = consumers.profiles_prefix ++ "stale";
+    const neighbor = "\x00antfly/embedded/resolver-consumers/v7/static0";
+    const large = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(large);
+    @memset(large, 'x');
+    {
+        var seed = try Txn.openWrite(&store);
+        errdefer seed.abort();
+        try seed.put(stale, large);
+        try seed.put(neighbor, large);
+        try seed.commit();
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    {
+        var write = try Txn.openWrite(&store);
+        errdefer write.abort();
+        const before = store.file.test_page_reads.load(.monotonic);
+        try consumers.bootstrap(arena.allocator(), &write);
+        // Two MiB of discarded/adjacent values must not be read to migrate
+        // one stale key. Count logical reads so the assertion ignores caches.
+        try std.testing.expect(store.file.test_page_reads.load(.monotonic) - before < 64);
+        try std.testing.expectError(error.NotFound, write.get(stale));
+        try std.testing.expectEqualStrings("1", try write.get(consumers.marker));
+        try write.commit();
+    }
+    var read = try Txn.openRead(&store);
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(stale));
+    try std.testing.expectEqualStrings(large, try read.get(neighbor));
+    try std.testing.expectEqualStrings("1", try read.get(consumers.marker));
+}
+
 test "lite native write cursors merge pending writes and deletes in order" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

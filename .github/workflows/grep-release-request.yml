@@ -1,0 +1,29 @@
+name: Grep release request
+
+# A tag can request a release, but cannot build with publication credentials.
+on:
+  push:
+    tags:
+      - "antfly-grep/v*"
+
+permissions:
+  contents: read
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write untrusted grep tag request
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p dist/grep-tag-request
+          jq -n --arg tag "$RELEASE_TAG" --arg commit "$SOURCE_COMMIT" \
+            '{schema_version: 1, tag: $tag, source_commit: $commit}' \
+            > dist/grep-tag-request/request.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: grep-tag-request
+          path: dist/grep-tag-request/request.json
+          if-no-files-found: error
