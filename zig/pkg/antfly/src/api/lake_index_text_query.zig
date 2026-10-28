@@ -1216,6 +1216,9 @@ const Execution = struct {
             fn accept(raw: *anyopaque, scratch: A, i: usize, field: []const u8, value: std.json.Value) !void {
                 const consumer: *@This() = @ptrCast(@alignCast(raw));
                 if (consumer.skip[i]) return;
+                // Matching can cost more than decoding; retain a checkpoint
+                // for each borrowed value, independently of hydration tiles.
+                try consumer.execution.context.ensureActive();
                 var source: std.json.Value = .{ .object = .empty };
                 if (std.mem.eql(u8, field, "_type")) {
                     consumer.types[i] = try local.storage_db_types.cloneJsonValue(consumer.metadata, value);
