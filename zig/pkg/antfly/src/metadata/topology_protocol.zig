@@ -93,11 +93,17 @@ const std = @import("std");
 /// Version 60 backfills and maintains root-scoped resolver pin projections.
 /// Version 61 resumes bounded pin paths and backfills static root membership.
 /// Version 62 incrementally repairs graph-fenced pin membership from edit journals.
-pub const current_version: u16 = 62;
+/// Version 63 adds dependency-scoped pin repair and indexed invalidation proofs.
+/// Version 64 adds deletable dependency summaries and forward-only pin repair.
+/// Version 65 scopes native paths and adds paged fingerprint dependency summaries.
+/// Version 66 indexes routing sources for dependency-validated canonical proofs.
+/// Version 67 qualifies legacy resolver content before native cache admission.
+/// Version 68 tracks bounded edits during resumable resolver qualification.
+pub const current_version: u16 = 68;
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 62;
+pub const resolver_namespaces_version: u16 = 68;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

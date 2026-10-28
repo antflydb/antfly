@@ -1,3 +1,4 @@
+import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
 /**
  * Antfly SDK Client
  * Provides a high-level interface for interacting with the Antfly API
@@ -442,7 +443,7 @@ function indexMutationError(prefix: string, error: unknown, response: Response |
       Number.isSafeInteger(retryAfter) && retryAfter > 0 ? retryAfter : undefined
     );
   }
-  return new Error(message);
+  return new AntflyHTTPError(message, response?.status ?? 0, error);
 }
 
 function normalizedWriteOptions(
@@ -827,7 +828,11 @@ export class AntflyClient {
         const structured = errorFactory(response.status, errorBody);
         if (structured) throw structured;
       }
-      throw new Error(`${errorPrefix}: ${response.status} ${message}`);
+      throw new AntflyHTTPError(
+        `${errorPrefix}: ${response.status} ${message}`,
+        response.status,
+        errorBody
+      );
     }
 
     const { text, truncated } = await readLimitedResponseText(response, opts.maxResponseBytes);
@@ -1932,10 +1937,15 @@ export class AntflyClient {
      * Get table details and status
      */
     get: async (tableName: string): Promise<Table | undefined> => {
-      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}", {
+      const { data, error, response } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
-      if (error) throw new Error(`Failed to get table: ${apiErrorMessage(error)}`);
+      if (!response.ok)
+        throw new AntflyHTTPError(
+          `Failed to get table: ${apiErrorMessage(error)}`,
+          response?.status ?? 0,
+          error
+        );
       return data;
     },
 
@@ -2065,13 +2075,11 @@ export class AntflyClient {
         "Batch operation failed",
         "marshalling batch request"
       );
-      return (
-        data ?? {
-          inserted: Object.keys(request.inserts ?? {}).length,
-          deleted: request.deletes?.length ?? 0,
-          transformed: request.transforms?.length ?? 0,
-        }
-      );
+      if (!data)
+        throw new AntflyResponseError(
+          "Batch operation failed: missing mutation outcome; do not blindly retry"
+        );
+      return data;
     },
 
     rows: {
@@ -2232,13 +2240,21 @@ export class AntflyClient {
      * @param options.fields - Comma-separated list of fields to include (e.g., "title,author,metadata.tags")
      */
     lookup: async (tableName: string, key: string, options?: { fields?: string }) => {
-      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/documents/{key}", {
-        params: {
-          path: { tableName, key },
-          query: options?.fields ? { fields: options.fields } : undefined,
-        },
-      });
-      if (error) throw new Error(`Key lookup failed: ${error.error}`);
+      const { data, error, response } = await this.client.GET(
+        "/db/v1/tables/{tableName}/documents/{key}",
+        {
+          params: {
+            path: { tableName, key },
+            query: options?.fields ? { fields: options.fields } : undefined,
+          },
+        }
+      );
+      if (!response.ok)
+        throw new AntflyHTTPError(
+          `Key lookup failed: ${apiErrorMessage(error)}`,
+          response?.status ?? 0,
+          error
+        );
       return data;
     },
 
@@ -3536,13 +3552,18 @@ export class AntflyClient {
      * Get index details
      */
     get: async (tableName: string, indexName: string) => {
-      const { data, error } = await this.client.GET(
+      const { data, error, response } = await this.client.GET(
         "/db/v1/tables/{tableName}/indexes/{indexName}",
         {
           params: { path: { tableName, indexName } },
         }
       );
-      if (error) throw new Error(`Failed to get index: ${error.error}`);
+      if (!response.ok)
+        throw new AntflyHTTPError(
+          `Failed to get index: ${apiErrorMessage(error)}`,
+          response?.status ?? 0,
+          error
+        );
       if (!data) throw new Error("Failed to get index: unexpected empty response");
       return data;
     },
