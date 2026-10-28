@@ -3360,3 +3360,10 @@ with identical expanded tokens and the unchanged complete shipping PTX.
 vision rotation, per-token vision phase reuse, single-head specialization,
 independent bitwise oracles and the complete retained performance matrices.
 It charges the small production-source increase separately from the speedup.
+
+### Large-win audit after AP
+
+[The large-win audit](unified-execution-large-wins-audit.md) prioritizes whole
+pipeline lifecycle, decoder phases, CPU projection families and CUDA attention
+launch preparation. It separates a prototype-backed 40–70 KB catalog budget
+from unproven family goals and from device-kernel source accounting.
