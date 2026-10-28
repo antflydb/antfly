@@ -1795,6 +1795,8 @@ pub const Backend = struct {
     retired_run_directories: ?*RunDirectory = null,
     retired_run_stores: ?*RunStore = null,
     retired_manifest_preparations: ?*@import("lsm_backend/manifest_edit_preparation.zig").Frame = null,
+    retired_manifest_preparations_tail: ?*@import("lsm_backend/manifest_edit_preparation.zig").Frame = null,
+    active_manifest_preparation: ?*@import("lsm_backend/manifest_edit_preparation.zig").Frame = null,
     manifest_preparation_reclaim_in_flight: bool = false,
     retired_flush_outputs: ?*@import("lsm_backend/registered_flush_outputs.zig").Owner = null,
     flush_outputs_reclaim_in_flight: bool = false,
@@ -2533,6 +2535,7 @@ pub const Backend = struct {
             retired_gc,
             live_read_versions,
             retired_run_directories,
+            retired_manifest_preparations,
             retired_read_versions,
             retired_projection_versions,
             retired_domain_indexes,
@@ -2612,6 +2615,7 @@ pub const Backend = struct {
             if (b.directory_reclaimer) |*job| self.bytes +|= job.directory.accountedMemoryBytes(pass);
             if (b.domain_index) |value| self.bytes +|= value.memoryBytes();
             if (b.read_metadata_reclaimer) |*job| self.bytes +|= job.memoryBytes(pass);
+            if (b.active_manifest_preparation) |frame| self.bytes +|= frame.accountedMemoryBytes(pass);
             self.bytes +|= b.bulk_snapshot_unshared_bytes;
             if (b.memtable_reclaimer) |*job| self.bytes +|= job.memoryBytes(pass);
         }
@@ -2620,7 +2624,7 @@ pub const Backend = struct {
             const field = @tagName(phase);
             const Pointer = @typeInfo(@FieldType(Backend, field)).optional.child;
             const next = switch (phase) {
-                .active_ledger_reclamations, .active_compaction_publications => "next",
+                .active_ledger_reclamations, .active_compaction_publications, .retired_manifest_preparations => "next",
                 .ledger_snapshots, .active_bulk_plans => "active_next",
                 .live_read_versions => "live_next",
                 else => "retired_next",
@@ -2672,7 +2676,7 @@ pub const Backend = struct {
                         self.fixed(b);
                         self.advance();
                     },
-                    inline .active_ledger_reclamations, .ledger_snapshots, .active_compaction_publications, .retired_run_stores, .retired_admissions, .active_bulk_plans, .retired_bulk_plans, .retired_closures, .retired_gc, .live_read_versions, .retired_run_directories, .retired_read_versions, .retired_projection_versions, .retired_domain_indexes => |phase| self.list(b, phase),
+                    inline .active_ledger_reclamations, .ledger_snapshots, .active_compaction_publications, .retired_run_stores, .retired_admissions, .active_bulk_plans, .retired_bulk_plans, .retired_closures, .retired_gc, .live_read_versions, .retired_run_directories, .retired_manifest_preparations, .retired_read_versions, .retired_projection_versions, .retired_domain_indexes => |phase| self.list(b, phase),
                     .immutable, .retired_immutable, .retired_mutable => {
                         const items = switch (self.phase) {
                             .immutable => b.activeImmutableMemtables(),
@@ -4043,6 +4047,9 @@ pub const Backend = struct {
         while (ledger_reclamation) |job| : (ledger_reclamation = job.next) bytes +|= job.memoryBytes(pass);
         var ledger_snapshot = self.ledger_snapshots;
         while (ledger_snapshot) |snapshot| : (ledger_snapshot = snapshot.active_next) bytes +|= snapshot.memoryBytes(pass);
+        if (self.active_manifest_preparation) |frame| bytes +|= frame.accountedMemoryBytes(pass);
+        var manifest_frame = self.retired_manifest_preparations;
+        while (manifest_frame) |frame| : (manifest_frame = frame.next) bytes +|= frame.accountedMemoryBytes(pass);
         var publication = self.active_compaction_publications;
         while (publication) |job| : (publication = job.next) bytes +|= job.accountedMemoryBytes(pass);
         bytes +|= self.runs.memoryBytes(pass);
@@ -4987,9 +4994,12 @@ pub const Backend = struct {
     }
 
     pub fn retireManifestPreparation(self: *Backend, frame: *@import("lsm_backend/manifest_edit_preparation.zig").Frame) void {
-        frame.detachLocked(self);
-        frame.next = self.retired_manifest_preparations;
-        self.retired_manifest_preparations = frame;
+        if (self.active_manifest_preparation == frame) self.active_manifest_preparation = null;
+        // The owned writer's source stays pinned through physical retirement.
+        if (frame.checkpoint_owner == null) frame.detachLocked(self);
+        frame.next = null;
+        if (self.retired_manifest_preparations_tail) |tail| tail.next = frame else self.retired_manifest_preparations = frame;
+        self.retired_manifest_preparations_tail = frame;
         self.cached_maintenance_hint.store(1, .release);
     }
 
@@ -5003,19 +5013,18 @@ pub const Backend = struct {
         const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
         while (credits > 1 and runtime_mod.workNowNs(self) < deadline) {
             const frame = self.retired_manifest_preparations orelse break;
-            // New publications can enqueue while cleanup runs off-lock.
-            self.retired_manifest_preparations = frame.next;
+            // Publishers append at the tail. The observed head and its source
+            // pins stay reachable while this cleanup turn drops the mutex.
             credits -= 1;
             self.mu.unlock();
             const result = @import("lsm_backend/retirement_execution.zig").step(self, frame, credits, deadline);
             _ = runtime_mod.lockBackend(Backend, self);
             credits -= result.units;
             if (result.refused) self.retirement_execution_retry_at_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_ms;
-            if (!result.done) {
-                frame.next = self.retired_manifest_preparations;
-                self.retired_manifest_preparations = frame;
-                break;
-            }
+            if (!result.done) break;
+            self.retired_manifest_preparations = frame.next;
+            if (self.retired_manifest_preparations == null) self.retired_manifest_preparations_tail = null;
+            frame.detachLocked(self);
             frame.finish(self.allocator);
         }
     }
@@ -5028,6 +5037,8 @@ pub const Backend = struct {
             credits.* -= 1;
             if (!try frame.stepWithAdmission(self.allocator, credits, original)) return false;
             self.retired_manifest_preparations = frame.next;
+            if (self.retired_manifest_preparations == null) self.retired_manifest_preparations_tail = null;
+            frame.detachLocked(self);
             frame.finish(self.allocator);
         }
         return self.retired_manifest_preparations == null;
@@ -7383,7 +7394,7 @@ pub const Backend = struct {
         // writer-array address that could have changed while waiting.
         const current_runs = if (live) &.{} else runs;
         const covered_logical_bytes = self.unpublished_wal_logical_bytes;
-        const prepared_edit = execution_runtime != null and self.options.resource_manager != null and live and !self.run_directory_dirty and self.run_directory != null and self.manifest_directory != null and self.manifest_journal.sequence != null and self.manifest_journal.descriptor != null;
+        const prepared_edit = execution_runtime != null and self.options.resource_manager != null and self.options.unpublished_outputs != null and live and !self.run_directory_dirty and self.run_directory != null;
         if (prepared_edit) {
             // Captured changes and their neighbors are validated off-lock by
             // the same controlled preparation that encodes their journal edit.
@@ -7402,7 +7413,7 @@ pub const Backend = struct {
         // new obsolete files indefinitely instead of settling to zero debt.
         if (live) try self.ensureRunDirectory();
         const persisted = if (prepared_edit)
-            self.manifest_journal.persistPreparedEdit(self, root_dir, execution_runtime.?) catch |cause| {
+            self.manifest_journal.persistWithExecution(self, root_dir, execution_runtime.?) catch |cause| {
                 if (cause == error.ManifestEditTooLarge) self.manifest_journal.sequence = null;
                 return cause;
             }
@@ -7895,13 +7906,19 @@ pub const Backend = struct {
         self.retired_read_versions = version;
     }
 
-    pub fn destroyRunMetadata(self: *Backend) void {
-        // Background work and readers have joined. Return each vector's
-        // prearranged owner even when close cancelled its last cleanup pass.
+    /// Joined teardown must release physical writers before the ledger drain:
+    /// those writers still own source snapshots registered with this backend.
+    pub fn drainManifestPreparations(self: *Backend) void {
         while (self.retired_manifest_preparations != null) {
             var credits: usize = 2048;
             _ = self.reclaimManifestPreparationQuiescedStep(&credits, null) catch unreachable;
         }
+    }
+
+    pub fn destroyRunMetadata(self: *Backend) void {
+        // Background work and readers have joined. Return each vector's
+        // prearranged owner even when close cancelled its last cleanup pass.
+        self.drainManifestPreparations();
         while (self.retired_flush_outputs != null) {
             var credits: usize = 2048;
             _ = self.reclaimFlushOutputsQuiescedStep(&credits, null) catch unreachable;

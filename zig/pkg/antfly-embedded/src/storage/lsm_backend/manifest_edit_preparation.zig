@@ -28,11 +28,14 @@ const execution = @import("../../common/background_execution.zig");
 const Comparison = @import("run_comparison.zig").Cursor;
 const platform = @import("antfly_platform");
 const Run = repository.Run;
+pub const checkpoint_publication = @import("normal_checkpoint_publication.zig");
 pub var test_hook: ?*const fn (admission.Port) anyerror!void = null;
 pub var test_retirement_hook: ?*const fn (admission.Port) anyerror!void = null;
 
 pub const Frame = struct {
     credit: resources.Reservation,
+    checkpoint_owner: ?*checkpoint_publication.Owner = null,
+    checkpoint_retirement_offset: usize = 0,
     next: ?*Frame = null,
     current: ?*Directory = null,
     previous: ?*Directory = null,
@@ -105,6 +108,41 @@ pub const Frame = struct {
         if (comptime @import("builtin").is_test) if (test_hook) |hook| try hook(original);
         try manifest.encodeJournalFrameIntoWithAdmission(self.encoded, sequence, false, self.removed, self.removed_paths, .{ .next_run_id = next_id, .runs = self.added, .obsolete_paths = self.added_paths }, original);
     }
+    pub fn prepareCheckpoint(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, root: []const u8, id: u64, next_id: u64) !void {
+        const io = owner.io() orelse return error.ExecutionWaitUnsupported;
+        const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+        // Fixed streaming scratch plus one retained provider grant, independent
+        // of metadata/key count. Funding occurs off-lock before CPU admission.
+        try self.credit.growBoundedOversized(try std.math.add(u64, @sizeOf(checkpoint_publication.Owner), try backend.storage.?.appendResourceBytes(0)), 1);
+        var pass = try execution.Pass.init(owner.runnableOwner(), &io, deadline, .{ .context = backend, .is_cancelled = cancelled });
+        defer pass.deinit();
+        var scope = try pass.admissionScope(io);
+        const payload = scope.payload();
+        const original = admission.Port.init(&payload);
+        var runs = self.current.?.readCursor();
+        var prior: ?Run = null;
+        while (runs.next()) |handle| {
+            if (prior) |previous| try validate(&.{ previous, handle.run.* }, original) else try validate(&.{handle.run.*}, original);
+            prior = handle.run.*;
+        }
+        self.checkpoint_owner = &(try allocate(checkpoint_publication.Owner, backend.allocator, 1, original))[0];
+        const checkpoint = self.checkpoint_owner.?;
+        checkpoint.* = .{ .deadline = deadline };
+        try checkpoint.prepare(backend.storage.?, backend.options.unpublished_outputs.?, root, id, next_id, .{
+            .cursor = self.current.?.readCursor(),
+            .ledger = self.obsolete.?.value.iterator(),
+            .count = self.obsolete.?.value.count(),
+            .root = root,
+        }, original);
+    }
+    pub fn finishCheckpoint(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime) !usize {
+        const io = owner.io() orelse return error.ExecutionWaitUnsupported;
+        var pass = try execution.Pass.init(owner.runnableOwner(), &io, self.checkpoint_owner.?.deadline, .{ .context = backend, .is_cancelled = cancelled });
+        defer pass.deinit();
+        var scope = try pass.admissionScope(io);
+        const payload = scope.payload();
+        return self.checkpoint_owner.?.finish(.init(&payload));
+    }
     fn bound(a_ns: ?[]const u8, a: []const u8, b_ns: ?[]const u8, b: []const u8, original: admission.Port) !std.math.Order {
         var comparison = Comparison.bound(a_ns, a, b_ns, b);
         return comparison.resumeWithAdmission(original);
@@ -170,6 +208,14 @@ pub const Frame = struct {
         }
         if (!fill) self.counts = counts else std.debug.assert(std.meta.eql(self.counts, counts));
     }
+    pub fn accountedMemoryBytes(self: *const Frame, pass: u64) u64 {
+        // Header storage is already funded by the retained builder reservation.
+        // Sources can retain older COW accounts after live roots have moved on.
+        var bytes: u64 = 0;
+        if (self.current) |directory| bytes +|= directory.accountedMemoryBytes(pass) -| @sizeOf(Directory);
+        if (self.previous) |directory| bytes +|= directory.accountedMemoryBytes(pass) -| @sizeOf(Directory);
+        return bytes;
+    }
     /// Return all source pins before byte-only retirement can run. Descriptors
     /// may contain old borrowed addresses; cleanup never dereferences them.
     pub fn detachLocked(self: *Frame, backend: anytype) void {
@@ -184,6 +230,22 @@ pub const Frame = struct {
     }
     pub fn stepWithAdmission(self: *Frame, a: std.mem.Allocator, credits: *usize, original: ?admission.Port) !bool {
         if (comptime @import("builtin").is_test) if (original) |port| if (test_retirement_hook) |hook| try hook(port);
+        if (self.checkpoint_owner) |checkpoint| {
+            if (credits.* == 0) return false;
+            credits.* -= 1;
+            if (self.checkpoint_retirement_offset == 0 and !try checkpoint.retireStep(original)) return false;
+            const bytes = std.mem.asBytes(checkpoint);
+            while (self.checkpoint_retirement_offset < bytes.len) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                const end = @min(bytes.len, self.checkpoint_retirement_offset + 16 * 1024);
+                @memset(bytes[self.checkpoint_retirement_offset..end], undefined);
+                self.checkpoint_retirement_offset = end;
+            }
+            a.rawFree(bytes, .of(checkpoint_publication.Owner), @returnAddress());
+            self.checkpoint_owner = null;
+        }
         inline for (.{ "added", "removed", "added_paths", "removed_paths", "encoded" }, 0..) |field, i| {
             if (self.retirement_field == i) {
                 const T = @typeInfo(@TypeOf(@field(self, field))).pointer.child;

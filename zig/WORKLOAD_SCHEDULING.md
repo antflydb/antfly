@@ -12,6 +12,13 @@ maintenance selection uses bounded rotating registry windows and carries partial
 scan continuation through the write facade and background worker. See
 [implementation scope and restrictions](WORKLOAD_POOLING_IMPLEMENTATION.md).
 
+Eligible normal file flushes now admit SST construction, metadata append
+preparation, incremental manifest encoding, and cold/replacement streaming
+checkpoint publication. Physical checkpoint I/O retains its grant through
+independent cleanup. Periodic checkpoint rotation, journal/WAL I/O, remaining
+metadata planning and broader compaction execution still need integration;
+this does not establish full engine or mixed-protocol overload qualification.
+
 Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 `origin/main`, verified against GitHub on 2026-10-05. Active development uses one
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
@@ -20,7 +27,7 @@ implementation evidence are recorded in the implementation ledger.
 The branch integrates main through `a507489e93` (#1330). The October 27 merge
 retains the bounded maintenance worker and main's newer document/resolver paths.
 
-Private native ABI 157 and kernel-owner ABI 217 fence the current manager,
+Private native ABI 158 and kernel-owner ABI 218 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
 retirement, allocator-host acquisition, publication-resource and registered source-ancestry and yieldable physical output retirement and registered writer-root contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;

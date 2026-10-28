@@ -1270,6 +1270,14 @@ pub const ManifestJournal = struct {
         };
     }
 
+    /// Normal detached callers choose the same checkpoint/edit boundaries as
+    /// legacy publication, but lend execution only after immutable capture.
+    pub fn persistWithExecution(self: *@This(), backend: anytype, root: []const u8, owner: *@import("../background_runtime.zig").BackendRuntime) !Result {
+        if (self.sequence == null or self.descriptor == null or backend.manifest_directory == null)
+            return self.persistCheckpointPinned(backend, root, backend.run_directory.?, owner);
+        return self.persistPreparedEdit(backend, root, owner);
+    }
+
     /// Incremental edits capture immutable roots before off-lock preparation.
     /// Detached normal callers pin roots under Backend.mu, then admit only the
     /// off-lock preparation. IO keeps the existing joined append contract.
@@ -1280,6 +1288,8 @@ pub const ManifestJournal = struct {
             backend.obsolete_paths.tree.root == self.obsolete.tree.root and backend.next_run_id == self.next_run_id)
             return .{ .written = 0, .total = self.bytes, .checkpoint = false };
         const frame = try Frame.create(backend);
+        std.debug.assert(backend.active_manifest_preparation == null);
+        backend.active_manifest_preparation = frame;
         defer backend.retireManifestPreparation(frame);
         try frame.capture(backend);
         const sequence = try std.math.add(u64, self.sequence.?, 1);
@@ -1319,10 +1329,19 @@ pub const ManifestJournal = struct {
         return .{ .written = frame.encoded.len, .total = total, .checkpoint = false };
     }
 
-    fn persistCheckpointPinned(self: *@This(), backend: anytype, root: []const u8, current: *const @import("run_directory.zig").Directory) !Result {
+    fn persistCheckpointPinned(self: *@This(), backend: anytype, root: []const u8, current: *const @import("run_directory.zig").Directory, execution_runtime: ?*@import("../background_runtime.zig").BackendRuntime) !Result {
         const allocator = backend.allocator;
         const storage = backend.storage.?;
-        errdefer self.sequence = null;
+        errdefer if (execution_runtime == null) {
+            self.sequence = null;
+        };
+        const Frame = @import("manifest_edit_preparation.zig").Frame;
+        const frame = if (execution_runtime != null) try Frame.create(backend) else null;
+        if (frame) |owned| {
+            std.debug.assert(backend.active_manifest_preparation == null);
+            backend.active_manifest_preparation = owned;
+        }
+        defer if (frame) |owned| backend.retireManifestPreparation(owned);
         var reservation: ?resource_manager_mod.Reservation = null;
         defer {
             backend.syncTrackedInMemoryStateUsageCurrentLocked();
@@ -1335,7 +1354,8 @@ pub const ManifestJournal = struct {
             reservation = try manager.reserve(.lsm_table_builder_working_set, bound);
         }
         const directory = try current.fork(allocator);
-        errdefer directory.destroy(allocator);
+        if (frame) |owned| owned.current = directory;
+        errdefer if (frame == null) directory.destroy(allocator);
         const retired = try allocator.alloc(lsm_manifest.ObsoletePathMeta, retired_count);
         defer allocator.free(retired);
         var initialized: usize = 0;
@@ -1350,11 +1370,44 @@ pub const ManifestJournal = struct {
         }
         transferred = true;
         const ledger_owner = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
-        defer ledger_owner.retire(backend);
+        if (frame) |owned| owned.obsolete = ledger_owner;
+        defer if (frame == null) ledger_owner.retire(backend);
         const ledger = &ledger_owner.value;
         const id = backend.next_run_id;
         backend.next_run_id = try std.math.add(u64, id, 1);
         const next_run_id = backend.next_run_id;
+        if (frame) |owned| {
+            // Installation gets separate fixed headers. The streaming writer
+            // retains its original source through physical retirement.
+            owned.previous = try directory.fork(allocator);
+            owned.previous_obsolete = try LedgerSnapshot.capture(backend, ledger);
+            const runtime = @import("runtime.zig");
+            const fence = CheckpointFence.capture(backend);
+            const descriptor = manifest_set.Descriptor{ .checkpoint = id, .first_segment = id, .sequence = 0 };
+            const started = backend.writeStatsNowNs();
+            runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+            const prepared = owned.prepareCheckpoint(backend, execution_runtime.?, root, id, next_run_id);
+            _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+            try prepared;
+            // No descriptor operation can begin until the captured durable
+            // lineage has been checked again under the publication mutex.
+            if (!fence.matches(backend)) return error.RecoveryRequired;
+            runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+            const completed = owned.finishCheckpoint(backend, execution_runtime.?);
+            _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+            backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(started);
+            const bytes = completed catch |cause| {
+                if (owned.checkpoint_owner.?.descriptorMayHavePublished()) {
+                    backend.manifest_recovery_required = true;
+                    self.sequence = null;
+                    backend.markManifestDirty();
+                }
+                return cause;
+            };
+            const result = try self.installPreparedCheckpoint(backend, &fence, descriptor, next_run_id, bytes, owned.previous.?, &owned.previous_obsolete.?.value);
+            owned.previous = null;
+            return result;
+        }
         const Source = struct {
             cursor: @import("run_directory.zig").Directory.Cursor,
             ledger: ObsoleteLedger.Cursor,
@@ -1420,7 +1473,7 @@ pub const ManifestJournal = struct {
         // Count suffix bytes, not the checkpoint itself: large stores must
         // not checkpoint on every edit merely because their base exceeds 8 MiB.
         const checkpoint = self.sequence == null or self.descriptor == null or current == null or backend.manifest_directory == null;
-        if (checkpoint) if (current) |directory| return self.persistCheckpointPinned(backend, root_dir, directory);
+        if (checkpoint) if (current) |directory| return self.persistCheckpointPinned(backend, root_dir, directory, null);
         if (!checkpoint and current.?.tree.root == backend.manifest_directory.?.tree.root and self.next_run_id == backend.next_run_id and self.obsolete.tree.root == backend.obsolete_paths.tree.root)
             return .{ .written = 0, .total = self.bytes, .checkpoint = false };
         var reservation: ?resource_manager_mod.Reservation = null;

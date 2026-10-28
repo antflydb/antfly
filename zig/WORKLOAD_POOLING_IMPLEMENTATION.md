@@ -29981,9 +29981,12 @@ accepted debt with its detached owner instead of bypassing admission. Peer write
 retain WAL durability and can complete while manifest preparation is suspended.
 
 Transient descriptor/frame storage keeps its funding until protected physical
-cleanup completes, including refusal, queued retry, and quiesced close. Cleanup
-removes a frame from the intrusive queue before dropping the mutex so concurrent
-publications cannot be lost. Normal native tests exercise a warm second flush,
+cleanup completes, including refusal, queued retry, and quiesced close. Publishers
+append at the FIFO tail, leaving the cleanup head reachable by accounting while
+its worker drops the mutex. Captured checkpoint directories and ledger snapshots
+stay pinned until the owned writer retires. Active and queued frames expose their
+retained COW accounts to normal and quiesced observation; joined teardown retires
+physical writers before draining their source ledgers. Normal native tests exercise a warm second flush,
 preparation/cleanup refusal, peer commit during captured preparation, unchanged
 checkpoint cadence, reopen recovery, and controlled close with queued frames.
 A separate deterministic codec oracle compares exact edit/checkpoint bytes with
@@ -29991,7 +29994,7 @@ the legacy encoder and injects rejection at every checkpoint, including long
 field copies and both checksums. Private native/owner ABI versions are 157/217;
 public wire and durable formats are unchanged.
 
-Focused Debug qualification is recorded in
+Initial incremental-path Debug qualification is recorded in
 [`manifest-preparation-v7-debug.json`](qualification/workload-pooling/receipts/2026-10-10/child-outbox-capture-retirement-cumulative-integration/manifest-preparation-v7-debug.json):
 34 native publication cases, the local owner check, 12 maintenance dispatch cases,
 and semantic compilation of the actual C API/provider paths pass. The codec
@@ -29999,7 +30002,40 @@ oracle is deterministic fixture evidence; warm flush/retry, concurrent commit,
 crash/reopen and queued close cases use the native backend and actual shared
 scheduler. This is not full DB/server or cross-engine overload qualification.
 
-The bounded-publication milestone remains open for cold/replacement checkpoints,
-physical journal/WAL operations, and compaction construction/remaining metadata
-operations. Those paths retain their legacy implementation and are not claimed
-as admitted by the incremental-flush evidence. The full design remains open.
+Normal detached cold/replacement flush publication now also reaches the owned
+streaming manifest-set writer. Full run validation and 16 KiB encoding run under
+shared background CPU outside `Backend.mu`; checkpoint, successor journal and
+descriptor writes use the retained durability grant and park CPU during accepted
+physical I/O. The same native deadline covers preparation and descriptor finish.
+The publisher checks captured durable lineage under the mutex before descriptor
+I/O, then installs the matching captured roots after physical completion. Peer
+commits retain their newer roots and WAL debt. No full-checkpoint buffer or new
+checkpoint cadence is introduced.
+
+The backend retains the funded physical owner through independent protected
+cleanup, including accepted I/O, exact command bytes, output cleanup tickets and
+provider-grant retirement. Pre-descriptor refusal abandons private outputs and
+retries publication without rebuilding SSTs. Possible descriptor publication
+fences recovery, preserves both final paths and WAL, and suppresses blind retry.
+Controlled close and the joined fallback drain the retained owner before backend
+and provider teardown. Private native/owner ABI versions 158/218 fence the backend's
+new active/FIFO source-accounting fields; public wire and durable formats remain
+unchanged.
+
+[`checkpoint-production-v8-debug.json`](qualification/workload-pooling/receipts/2026-10-10/child-outbox-capture-retirement-cumulative-integration/checkpoint-production-v8-debug.json)
+records the final focused Debug qualification: 42 native publication cases, the
+local owner check, 12 maintenance dispatch cases, six metadata retirement checks
+and actual C API/provider semantic compilation pass. Native tests cover cold preparation and descriptor
+refusal, actual descriptor rename uncertainty, concurrent commit, queued close,
+replacement after warm journal failure, a 48 KiB key whose manifest bounds
+span physical chunks, and cancellation with an accepted physical command retained
+for independent controlled close. Source pins remain live through that join. Successful retry/concurrency/replacement cases crash and
+reopen without close repairing their publication. Existing owned-writer fixtures
+provide finer rejection-point coverage; this is not full DB/server or cross-engine
+overload qualification.
+
+The bounded-publication milestone remains open for checkpoint retirement-path
+planning under the metadata mutex, periodic checkpoint rotation, incremental
+journal append/WAL operations, and compaction construction/remaining metadata
+operations. Callers without the eligible detached runtime retain their legacy
+publication path. The full design remains open.

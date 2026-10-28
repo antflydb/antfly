@@ -5954,7 +5954,7 @@ test "physical cache metadata bounded writer retirement refuses unknown producer
     try std.testing.expectEqual(@as(usize, 1), Callback.called);
 }
 
-fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry, retirement_retry, retirement_capacity, publication_directory_retry, output_retirement_retry, output_retirement_close, immutable_retirement_retry, immutable_retirement_close, output_retirement_preflight, manifest_completion_retry, manifest_completion_io_retry, manifest_completion_waker, read_metadata_retry, manifest_completion_fence, manifest_preparation_retry, manifest_preparation_interleave, manifest_preparation_close }) !void {
+fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry, retirement_retry, retirement_capacity, publication_directory_retry, output_retirement_retry, output_retirement_close, immutable_retirement_retry, immutable_retirement_close, output_retirement_preflight, manifest_completion_retry, manifest_completion_io_retry, manifest_completion_waker, read_metadata_retry, manifest_completion_fence, manifest_preparation_retry, manifest_preparation_interleave, manifest_preparation_close, checkpoint_prepare_retry, checkpoint_descriptor_retry, checkpoint_descriptor_fence, checkpoint_cleanup_close, checkpoint_interleave, checkpoint_replacement, checkpoint_streaming }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -5963,10 +5963,14 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     const platform = @import("antfly_platform");
     const scheduler = local.common_request_admission.runnable_scheduler;
     const a = std.testing.allocator;
+    const test_key: []const u8 = if (mode == .checkpoint_streaming) try a.alloc(u8, 48 * 1024 + 17) else "admitted";
+    defer if (mode == .checkpoint_streaming) a.free(test_key);
+    if (mode == .checkpoint_streaming) @memset(@constCast(test_key), 'k');
     const maintenance_origin = mode == .maintenance or mode == .maintenance_retry or mode == .maintenance_close or mode == .waker or mode == .maintenance_budget or mode == .maintenance_unsupported;
     const rebase_publication = mode == .publication_rebase or mode == .publication_rebase_retry;
     const completion_retry = mode == .manifest_completion_retry or mode == .manifest_completion_io_retry or mode == .manifest_completion_waker;
     const preparing_manifest = mode == .manifest_preparation_retry or mode == .manifest_preparation_interleave or mode == .manifest_preparation_close;
+    const cold_checkpoint = mode == .checkpoint_prepare_retry or mode == .checkpoint_descriptor_retry or mode == .checkpoint_descriptor_fence or mode == .checkpoint_cleanup_close or mode == .checkpoint_interleave or mode == .checkpoint_streaming;
     const retry_refusal = mode == .retry or mode == .maintenance_retry;
     var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
     defer state.owner.deinit();
@@ -6041,6 +6045,43 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         var manifest_calls: std.atomic.Value(usize) = .init(0);
         var manifest_failure: anyerror = error.ResourceBudgetExceeded;
         var fence_manifest: bool = false;
+        var warm_io_calls: std.atomic.Value(usize) = .init(0);
+        fn warmIo(_: *anyopaque) !void {
+            if (warm_io_calls.fetchAdd(1, .monotonic) == 0) return error.InputOutput;
+        }
+        var checkpoint_calls: std.atomic.Value(usize) = .init(0);
+        var descriptor_calls: std.atomic.Value(usize) = .init(0);
+        var checkpoint_backend: ?*lsm.Backend = null;
+        var checkpoint_refuse: std.atomic.Value(bool) = .init(false);
+        var descriptor_refuse: std.atomic.Value(bool) = .init(false);
+        var descriptor_fence: bool = false;
+        var checkpoint_interleave: bool = false;
+        fn checkpoint(original: read_admission.Port) !void {
+            _ = checkpoint_calls.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            const stats = execution.?.owner.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots - stats.control_slots);
+            const backend = checkpoint_backend.?;
+            while (!backend.mu.tryLock()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            backend.mu.unlock();
+            if (checkpoint_refuse.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+        }
+        fn descriptor(original: read_admission.Port) !void {
+            const call = descriptor_calls.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            const stats = execution.?.owner.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots - stats.control_slots);
+            if (descriptor_refuse.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+            if (descriptor_fence) io_mod.NativeSyncTestControl.control_failure_after_rename.store(true, .release);
+            if (call == 0 and checkpoint_interleave) {
+                const wait = (try original.executionWait()).?;
+                try wait.beginWait();
+                ready.set(std.testing.io);
+                const waited = go.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+                try wait.endWait();
+                try waited;
+            }
+        }
         var preparation_calls: std.atomic.Value(usize) = .init(0);
         var preparation_backend: ?*lsm.Backend = null;
         var preparation_interleave: bool = false;
@@ -6161,6 +6202,27 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         }
     };
     Interleave.execution = &state;
+    Interleave.checkpoint_backend = handle.ptr();
+    Interleave.checkpoint_calls.store(0, .release);
+    Interleave.descriptor_calls.store(0, .release);
+    Interleave.checkpoint_refuse.store(mode == .checkpoint_prepare_retry, .release);
+    Interleave.descriptor_refuse.store(mode == .checkpoint_descriptor_retry, .release);
+    Interleave.descriptor_fence = mode == .checkpoint_descriptor_fence;
+    Interleave.checkpoint_interleave = mode == .checkpoint_interleave;
+    if (cold_checkpoint) {
+        publication.manifest_edit_preparation.checkpoint_publication.test_hook = Interleave.checkpoint;
+        publication.manifest_edit_preparation.checkpoint_publication.test_descriptor_hook = Interleave.descriptor;
+    }
+    if (mode == .checkpoint_interleave) {
+        Interleave.ready = .unset;
+        Interleave.go = .unset;
+    }
+    if (mode == .checkpoint_cleanup_close) {
+        Interleave.frame_calls.store(0, .release);
+        Interleave.refuse_frame.store(false, .release);
+        Interleave.keep_frame_queued = true;
+        publication.manifest_edit_preparation.test_retirement_hook = Interleave.frameRetirement;
+    }
     Interleave.controlled_calls.store(0, .release);
     Interleave.refuse.store(mode == .publication_retry, .release);
     Interleave.refuse_replay = mode == .publication_rebase_retry;
@@ -6207,6 +6269,9 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         publication.memtable_reclamation.Job.test_admission_hook = null;
         lsm.repository.publication_test_hook = null;
         publication.read_metadata_reclamation.Job.test_admission_hook = null;
+        publication.manifest_edit_preparation.checkpoint_publication.test_hook = null;
+        publication.manifest_edit_preparation.checkpoint_publication.test_descriptor_hook = null;
+        io_mod.NativeSyncTestControl.control_failure_after_rename.store(false, .release);
         publication.manifest_edit_preparation.test_hook = null;
         publication.manifest_edit_preparation.test_retirement_hook = null;
         Interleave.execution = null;
@@ -6221,7 +6286,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     {
         var write = try handle.ptr().beginWrite();
         defer write.abort();
-        try write.put(.{}, "admitted", "durable");
+        try write.put(.{}, test_key, "durable");
         try write.commit();
     }
     const deadline = platform.time.monotonicNs() + 10 * std.time.ns_per_s;
@@ -6261,7 +6326,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         defer reopened.close();
         var read = try reopened.beginRead();
         defer read.abort();
-        try std.testing.expectEqualStrings("durable", try read.get(.{}, "admitted"));
+        try std.testing.expectEqualStrings("durable", try read.get(.{}, test_key));
         return;
     }
     if (mode == .maintenance_budget) {
@@ -6313,7 +6378,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         foreground = null;
         var pinned: ?local.storage_lsm_backend_runtime.NamespaceReadTxn(lsm.Backend) = null;
         defer if (pinned) |*read| read.abort();
-        if (mode == .publication_interleave or rebase_publication) {
+        if (mode == .publication_interleave or rebase_publication or mode == .checkpoint_interleave) {
             while (!Interleave.ready.isSet()) {
                 if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
                 try io.sleep(.fromMilliseconds(1), .awake);
@@ -6324,10 +6389,10 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             try std.testing.expect(handle.ptr().mu.tryLock());
             handle.ptr().mu.unlock();
             pinned = try handle.ptr().beginRead();
-            try std.testing.expectEqualStrings("durable", try pinned.?.get(.{}, "admitted"));
+            try std.testing.expectEqualStrings("durable", try pinned.?.get(.{}, test_key));
             var peer = try handle.ptr().beginWrite();
             defer peer.abort();
-            try peer.put(.{}, "admitted", "newer");
+            try peer.put(.{}, test_key, "newer");
             try peer.commit();
             if (rebase_publication) {
                 // A concurrent metadata owner changes the authoritative ledger
@@ -6346,16 +6411,18 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         while (true) {
             while (!handle.ptr().mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
             const backend = handle.ptr();
-            const cleanup_done = backend.retired_run_directories == null and backend.directory_reclaimer == null and
+            const cleanup_done = backend.retired_manifest_preparations == null and !backend.manifest_preparation_reclaim_in_flight and backend.retired_run_directories == null and backend.directory_reclaimer == null and
                 backend.retired_run_stores == null and backend.store_reclaimer == null and backend.retired_ledger_snapshots == null and
                 backend.retired_flush_outputs == null and !backend.flush_outputs_reclaim_in_flight and
                 backend.retired_memory_head == null and backend.memtable_reclaimer == null and !backend.memtable_reclaim_in_flight and
                 backend.read_metadata_reclaimer == null and backend.retired_projection_versions == null and backend.retired_domain_indexes == null and !backend.read_metadata_reclaim_in_flight and
                 !backend.directory_reclaim_in_flight and !backend.store_reclaim_in_flight and !backend.ledger_reclaim_in_flight and !backend.maintenance_job_in_flight;
             const done = backend.activeImmutableMemtableCount() == 0 and !backend.immutable_flush_job_in_flight and
-                (if (mode == .manifest_completion_fence)
+                (if (mode == .manifest_completion_fence or mode == .checkpoint_descriptor_fence)
                     cleanup_done and backend.flush_completion_pending and backend.manifest_recovery_required
-                else if (completion_retry)
+                else if (mode == .checkpoint_cleanup_close)
+                    !backend.flush_completion_pending and backend.retired_manifest_preparations != null and Interleave.frame_calls.load(.acquire) != 0
+                else if (completion_retry or cold_checkpoint)
                     cleanup_done and !backend.flush_completion_pending
                 else if (mode == .retirement_retry or mode == .retirement_capacity or mode == .publication_directory_retry or mode == .output_retirement_retry or mode == .immutable_retirement_retry)
                     cleanup_done
@@ -6370,6 +6437,14 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
             try io.sleep(.fromMilliseconds(1), .awake);
         }
+        if (cold_checkpoint) {
+            try std.testing.expect(Interleave.checkpoint_calls.load(.acquire) >= (if (mode == .checkpoint_prepare_retry or mode == .checkpoint_descriptor_retry) @as(usize, 2) else 1));
+            const completed = handle.ptr().snapshotWriteStats();
+            const expected: u64 = if (mode == .checkpoint_interleave) 2 else 1;
+            try std.testing.expectEqual(expected, completed.immutable_flushes);
+            try std.testing.expectEqual(expected, completed.flushes);
+            if (mode != .checkpoint_descriptor_fence) try std.testing.expectEqual(@as(u64, 1), completed.manifest_checkpoints);
+        }
         if (completion_retry) {
             try std.testing.expect(Interleave.manifest_calls.load(.acquire) >= 4);
             const completed = handle.ptr().snapshotWriteStats();
@@ -6378,8 +6453,15 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             try std.testing.expect(completed.wal_resets >= 1);
             try std.testing.expect(handle.ptr().wal_retention.reset_proven);
         }
-        if (mode == .read_metadata_retry or preparing_manifest) {
+        if (mode == .read_metadata_retry or preparing_manifest or mode == .checkpoint_replacement) {
             const before = handle.ptr().snapshotWriteStats();
+            const prior_descriptor = handle.ptr().manifest_journal.descriptor;
+            if (mode == .checkpoint_replacement) {
+                Interleave.warm_io_calls.store(0, .release);
+                lsm.repository.publication_test_hook = .{ .context = handle.ptr(), .run = Interleave.warmIo };
+                publication.manifest_edit_preparation.checkpoint_publication.test_hook = Interleave.checkpoint;
+                publication.manifest_edit_preparation.checkpoint_publication.test_descriptor_hook = Interleave.descriptor;
+            }
             if (preparing_manifest) {
                 Interleave.preparation_refuse = mode == .manifest_preparation_retry;
                 Interleave.preparation_interleave = mode == .manifest_preparation_interleave;
@@ -6394,7 +6476,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
                 publication.manifest_edit_preparation.test_hook = Interleave.preparation;
             }
             var cached = try handle.ptr().beginRead();
-            try std.testing.expectEqualStrings("durable", try cached.get(.{}, "admitted"));
+            try std.testing.expectEqualStrings("durable", try cached.get(.{}, test_key));
             cached.abort();
             // A normal peer commit invalidates the cached read generation.
             var peer = try handle.ptr().beginWrite();
@@ -6420,7 +6502,9 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
                         backend.retired_manifest_preparations == null and !backend.manifest_preparation_reclaim_in_flight;
                 const done = backend.activeImmutableMemtableCount() == 0 and !backend.immutable_flush_job_in_flight and
                     !backend.flush_completion_pending and cleanup_ready and
-                    (if (preparing_manifest) Interleave.preparation_calls.load(.acquire) >= (if (mode == .manifest_preparation_close) @as(usize, 1) else 2) else Interleave.metadata_calls.load(.acquire) >= 2);
+                    (if (mode == .checkpoint_replacement)
+                        Interleave.warm_io_calls.load(.acquire) >= 2 and Interleave.checkpoint_calls.load(.acquire) >= 1
+                    else if (preparing_manifest) Interleave.preparation_calls.load(.acquire) >= (if (mode == .manifest_preparation_close) @as(usize, 1) else 2) else Interleave.metadata_calls.load(.acquire) >= 2);
                 backend.mu.unlock();
                 if (done) break;
                 if (platform.time.monotonicNs() >= deadline) {
@@ -6430,6 +6514,13 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
                     return error.TestUnexpectedResult;
                 }
                 try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            if (mode == .checkpoint_replacement) {
+                const after = handle.ptr().snapshotWriteStats();
+                try std.testing.expectEqual(before.manifest_checkpoints + 1, after.manifest_checkpoints);
+                try std.testing.expect(!std.meta.eql(prior_descriptor, handle.ptr().manifest_journal.descriptor));
+                try std.testing.expectEqual(before.immutable_flushes + 1, after.immutable_flushes);
+                try std.testing.expectEqual(before.flushes + 1, after.flushes);
             }
             if (preparing_manifest) {
                 const after = handle.ptr().snapshotWriteStats();
@@ -6468,20 +6559,25 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             try std.testing.expect(completed.flushes > completed.immutable_flushes);
         }
         if (pinned) |*read| {
-            try std.testing.expectEqualStrings("durable", try read.get(.{}, "admitted"));
+            try std.testing.expectEqualStrings("durable", try read.get(.{}, test_key));
             read.abort();
             pinned = null;
             var fresh = try handle.ptr().beginRead();
             defer fresh.abort();
-            try std.testing.expectEqualStrings("newer", try fresh.get(.{}, "admitted"));
+            try std.testing.expectEqualStrings("newer", try fresh.get(.{}, test_key));
         }
         if (mode == .waker) {
             const waker_stats = handle.internalFlushWorkerStats().?;
             try std.testing.expect(waker_stats.wakeups >= 2);
             try std.testing.expect(waker_stats.maintenance_steps > 0);
         }
-        if (mode == .output_retirement_preflight or mode == .manifest_preparation_close) {
+        if (mode == .output_retirement_preflight or mode == .manifest_preparation_close or mode == .checkpoint_cleanup_close) {
             const backend = handle.ptr();
+            if (mode == .checkpoint_cleanup_close) {
+                const frame = backend.retired_manifest_preparations.?;
+                try std.testing.expect(frame.current != null and frame.obsolete != null and !frame.obsolete.?.retired);
+                try std.testing.expectEqual(frame.current.?, frame.checkpoint_owner.?.physical.encoder.source.cursor.directory);
+            }
             backend.closing.store(true, .release);
             backend.background_executor.drain();
             try std.testing.expectEqual(@as(u64, 0), backend.active_readers);
@@ -6499,13 +6595,13 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             try std.testing.expect(backend.retired_flush_outputs == null);
             try std.testing.expect(backend.retired_manifest_preparations == null);
         }
-        if (mode == .manifest_completion_fence) {
-            try std.testing.expectEqual(@as(usize, 1), Interleave.manifest_calls.load(.acquire));
+        if (mode == .manifest_completion_fence or mode == .checkpoint_descriptor_fence) {
+            if (mode == .manifest_completion_fence) try std.testing.expectEqual(@as(usize, 1), Interleave.manifest_calls.load(.acquire)) else try std.testing.expectEqual(@as(usize, 1), Interleave.descriptor_calls.load(.acquire));
             try std.testing.expect(!handle.ptr().wal_retention.reset_proven);
             // Recovery authority excludes publication retries. Simulate a crash
             // rather than invoking explicit close-time durability repair.
             handle.abandonAfterCrash();
-        } else if (mode == .manifest_preparation_retry or mode == .manifest_preparation_interleave) {
+        } else if (mode == .manifest_preparation_retry or mode == .manifest_preparation_interleave or mode == .checkpoint_replacement or (cold_checkpoint and mode != .checkpoint_cleanup_close)) {
             // Reopen must observe the accepted journal without close repairing
             // or checkpointing a missed publication.
             handle.abandonAfterCrash();
@@ -6523,8 +6619,8 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     defer reopened.close();
     var read = try reopened.beginRead();
     defer read.abort();
-    try std.testing.expectEqualStrings(if (mode == .publication_interleave or rebase_publication) "newer" else "durable", try read.get(.{}, "admitted"));
-    if (preparing_manifest) try std.testing.expectEqualStrings("metadata", try read.get(.{}, "second"));
+    try std.testing.expectEqualStrings(if (mode == .publication_interleave or rebase_publication or mode == .checkpoint_interleave) "newer" else "durable", try read.get(.{}, test_key));
+    if (preparing_manifest or mode == .checkpoint_replacement) try std.testing.expectEqualStrings("metadata", try read.get(.{}, "second"));
     if (mode == .manifest_preparation_interleave) try std.testing.expectEqualStrings("concurrent", try read.get(.{}, "third"));
 }
 
@@ -6759,4 +6855,123 @@ test "physical cache metadata registered flush publication captured manifest roo
 
 test "physical cache metadata registered flush publication controlled close drains refused manifest frame cleanup" {
     try normalAdmittedFlushWorker(.manifest_preparation_close);
+}
+
+test "physical cache metadata registered flush publication cold owned checkpoint retries preparation without rebuilding SST" {
+    try normalAdmittedFlushWorker(.checkpoint_prepare_retry);
+}
+test "physical cache metadata registered flush publication cold owned checkpoint retries before descriptor permission" {
+    try normalAdmittedFlushWorker(.checkpoint_descriptor_retry);
+}
+test "physical cache metadata registered flush publication cold owned checkpoint descriptor uncertainty fences WAL and reopens" {
+    try normalAdmittedFlushWorker(.checkpoint_descriptor_fence);
+}
+test "physical cache metadata registered flush publication cold owned checkpoint close drains retained physical grant" {
+    try normalAdmittedFlushWorker(.checkpoint_cleanup_close);
+}
+test "physical cache metadata registered flush publication cold owned checkpoint captured roots allow concurrent commit" {
+    try normalAdmittedFlushWorker(.checkpoint_interleave);
+}
+
+test "physical cache metadata registered flush publication normal journal IO failure replaces cold lineage without rebuilding SST" {
+    try normalAdmittedFlushWorker(.checkpoint_replacement);
+}
+test "physical cache metadata registered flush publication owned checkpoint streams long native metadata across physical chunks" {
+    try normalAdmittedFlushWorker(.checkpoint_streaming);
+}
+
+test "physical cache metadata registered flush publication close joins accepted checkpoint IO after producer cancellation" {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const io_mod = local.storage_lsm_backend_storage_io;
+    const checkpoint = local.storage_lsm_backend_compaction_publication.manifest_edit_preparation.checkpoint_publication;
+    const owners = @import("api/runnable_owner_execution.zig");
+    const platform = @import("antfly_platform");
+    const scheduler = local.common_request_admission.runnable_scheduler;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
+    defer state.owner.deinit();
+    var resources = try Resources.initWithBudgets(a, budgets_mod.smartResourceBudgetsForTotal(128 << 20));
+    defer resources.deinit();
+    resources.attachResourceManager();
+    defer RegisteredOutputFixture.drain(&resources.resource_manager);
+    var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
+    defer pool.deinit();
+    var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/checkpoint-cancel", .{tmp.sub_path});
+    defer a.free(root);
+    var handle = try lsm.BackendHandle.openWithConfig(a, root, .{
+        .storage = native.storage(),
+        .resource_manager = &resources.resource_manager,
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 128,
+        .immutable_flush_window_max_memtables = 1,
+        .compact_threshold_runs = 1000,
+        .l0_soft_limit_runs = 1000,
+        .l0_hard_limit_runs = 2000,
+    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = state.port() } });
+    var open = true;
+    const Hook = struct {
+        fn descriptor(original: read_admission.Port) !void {
+            try original.checkpoint();
+            // Prefix files are durable. Pause the actual next private-file
+            // operation, leaving its command accepted on the provider worker.
+            io_mod.NativeSyncTestControl.started.store(false, .release);
+            io_mod.NativeSyncTestControl.release.store(false, .release);
+            io_mod.NativeSyncTestControl.pause.store(true, .release);
+        }
+    };
+    checkpoint.test_descriptor_hook = Hook.descriptor;
+    defer {
+        io_mod.NativeSyncTestControl.release.store(true, .release);
+        io_mod.NativeSyncTestControl.pause.store(false, .release);
+        if (open) handle.close();
+        checkpoint.test_descriptor_hook = null;
+    }
+    var write = try handle.ptr().beginWrite();
+    defer write.abort();
+    try write.put(.{}, "accepted", "wal-durable");
+    try write.commit();
+    const deadline = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
+    while (!io_mod.NativeSyncTestControl.started.load(.acquire)) {
+        if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const backend = handle.ptr();
+    backend.closing.store(true, .release);
+    io_mod.NativeSyncTestControl.release.store(true, .release);
+    backend.background_executor.drain();
+    io_mod.NativeSyncTestControl.pause.store(false, .release);
+    try std.testing.expectEqual(@as(u64, 0), backend.active_readers);
+    const retained_frame = backend.retired_manifest_preparations.?;
+    const retained = retained_frame.checkpoint_owner.?;
+    try std.testing.expect(retained_frame.current != null and retained_frame.obsolete != null and !retained_frame.obsolete.?.retired);
+    try std.testing.expectEqual(retained_frame.current.?, retained.physical.encoder.source.cursor.directory);
+    try std.testing.expectEqual(@as(usize, 1), retained_frame.current.?.count());
+    try std.testing.expect(retained.live and retained.physical.file.pending != null);
+    try std.testing.expect(backend.flush_completion_pending and !backend.wal_retention.reset_proven);
+    {
+        var pass = try local.common_background_execution.Pass.initWithOptions(state.port(), &io, platform.time.monotonicNs() +| 200 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true });
+        defer pass.deinit();
+        var scope = try pass.admissionScope(io);
+        const payload = scope.payload();
+        var preparation: lsm.Backend.QuiescedClosePreparation = .{};
+        try preparation.resumeWithAdmission(backend, io, .init(&payload));
+        try std.testing.expect(backend.retired_manifest_preparations == null);
+    }
+    handle.abandonAfterCrash();
+    open = false;
+    RegisteredOutputFixture.drain(&resources.resource_manager);
+    try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("wal-durable", try read.get(.{}, "accepted"));
 }
