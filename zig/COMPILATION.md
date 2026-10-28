@@ -1597,6 +1597,14 @@ are 20/14 GiB, each including at least 25% headroom and fitting that budget
 alone. The policy never lowers an authored claim and leaves other test roots
 and build modes unchanged.
 
+Main run 40624165216 measured the C API consumer test object at
+17,141,358,592 bytes with the pinned Nix/glibc compiler. Its native Linux
+x86_64 GNU Debug reservation is 18 GiB: at least 10% above that peak while
+leaving 2 GiB in the existing 20 GiB compiler budget. The separately compiled
+physical implementation retains its authored 7 GiB claim instead of inheriting
+the consumer's reservation. The Lite model workflow uses the same pinned
+Nix/glibc compiler; portable compiler measurements are a different profile.
+
 Main run 39957596246 subsequently exhausted the heavy runner's 24 GiB
 cgroup limit while three default 7 GiB compiler claims overlapped under the
 workflow's 22 GiB override. Kernel OOM records showed approximately 23.5 GiB
