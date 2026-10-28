@@ -5112,6 +5112,37 @@ fn installOwnedTreeRuns(backend: anytype, plan: CompactionPlan, selected_len: us
     try job.publishLocked(backend, input_bytes, start_ns);
 }
 
+/// The normal detached flush owns its captured immutable inputs until this
+/// coupled handoff completes. Preparation/rebase and output retirement release
+/// Backend.mu; only the final candidate validation/swap runs under that guard.
+/// This does not yet authorize CPU admission around legacy metadata operators.
+pub fn publishFlushRuns(backend: anytype, outputs: *std.ArrayListUnmanaged(Run)) !void {
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    var job = try Publication.initAppend(backend, outputs.items.len);
+    job.controlled_append = true;
+    job.next = backend.active_compaction_publications;
+    backend.active_compaction_publications = &job;
+    defer {
+        job.finishLocked(backend, outputs);
+        var link = &backend.active_compaction_publications;
+        while (link.*.? != &job) link = &link.*.?.next;
+        link.* = job.next;
+    }
+    while (true) {
+        const ready = try job.advanceLocked(backend, outputs.items);
+        backend.directory_planning_slices +|= 1;
+        if (ready) break;
+        if (backend.manifestCoordinationIo()) |io| {
+            runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+            const yielded = io.sleep(.fromNanoseconds(1), .awake);
+            _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+            try yielded;
+        }
+    }
+    try job.publishLocked(backend, 0, backend.writeStatsNowNs());
+}
+
 /// Caller holds Backend.mu; large metadata destruction yields off-lock.
 pub fn discardOutputRunsLocked(comptime BackendType: type, backend: *BackendType, runs: *std.ArrayListUnmanaged(Run)) void {
     if (comptime @hasDecl(BackendType, "initOutputCleanup")) {

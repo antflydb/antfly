@@ -112,6 +112,13 @@ pub const Record = struct {
         return self.run.retainOwned();
     }
 
+    pub fn retainLegacyEntryWithAdmission(run: *const Run, original: admission.Port) !@import("run_directory.zig").Directory.EntryLease {
+        try original.checkpoint();
+        const self = try validateFixed(run);
+        if (!self.legacy_output) return error.ExecutionWaitUnsupported;
+        return self.source.?.lease.?.retainWithAdmission(original);
+    }
+
     pub fn validateLegacyOutputFixed(run: *const Run) !void {
         const self = try validateFixed(run);
         if (!self.legacy_output) return error.ExecutionWaitUnsupported;

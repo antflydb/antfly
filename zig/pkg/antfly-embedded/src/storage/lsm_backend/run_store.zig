@@ -552,6 +552,88 @@ pub const Store = struct {
         self.tree.putPrepared(allocator, entry);
         self.invalidateProjection(allocator);
     }
+    /// Controlled insertion of a completed registered output into a private
+    /// legacy writer candidate. The caller prepays the fixed wrapper/pool and
+    /// retains the entire candidate through abort; every path copy stays rooted.
+    pub const OutputInsertion = struct {
+        store: *Store,
+        payload: ?*Payload = null,
+        low: usize = 0,
+        high: usize = 0,
+        middle: usize = 0,
+        comparison: ?@import("run_comparison.zig").Cursor = null,
+        rank: ?usize = null,
+        edit: ?Tree.RankInsertion = null,
+        complete: bool = false,
+
+        pub fn memoryBound(store: *const Store) !u64 {
+            return std.math.add(u64, @sizeOf(Payload), try store.tree.prepareMemoryBound(1));
+        }
+
+        pub fn init(store: *Store, allocator: std.mem.Allocator, run: *const Run, original: admission.Port) !@This() {
+            try original.checkpoint();
+            if (store.registered_owner != null or store.testProjectionPresent()) return error.ExecutionWaitUnsupported;
+            try @import("registered_writer.zig").Record.validateLegacyOutputFixed(run);
+            try store.tree.prepareWithAdmission(allocator, original);
+            const payload = try allocator.create(Payload);
+            const parent = run.owner.?.raw.owner.?.retain();
+            store.tree.account.?.charge(@sizeOf(Payload));
+            payload.* = .{ .owner = .{ .raw = parent.raw, .destroy = Payload.destroy }, .parent = parent, .run = run.*, .owned = true, .destroy_run = store.destroy_run, .account = store.tree.account.?, .bytes = @sizeOf(Payload) };
+            payload.run.owner = &payload.owner;
+            payload.run.bloom_filter = null;
+            payload.run.owns_bloom_filter = false;
+            payload.run.table_index = null;
+            payload.run.cached_state_index = null;
+            payload.run.cached_index_index = null;
+            payload.run.cached_table_index = null;
+            payload.run.version_ref_pinned = false;
+            if (payload.run.path != null) payload.run.state = null;
+            return .{ .store = store, .payload = payload, .high = store.count() };
+        }
+        pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: admission.Port) !void {
+            try original.checkpoint();
+            if (self.complete) return;
+            const payload = self.payload orelse return error.InvalidArgument;
+            while (self.rank == null) {
+                try original.checkpoint();
+                if (self.low == self.high) {
+                    self.rank = self.low;
+                    break;
+                }
+                if (self.comparison == null) {
+                    self.middle = self.low + (self.high - self.low) / 2;
+                    self.comparison = .init(.read, .{ .run = self.store.at(self.middle) }, .{ .run = &payload.run });
+                }
+                const order = try self.comparison.?.resumeWithAdmission(original);
+                self.comparison = null;
+                switch (order) {
+                    .lt => self.low = self.middle + 1,
+                    .gt => self.high = self.middle,
+                    .eq => return error.DuplicateRun,
+                }
+            }
+            if (self.edit == null) self.edit = try Tree.RankInsertion.init(&self.store.tree, .{ .run = &payload.run, .payload = payload }, self.rank.?, false);
+            try self.edit.?.resumeWithAdmission(allocator, original);
+            std.debug.assert(try self.edit.?.takeRetired() == null);
+            self.complete = true;
+        }
+        pub fn takeWithAdmission(self: *@This(), original: admission.Port) !Run {
+            try original.checkpoint();
+            if (!self.complete or self.payload == null) return error.InvalidArgument;
+            return self.payload.?.run.retainOwned();
+        }
+        /// Final fixed drop only: the source is registered, caches are empty,
+        /// and any partially inserted path remains owned by the private tree.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.payload) |payload| payload.owner.release(allocator);
+            self.payload = null;
+        }
+    };
+
+    fn testProjectionPresent(self: *const Store) bool {
+        return if (comptime @import("builtin").is_test) self.test_projection != null else false;
+    }
+
     /// Registered candidates prepay the pool and prove this exact rank with
     /// bounded comparisons. The caller pins run through completion/abort.
     pub fn beginRegisteredInsertion(self: *Store, run: Run, rank: usize, replacing: bool, original: @import("../../common/read_admission.zig").Port) !Tree.RankInsertion {

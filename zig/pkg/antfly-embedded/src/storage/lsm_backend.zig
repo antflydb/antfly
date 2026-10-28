@@ -6038,7 +6038,7 @@ pub const Backend = struct {
                     if (self.closing.load(.acquire)) return;
                     return err;
                 },
-                error.Timeout, error.DeadlineExceeded, error.ResourceBudgetExceeded, error.ParentMemoryBusy, error.CapacityUnavailable, error.OutOfMemory, error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable => {
+                error.Timeout, error.DeadlineExceeded, error.ResourceBudgetExceeded, error.ParentMemoryBusy, error.CapacityUnavailable, error.OutOfMemory, error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable, error.CompactionPlanningStale => {
                     // Preserve immutable/WAL debt. Backoff outside every storage
                     // guard and execution capsule before admitting a new pass.
                     runtime_mod.unlockBackend(Backend, self, locked);
@@ -6309,25 +6309,32 @@ pub const Backend = struct {
 
         const elapsed_ns = self.writeStatsElapsedNs(start_ns);
         self.recordFlushWriteStats(input_entries, build_result.items, elapsed_ns);
-        self.write_stats.immutable_flushes += 1;
-        self.write_stats.immutable_flush_input_memtables += @intCast(window_count);
-        self.write_stats.immutable_flush_entries += @intCast(input_entries);
-        self.write_stats.immutable_flush_ns += elapsed_ns;
         // The build ran without the backend lock, so reserve only after the
-        // generation identity has been revalidated. From this point through
-        // retirement, publication is allocation-free except for installing
-        // the new run pointers themselves.
+        // generation identity has been revalidated. Publication may release
+        // the guard again while preparing its private candidate.
         var pinned_retirements: usize = 0;
         for (states_newest_first) |window_state| {
             if (self.immutableMemtableIsPinned(window_state)) pinned_retirements += 1;
         }
-        try self.retired_immutable_memtables.ensureUnusedCapacity(self.allocator, pinned_retirements);
-        var directory = try self.prepareRunDirectoryChange(null, build_result.items);
-        errdefer if (directory) |owned| owned.destroy(self.allocator);
-        self.invalidateReadVersion();
-        try compaction_mod.appendBackendRuns(self, &build_result);
-        self.publishRunDirectory(directory);
-        directory = null;
+        // Publication preparation can now release Backend.mu too. Readers may
+        // pin any captured input during that interval; reserve for that full
+        // bounded window before starting the off-lock candidate, not just for
+        // the pins observed before it starts.
+        try self.retired_immutable_memtables.ensureUnusedCapacity(self.allocator, if (admitted_runtime != null) window_count else pinned_retirements);
+        if (admitted_runtime != null) {
+            try compaction_mod.publishFlushRuns(self, &build_result);
+        } else {
+            var directory = try self.prepareRunDirectoryChange(null, build_result.items);
+            errdefer if (directory) |owned| owned.destroy(self.allocator);
+            self.invalidateReadVersion();
+            try compaction_mod.appendBackendRuns(self, &build_result);
+            self.publishRunDirectory(directory);
+            directory = null;
+        }
+        self.write_stats.immutable_flushes += 1;
+        self.write_stats.immutable_flush_input_memtables += @intCast(window_count);
+        self.write_stats.immutable_flush_entries += @intCast(input_entries);
+        self.write_stats.immutable_flush_ns += elapsed_ns;
         for (states_newest_first) |window_state| self.noteImmutablePublishedForWal(window_state);
         self.immutable_head += window_count;
         for (states_newest_first) |window_state| self.retireImmutableMemtable(@constCast(window_state));

@@ -140,7 +140,8 @@ const builtin = @import("builtin");
 // Physical checkpoint join observations survive metadata and issuer lifetimes.
 // Maintenance rounds carry bounded-selection continuation state.
 // Detached flush executors retain runtime access; writer records own legacy output tickets.
-pub const abi_version: u32 = 152;
+// Normal flush publication retains controlled edit cursors and pass deadlines.
+pub const abi_version: u32 = 153;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

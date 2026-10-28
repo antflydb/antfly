@@ -29865,3 +29865,44 @@ DB/index wiring; this is not full compiled-server durability qualification.
 
 Bounded legacy publication, compaction, synchronous foreground maintenance and
 remaining engine paths still need integration. The complete design stays open.
+
+## Normal flush publication uses off-lock controlled append edits (2026-10-27)
+
+The normal admitted detached file flush now uses the existing coupled candidate
+publication protocol instead of preparing all directory/writer additions under
+Backend.mu. Append-only publication snapshots the existing roots, prepares one
+output at a time off-lock, rebases concurrent directory/obsolete changes, and
+validates/swaps the coupled roots under the guard. It preserves existing runs and
+obsolete intent and does not count flush publication as a compaction. Flush
+metadata uses its accepted write/WAL credit rather than requesting a second
+compaction credit at the manifest frontier; recovery fences still reject swaps. Captured
+immutable retirement reserves for the full bounded window because readers may
+pin inputs during off-lock preparation. Completed immutable-flush counters advance
+only after publication; successfully built but rejected attempts remain physical
+build statistics and retain the immutable/WAL debt.
+
+Normal append edits use the controlled directory Put/IndexPreparation and writer
+rank-insertion cursors under a shared background execution pass. Writer comparison,
+COW path copying and directory summary work keep their checkpoints. Each output
+admission uses the same publication deadline; CPU ownership ends before relocking,
+legacy rebase, root retirement or the final guarded handoff. Directory entries
+retain the existing registered output source instead of cloning its metadata.
+Construction reservations cover the prepared index pools and writer wrappers;
+backend accounting adopts published/queued legacy accounts before those
+reservations release. Scope rejection owns all partial private trees through
+rollback, and transient refusal or stale planning retries the immutable debt.
+
+Focused native tests observe actual CPU ownership during controlled metadata
+edits, inject a pre-publication refusal, verify autonomous retry and reopen, and
+pause the real worker off-lock while a peer pins the captured input and commits a
+newer generation. The pinned reader retains its old value; a fresh reader and
+reopen see the newer one. Deterministic append/rebase fixtures preserve concurrent
+run and obsolete-ledger edits through every allocation failure. Controlled writer
+fixtures cover allocation and original-scope rejection ownership.
+
+This completes the normal-path wiring for controlled append preparation, not the
+whole bounded-publication milestone. Legacy rebase and retirement still require
+controlled execution integration. Existing compaction publication benefits from
+the corrected owned-output reference transfer, but compaction construction and
+remaining metadata operations have not been enabled under shared CPU admission.
+The same publication/compaction milestone and the full design remain open.

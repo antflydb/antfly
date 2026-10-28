@@ -3311,7 +3311,7 @@ const FlushPublicationFixture = struct {
     const Batch = Scope.FlushOutputs;
     const Builder = Scope.FlushBuilder.Owner;
     const Control = RegisteredOutputFixture.Control;
-    const Mode = enum { legacy, publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject, wal_retire, wal_replay, wal_prefix, wal_cancel, wal_failure, wal_resume, wal_delete_failure, wal_floor_failure, wal_legacy_replay, immutable_retire, immutable_prefix, immutable_cancel, file_snapshot };
+    const Mode = enum { controlled_writer, legacy, publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject, wal_retire, wal_replay, wal_prefix, wal_cancel, wal_failure, wal_resume, wal_delete_failure, wal_floor_failure, wal_legacy_replay, immutable_retire, immutable_prefix, immutable_cancel, file_snapshot };
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
     const Retry = struct {
         failing: *std.testing.FailingAllocator,
@@ -3447,7 +3447,7 @@ const FlushPublicationFixture = struct {
         };
         const install_checkpoint = mode == .checkpoint_install or mode == .checkpoint_repeat or mode == .checkpoint_install_reject or wal_mode or immutable_mode;
         var expected_logical: u64 = 17;
-        const late = mode == .legacy or mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode or mode == .file_snapshot;
+        const late = mode == .controlled_writer or mode == .legacy or mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode or mode == .file_snapshot;
         var failing = std.testing.FailingAllocator.init(a, .{});
         const owned = failing.allocator();
         var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
@@ -3562,7 +3562,7 @@ const FlushPublicationFixture = struct {
                 }
                 try std.testing.expectEqual(@as(usize, 3), queue.live.load(.acquire));
             }
-            if (mode == .legacy) {
+            if (mode == .legacy or mode == .controlled_writer) {
                 start = failing.alloc_index;
                 control.calls = 0;
                 control.target = if (oom) null else target;
@@ -3575,13 +3575,26 @@ const FlushPublicationFixture = struct {
                     result.runs.deinit(owned);
                     if (result.credit) |*credit| credit.release();
                 }
+                if (mode == .controlled_writer) {
+                    var candidate = backend.runs.fork();
+                    defer candidate.deinit(owned);
+                    for (result.runs.items) |*projected| {
+                        var insertion = retry.call(Scope.WriterStore.OutputInsertion.init, .{ &candidate, owned, projected, original }) catch |cause| break :work cause;
+                        defer insertion.deinit(owned);
+                        retry.call(Scope.WriterStore.OutputInsertion.resumeWithAdmission, .{ &insertion, owned, original }) catch |cause| break :work cause;
+                        var held = retry.call(Scope.WriterStore.OutputInsertion.takeWithAdmission, .{ &insertion, original }) catch |cause| break :work cause;
+                        held.deinit(owned);
+                    }
+                    for (result.runs.items) |*projected| projected.commitOutput();
+                    std.mem.swap(Scope.WriterStore, &backend.runs, &candidate);
+                }
                 allocations = failing.alloc_index - start;
                 control.live = false;
                 failing.fail_index = std.math.maxInt(usize);
                 try std.testing.expectEqual(@as(usize, 2), result.runs.items.len);
                 // Ticket-bearing projections must never enter coupled roots.
-                for (result.runs.items) |*projected| try std.testing.expectError(error.ExecutionWaitUnsupported, Scope.RegisteredWriter.validate(projected, quotaControl()));
-                try local.storage_lsm_backend_compaction.appendBackendRuns(&backend, &result.runs);
+                if (mode != .controlled_writer) for (result.runs.items) |*projected| try std.testing.expectError(error.ExecutionWaitUnsupported, Scope.RegisteredWriter.validate(projected, quotaControl()));
+                if (mode != .controlled_writer) try local.storage_lsm_backend_compaction.appendBackendRuns(&backend, &result.runs);
                 owners.installed = true;
                 owners.batch.?.requestRetirement();
                 owners.batch = null;
@@ -5920,7 +5933,7 @@ test "physical cache metadata bounded writer retirement refuses unknown producer
     try std.testing.expectEqual(@as(usize, 1), Callback.called);
 }
 
-fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported }) !void {
+fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -5984,6 +5997,47 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = worker_owner }, .internal_flush_worker = mode == .waker });
     var open = true;
     defer if (open) handle.close();
+    const publication = local.storage_lsm_backend_compaction_publication;
+    const Interleave = struct {
+        var claimed: std.atomic.Value(bool) = .init(false);
+        var ready: std.Io.Event = .unset;
+        var go: std.Io.Event = .unset;
+        var execution: ?*owners.State = null;
+        var controlled_calls: std.atomic.Value(usize) = .init(0);
+        var refuse: std.atomic.Value(bool) = .init(false);
+        fn controlled(_: *lsm.Backend, original: read_admission.Port) !void {
+            _ = controlled_calls.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.?.owner.scheduler.stats().runnable_slots);
+            if (refuse.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+        }
+        fn hook(_: *lsm.Backend, job: *const publication.Job) !void {
+            if (!job.append_only or claimed.swap(true, .acq_rel)) return;
+            try std.testing.expectEqual(@as(usize, 0), execution.?.owner.scheduler.stats().runnable_slots);
+            ready.set(std.testing.io);
+            go.waitUncancelable(std.testing.io);
+        }
+    };
+    Interleave.execution = &state;
+    Interleave.controlled_calls.store(0, .release);
+    Interleave.refuse.store(mode == .publication_retry, .release);
+    publication.test_controlled_hook = Interleave.controlled;
+    if (mode == .publication_interleave) {
+        Interleave.claimed.store(false, .release);
+        Interleave.ready = .unset;
+        Interleave.go = .unset;
+        publication.test_preparation_hook = Interleave.hook;
+    }
+    defer {
+        Interleave.go.set(std.testing.io);
+        if (open) {
+            handle.close();
+            open = false;
+        }
+        publication.test_preparation_hook = null;
+        publication.test_controlled_hook = null;
+        Interleave.execution = null;
+    }
     const io = std.testing.io;
     const borrowed = runtime.native_abi.IoBorrow.init(&io);
     const owner = state.port();
@@ -6084,6 +6138,26 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     } else {
         owner.finish(foreground.?);
         foreground = null;
+        var pinned: ?local.storage_lsm_backend_runtime.NamespaceReadTxn(lsm.Backend) = null;
+        defer if (pinned) |*read| read.abort();
+        if (mode == .publication_interleave) {
+            while (!Interleave.ready.isSet()) {
+                if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            // This is the actual native worker paused during off-lock metadata
+            // preparation. A peer can pin its captured immutable and commit a
+            // new generation before the final publication swap.
+            try std.testing.expect(handle.ptr().mu.tryLock());
+            handle.ptr().mu.unlock();
+            pinned = try handle.ptr().beginRead();
+            try std.testing.expectEqualStrings("durable", try pinned.?.get(.{}, "admitted"));
+            var peer = try handle.ptr().beginWrite();
+            defer peer.abort();
+            try peer.put(.{}, "admitted", "newer");
+            try peer.commit();
+            Interleave.go.set(io);
+        }
         while (true) {
             while (!handle.ptr().mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
             const done = handle.ptr().activeImmutableMemtableCount() == 0 and !handle.ptr().immutable_flush_job_in_flight;
@@ -6093,6 +6167,20 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             try io.sleep(.fromMilliseconds(1), .awake);
         }
         try std.testing.expect(state.owner.scheduler.stats().grants[@backingInt(scheduler.Class.background)] > 0);
+        try std.testing.expect(Interleave.controlled_calls.load(.acquire) >= (if (mode == .publication_retry) @as(usize, 2) else 1));
+        if (mode == .publication_retry) {
+            const completed = handle.ptr().snapshotWriteStats();
+            try std.testing.expectEqual(@as(u64, 1), completed.immutable_flushes);
+            try std.testing.expect(completed.flushes >= 2);
+        }
+        if (pinned) |*read| {
+            try std.testing.expectEqualStrings("durable", try read.get(.{}, "admitted"));
+            read.abort();
+            pinned = null;
+            var fresh = try handle.ptr().beginRead();
+            defer fresh.abort();
+            try std.testing.expectEqualStrings("newer", try fresh.get(.{}, "admitted"));
+        }
         if (mode == .waker) {
             const waker_stats = handle.internalFlushWorkerStats().?;
             try std.testing.expect(waker_stats.wakeups >= 2);
@@ -6112,7 +6200,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     defer reopened.close();
     var read = try reopened.beginRead();
     defer read.abort();
-    try std.testing.expectEqualStrings("durable", try read.get(.{}, "admitted"));
+    try std.testing.expectEqualStrings(if (mode == .publication_interleave) "newer" else "durable", try read.get(.{}, "admitted"));
 }
 
 test "physical cache metadata registered flush publication normal worker waits for shared execution then persists and reopens" {
@@ -6154,4 +6242,18 @@ test "physical cache metadata registered flush publication internal waker uses s
 
 test "physical cache metadata registered flush publication unsupported admitted provider keeps working legacy maintenance" {
     try normalAdmittedFlushWorker(.maintenance_unsupported);
+}
+
+test "physical cache metadata registered flush publication normal candidate permits peer pins writes and stable reads before swap" {
+    try normalAdmittedFlushWorker(.publication_interleave);
+}
+
+test "physical cache metadata registered flush publication controlled candidate refusal retires and retries immutable debt" {
+    try normalAdmittedFlushWorker(.publication_retry);
+}
+
+test "physical cache metadata registered flush publication controlled writer insertion preserves ownership at allocation and original refusal" {
+    const baseline = try FlushPublicationFixture.run(.controlled_writer, null, false, false);
+    for ([_]usize{ 0, 1, 8, 24, 48, 96 }) |point| _ = try FlushPublicationFixture.run(.controlled_writer, point, false, true);
+    for (0..baseline.allocations) |allocation| _ = try FlushPublicationFixture.run(.controlled_writer, allocation, true, true);
 }
