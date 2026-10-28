@@ -13011,7 +13011,7 @@ fn linearNoBiasQ4Q5KPreparedPanel(
             var acc_r1_3: F32xN = @splat(0.0);
             for (0..row_blocks) |block_idx| {
                 const block_input_off = block_idx * values_per_block;
-                accumulateQ4KPreparedBlock4Rows(2, .{ input_r0[block_input_off..][0..values_per_block], input_r1[block_input_off..][0..values_per_block] }, preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3), .{ .{ &acc_r0_0, &acc_r0_1, &acc_r0_2, &acc_r0_3 }, .{ &acc_r1_0, &acc_r1_1, &acc_r1_2, &acc_r1_3 } });
+                accumulatePreparedFloatBlock4Rows(false, 2, .{ input_r0[block_input_off..][0..values_per_block], input_r1[block_input_off..][0..values_per_block] }, .{ preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3) }, .{ .{ &acc_r0_0, &acc_r0_1, &acc_r0_2, &acc_r0_3 }, .{ &acc_r1_0, &acc_r1_1, &acc_r1_2, &acc_r1_3 } });
             }
             out_r0[o] = @reduce(.Add, acc_r0_0);
             out_r0[o + 1] = @reduce(.Add, acc_r0_1);
@@ -13053,7 +13053,7 @@ fn linearNoBiasQ4Q5KPreparedPanel(
             var acc3: F32xN = @splat(0.0);
             for (0..row_blocks) |block_idx| {
                 const input_block = input_row[block_idx * values_per_block ..][0..values_per_block];
-                accumulateQ4KPreparedBlock4Rows(1, .{input_block}, preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3), .{.{ &acc0, &acc1, &acc2, &acc3 }});
+                accumulatePreparedFloatBlock4Rows(false, 1, .{input_block}, .{ preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2), preparedKPanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3) }, .{.{ &acc0, &acc1, &acc2, &acc3 }});
             }
             out_row[o] = @reduce(.Add, acc0);
             out_row[o + 1] = @reduce(.Add, acc1);
@@ -13136,9 +13136,24 @@ fn processQ4KTripleRowSingle(
         for (0..row_blocks) |block_idx| {
             const prepared_off = block_idx * prepared_q4_k_block_bytes;
             const input_block = input_row[block_idx * values_per_block ..][0..values_per_block];
-            accumulateQ4KPreparedBlock4Rows(1, .{input_block}, prepared_blocks_a[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_a[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_a[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_a[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes], .{.{ &acc_a0, &acc_a1, &acc_a2, &acc_a3 }});
-            accumulateQ4KPreparedBlock4Rows(1, .{input_block}, prepared_blocks_b[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_b[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_b[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_b[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes], .{.{ &acc_b0, &acc_b1, &acc_b2, &acc_b3 }});
-            accumulateQ4KPreparedBlock4Rows(1, .{input_block}, prepared_blocks_c[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_c[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_c[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_c[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes], .{.{ &acc_c0, &acc_c1, &acc_c2, &acc_c3 }});
+            accumulatePreparedFloatBlock4Rows(false, 1, .{input_block}, .{
+                prepared_blocks_a[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_a[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_a[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_a[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes],
+            }, .{.{ &acc_a0, &acc_a1, &acc_a2, &acc_a3 }});
+            accumulatePreparedFloatBlock4Rows(false, 1, .{input_block}, .{
+                prepared_blocks_b[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_b[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_b[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_b[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes],
+            }, .{.{ &acc_b0, &acc_b1, &acc_b2, &acc_b3 }});
+            accumulatePreparedFloatBlock4Rows(false, 1, .{input_block}, .{
+                prepared_blocks_c[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_c[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_c[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_c[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes],
+            }, .{.{ &acc_c0, &acc_c1, &acc_c2, &acc_c3 }});
         }
         out_a[o] = @reduce(.Add, acc_a0) + optionalLinearBiasAt(bias_a, o);
         out_a[o + 1] = @reduce(.Add, acc_a1) + optionalLinearBiasAt(bias_a, o + 1);
@@ -13280,9 +13295,24 @@ fn processQ4KTripleRowPair(
             const block_input_off = block_idx * values_per_block;
             const input_block_r0 = input_r0[block_input_off..][0..values_per_block];
             const input_block_r1 = input_r1[block_input_off..][0..values_per_block];
-            accumulateQ4KPreparedBlock4Rows(2, .{ input_block_r0, input_block_r1 }, prepared_blocks_a[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_a[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_a[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_a[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes], .{ .{ &a_r0_0, &a_r0_1, &a_r0_2, &a_r0_3 }, .{ &a_r1_0, &a_r1_1, &a_r1_2, &a_r1_3 } });
-            accumulateQ4KPreparedBlock4Rows(2, .{ input_block_r0, input_block_r1 }, prepared_blocks_b[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_b[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_b[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_b[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes], .{ .{ &b_r0_0, &b_r0_1, &b_r0_2, &b_r0_3 }, .{ &b_r1_0, &b_r1_1, &b_r1_2, &b_r1_3 } });
-            accumulateQ4KPreparedBlock4Rows(2, .{ input_block_r0, input_block_r1 }, prepared_blocks_c[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_c[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_c[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes], prepared_blocks_c[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes], .{ .{ &c_r0_0, &c_r0_1, &c_r0_2, &c_r0_3 }, .{ &c_r1_0, &c_r1_1, &c_r1_2, &c_r1_3 } });
+            accumulatePreparedFloatBlock4Rows(false, 2, .{ input_block_r0, input_block_r1 }, .{
+                prepared_blocks_a[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_a[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_a[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_a[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes],
+            }, .{ .{ &a_r0_0, &a_r0_1, &a_r0_2, &a_r0_3 }, .{ &a_r1_0, &a_r1_1, &a_r1_2, &a_r1_3 } });
+            accumulatePreparedFloatBlock4Rows(false, 2, .{ input_block_r0, input_block_r1 }, .{
+                prepared_blocks_b[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_b[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_b[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_b[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes],
+            }, .{ .{ &b_r0_0, &b_r0_1, &b_r0_2, &b_r0_3 }, .{ &b_r1_0, &b_r1_1, &b_r1_2, &b_r1_3 } });
+            accumulatePreparedFloatBlock4Rows(false, 2, .{ input_block_r0, input_block_r1 }, .{
+                prepared_blocks_c[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_c[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_c[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes],
+                prepared_blocks_c[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes],
+            }, .{ .{ &c_r0_0, &c_r0_1, &c_r0_2, &c_r0_3 }, .{ &c_r1_0, &c_r1_1, &c_r1_2, &c_r1_3 } });
         }
         const bias_a0 = optionalLinearBiasAt(bias_a, o);
         const bias_a1 = optionalLinearBiasAt(bias_a, o + 1);
@@ -29871,7 +29901,7 @@ inline fn accumulateQ4KPreparedBlock4MR1(
     acc2: *F32xN,
     acc3: *F32xN,
 ) void {
-    accumulateQ4KPreparedBlock4Rows(1, .{input_block}, prepared_block0, prepared_block1, prepared_block2, prepared_block3, .{.{ acc0, acc1, acc2, acc3 }});
+    accumulatePreparedFloatBlock4Rows(false, 1, .{input_block}, .{ prepared_block0, prepared_block1, prepared_block2, prepared_block3 }, .{.{ acc0, acc1, acc2, acc3 }});
 }
 
 inline fn accumulateQ4KPreparedBlock4MR2(
@@ -29890,110 +29920,55 @@ inline fn accumulateQ4KPreparedBlock4MR2(
     acc_r1_2: *F32xN,
     acc_r1_3: *F32xN,
 ) void {
-    accumulateQ4KPreparedBlock4Rows(2, .{ input_block_r0, input_block_r1 }, prepared_block0, prepared_block1, prepared_block2, prepared_block3, .{ .{ acc_r0_0, acc_r0_1, acc_r0_2, acc_r0_3 }, .{ acc_r1_0, acc_r1_1, acc_r1_2, acc_r1_3 } });
+    accumulatePreparedFloatBlock4Rows(false, 2, .{ input_block_r0, input_block_r1 }, .{ prepared_block0, prepared_block1, prepared_block2, prepared_block3 }, .{ .{ acc_r0_0, acc_r0_1, acc_r0_2, acc_r0_3 }, .{ acc_r1_0, acc_r1_1, acc_r1_2, acc_r1_3 } });
 }
 
-inline fn accumulateQ4KPreparedBlock4Rows(
-    comptime row_count: usize,
-    input_blocks: [row_count][]const f32,
-    prepared_block0: []const u8,
-    prepared_block1: []const u8,
-    prepared_block2: []const u8,
-    prepared_block3: []const u8,
-    accumulators: [row_count][4]*F32xN,
-) void {
-    comptime std.debug.assert(row_count == 1 or row_count == 2);
-    std.debug.assert(prepared_block0.len == prepared_q4_k_block_bytes);
-    std.debug.assert(prepared_block1.len == prepared_q4_k_block_bytes);
-    std.debug.assert(prepared_block2.len == prepared_q4_k_block_bytes);
-    std.debug.assert(prepared_block3.len == prepared_q4_k_block_bytes);
+inline fn preparedFloatBlock4Weight(comptime signed_q6: bool, raw: U8xN, scale: F32xN, minimum: F32xN) F32xN {
+    const decoded: F32xN = if (signed_q6) @floatFromInt(@as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(raw)))) else @floatFromInt(raw);
+    return if (signed_q6) scale * decoded else scale * decoded - minimum;
+}
 
-    const q_values0 = prepared_block0[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
+/// Share decoding while retaining MR1's per-column arithmetic/store schedule.
+inline fn preparedFloatBlock4Step(comptime signed_q6: bool, comptime mr: usize, inputs: [mr][]const f32, values: [4][]const u8, offset: usize, scales: [4]F32xN, minimums: [4]F32xN, accumulators: [mr][4]*F32xN) void {
+    var x: [mr]F32xN = undefined;
+    inline for (0..mr) |row| x[row] = inputs[row][offset..][0..VEC_LEN].*;
+    var raw: [4]U8xN = undefined;
+    inline for (0..4) |col| raw[col] = values[col][offset..][0..VEC_LEN].*;
+    if (comptime mr == 1) {
+        inline for (0..4) |col| accumulators[0][col].* += x[0] * preparedFloatBlock4Weight(signed_q6, raw[col], scales[col], minimums[col]);
+    } else {
+        var weights: [4]F32xN = undefined;
+        inline for (0..4) |col| weights[col] = preparedFloatBlock4Weight(signed_q6, raw[col], scales[col], minimums[col]);
+        inline for (0..mr) |row| inline for (0..4) |col| {
+            accumulators[row][col].* += x[row] * weights[col];
+        };
+    }
+}
 
-    const q_values1 = prepared_block1[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-
-    const q_values2 = prepared_block2[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-
-    const q_values3 = prepared_block3[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-
-    for (0..4) |chunk| {
-        const sub = chunk * 2;
-        const dsc00: F32xN = @splat(preparedQ4KDsc(prepared_block0, sub));
-        const dmn00: F32xN = @splat(preparedQ4KDmn(prepared_block0, sub));
-        const dsc01: F32xN = @splat(preparedQ4KDsc(prepared_block0, sub + 1));
-        const dmn01: F32xN = @splat(preparedQ4KDmn(prepared_block0, sub + 1));
-
-        const dsc10: F32xN = @splat(preparedQ4KDsc(prepared_block1, sub));
-        const dmn10: F32xN = @splat(preparedQ4KDmn(prepared_block1, sub));
-        const dsc11: F32xN = @splat(preparedQ4KDsc(prepared_block1, sub + 1));
-        const dmn11: F32xN = @splat(preparedQ4KDmn(prepared_block1, sub + 1));
-
-        const dsc20: F32xN = @splat(preparedQ4KDsc(prepared_block2, sub));
-        const dmn20: F32xN = @splat(preparedQ4KDmn(prepared_block2, sub));
-        const dsc21: F32xN = @splat(preparedQ4KDsc(prepared_block2, sub + 1));
-        const dmn21: F32xN = @splat(preparedQ4KDmn(prepared_block2, sub + 1));
-
-        const dsc30: F32xN = @splat(preparedQ4KDsc(prepared_block3, sub));
-        const dmn30: F32xN = @splat(preparedQ4KDmn(prepared_block3, sub));
-        const dsc31: F32xN = @splat(preparedQ4KDsc(prepared_block3, sub + 1));
-        const dmn31: F32xN = @splat(preparedQ4KDmn(prepared_block3, sub + 1));
-
-        const input_off = chunk * 64;
-        const q_off = chunk * 64;
-
-        // First sub-block (sub).  Compute each col's dequantised weight
-        // lane once and apply to both input rows.
-        var i: usize = 0;
-        while (i < 32) : (i += VEC_LEN) {
-            var inputs: [row_count]F32xN = undefined;
-            inline for (0..row_count) |row| inputs[row] = input_blocks[row][input_off + i ..][0..VEC_LEN].*;
-            const q0: U8xN = q_values0[q_off + i ..][0..VEC_LEN].*;
-            const q1: U8xN = q_values1[q_off + i ..][0..VEC_LEN].*;
-            const q2: U8xN = q_values2[q_off + i ..][0..VEC_LEN].*;
-            const q3: U8xN = q_values3[q_off + i ..][0..VEC_LEN].*;
-            if (row_count == 1) {
-                accumulators[0][0].* += inputs[0] * (dsc00 * @as(F32xN, @floatFromInt(q0)) - dmn00);
-                accumulators[0][1].* += inputs[0] * (dsc10 * @as(F32xN, @floatFromInt(q1)) - dmn10);
-                accumulators[0][2].* += inputs[0] * (dsc20 * @as(F32xN, @floatFromInt(q2)) - dmn20);
-                accumulators[0][3].* += inputs[0] * (dsc30 * @as(F32xN, @floatFromInt(q3)) - dmn30);
+inline fn accumulatePreparedFloatBlock4Rows(comptime signed_q6: bool, comptime mr: usize, inputs: [mr][]const f32, blocks: [4][]const u8, accumulators: [mr][4]*F32xN) void {
+    comptime std.debug.assert(mr == 1 or mr == 2);
+    var values: [4][]const u8 = undefined;
+    inline for (0..4) |col| {
+        std.debug.assert(blocks[col].len == prepared_q4_k_block_bytes);
+        values[col] = blocks[col][prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
+    }
+    const halves = if (signed_q6) 1 else 2;
+    for (0..(if (signed_q6) 16 else 4)) |chunk| {
+        var scales: [halves][4]F32xN = undefined;
+        var minimums: [halves][4]F32xN = undefined;
+        inline for (0..4) |col| inline for (0..halves) |half| {
+            const sub = chunk * halves + half;
+            scales[half][col] = @splat(if (signed_q6) preparedQ6KDsc(blocks[col], sub) else preparedQ4KDsc(blocks[col], sub));
+            if (!signed_q6) minimums[half][col] = @splat(preparedQ4KDmn(blocks[col], sub));
+        };
+        inline for (0..halves) |half| {
+            const base = chunk * (if (signed_q6) @as(usize, 16) else 64) + half * 32;
+            if (comptime signed_q6) {
+                comptime var i: usize = 0;
+                inline while (i < 16) : (i += VEC_LEN) preparedFloatBlock4Step(true, mr, inputs, values, base + i, scales[half], undefined, accumulators);
             } else {
-                const w0 = dsc00 * @as(F32xN, @floatFromInt(q0)) - dmn00;
-                const w1 = dsc10 * @as(F32xN, @floatFromInt(q1)) - dmn10;
-                const w2 = dsc20 * @as(F32xN, @floatFromInt(q2)) - dmn20;
-                const w3 = dsc30 * @as(F32xN, @floatFromInt(q3)) - dmn30;
-                inline for (0..row_count) |row| {
-                    accumulators[row][0].* += inputs[row] * w0;
-                    accumulators[row][1].* += inputs[row] * w1;
-                    accumulators[row][2].* += inputs[row] * w2;
-                    accumulators[row][3].* += inputs[row] * w3;
-                }
-            }
-        }
-        // Second sub-block (sub + 1).
-        i = 0;
-        while (i < 32) : (i += VEC_LEN) {
-            var inputs: [row_count]F32xN = undefined;
-            inline for (0..row_count) |row| inputs[row] = input_blocks[row][input_off + 32 + i ..][0..VEC_LEN].*;
-            const q0: U8xN = q_values0[q_off + 32 + i ..][0..VEC_LEN].*;
-            const q1: U8xN = q_values1[q_off + 32 + i ..][0..VEC_LEN].*;
-            const q2: U8xN = q_values2[q_off + 32 + i ..][0..VEC_LEN].*;
-            const q3: U8xN = q_values3[q_off + 32 + i ..][0..VEC_LEN].*;
-            if (row_count == 1) {
-                accumulators[0][0].* += inputs[0] * (dsc01 * @as(F32xN, @floatFromInt(q0)) - dmn01);
-                accumulators[0][1].* += inputs[0] * (dsc11 * @as(F32xN, @floatFromInt(q1)) - dmn11);
-                accumulators[0][2].* += inputs[0] * (dsc21 * @as(F32xN, @floatFromInt(q2)) - dmn21);
-                accumulators[0][3].* += inputs[0] * (dsc31 * @as(F32xN, @floatFromInt(q3)) - dmn31);
-            } else {
-                const w0 = dsc01 * @as(F32xN, @floatFromInt(q0)) - dmn01;
-                const w1 = dsc11 * @as(F32xN, @floatFromInt(q1)) - dmn11;
-                const w2 = dsc21 * @as(F32xN, @floatFromInt(q2)) - dmn21;
-                const w3 = dsc31 * @as(F32xN, @floatFromInt(q3)) - dmn31;
-                inline for (0..row_count) |row| {
-                    accumulators[row][0].* += inputs[row] * w0;
-                    accumulators[row][1].* += inputs[row] * w1;
-                    accumulators[row][2].* += inputs[row] * w2;
-                    accumulators[row][3].* += inputs[row] * w3;
-                }
+                var i: usize = 0;
+                while (i < 32) : (i += VEC_LEN) preparedFloatBlock4Step(false, mr, inputs, values, base + i, scales[half], minimums[half], accumulators);
             }
         }
     }
@@ -31014,40 +30989,7 @@ inline fn accumulateQ6KPreparedBlock4MR1(
     acc2: *F32xN,
     acc3: *F32xN,
 ) void {
-    std.debug.assert(prepared_block0.len == prepared_q4_k_block_bytes);
-    std.debug.assert(prepared_block1.len == prepared_q4_k_block_bytes);
-    std.debug.assert(prepared_block2.len == prepared_q4_k_block_bytes);
-    std.debug.assert(prepared_block3.len == prepared_q4_k_block_bytes);
-
-    const q_values0 = prepared_block0[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-    const q_values1 = prepared_block1[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-    const q_values2 = prepared_block2[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-    const q_values3 = prepared_block3[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-
-    for (0..16) |sub| {
-        const scale0: F32xN = @splat(preparedQ6KDsc(prepared_block0, sub));
-        const scale1: F32xN = @splat(preparedQ6KDsc(prepared_block1, sub));
-        const scale2: F32xN = @splat(preparedQ6KDsc(prepared_block2, sub));
-        const scale3: F32xN = @splat(preparedQ6KDsc(prepared_block3, sub));
-        const q_off = sub * 16;
-        const input_off = sub * 16;
-        comptime var i: usize = 0;
-        inline while (i < 16) : (i += VEC_LEN) {
-            const inp: F32xN = input_block[input_off + i ..][0..VEC_LEN].*;
-            const raw0: U8xN = q_values0[q_off + i ..][0..VEC_LEN].*;
-            const raw1: U8xN = q_values1[q_off + i ..][0..VEC_LEN].*;
-            const raw2: U8xN = q_values2[q_off + i ..][0..VEC_LEN].*;
-            const raw3: U8xN = q_values3[q_off + i ..][0..VEC_LEN].*;
-            const q0: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw0));
-            const q1: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw1));
-            const q2: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw2));
-            const q3: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw3));
-            acc0.* += inp * (scale0 * @as(F32xN, @floatFromInt(q0)));
-            acc1.* += inp * (scale1 * @as(F32xN, @floatFromInt(q1)));
-            acc2.* += inp * (scale2 * @as(F32xN, @floatFromInt(q2)));
-            acc3.* += inp * (scale3 * @as(F32xN, @floatFromInt(q3)));
-        }
-    }
+    accumulatePreparedFloatBlock4Rows(true, 1, .{input_block}, .{ prepared_block0, prepared_block1, prepared_block2, prepared_block3 }, .{.{ acc0, acc1, acc2, acc3 }});
 }
 
 inline fn accumulateQ6KPreparedBlock4MR2(
@@ -31066,49 +31008,7 @@ inline fn accumulateQ6KPreparedBlock4MR2(
     acc_r1_2: *F32xN,
     acc_r1_3: *F32xN,
 ) void {
-    std.debug.assert(prepared_block0.len == prepared_q4_k_block_bytes);
-    std.debug.assert(prepared_block1.len == prepared_q4_k_block_bytes);
-    std.debug.assert(prepared_block2.len == prepared_q4_k_block_bytes);
-    std.debug.assert(prepared_block3.len == prepared_q4_k_block_bytes);
-
-    const q_values0 = prepared_block0[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-    const q_values1 = prepared_block1[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-    const q_values2 = prepared_block2[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-    const q_values3 = prepared_block3[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-
-    for (0..16) |sub| {
-        const scale0: F32xN = @splat(preparedQ6KDsc(prepared_block0, sub));
-        const scale1: F32xN = @splat(preparedQ6KDsc(prepared_block1, sub));
-        const scale2: F32xN = @splat(preparedQ6KDsc(prepared_block2, sub));
-        const scale3: F32xN = @splat(preparedQ6KDsc(prepared_block3, sub));
-        const q_off = sub * 16;
-        const input_off = sub * 16;
-        comptime var i: usize = 0;
-        inline while (i < 16) : (i += VEC_LEN) {
-            const inp_r0: F32xN = input_block_r0[input_off + i ..][0..VEC_LEN].*;
-            const inp_r1: F32xN = input_block_r1[input_off + i ..][0..VEC_LEN].*;
-            const raw0: U8xN = q_values0[q_off + i ..][0..VEC_LEN].*;
-            const raw1: U8xN = q_values1[q_off + i ..][0..VEC_LEN].*;
-            const raw2: U8xN = q_values2[q_off + i ..][0..VEC_LEN].*;
-            const raw3: U8xN = q_values3[q_off + i ..][0..VEC_LEN].*;
-            const q0: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw0));
-            const q1: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw1));
-            const q2: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw2));
-            const q3: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw3));
-            const w0 = scale0 * @as(F32xN, @floatFromInt(q0));
-            const w1 = scale1 * @as(F32xN, @floatFromInt(q1));
-            const w2 = scale2 * @as(F32xN, @floatFromInt(q2));
-            const w3 = scale3 * @as(F32xN, @floatFromInt(q3));
-            acc_r0_0.* += inp_r0 * w0;
-            acc_r0_1.* += inp_r0 * w1;
-            acc_r0_2.* += inp_r0 * w2;
-            acc_r0_3.* += inp_r0 * w3;
-            acc_r1_0.* += inp_r1 * w0;
-            acc_r1_1.* += inp_r1 * w1;
-            acc_r1_2.* += inp_r1 * w2;
-            acc_r1_3.* += inp_r1 * w3;
-        }
-    }
+    accumulatePreparedFloatBlock4Rows(true, 2, .{ input_block_r0, input_block_r1 }, .{ prepared_block0, prepared_block1, prepared_block2, prepared_block3 }, .{ .{ acc_r0_0, acc_r0_1, acc_r0_2, acc_r0_3 }, .{ acc_r1_0, acc_r1_1, acc_r1_2, acc_r1_3 } });
 }
 
 fn dotQ6_KBlock(input_block: []const f32, block: []const u8) f32 {
@@ -51377,5 +51277,101 @@ test "Q3 four column rows independent oracle and benchmark" {
         for (&times) |*sample| sample.* = state.measure(mr);
         std.mem.sort(u64, &times, {}, std.sort.asc(u64));
         std.debug.print("q3_four mr={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=2001\n", .{ mr, @as(f64, @floatFromInt(times[10])) / 2001.0, @as(f64, @floatFromInt(times[19])) / 2001.0, times[10], times[19] });
+    };
+}
+test "prepared float four column families independent oracle and benchmark" {
+    @setEvalBranchQuota(500_000);
+    const State = struct {
+        inputs: [2][256]f32 align(64) = @splat(@splat(0)),
+        blocks: [4][320]u8 align(64) = @splat(@splat(0)),
+        fn initialize(self: *@This(), comptime kind: usize, seed: usize) void {
+            for (&self.inputs, 0..) |*input, row| for (input, 0..) |*x, i| {
+                x.* = if (seed == 0) 0 else @as(f32, @floatFromInt(@as(i32, @intCast((i * 17 + row * 31 + seed) % 33)) - 16)) * 0.125;
+            };
+            for (&self.blocks, 0..) |*block, col| {
+                @memset(block, 0);
+                for (0..(if (kind == 2) @as(usize, 16) else 8)) |sub| {
+                    const scale: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((sub + col * 3 + seed) % 11)) - 5)) * 0.125;
+                    const minimum: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((sub * 3 + col + seed) % 9)) - 4)) * 0.0625;
+                    std.mem.writeInt(u32, block[sub * 4 ..][0..4], @bitCast(scale), .little);
+                    if (kind != 2) std.mem.writeInt(u32, block[32 + sub * 4 ..][0..4], @bitCast(minimum), .little);
+                }
+                for (0..256) |i| {
+                    if (kind == 2) {
+                        const value: i8 = if (seed == 1) (if ((i + col) % 2 == 0) -32 else 31) else @intCast(@as(i32, @intCast((i * 7 + col * 13 + seed) % 64)) - 32);
+                        block[64 + i] = @bitCast(value);
+                    } else {
+                        const maximum: usize = if (kind == 0) 15 else 31;
+                        block[64 + i] = @intCast(if (seed == 1) (if ((i + col) % 2 == 0) 0 else maximum) else (i * 7 + col * 13 + seed) % (maximum + 1));
+                    }
+                }
+            }
+        }
+        noinline fn run(self: *@This(), comptime mr: usize, comptime kind: usize) [mr][4]F32xN {
+            var acc: [mr][4]F32xN = undefined;
+            inline for (0..mr) |row| inline for (0..4) |col| {
+                inline for (0..VEC_LEN) |lane| acc[row][col][lane] = @as(f32, @floatFromInt(row * 11 + col * 3 + lane)) * 0.0625;
+            };
+            if (kind == 2) {
+                if (mr == 1) accumulateQ6KPreparedBlock4MR1(&self.inputs[0], &self.blocks[0], &self.blocks[1], &self.blocks[2], &self.blocks[3], &acc[0][0], &acc[0][1], &acc[0][2], &acc[0][3]) else accumulateQ6KPreparedBlock4MR2(&self.inputs[0], &self.inputs[1], &self.blocks[0], &self.blocks[1], &self.blocks[2], &self.blocks[3], &acc[0][0], &acc[0][1], &acc[0][2], &acc[0][3], &acc[1][0], &acc[1][1], &acc[1][2], &acc[1][3]);
+            } else {
+                if (mr == 1) accumulateQ4KPreparedBlock4MR1(&self.inputs[0], &self.blocks[0], &self.blocks[1], &self.blocks[2], &self.blocks[3], &acc[0][0], &acc[0][1], &acc[0][2], &acc[0][3]) else accumulateQ4KPreparedBlock4MR2(&self.inputs[0], &self.inputs[1], &self.blocks[0], &self.blocks[1], &self.blocks[2], &self.blocks[3], &acc[0][0], &acc[0][1], &acc[0][2], &acc[0][3], &acc[1][0], &acc[1][1], &acc[1][2], &acc[1][3]);
+            }
+            return acc;
+        }
+        noinline fn full(self: *@This(), comptime mr: usize, comptime kind: usize) [mr * 4]f32 {
+            var output: [mr * 4]f32 = undefined;
+            const input = @as([*]const f32, @ptrCast(&self.inputs))[0 .. mr * 256];
+            const blocks = std.mem.asBytes(&self.blocks);
+            if (kind == 2) linearQ6KPreparedTiledRange(input, blocks, &output, mr, 256, 4, 0, 4) catch unreachable else linearQ4KPreparedTiledRange(input, blocks, &output, mr, 256, 4, 0, 4) catch unreachable;
+            return output;
+        }
+        noinline fn measure(self: *@This(), comptime mr: usize, comptime kind: usize, comptime whole: bool) u64 {
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..2001) |_| {
+                self.inputs[0][0] = -self.inputs[0][0];
+                if (whole) std.mem.doNotOptimizeAway(self.full(mr, kind)) else std.mem.doNotOptimizeAway(self.run(mr, kind));
+            }
+            return @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - start);
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 64), prepared_q4_k_header_bytes);
+    try std.testing.expectEqual(@as(usize, 320), prepared_q4_k_block_bytes);
+    var state: State = .{};
+    inline for (.{ 0, 1, 2 }) |kind| {
+        for (0..4) |seed| {
+            state.initialize(kind, seed);
+            inline for (.{ 1, 2 }) |mr| {
+                const actual = state.run(mr, kind);
+                const full = state.full(mr, kind);
+                var reference: [mr * 4]f64 = @splat(0);
+
+                for (0..mr) |row| for (0..4) |col| inline for (0..VEC_LEN) |lane| {
+                    var expected: f64 = @as(f64, @floatFromInt(row * 11 + col * 3 + lane)) * 0.0625;
+                    var i = lane;
+                    while (i < 256) : (i += VEC_LEN) {
+                        const sub = i / (if (kind == 2) @as(usize, 16) else 32);
+                        const scale = @as(f32, @bitCast(std.mem.readInt(u32, state.blocks[col][sub * 4 ..][0..4], .little)));
+                        const minimum: f32 = if (kind == 2) 0 else @bitCast(std.mem.readInt(u32, state.blocks[col][32 + sub * 4 ..][0..4], .little));
+                        const value: i32 = if (kind == 2) @as(i8, @bitCast(state.blocks[col][64 + i])) else state.blocks[col][64 + i];
+                        expected += @as(f64, state.inputs[row][i]) * (@as(f64, scale) * @as(f64, @floatFromInt(value)) - @as(f64, minimum));
+                    }
+                    try std.testing.expectEqual(@as(f32, @floatCast(expected)), actual[row][col][lane]);
+                    reference[row * 4 + col] += expected - @as(f64, @floatFromInt(row * 11 + col * 3 + lane)) * 0.0625;
+                };
+                for (full, reference) |got, want| try std.testing.expectEqual(@as(f32, @floatCast(want)), got);
+            }
+        }
+    }
+    if (platform.env.getenvBool("ANTFLY_PREPARED_FLOAT_BENCH")) inline for (.{ 0, 1, 2 }) |kind| {
+        state.initialize(kind, 3);
+        inline for (.{ 1, 2 }) |mr| inline for (.{ false, true }) |whole| {
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            while (std.Io.Clock.awake.now(std.testing.io).nanoseconds - start < 25_000_000) _ = state.measure(mr, kind, whole);
+            var times: [21]u64 = undefined;
+            for (&times) |*sample| sample.* = state.measure(mr, kind, whole);
+            std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+            std.debug.print("prepared_float mr={d} kind={d} whole={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=2001\n", .{ mr, kind, @intFromBool(whole), @as(f64, @floatFromInt(times[10])) / 2001.0, @as(f64, @floatFromInt(times[19])) / 2001.0, times[10], times[19] });
+        };
     };
 }

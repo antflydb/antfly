@@ -3309,3 +3309,9 @@ views, removal of packed-specific helpers and shared projection traversal.
 [The AH outcome register](unified-execution-ah-outcomes.md) records shared
 Q3 subblock traversal across one, two and four rows, preserving two-row dot
 tiles, arithmetic order and the existing private result contracts.
+
+### AI prepared float four-column row ownership
+
+[The AI outcome register](unified-execution-ai-outcomes.md) records shared
+Q4/Q5/Q6 float-input weight decoding and accumulation, retaining format-specific
+traversal and four-column MR1/MR2 contracts.
