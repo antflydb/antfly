@@ -3027,6 +3027,17 @@ pub const StateRecordSize = struct {
 
 /// Canonical state-record preparation on admitted CPU, before publication and
 /// physical dispatch. The stable source outlives this synchronous call only.
+pub fn stateRecordLenWithAdmission(state: anytype, original: @import("../../common/read_admission.zig").Port) !usize {
+    var plan: StateRecordSize = .{};
+    for (0..state.entryCount()) |index| {
+        try original.checkpoint();
+        const entry = state.entryAt(index);
+        const namespace: []const u8 = entry.namespace_name orelse "";
+        try plan.add(namespace.len, entry.key.len, entry.value.len);
+    }
+    return plan.total();
+}
+
 pub fn prepareStateRecordWithAdmission(allocator: Allocator, state: anytype, original: @import("../../common/read_admission.zig").Port) ![]u8 {
     try original.checkpoint();
     const count = state.entryCount();
@@ -3041,8 +3052,9 @@ pub fn prepareStateRecordWithAdmission(allocator: Allocator, state: anytype, ori
     }
     const size = plan.payload;
     const total = plan.total();
-    const record = try allocator.alloc(u8, total);
-    errdefer allocator.free(record);
+    const raw = allocator.rawAlloc(total, .of(u8), @returnAddress()) orelse return error.OutOfMemory;
+    const record = raw[0..total];
+    errdefer allocator.rawFree(record, .of(u8), @returnAddress());
     const payload = record[record_header_len..];
     var pos: usize = 0;
     writeIntToPayload(payload, &pos, u32, @intCast(count));
@@ -3094,6 +3106,7 @@ pub fn prepareStateRecordWithAdmission(allocator: Allocator, state: anytype, ori
 pub fn CurrentStateAppend(comptime Publication: type) type {
     return struct {
         const Self = @This();
+        pub var test_hook: ?*const fn (*Self, @import("../../common/read_admission.zig").Port) anyerror!void = null;
         const Stage = enum { current, checkpoint_probe, segment_stat, next_segment_probe, create_directory, directory_parent, current_replace, checkpoint_replace, append, segment_sync, segment_parent, ready, published, failed };
         const Pending = union(enum) { none, read: storage_io.ControlFileReadOperation, physical: storage_io.SyncOperation };
         index: [std.fs.max_path_bytes]u8 = undefined,
@@ -3106,6 +3119,7 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
         options: AppendOptions,
         record_len: usize,
         bootstrap: bool = false,
+        sync_on_commit: bool = true,
         create_segment: bool = false,
         mutation_started: bool = false,
         resources: ?storage_io.DurabilityResources = null,
@@ -3152,6 +3166,7 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
             _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
             while (true) {
                 try original.checkpoint();
+                if (comptime @import("builtin").is_test) if (test_hook) |hook| try hook(self, original);
                 switch (self.stage) {
                     .ready, .published => return self.result,
                     .failed => return self.failure.?,
@@ -3257,7 +3272,7 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
                             .append => blk: {
                                 self.result.bytes = self.record_len;
                                 self.result.segment_became_nonempty = self.create_segment;
-                                break :blk .segment_sync;
+                                break :blk if (self.sync_on_commit) .segment_sync else .ready;
                             },
                             .segment_sync => blk: {
                                 self.result.segment_syncs = 1;
@@ -3306,6 +3321,35 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
             self.stage = .failed;
             self.releasePublication(true);
             return cause;
+        }
+
+        /// Join an abandoned attempt under independent protected execution.
+        /// Never publish or complete missing barriers after original rejection.
+        pub fn abortWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !void {
+            try original.checkpoint();
+            var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
+            switch (self.pending) {
+                .read => |*read| {
+                    _ = read.waitWithAdmission(trace.bind(original).?) catch {
+                        if (trace.failure) |rejected| return rejected;
+                        self.joinAndRelease();
+                        return;
+                    };
+                },
+                .physical => |*op| op.waitWithAdmission(trace.bind(original).?) catch {
+                    if (trace.failure) |rejected| return rejected;
+                },
+                .none => {},
+            }
+            self.joinAndRelease();
+        }
+        pub fn joinAndRelease(self: *Self) void {
+            self.retirePending();
+            self.releasePublication(self.stage != .published);
+            if (self.stage != .published) {
+                self.failure = error.Canceled;
+                self.stage = .failed;
+            }
         }
 
         /// Retire a terminal append's worker on the original wait boundary.

@@ -86,7 +86,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Normal primary WAL retirement owns a funded physical continuation and
 // generation-stamped retention state independently of dedicated replay.
 // Periodic checkpoints retain admitted rotation and private retirement plans.
-pub const abi_version: u32 = 221;
+// Foreground commits carry original admission across the native batch boundary.
+pub const abi_version: u32 = 222;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

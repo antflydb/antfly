@@ -29,6 +29,7 @@ const Comparison = @import("run_comparison.zig").Cursor;
 const platform = @import("antfly_platform");
 const Run = repository.Run;
 const storage_io = @import("storage_io.zig");
+pub const foreground_append = @import("foreground_wal_append.zig");
 pub const wal_retirement = @import("normal_wal_retirement.zig");
 pub const checkpoint_rotation = @import("normal_checkpoint_rotation.zig");
 pub const checkpoint_publication = @import("normal_checkpoint_publication.zig");
@@ -48,6 +49,10 @@ pub const Frame = struct {
     append_path: [std.fs.max_path_bytes]u8 = undefined,
     append_path_len: usize = 0,
     deadline_ns: u64 = 0,
+    foreground_owner: ?*foreground_append.Owner = null,
+    foreground_meter: ?*@import("memory_account.zig").Account = null,
+    foreground_spare_bytes: u64 = 0,
+    foreground_retirement_offset: usize = 0,
     wal_owner: ?*wal_retirement.Owner = null,
     wal_retirement_offset: usize = 0,
     rotation_owner: ?*checkpoint_rotation.Owner = null,
@@ -196,6 +201,49 @@ pub const Frame = struct {
             if (self.append_pending != null) self.joinAppendIndependently(owner) catch {};
             return cause;
         };
+    }
+    pub fn prepareForeground(self: *Frame, backend: anytype, incoming: *const @import("state.zig").ActiveMemTable, original: admission.Port) !void {
+        const boundary = (try original.executionWait()).?;
+        try boundary.beginWait();
+        const funded = self.credit.growBoundedOversized(@sizeOf(foreground_append.Owner), 1);
+        try boundary.endWait();
+        try funded;
+        self.foreground_owner = &(try allocate(foreground_append.Owner, backend.allocator, 1, original))[0];
+        self.foreground_owner.?.* = .{};
+        try self.foreground_owner.?.prepare(backend, incoming, &self.credit, original);
+    }
+    pub fn joinForeground(self: *Frame, owner: *@import("../background_runtime.zig").BackendRuntime) !void {
+        const work = self.foreground_owner orelse return;
+        errdefer work.join();
+        const io = owner.io() orelse return error.ExecutionWaitUnsupported;
+        while (true) {
+            const joined = blk: {
+                var pass = execution.Pass.initWithOptions(owner.runnableOwner(), &io, platform.time.monotonicNs() +| 100 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true }) catch |cause| break :blk @as(anyerror!void, cause);
+                defer pass.deinit();
+                var scope = pass.admissionScope(io) catch |cause| break :blk @as(anyerror!void, cause);
+                const payload = scope.payload();
+                break :blk work.abortWithAdmission(.init(&payload));
+            };
+            joined catch |cause| {
+                switch (cause) {
+                    error.Timeout, error.DeadlineExceeded, error.ResourceBudgetExceeded, error.ParentMemoryBusy, error.CapacityUnavailable, error.OutOfMemory, error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable => {
+                        try io.sleep(.fromMilliseconds(1), .awake);
+                        continue;
+                    },
+                    else => return cause,
+                }
+            };
+            return;
+        }
+    }
+    /// Called under Backend.mu; observers read only this fixed account receipt.
+    pub fn observeForeground(self: *Frame) void {
+        const work = self.foreground_owner orelse return;
+        if (!work.cpu_live) return;
+        if (self.foreground_meter == null) {
+            if (work.cpu.candidate.ordered.account) |account| self.foreground_meter = account.retain();
+        }
+        self.foreground_spare_bytes = work.cpu.candidate.ordered.spare.capacity * @sizeOf(*anyopaque);
     }
     pub fn prepareWal(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime) !void {
         const io = owner.io() orelse return error.ExecutionWaitUnsupported;
@@ -436,7 +484,8 @@ pub const Frame = struct {
     pub fn accountedMemoryBytes(self: *const Frame, pass: u64) u64 {
         // Header storage is already funded by the retained builder reservation.
         // Sources can retain older COW accounts after live roots have moved on.
-        var bytes: u64 = 0;
+        var bytes: u64 = self.foreground_spare_bytes;
+        if (self.foreground_meter) |account| bytes +|= account.chargeOnce(pass);
         if (self.current) |directory| bytes +|= directory.accountedMemoryBytes(pass) -| @sizeOf(Directory);
         if (self.previous) |directory| bytes +|= directory.accountedMemoryBytes(pass) -| @sizeOf(Directory);
         return bytes;
@@ -466,6 +515,22 @@ pub const Frame = struct {
                 if (!try reclaimer.stepWithAdmission(a, credits, original)) return false;
                 @field(self, fields[1]) = null;
             }
+        }
+        if (self.foreground_owner) |work| {
+            if (credits.* == 0) return false;
+            credits.* -= 1;
+            if (self.foreground_retirement_offset == 0) try work.retireWithAdmission(a, original);
+            const bytes = std.mem.asBytes(work);
+            while (self.foreground_retirement_offset < bytes.len) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                const end = @min(bytes.len, self.foreground_retirement_offset + 16 * 1024);
+                @memset(bytes[self.foreground_retirement_offset..end], undefined);
+                self.foreground_retirement_offset = end;
+            }
+            a.rawFree(bytes, .of(foreground_append.Owner), @returnAddress());
+            self.foreground_owner = null;
         }
         if (self.wal_owner) |wal_owner| {
             if (credits.* == 0) return false;
@@ -549,6 +614,7 @@ pub const Frame = struct {
     }
     pub fn finish(self: *Frame, a: std.mem.Allocator) void {
         var credit = self.credit;
+        if (self.foreground_meter) |account| account.release();
         a.destroy(self);
         credit.release();
     }

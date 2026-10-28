@@ -145,7 +145,8 @@ const builtin = @import("builtin");
 // Normal primary WAL retirement owns a funded physical continuation and
 // generation-stamped retention state independently of dedicated replay.
 // Periodic checkpoints retain admitted rotation and private retirement plans.
-pub const abi_version: u32 = 161;
+// Foreground commits carry original admission across the native batch boundary.
+pub const abi_version: u32 = 162;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

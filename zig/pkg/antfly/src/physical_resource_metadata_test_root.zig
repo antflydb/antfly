@@ -7818,3 +7818,287 @@ test "physical cache metadata registered flush publication periodic checkpoint s
 test "physical cache metadata registered flush publication periodic checkpoint partial retirement plan retains funded cleanup" {
     try normalAdmittedPeriodicCheckpoint(.plan_partial);
 }
+
+fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, partial, concurrent, namespace_erased, docstore, docstore_gate, guarded, staging_spares, cancel_io, cancel_append, pressure }) !void {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const io_mod = local.storage_lsm_backend_storage_io;
+    const preparation = local.storage_lsm_backend_compaction_publication.manifest_edit_preparation;
+    const foreground = preparation.foreground_append;
+    const owners = @import("api/runnable_owner_execution.zig");
+    const platform = @import("antfly_platform");
+    const scheduler = local.common_request_admission.runnable_scheduler;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
+    defer state.owner.deinit();
+    var resources = try Resources.initWithBudgets(a, budgets_mod.smartResourceBudgetsForTotal(128 << 20));
+    defer resources.deinit();
+    resources.attachResourceManager();
+    defer RegisteredOutputFixture.drain(&resources.resource_manager);
+    var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 12);
+    defer pool.deinit();
+    var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/foreground-wal", .{tmp.sub_path});
+    defer a.free(root);
+    var handle = try lsm.BackendHandle.openWithConfig(a, root, .{
+        .backend = .{ .durability = if (mode == .sync) .full else .none },
+        .storage = native.storage(),
+        .resource_manager = &resources.resource_manager,
+        .flush_threshold = 1 << 20,
+        .defer_flush_on_commit = true,
+        .wal_sync_on_commit = mode == .sync,
+        .wal_hard_limit_bytes = if (mode == .pressure) 512 else 0,
+        .compact_threshold_runs = 10000,
+        .l0_soft_limit_runs = 10000,
+        .l0_hard_limit_runs = 20000,
+    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = state.port() } });
+    var open = true;
+    const value: []const u8 = if (mode == .large or mode == .pressure) try a.alloc(u8, 80 * 1024 + 19) else "new-value";
+    defer if (mode == .large or mode == .pressure) a.free(value);
+    if (mode == .large or mode == .pressure) @memset(@constCast(value), 'w');
+    const H = struct {
+        var selected: @TypeOf(mode) = .plain;
+        var backend: *lsm.Backend = undefined;
+        var execution: *owners.State = undefined;
+        var store_gate: std.atomic.Mutex = .unlocked;
+        var cancelled: std.atomic.Value(bool) = .init(false);
+        fn cancellation(raw: ?*const anyopaque) callconv(.c) u8 {
+            const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(flag.load(.acquire));
+        }
+        fn append(op: *foreground.Operation, _: read_admission.Port) !void {
+            if (selected == .cancel_append and op.stage == .append and !injected.swap(true, .acq_rel)) {
+                io_mod.NativeSyncTestControl.started.store(false, .release);
+                io_mod.NativeSyncTestControl.release.store(false, .release);
+                io_mod.NativeSyncTestControl.pause.store(true, .release);
+            }
+        }
+        var calls: std.atomic.Value(usize) = .init(0);
+        var joined: std.atomic.Value(usize) = .init(0);
+        var injected: std.atomic.Value(bool) = .init(false);
+        fn hook(owner: *foreground.Owner, original: read_admission.Port) !void {
+            try original.checkpoint();
+            _ = calls.fetchAdd(1, .monotonic);
+            try std.testing.expect(backend.mu.tryLock());
+            try std.testing.expect(backend.foreground_commit_pending);
+            backend.mu.unlock();
+            if (owner.operation == null) {
+                if ((selected == .concurrent or selected == .docstore_gate or selected == .cancel_io) and !injected.swap(true, .acq_rel)) {
+                    io_mod.NativeSyncTestControl.started.store(false, .release);
+                    io_mod.NativeSyncTestControl.release.store(false, .release);
+                    io_mod.NativeSyncTestControl.pause.store(true, .release);
+                }
+                if (selected == .partial) io_mod.NativeSyncTestControl.append_failure_after.store(8, .release);
+            } else if (selected == .accepted_reject) return error.ResourceBudgetExceeded;
+        }
+        fn abort(original: read_admission.Port) !void {
+            _ = joined.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().cleanup_runnable_slots);
+            try std.testing.expect(backend.mu.tryLock());
+            backend.mu.unlock();
+            if (selected == .accepted_reject and joined.load(.acquire) == 1) return error.ResourceBudgetExceeded;
+        }
+    };
+    H.selected = mode;
+    H.backend = handle.ptr();
+    H.execution = &state;
+    H.calls.store(0, .release);
+    H.joined.store(0, .release);
+    H.injected.store(false, .release);
+    H.store_gate = .unlocked;
+    H.cancelled.store(false, .release);
+    foreground.Operation.test_hook = H.append;
+    foreground.test_hook = H.hook;
+    foreground.test_abort_hook = H.abort;
+    defer {
+        io_mod.NativeSyncTestControl.release.store(true, .release);
+        io_mod.NativeSyncTestControl.pause.store(false, .release);
+        io_mod.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
+        if (open) handle.close();
+        foreground.Operation.test_hook = null;
+        foreground.test_hook = null;
+        foreground.test_abort_hook = null;
+    }
+    var seed = try handle.ptr().beginWrite();
+    defer seed.abort();
+    try seed.put(.{}, "seed", "old-value");
+    try seed.commit();
+    const before = handle.ptr().snapshotWriteStats();
+    const retained_before = resources.resource_manager.sliceStats(.lsm_wal_retention).used_bytes;
+    const Worker = struct {
+        backend: *lsm.Backend,
+        execution: *owners.State,
+        value: []const u8,
+        selected: @TypeOf(mode),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.commit() catch |cause| {
+                self.failure = cause;
+            };
+        }
+        fn commit(self: *@This()) !void {
+            var pass = try local.common_background_execution.Pass.init(self.execution.port(), &std.testing.io, platform.time.monotonicNs() +| 15 * std.time.ns_per_s, .{ .context = &H.cancelled, .is_cancelled = H.cancellation });
+            defer pass.deinit();
+            var scope = try pass.admissionScope(std.testing.io);
+            var payload = scope.payload();
+            if (self.selected == .guarded) payload.execution_wait = null;
+            const original = read_admission.Port.init(&payload);
+            if (self.selected == .docstore or self.selected == .docstore_gate) {
+                var runtime = try self.backend.runtimeStore(std.testing.allocator, .{});
+                defer runtime.deinit();
+                if (self.selected == .docstore_gate) runtime.write_gate = &H.store_gate;
+                var store = try local.storage_docstore.DocStore.openRuntime(std.testing.allocator, &runtime);
+                defer store.close();
+                return store.putBatchWithReplayAndParticipantAndMetadata(std.testing.io, &.{.{ .key = "first", .value = self.value }}, &.{}, null, .{}, null, .{}, original);
+            }
+            if (self.selected == .namespace_erased) {
+                var runtime = try self.backend.runtimeNamespaceStore(std.testing.allocator);
+                defer runtime.deinit();
+                var batch = try runtime.beginBatch();
+                errdefer batch.abort();
+                try batch.put(.{}, "first", self.value);
+                return batch.commitWithAdmission(original);
+            }
+            var write = try self.backend.beginWrite();
+            defer write.abort();
+            try write.put(.{}, "first", self.value);
+            if (self.selected == .staging_spares) try write.mutable.ordered.prepareEdits(std.testing.allocator, 1);
+            try write.commitWithAdmission(original);
+        }
+    };
+    var worker: Worker = .{ .backend = handle.ptr(), .execution = &state, .value = value, .selected = mode };
+    if (mode == .concurrent or mode == .docstore_gate or mode == .cancel_io or mode == .cancel_append) {
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) {
+            io_mod.NativeSyncTestControl.release.store(true, .release);
+            thread.join();
+        };
+        const until = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
+        while (!io_mod.NativeSyncTestControl.started.load(.acquire) or !H.injected.load(.acquire) or H.calls.load(.acquire) == 0) {
+            if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        while (state.owner.scheduler.stats().runnable_slots != state.owner.scheduler.stats().control_slots) {
+            if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        var read = try handle.ptr().beginRead();
+        try std.testing.expectEqualStrings("old-value", try read.get(.{}, "seed"));
+        try std.testing.expectError(error.NotFound, read.get(.{}, "first"));
+        defer read.abort();
+        if (mode == .docstore_gate) {
+            var runtime = try handle.ptr().runtimeStore(a, .{});
+            defer runtime.deinit();
+            runtime.write_gate = &H.store_gate;
+            try std.testing.expectError(error.WriterLocked, runtime.beginWrite());
+            try std.testing.expectError(error.WriterLocked, runtime.beginBatch());
+            try std.testing.expectError(error.WriterLocked, runtime.beginBatchWithOptions(.{}));
+            var store = try local.storage_docstore.DocStore.openRuntime(a, &runtime);
+            defer store.close();
+            var pass = try local.common_background_execution.Pass.init(state.port(), &io, platform.time.monotonicNs() +| std.time.ns_per_s, .{});
+            defer pass.deinit();
+            var scope = try pass.admissionScope(io);
+            var payload = scope.payload();
+            payload.execution_wait = null; // Same non-lending policy as guarded publication.
+            try std.testing.expectError(error.Backpressured, store.putBatchWithReplayAndParticipantAndMetadata(io, &.{.{ .key = "peer", .value = "rejected" }}, &.{}, null, .{}, null, .{}, .init(&payload)));
+        }
+        var peer = try handle.ptr().beginWrite();
+        defer peer.abort();
+        try peer.put(.{}, "peer", "blocked");
+        try std.testing.expectError(error.WriterLocked, peer.commit());
+        try std.testing.expectError(error.WriterLocked, handle.ptr().checkpointWalAfterDurableBoundary());
+        var health: scheduler.Execution = .{};
+        try health.start(&state.owner.scheduler, .{ .io = io, .native_now_ns = platform.time.monotonicNs }, .control);
+        health.finish();
+        if (mode == .cancel_io or mode == .cancel_append) H.cancelled.store(true, .release);
+        io_mod.NativeSyncTestControl.release.store(true, .release);
+        io_mod.NativeSyncTestControl.pause.store(false, .release);
+        thread.join();
+        joined = true;
+        try std.testing.expectError(error.NotFound, read.get(.{}, "first"));
+    } else worker.run();
+    if (mode == .accepted_reject) {
+        try std.testing.expectEqual(@as(?anyerror, error.ResourceBudgetExceeded), worker.failure);
+        try std.testing.expect(H.joined.load(.acquire) >= 2);
+    } else if (mode == .cancel_io or mode == .cancel_append) {
+        try std.testing.expectEqual(@as(?anyerror, error.Canceled), worker.failure);
+        try std.testing.expect(H.joined.load(.acquire) >= 1);
+        try std.testing.expectEqual(mode == .cancel_append, handle.ptr().manifest_recovery_required);
+    } else if (mode == .partial) {
+        try std.testing.expect(worker.failure != null);
+        try std.testing.expect(handle.ptr().manifest_recovery_required);
+    } else if (mode == .pressure) {
+        try std.testing.expectEqual(@as(?anyerror, error.WalRecordTooLarge), worker.failure);
+    } else if (worker.failure) |cause| return cause;
+    if (mode == .guarded) try std.testing.expectEqual(@as(usize, 0), H.calls.load(.acquire)) else if (mode != .pressure) try std.testing.expect(H.calls.load(.acquire) > 0);
+    try std.testing.expect(!handle.ptr().foreground_commit_pending and handle.ptr().active_foreground_preparation == null);
+    const after = handle.ptr().snapshotWriteStats();
+    const successful = mode != .accepted_reject and mode != .partial and mode != .pressure and mode != .cancel_io and mode != .cancel_append;
+    try std.testing.expectEqual(before.wal_append_records + @intFromBool(successful), after.wal_append_records);
+    try std.testing.expectEqual(before.wal_segment_syncs + @intFromBool(successful and mode == .sync), after.wal_segment_syncs);
+    if (successful) try std.testing.expect(resources.resource_manager.sliceStats(.lsm_wal_retention).used_bytes >= retained_before + after.wal_append_bytes - before.wal_append_bytes);
+    io_mod.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
+    handle.abandonAfterCrash();
+    open = false;
+    RegisteredOutputFixture.drain(&resources.resource_manager);
+    try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("old-value", try read.get(.{}, "seed"));
+    if (successful or mode == .cancel_append) try std.testing.expectEqualStrings(value, try read.get(.{}, "first")) else try std.testing.expectError(error.NotFound, read.get(.{}, "first"));
+}
+
+test "physical cache metadata registered flush publication foreground WAL uses original caller admission and preserves unsynced policy" {
+    try foregroundAdmittedCommit(.plain);
+}
+test "physical cache metadata registered flush publication foreground WAL sync joins and recovers ordinary commit" {
+    try foregroundAdmittedCommit(.sync);
+}
+test "physical cache metadata registered flush publication foreground WAL large values retain owned preparation through retirement" {
+    try foregroundAdmittedCommit(.large);
+}
+test "physical cache metadata registered flush publication foreground WAL rejected accepted read joins through independent refused cleanup" {
+    try foregroundAdmittedCommit(.accepted_reject);
+}
+test "physical cache metadata registered flush publication foreground WAL partial append fences backend before writer gate release" {
+    try foregroundAdmittedCommit(.partial);
+}
+test "physical cache metadata registered flush publication foreground WAL parks CPU permits old readers and protects against peer checkpoint" {
+    try foregroundAdmittedCommit(.concurrent);
+}
+test "physical cache metadata registered flush publication foreground WAL erased namespace batch preserves original admission" {
+    try foregroundAdmittedCommit(.namespace_erased);
+}
+test "physical cache metadata registered flush publication foreground WAL DocStore batch reaches native admitted publication" {
+    try foregroundAdmittedCommit(.docstore);
+}
+test "physical cache metadata registered flush publication foreground WAL pressure rejection precedes physical mutation" {
+    try foregroundAdmittedCommit(.pressure);
+}
+
+test "physical cache metadata registered flush publication foreground WAL guarded callers retain non-lending policy" {
+    try foregroundAdmittedCommit(.guarded);
+}
+test "physical cache metadata registered flush publication foreground WAL DocStore gate rejects guarded contention without occupying CPU" {
+    try foregroundAdmittedCommit(.docstore_gate);
+}
+
+test "physical cache metadata registered flush publication foreground WAL transfers staging index spare ownership through cleanup" {
+    try foregroundAdmittedCommit(.staging_spares);
+}
+
+test "physical cache metadata registered flush publication foreground WAL cancellation joins accepted read under protected cleanup" {
+    try foregroundAdmittedCommit(.cancel_io);
+}
+test "physical cache metadata registered flush publication foreground WAL cancellation after accepted append fences possible commit for recovery" {
+    try foregroundAdmittedCommit(.cancel_append);
+}

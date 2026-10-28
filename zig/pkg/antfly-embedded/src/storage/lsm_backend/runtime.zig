@@ -472,8 +472,11 @@ pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
-fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable) !void {
+fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, control: ?read_admission.Port) !void {
     if (incoming.entryCount() == 0) return;
+    if (comptime @hasDecl(@TypeOf(backend.*), "publishMutableWithWalAdmission")) if (control) |original| {
+        if (try backend.publishMutableWithWalAdmission(incoming, original)) return;
+    };
     if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
         var candidate = if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
             try backend.prepareAndAppendWalForMutable(incoming)
@@ -5220,13 +5223,23 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn commit(self: *@This()) !void {
+            return self.commitControlled(null);
+        }
+        pub fn commitWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            return self.commitControlled(original);
+        }
+        fn commitControlled(self: *@This(), control: ?read_admission.Port) !void {
+            if (control) |original| try original.checkpoint();
             if (self.closed) return error.TransactionClosed;
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
                 self.prefix_index.deinit(self.allocator);
             };
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
-            const locked = lockBackend(BackendType, self.backend);
+            const locked = if (control) |original|
+                if (try original.hasExecutionWait()) try lockBackendWithAdmission(BackendType, self.backend, original) else lockBackend(BackendType, self.backend)
+            else
+                lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
             var release_on_error = true;
             errdefer if (release_on_error) {
@@ -5260,7 +5273,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
+                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -11249,6 +11262,13 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn commit(self: *@This()) !void {
+            return self.commitControlled(null);
+        }
+        pub fn commitWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            return self.commitControlled(original);
+        }
+        fn commitControlled(self: *@This(), control: ?read_admission.Port) !void {
+            if (control) |original| try original.checkpoint();
             if (self.closed) return error.TransactionClosed;
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
@@ -11257,7 +11277,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.probe_scratch.deinit(self.metadata_allocator);
             };
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
-            const locked = lockBackend(BackendType, self.backend);
+            const locked = if (control) |original|
+                if (try original.hasExecutionWait()) try lockBackendWithAdmission(BackendType, self.backend, original) else lockBackend(BackendType, self.backend)
+            else
+                lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
             var release_on_error = true;
             errdefer if (release_on_error) {
@@ -11292,7 +11315,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
+                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);

@@ -1800,6 +1800,7 @@ pub const Backend = struct {
     registered_manifest_checkpoint: ?*@import("lsm_backend/registered_manifest_checkpoint.zig").Owner = null,
     wal_retirement_recovery: ?WalRetirementRecovery = null,
     normal_wal_retirement_in_flight: bool = false,
+    foreground_commit_pending: bool = false,
     manifest_journal: repository_mod.ManifestJournal = .{},
     run_directory_dirty: bool = true,
     run_directory_generation: u64 = 0,
@@ -1807,6 +1808,7 @@ pub const Backend = struct {
     retired_run_stores: ?*RunStore = null,
     retired_manifest_preparations: ?*@import("lsm_backend/manifest_edit_preparation.zig").Frame = null,
     retired_manifest_preparations_tail: ?*@import("lsm_backend/manifest_edit_preparation.zig").Frame = null,
+    active_foreground_preparation: ?*@import("lsm_backend/manifest_edit_preparation.zig").Frame = null,
     active_manifest_preparation: ?*@import("lsm_backend/manifest_edit_preparation.zig").Frame = null,
     manifest_preparation_reclaim_in_flight: bool = false,
     retired_flush_outputs: ?*@import("lsm_backend/registered_flush_outputs.zig").Owner = null,
@@ -2641,6 +2643,7 @@ pub const Backend = struct {
             if (b.domain_index) |value| self.bytes +|= value.memoryBytes();
             if (b.read_metadata_reclaimer) |*job| self.bytes +|= job.memoryBytes(pass);
             if (b.active_manifest_preparation) |frame| self.bytes +|= frame.accountedMemoryBytes(pass);
+            if (b.active_foreground_preparation) |frame| self.bytes +|= frame.accountedMemoryBytes(pass);
             self.bytes +|= b.bulk_snapshot_unshared_bytes;
             if (b.memtable_reclaimer) |*job| self.bytes +|= job.memoryBytes(pass);
         }
@@ -4073,6 +4076,7 @@ pub const Backend = struct {
         var ledger_snapshot = self.ledger_snapshots;
         while (ledger_snapshot) |snapshot| : (ledger_snapshot = snapshot.active_next) bytes +|= snapshot.memoryBytes(pass);
         if (self.active_manifest_preparation) |frame| bytes +|= frame.accountedMemoryBytes(pass);
+        if (self.active_foreground_preparation) |frame| bytes +|= frame.accountedMemoryBytes(pass);
         var manifest_frame = self.retired_manifest_preparations;
         while (manifest_frame) |frame| : (manifest_frame = frame.next) bytes +|= frame.accountedMemoryBytes(pass);
         var publication = self.active_compaction_publications;
@@ -5024,6 +5028,7 @@ pub const Backend = struct {
 
     pub fn retireManifestPreparation(self: *Backend, frame: *@import("lsm_backend/manifest_edit_preparation.zig").Frame) void {
         if (self.active_manifest_preparation == frame) self.active_manifest_preparation = null;
+        if (self.active_foreground_preparation == frame) self.active_foreground_preparation = null;
         // The owned writer's source stays pinned through physical retirement.
         if (frame.checkpoint_owner == null) frame.detachLocked(self);
         frame.next = null;
@@ -5415,6 +5420,7 @@ pub const Backend = struct {
     }
 
     fn maybeCheckpointWalAfterManifestPublishWithExecution(self: *Backend, execution_runtime: ?*background_runtime_mod.BackendRuntime) !void {
+        if (self.foreground_commit_pending) return error.WriterLocked;
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         if (self.registered_publication.seal != null or self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
@@ -6195,6 +6201,7 @@ pub const Backend = struct {
     }
 
     fn rotateMutableToImmutable(self: *Backend) !void {
+        if (self.foreground_commit_pending) return error.WriterLocked;
         if (self.mutable.entryCount() == 0) return;
         self.invalidateMutableReadSnapshot();
         const rotated_logical_bytes = self.mutable.logical_bytes;
@@ -7456,6 +7463,7 @@ pub const Backend = struct {
     };
 
     pub fn admitPreparedCommit(self: *Backend, incoming: *const ActiveMemTable, bulk: *const State, wire: u64) !CommitAdmission {
+        if (self.foreground_commit_pending) return error.WriterLocked;
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         const counted = incoming.entryCount() != 0 or bulk.entryCount() != 0;
         if (!counted) return .{ .backend = self, .bytes = 0, .counted = false };
@@ -7569,6 +7577,84 @@ pub const Backend = struct {
         try self.appendWalWithPreparation(state, null);
     }
 
+    /// The transaction caller owns Backend.mu and its staged input. Only an
+    /// explicit lendable scope may take this path; guarded DB publication ports
+    /// retain their existing non-lending policy until their phase handoff.
+    pub fn publishMutableWithWalAdmission(self: *Backend, incoming: *ActiveMemTable, original: read_admission.Port) !bool {
+        try original.checkpoint();
+        if (!try original.hasExecutionWait() or (try original.deadlineNs()) == null) return false;
+        const owner = self.background_executor.runtime orelse return false;
+        const manager = self.options.resource_manager orelse return false;
+        if (!self.background_executor.canRunDetached() or owner.runnableOwner() == null or manager.allocator_host_source == null) return false;
+        if (!self.options.wal_enabled or self.options.backend.read_only or incoming.ordered_enabled or !self.mutable.supportsQuiescedPublication() or self.root_writer_lock == null or
+            self.root_lock_state == null or self.wal_operation_lock_file == null or self.storage.?.vtable.try_prepare_append_with_admission == null) return false;
+        if (self.foreground_commit_pending) return error.WriterLocked;
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.closing.load(.acquire)) return error.BackendClosing;
+        self.foreground_commit_pending = true;
+        defer self.foreground_commit_pending = false;
+        const Frame = @import("lsm_backend/manifest_edit_preparation.zig").Frame;
+        const frame = try Frame.create(self);
+        std.debug.assert(self.active_foreground_preparation == null);
+        self.active_foreground_preparation = frame;
+        defer self.retireManifestPreparation(frame);
+        const started = self.writeStatsNowNs();
+        self.mu.unlock();
+        const prepared = frame.prepareForeground(self, incoming, original);
+        _ = runtime_mod.lockBackend(Backend, self);
+        frame.observeForeground();
+        prepared catch |cause| {
+            if (cause == error.WalRecordTooLarge) self.write_stats.wal_pressure_rejections +|= 1;
+            return cause;
+        };
+        if (self.closing.load(.acquire)) return error.BackendClosing;
+        const work = frame.foreground_owner.?;
+        try self.prepareWalAppendForPressureLocked(work.record.len);
+        work.lock = (try self.tryAcquireWalOperationLockImpl(.exclusive, false)) orelse return error.WriterLocked;
+        self.mu.unlock();
+        const written = work.drive(self, original);
+        written catch {
+            frame.joinForeground(owner) catch {};
+        };
+        _ = runtime_mod.lockBackend(Backend, self);
+        if (work.recovery) {
+            self.manifest_recovery_required = true;
+            self.wal_retention.invalidateAll();
+        }
+        try written;
+        // The WAL callback decided publication under original execution. No
+        // rejected reentry may split its receipt from this fixed root swap.
+        std.debug.assert(work.published);
+        self.invalidateMutableReadSnapshot();
+        work.cpu.publish(&self.mutable);
+        frame.observeForeground();
+        self.wal_retention.noteAppend(work.result, self.writeStatsNowNs());
+        self.noteMutableWalSegment(work.result.segment);
+        // Publication cannot perform a legacy filesystem inventory under the
+        // metadata mutex. Increment retained bytes from the accepted append;
+        // concurrent retirement can only leave this estimate conservative.
+        self.syncTrackedWalRetentionUsageLocked(self.tracked_wal_retention_bytes +| work.result.bytes);
+        self.write_stats.wal_append_records +|= 1;
+        self.write_stats.wal_append_entries +|= incoming.entryCount();
+        self.write_stats.wal_append_bytes +|= work.result.bytes;
+        self.write_stats.wal_segment_syncs +|= work.result.segment_syncs;
+        self.write_stats.wal_index_syncs +|= work.result.index_syncs;
+        const elapsed = self.writeStatsElapsedNs(started);
+        self.write_stats.wal_append_ns +|= elapsed;
+        if (self.options.wal_sync_on_commit) {
+            self.write_stats.wal_sync_records +|= 1;
+            self.write_stats.wal_sync_ns +|= elapsed;
+        }
+        // Move staged payloads into the credited retirement owner. The CPU
+        // preparation borrowed them only until this fixed ownership receipt.
+        work.cpu.source = .{ .entries = incoming.entries, .arena_owner = incoming.arena_owner };
+        work.cpu.source_owned = true;
+        work.input_index = incoming.index;
+        work.input_ordered = incoming.ordered;
+        incoming.* = .{ .ordered_enabled = false };
+        return true;
+    }
+
     pub fn prepareAndAppendWalForMutable(self: *Backend, state: *const ActiveMemTable) !ActiveMemTable {
         var prepared: ActiveMemTable = .{};
         errdefer prepared.deinit(self.allocator);
@@ -7577,6 +7663,7 @@ pub const Backend = struct {
     }
 
     fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable) !void {
+        if (self.foreground_commit_pending) return error.WriterLocked;
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         const wal_enabled = self.options.wal_enabled and self.root_dir != null and !self.options.backend.read_only and state.entryCount() != 0;
 
@@ -7761,6 +7848,7 @@ pub const Backend = struct {
     }
 
     fn resetWalAfterManifestCheckpoint(self: *Backend) !void {
+        if (self.foreground_commit_pending) return error.WriterLocked;
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         if (self.registered_publication.seal != null or self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;

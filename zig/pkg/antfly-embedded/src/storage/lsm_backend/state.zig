@@ -1149,6 +1149,7 @@ pub const ActiveMemTable = struct {
         const quantum = 16 * 1024;
         source: State,
         candidate: ActiveMemTable,
+        source_owned: bool = true,
         planned_index: usize = 0,
         planned_bytes: u64 = 0,
         allocation_bound: ?u64 = null,
@@ -1175,6 +1176,14 @@ pub const ActiveMemTable = struct {
             const out = @This(){ .source = source.*, .candidate = .{ .ordered = live.ordered.fork(), .logical_bytes = live.logical_bytes } };
             source.* = .{};
             return out;
+        }
+
+        /// The normal transaction retains this flat staging buffer until its
+        /// synchronous publication attempt returns. Retirement never reads or
+        /// frees that borrow; every published value has its own retained copy.
+        pub fn initBorrowed(live: *const ActiveMemTable, incoming: *const ActiveMemTable) @This() {
+            std.debug.assert(live.supportsQuiescedPublication() and !incoming.ordered_enabled);
+            return .{ .source = .{ .entries = incoming.entries }, .candidate = .{ .ordered = live.ordered.fork(), .logical_bytes = live.logical_bytes }, .source_owned = false };
         }
 
         /// Conservative additional heap bound for this successor. Input and
@@ -1325,6 +1334,7 @@ pub const ActiveMemTable = struct {
         fn beginRetirement(self: *@This(), allocator: Allocator) void {
             if (self.retirement != null or self.retired) return;
             _ = allocator;
+            if (!self.source_owned) self.source = .{};
             const pending: ?OwnedEntry.Retirement = if (self.pending) |entry| .init(entry) else null;
             self.pending = null;
             self.retirement = .{ .tree = .init(self.candidate.ordered), .source = .init(self.source), .pending = pending };

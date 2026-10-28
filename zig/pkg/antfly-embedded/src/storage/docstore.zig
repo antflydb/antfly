@@ -1467,6 +1467,13 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Batch) !void {
+            return self.commitControlled(null);
+        }
+        pub fn commitWithAdmission(self: *Batch, original: @import("../common/read_admission.zig").Port) !void {
+            return self.commitControlled(original);
+        }
+        fn commitControlled(self: *Batch, control: ?@import("../common/read_admission.zig").Port) !void {
+            if (control) |original| try original.checkpoint();
             try self.read_guards.check();
             try self.prepared_guards.check();
             if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
@@ -1500,7 +1507,7 @@ pub const DocStore = struct {
             defer if (catalog_owner) |owner| owner.resolver_catalog_revision.endWrite();
             if (payload_session) |session| session.primary_commit_attempted = true;
             if (self.runtime) |*runtime| {
-                try runtime.commit();
+                if (control) |original| try runtime.commitWithAdmission(original) else try runtime.commit();
             }
             if (payload_session) |session| {
                 session.committed = true;
@@ -2740,6 +2747,13 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
+        return self.beginWriteBatchControlled(options, null);
+    }
+    pub fn beginWriteBatchWithAdmission(self: *DocStore, options: backend_types.BatchOptions, original: @import("../common/read_admission.zig").Port) !Batch {
+        return self.beginWriteBatchControlled(options, original);
+    }
+    fn beginWriteBatchControlled(self: *DocStore, options: backend_types.BatchOptions, control: ?@import("../common/read_admission.zig").Port) !Batch {
+        if (control) |original| try original.checkpoint();
         try self.ensurePortableImportOperational();
         const payload_session = try self.createWritePayloadSession();
         errdefer if (payload_session) |session| session.release();
@@ -2747,7 +2761,7 @@ pub const DocStore = struct {
             .payload_session = payload_session,
             .alloc = self.alloc,
             .columnar_owner = self,
-            .runtime = try self.runtime_store.beginBatchWithOptions(options),
+            .runtime = if (control) |original| try self.runtime_store.beginBatchWithOptionsAndAdmission(options, original) else try self.runtime_store.beginBatchWithOptions(options),
             .unordered_bulk_append_puts = options.mode == .bulk_ingest and self.runtime_store.capabilities().unordered_bulk_append_puts,
         };
     }
@@ -3111,7 +3125,7 @@ pub const DocStore = struct {
         // The retirement mask reads candidate markers from this same writer
         // transaction. It remains authoritative during directory migration,
         // so bulk ingestion never needs a foreground whole-store backfill.
-        var batch = try self.beginWriteBatchWithOptions(options);
+        var batch = if (control) |original| try self.beginWriteBatchWithAdmission(options, original) else try self.beginWriteBatchWithOptions(options);
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
         var txn = batch.asTxn();
@@ -3147,7 +3161,7 @@ pub const DocStore = struct {
             try batch.setReplayOpaque(entry.sequence, entry.payload);
         }
         try metadata.apply(&txn, control);
-        try batch.commit();
+        if (control) |original| try batch.commitWithAdmission(original) else try batch.commit();
     }
 
     fn putBatchWithReplayOnce(self: *DocStore, writes: []const KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {

@@ -30147,9 +30147,66 @@ crash/reopen and zero remaining construction/execution charges are checked. Thes
 are native backend integration fixtures and C API/provider semantic compilation,
 not full server/Raft, archive/GNU or cross-engine overload qualification.
 
-The bounded-publication milestone remains open for foreground WAL append/sync
-and other legacy WAL callers, and compaction construction/remaining metadata
-operations. Synchronous and ineligible checkpoint callers retain legacy paths.
+Explicit admitted commit now crosses ordinary native transactions, erased batch
+contracts and DocStore mutation batches without borrowing a new background CPU
+slot. When the caller supplies a lendable original scope and the file backend has
+native locks, prepared append, a shared runtime and allocator-host accounting,
+mutable COW preparation, canonical WAL encoding and append/sync run outside
+Backend.mu on that original execution. Foreground eligibility does not depend on
+SST partition callbacks. A fixed writer-pending fence excludes competing commits,
+mutable rotation and destructive WAL cleanup while readers retain the old visible
+generation. Physical callbacks update only their owned receipt and release the
+WAL gate before metadata-mutex reentry. Once publication is decided, a fixed root
+swap and scalar retention/stat updates adopt it without a fallible reentry check
+or a synchronous filesystem inventory. Sync policy follows normalized backend
+durability; full durability still forces sync, and explicit relaxed policy stays
+unsynced.
+
+Original rejection joins the exact accepted read/write under independent protected
+cleanup before writer exclusion ends. Partial/uncertain mutations fence recovery
+before later writers can enter. Frozen bytes, private successors, staged payloads
+and grants stay funded through queued cleanup. Admitted payload and byte-buffer
+retirement retains progress on refusal. Native staging-index teardown still uses
+its legacy destructor; early-error transaction teardown and remaining foreground
+planning/pressure paths also require further work. Private native/owner ABI
+versions 162/222 fence the new original-admission batch callbacks and retained
+foreground fields. Public wire/durable formats are unchanged.
+
+Controlled DocStore batch entry preserves options and immediately rejects a busy
+transaction gate with Backpressured. Legacy gate entry returns WriterLocked
+before constructing state, preserving existing bounded DocStore retry handling
+instead of occupying CPU behind another writer's parked IO. Commit failure keeps
+gate ownership until abort, and active child cursors still prevent parent commit.
+Guarded callers retain their original non-lending policy: normal DB mutation
+publication currently strips execution_wait while the apply fence is held, so
+this integration does not yet move that guarded production path onto lendable
+foreground execution. Plain commit() and guarded DB commits still use the legacy
+path and remain integration targets of this foreground milestone.
+
+[`foreground-wal-production-v9-debug.json`](qualification/workload-pooling/receipts/2026-10-10/child-outbox-capture-retirement-cumulative-integration/foreground-wal-production-v9-debug.json)
+records focused Debug qualification including fourteen new native integration cases.
+They invoke ordinary commitWithAdmission, erased namespace batches and the public
+DocStore mutation batch with real native IO and a caller-owned scope. Cases cover
+sync/unsynced policy, large values, rejected accepted-read waits with independently
+refused cleanup, actual partial append and recovery fencing, old snapshot reads
+and control progress while IO parks CPU, exclusion of peer commit/checkpoint,
+forwarding through both adapters, hard-record rejection before mutation,
+non-lending policy preservation, staged-index spare ownership, mixed
+legacy/guarded gate contention, cancellation of an accepted read, and cancellation
+after an accepted append whose possible commit is fenced until recovery. They
+check append/sync statistics and WAL retention resource accounting, abandon/reopen
+without close repairing the write, and verify zero remaining construction and
+execution charges. Relaxed-mode reopen is process-abandon evidence, not a
+power-loss durability claim. The existing publication, metadata-retirement,
+prepared-append and maintenance checks and actual C API/provider semantic
+compilation accompany these native fixtures; this is not full DB/server,
+archive/GNU or cross-engine overload qualification.
+
+The foreground milestone remains open: integrate the normal guarded DB apply-fence
+handoff, finish admitted foreground planning/pressure and transaction/staging-index
+teardown, and connect remaining explicit sync/legacy WAL callers. Continue this
+milestone before broader compaction construction/remaining metadata operations.
+Synchronous and ineligible checkpoint callers retain legacy paths.
 Nonempty legacy `wal.log` or mixed embedded replay layouts
 are refused before destructive normal retirement and still need migration or a
 compatible admitted driver. Callers without the

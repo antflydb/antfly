@@ -83,6 +83,19 @@ fn ParentBox(comptime T: type) type {
         }
 
         fn commit(self: *@This()) !void {
+            return self.commitControlled(null);
+        }
+        fn commitWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            return self.commitControlled(original);
+        }
+        fn commitHandle(self: *@This(), control: ?read_admission.Port) !void {
+            if (control) |original| {
+                if (comptime @hasDecl(T, "commitWithAdmission")) return self.handle.commitWithAdmission(original);
+                try original.checkpoint();
+            }
+            return self.handle.commit();
+        }
+        fn commitControlled(self: *@This(), control: ?read_admission.Port) !void {
             platform.sync.lockYielding(&self.mutex);
             if (self.owner_closed or self.finalizing) {
                 self.mutex.unlock();
@@ -95,7 +108,8 @@ fn ParentBox(comptime T: type) type {
             self.finalizing = true;
             self.mutex.unlock();
 
-            self.handle.commit() catch |err| {
+            const committed = self.commitHandle(control);
+            committed catch |err| {
                 platform.sync.lockYielding(&self.mutex);
                 self.finalizing = false;
                 self.mutex.unlock();
@@ -1075,6 +1089,7 @@ pub const Batch = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
+        commit_with_admission: ?*const fn (Allocator, *anyopaque, read_admission.Port) anyerror!void = null,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         has_prefix: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
@@ -1118,6 +1133,17 @@ pub const Batch = struct {
         self.vtable.abort(self.allocator, self.ptr);
         if (gate) |mutex| mutex.unlock();
         self.* = undefined;
+    }
+
+    pub fn commitWithAdmission(self: *Batch, original: read_admission.Port) !void {
+        try original.checkpoint();
+        if (self.vtable.commit_with_admission) |commit_callback| {
+            try BoundaryAbi.call("commit_with_admission", self.boundary_dispatch, commit_callback, .{ self.allocator, self.ptr, original });
+            if (self.write_gate) |mutex| mutex.unlock();
+            self.* = undefined;
+            return;
+        }
+        return self.commit();
     }
 
     pub fn commit(self: *Batch) !void {
@@ -1243,6 +1269,7 @@ pub const NamespaceBatch = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
+        commit_with_admission: ?*const fn (Allocator, *anyopaque, read_admission.Port) anyerror!void = null,
         get: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, backend_types.Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void,
@@ -1254,6 +1281,16 @@ pub const NamespaceBatch = struct {
     pub fn abort(self: *NamespaceBatch) void {
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
+    }
+
+    pub fn commitWithAdmission(self: *NamespaceBatch, original: read_admission.Port) !void {
+        try original.checkpoint();
+        if (self.vtable.commit_with_admission) |commit_callback| {
+            try BoundaryAbi.call("commit_with_admission", self.boundary_dispatch, commit_callback, .{ self.allocator, self.ptr, original });
+            self.* = undefined;
+            return;
+        }
+        return self.commit();
     }
 
     pub fn commit(self: *NamespaceBatch) !void {
@@ -1299,6 +1336,8 @@ pub const Store = struct {
     /// Opt-in transaction-wide serialization for read/modify/write users.
     /// The backend owns this gate and must outlive all stores/transactions.
     /// Reads and computation outside a write transaction remain concurrent.
+    /// Contenders return WriterLocked before state construction; retries must
+    /// not occupy a CPU slot waiting for another writer's parked durability IO.
     write_gate: ?*std.atomic.Mutex = null,
     /// Shared across all namespace views; borrowed for publication debt RMW.
     publication_gate: ?*std.atomic.Mutex = null,
@@ -1482,7 +1521,7 @@ pub const Store = struct {
     }
 
     pub fn beginWrite(self: *Store) !WriteTxn {
-        if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);
+        if (self.write_gate) |mutex| if (!mutex.tryLock()) return error.WriterLocked;
         errdefer if (self.write_gate) |mutex| mutex.unlock();
         var txn = try BoundaryAbi.call("begin_write", self.boundary_dispatch, self.vtable.begin_write, .{ self.allocator, self.ptr });
         txn.write_gate = self.write_gate;
@@ -1490,7 +1529,7 @@ pub const Store = struct {
     }
 
     pub fn beginBatch(self: *Store) !Batch {
-        if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);
+        if (self.write_gate) |mutex| if (!mutex.tryLock()) return error.WriterLocked;
         errdefer if (self.write_gate) |mutex| mutex.unlock();
         var batch = try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
         batch.write_gate = self.write_gate;
@@ -1512,9 +1551,26 @@ pub const Store = struct {
         return batch;
     }
 
+    /// Controlled callers never occupy CPU waiting for the transaction gate.
+    /// Preserve batch options and return backpressure before constructing state.
+    pub fn beginBatchWithOptionsAndAdmission(self: *Store, options: backend_types.BatchOptions, original: read_admission.Port) !Batch {
+        try original.checkpoint();
+        if (self.write_gate) |mutex| if (!mutex.tryLock()) {
+            try original.checkpoint();
+            return error.Backpressured;
+        };
+        errdefer if (self.write_gate) |mutex| mutex.unlock();
+        var batch = if (self.vtable.begin_batch_with_options) |begin_options|
+            try BoundaryAbi.call("begin_batch_with_options", self.boundary_dispatch, begin_options, .{ self.allocator, self.ptr, options })
+        else
+            try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
+        batch.write_gate = self.write_gate;
+        return batch;
+    }
+
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Batch {
         if (self.vtable.begin_batch_with_options) |begin_batch_with_options| {
-            if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);
+            if (self.write_gate) |mutex| if (!mutex.tryLock()) return error.WriterLocked;
             errdefer if (self.write_gate) |mutex| mutex.unlock();
             var batch = try BoundaryAbi.call("begin_batch_with_options", self.boundary_dispatch, begin_batch_with_options, .{ self.allocator, self.ptr, options });
             batch.write_gate = self.write_gate;
@@ -2535,6 +2591,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             try unbox(ptr).commit();
         }
 
+        fn commitWithAdmission(_: Allocator, ptr: *anyopaque, original: read_admission.Port) anyerror!void {
+            try unbox(ptr).commitWithAdmission(original);
+        }
+
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
             return try unbox(ptr).handle.get(key);
         }
@@ -2614,6 +2674,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
         .vtable = &.{
             .abort = vt.abort,
             .commit = vt.commit,
+            .commit_with_admission = vt.commitWithAdmission,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
             .has_prefix = if (@hasDecl(Handle, "hasPrefix")) vt.hasPrefix else null,
@@ -2661,6 +2722,15 @@ pub fn namespaceBatchFrom(
             box_allocator.destroy(state);
         }
 
+        fn commitWithAdmission(_: Allocator, ptr: *anyopaque, original: read_admission.Port) anyerror!void {
+            const state = unbox(ptr);
+            if (comptime @hasDecl(Handle, "commitWithAdmission")) try state.handle.commitWithAdmission(original) else {
+                try original.checkpoint();
+                try state.handle.commit();
+            }
+            state.allocator.destroy(state);
+        }
+
         fn get(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror![]const u8 {
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
@@ -2688,6 +2758,7 @@ pub fn namespaceBatchFrom(
         .vtable = &.{
             .abort = vt.abort,
             .commit = vt.commit,
+            .commit_with_admission = vt.commitWithAdmission,
             .get = vt.get,
             .get_many_sorted = if (@hasDecl(Handle, "getManySorted")) vt.getManySorted else null,
             .put = vt.put,
