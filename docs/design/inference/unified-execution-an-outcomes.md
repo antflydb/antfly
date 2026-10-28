@@ -40,5 +40,5 @@ source accounting and `verified.json`. The compiler-only remote snapshot is
 The existing `scripts/lightonocr3/verify_cuda_recurrent.sh` independently
 rebuilds and compares the production image before numerical validation.
 
-AM's ownership-fix device qualification remains separately queued behind other
-Glowworm work. Its acceptance is not inferred from this source-only proof.
+AM's ownership-fix device qualification subsequently passed all 50 tests on
+Glowworm. That acceptance is recorded separately in the AM outcome register.

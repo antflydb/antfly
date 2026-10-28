@@ -31,12 +31,18 @@ source or alter compiled GPU arithmetic. No timing improvement is claimed.
 - Both-backend compilation passes, generated-source freshness checks pass
   for 70 files and 129 native owned regions, and the expanded Linux ARM64
   CUDA regression binary compiles.
-- The expanded device suite checks all six original AL cases plus recurrent
+- The expanded device suite passes **50/50 tests**, including all twelve
+  targeted cases, with **zero skips, failures or leaks** on Glowworm.
+  It covers all six original AL cases plus recurrent
   batching, independent-page prefill, graph-head admission, token bursts,
-  resident-cache teardown and the ownership regression. Each named case must
-  pass; imported smoke tests may increase the selected count. Failures and
-  leaks are rejected, and the original AL failure is a retained negative
-  control for the corrected result collector.
+  resident-cache teardown and the ownership regression. The collector verifies
+  each named case separately from the 38 imported smoke tests. The original
+  AL failure remains a negative control for the corrected result collector.
+- Retained binary, remote inputs and result archive hashes all match; the
+  measured CUDA compute source matches the committed ownership fix.
+
+Device archive SHA256:
+`b6a2a1e9e94a7f179712ba102b419d8aaf281e062292ec5471b2aeaed821da8a`.
 
 Evidence: `.benchmark-assets/1166/am-campaign/`. The original failed evidence
 remains under `.benchmark-assets/1166/al-campaign/device-final/`.
