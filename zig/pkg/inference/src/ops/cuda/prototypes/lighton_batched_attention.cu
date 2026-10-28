@@ -47,6 +47,15 @@ struct LightOnAttentionParams {
 static_assert(sizeof(LightOnAttentionPage) == 268, "page ABI");
 static_assert(sizeof(LightOnAttentionParams) == 17264, "packet ABI");
 
+// Shared live-page validation; delta remains in the caller's lexical scope.
+#define ANTFLY_ATTENTION_PAGE_PROGRESS() \
+const uint32_t progress = p.graph_progress ? *p.graph_progress : 0; \
+if (p.graph_progress && progress < p.graph_step) \
+return; \
+const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0; \
+if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens) \
+return;
+
 // Each page owns an exclusive writable tail. Host validation proves bounds,
 // physical capacity and non-aliasing before a single suffix is changed.
 extern "C" __global__ void lighton_attention_write_suffix(
@@ -56,12 +65,7 @@ extern "C" __global__ void lighton_attention_write_suffix(
   if (item >= p.items || d >= p.row_values)
     return;
   const LightOnAttentionPage &page = p.pages[item];
-  const uint32_t progress = p.graph_progress ? *p.graph_progress : 0;
-  if (p.graph_progress && progress < p.graph_step)
-    return;
-  const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0;
-  if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens)
-    return;
+  ANTFLY_ATTENTION_PAGE_PROGRESS()
   const uint32_t token = page.tokens + delta - 1;
   if (token / p.page_size >= page.block_count)
     return;
@@ -97,12 +101,7 @@ attention_chunks(const LightOnAttentionParams &p) {
   if (item >= p.items || head >= p.heads || blockDim.x != 128)
     return;
   const LightOnAttentionPage &page = p.pages[item];
-  const uint32_t progress = p.graph_progress ? *p.graph_progress : 0;
-  if (p.graph_progress && progress < p.graph_step)
-    return;
-  const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0;
-  if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens)
-    return;
+  ANTFLY_ATTENTION_PAGE_PROGRESS()
   const uint32_t tokens = page.tokens + delta;
   const uint32_t query_position = page.query_position + delta;
   if (chunk * Chunk >= tokens || chunk * Chunk > query_position) {
@@ -208,12 +207,7 @@ attention_grouped_chunks(const LightOnAttentionParams &p) {
       blockDim.x != 128)
     return;
   const auto &page = p.pages[item];
-  const uint32_t progress = p.graph_progress ? *p.graph_progress : 0;
-  if (p.graph_progress && progress < p.graph_step)
-    return;
-  const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0;
-  if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens)
-    return;
+  ANTFLY_ATTENTION_PAGE_PROGRESS()
   const uint32_t tokens = page.tokens + delta;
   const uint32_t query_position = page.query_position + delta;
   if (chunk * Chunk >= tokens || chunk * Chunk > query_position) {
@@ -361,3 +355,5 @@ extern "C" __global__ void lighton_attention_grouped_chunks128(
     const __grid_constant__ LightOnAttentionParams p) {
   attention_grouped_chunks<128>(p);
 }
+
+#undef ANTFLY_ATTENTION_PAGE_PROGRESS

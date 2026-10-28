@@ -3328,3 +3328,10 @@ contracts, source budgets and independent device acceptance.
 [The AK outcome register](unified-execution-ak-outcomes.md) records shared CUDA
 rotary traversal and typed export recipes, Metal paged-seed and packed-split
 owners, exact rebuilt CUDA images, and reproducible in-place/layout validation.
+
+### AL main integration and attention paging ownership
+
+[The AL register](unified-execution-al-outcomes.md) records the latest main
+merge, new exports integrated into existing generic CUDA owners, BF16 fused
+output ownership, graph/KV lock handoff and a shared live-page recipe whose
+complete attention PTX remains byte-identical.
