@@ -50,6 +50,7 @@ pub const Payload = struct {
     vtable: *const VTable,
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     execution_wait: ?@import("execution_wait.zig").Boundary = null,
+    publication_wait: ?@import("execution_wait.zig").Boundary = null,
     delegation: ?Delegation = null,
 };
 pub const Port = extern struct {
@@ -77,7 +78,7 @@ pub const Port = extern struct {
         if (!payload.vtable_contract.matches(.of(VTable))) return error.UnsupportedVersion;
         if (payload.vtable.check_lifetime) |check|
             return Boundary.call("check_lifetime", payload.dispatch, check, .{payload.ptr});
-        if (payload.execution_wait != null or payload.delegation != null) return error.ExecutionWaitUnsupported;
+        if (payload.execution_wait != null or payload.publication_wait != null or payload.delegation != null) return error.ExecutionWaitUnsupported;
         return self.checkpoint();
     }
     pub fn deadlineNs(self: Port) !?u64 {
@@ -124,6 +125,13 @@ pub const Port = extern struct {
         if (!try self.allowsRetainedPhysicalWait()) return error.ExecutionWaitUnsupported;
         return null;
     }
+    /// Trusted guarded-publication scope, for independent native readiness
+    /// only. Ordinary funding and mutex helpers must not use this capability.
+    pub fn publicationWaitAfterLifetime(self: Port) !?@import("execution_wait.zig").Boundary {
+        try self.checkLifetime();
+        const payload: *const Payload = @ptrCast(@alignCast(self.payload));
+        return payload.publication_wait;
+    }
     pub fn hasExecutionWait(self: Port) !bool {
         try self.validate();
         const payload: *const Payload = @ptrCast(@alignCast(self.payload));
@@ -135,7 +143,7 @@ pub const Port = extern struct {
     pub fn hasExecutionSuspension(self: Port) !bool {
         _ = try self.hasExecutionWait();
         const payload: *const Payload = @ptrCast(@alignCast(self.payload));
-        return payload.execution_wait != null or payload.delegation != null;
+        return payload.execution_wait != null or payload.publication_wait != null or payload.delegation != null;
     }
     /// Only providers that perform physical I/O may use this boundary.
     pub fn executionWait(self: Port) !?@import("execution_wait.zig").Boundary {
@@ -181,7 +189,7 @@ pub const ErrorRelay = struct {
         const original_payload: *const Payload = @ptrCast(@alignCast(original.payload));
         self.original = original;
         self.rejection = null;
-        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = lifetime, .wait_for_progress = wait, .deadline_ns = deadline, .retirement_binding = retirement, .remote_executor = remoteExecutor, .retained_physical_wait = retainedPhysicalWait }, .execution_wait = original_payload.execution_wait, .delegation = original_payload.delegation };
+        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = lifetime, .wait_for_progress = wait, .deadline_ns = deadline, .retirement_binding = retirement, .remote_executor = remoteExecutor, .retained_physical_wait = retainedPhysicalWait }, .execution_wait = original_payload.execution_wait, .publication_wait = original_payload.publication_wait, .delegation = original_payload.delegation };
         return Port.init(&self.payload);
     }
     fn retainedPhysicalWait(raw: *anyopaque) !bool {
@@ -485,6 +493,7 @@ pub const RejectionTrace = struct {
         if (original.?.validate()) |_| {
             const source: *const Payload = @ptrCast(@alignCast(original.?.payload));
             if (source.vtable_contract.matches(.of(VTable))) {
+                self.payload.publication_wait = source.publication_wait;
                 if (source.execution_wait != null) self.payload.execution_wait = .{ .ptr = self, .begin = beginWait, .end = endWait };
                 if (source.delegation != null) self.payload.delegation = .{ .suspension = .{ .ptr = self, .begin = suspendDelegation, .end = resumeDelegation } };
             } else self.failure = error.UnsupportedVersion;

@@ -21,7 +21,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 20;
+pub const abi_version: u32 = 21;
 /// Synchronous, non-yielding restriction on the original CPU-return wait.
 /// Borrowed only until enterChecked returns; never retained by the owner.
 /// Rejection stops that execution and does not retire physical ownership.
@@ -227,6 +227,12 @@ pub const Owner = extern struct {
     current_class: ?*const fn (*anyopaque, *c_int) callconv(.c) errors.Status = null,
     enter_checked: ?*const fn (*anyopaque, c_int, *const Reentry) callconv(.c) errors.Status = null,
     cpu_borrow: ?*const fn (*anyopaque, *const CpuBorrow) callconv(.c) errors.Status = null,
+    /// Guarded publication borrows a dedicated return CPU inside the node
+    /// ceiling. False keeps the existing grant. Scope finish follows every
+    /// service-fence/physical join; this conveys no new logical authority.
+    park_publication: ?*const fn (*anyopaque, *u8) callconv(.c) errors.Status = null,
+    resume_publication: ?*const fn (*anyopaque, ?*const Reentry) callconv(.c) errors.Status = null,
+    finish_publication: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
     request_resources: ?*const fn (*anyopaque, *const ResourceBundle) callconv(.c) errors.Status = null,
     /// Synchronous stage: copies resource metadata, releases CPU, acquires the
     /// complete bundle with CPU, and detaches the participant on every return.
@@ -462,6 +468,12 @@ pub const Borrowed = extern struct {
     current_class: ?*const fn (*anyopaque, *c_int) callconv(.c) errors.Status = null,
     enter_checked: ?*const fn (*anyopaque, c_int, *const Reentry) callconv(.c) errors.Status = null,
     cpu_borrow: ?*const fn (*anyopaque, *const CpuBorrow) callconv(.c) errors.Status = null,
+    /// Guarded publication borrows a dedicated return CPU inside the node
+    /// ceiling. False keeps the existing grant. Scope finish follows every
+    /// service-fence/physical join; this conveys no new logical authority.
+    park_publication: ?*const fn (*anyopaque, *u8) callconv(.c) errors.Status = null,
+    resume_publication: ?*const fn (*anyopaque, ?*const Reentry) callconv(.c) errors.Status = null,
+    finish_publication: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
     request_resources: ?*const fn (*anyopaque, *const ResourceBundle) callconv(.c) errors.Status = null,
     /// Synchronous stage: copies resource metadata, releases CPU, acquires the
     /// complete bundle with CPU, and detaches the participant on every return.
@@ -473,6 +485,30 @@ pub const Borrowed = extern struct {
     producer_parent: ?*const fn (*anyopaque, *Borrowed) callconv(.c) errors.Status = null,
     /// Original call-scoped restriction, borrowed synchronously until activation returns.
     activate_child_checked: ?*const fn (*anyopaque, *const Reentry) callconv(.c) errors.Status = null,
+
+    pub fn parkPublication(self: Borrowed) !bool {
+        try self.validate();
+        const callback = self.park_publication orelse return false;
+        if (self.resume_publication == null or self.finish_publication == null) return error.ExecutionWaitUnsupported;
+        var parked: u8 = 0;
+        const status = callback(self.context, &parked);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+        if (parked > 1) return error.InvalidArgument;
+        return parked != 0;
+    }
+    pub fn resumePublication(self: Borrowed, restriction: ?*const Reentry) !void {
+        try self.validate();
+        if (restriction) |check| try check.validate();
+        const callback = self.resume_publication orelse return error.ExecutionWaitUnsupported;
+        const status = callback(self.context, restriction);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+    pub fn finishPublication(self: Borrowed) !void {
+        try self.validate();
+        const callback = self.finish_publication orelse return;
+        const status = callback(self.context);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     pub fn producerParent(self: Borrowed) !Borrowed {
         try self.validate();
@@ -647,6 +683,9 @@ pub const Borrowed = extern struct {
             .current_class = owner.current_class,
             .enter_checked = owner.enter_checked,
             .cpu_borrow = owner.cpu_borrow,
+            .park_publication = owner.park_publication,
+            .resume_publication = owner.resume_publication,
+            .finish_publication = owner.finish_publication,
             .request_resources = owner.request_resources,
             .enter_resources = owner.enter_resources,
         };
@@ -1237,4 +1276,65 @@ test "runnable CPU borrow ABI rejects malformed prefixes before calling capabili
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     borrow.cpu_borrow = null;
     try std.testing.expectError(error.UnsupportedOperation, borrow.setCpuBorrow(&enabled));
+}
+
+test "runnable lifetime ABI guarded publication rejects stale prefixes and incomplete return capabilities before dispatch" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn check(_: *anyopaque) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn park(raw: *anyopaque, out: *u8) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            out.* = 1;
+            return .ok;
+        }
+        fn reenter(raw: *anyopaque, restriction: ?*const Reentry) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (restriction) |fence| fence.checkpoint() catch |cause| return errors.statusFromError(cause);
+            return .ok;
+        }
+        fn finish(raw: *anyopaque) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .ok;
+        }
+        fn canceled(_: *anyopaque) callconv(.c) errors.Status {
+            return errors.statusFromError(error.Canceled);
+        }
+    };
+    var fake: Fake = .{};
+    var borrow: Borrowed = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(Class.write), .checkpoint = Fake.check, .park = Fake.phase, .enter = Fake.phase, .park_publication = Fake.park, .resume_publication = Fake.reenter, .finish_publication = Fake.finish };
+    var stale = borrow;
+    stale.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, stale.parkPublication());
+    try std.testing.expectError(error.UnsupportedVersion, stale.resumePublication(null));
+    try std.testing.expectError(error.UnsupportedVersion, stale.finishPublication());
+    stale = borrow;
+    stale.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, stale.parkPublication());
+    try std.testing.expectError(error.UnsupportedVersion, stale.resumePublication(null));
+    try std.testing.expectError(error.UnsupportedVersion, stale.finishPublication());
+    stale = borrow;
+    stale.finish_publication = null;
+    try std.testing.expectError(error.ExecutionWaitUnsupported, stale.parkPublication());
+    stale = borrow;
+    stale.resume_publication = null;
+    try std.testing.expectError(error.ExecutionWaitUnsupported, stale.parkPublication());
+    var invalid: Reentry = .{ .context = &fake, .check = Fake.canceled };
+    invalid.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.resumePublication(&invalid));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(try borrow.parkPublication());
+    try std.testing.expectError(error.Canceled, borrow.resumePublication(&.{ .context = &fake, .check = Fake.canceled }));
+    try borrow.finishPublication();
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    borrow.park_publication = null;
+    try std.testing.expect(!try borrow.parkPublication());
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
 }

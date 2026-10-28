@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Read capability on an ingress-owned execution. Keep this adapter, its
 //! allocator and the original execution alive until every physical child joins.
@@ -43,6 +43,9 @@ pub const Read = struct {
             .check_lifetime = lifetime,
             .current_class = currentClass,
             .cpu_borrow = cpuBorrow,
+            .park_publication = parkPublication,
+            .resume_publication = resumePublication,
+            .finish_publication = finishPublication,
             .request_resources = requestResources,
             .enter_resources = enterResources,
         };
@@ -64,6 +67,23 @@ pub const Read = struct {
         self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
+    fn parkPublication(raw: *anyopaque, out: *u8) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.precheck() catch |cause| return runtime.error_abi.statusFromError(cause);
+        return @import("runnable_publication.zig").park(self.execution, out);
+    }
+    fn resumePublication(raw: *anyopaque, restriction: ?*const abi.Reentry) callconv(.c) runtime.error_abi.Status {
+        return @import("runnable_publication.zig").reenter(from(raw).execution, restriction);
+    }
+    fn finishPublication(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        const generation = self.execution.resume_generation;
+        const result = @import("runnable_publication.zig").finish(self.execution);
+        if (!result.isOk()) return result;
+        if (generation != self.execution.resume_generation) self.validateCurrent() catch |cause| return runtime.error_abi.statusFromError(cause);
+        return .ok;
+    }
+
     fn cpuBorrow(raw: *anyopaque, options: *const abi.CpuBorrow) callconv(.c) runtime.error_abi.Status {
         options.validate() catch |err| return runtime.error_abi.statusFromError(err);
         const self = from(raw);

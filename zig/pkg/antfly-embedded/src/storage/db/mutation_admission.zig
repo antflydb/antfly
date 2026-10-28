@@ -388,6 +388,9 @@ pub const IntentCollection = struct {
     pub fn bindPublication(self: *@This(), controls: ?lock.ApplyRwLock.Acquisition, io: ?@import("std").Io) ?read.Port {
         const port = self.bind(controls, io) orelse return null;
         self.retained_physical_wait = self.original.?.retained_physical_wait;
+        if (self.original.?.publication_armed) if (self.original.?.publication) |scope| {
+            self.payload.publication_wait = scope.wait;
+        };
         return port;
     }
     pub fn bind(self: *@This(), controls: ?lock.ApplyRwLock.Acquisition, io: ?@import("std").Io) ?read.Port {

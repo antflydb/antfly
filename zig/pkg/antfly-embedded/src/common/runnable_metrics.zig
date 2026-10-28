@@ -90,6 +90,8 @@ pub fn appendPrometheusMetrics(writer: *std.Io.Writer, stats: Snapshot) !void {
     try prometheus.appendPromMetric(writer, "antfly_runnable_enabled", "gauge", "Whether runnable scheduling is configured on this execution owner", @intFromBool(stats.enabled));
     // Derive both from the same captured capacity; no second owner observation
     // or extern telemetry layout change is needed.
+    const publication_capacity = stats.capacity_slots -| (stats.control_capacity_slots +| stats.general_capacity_slots +| stats.bounded_read_capacity_slots);
+    try prometheus.appendPromMetric(writer, "antfly_runnable_publication_capacity_slots", "gauge", "CPU slots reserved inside total capacity for guarded publication return", publication_capacity);
     const floor: u64 = @intFromBool(stats.bounded_read_capacity_slots != 0);
     try prometheus.appendPromMetric(writer, "antfly_runnable_bounded_read_floor_slots", "gauge", "Nonborrowable bounded read CPU floor inside the reserve", floor);
     try prometheus.appendPromMetric(writer, "antfly_runnable_cpu_borrow_capacity_slots", "gauge", "Maximum CPU loans above the bounded read floor", @min(@as(u64, 1), stats.bounded_read_capacity_slots - floor));
@@ -489,4 +491,18 @@ test "runnable metrics service emits every accounting signal from actual executi
         "antfly_runnable_service_debt_slot_ns{service_class=\"background\"} 64000000\n",
         "antfly_runnable_service_rebate_slot_ns{service_class=\"write\"} 500000\n",
     }) |expected| try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), expected) != null);
+}
+
+test "runnable metrics expose guarded publication reserve within the same effective node ceiling" {
+    const policy = try (scheduling.Config{ .capacity_mode = .automatic }).resolveCapacity(.{ .millicpus = 1000 }, .{});
+    var scheduler = try scheduling.Scheduler.init(policy);
+    defer scheduler.close();
+    const stats = snapshot(&scheduler);
+    try std.testing.expectEqual(@as(u64, 4), stats.capacity_slots);
+    try std.testing.expectEqual(@as(u64, 1), stats.general_capacity_slots);
+    try std.testing.expectEqual(@as(u64, 2), stats.control_capacity_slots);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try appendPrometheusMetrics(&output.writer, stats);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "antfly_runnable_publication_capacity_slots 1\n") != null);
 }

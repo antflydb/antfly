@@ -147,7 +147,8 @@ const builtin = @import("builtin");
 // Periodic checkpoints retain admitted rotation and private retirement plans.
 // Foreground commits carry original admission across the native batch boundary.
 // Finite guarded publication distinguishes retained CPU from lending physical waits.
-pub const abi_version: u32 = 163;
+// Guarded scopes carry independent publication CPU return and mandatory retirement.
+pub const abi_version: u32 = 164;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

@@ -63,6 +63,7 @@ pub fn acquisition(budget: *Budget) lock.ApplyRwLock.Acquisition {
     return .{
         .lifetime = .{ .context = budget, .check_fn = checkBudget },
         .execution_wait = budget.executionBoundary(),
+        .publication = if (budget.controls.pre_decision.deadline_ns != null) budget.publication() else null,
         .retained_physical_wait = budget.controls.execution_runnable != null and budget.controls.pre_decision.deadline_ns != null,
     };
 }

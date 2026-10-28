@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! SQL write capability on one already admitted execution. The caller supplies
 //! a stable concurrent bounded allocator, and retains it through all joins.
@@ -39,6 +39,9 @@ fn initTeam(execution: *scheduler.Execution, allocator: std.mem.Allocator) !runt
             .resize_team = resize,
             .check_lifetime = lifetime,
             .current_class = currentClass,
+            .park_publication = @import("runnable_publication.zig").park,
+            .resume_publication = @import("runnable_publication.zig").reenter,
+            .finish_publication = @import("runnable_publication.zig").finish,
         },
         // Protected terminal SQL work must leave the health reserve available.
         .maximum_slots = if (entry.class == .control) 1 else owner.config.generalSlots(),
@@ -105,6 +108,9 @@ pub const Completion = struct {
         value.borrow.enter_checked = enterChecked;
         value.borrow.reserve_child = reserveChild;
         value.borrow.producer_parent = producerParent;
+        value.borrow.park_publication = parkPublication;
+        value.borrow.resume_publication = resumePublication;
+        value.borrow.finish_publication = finishPublication;
         return value;
     }
 
@@ -123,6 +129,9 @@ pub const Completion = struct {
         out.reserve_child = Producer.reserve;
         out.check_lifetime = Completion.lifetime;
         out.current_class = Completion.currentClass;
+        out.park_publication = Completion.parkPublication;
+        out.resume_publication = Completion.resumePublication;
+        out.finish_publication = Completion.finishPublication;
         return .ok;
     }
     const Producer = struct {
@@ -151,6 +160,16 @@ pub const Completion = struct {
             return .ok;
         }
     };
+
+    fn parkPublication(raw: *anyopaque, out: *u8) callconv(.c) runtime.error_abi.Status {
+        return @import("runnable_publication.zig").park(from(raw).execution, out);
+    }
+    fn resumePublication(raw: *anyopaque, restriction: ?*const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+        return @import("runnable_publication.zig").reenter(from(raw).execution, restriction);
+    }
+    fn finishPublication(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+        return @import("runnable_publication.zig").finish(from(raw).execution);
+    }
 
     fn reserveChild(raw: *anyopaque, options: *const runtime.runnable_abi.ChildStart) callconv(.c) runtime.error_abi.Status {
         const self = from(raw);

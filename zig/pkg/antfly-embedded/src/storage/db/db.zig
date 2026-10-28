@@ -7862,6 +7862,30 @@ pub const DB = struct {
     }
 
     pub fn batchWithAdmissionControlsAndRootContext(self: *DB, req: types.BatchRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, visibility_cancellation: types.CancellationToken, roots: @import("../../api/batch_execution_admission.zig").RootContext, dispatcher: ?DocumentArtifactChildRangeDispatcher, observer: ?CommittedBatchEffectsObserver) anyerror!void {
+        var scoped = controls;
+        // The invocation owns every mutation/capture lease only when no outer
+        // root, retirement or producer authority was supplied. Nested callers
+        // must keep CPU until their enclosing service owners can retire.
+        if (roots.root != null or roots.retirement != null or roots.producer != null) scoped.publication = null;
+        if (scoped.publication) |publication| {
+            try publication.scope.beginWait();
+            scoped.publication_armed = true;
+            const result = self.batchWithGuardedPublication(req, scoped, visibility_cancellation, roots, dispatcher, observer);
+            const retired = publication.scope.endWait();
+            if (result) |_| {
+                retired catch return error.DurabilityOutcomeUnknown;
+                return;
+            } else |cause| {
+                // Physical uncertainty and the first original rejection cannot
+                // be masked by denied ordinary CPU return after fence unwind.
+                retired catch {};
+                return cause;
+            }
+        }
+        return self.batchWithGuardedPublication(req, scoped, visibility_cancellation, roots, dispatcher, observer);
+    }
+
+    fn batchWithGuardedPublication(self: *DB, req: types.BatchRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, visibility_cancellation: types.CancellationToken, roots: @import("../../api/batch_execution_admission.zig").RootContext, dispatcher: ?DocumentArtifactChildRangeDispatcher, observer: ?CommittedBatchEffectsObserver) anyerror!void {
         try controls.lifetime.check();
         try roots.validate();
         var invocation: @import("mutation_admission.zig").InvocationRoot = .{};

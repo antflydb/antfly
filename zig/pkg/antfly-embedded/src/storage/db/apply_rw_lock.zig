@@ -34,6 +34,8 @@ pub const ApplyRwLock = struct {
         exclusive_max_wait_ns: u64 = 0,
     };
 
+    pub const Publication = @import("antfly_runtime_abi").execution_wait.GuardedPublication;
+
     /// Original non-suspending lifetime authority plus an optional CPU wait
     /// boundary. The caller keeps both alive until acquisition returns.
     pub const Acquisition = struct {
@@ -43,6 +45,8 @@ pub const ApplyRwLock = struct {
         /// Only publication may use this for independent owned native I/O.
         /// It grants no permission to wait for locks or resource progress.
         retained_physical_wait: bool = false,
+        publication: ?Publication = null,
+        publication_armed: bool = false,
     };
 
     // One atomic word linearizes reader admission against writer closure.

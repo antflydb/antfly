@@ -88,7 +88,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Periodic checkpoints retain admitted rotation and private retirement plans.
 // Foreground commits carry original admission across the native batch boundary.
 // Finite guarded publication distinguishes retained CPU from lending physical waits.
-pub const abi_version: u32 = 223;
+// Guarded scopes carry independent publication CPU return and mandatory retirement.
+pub const abi_version: u32 = 224;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

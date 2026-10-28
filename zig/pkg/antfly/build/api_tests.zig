@@ -711,6 +711,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-cleanup-budget-test", "Verify cleanup activation budgets and runnable scheduler contracts")
         .dependOn(&b.addRunArtifact(cleanup_budget_tests).step);
 
+    const runnable_metrics_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/common/runnable_metrics.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    runnable_metrics_root.addImport("antfly_platform", antfly_imports.platform);
+    runnable_metrics_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    const runnable_metrics_tests = b.addTest(.{
+        .name = "runnable-metrics-tests",
+        .root_module = runnable_metrics_root,
+        .filters = &.{"runnable metrics"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-runnable-metrics-test", "Verify effective runnable capacity and publication reserve telemetry")
+        .dependOn(&b.addRunArtifact(runnable_metrics_tests).step);
+
     const status_refresh_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_status_refresh.zig"),
         .target = target,

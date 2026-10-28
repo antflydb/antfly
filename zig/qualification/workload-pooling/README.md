@@ -278,3 +278,29 @@ cannot pass qualification. Missing or failed matrix receipts fail the sweep.
 A point with generator drops fails its existing envelope gate; receipts must be
 reviewed before changing any future workload declaration. No current-source
 sweep has passed, and automatic defaults remain unqualified.
+
+## Guarded native publication CPU return
+
+Automatic runnable policy reserves one publication-return CPU inside the node's
+slot ceiling, alongside independent health and cleanup CPUs. Its minimum is four
+logical slots, including one ordinary CPU. Fixed policies opt in with
+`publication_slots = 1`; a zero or busy reserve keeps the publisher's existing
+CPU and never waits to acquire the reserve under a DB fence.
+
+Top-level managed table batches can release ordinary CPU at an independently
+owned native WAL readiness wait and resume on publication CPU while retaining
+their apply, snapshot and policy fences. The original operation, class, memory,
+cancellation and deadline remain authoritative. The scope returns to ordinary
+CPU after its DB work and physical joins retire. Denied return after a successful
+primary commit reports `DurabilityOutcomeUnknown`; it does not fence an otherwise
+healthy backend or claim that the mutation was rejected before commit. Metrics
+expose the effective reserve as `antfly_runnable_publication_capacity_slots`.
+
+Nested capture/producer scopes, child executions, multi-CPU teams and providers
+without the owned native readiness contract retain their existing CPU policy.
+The `antfly-guarded-db-commit-test` gate exercises actual bound table callbacks,
+managed filesystem DBs, native WAL I/O and reopen recovery, with deterministic
+physical pause hooks. It includes an ordinary status request holding the sole
+ordinary CPU while waiting on the publisher's apply fence, independent health
+progress, cancellation/deadline joins and bounded ordinary-return refusal. This
+focused evidence does not qualify HTTP transport overload or every engine.

@@ -109,6 +109,10 @@ pub const Config = struct {
     /// Dedicated cleanup CPU drawn from slots, separate from health controls.
     /// Zero retains the legacy shared-control policy until callers opt in.
     cleanup_slots: usize = 0,
+    /// Independent, nonborrowable return CPU for a single guarded publisher.
+    /// The original operation/class/lifetime remains authoritative. Fixed
+    /// policies opt in explicitly; automatic startup funds this inside slots.
+    publication_slots: usize = 0,
     /// Reserve bounded_read_slots ordinary CPUs and one quarter of ordinary
     /// registry count/bytes for verified bounded reads.
     read_isolation: ?bool = null,
@@ -135,7 +139,8 @@ pub const Config = struct {
         var resolved = self;
         resolved.capacity_mode = .fixed;
         resolved.cleanup_slots = 1;
-        const minimum = self.control_slots + 2;
+        resolved.publication_slots = 1;
+        const minimum = self.control_slots + 3;
         if (minimum > self.slots) return error.InvalidRunnablePolicy;
         resolved.slots = @max(minimum, @min(self.slots, cpu.parallelism()));
         resolved.read_isolation = self.read_isolation orelse (resolved.ordinarySlots() > self.bounded_read_slots and self.max_operations >= 8);
@@ -170,7 +175,7 @@ pub const Config = struct {
     }
 
     pub fn ordinarySlots(self: Config) usize {
-        return self.slots - self.control_slots - self.cleanup_slots;
+        return self.slots - self.control_slots - self.cleanup_slots - self.publication_slots;
     }
 
     pub fn readIsolation(self: Config) bool {
@@ -219,7 +224,7 @@ pub const Config = struct {
 
     pub fn validate(self: Config) !void {
         if (self.slots < 2 or self.slots > 65535 or self.control_slots == 0 or self.control_slots >= self.slots or
-            self.cleanup_slots > 1 or self.cleanup_slots >= self.slots - self.control_slots or
+            self.cleanup_slots > 1 or self.publication_slots > 1 or self.cleanup_slots + self.publication_slots >= self.slots - self.control_slots or
             self.bounded_read_slots == 0 or self.bounded_read_slots > 65533 or
             (self.readIsolation() and (self.ordinarySlots() <= self.bounded_read_slots or self.max_operations < 8 or self.max_bytes -| self.control_bytes < 4)) or
             self.max_operations < 2 or self.max_bytes == 0 or self.control_bytes == 0 or self.control_bytes >= self.max_bytes or self.max_wait_ms == 0 or self.max_wait_ms > 60000 or
@@ -287,6 +292,8 @@ pub const Entry = struct {
     cleanup_active: bool = false,
     protected_cleanup_root: bool = false,
     dormant_cleanup_root: bool = false,
+    /// CPU partition only: never changes query, completion or cleanup authority.
+    publication_active: bool = false,
 
     fn retainedPhase(self: *const Entry) bool {
         return self.completion_active or self.cleanup_active or self.protected_cleanup_root;
@@ -297,10 +304,10 @@ const Queue = struct { head: ?*Entry = null, tail: ?*Entry = null };
 pub const Scheduler = struct {
     config: Config,
     mutex: std.atomic.Mutex = .unlocked,
-    queues: [8]Queue = @splat(.{}),
-    continuation_queues: [8]Queue = @splat(.{}),
+    queues: [9]Queue = @splat(.{}),
+    continuation_queues: [9]Queue = @splat(.{}),
     entries: ?*Entry = null,
-    used: [8]usize = @splat(0),
+    used: [9]usize = @splat(0),
     credits: [6]usize = @splat(0),
     cursor: usize = 0,
     round_open: bool = false,
@@ -318,6 +325,7 @@ pub const Scheduler = struct {
     metrics: Stats = .{},
     control_baseline_bytes: u64 = 0,
     cpu_borrower: ?*Entry = null,
+    publication_owner: ?*Entry = null,
     cpu_borrow_grants: u64 = 0,
     cpu_borrow_returns: u64 = 0,
 
@@ -432,6 +440,7 @@ pub const Scheduler = struct {
         runnable_slots: usize = 0,
         control_slots: usize = 0,
         cleanup_runnable_slots: usize = 0,
+        publication_runnable_slots: usize = 0,
         resource_blocked: usize = 0,
         output_blocked: usize = 0,
         grants: [5]u64 = @splat(0),
@@ -503,6 +512,7 @@ pub const Scheduler = struct {
         return self.config.readIsolation() and e.class == .query and e.read_lane == .bounded and !e.read_transition_active;
     }
     fn cpuIndex(self: *const Scheduler, e: *const Entry) usize {
+        if (e.publication_active) return 8;
         if ((e.protected_cleanup_root or e.cleanup_active) and self.config.cleanup_slots != 0) return 5;
         if (self.config.readIsolation() and e.class == .query) return switch (e.read_lane) {
             .general => 0,
@@ -512,6 +522,7 @@ pub const Scheduler = struct {
         return @backingInt(e.class);
     }
     fn capacityFor(self: *const Scheduler, e: *const Entry, class: Class) usize {
+        if (e.publication_active) return self.config.publication_slots;
         if ((e.protected_cleanup_root or e.cleanup_active) and self.config.cleanup_slots != 0) return self.config.cleanup_slots;
         if (class == .control) return self.config.control_slots;
         if (!self.config.readIsolation()) return self.config.ordinarySlots();
@@ -535,7 +546,7 @@ pub const Scheduler = struct {
     fn validateCpuBorrow(self: *const Scheduler, e: *const Entry, budget: CpuBorrowBudget) !void {
         if (budget.max_non_yield_ns == 0 or budget.max_non_yield_ns > @as(u64, self.config.quantum_ms) * std.time.ns_per_ms or
             e.slots != 1 or e.parent != null or e.children != 0 or e.class == .control or
-            e.read_lane == .bounded or e.read_transition_active or e.retainedPhase() or e.completion_options != null)
+            e.read_lane == .bounded or e.read_transition_active or e.retainedPhase() or e.publication_active or e.completion_options != null)
             return error.InvalidRunnableTransition;
     }
     pub fn enableCpuBorrow(self: *Scheduler, e: *Entry, budget: CpuBorrowBudget) !void {
@@ -677,7 +688,7 @@ pub const Scheduler = struct {
         e.continuation = true;
         e.state = .running;
         const c = @backingInt(e.class);
-        if (self.config.readIsolation() and !self.boundedRead(e) and e.class != .control and !e.retainedPhase() and
+        if (self.config.readIsolation() and !self.boundedRead(e) and e.class != .control and !e.retainedPhase() and !e.publication_active and
             e.slots > self.config.generalSlots() -| self.generalUsed())
         {
             self.startCpuLoan(e);
@@ -687,7 +698,7 @@ pub const Scheduler = struct {
         e.service_started_ns = null;
         e.service_observed_ns = 0;
         e.service_clock_valid = true;
-        e.service_class = if (e.retainedPhase() or (self.boundedRead(e) and e.read_transition_budget != null)) null else self.barrierClass(e);
+        e.service_class = if (e.publication_active or e.retainedPhase() or (self.boundedRead(e) and e.read_transition_budget != null)) null else self.barrierClass(e);
         e.service_estimate_ns = @as(u64, @intCast(e.slots)) * self.serviceQuantumNs();
         if (e.service_class) |index| self.work_service.estimated_slot_ns[index] +|= e.service_estimate_ns;
         if (self.boundedRead(e)) e.bounded_service_paid +|= e.slots;
@@ -764,7 +775,7 @@ pub const Scheduler = struct {
         try self.checkAuthority(e);
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.class == .control or e.retainedPhase() or e.pending_resources != null or
+        if (e.scheduler != self or e.class == .control or e.publication_active or e.retainedPhase() or e.pending_resources != null or
             (e.state != .resource_blocked and e.state != .output_blocked)) return error.InvalidRunnableTransition;
         e.pending_resources = resources;
         e.resource_probe_epoch = 0;
@@ -995,6 +1006,10 @@ pub const Scheduler = struct {
             if (e.slots > self.config.cleanup_slots - self.used[5]) break;
             self.grant(e);
         }
+        while (self.queueHead(8)) |e| {
+            if (e.slots > self.config.publication_slots - self.used[8]) break;
+            self.grant(e);
+        }
         const capacity = self.config.ordinarySlots();
         while (self.ordinaryUsed() < capacity) {
             const free = capacity - self.ordinaryUsed();
@@ -1058,7 +1073,7 @@ pub const Scheduler = struct {
         const now = parent.options.now();
         self.lock();
         defer self.mutex.unlock();
-        if (parent == child or parent.scheduler != self or parent.state != .running or parent.cleanup_active or parent.protected_cleanup_root or parent.cpu_borrow_budget != null or child.cpu_borrow_budget != null or
+        if (parent == child or parent.scheduler != self or parent.state != .running or parent.publication_active or parent.cleanup_active or parent.protected_cleanup_root or parent.cpu_borrow_budget != null or child.cpu_borrow_budget != null or
             child.state != .fresh or child.scheduler != null or child.parent != null or child.children != 0 or parent.slots != 1) return error.InvalidRunnableTransition;
         try self.checkAncestorsLocked(parent);
         if (child.bytes < @sizeOf(Entry)) return error.InvalidRunnableDemand;
@@ -1351,7 +1366,7 @@ pub const Scheduler = struct {
         const now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.state != .running or e.children != 0) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.state != .running or e.children != 0 or (e.publication_active and slots != 1)) return error.InvalidRunnableTransition;
         const capacity = self.capacityFor(e, e.class);
         if (slots == 0 or slots > capacity) return error.InvalidRunnableDemand;
         if (e.cpu_borrow_budget != null and slots != 1) return error.InvalidRunnableTransition;
@@ -1396,6 +1411,77 @@ pub const Scheduler = struct {
         if (reason == .resource_blocked) self.metrics.resource_blocked += 1 else self.metrics.output_blocked += 1;
         self.dispatch();
     }
+    /// Claim without waiting while service fences are held. A busy/disabled
+    /// reserve keeps the original CPU; it cannot introduce a dependency cycle.
+    /// Only an independent owned physical-I/O producer may use this transfer.
+    pub fn parkPublication(self: *Scheduler, e: *Entry) !bool {
+        try self.checkAuthority(e);
+        const now = e.options.now();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .running) return error.InvalidRunnableTransition;
+        if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
+        if (e.slots != 1 or e.children != 0 or e.parent != null or e.class == .control or
+            self.boundedRead(e) or e.cleanup_active or e.protected_cleanup_root or e.cpu_borrow_budget != null or e.pending_resources != null) return false;
+        if (!e.publication_active) {
+            if (self.config.publication_slots == 0 or self.publication_owner != null) return false;
+            // Release from the old partition before changing classification.
+            self.releaseCpu(e, now);
+            self.publication_owner = e;
+            e.publication_active = true;
+        } else {
+            std.debug.assert(self.publication_owner == e);
+            self.releaseCpu(e, now);
+        }
+        e.state = .resource_blocked;
+        self.metrics.resource_blocked += 1;
+        self.dispatch();
+        return true;
+    }
+
+    /// All service fences and physical consumers must retire before this call.
+    /// Reacquisition uses the original class, deadline and cancellation; a
+    /// stopped operation never acquires fresh foreground authority.
+    pub fn finishPublication(self: *Scheduler, e: *Entry) !bool {
+        // Evaluate user clock/cancellation outside the scheduler mutex. The
+        // reservation must retire even when original authority has expired.
+        var refusal: ?anyerror = null;
+        self.checkAuthority(e) catch |cause| {
+            refusal = cause;
+        };
+        const now = e.options.now();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self) return error.InvalidRunnableTransition;
+        if (!e.publication_active) return false;
+        std.debug.assert(self.publication_owner == e);
+        const running = e.state == .running;
+        if (running) self.releaseCpu(e, now) else if (e.state == .queued) self.unlink(e);
+        self.publication_owner = null;
+        e.publication_active = false;
+        if (running and refusal == null and self.closed and !e.retainedPhase()) refusal = error.SchedulerClosed;
+        if (running and refusal != null) {
+            e.state = .stopped;
+            e.failure = e.failure orelse refusal.?;
+            e.ready.set(e.options.io);
+        } else if (running) {
+            e.bypasses = 0;
+            self.sequence +|= 1;
+            e.sequence = self.sequence;
+            self.enqueue(e, now);
+        } else if (e.state == .queued) {
+            e.state = .stopped;
+            e.failure = e.failure orelse error.InvalidRunnableTransition;
+            e.ready.set(e.options.io);
+        }
+        self.dispatch();
+        if (running) {
+            if (refusal) |cause| return cause;
+            e.waited = e.state == .queued;
+        }
+        return running;
+    }
+
     pub fn unblock(self: *Scheduler, e: *Entry) !void {
         // A blocked operation still owns its reservations, but cancellation,
         // expiry or family failure must be observed before dispatch can grant
@@ -1433,7 +1519,7 @@ pub const Scheduler = struct {
         if (e.read_transition_active and !e.cleanup_active) return error.InvalidRunnableTransition;
         if ((e.children != 0 or e.parent != null) and class != e.class) return error.InvalidRunnableTransition;
         // Retained completion/cleanup cannot promote its capacity partition.
-        if (e.retainedPhase() and class != e.class) return error.InvalidRunnableTransition;
+        if ((e.publication_active or e.retainedPhase()) and class != e.class) return error.InvalidRunnableTransition;
         const capacity = self.capacityFor(e, class);
         if (e.slots > capacity) return error.InvalidRunnableDemand;
         if (self.boundedRead(e) and class != .query) return error.InvalidRunnableTransition;
@@ -1636,7 +1722,7 @@ pub const Scheduler = struct {
         defer self.mutex.unlock();
         if (e.scheduler != self or e.state != .running or
             (e.class != .write and e.class != .control) or
-            e.completion_options != null or e.cpu_borrow_budget != null or e.retainedPhase() or e.parent != null) return error.InvalidRunnableTransition;
+            e.completion_options != null or e.cpu_borrow_budget != null or e.publication_active or e.retainedPhase() or e.parent != null) return error.InvalidRunnableTransition;
         if (self.closed) return error.SchedulerClosed;
         if (completion.retained_bytes > e.bytes) return error.InvalidRunnableDemand;
         var options = completion;
@@ -1696,7 +1782,7 @@ pub const Scheduler = struct {
         try cleanup.check();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.retainedPhase() or e.children != 0 or e.parent != null) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.publication_active or e.retainedPhase() or e.children != 0 or e.parent != null) return error.InvalidRunnableTransition;
         switch (e.state) {
             .running => {},
             .queued => self.unlink(e),
@@ -1745,7 +1831,7 @@ pub const Scheduler = struct {
         const foreground_now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.state != .running or e.retainedPhase() or e.cpu_borrow_budget != null or e.children != 0 or e.parent != null) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.state != .running or e.publication_active or e.retainedPhase() or e.cpu_borrow_budget != null or e.children != 0 or e.parent != null) return error.InvalidRunnableTransition;
         if (self.closed) return error.SchedulerClosed;
         const options = e.completion_options orelse return error.InvalidRunnableTransition;
         self.settleServiceLocked(e, foreground_now);
@@ -1802,6 +1888,11 @@ pub const Scheduler = struct {
             self.metrics.cleanup_retained_bytes -= e.bytes;
             e.protected_cleanup_root = false;
         }
+        if (e.publication_active) {
+            std.debug.assert(self.publication_owner == e);
+            self.publication_owner = null;
+            e.publication_active = false;
+        }
         e.state = .finished;
         e.cpu_borrow_budget = null;
         std.debug.assert(!e.borrowed_read_cpu);
@@ -1848,9 +1939,10 @@ pub const Scheduler = struct {
     }
     fn statsLocked(self: *const Scheduler) Stats {
         var result = self.metrics;
-        result.runnable_slots = self.ordinaryUsed() + self.used[4] + self.used[5];
+        result.runnable_slots = self.ordinaryUsed() + self.used[4] + self.used[5] + self.used[8];
         result.control_slots = self.used[4] + self.used[5];
         result.cleanup_runnable_slots = self.used[5];
+        result.publication_runnable_slots = self.used[8];
         result.bounded_read_slots = self.used[6];
         result.cpu_borrowed_slots = @intFromBool(self.cpu_borrower != null);
         result.cpu_borrow_grants = self.cpu_borrow_grants;
@@ -1923,6 +2015,7 @@ pub const Execution = struct {
     /// retire their owner-produced token after the worker has physically joined.
     borrowed: ?Borrow = null,
     child_pending: bool = false,
+    borrowed_publication_active: bool = false,
     quantum_start_ns: u64 = 0,
     read_sample_ns: u64 = 0,
     checkpoints: u32 = 0,
@@ -1935,6 +2028,9 @@ pub const Execution = struct {
         class: Class,
         current_class: ?*const fn (*anyopaque) anyerror!Class = null,
         cpu_borrow: ?*const fn (*anyopaque, ?CpuBorrowBudget) anyerror!void = null,
+        park_publication: ?*const fn (*anyopaque) anyerror!bool = null,
+        resume_publication: ?*const fn (*anyopaque, ?AdmissionCheck) anyerror!void = null,
+        finish_publication: ?*const fn (*anyopaque) anyerror!void = null,
         request_resources: ?*const fn (*anyopaque, GrantResources) anyerror!void = null,
         enter_resources: ?*const fn (*anyopaque, GrantResources, ?AdmissionCheck) anyerror!void = null,
         checkpoint: *const fn (*anyopaque) anyerror!void,
@@ -2349,6 +2445,49 @@ pub const Execution = struct {
         self.read_sample_ns = self.quantum_start_ns;
         self.checkpoints = 0;
     }
+    pub fn parkPublication(self: *Execution) !bool {
+        if (self.child_pending) return error.InvalidRunnableTransition;
+        if (self.borrowed) |borrow| {
+            const callback = borrow.park_publication orelse return false;
+            if (borrow.resume_publication == null or borrow.finish_publication == null) return error.ExecutionWaitUnsupported;
+            const parked = try callback(borrow.ptr);
+            self.borrowed_publication_active = self.borrowed_publication_active or parked;
+            return parked;
+        }
+        const e = if (self.entry) |*value| value else return false;
+        const owner = try schedulerFor(e, false);
+        return owner.parkPublication(e);
+    }
+    pub fn resumePublication(self: *Execution, restriction: ?AdmissionCheck) !void {
+        if (self.borrowed) |borrow| {
+            try (borrow.resume_publication orelse return error.ExecutionWaitUnsupported)(borrow.ptr, restriction);
+            self.resume_generation +%= 1;
+            return;
+        }
+        const e = if (self.entry) |*value| value else return error.ExecutionWaitUnsupported;
+        if (!e.publication_active) return error.InvalidRunnableTransition;
+        try self.enterWithCheck(e.class, restriction);
+    }
+    pub fn finishPublication(self: *Execution) !void {
+        if (self.borrowed) |borrow| {
+            if (!self.borrowed_publication_active) return;
+            self.borrowed_publication_active = false;
+            try (borrow.finish_publication orelse return error.ExecutionWaitUnsupported)(borrow.ptr);
+            self.resume_generation +%= 1;
+            return;
+        }
+        const e = if (self.entry) |*value| value else return;
+        // Reservation retirement is mandatory after stopped reentry as well.
+        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+        if (try owner.finishPublication(e)) {
+            try owner.waitRetained(e);
+            self.resume_generation +%= 1;
+            self.quantum_start_ns = e.options.now();
+            self.read_sample_ns = self.quantum_start_ns;
+            self.checkpoints = 0;
+        }
+    }
+
     pub fn park(self: *Execution, reason: State) !void {
         if (self.child_pending) return error.InvalidRunnableTransition;
         if (self.borrowed) |borrow| return borrow.park(borrow.ptr, reason);
@@ -4836,12 +4975,12 @@ test "runnable scheduler automatic capacity respects quota ceilings memory and p
     const automatic: Config = .{ .capacity_mode = .automatic };
     for ([_]u64{ 250, 1000, 2000, 3500, 8000, 64000 }) |millicpus| {
         const policy = try automatic.resolveCapacity(.{ .millicpus = millicpus, .source = .cgroup_v2 }, .{ .limit_bytes = 64 << 20, .source = .cgroup_v2 });
-        try std.testing.expectEqual(@max(@as(usize, 3), @min(@as(usize, 8), @as(usize, @intCast(millicpus / 1000)))), policy.slots);
+        try std.testing.expectEqual(@max(@as(usize, 4), @min(@as(usize, 8), @as(usize, @intCast(millicpus / 1000)))), policy.slots);
         try std.testing.expectEqual(@as(usize, 1), policy.control_slots);
         try std.testing.expectEqual(@as(usize, 1), policy.cleanup_slots);
         try std.testing.expectEqual(@as(u64, 2 << 20), policy.max_bytes);
         try std.testing.expectEqual(automatic.max_wait_ms, policy.max_wait_ms);
-        var scheduler = try Scheduler.init(.{ .slots = policy.slots, .cleanup_slots = policy.cleanup_slots, .max_bytes = policy.max_bytes });
+        var scheduler = try Scheduler.init(.{ .slots = policy.slots, .cleanup_slots = policy.cleanup_slots, .publication_slots = policy.publication_slots, .max_bytes = policy.max_bytes });
         defer scheduler.close();
         var ordinary: Execution = .{};
         try ordinary.startWithSlots(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .query, policy.ordinarySlots());
@@ -4852,7 +4991,7 @@ test "runnable scheduler automatic capacity respects quota ceilings memory and p
         var cleanup: Execution = .{};
         try cleanup.startCleanupRoot(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 7, .deadline_ns = 200, .native_now_ns = Clock.now });
         defer cleanup.finish();
-        try std.testing.expectEqual(policy.slots, scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(policy.slots - policy.publication_slots, scheduler.stats().runnable_slots);
         ordinary.finish();
         health.finish();
         cleanup.finish();
@@ -4862,7 +5001,7 @@ test "runnable scheduler automatic capacity respects quota ceilings memory and p
     const fixed: Config = .{};
     try std.testing.expectEqualDeep(fixed, try fixed.resolveCapacity(.{ .millicpus = 250 }, .{ .limit_bytes = 1 }));
     const unknown = try automatic.resolveCapacity(.{}, .{});
-    try std.testing.expectEqual(@as(usize, 3), unknown.slots);
+    try std.testing.expectEqual(@as(usize, 4), unknown.slots);
     try std.testing.expectEqual(automatic.max_bytes, unknown.max_bytes);
     try std.testing.expectError(error.InvalidRunnablePolicy, automatic.resolveCapacity(.{}, .{ .limit_bytes = 1 << 20 }));
     var detected = try Scheduler.init(automatic);
@@ -5686,8 +5825,8 @@ test "runnable scheduler bounded CPU reserve validates startup and preserves cle
     const automatic: Config = .{ .capacity_mode = .automatic, .bounded_read_slots = 2 };
     const small = try automatic.resolveCapacity(.{ .millicpus = 4000, .source = .cgroup_v2 }, .{});
     try std.testing.expect(!small.readIsolation());
-    try std.testing.expectEqual(@as(usize, 2), small.generalSlots());
-    const large = try automatic.resolveCapacity(.{ .millicpus = 5000, .source = .cgroup_v2 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), small.generalSlots());
+    const large = try automatic.resolveCapacity(.{ .millicpus = 6000, .source = .cgroup_v2 }, .{});
     try std.testing.expect(large.readIsolation());
     try std.testing.expectEqual(@as(usize, 1), large.generalSlots());
     const required: Config = .{ .capacity_mode = .automatic, .bounded_read_slots = 2, .read_isolation = true };
@@ -6684,4 +6823,101 @@ test "runnable measured service protects earned team credit while an overrunning
     scheduler.finish(&holder);
     try std.testing.expectEqual(State.running, scheduler.state(&team));
     try std.testing.expectEqual(@as(u64, 4 * std.time.ns_per_ms), scheduler.serviceStats().debt_paid_slot_ns[0]);
+}
+
+test "runnable scheduler guarded publication resumes within ceiling while ordinary health and cleanup CPUs are occupied" {
+    const Clock = struct {
+        fn now() u64 {
+            return 100;
+        }
+    };
+    var scheduler = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .publication_slots = 1, .read_isolation = false });
+    defer scheduler.close();
+    var writer: Execution = .{};
+    defer writer.finish();
+    try writer.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 1000, .retained_bytes = 17 }, .write);
+    const bytes = scheduler.stats().retained_bytes;
+    try std.testing.expect(try writer.parkPublication());
+    try std.testing.expectEqual(State.resource_blocked, writer.entry.?.state);
+    try std.testing.expectEqual(bytes, scheduler.stats().retained_bytes);
+    var ordinary: Execution = .{};
+    defer ordinary.finish();
+    try ordinary.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
+    // No waiting or partial CPU transfer when the unique reserve is occupied.
+    try std.testing.expect(!try ordinary.parkPublication());
+    try std.testing.expectEqual(State.running, ordinary.entry.?.state);
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+    var cleanup: Execution = .{};
+    defer cleanup.finish();
+    try cleanup.startCleanupRoot(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 200, .allow_wait = false });
+    try writer.resumePublication(null);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().publication_runnable_slots);
+    try std.testing.expectEqual(Class.write, try writer.retainedClass());
+    try std.testing.expectEqual(@as(?u64, 1000), writer.entry.?.options.deadline_ns);
+    try std.testing.expectError(error.InvalidRunnableTransition, writer.resizeTeam(2));
+    try std.testing.expectError(error.InvalidRunnableTransition, writer.enableCpuBorrow(.{ .max_non_yield_ns = 1000 }));
+    // A subsequent physical wait returns only publication CPU, retaining its
+    // reservation and exact original operation while all other lanes progress.
+    try std.testing.expect(try writer.parkPublication());
+    try writer.resumePublication(null);
+    ordinary.finish();
+    try writer.finishPublication();
+    try std.testing.expect(!writer.entry.?.publication_active);
+    try std.testing.expect(scheduler.publication_owner == null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().publication_runnable_slots);
+    writer.finish();
+    health.finish();
+    cleanup.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "runnable scheduler guarded publication retains resources and reserve through stopped IO return until fence retirement" {
+    var scheduler = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .publication_slots = 1, .read_isolation = false });
+    defer scheduler.close();
+    var writer: Execution = .{};
+    defer writer.finish();
+    try writer.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .write);
+    try std.testing.expect(try writer.parkPublication());
+    scheduler.close();
+    try std.testing.expectError(error.SchedulerClosed, writer.resumePublication(null));
+    try std.testing.expect(scheduler.publication_owner != null);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    try writer.finishPublication();
+    try std.testing.expect(scheduler.publication_owner == null);
+    try std.testing.expectEqual(State.stopped, writer.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    writer.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+}
+
+test "runnable scheduler guarded publication retires expired return CPU before any ordinary requeue" {
+    const Clock = struct {
+        var now_ns: u64 = 0;
+        fn now() u64 {
+            return now_ns;
+        }
+    };
+    Clock.now_ns = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .publication_slots = 1, .read_isolation = false });
+    defer scheduler.close();
+    var writer: Execution = .{};
+    defer writer.finish();
+    try writer.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .retained_bytes = 17 }, .write);
+    try std.testing.expect(try writer.parkPublication());
+    try writer.resumePublication(null);
+    const grants = scheduler.stats().grants;
+    Clock.now_ns = 10;
+    try std.testing.expectError(error.DeadlineExceeded, writer.finishPublication());
+    try std.testing.expectEqual(State.stopped, writer.entry.?.state);
+    try std.testing.expect(scheduler.publication_owner == null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().queued);
+    try std.testing.expectEqualDeep(grants, scheduler.stats().grants);
+    try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+    writer.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
 }

@@ -170,3 +170,21 @@ export fn antfly_execution_fixture_drain_closing(scope: *anyopaque) callconv(.c)
 export fn antfly_execution_fixture_drain_try_guard(scope: *anyopaque, registry: bool) callconv(.c) bool {
     return services.qualifyDrainTryGuard(scope, registry);
 }
+
+/// Exercise the real checked Boundary dispatch from a separately compiled
+/// producer. Host callbacks must retain their original stack scope and owner.
+export fn antfly_execution_fixture_publication(contract: *const runtime.native_abi.TypeContract, raw: *const anyopaque, phase: u8) callconv(.c) status.Status {
+    const Publication = runtime.execution_wait.GuardedPublication;
+    if (!contract.matches(runtime.native_abi.TypeContract.of(Publication))) return status.statusFromError(error.UnsupportedVersion);
+    if (@intFromPtr(raw) % @alignOf(Publication) != 0) return status.statusFromError(error.InvalidArgument);
+    const publication: *const Publication = @ptrCast(@alignCast(raw));
+    const result = switch (phase) {
+        0 => publication.scope.beginWait(),
+        1 => publication.wait.beginWait(),
+        2 => publication.wait.endWait(),
+        3 => publication.scope.endWait(),
+        else => return status.statusFromError(error.InvalidArgument),
+    };
+    result catch |cause| return status.statusFromError(cause);
+    return .ok;
+}

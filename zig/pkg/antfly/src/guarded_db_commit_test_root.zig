@@ -44,9 +44,9 @@ fn drain(backend: *lsm.Backend) !void {
     }
 }
 
-const Mode = enum { legacy, owned, cancel_preparation, cancel_read, cancel_append, deadline_append };
+const Mode = enum { legacy, owned, cancel_preparation, cancel_read, cancel_append, deadline_append, handoff_read, handoff_return_timeout };
 
-const Entry = enum { db, table, worker };
+const Entry = enum { db, table, worker, handoff };
 
 /// Use the same callback dispatch and stack-owned controls as bound HTTP/SQL
 /// table commits. The direct DB cases remain useful for legacy-policy coverage.
@@ -73,9 +73,10 @@ fn guardedCommit(mode: Mode) !void {
 
 fn guardedCommitVia(mode: Mode, entry: Entry) !void {
     const owned_io = mode != .legacy;
-    const rejected = mode != .legacy and mode != .owned;
-    const paused_io = mode == .cancel_read or mode == .cancel_append or mode == .deadline_append;
-    const uncertain = mode == .cancel_append or mode == .deadline_append;
+    const committed_return_failure = mode == .handoff_return_timeout;
+    const rejected = mode != .legacy and mode != .owned and mode != .handoff_read;
+    const paused_io = mode == .cancel_read or mode == .cancel_append or mode == .deadline_append or mode == .handoff_read or mode == .handoff_return_timeout;
+    const uncertain = mode == .cancel_append or mode == .deadline_append or committed_return_failure;
     const io_mod = local.storage_lsm_backend_storage_io;
     const native = io_mod.NativeSyncTestControl;
     const a = std.testing.allocator;
@@ -83,7 +84,7 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
     const budgets = @import("storage/memory_budget.zig");
     const owners = @import("api/runnable_owner_execution.zig");
     const scheduler = local.common_request_admission.runnable_scheduler;
-    var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
+    var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = if (entry == .handoff) 4 else 3, .control_slots = 1, .cleanup_slots = 1, .publication_slots = if (entry == .handoff) 1 else 0 }), .native_now_ns = platform.time.monotonicNs };
     defer state.owner.deinit();
     var resources = try Resources.initWithBudgets(a, budgets.smartResourceBudgetsForTotal(1 << 30));
     defer resources.deinit();
@@ -127,6 +128,14 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
         var execution: *owners.State = undefined;
         var database: *DB = undefined;
         var selected: Mode = .legacy;
+        var guarded: bool = false;
+        var resumed: std.atomic.Value(bool) = .init(false);
+        var return_started: std.atomic.Value(bool) = .init(false);
+        var original_finish: *const fn (*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status = undefined;
+        fn finish(raw: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return_started.store(true, .release);
+            return original_finish(raw);
+        }
         var deadline_ns: u64 = 0;
         var injected: std.atomic.Value(bool) = .init(false);
         var joins: std.atomic.Value(usize) = .init(0);
@@ -173,7 +182,7 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
                 canceled.store(true, .release);
                 try original.checkpoint();
             }
-            if (selected == .cancel_read and !injected.swap(true, .acq_rel)) pause();
+            if ((selected == .cancel_read or selected == .handoff_read or selected == .handoff_return_timeout) and !injected.swap(true, .acq_rel)) pause();
         }
         fn pause() void {
             native.started.store(false, .release);
@@ -182,6 +191,10 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
         }
         fn append(operation: *foreground.Operation, original: admission.Port) !void {
             try original.checkpoint();
+            if (guarded and (selected == .handoff_read or selected == .handoff_return_timeout) and operation.stage == .append and !resumed.load(.acquire)) {
+                try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().publication_runnable_slots);
+                resumed.store(true, .release);
+            }
             if ((selected == .cancel_append or selected == .deadline_append) and operation.stage == .append and !injected.swap(true, .acq_rel)) pause();
         }
         fn join(original: admission.Port) !void {
@@ -199,6 +212,9 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
     };
     H.execution = &state;
     H.selected = mode;
+    H.guarded = entry == .handoff;
+    H.resumed.store(false, .release);
+    H.return_started.store(false, .release);
     H.injected.store(false, .release);
     H.joins.store(0, .release);
     H.join_authorized.store(false, .release);
@@ -233,6 +249,40 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
         foreground.test_abort_hook = null;
         foreground.Operation.test_hook = null;
     }
+    const FenceWaiter = struct {
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.drive() catch |cause| {
+                self.failure = cause;
+            };
+        }
+        fn drive(_: *@This()) !void {
+            const io = std.testing.io;
+            const runtime = @import("antfly_runtime_abi");
+            const io_borrow = runtime.io_abi.Borrow.init(&io);
+            const owner = H.execution.port();
+            var handle: ?*anyopaque = null;
+            const started = owner.start(owner.context, &.{ .io = &io_borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .has_deadline = 1, .native_deadline = 1, .deadline_ns = platform.time.monotonicNs() +| 15 * std.time.ns_per_s, .out_handle = &handle });
+            if (!started.isOk()) return runtime.error_abi.errorFromStatus(started);
+            defer owner.finish(handle.?);
+            try std.testing.expect((try H.database.vectorMigrationStatus(std.testing.allocator)) == null);
+            const value = (try H.database.get(std.testing.allocator, "doc:0000")) orelse return error.PublishedValueMissing;
+            defer std.testing.allocator.free(value);
+            try std.testing.expectEqualStrings("{\"value\":1}", value);
+            if (H.selected == .handoff_return_timeout) {
+                // A slow ordinary consumer keeps its already admitted CPU.
+                // The committed publisher must respect bounded return waiting
+                // without claiming that its durable mutation was rejected.
+                const observed_until = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+                while (!H.return_started.load(.acquire)) {
+                    if (platform.time.monotonicNs() >= observed_until) return error.PublicationReturnNotObserved;
+                    std.atomic.spinLoopHint();
+                }
+                const until = platform.time.monotonicNs() +| 500 * std.time.ns_per_ms;
+                while (platform.time.monotonicNs() < until) std.atomic.spinLoopHint();
+            }
+        }
+    };
     const Coordinator = struct {
         failure: ?anyerror = null,
         fn run(self: *@This()) void {
@@ -258,6 +308,24 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
                 defer owner.finish(handle.?);
                 _ = H.health.fetchAdd(1, .release);
             }
+            if (H.selected == .handoff_read or H.selected == .handoff_return_timeout) {
+                var waiter: FenceWaiter = .{};
+                var thread: ?std.Thread = try std.Thread.spawn(.{}, FenceWaiter.run, .{&waiter});
+                defer if (thread) |live| {
+                    native.release.store(true, .release);
+                    live.join();
+                };
+                while (H.database.core.apply_mutex.shared_waiters.load(.acquire) == 0) {
+                    if (platform.time.monotonicNs() >= until) return error.OrdinaryFenceWaitNotObserved;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+                try std.testing.expectEqual(@as(usize, 1), H.execution.owner.scheduler.stats().runnable_slots);
+                native.release.store(true, .release);
+                thread.?.join();
+                thread = null;
+                if (waiter.failure) |cause| return cause;
+                return;
+            }
             if (H.selected == .deadline_append) {
                 while (platform.time.monotonicNs() < H.deadline_ns)
                     try std.testing.io.sleep(.fromMilliseconds(1), .awake);
@@ -271,24 +339,28 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
     };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const writes = try arena.allocator().alloc(local.storage_db_mod.types.BatchWrite, if (rejected or entry == .worker) 64 else 1024);
+    const writes = try arena.allocator().alloc(local.storage_db_mod.types.BatchWrite, if (rejected or entry == .worker or entry == .handoff) 64 else 1024);
     for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "doc:{d:0>4}", .{i}), .value = "{\"value\":1}" };
     {
         var pass = try local.common_background_execution.Pass.init(state.port(), &std.testing.io, platform.time.monotonicNs() +| 60 * std.time.ns_per_s, .{ .context = &H.execution_canceled, .is_cancelled = H.cancellation });
         defer pass.deinit();
+        if (committed_return_failure) {
+            H.original_finish = pass.borrow.?.finish_publication.?;
+            pass.borrow.?.finish_publication = H.finish;
+        }
         const api_controls = local.api_mutation_admission_controls;
         H.deadline_ns = if (mode == .deadline_append) platform.time.monotonicNs() +| 5 * std.time.ns_per_s else pass.deadline_ns;
         const original: local.api_local_transaction_contract.PreDecisionContext = .{ .deadline_ns = H.deadline_ns, .cancellation = local.storage_db_mod.types.CancellationToken.fromAtomic(&H.canceled) };
         var budget = api_controls.init(original, pass.borrow, std.testing.io);
         var controls = api_controls.acquisition(&budget);
         if (!owned_io) controls.retained_physical_wait = false;
+        var coordinator: Coordinator = .{};
+        var thread: ?std.Thread = if (paused_io) try std.Thread.spawn(.{}, Coordinator.run, .{&coordinator}) else null;
+        defer if (thread) |live| {
+            native.release.store(true, .release);
+            live.join();
+        };
         if (rejected) {
-            var coordinator: Coordinator = .{};
-            var thread: ?std.Thread = if (paused_io) try std.Thread.spawn(.{}, Coordinator.run, .{&coordinator}) else null;
-            defer if (thread) |live| {
-                native.release.store(true, .release);
-                live.join();
-            };
             const before = backend.snapshotWriteStats();
             const result = commit(entry, &db, writes, controls, original, pass.borrow);
             if (thread) |live| {
@@ -297,10 +369,13 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
             }
             if (coordinator.failure) |cause| return cause;
             if (uncertain) try std.testing.expectError(error.DurabilityOutcomeUnknown, result) else try std.testing.expectError(error.Canceled, result);
-            try std.testing.expectEqual(uncertain, backend.manifest_recovery_required);
-            try std.testing.expectEqual(before.wal_append_records, backend.snapshotWriteStats().wal_append_records);
+            try std.testing.expectEqual(uncertain and !committed_return_failure, backend.manifest_recovery_required);
+            if (committed_return_failure)
+                try std.testing.expect(backend.snapshotWriteStats().wal_append_records > before.wal_append_records)
+            else
+                try std.testing.expectEqual(before.wal_append_records, backend.snapshotWriteStats().wal_append_records);
             try std.testing.expect(H.injected.load(.acquire));
-            if (paused_io) {
+            if (paused_io and !committed_return_failure) {
                 try std.testing.expect(H.joins.load(.acquire) != 0);
                 try std.testing.expect(H.join_authorized.load(.acquire));
                 try std.testing.expectEqual(@as(usize, 1), H.health.load(.acquire));
@@ -312,6 +387,12 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
                 write.value = "{\"value\":2}";
             };
             try commit(entry, &db, writes, controls, original, pass.borrow);
+            if (thread) |live| {
+                live.join();
+                thread = null;
+                if (coordinator.failure) |cause| return cause;
+                try std.testing.expect(H.resumed.load(.acquire));
+            }
             // The public DB path retains apply/snapshot fences. Physical
             // cleanup must finish using its dedicated CPU while this pass
             // still owns the sole ordinary slot, including overwritten roots.
@@ -324,8 +405,17 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
                 try std.testing.expectEqual(@as(usize, 0), H.foreground_calls.load(.acquire));
             }
             try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().publication_runnable_slots);
+            try std.testing.expect(state.owner.scheduler.publication_owner == null);
         }
-        try pass.borrow.?.checkLifetime();
+        if (entry == .handoff and rejected) {
+            // A denied guarded return stops logical execution while retaining
+            // its physical owners. It cannot revive under the still-live node
+            // token after the independent request fence has rejected it.
+            if (pass.borrow.?.checkLifetime()) |_| return error.RejectedPublicationResumed else |_| {}
+            try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().publication_runnable_slots);
+            try std.testing.expect(state.owner.scheduler.publication_owner == null);
+        } else try pass.borrow.?.checkLifetime();
         if (!rejected) {
             try std.testing.expect(H.refused.load(.acquire));
             try std.testing.expect(H.retained_peak.load(.acquire) >= writes.len * 32);
@@ -345,7 +435,7 @@ fn guardedCommitVia(mode: Mode, entry: Entry) !void {
         try std.testing.expectEqualStrings("{\"value\":2}", value);
         try std.testing.expect((try db.get(a, "rejected")) == null);
     }
-    if (uncertain) @import("antfly_test_error_logs").expectErrorLogs(1);
+    if (uncertain and !committed_return_failure) @import("antfly_test_error_logs").expectErrorLogs(1);
     db.close();
     open = false;
     try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
@@ -418,6 +508,26 @@ test "guarded managed DB commit context worker joins uncertain append after requ
 
 test "guarded managed DB commit context worker preserves original deadline after accepted append" {
     try guardedCommitVia(.deadline_append, .worker);
+}
+
+test "guarded managed DB commit returns on publication CPU while an ordinary status request waits for its apply fence" {
+    try guardedCommitVia(.handoff_read, .handoff);
+}
+
+test "guarded managed DB commit guarded return preserves independent cancellation and joins physical read" {
+    try guardedCommitVia(.cancel_read, .handoff);
+}
+
+test "guarded managed DB commit guarded return preserves uncertain append and protected cleanup on cancellation" {
+    try guardedCommitVia(.cancel_append, .handoff);
+}
+
+test "guarded managed DB commit guarded return preserves original deadline and uncertain append recovery" {
+    try guardedCommitVia(.deadline_append, .handoff);
+}
+
+test "guarded managed DB commit reports durable uncertainty when ordinary return times out after successful publication" {
+    try guardedCommitVia(.handoff_return_timeout, .handoff);
 }
 
 test "guarded incremental publication memory bound covers measured peak across private inserts and overwrites" {

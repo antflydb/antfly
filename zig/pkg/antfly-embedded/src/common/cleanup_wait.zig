@@ -31,7 +31,7 @@ fn untilWithPolicy(io: ?std.Io, original: admission.Port, context: *anyopaque, r
     var trace: admission.RejectionTrace = .{};
     const control = trace.bind(original).?;
     const boundary: ?@import("execution_wait.zig").Boundary = if (physical)
-        try control.physicalWaitAfterLifetime()
+        (try control.publicationWaitAfterLifetime()) orelse try control.physicalWaitAfterLifetime()
     else blk: {
         const lending = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
         _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;

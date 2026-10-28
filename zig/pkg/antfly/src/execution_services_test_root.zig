@@ -1272,3 +1272,68 @@ test "execution services archive boundary drain lease pins scope through lock-fr
     try group.await(io.io());
     try std.testing.expect(f.closed.load(.acquire) and !f.failed.load(.acquire));
 }
+
+extern fn antfly_execution_fixture_publication(*const runtime.native_abi.TypeContract, *const anyopaque, u8) callconv(.c) runtime.error_abi.Status;
+
+test "execution services archive boundary preserves guarded publication return and stopped physical ownership" {
+    const owners = @import("api/runnable_owner_execution.zig");
+    const scheduler = local.common_request_admission.runnable_scheduler;
+    const clock = @import("antfly_platform").time;
+    const Publication = runtime.execution_wait.GuardedPublication;
+    for ([_]bool{ false, true }) |reject| {
+        var state: owners.State = .{ .owner_alloc = std.testing.allocator, .owner = try scheduler.NodeOwner.init(.{ .slots = 4, .cleanup_slots = 1, .publication_slots = 1, .read_isolation = false }), .native_now_ns = clock.monotonicNs };
+        defer state.owner.deinit();
+        const owner = state.port();
+        const io = std.testing.io;
+        const io_borrow = runtime.io_abi.Borrow.init(&io);
+        const until = clock.monotonicNs() +| 60 * std.time.ns_per_s;
+        var handle: ?*anyopaque = null;
+        const started = owner.start(owner.context, &.{ .io = &io_borrow, .class = @backingInt(runtime.runnable_abi.Class.write), .native_deadline = 1, .has_deadline = 1, .deadline_ns = until, .out_handle = &handle });
+        try std.testing.expect(started.isOk());
+        defer owner.finish(handle.?);
+        const borrow = try runtime.runnable_abi.Borrowed.fromOwner(owner, handle.?, 1, .write);
+        var canceled = std.atomic.Value(bool).init(false);
+        const Controls = struct {
+            execution_runnable: ?runtime.runnable_abi.Borrowed,
+            cancellation: local.storage_db_types.CancellationToken,
+            fn check(self: @This()) !void {
+                if (self.execution_runnable) |original| try original.checkLifetime();
+                try self.cancellation.check();
+            }
+        };
+        var budget: local.common_read_execution_budget.Budget(Controls, Controls.check) = .{
+            .controls = .{ .execution_runnable = borrow, .cancellation = local.storage_db_types.CancellationToken.fromAtomic(&canceled) },
+            .io = io,
+        };
+        const publication = budget.publication().?;
+        const contract = runtime.native_abi.TypeContract.of(Publication);
+        var stale = contract;
+        stale.layout_id ^= 1;
+        try std.testing.expectEqual(runtime.error_abi.statusFromError(error.UnsupportedVersion), antfly_execution_fixture_publication(&stale, @ptrFromInt(@alignOf(Publication)), 0));
+        try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().runnable_slots);
+        try std.testing.expect(antfly_execution_fixture_publication(&contract, &publication, 0).isOk());
+        try std.testing.expect(antfly_execution_fixture_publication(&contract, &publication, 1).isOk());
+        try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().runnable_slots);
+        var ordinary: scheduler.Execution = .{};
+        defer ordinary.finish();
+        try ordinary.start(&state.owner.scheduler, .{ .io = io, .allow_wait = false }, .query);
+        const bytes = state.owner.scheduler.stats().retained_bytes;
+        if (reject) {
+            canceled.store(true, .release);
+            try std.testing.expectEqual(runtime.error_abi.statusFromError(error.Canceled), antfly_execution_fixture_publication(&contract, &publication, 2));
+            try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().publication_runnable_slots);
+            try std.testing.expect(state.owner.scheduler.publication_owner != null);
+        } else {
+            try std.testing.expect(antfly_execution_fixture_publication(&contract, &publication, 2).isOk());
+            try std.testing.expectEqual(@as(usize, 2), state.owner.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().publication_runnable_slots);
+            try std.testing.expectEqual(runtime.runnable_abi.Class.write, try borrow.currentClass());
+        }
+        try std.testing.expectEqual(bytes, state.owner.scheduler.stats().retained_bytes);
+        ordinary.finish();
+        try std.testing.expect(antfly_execution_fixture_publication(&contract, &publication, 3).isOk());
+        try std.testing.expect(state.owner.scheduler.publication_owner == null);
+        try std.testing.expectEqual(@as(usize, @intFromBool(!reject)), state.owner.scheduler.stats().runnable_slots);
+        if (reject) try std.testing.expectError(error.Canceled, borrow.checkLifetime());
+    }
+}

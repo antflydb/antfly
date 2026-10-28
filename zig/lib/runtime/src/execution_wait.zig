@@ -19,6 +19,14 @@
 const std = @import("std");
 const callbacks = @import("runtime_callback_abi.zig");
 
+/// One trusted publication scope. Its owner arms before acquiring service
+/// fences and joins/retire them all before scope.end returns ordinary CPU.
+/// Only independent physical readiness waits may use wait while it is armed.
+pub const GuardedPublication = struct {
+    scope: Boundary,
+    wait: Boundary,
+};
+
 pub const Boundary = struct {
     ptr: *anyopaque,
     begin: *const fn (*anyopaque) anyerror!void,

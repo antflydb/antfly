@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! API-kernel-owned execution capsules. Foreign archives see only checked
 //! C callbacks, stable statuses and opaque handles.
@@ -27,7 +27,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .reserve_cleanup_root = reserveCleanupRoot, .enter_cleanup_root = enterCleanupRoot, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .activate_child_checked = activateChildChecked, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources, .enter_resources = enterResources };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .reserve_cleanup_root = reserveCleanupRoot, .enter_cleanup_root = enterCleanupRoot, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .activate_child_checked = activateChildChecked, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .park_publication = parkPublication, .resume_publication = resumePublication, .finish_publication = finishPublication, .request_resources = requestResources, .enter_resources = enterResources };
     }
 };
 
@@ -158,6 +158,16 @@ fn cpuBorrow(raw: *anyopaque, options: *const abi.CpuBorrow) callconv(.c) runtim
         value.execution.enableCpuBorrow(.{ .max_non_yield_ns = options.max_non_yield_ns }) catch |err| return runtime.error_abi.statusFromError(err);
     } else value.execution.disableCpuBorrow() catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
+}
+
+fn parkPublication(raw: *anyopaque, out: *u8) callconv(.c) runtime.error_abi.Status {
+    return @import("runnable_publication.zig").park(&capsule(raw).execution, out);
+}
+fn resumePublication(raw: *anyopaque, restriction: ?*const abi.Reentry) callconv(.c) runtime.error_abi.Status {
+    return @import("runnable_publication.zig").reenter(&capsule(raw).execution, restriction);
+}
+fn finishPublication(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+    return @import("runnable_publication.zig").finish(&capsule(raw).execution);
 }
 
 fn reserveChild(raw: *anyopaque, options: *const abi.ChildStart) callconv(.c) runtime.error_abi.Status {

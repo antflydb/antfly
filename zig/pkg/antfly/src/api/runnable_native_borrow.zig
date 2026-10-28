@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Stable local adapter for native read kernels borrowing an opaque admitted
 //! execution. Root adapters never finish the ingress owner's operation. Child
@@ -43,6 +43,9 @@ pub const Bridge = struct {
             .class = try currentClass(self),
             .current_class = currentClass,
             .cpu_borrow = if (self.borrow.cpu_borrow != null) cpuBorrow else null,
+            .park_publication = if (self.borrow.park_publication != null) parkPublication else null,
+            .resume_publication = if (self.borrow.resume_publication != null) resumePublication else null,
+            .finish_publication = if (self.borrow.finish_publication != null) finishPublication else null,
             .request_resources = if (self.borrow.request_resources != null) requestResources else null,
             .enter_resources = if (self.borrow.enter_resources != null) enterResources else null,
             .checkpoint = checkpoint,
@@ -89,6 +92,25 @@ pub const Bridge = struct {
         const participant = @import("runnable_resource_bridge.zig").send(resources);
         try self.borrow.requestResources(&participant);
     }
+    fn parkPublication(raw: *anyopaque) !bool {
+        return from(raw).borrow.parkPublication();
+    }
+    fn resumePublication(raw: *anyopaque, restriction: ?native.AdmissionCheck) !void {
+        const Check = struct {
+            original: native.AdmissionCheck,
+            fn call(context: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const self: *@This() = @ptrCast(@alignCast(context));
+                self.original.checkpoint() catch |cause| return runtime.error_abi.statusFromError(cause);
+                return .ok;
+            }
+        };
+        var check: ?Check = if (restriction) |value| .{ .original = value } else null;
+        try from(raw).borrow.resumePublication(if (check) |*fence| &.{ .context = fence, .check = Check.call } else null);
+    }
+    fn finishPublication(raw: *anyopaque) !void {
+        try from(raw).borrow.finishPublication();
+    }
+
     fn cpuBorrow(raw: *anyopaque, budget: ?native.CpuBorrowBudget) !void {
         const self = from(raw);
         try self.borrow.setCpuBorrow(&.{ .enabled = @intFromBool(budget != null), .max_non_yield_ns = if (budget) |value| value.max_non_yield_ns else 0 });

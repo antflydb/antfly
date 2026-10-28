@@ -24,6 +24,8 @@ pub fn Budget(comptime Controls: type, comptime check: anytype) type {
         io: std.Io,
         rejection: ?anyerror = null,
         parked_class: ?runtime.runnable_abi.Class = null,
+        publication_scope: bool = false,
+        publication_parked: bool = false,
 
         pub fn checkpoint(self: *@This()) !void {
             if (self.rejection) |err| return err;
@@ -62,6 +64,51 @@ pub fn Budget(comptime Controls: type, comptime check: anytype) type {
             }
             try check(controls);
         }
+        pub fn publication(self: *@This()) ?runtime.execution_wait.GuardedPublication {
+            const borrow = self.controls.execution_runnable orelse return null;
+            if (borrow.park_publication == null or borrow.resume_publication == null or borrow.finish_publication == null) return null;
+            return .{
+                .scope = .{ .ptr = self, .begin = beginPublication, .end = finishPublication },
+                .wait = .{ .ptr = self, .begin = parkPublication, .end = resumePublication },
+            };
+        }
+        fn beginPublication(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkLifetime();
+            if (self.publication_scope or self.parked_class != null) return error.InvalidRunnableTransition;
+            self.publication_scope = true;
+        }
+        fn parkPublication(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkLifetime();
+            if (!self.publication_scope or self.publication_parked or self.parked_class != null) return error.InvalidRunnableTransition;
+            self.publication_parked = try self.controls.execution_runnable.?.parkPublication();
+        }
+        fn resumePublication(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.publication_scope) return error.InvalidRunnableTransition;
+            if (self.publication_parked) {
+                self.publication_parked = false;
+                // The scope retains the exact DB fences. Revalidate original
+                // lifetime, not a read callback that could acquire them again.
+                try self.controls.execution_runnable.?.resumePublication(&.{ .context = self, .check = publicationReentry });
+            }
+            try self.checkLifetime();
+        }
+        fn publicationReentry(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkLifetime() catch |cause| return runtime.error_abi.statusFromError(cause);
+            return .ok;
+        }
+        fn finishPublication(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.publication_scope) return error.InvalidRunnableTransition;
+            self.publication_scope = false;
+            self.publication_parked = false;
+            // Always retire the reserve, even after a sticky caller rejection.
+            try self.controls.execution_runnable.?.finishPublication();
+        }
+
         pub fn executionBoundary(self: *@This()) ?@import("execution_wait.zig").Boundary {
             if (self.controls.execution_runnable == null) return null;
             return .{ .ptr = self, .begin = begin, .end = end };
