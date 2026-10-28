@@ -525,7 +525,11 @@ pub fn runRewrite(comptime Driver: type) !void {
 
 fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bool, empty_generation: bool, unavailable_authority: bool) !void {
     const unsupported_native_empty = unavailable_authority;
-    const alloc = std.testing.allocator;
+    // Exercise the durable failure/reopen matrix without unwinding DWARF on
+    // every allocation. Keep SafeAllocator checks and fail on leaked owners.
+    var fixture_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (fixture_allocator.deinit() != 0) @panic("restore fixture leaked allocations");
+    const alloc = fixture_allocator.allocator();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -888,15 +892,12 @@ fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *d
     try std.testing.expect((try source.relationalTopologyStatus()).fence == null);
 }
 pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http.StatusSource, persistence: ?restore_jobs.ReplicatedPersistence, policy: Policy) !void {
-    // This corpus benchmark measures restore work, not Mach-O/DWARF stack
-    // unwinding for every allocation. Keep safety and leak checks enabled;
-    // ordinary correctness fixtures retain the testing allocator's traces.
-    var benchmark_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer if (policy.benchmark_rows > 1) {
-        const allocator_status = benchmark_allocator.deinit();
-        std.debug.assert(allocator_status == 0);
-    };
-    const alloc = if (policy.benchmark_rows > 1) benchmark_allocator.allocator() else std.testing.allocator;
+    // These fixtures measure restore correctness and durability, rather than
+    // allocator stack capture. Retain safety checks and explicit leak failure
+    // for every corpus size, including ReleaseFast qualification.
+    var fixture_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (fixture_allocator.deinit() != 0) @panic("restore fixture leaked allocations");
+    const alloc = fixture_allocator.allocator();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
