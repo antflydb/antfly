@@ -2261,8 +2261,8 @@ pub const CudaCompute = struct {
         if (source.dtype != .f32 or source.quant_type != null or source.owned_by_tensor or
             source.shape.len != 1 or source.elem_count != dim or source.buffer.len < dim * 4) return null;
         var key_buf: [128]u8 = undefined;
-        // Resident weights deliberately have owns_buffer=false: the model,
-        // rather than an individual tensor handle, releases their storage.
+        // Resident weight metadata belongs to the model (owned_by_tensor=false),
+        // independently of whether that entry owns its device allocation.
         // Include handle identity so an external alias cannot hit this cache.
         const key = try std.fmt.bufPrint(&key_buf, "lighton.norm_weight.{x}.{x}.{d}.{x}", .{ @intFromPtr(source), source.buffer.ptr, dim, @as(u32, @bitCast(offset)) });
         if (try modelConstantOp(self, key, null)) |cached| {
@@ -2430,12 +2430,10 @@ pub const CudaCompute = struct {
     pub fn lightOnGraphWeightPointer(cb: *const ops.ComputeBackend, weight: CT) ?driver_mod.CUdeviceptr {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const tensor = tensorFromCt(weight);
-        if (tensor.dtype != .bf16 or tensor.quant_type != null or tensor.strict_resident_training or tensor.owns_buffer or
-            residentTensorForSlot(self, tensor) != tensor)
-        {
+        if (tensor.dtype != .bf16 or tensor.quant_type != null or !isImmutableResidentWeight(self, tensor)) {
             if (self.lighton_decode_graph.weight_declines_logged < 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 self.lighton_decode_graph.weight_declines_logged += 1;
-                std.debug.print("LIGHTONOCR3 cuda_model_graph_weight_decline bf16={d} quantized={d} training={d} owns_buffer={d} exact_resident={d}\n", .{ @intFromBool(tensor.dtype == .bf16), @intFromBool(tensor.quant_type != null), @intFromBool(tensor.strict_resident_training), @intFromBool(tensor.owns_buffer), @intFromBool(residentTensorForSlot(self, tensor) == tensor) });
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_weight_decline bf16={d} quantized={d} training={d} owned_by_tensor={d} exact_resident={d}\n", .{ @intFromBool(tensor.dtype == .bf16), @intFromBool(tensor.quant_type != null), @intFromBool(tensor.strict_resident_training), @intFromBool(tensor.owned_by_tensor), @intFromBool(residentTensorForSlot(self, tensor) == tensor) });
             }
             return null;
         }
@@ -2696,8 +2694,7 @@ pub const CudaCompute = struct {
             self.kernels.embedding_lookup_i32_bf16_weight_f32 == null or
             (if (suppress_ids.len == 0) self.kernels.argmax_rows_f32 == null else self.kernels.argmax_rows_suppress_f32 == null)) return null;
         const weight = tensorFromCt(embedding_weight);
-        if (weight.dtype != .bf16 or weight.quant_type != null or weight.strict_resident_training or weight.owns_buffer or
-            residentTensorForSlot(self, weight) != weight) return null;
+        if (weight.dtype != .bf16 or weight.quant_type != null or !isImmutableResidentWeight(self, weight)) return null;
         try ensureCount(weight, try checkedMul(hidden, vocab));
         var suppression = buffer_mod.DeviceBuffer{};
         errdefer releaseDeviceBuffer(self, &suppression);
@@ -3349,7 +3346,7 @@ pub const CudaCompute = struct {
             if (tensor.elem_count != count or tensor.buffer.len < count * tensor.dtype.byteSize()) return error.InvalidTensorShape;
             // One shared immutable checkpoint supplies every page. Mutable
             // aliases keep the existing independently snapshotted fallback.
-            if (tensor.strict_resident_training or tensor.owns_buffer or residentTensorForSlot(self, tensor) != tensor) return null;
+            if (!isImmutableResidentWeight(self, tensor)) return null;
         }
         for (states, 0..) |state, index| {
             if (state.failed) return error.CudaRecurrentStateInvalid;
@@ -3534,8 +3531,8 @@ pub const CudaCompute = struct {
 
     fn canBorrowLightOnRecurrentWeight(self: *CudaCompute, tensor: *const CudaTensor) bool {
         return self.lighton_shared_recurrent_weights_enabled and self.capability_profile == .lightonocr3 and
-            self.lazy_host_store == null and !self.resident_training_cache and !tensor.strict_resident_training and
-            tensor.dtype == .f32 and !tensor.owns_buffer and residentTensorForSlot(self, tensor) == tensor;
+            self.lazy_host_store == null and !self.resident_training_cache and
+            tensor.dtype == .f32 and isImmutableResidentWeight(self, tensor);
     }
 
     /// Pack a fresh pooled state without adding bytes or cache entries for
@@ -13037,6 +13034,14 @@ fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     borrowed.owns_shape = false;
     borrowed.owned_by_tensor = false;
     return borrowed;
+}
+
+/// Only the model's exact checkpoint descriptor can supply immutable storage.
+/// Device allocation ownership is independent: both owning cache entries and
+/// model-owned views can be borrowed, while detached aliases cannot.
+fn isImmutableResidentWeight(self: *CudaCompute, tensor: *const CudaTensor) bool {
+    return !tensor.strict_resident_training and !tensor.owned_by_tensor and
+        residentTensorForSlot(self, tensor) == tensor;
 }
 
 fn residentTensorForSlot(self: *CudaCompute, tensor: *const CudaTensor) ?*CudaTensor {
@@ -32303,6 +32308,49 @@ test "CUDA resident weight cache teardown respects borrowed storage without a dr
     deinitResidentWeights(&compute);
     try std.testing.expectEqual(@as(usize, 0), compute.resident_weights.count());
     try std.testing.expectEqual(@as(usize, 0), compute.stats.device_free_calls);
+}
+
+test "CUDA immutable resident eligibility follows metadata identity rather than allocation ownership" {
+    const a = std.testing.allocator;
+    var compute: CudaCompute = undefined;
+    compute.resident_weights = .empty;
+    defer compute.resident_weights.deinit(a);
+    compute.lighton_shared_recurrent_weights_enabled = true;
+    compute.capability_profile = .lightonocr3;
+    compute.lazy_host_store = null;
+    compute.resident_training_cache = false;
+    var shape = [_]i64{128};
+    try compute.resident_weights.put(a, "checkpoint", .{
+        .buffer = .{ .ptr = 4096, .len = 512 },
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 128,
+        .owned_by_tensor = false,
+    });
+    const resident = compute.resident_weights.getPtr("checkpoint").?;
+    // Actual uploads own the allocation, but tensor handles cannot free them.
+    try std.testing.expect(resident.owns_buffer);
+    try std.testing.expect(isImmutableResidentWeight(&compute, resident));
+    try std.testing.expect(compute.canBorrowLightOnRecurrentWeight(resident));
+    resident.owns_buffer = false;
+    try std.testing.expect(isImmutableResidentWeight(&compute, resident));
+    // Matching storage does not make a detached handle a model checkpoint.
+    var alias = resident.*;
+    try std.testing.expect(!isImmutableResidentWeight(&compute, &alias));
+    alias.owned_by_tensor = true;
+    try std.testing.expect(!isImmutableResidentWeight(&compute, &alias));
+    resident.owned_by_tensor = true;
+    try std.testing.expect(!isImmutableResidentWeight(&compute, resident));
+    resident.owned_by_tensor = false;
+    resident.strict_resident_training = true;
+    try std.testing.expect(!isImmutableResidentWeight(&compute, resident));
+    resident.strict_resident_training = false;
+    compute.resident_training_cache = true;
+    try std.testing.expect(!compute.canBorrowLightOnRecurrentWeight(resident));
+    compute.resident_training_cache = false;
+    resident.dtype = .bf16;
+    try std.testing.expect(isImmutableResidentWeight(&compute, resident));
+    try std.testing.expect(!compute.canBorrowLightOnRecurrentWeight(resident));
 }
 
 test "CUDA resident weight cache releases owners and preserves borrowed aliases" {

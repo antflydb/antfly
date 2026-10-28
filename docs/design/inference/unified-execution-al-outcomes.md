@@ -49,9 +49,13 @@ No shipped image changes or new device instructions are required.
   consumer, copy, canary, fallback and cancellation checks after the merge.
 - A six-test Linux ARM64 CUDA binary compiles for the merged attention,
   recurrent-state, cuDNN vision, fused QKV, compact norm and BF16 bias paths.
-  Its isolated device run is queued behind other Glowworm work; it requires
-  all six tests selected and at least four passing, allowing unavailable
-  optional backend capabilities to report skips. No failed run is retried.
+  The isolated device run selected those six cases plus 38 imported smoke
+  tests: **43 passed / one failed / zero skipped / zero leaked**. The failure
+  is recurrent-state recycling's expected resident weight pointer equality.
+  The original collector also incorrectly assumed six total tests, ignoring
+  imported smoke tests. The failed receipt and binary remain retained.
+  [AM](unified-execution-am-outcomes.md) fixes the ownership guard and validates
+  each named case explicitly, independently of imported test counts.
 
 The new source recipe's compiled PTX is unchanged, so its device-code
 performance is unchanged. No timing claim is made for the host integration

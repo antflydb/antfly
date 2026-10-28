@@ -3335,3 +3335,9 @@ owners, exact rebuilt CUDA images, and reproducible in-place/layout validation.
 merge, new exports integrated into existing generic CUDA owners, BF16 fused
 output ownership, graph/KV lock handoff and a shared live-page recipe whose
 complete attention PTX remains byte-identical.
+
+### AM immutable CUDA checkpoint ownership
+
+[The AM register](unified-execution-am-outcomes.md) records the AL device
+regression, a shared resident-weight ownership guard across four CUDA host
+fast paths and expanded independent ownership and device validation.
