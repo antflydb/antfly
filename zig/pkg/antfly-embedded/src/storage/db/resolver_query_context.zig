@@ -70,6 +70,14 @@ pub const CanonicalProof = struct {
     routing: [32]u8,
     dependencies: []const [32]u8,
 };
+pub const CanonicalCheckpoint = struct {
+    sequence: u64,
+    graph: [32]u8,
+    routing: [32]u8,
+    fn of(proof: CanonicalProof) CanonicalCheckpoint {
+        return .{ .sequence = proof.sequence, .graph = proof.graph, .routing = proof.routing };
+    }
+};
 pub const Graph = struct {
     canonical: ?CanonicalProof = null,
     routes: []const Route = &.{},
@@ -100,6 +108,8 @@ pub const Redirects = struct {
 };
 pub const Context = struct {
     canonical: ?CanonicalProof = null,
+    canonical_mutex: std.atomic.Mutex = .unlocked,
+    canonical_checkpoint: ?CanonicalCheckpoint = null,
     references: std.atomic.Value(usize) = .init(1),
     dependents: std.atomic.Value(usize) = .init(0),
     base: ?Lease = null,
@@ -119,6 +129,33 @@ pub const Context = struct {
     redirects: Redirects,
     pins: std.StringHashMapUnmanaged(std.ArrayList(resolver.curation.Pair)) = .empty,
     routes: []const Route = &.{},
+    /// Only the validated-through checkpoint is mutable. Paths and full-SHA
+    /// dependencies retain the lease's immutable ownership and budget charge.
+    pub fn canonicalProof(self: *const Context) ?CanonicalProof {
+        const mutable = @constCast(self);
+        @import("antfly_platform").sync.lockYielding(&mutable.canonical_mutex);
+        defer mutable.canonical_mutex.unlock();
+        var proof = self.canonical orelse return null;
+        if (self.canonical_checkpoint) |checkpoint| {
+            proof.sequence = checkpoint.sequence;
+            proof.graph = checkpoint.graph;
+            proof.routing = checkpoint.routing;
+        }
+        return proof;
+    }
+    /// Publish only after dependency/ancestry validation at the caller's read
+    /// cut. Compare the observed checkpoint so older or competing snapshots
+    /// cannot overwrite a certificate installed by another reader.
+    pub fn advanceCanonical(self: *const Context, expected: CanonicalProof, next: CanonicalCheckpoint) bool {
+        const mutable = @constCast(self);
+        @import("antfly_platform").sync.lockYielding(&mutable.canonical_mutex);
+        defer mutable.canonical_mutex.unlock();
+        const original = self.canonical orelse return false;
+        const current = self.canonical_checkpoint orelse CanonicalCheckpoint.of(original);
+        if (next.sequence < current.sequence or !std.meta.eql(current, CanonicalCheckpoint.of(expected))) return false;
+        mutable.canonical_checkpoint = next;
+        return true;
+    }
     pub fn routesFor(self: *const Context, root: []const u8) []const Route {
         var lo: usize = 0;
         var hi = self.routes.len;
@@ -682,4 +719,74 @@ test "native resolver authority invalidation preserves leases and newer cache ge
     defer hit.release();
     try std.testing.expect(hit.context == replacement.context);
     try std.testing.expectEqual(@as(usize, 2), cache.builds.load(.monotonic));
+}
+
+test "native resolver authority canonical checkpoint rejects stale publication and preserves dependencies" {
+    const Fixture = struct {
+        fn load(_: *anyopaque, a: A) !Graph {
+            const dependencies = try a.alloc([32]u8, 1);
+            dependencies[0] = @splat(4);
+            return .{ .canonical = .{ .sequence = 1, .graph = @splat(2), .routing = @splat(3), .dependencies = dependencies } };
+        }
+    };
+    var marker: u8 = 0;
+    var cache: Cache = .{ .allocator = std.testing.allocator };
+    defer cache.deinit();
+    const lease = try cache.acquire(@splat(121), true, .{ .ptr = &marker, .load = Fixture.load });
+    defer lease.release();
+    const original = lease.context.canonicalProof().?;
+    const charge = cache.bytes;
+    try std.testing.expect(lease.context.advanceCanonical(original, .{ .sequence = 2, .graph = @splat(5), .routing = @splat(6) }));
+    const advanced = lease.context.canonicalProof().?;
+    try std.testing.expectEqual(@as(u64, 2), advanced.sequence);
+    try std.testing.expectEqual(@as([32]u8, @splat(5)), advanced.graph);
+    try std.testing.expectEqual(@as([32]u8, @splat(6)), advanced.routing);
+    try std.testing.expect(original.dependencies.ptr == advanced.dependencies.ptr);
+    try std.testing.expectEqual(@as(u64, 1), lease.context.canonical.?.sequence);
+    try std.testing.expectEqual(charge, cache.bytes);
+    try std.testing.expect(!lease.context.advanceCanonical(original, .{ .sequence = 3, .graph = @splat(7), .routing = @splat(8) }));
+    try std.testing.expect(!lease.context.advanceCanonical(advanced, .{ .sequence = 1, .graph = @splat(2), .routing = @splat(3) }));
+    var other_branch = advanced;
+    other_branch.graph = @splat(9);
+    try std.testing.expect(!lease.context.advanceCanonical(other_branch, .{ .sequence = 3, .graph = @splat(7), .routing = @splat(8) }));
+    cache.invalidate(@splat(121), lease.context);
+    try std.testing.expectEqual(@as(u64, 2), lease.context.canonicalProof().?.sequence);
+}
+
+test "native resolver authority canonical checkpoints publish coherent concurrent snapshots" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const Fixture = struct {
+        fn load(_: *anyopaque, _: A) !Graph {
+            return .{ .canonical = .{ .sequence = 0, .graph = @splat(0), .routing = @splat(0), .dependencies = &.{} } };
+        }
+        fn run(context: *const Context, failed: *std.atomic.Value(bool)) void {
+            for (0..64) |_| while (true) {
+                const proof = context.canonicalProof().?;
+                if (std.mem.readInt(u64, proof.graph[0..8], .little) != proof.sequence or std.mem.readInt(u64, proof.routing[0..8], .little) != proof.sequence) failed.store(true, .release);
+                var graph: [32]u8 = @splat(0);
+                std.mem.writeInt(u64, graph[0..8], proof.sequence + 1, .little);
+                if (context.advanceCanonical(proof, .{ .sequence = proof.sequence + 1, .graph = graph, .routing = graph })) break;
+            };
+        }
+    };
+    var marker: u8 = 0;
+    var cache: Cache = .{ .allocator = std.testing.allocator };
+    defer cache.deinit();
+    const lease = try cache.acquire(@splat(122), true, .{ .ptr = &marker, .load = Fixture.load });
+    defer lease.release();
+    var failed: std.atomic.Value(bool) = .init(false);
+    var threads: [8]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Fixture.run, .{ lease.context, &failed });
+        started += 1;
+    }
+    for (threads[0..started]) |thread| thread.join();
+    started = 0;
+    try std.testing.expect(!failed.load(.acquire));
+    const proof = lease.context.canonicalProof().?;
+    try std.testing.expectEqual(@as(u64, 512), proof.sequence);
+    try std.testing.expectEqual(proof.sequence, std.mem.readInt(u64, proof.graph[0..8], .little));
+    try std.testing.expectEqual(proof.graph, proof.routing);
 }

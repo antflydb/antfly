@@ -2760,8 +2760,14 @@ proofs first intersect edited routing sources with the profile's published
 paths, dirty nodes and active traces. All routing sources, including currently
 flat edges, enter shared `routed-key/` and `routed/` indices; this preserves a
 configured source that first enters an unknown node and later reaches a native
-chain. Small bursts use point coverage checks; larger sets merge-seek the sorted
-source and coverage indices, skipping unrelated gaps on either side. The target
+chain. Small bursts use point coverage checks. Larger sets freeze sorted recent
+routing digests from the bounded compact journal, then gallop between that input
+and the profile's coverage rows. A recently changed source is the only source-side
+input: the retained historical key index is never traversed to discover recent
+versions. Sparse inputs can skip gaps on either side. Cache validation uses a
+separate workspace, so extending an older checkpoint cannot mutate an active
+source iterator. Both changed-key workspaces fit in the existing 8-MiB proof
+scratch. The target
 index remains a cheap trigger, so flat unrelated edits need one empty range scan.
 Both index families expire only versions still owned by the overwritten slot.
 
@@ -2775,11 +2781,27 @@ records builds a sorted changed-key set; only edits newer than the result and
 intersecting its dependencies invalidate reuse. Journal ancestry, barriers and the
 256-event window are checked before accepting that proof. Unrelated edits retain
 warm terminals; edits to a path or terminal immediately require a fresh walk.
+Successful validation advances a small, synchronized validated-through checkpoint
+without changing retained paths or dependency arrays. Readers copy sequence,
+graph and routing identity together. Publication compares the observed checkpoint
+and refuses backward sequences, so older or competing snapshots cannot replace a
+new certificate. The next unrelated head validates only the new suffix rather
+than replaying the result's entire lifetime. No checkpoint is advanced on failed
+ancestry, dependency, history-window or barrier validation.
 Removal compares the observed cache generation, preserving active leases and
 concurrent replacements. Older snapshots cannot evict newer entries in that lineage.
 Root sets, pin memberships, source proofs and grants are never cached in a terminal
 entry. Retained strings and dependencies own their bytes; bounded caller scratch
 and a 1-MiB reservation cover the largest frozen terminal result.
+
+After a cached terminal is excluded from the requested root set, its full-SHA
+dependencies can establish request-local suffix absence. The memo retains at most
+32 immutable leases and materializes their digests only before a cold walk (or
+when that pending set fills). Warm-only proofs avoid copying entire long paths;
+a new entry into an already validated suffix spends no native forward work.
+Pending leases are released on materialization and every proof exit, and their
+memory remains charged to the existing routing budget. Root-set verdicts remain
+local and no partially resolved canonical result is published.
 
 A proof spends at most 16,384 cold forward steps. Cache hits spend no forward
 steps. A cycle, affected canonical root or exhausted budget selects exact fallback.
@@ -3011,3 +3033,22 @@ Fresh-review regression measurements for the routing-source generation:
 - A valid 3,647,828-byte namespace (4,194,304-byte default limit), 1,800 native
   hops and 1,000-byte keys succeeds through cached and streaming membership
   fallback. Previously the unrelated-root query exhausted scratch.
+
+The recent-source and checkpoint regressions add these operation-count bounds:
+
+- With 4,096 historical covered sources, eight new unrelated sources use 11
+  scans and nine use 13. The former history-wide join jumped to 8,197 scans at
+  nine sources. Recent intersection also covers dirty nodes and active traces,
+  and remains stable while another proof extends older routing history.
+- After warming an 8,192-hop canonical path, a new entry into its suffix uses
+  three reads, versus 8,196 before cached dependencies fed the local memo.
+  Warm-only cache hits materialize no path digests.
+- Accepted checkpoints use two journal reads per unrelated routing head: 512
+  reads across 256 heads, versus 33,152. Continuous validation also remains valid
+  at head 257; actual dependency edits, wrong ancestry, older snapshots and
+  journal barriers still refuse reuse. Concurrent checkpoint tests preserve
+  coherent fields, compare/publication fencing, immutable dependencies and
+  constant cache charges.
+
+These are read-side changes. Projection format 5 and the reader-27 / topology-66 /
+bootstrap-v19 / Lite-enrollment-v7 durable contracts remain unchanged.

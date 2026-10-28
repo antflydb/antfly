@@ -25,6 +25,7 @@ const policy = @import("resolver_namespace.zig");
 const A = std.mem.Allocator;
 var test_pin_summary_probes: std.atomic.Value(usize) = .init(0);
 var test_tail_forward_steps: std.atomic.Value(usize) = .init(0);
+var test_tail_memo_canonical_digests: std.atomic.Value(usize) = .init(0);
 pub const static_profiles = @import("resolver_static_profiles.zig");
 pub const query_context = @import("resolver_query_context.zig");
 const dependency_filter = @import("resolver_dependency_filter.zig");
@@ -1974,6 +1975,31 @@ pub const Store = struct {
         values: [][32]u8,
         slots: []u32,
         len: usize = 0,
+        pending: [32]?query_context.Lease = @splat(null),
+        pending_len: usize = 0,
+        fn deinit(self: *PinTailMemo) void {
+            for (self.pending[0..self.pending_len]) |lease| lease.?.release();
+            self.pending_len = 0;
+        }
+        fn materialize(self: *PinTailMemo) void {
+            for (self.pending[0..self.pending_len]) |lease| {
+                for (lease.?.context.canonical.?.dependencies) |*digest| {
+                    if (builtin.is_test) _ = test_tail_memo_canonical_digests.fetchAdd(1, .monotonic);
+                    self.remember(digest);
+                }
+                lease.?.release();
+            }
+            self.pending_len = 0;
+        }
+        fn rememberCanonical(self: *PinTailMemo, lease: query_context.Lease) void {
+            // Warm-only proofs need no O(path-length) memo fill. Retain a
+            // bounded set of immutable leases and materialize before a cold
+            // walk, when sharing their suffixes can actually avoid native I/O.
+            if (self.pending_len == self.pending.len) self.materialize();
+            self.pending[self.pending_len] = lease;
+            self.pending_len += 1;
+        }
+
         fn slot(self: *const PinTailMemo, digest: *const [32]u8) usize {
             var i: usize = @intCast(std.mem.readInt(u64, digest[0..8], .little) & (self.slots.len - 1));
             while (self.slots[i] != 0 and !std.mem.eql(u8, &self.values[self.slots[i] - 1], digest)) i = (i + 1) & (self.slots.len - 1);
@@ -2003,6 +2029,7 @@ pub const Store = struct {
         io: *std.heap.FixedBufferAllocator,
         current: [16384]u8 = undefined,
         fn resolve(self: *@This()) ![]const u8 {
+            self.memo.materialize();
             var len = self.key.len;
             @memcpy(self.current[0..len], self.key);
             var temporary = self.store;
@@ -2131,35 +2158,40 @@ pub const Store = struct {
         store: Store,
         sequence: u64,
         raw_prefix: []const u8,
-        native_prefix: []const u8,
-        coverage: [3][]const u8,
-        raw: bool,
+        coverage: [3][]const u8 = .{ "", "", "" },
+        recent: []const RoutingChanges.Change = &.{},
+        raw: bool = true,
         done: bool = false,
         kind: usize = 0,
-        digest: ?[64]u8 = null,
+        position: usize = 0,
         cursor: [85]u8 = undefined,
         cursor_len: usize = 0,
-        fn init(store: Store, prepared: PreparedQuery, sequence: u64, frame: *std.heap.FixedBufferAllocator) !@This() {
+        fn init(store: Store, prepared: PreparedQuery, journal_head: PinEditHead, sequence: u64, changes: *RoutingChanges, storage: []u8, frame: *std.heap.FixedBufferAllocator) !@This() {
             const journal = try store.pinEditRoot(prepared.template);
             const prefix = try std.mem.concat(store.a, u8, &.{ journal, "routed/" });
-            var result: @This() = .{ .store = store, .sequence = sequence, .raw_prefix = prefix, .native_prefix = try std.mem.concat(store.a, u8, &.{ journal, "routed-key/" }), .coverage = .{ "", "", "" }, .raw = true };
+            var result: @This() = .{ .store = store, .sequence = sequence, .raw_prefix = prefix };
             result.cursor_len = (try std.fmt.bufPrint(&result.cursor, "{d:0>20}/~", .{sequence})).len;
             if (prepared.profile_id.len != 64) return result;
+            const root = try store.pinProjectionRoot(prepared.template, prepared.profile_id);
+            inline for (.{ "path/", "dirty-node/", "trace/" }, 0..) |suffix, i| result.coverage[i] = try std.mem.concat(store.a, u8, &.{ root, suffix });
             frame.reset();
             const a = frame.allocator();
             const page = try store.backend.scan(store.backend.ptr, a, prefix, try std.mem.concat(a, u8, &.{ prefix, result.cursor[0..result.cursor_len] }), 9);
             if (page.next == null and page.rows.len <= 8) return result;
+            // Intersect only recent versions, never the entire retained key
+            // index. Freeze this sorted input: cache validation may extend its
+            // own changed-key workspace to an older checkpoint during iteration.
+            try changes.load(store, prepared.template, journal_head, sequence, frame);
+            var workspace: std.heap.FixedBufferAllocator = .init(storage);
+            result.recent = try workspace.allocator().dupe(RoutingChanges.Change, changes.entries);
             result.raw = false;
-            const root = try store.pinProjectionRoot(prepared.template, prepared.profile_id);
-            inline for (.{ "path/", "dirty-node/", "trace/" }, 0..) |suffix, i| result.coverage[i] = try std.mem.concat(store.a, u8, &.{ root, suffix });
             return result;
         }
         fn relevant(self: @This(), prepared: PreparedQuery, digest: []const u8, frame: *std.heap.FixedBufferAllocator) !bool {
             if (prepared.profile_id.len != 64) return true;
             frame.reset();
             const a = frame.allocator();
-            const root = try self.store.pinProjectionRoot(prepared.template, prepared.profile_id);
-            inline for (.{ "path/", "dirty-node/", "trace/" }) |kind| if (try self.store.backend.get(self.store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}{s}{s}", .{ root, kind, digest })) != null) return true;
+            for (self.coverage) |prefix| if (try self.store.backend.get(self.store.backend.ptr, a, try std.mem.concat(a, u8, &.{ prefix, digest })) != null) return true;
             return false;
         }
         fn next(self: *@This(), prepared: PreparedQuery, frame: *std.heap.FixedBufferAllocator, points: *std.heap.FixedBufferAllocator) !?PinInvalidation {
@@ -2187,54 +2219,46 @@ pub const Store = struct {
                     self.done = true;
                     return null;
                 }
+                if (self.position == self.recent.len) {
+                    self.kind += 1;
+                    self.position = 0;
+                    continue;
+                }
                 const prefix = self.coverage[self.kind];
-                const after = if (self.digest) |digest| try std.mem.concat(a, u8, &.{ prefix, &digest }) else null;
-                const page = try self.store.backend.scan(self.store.backend.ptr, a, prefix, after, 1);
+                const wanted = std.fmt.bytesToHex(self.recent[self.position].digest, .lower);
+                const before = try std.mem.concat(a, u8, &.{ prefix, &wanted });
+                before[before.len - 1] -= 1;
+                const page = try self.store.backend.scan(self.store.backend.ptr, a, prefix, before, 1);
                 if (page.rows.len == 0) {
                     self.kind += 1;
-                    self.digest = null;
+                    self.position = 0;
                     continue;
                 }
-                var covered = page.rows[0];
+                const covered = page.rows[0];
                 if (covered.key.len != prefix.len + 64) return error.InvalidCatalogRecord;
-                const before = try std.mem.concat(a, u8, &.{ self.native_prefix, covered.key[prefix.len..] });
-                before[before.len - 1] -= 1;
-                const native_page = try self.store.backend.scan(self.store.backend.ptr, a, self.native_prefix, before, 1);
-                if (native_page.rows.len == 0) {
-                    self.kind += 1;
-                    self.digest = null;
-                    continue;
+                var digest: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&digest, covered.key[prefix.len..]) catch return error.InvalidCatalogRecord;
+                // Gallop the in-memory recent side to this coverage row, then
+                // seek coverage to the next recent digest. Either sparse side
+                // can skip arbitrary old/unrelated gaps with one bounded seek.
+                var lo = self.position;
+                var hi = self.recent.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (std.mem.lessThan(u8, &self.recent[mid].digest, &digest)) lo = mid + 1 else hi = mid;
                 }
-                const native = native_page.rows[0];
-                if (native.key.len != self.native_prefix.len + 64) return error.InvalidCatalogRecord;
-                const native_digest = native.key[self.native_prefix.len..];
-                if (!std.mem.eql(u8, native_digest, covered.key[prefix.len..])) {
-                    const lower = try std.mem.concat(a, u8, &.{ prefix, native_digest });
-                    lower[lower.len - 1] -= 1;
-                    const next_page = try self.store.backend.scan(self.store.backend.ptr, a, prefix, lower, 1);
-                    if (next_page.rows.len == 0) {
-                        self.kind += 1;
-                        self.digest = null;
-                        continue;
-                    }
-                    covered = next_page.rows[0];
-                    if (covered.key.len != prefix.len + 64) return error.InvalidCatalogRecord;
-                    if (!std.mem.eql(u8, native_digest, covered.key[prefix.len..])) {
-                        self.digest = native_digest[0..64].*;
-                        continue;
-                    }
-                }
-                self.digest = covered.key[prefix.len..][0..64].*;
-                const sequence = try parse(u64, a, native.value);
-                if (sequence <= self.sequence) continue;
+                self.position = lo;
+                if (lo == self.recent.len or !std.mem.eql(u8, &self.recent[lo].digest, &digest)) continue;
+                const change = self.recent[lo];
+                self.position += 1;
                 const key = switch (self.kind) {
                     0 => (try parse(PinPath, a, covered.value)).key,
                     1 => (try parse(DirtyPinNode, a, covered.value)).key,
                     2 => try parse([]const u8, a, covered.value),
                     else => unreachable,
                 };
-                if (!std.mem.eql(u8, native_digest, try hash(a, key))) return error.InvalidCatalogRecord;
-                return .{ .sequence = sequence, .key = key };
+                if (!std.mem.eql(u8, covered.key[prefix.len..], try hash(a, key))) return error.InvalidCatalogRecord;
+                return .{ .sequence = change.sequence, .key = key };
             }
             return null;
         }
@@ -2262,15 +2286,16 @@ pub const Store = struct {
         const trigger = try std.mem.concat(reader.a, u8, &.{ try reader.pinEditRoot(prepared.template), "tails/" });
         const gate = try self.backend.scan(self.backend.ptr, reader.a, trigger, try std.fmt.allocPrint(reader.a, "{s}{d:0>20}/~", .{ trigger, sequence }), 1);
         if (gate.rows.len == 0) return true;
-        var sources = try RoutingSources.init(self, prepared, sequence, events);
+        var changes: RoutingChanges = .{ .storage = storage[0 .. 2 * 1024 * 1024] };
+        var sources = try RoutingSources.init(self, prepared, journal_head, sequence, &changes, storage[2 * 1024 * 1024 ..], events);
         memo_frame.reset();
         const a = memo_frame.allocator();
         const slots = try a.alloc(u32, 32768);
         @memset(slots, 0);
         var memo: PinTailMemo = .{ .values = try a.alloc([32]u8, 16384), .slots = slots };
+        defer memo.deinit();
         const visited = std.mem.bytesAsSlice([32]u8, points.buffer[0 .. 512 * 1024]);
         var io_frame: std.heap.FixedBufferAllocator = .init(points.buffer[512 * 1024 ..]);
-        var changes: RoutingChanges = .{ .storage = storage };
         var remaining: u32 = 16384;
         while (try sources.next(prepared, events, points)) |source| {
             if (source.sequence > journal_head.sequence) return error.InvalidCatalogRecord;
@@ -2298,8 +2323,11 @@ pub const Store = struct {
                         else => return err,
                     };
                     const lease = cached orelse break;
-                    const proof = lease.context.canonical;
-                    if (proof != null and lease.context.routes.len == 1 and try self.tailProofCurrent(prepared, journal_head, proof.?, &changes, events)) break;
+                    const proof = lease.context.canonicalProof();
+                    if (proof != null and lease.context.routes.len == 1 and try self.tailProofCurrent(prepared, journal_head, proof.?, &changes, events)) {
+                        _ = lease.context.advanceCanonical(proof.?, .{ .sequence = journal_head.sequence, .graph = journal_head.graph, .routing = prepared.routing_id });
+                        break;
+                    }
                     // Older snapshots do not displace a newer cached generation.
                     const replace = proof == null or proof.?.sequence <= journal_head.sequence;
                     if (replace) query_context.invalidateTailCanonical(cache_key, lease.context);
@@ -2311,6 +2339,11 @@ pub const Store = struct {
             if (memo.contains(&entry_digest)) continue;
             if (cached) |lease| {
                 if (roots.contains(lease.context.routes[0].root)) return false;
+                // Validated path dependencies all reach this terminal. Only
+                // after excluding the caller's roots may they seed the local
+                // negative memo; no root-set verdict enters the shared cache.
+                memo.rememberCanonical(lease);
+                cached = null; // Ownership moves to the request-local memo.
             } else {
                 const terminal = loader.resolve() catch |err| switch (err) {
                     error.PinTailAlreadyClear => {
@@ -7058,10 +7091,14 @@ test "resolver curation dependency tail canonical cache reuses work and fences r
         };
         const lookup: AliasLookup = .{ .ptr = &loader, .expand = Empty.expand };
         for (0..2) |repeat| {
+            const copied = test_tail_memo_canonical_digests.load(.monotonic);
             const reads = memory.reads;
             const scans = memory.scans;
             try std.testing.expect(try store.incomingPinRootsCurrent(prepared, 0, 1, roots, lookup, &events, &points, &memo, scratch.bytes[0 .. 5 * 1024 * 1024]));
-            if (repeat == 1) try std.testing.expect(memory.reads - reads < 16);
+            if (repeat == 1) {
+                try std.testing.expect(memory.reads - reads < 16);
+                try std.testing.expectEqual(copied, test_tail_memo_canonical_digests.load(.monotonic));
+            }
             std.debug.print("CACHED NATIVE TAIL hops={d} repeat={d} reads={d} scans={d}\n", .{ count, repeat, memory.reads - reads, memory.scans - scans });
         }
         try store.appendPinEdit(template, prepared.graph_id, prepared.graph_id, &.{}, &.{second[0].key}, &.{second[0].key});
@@ -7667,4 +7704,244 @@ test "resolver curation dependency cached path validation reads only missing jou
     try changes.load(store, template, journal_head, 200, &frame);
     try std.testing.expectEqual(@as(usize, 256), memory.reads - reads);
     try std.testing.expectEqual(@as(usize, 2), changes.entries.len);
+}
+
+test "resolver curation dependency recent source intersection excludes historical coverage" {
+    for ([_]usize{ 0, 4096 }) |old_count| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var memory: OrderedPinMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+        const template = "entity/{{_key}}";
+        try store.adoptNamespace(.{ .key_template = template, .revision = 1, .merges = &.{.{ .key = "entity/new-tail", .target = "entity/new-terminal" }} });
+        var input: Store.InlineQueryProfile = .{ .aliases = &.{} };
+        const profile = try hash(a, "review-history-cliff");
+        const prepared = (try store.prepareQuery(template, .{ .id = profile, .ptr = &input, .load = Store.InlineQueryProfile.load }, true)).?;
+        defer prepared.release();
+        const journal = try store.pinEditRoot(template);
+        try store.backend.put(store.backend.ptr, a, try std.mem.concat(a, u8, &.{ journal, "head" }), try encode(a, Store.PinEditHead{ .graph = prepared.graph_id, .indexed = true, .compact = true, .tails_indexed = true, .routing_indexed = true, .routing_origin = prepared.graph_id }));
+        const projection = try store.pinProjectionRoot(template, profile);
+        var old_keys: [128][]const u8 = undefined;
+        for (0..old_count / 128) |batch| {
+            for (&old_keys, 0..) |*key, i| {
+                key.* = try std.fmt.allocPrint(a, "entity/old-covered-{d}", .{batch * 128 + i});
+                try store.backend.put(store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}path/{s}", .{ projection, try hash(a, key.*) }), try encode(a, Store.PinPath{ .key = key.*, .root = "entity/old-root" }));
+            }
+            try store.appendPinEdit(template, prepared.graph_id, prepared.graph_id, &.{}, &old_keys, &.{});
+        }
+        const baseline = (try store.pinEditHead(template, prepared.graph_id)).sequence;
+        var roots: std.StringHashMapUnmanaged(void) = .empty;
+        try roots.put(a, "entity/unrelated", {});
+        const scratch = try query_context.RoutingScratch.init();
+        defer scratch.deinit();
+        var events: std.heap.FixedBufferAllocator = .init(scratch.bytes[6 * 1024 * 1024 .. 7 * 1024 * 1024]);
+        var points: std.heap.FixedBufferAllocator = .init(scratch.bytes[7 * 1024 * 1024 ..]);
+        var memo: std.heap.FixedBufferAllocator = .init(scratch.bytes[5 * 1024 * 1024 .. 6 * 1024 * 1024]);
+        const Empty = struct {
+            fn expand(_: *anyopaque, _: A, _: []const u8, _: bool, _: EdgeMask) ![]const resolver.KeyAlias {
+                return &.{};
+            }
+        };
+        const lookup: AliasLookup = .{ .ptr = &input, .expand = Empty.expand };
+        for (0..9) |i| {
+            const source = try std.fmt.allocPrint(a, "entity/new-unrelated-{d}", .{i});
+            try store.appendPinEdit(template, prepared.graph_id, prepared.graph_id, &.{}, &.{source}, &.{"entity/new-tail"});
+            if (i < 7) continue;
+            const before = memory.scans;
+            try std.testing.expect(try store.incomingPinRootsCurrent(prepared, baseline, baseline + i + 1, roots, lookup, &events, &points, &memo, scratch.bytes[0 .. 5 * 1024 * 1024]));
+            try std.testing.expect(memory.scans - before < 32);
+            std.debug.print("RECENT SOURCE INTERSECTION old_covered={d} recent_sources={d} scans={d}\n", .{ old_count, i + 1, memory.scans - before });
+        }
+    }
+}
+
+test "resolver curation dependency warm canonical dependencies share new suffix entries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    const template = "entity/{{_key}}";
+    const count: usize = 8192;
+    const edges = try a.alloc(resolver.KeyAlias, count);
+    for (edges, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/review-shared-{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/review-shared-{d}", .{i + 1}) };
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1, .merges = edges });
+    var input: Store.InlineQueryProfile = .{ .aliases = &.{} };
+    const profile = try hash(a, "review-warm-shared-suffix");
+    const prepared = (try store.prepareQuery(template, .{ .id = profile, .ptr = &input, .load = Store.InlineQueryProfile.load }, true)).?;
+    defer prepared.release();
+    const journal = try store.pinEditRoot(template);
+    try store.backend.put(store.backend.ptr, a, try std.mem.concat(a, u8, &.{ journal, "head" }), try encode(a, Store.PinEditHead{ .graph = prepared.graph_id, .indexed = true, .compact = true, .tails_indexed = true, .routing_indexed = true, .routing_origin = prepared.graph_id }));
+    const projection = try store.pinProjectionRoot(template, profile);
+    for (edges[0..2]) |edge| try store.backend.put(store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}path/{s}", .{ projection, try hash(a, edge.key) }), try encode(a, Store.PinPath{ .key = edge.key, .root = edges[count - 1].target }));
+    const first = edges[0].key;
+    const second = edges[1].key;
+    try store.appendPinEdit(template, prepared.graph_id, prepared.graph_id, &.{}, &.{first}, &.{edges[1].key});
+    var roots: std.StringHashMapUnmanaged(void) = .empty;
+    try roots.put(a, "entity/unrelated", {});
+    const scratch = try query_context.RoutingScratch.init();
+    defer scratch.deinit();
+    var events: std.heap.FixedBufferAllocator = .init(scratch.bytes[6 * 1024 * 1024 .. 7 * 1024 * 1024]);
+    var points: std.heap.FixedBufferAllocator = .init(scratch.bytes[7 * 1024 * 1024 ..]);
+    var memo: std.heap.FixedBufferAllocator = .init(scratch.bytes[5 * 1024 * 1024 .. 6 * 1024 * 1024]);
+    const Empty = struct {
+        fn expand(_: *anyopaque, _: A, _: []const u8, _: bool, _: EdgeMask) ![]const resolver.KeyAlias {
+            return &.{};
+        }
+    };
+    const lookup: AliasLookup = .{ .ptr = &input, .expand = Empty.expand };
+    try std.testing.expect(try store.incomingPinRootsCurrent(prepared, 0, 1, roots, lookup, &events, &points, &memo, scratch.bytes[0 .. 5 * 1024 * 1024]));
+    try store.appendPinEdit(template, prepared.graph_id, prepared.graph_id, &.{}, &.{second}, &.{edges[1].key});
+    const before = memory.reads;
+    try std.testing.expect(try store.incomingPinRootsCurrent(prepared, 0, 2, roots, lookup, &events, &points, &memo, scratch.bytes[0 .. 5 * 1024 * 1024]));
+    try std.testing.expect(memory.reads - before < 16);
+    std.debug.print("WARM SHARED SUFFIX hops={d} shared_entry_reads={d}\n", .{ count, memory.reads - before });
+}
+
+test "resolver curation dependency accepted canonical checkpoints bound cumulative journal reads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    const template = "entity/{{_key}}";
+    const graph: [32]u8 = @splat(43);
+    const journal = try store.pinEditRoot(template);
+    try store.backend.put(store.backend.ptr, a, try std.mem.concat(a, u8, &.{ journal, "head" }), try encode(a, Store.PinEditHead{ .graph = graph, .indexed = true, .compact = true, .tails_indexed = true, .routing_indexed = true, .routing_origin = graph }));
+    var dependency: [32]u8 = undefined;
+    @import("antfly_hash").Sha256.hash("entity/unchanged-path", &dependency, .{});
+    const Fixture = struct {
+        dependencies: []const [32]u8,
+        fn load(ptr: *anyopaque, alloc: A) !query_context.Graph {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .canonical = .{ .sequence = 0, .graph = @splat(43), .routing = @splat(0), .dependencies = try alloc.dupe([32]u8, self.dependencies) } };
+        }
+    };
+    var fixture: Fixture = .{ .dependencies = &.{dependency} };
+    var cache: query_context.Cache = .{ .allocator = std.testing.allocator };
+    defer cache.deinit();
+    const lease = try cache.acquire(@splat(117), true, .{ .ptr = &fixture, .load = Fixture.load });
+    defer lease.release();
+    var prepared: Store.PreparedQuery = .{ .lease = null, .stamp = .{ .revision = 1, .fingerprint = graph }, .template = template, .distinct = true, .routing_id = @splat(1), .graph_id = graph };
+    const scratch = try query_context.RoutingScratch.init();
+    defer scratch.deinit();
+    var events: std.heap.FixedBufferAllocator = .init(scratch.bytes[6 * 1024 * 1024 ..]);
+    var total: usize = 0;
+    for (1..258) |step| {
+        try store.appendPinEdit(template, graph, graph, &.{}, &.{"entity/unrelated-routing"}, &.{});
+        const latest = try store.pinEditHead(template, graph);
+        var changes: Store.RoutingChanges = .{ .storage = scratch.bytes[0 .. 5 * 1024 * 1024] };
+        prepared.stamp.revision += 1;
+        const before = memory.reads;
+        std.mem.writeInt(u64, prepared.routing_id[0..8], step, .little);
+        const proof = lease.context.canonicalProof().?;
+        const current = try store.tailProofCurrent(prepared, latest, proof, &changes, &events);
+        try std.testing.expect(current);
+        try std.testing.expect(lease.context.advanceCanonical(proof, .{ .sequence = latest.sequence, .graph = latest.graph, .routing = prepared.routing_id }));
+        try std.testing.expect(memory.reads - before <= 2);
+        total += memory.reads - before;
+        if (step == 1 or step == 128 or step == 256 or step == 257) std.debug.print("VALIDATED CHECKPOINT AGE unrelated_edits={d} reads={d} valid={any} total_reads={d}\n", .{ step, memory.reads - before, current, total });
+    }
+    try std.testing.expect(total <= 514);
+    const checkpoint = lease.context.canonicalProof().?;
+    const moved: [32]u8 = @splat(44);
+    try store.appendPinEdit(template, graph, moved, &.{}, &.{"entity/unchanged-path"}, &.{});
+    prepared.graph_id = moved;
+    prepared.routing_id = @splat(7);
+    var changes: Store.RoutingChanges = .{ .storage = scratch.bytes[0 .. 5 * 1024 * 1024] };
+    try std.testing.expect(!try store.tailProofCurrent(prepared, try store.pinEditHead(template, moved), checkpoint, &changes, &events));
+    try std.testing.expectEqual(checkpoint.sequence, lease.context.canonicalProof().?.sequence);
+    var older = prepared;
+    older.routing_id = @splat(6);
+    try std.testing.expect(!try store.tailProofCurrent(older, .{ .sequence = checkpoint.sequence - 1, .graph = graph }, checkpoint, &changes, &events));
+    var wrong_ancestor = checkpoint;
+    wrong_ancestor.graph = @splat(99);
+    changes = .{ .storage = scratch.bytes[0 .. 5 * 1024 * 1024] };
+    try std.testing.expect(!try store.tailProofCurrent(prepared, try store.pinEditHead(template, moved), wrong_ancestor, &changes, &events));
+    const oversized = try a.alloc([]const u8, 129);
+    @memset(oversized, "entity/unrelated");
+    try store.appendPinEdit(template, moved, moved, &.{}, oversized, &.{});
+    try std.testing.expect(!try store.tailProofCurrent(prepared, try store.pinEditHead(template, moved), checkpoint, &changes, &events));
+}
+
+test "resolver curation dependency recent source input survives older cache validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    const template = "entity/{{_key}}";
+    const graph: [32]u8 = @splat(52);
+    const profile = try hash(a, "frozen-recent-source-input");
+    const prepared: Store.PreparedQuery = .{ .lease = null, .stamp = .{ .revision = 1, .fingerprint = graph }, .profile_id = profile, .template = template, .distinct = true, .graph_id = graph };
+    const journal = try store.pinEditRoot(template);
+    try store.backend.put(store.backend.ptr, a, try std.mem.concat(a, u8, &.{ journal, "head" }), try encode(a, Store.PinEditHead{ .graph = graph, .indexed = true, .compact = true, .tails_indexed = true, .routing_indexed = true, .routing_origin = graph }));
+    const projection = try store.pinProjectionRoot(template, profile);
+    const old = "entity/old-covered";
+    try store.backend.put(store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}path/{s}", .{ projection, try hash(a, old) }), try encode(a, Store.PinPath{ .key = old, .root = "entity/root" }));
+    try store.appendPinEdit(template, graph, graph, &.{}, &.{old}, &.{});
+    var recent: [9][]const u8 = undefined;
+    for (&recent, 0..) |*key, i| {
+        key.* = try std.fmt.allocPrint(a, "entity/recent-{d}", .{i});
+        const digest = try hash(a, key.*);
+        switch (i % 3) {
+            0 => try store.backend.put(store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}path/{s}", .{ projection, digest }), try encode(a, Store.PinPath{ .key = key.*, .root = "entity/root" })),
+            1 => try store.backend.put(store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}dirty-node/{s}", .{ projection, digest }), try encode(a, Store.DirtyPinNode{ .key = key.*, .root = "entity/root" })),
+            2 => try store.backend.put(store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}trace/{s}", .{ projection, digest }), try encode(a, key.*)),
+            else => unreachable,
+        }
+    }
+    try store.appendPinEdit(template, graph, graph, &.{}, &recent, &.{});
+    const latest = try store.pinEditHead(template, graph);
+    const scratch = try query_context.RoutingScratch.init();
+    defer scratch.deinit();
+    var events: std.heap.FixedBufferAllocator = .init(scratch.bytes[6 * 1024 * 1024 .. 7 * 1024 * 1024]);
+    var points: std.heap.FixedBufferAllocator = .init(scratch.bytes[7 * 1024 * 1024 ..]);
+    var changes: Store.RoutingChanges = .{ .storage = scratch.bytes[0 .. 2 * 1024 * 1024] };
+    var sources = try Store.RoutingSources.init(store, prepared, latest, 1, &changes, scratch.bytes[2 * 1024 * 1024 .. 5 * 1024 * 1024], &events);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    while (try sources.next(prepared, &events, &points)) |source| {
+        try std.testing.expectEqual(@as(u64, 2), source.sequence);
+        try std.testing.expect(!std.mem.eql(u8, old, source.key));
+        try std.testing.expect(!(try seen.getOrPut(a, try a.dupe(u8, source.key))).found_existing);
+        // An older cached checkpoint extends and re-sorts the other workspace.
+        try changes.load(store, template, latest, 0, &events);
+    }
+    try std.testing.expectEqual(@as(usize, 9), seen.count());
+    try std.testing.expectEqual(@as(usize, 10), changes.entries.len);
+}
+
+test "resolver curation dependency pending canonical memo bounds leases and releases on spill and exit" {
+    const Fixture = struct {
+        digest: [32]u8,
+        fn load(ptr: *anyopaque, a: A) !query_context.Graph {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .canonical = .{ .sequence = 1, .graph = @splat(2), .routing = @splat(3), .dependencies = try a.dupe([32]u8, &.{self.digest}) } };
+        }
+    };
+    var cache: query_context.Cache = .{ .allocator = std.testing.allocator };
+    defer cache.deinit();
+    var values: [4][32]u8 = undefined;
+    var slots: [8]u32 = @splat(0);
+    var memo: Store.PinTailMemo = .{ .values = &values, .slots = &slots };
+    defer memo.deinit();
+    var contexts: [33]*const query_context.Context = undefined;
+    const copied = test_tail_memo_canonical_digests.load(.monotonic);
+    for (&contexts, 0..) |*context, i| {
+        var fixture: Fixture = .{ .digest = @splat(@intCast(i)) };
+        const lease = try cache.acquire(@splat(@intCast(i + 128)), true, .{ .ptr = &fixture, .load = Fixture.load });
+        context.* = lease.context;
+        memo.rememberCanonical(lease);
+        if (i < 32) try std.testing.expectEqual(copied, test_tail_memo_canonical_digests.load(.monotonic));
+        try std.testing.expect(memo.pending_len <= 32);
+    }
+    try std.testing.expectEqual(@as(usize, 1), memo.pending_len);
+    try std.testing.expectEqual(@as(usize, 4), memo.len);
+    try std.testing.expect(memo.contains(&@as([32]u8, @splat(0))));
+    try std.testing.expect(!memo.contains(&@as([32]u8, @splat(32))));
+    for (contexts[0..32]) |context| try std.testing.expectEqual(@as(usize, 1), context.references.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), contexts[32].references.load(.acquire));
+    memo.deinit();
+    try std.testing.expectEqual(@as(usize, 1), contexts[32].references.load(.acquire));
 }

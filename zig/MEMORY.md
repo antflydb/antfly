@@ -2702,3 +2702,17 @@ streaming fallback. Source and final grant fences remain independent. These
 changes preserve projection format 5; the new journal contract advances Lite to
 reader 27, topology to 66, metadata bootstrap to v19 and Lite enrollment to v7.
 See `RESOLUTION.md` for bounded maintenance, measurements and fallback rules.
+
+Recent routing-source discovery intersects a frozen sorted digest set from the
+bounded recent journal with profile coverage. It never walks old retained source
+versions merely because a small new burst exceeds a point-lookup threshold.
+Canonical cache hits can provide validated suffix dependencies to a bounded local
+memo; those dependencies are materialized only when a cold walk needs them.
+Accepted canonical proofs advance synchronized, compare-checked sequence/graph/
+routing checkpoints, so unrelated heads validate the new history suffix without
+replaying the entry's lifetime. The immutable paths and dependencies retain their
+existing cache ownership and accounting. No root-set, source or grant decision
+enters the shared certificate. Failed dependency/ancestry checks and barriers
+still force fallback, and older snapshots cannot overwrite newer checkpoints.
+These changes preserve the existing durable formats and reader floors. The
+operation-count regressions and concurrency contracts are in `RESOLUTION.md`.
