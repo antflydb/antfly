@@ -3994,7 +3994,7 @@ test "external lake stored highlights read authenticated native source without P
     var status_token: u8 = 0;
     var server = server_api.ApiHttpServer.init(a, .{}, .{ .ptr = &status_token, .vtable = &.{ .status = undefined } }, null, null);
     defer server.deinit();
-    var owner: Execution = .{ .server = &server, .table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{} }, .source = &source, .store = &store, .domain = root.domain, .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = schema_json, .arena = ca, .use_stored_highlights = true };
+    var owner: Execution = .{ .server = &server, .table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{ .{ .name = "body", .path = "body", .type = .string }, .{ .name = "label", .path = "label", .type = .string } } }, .source = &source, .store = &store, .domain = root.domain, .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = schema_json, .arena = ca, .use_stored_highlights = true };
     defer owner.deinit();
     owner.declarations = &.{declaration};
     owner.use_stored_highlights = false;
@@ -4050,7 +4050,7 @@ test "external lake stored highlights read authenticated native source without P
     try owner.highlight_locations.put(ca, id, .{ .segment = segment, .document = 1 });
     var invalid_hits = [_]types.SearchHit{.{ .id = id, .score = 1 }};
     var invalid: types.SearchResult = .{ .alloc = a, .hits = &invalid_hits, .total_hits = 1, .graph_results = &.{} };
-    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &invalid));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &invalid));
     try std.testing.expectEqual(@as(usize, 0), invalid_hits[0].highlights.len);
     owner.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &grouped));

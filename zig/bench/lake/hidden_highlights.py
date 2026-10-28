@@ -197,7 +197,7 @@ report = {
         }
         for mode in queries
     },
-    "qualification": "Warm local Debug, three samples per shape, alternating query order. Compare identical query shapes across immutable binaries; projected-wide and hidden-narrow are separate controls. No build, E2E or cleanup overlaps these measurements. This does not qualify cloud latency or archive scale.",
+    "qualification": "Warm local Debug, three samples per shape, alternating query order. Compare identical query shapes across immutable binaries; projected-wide and hidden-narrow are separate controls. No build, E2E or cleanup from this task overlaps these measurements; the host is shared. This does not qualify cloud latency or archive scale.",
 }
 (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 print(json.dumps(report["summary"], indent=2))
