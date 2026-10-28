@@ -29,6 +29,8 @@ const Cleanup = @import("output_cleanup.zig");
 const Publication = @import("registered_publication.zig");
 const Directory = @import("run_directory.zig").Directory;
 const Run = @import("repository.zig").Run;
+const PublicationResources = @import("publication_resources.zig").Owner;
+const RegisteredWriter = @import("registered_writer.zig").Record;
 const slice = .lsm_table_builder_working_set;
 
 const Node = struct {
@@ -40,6 +42,8 @@ const Node = struct {
     rows: usize = 0,
     tombstones: u32 = 0,
     run: ?Run = null,
+    owns_run: bool = false,
+    record: ?*RegisteredWriter = null,
 };
 
 pub const Owner = struct {
@@ -61,6 +65,14 @@ pub const Owner = struct {
     total_size_bytes: u64 = 0,
     compression_stats: @FieldType(Run, "compression_stats") = .{},
     collected: bool = false,
+    legacy_scope: ?*PublicationResources = null,
+    legacy_frame: ?*Publication.Candidate = null,
+    legacy_next: ?*Node = null,
+    legacy_started: bool = false,
+    legacy_ready: bool = false,
+    legacy_runs: std.ArrayListUnmanaged(Run) = .empty,
+    legacy_credit: ?resources.Reservation = null,
+    legacy_retire_offset: usize = 0,
     frame: ?*Publication.Candidate = null,
     receipt: ?Publication.Candidate.PreparedReceipt = null,
     next_validation: ?*Node = null,
@@ -140,6 +152,77 @@ pub const Owner = struct {
         if (!try builder.completedExhaustedForOwnerWithAdmission(self, original)) return error.InvalidArgument;
         self.collected = true;
         self.builder = null;
+    }
+
+    /// Prepare owned writer records while execution admission may yield. The
+    /// scratch roots are never installed; only their independently funded entry
+    /// leases escape into the legacy publication path.
+    pub fn prepareLegacyWithAdmission(self: *Owner, backend: anytype, original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.closing or self.live or !self.collected or self.frame != null) return error.InvalidArgument;
+        if (self.legacy_ready) return;
+        if (self.legacy_scope == null) self.legacy_scope = try backend.beginPublicationResourcesWithAdmission(original);
+        const scope = self.legacy_scope.?;
+        try scope.resumeWithAdmission(original);
+        if (self.legacy_frame == null) self.legacy_frame = try scope.preparePublicationWithAdmission(original);
+        const frame = self.legacy_frame.?;
+        const empty: Publication.Roots = .{};
+        if (!frame.source_captured) try frame.captureRootsWithAdmission(&empty, original);
+        try frame.prepareUnchangedWithAdmission(original);
+        const roots = try frame.preparedRootsWithAdmission(original);
+        // The frame's construction grant covers six empty accounts. Entry
+        // preparation needs only this scratch account and transfers finished
+        // payloads to each entry owner's independent account.
+        if (roots.directory.?.tree.account == null) roots.directory.?.tree.account = try @import("memory_account.zig").Account.createIndependentlyFunded(self.allocator);
+        if (!self.legacy_started) {
+            self.legacy_next = self.head;
+            self.legacy_started = true;
+        }
+        while (self.legacy_next) |node| {
+            try original.checkpoint();
+            if (node.record == null) {
+                if (scope.entry == null) try scope.beginEntryFromRegisteredOutputWithAdmission(backend, roots.directory.?, node.output.?, node.metadata, original);
+                var lease = try scope.takeEntryWithAdmission(original);
+                defer lease.deinit(self.allocator);
+                node.record = try scope.beginRegisteredWriterWithAdmission(backend, &lease, .{}, original);
+            }
+            node.run = try node.record.?.takeLegacyOutputWithAdmission(&node.ticket, original);
+            node.owns_run = true;
+            node.record.?.requestRetirement();
+            node.record = null;
+            self.legacy_next = node.next;
+        }
+        const count: usize = std.math.cast(usize, self.count) orelse return error.OutOfMemory;
+        if (self.legacy_credit == null) self.legacy_credit = try self.manager.reserveWithoutReclaimWithAdmission(slice, try std.math.mul(usize, count, @sizeOf(Run)), original);
+        if (self.legacy_runs.capacity == 0 and count != 0) {
+            const memory = try self.allocator.alloc(Run, count);
+            self.legacy_runs = .fromOwnedSlice(memory);
+            self.legacy_runs.items.len = 0;
+        }
+        var next = self.head;
+        while (next) |node| : (next = node.next) {
+            try original.checkpoint();
+            if (!node.owns_run) continue;
+            self.legacy_runs.appendAssumeCapacity(node.run.?);
+            node.run = null;
+            node.owns_run = false;
+        }
+        self.legacy_ready = true;
+    }
+
+    pub const LegacyResult = struct {
+        runs: std.ArrayListUnmanaged(Run),
+        // Retained until the receiving publication frees the physical vector.
+        credit: ?resources.Reservation,
+    };
+    pub fn takeLegacyRunsWithAdmission(self: *Owner, original: admission.Port) !LegacyResult {
+        try original.checkLifetime();
+        if (self.closing or self.live or !self.legacy_ready) return error.InvalidArgument;
+        const result: LegacyResult = .{ .runs = self.legacy_runs, .credit = self.legacy_credit };
+        self.legacy_runs = .empty;
+        self.legacy_credit = null;
+        self.legacy_ready = false;
+        return result;
     }
 
     pub const View = struct { output: *Output.Owner, metadata: Output.Metadata, rows: usize, tombstones: u32 };
@@ -256,16 +339,42 @@ pub const Owner = struct {
         self.receipt = null;
         self.next_validation = null;
         self.search = null;
+        if (self.legacy_frame) |frame| frame.requestRetirement();
+        self.legacy_frame = null;
+        if (self.legacy_scope) |scope| scope.requestRetirement();
+        self.legacy_scope = null;
+        self.legacy_next = null;
         self.registration.publish();
     }
     fn retire(raw: *anyopaque, original: ?admission.Port) !bool {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (original) |port| try port.checkpoint();
+        if (self.legacy_runs.items.len != 0) {
+            const index = self.legacy_runs.items.len - 1;
+            self.legacy_runs.items[index].deinit(self.allocator);
+            self.legacy_runs.items.len = index;
+            return false;
+        }
+        if (self.legacy_runs.capacity != 0) {
+            const bytes = std.mem.sliceAsBytes(self.legacy_runs.allocatedSlice());
+            const end = @min(bytes.len, self.legacy_retire_offset + 16 * 1024);
+            @memset(bytes[self.legacy_retire_offset..end], 0);
+            self.legacy_retire_offset = end;
+            if (end != bytes.len) return false;
+            self.legacy_runs.deinit(self.allocator);
+            self.legacy_runs = .empty;
+        }
+        if (self.legacy_credit) |*credit| credit.release();
+        self.legacy_credit = null;
         if (self.head) |node| {
             if (node.ticket) |ticket| {
                 if (self.live) ticket.destroy() else if (original) |port| try ticket.abandonWithAdmission(port) else ticket.abandon();
                 node.ticket = null;
             }
+            if (node.record) |record| record.requestRetirement();
+            node.record = null;
+            if (node.owns_run) node.run.?.deinit(self.allocator);
+            node.owns_run = false;
             if (node.output) |output| output.requestRetirement();
             node.output = null;
             self.head = node.next;

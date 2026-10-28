@@ -3311,7 +3311,7 @@ const FlushPublicationFixture = struct {
     const Batch = Scope.FlushOutputs;
     const Builder = Scope.FlushBuilder.Owner;
     const Control = RegisteredOutputFixture.Control;
-    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject, wal_retire, wal_replay, wal_prefix, wal_cancel, wal_failure, wal_resume, wal_delete_failure, wal_floor_failure, wal_legacy_replay, immutable_retire, immutable_prefix, immutable_cancel, file_snapshot };
+    const Mode = enum { legacy, publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject, wal_retire, wal_replay, wal_prefix, wal_cancel, wal_failure, wal_resume, wal_delete_failure, wal_floor_failure, wal_legacy_replay, immutable_retire, immutable_prefix, immutable_cancel, file_snapshot };
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
     const Retry = struct {
         failing: *std.testing.FailingAllocator,
@@ -3447,7 +3447,7 @@ const FlushPublicationFixture = struct {
         };
         const install_checkpoint = mode == .checkpoint_install or mode == .checkpoint_repeat or mode == .checkpoint_install_reject or wal_mode or immutable_mode;
         var expected_logical: u64 = 17;
-        const late = mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode or mode == .file_snapshot;
+        const late = mode == .legacy or mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode or mode == .file_snapshot;
         var failing = std.testing.FailingAllocator.init(a, .{});
         const owned = failing.allocator();
         var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
@@ -3561,6 +3561,37 @@ const FlushPublicationFixture = struct {
                     _ = resources.resource_manager.drainPayloadRetirementQuiesced();
                 }
                 try std.testing.expectEqual(@as(usize, 3), queue.live.load(.acquire));
+            }
+            if (mode == .legacy) {
+                start = failing.alloc_index;
+                control.calls = 0;
+                control.target = if (oom) null else target;
+                control.live = true;
+                if (oom) failing.fail_index = start + target.?;
+                retry.call(Batch.prepareLegacyWithAdmission, .{ owners.batch.?, &backend, original }) catch |cause| break :work cause;
+                var result = retry.call(Batch.takeLegacyRunsWithAdmission, .{ owners.batch.?, original }) catch |cause| break :work cause;
+                defer {
+                    for (result.runs.items) |*projected| projected.deinit(owned);
+                    result.runs.deinit(owned);
+                    if (result.credit) |*credit| credit.release();
+                }
+                allocations = failing.alloc_index - start;
+                control.live = false;
+                failing.fail_index = std.math.maxInt(usize);
+                try std.testing.expectEqual(@as(usize, 2), result.runs.items.len);
+                // Ticket-bearing projections must never enter coupled roots.
+                for (result.runs.items) |*projected| try std.testing.expectError(error.ExecutionWaitUnsupported, Scope.RegisteredWriter.validate(projected, quotaControl()));
+                try local.storage_lsm_backend_compaction.appendBackendRuns(&backend, &result.runs);
+                owners.installed = true;
+                owners.batch.?.requestRetirement();
+                owners.batch = null;
+                for (0..512) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+                try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+                var read = try backend.beginRead();
+                defer read.abort();
+                try std.testing.expectEqualStrings("one", try read.get(.{ .name = null }, "a"));
+                try std.testing.expectEqualStrings("two", try read.get(.{ .name = null }, "b"));
+                break :work {};
             }
             if (mode == .identity) {
                 const other_root = try std.fmt.allocPrint(a, "{s}-other", .{root});
@@ -5887,4 +5918,138 @@ test "physical cache metadata bounded writer retirement refuses unknown producer
     job.finishContents();
     finished = true;
     try std.testing.expectEqual(@as(usize, 1), Callback.called);
+}
+
+fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry }) !void {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const io_mod = local.storage_lsm_backend_storage_io;
+    const owners = @import("api/runnable_owner_execution.zig");
+    const runtime = @import("antfly_runtime_abi");
+    const platform = @import("antfly_platform");
+    const scheduler = local.common_request_admission.runnable_scheduler;
+    const a = std.testing.allocator;
+    var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
+    defer state.owner.deinit();
+    const Refusal = struct {
+        var delegate: @FieldType(runtime.runnable_abi.Owner, "start") = undefined;
+        var attempts: std.atomic.Value(usize) = .init(0);
+        fn start(raw: *anyopaque, request: *const runtime.runnable_abi.Start) callconv(.c) runtime.error_abi.Status {
+            const failures = [_]anyerror{ error.SchedulerFull, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable, error.OutOfMemory };
+            const index = attempts.fetchAdd(1, .monotonic);
+            if (index < failures.len) return runtime.error_abi.statusFromError(failures[index]);
+            return delegate(raw, request);
+        }
+    };
+    var worker_owner = state.port();
+    if (mode == .retry) {
+        Refusal.delegate = worker_owner.start;
+        Refusal.attempts.store(0, .release);
+        worker_owner.start = Refusal.start;
+    }
+    var resources = try Resources.initWithBudgets(a, budgets_mod.smartResourceBudgetsForTotal(128 << 20));
+    defer resources.deinit();
+    resources.attachResourceManager();
+    defer RegisteredOutputFixture.drain(&resources.resource_manager);
+    var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
+    defer pool.deinit();
+    var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/normal-admitted-flush", .{tmp.sub_path});
+    defer a.free(root);
+    var handle = try lsm.BackendHandle.openWithConfig(a, root, .{
+        .storage = native.storage(),
+        .resource_manager = &resources.resource_manager,
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 128,
+        .immutable_flush_window_max_memtables = 1,
+        .compact_threshold_runs = 1000,
+        .l0_soft_limit_runs = 1000,
+        .l0_hard_limit_runs = 2000,
+    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = worker_owner } });
+    var open = true;
+    defer if (open) handle.close();
+    const io = std.testing.io;
+    const borrowed = runtime.native_abi.IoBorrow.init(&io);
+    const owner = state.port();
+    var foreground: ?*anyopaque = null;
+    const started = owner.start(owner.context, &.{ .io = &borrowed, .class = @backingInt(runtime.runnable_abi.Class.query), .allow_wait = 0, .out_handle = &foreground });
+    try std.testing.expect(started.isOk());
+    defer if (foreground) |held| owner.finish(held);
+    {
+        var write = try handle.ptr().beginWrite();
+        defer write.abort();
+        try write.put(.{}, "admitted", "durable");
+        try write.commit();
+    }
+    const deadline = platform.time.monotonicNs() + 10 * std.time.ns_per_s;
+    while (state.owner.scheduler.stats().queued == 0) {
+        if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // The actual detached worker is queued before constructing any physical
+    // SST. Its immutable and WAL remain visible while a query owns capacity.
+    while (!handle.ptr().mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+    const pending = handle.ptr().activeImmutableMemtableCount();
+    const flushes = handle.ptr().write_stats.immutable_flushes;
+    handle.ptr().mu.unlock();
+    try std.testing.expectEqual(@as(usize, 1), pending);
+    try std.testing.expectEqual(@as(u64, 0), flushes);
+    if (mode == .cancel_queued) {
+        // Closing cancels the original queued pass even while the foreground
+        // retains ordinary capacity; joined close persists the immutable tail.
+        handle.close();
+        open = false;
+    } else {
+        owner.finish(foreground.?);
+        foreground = null;
+        while (true) {
+            while (!handle.ptr().mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+            const done = handle.ptr().activeImmutableMemtableCount() == 0 and !handle.ptr().immutable_flush_job_in_flight;
+            handle.ptr().mu.unlock();
+            if (done) break;
+            if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(state.owner.scheduler.stats().grants[@backingInt(scheduler.Class.background)] > 0);
+        handle.close();
+        open = false;
+    }
+    if (foreground) |held| owner.finish(held);
+    foreground = null;
+    RegisteredOutputFixture.drain(&resources.resource_manager);
+    if (mode == .retry) try std.testing.expect(Refusal.attempts.load(.acquire) >= 6);
+    try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("durable", try read.get(.{}, "admitted"));
+}
+
+test "physical cache metadata registered flush publication normal worker waits for shared execution then persists and reopens" {
+    try normalAdmittedFlushWorker(.publish);
+}
+
+test "physical cache metadata registered flush publication normal close cancels queued admission and persists immutable tail" {
+    try normalAdmittedFlushWorker(.cancel_queued);
+}
+
+test "physical cache metadata registered flush publication legacy handoff retains files and aborts partial ownership" {
+    _ = try FlushPublicationFixture.run(.legacy, null, false, false);
+    for ([_]usize{ 0, 1, 8, 24, 48, 96 }) |point| {
+        _ = try FlushPublicationFixture.run(.legacy, point, false, true);
+    }
+    const baseline = try FlushPublicationFixture.run(.legacy, null, false, false);
+    for (0..baseline.allocations) |allocation| {
+        _ = try FlushPublicationFixture.run(.legacy, allocation, true, true);
+    }
+}
+
+test "physical cache metadata registered flush publication normal worker retries refused admission without another write" {
+    try normalAdmittedFlushWorker(.retry);
 }

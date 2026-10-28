@@ -5981,16 +5981,36 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
         var progressed = false;
+        var retry = false;
         defer {
             self.immutable_flush_job_in_flight = false;
             // One publication window per dispatch. A hot writer can refill
             // the queue during the unlocked build; it must not extend this
             // same executor job indefinitely. Successor admission is a new
             // queue turn, still owned by the same backend's durable lane.
-            if (progressed and !self.closing.load(.acquire)) self.scheduleImmutableFlushJob();
+            if ((progressed or retry) and !self.closing.load(.acquire)) self.scheduleImmutableFlushJob();
         }
         if (self.options.backend.read_only) return;
-        progressed = try self.flushImmutableMemtableWindow(false);
+        progressed = self.flushImmutableMemtableWindowControlled(false, true, self.background_executor.runtime) catch |err| {
+            switch (err) {
+                error.Canceled, error.SchedulerClosed => {
+                    if (self.closing.load(.acquire)) return;
+                    return err;
+                },
+                error.Timeout, error.DeadlineExceeded, error.ResourceBudgetExceeded, error.ParentMemoryBusy, error.CapacityUnavailable, error.OutOfMemory, error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable => {
+                    // Preserve immutable/WAL debt. Backoff outside every storage
+                    // guard and execution capsule before admitting a new pass.
+                    runtime_mod.unlockBackend(Backend, self, locked);
+                    if (self.background_executor.runtime) |runtime| {
+                        if (runtime.io()) |io| io.sleep(.fromMilliseconds(10), .awake) catch {};
+                    }
+                    _ = runtime_mod.lockBackend(Backend, self);
+                    retry = true;
+                    return;
+                },
+                else => return err,
+            }
+        };
         _ = self.refreshCachedMaintenanceHintLocked();
     }
 
@@ -6090,6 +6110,12 @@ pub const Backend = struct {
     }
 
     fn flushImmutableMemtableWindowWithAdmission(self: *Backend, force: bool, charge_maintenance: bool) !bool {
+        return self.flushImmutableMemtableWindowControlled(force, charge_maintenance, null);
+    }
+
+    // Only detached durable jobs supply a runtime. Synchronous DB maintenance
+    // callers hold outer guards and must never lend execution while holding them.
+    fn flushImmutableMemtableWindowControlled(self: *Backend, force: bool, charge_maintenance: bool, execution_runtime: ?*background_runtime_mod.BackendRuntime) !bool {
         const window_count = self.immutableFlushWindowCount(force);
         if (window_count == 0) return false;
         const state = self.immutable_memtables.items[self.immutable_head];
@@ -6099,7 +6125,7 @@ pub const Backend = struct {
         }
         if (charge_maintenance and !self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
         if (self.root_dir != null and self.storage != null) {
-            return try self.flushOldestImmutableMemtableUnlockedBuild(window_count);
+            return try self.flushOldestImmutableMemtableUnlockedBuild(window_count, execution_runtime);
         }
         const start_ns = self.writeStatsNowNs();
         const input_entries = state.entryCount();
@@ -6146,7 +6172,7 @@ pub const Backend = struct {
         return true;
     }
 
-    fn flushOldestImmutableMemtableUnlockedBuild(self: *Backend, window_count: usize) !bool {
+    fn flushOldestImmutableMemtableUnlockedBuild(self: *Backend, window_count: usize, execution_runtime: ?*background_runtime_mod.BackendRuntime) !bool {
         if (self.activeImmutableMemtableCount() == 0) return false;
         if (self.immutable_flush_build_in_flight) return false;
         std.debug.assert(window_count > 0 and window_count <= self.activeImmutableMemtableCount());
@@ -6172,7 +6198,23 @@ pub const Backend = struct {
         var build_result: std.ArrayListUnmanaged(Run) = .empty;
         var build_result_valid = false;
         var build_err: ?anyerror = null;
-        build_result = compaction_mod.buildRunsFromStatesBorrowedWithReservedIds(
+        var build_credit: ?resource_manager_mod.Reservation = null;
+        defer if (build_credit) |*credit| credit.release();
+        const admitted_runtime = if (execution_runtime) |runtime| blk: {
+            const manager = self.options.resource_manager orelse break :blk null;
+            if (runtime.runnableOwner() == null or manager.allocator_host_source == null or self.options.unpublished_outputs == null or (self.options.run_partition_key != null and self.options.run_partition_key_with_admission == null)) break :blk null;
+            break :blk runtime;
+        } else null;
+        if (admitted_runtime) |runtime| {
+            const result = self.buildAdmittedImmutableFlush(runtime, states_newest_first, reserved_run_id_start, reserved_run_id_end) catch |err| blk: {
+                build_err = err;
+                break :blk @as(?@import("lsm_backend/registered_flush_outputs.zig").Owner.LegacyResult, null);
+            };
+            if (result) |owned| {
+                build_result = owned.runs;
+                build_credit = owned.credit;
+            }
+        } else build_result = compaction_mod.buildRunsFromStatesBorrowedWithReservedIds(
             Backend,
             self,
             states_newest_first,
@@ -6255,6 +6297,45 @@ pub const Backend = struct {
             try self.persistManifestLocked();
         }
         return true;
+    }
+
+    fn flushConstructionCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const Backend = @ptrCast(@alignCast(raw.?));
+        return @intFromBool(self.closing.load(.acquire));
+    }
+
+    fn buildAdmittedImmutableFlush(self: *Backend, runtime: *background_runtime_mod.BackendRuntime, states: []const *const State, first_id: u64, end_id: u64) !@import("lsm_backend/registered_flush_outputs.zig").Owner.LegacyResult {
+        const execution = @import("../common/background_execution.zig");
+        const Builder = @import("lsm_backend/registered_flush_builder.zig").Owner;
+        const Batch = @import("lsm_backend/registered_flush_outputs.zig").Owner;
+        const io = runtime.io() orelse return error.ExecutionWaitUnsupported;
+        var pass = try execution.Pass.init(runtime.runnableOwner(), &io, platform.time.monotonicNs() +| 30 * std.time.ns_per_s, .{ .context = self, .is_cancelled = flushConstructionCancelled });
+        defer pass.deinit();
+        var scope = try pass.admissionScope(io);
+        var payload = scope.payload();
+        const original = read_admission.Port.init(&payload);
+        // Standalone hosts have no joined cleanup consumer. Make one bounded
+        // retirement pass before new construction; pooled hosts leave cleanup
+        // to their existing consumer. No backend/service guard is held here.
+        _ = try self.options.resource_manager.?.drainForegroundPayloadRetirementWithAdmission(original);
+        const builder = try Builder.start(self.allocator, self.options.resource_manager.?, self.options.unpublished_outputs.?, self.root_dir.?, states, .{
+            .first_id = first_id,
+            .end_id = end_id,
+            .oldest_tombstone_unix_ns = platform.time.realtimeNs(),
+            .target_bytes = self.options.max_run_file_bytes,
+            .max_file_bytes = self.options.max_run_file_physical_bytes,
+            .max_entries = if (self.options.max_run_file_entries == 0) std.math.maxInt(u32) else @min(self.options.max_run_file_entries, std.math.maxInt(u32)),
+            .partition_prefix_bytes = self.options.run_partition_prefix_bytes,
+            .partition_key = if (self.options.run_partition_key != null) self.options.run_partition_key_with_admission else null,
+            .encoder = .{ .block_compression = self.options.table_block_compression, .bloom_config = self.options.bloom, .prefix_extractor = self.options.table_prefix_extractor },
+        }, original);
+        defer builder.requestRetirement();
+        try builder.driveWithAdmission(self.storage.?, original);
+        const batch = try Batch.start(self.allocator, self.options.resource_manager.?, builder, original);
+        defer batch.requestRetirement();
+        try batch.collectWithAdmission(original);
+        try batch.prepareLegacyWithAdmission(self, original);
+        return batch.takeLegacyRunsWithAdmission(original);
     }
 
     fn maybeCompactRuns(self: *Backend) !void {

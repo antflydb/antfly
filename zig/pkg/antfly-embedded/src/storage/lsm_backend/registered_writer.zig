@@ -32,6 +32,9 @@ pub const Record = struct {
     source: ?Directory.RegisteredSource = null,
     header: repository.RunOwner = undefined,
     run: Run = undefined,
+    /// Only completed output records may be projected into a legacy writer.
+    /// This does not relax registered candidate/root validation.
+    legacy_output: bool = false,
     ready: bool = false,
     closing: bool = false,
     exclusive: bool = false,
@@ -85,10 +88,44 @@ pub const Record = struct {
         if (!self.ready or self.closing) return error.InvalidArgument;
         return self.run.retainOwned();
     }
+    /// Move sole unpublished deletion authority into the canonical record.
+    /// Legacy publication already commits tickets through versionOwner().
+    /// No callback/allocation follows the transfer and retained run receipt.
+    pub fn takeLegacyOutputWithAdmission(self: *Record, ticket: *?*@import("output_cleanup.zig").Ticket, original: admission.Port) !Run {
+        try original.checkpoint();
+        if (!self.ready or self.closing or self.legacy_output or self.run.output_ticket != null or self.source == null) return error.InvalidArgument;
+        const offered = ticket.* orelse return error.InvalidArgument;
+        if (offered.queue.manager != self.manager or !std.meta.eql(offered.queue.allocator, self.allocator)) return error.ResourceAccountingMismatch;
+        const path = self.run.path orelse return error.InvalidArgument;
+        if (path.len != offered.path.len) return error.InvalidArgument;
+        var offset: usize = 0;
+        while (offset < path.len) {
+            try original.checkpoint();
+            const end = @min(path.len, offset + 16 * 1024);
+            if (!std.mem.eql(u8, path[offset..end], offered.path[offset..end])) return error.InvalidArgument;
+            offset = end;
+        }
+        try original.checkpoint();
+        self.run.output_ticket = offered;
+        self.legacy_output = true;
+        ticket.* = null;
+        return self.run.retainOwned();
+    }
+
+    pub fn validateLegacyOutputFixed(run: *const Run) !void {
+        const self = try validateFixed(run);
+        if (!self.legacy_output) return error.ExecutionWaitUnsupported;
+    }
+
     /// Validate the canonical record in constant work. A generic owned view
     /// cannot forge metadata revisions or replace its original allocator host.
     pub fn validate(run: *const Run, original: admission.Port) !*Record {
         try original.checkpoint();
+        const self = try validateFixed(run);
+        if (self.legacy_output) return error.ExecutionWaitUnsupported;
+        return self;
+    }
+    fn validateFixed(run: *const Run) !*Record {
         const header = run.owner orelse return error.ExecutionWaitUnsupported;
         const registration = header.registered orelse return error.ExecutionWaitUnsupported;
         if (header.destroy != forbiddenDestroy or registration.context == null or registration.credit == null) return error.InvalidArgument;
@@ -110,6 +147,10 @@ pub const Record = struct {
             // constructor. Closing excludes the latter; no external lease is left.
             self.header.refs.store(0, .release);
             self.exclusive = true;
+        }
+        if (self.run.output_ticket) |ticket| {
+            if (original) |port| try ticket.abandonWithAdmission(port) else ticket.abandon();
+            self.run.output_ticket = null;
         }
         if (self.source) |*source| {
             try source.releaseWithAdmission(original);

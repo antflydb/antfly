@@ -516,7 +516,13 @@ pub const Store = struct {
         return self.stageInternal(allocator, run, true);
     }
     fn stageInternal(self: *Store, allocator: std.mem.Allocator, run: Run, overwrite: bool) !void {
-        if (self.registered_owner != null or (run.owner != null and run.owner.?.registered != null)) return error.ExecutionWaitUnsupported;
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
+        if (run.owner) |owner| if (owner.registered != null) {
+            // A completed native output may retain its registered physical
+            // owner behind this legacy projection. Every other registered
+            // record still requires the registered candidate protocol.
+            try @import("registered_writer.zig").Record.validateLegacyOutputFixed(&run);
+        };
         var probe = run;
         if (!overwrite and Tree.find(self.tree.root, .{ .run = &probe }) != null) return error.DuplicateRun;
         try probe.ensureReadIdentity();

@@ -1816,3 +1816,11 @@ steps, giving other queued owners a dispatch opportunity. Refusal and shutdown
 preserve pending work and physical joins. Existing publication/durable formats
 remain unchanged. Work within each physical step is still legacy; bounded,
 concurrent retained execution remains required before CPU admission activation.
+
+Detached immutable file-flush construction uses shared background execution when
+its existing runtime and physical allocator host support it. Construction runs
+off-lock with registered ownership through cancellation/cleanup; the execution
+scope ends before legacy publication. Refused passes retain debt and retry after
+an off-lock backoff, and close cancels queued construction while persisting the
+immutable tail. This does not yet admit guarded publication, compaction or the
+server maintenance-waker path; those remain part of the production integration.

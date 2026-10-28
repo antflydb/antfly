@@ -80,7 +80,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Retained memory-run materialization preserves output visibility and lineage.
 // Physical checkpoint join observations survive metadata and issuer lifetimes.
 // Maintenance rounds carry bounded-selection continuation state.
-pub const abi_version: u32 = 211;
+// Detached flush executors retain runtime access; writer records own legacy output tickets.
+pub const abi_version: u32 = 212;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

@@ -29793,3 +29793,39 @@ native executor FIFO fairness. Work within one legacy flush/compaction step,
 independent funding/retirement and concurrent retained publication still need
 integration before maintenance can hold shared CPU admission. The same milestone
 and full goal remain open; full qualification remains waived.
+
+## Admitted detached file-flush construction (2026-10-27)
+
+Detached immutable-flush jobs with a shared runnable owner and a retained physical
+allocator host now acquire background execution before building SSTs. Construction
+uses the registered builder and output owners outside Backend.mu, with one original
+30-second pass deadline and backend-close cancellation. Physical IO waits park the
+same execution capsule; registered cleanup keeps accepted IO and partial outputs
+owned after rejection. The pass ends before legacy guarded publication begins.
+Synchronous maintenance callers that hold outer service guards retain their prior
+path. Missing execution/host support and uncontrolled partition callbacks retain
+the prior construction path; this does not activate every engine's maintenance.
+
+A funded batch prepares immutable writer records and transfers each unpublished
+file ticket into its canonical record. Legacy writer publication accepts only
+validated output projections and commits tickets through the existing publication
+handoff. Coupled registered roots reject these ticket-bearing records. Scratch
+entry construction, partial records and the projection vector retire independently;
+the vector's reservation remains until publication frees its physical allocation.
+Tombstone age and L0 visibility retain the existing publication semantics.
+
+Transient admission/resource refusal preserves immutable/WAL debt and backs off
+outside storage guards and execution admission before queueing a successor. Closing
+cancels queued construction and prevents successors; joined close persists the tail.
+
+Native integration coverage uses the real shared owner, io_threaded durable lane,
+physical resources, native SST IO, normal write/flush/publication path, and reopen.
+It checks queued foreground contention, cancellation during close and injected transient
+admission/resource refusals followed by autonomous retry. Focused handoff coverage
+checks published-file survival, original rejection and every handoff allocation
+failure, including independent cleanup with the allocator still exhausted.
+
+This integrates construction admission for the detached file-flush path. Bounded
+publication, the normal server maintenance-waker path, compaction and remaining
+engine paths still need integration before claiming shared admission for complete
+maintenance steps. The full design remains open; full qualification is waived.

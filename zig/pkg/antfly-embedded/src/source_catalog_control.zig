@@ -74,6 +74,7 @@ pub const chunking_types = @import("chunking/types.zig");
 pub const common_maintenance_scheduler = @import("common/maintenance_scheduler.zig");
 pub const common_byte_copy = @import("common/byte_copy.zig");
 pub const common_bounded_admission = @import("common/bounded_admission.zig");
+pub const common_background_execution = @import("common/background_execution.zig");
 pub const common_read_admission = @import("common/read_admission.zig");
 pub const common_read_execution_budget = @import("common/read_execution_budget.zig");
 pub const common_seed_snapshot_lifetime = @import("common/seed_snapshot_lifetime.zig");
