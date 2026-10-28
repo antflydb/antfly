@@ -539,15 +539,6 @@ its 6 GiB generation domain. Linux process admission accounts the leaf cgroup;
 run qualification after compilers have exited, or in a dedicated service cgroup.
 Native/Metal fixtures retain their existing 7 GiB worker envelope.
 
-On 2026-10-27, the GB10/SM121 process-level HTTP checks passed frozen extraction
-and classification outputs, typed decisions, sixteen mixed concurrent requests,
-512-token Decide requests, rejection at 513 tokens, and model eviction/reload.
-Ten-sample warm medians were 12.0 ms (base), 12.8 ms (multi), 60.5 ms (FP32 typed
-Decide) and 43.3 ms (Q8 typed Decide). First requests including verification/load
-took 1.52, 2.22, 1.96 and 1.58 seconds respectively. These are local smoke
-measurements; filesystem cache state was not controlled for a cold-disk study.
-The retained [HTTP receipt](../../../../../docs/design/inference/history/gliner2/gliner25-gb10-http-2026-10-27.json)
-records model revisions, binary hash, budgets and per-case results.
 On 2026-10-28 the expanded required-CUDA gate passed all 24 selected tests with
 zero skips, including native FP32 regression, 132 strict batch checks over the
 base and all multilingual profile endpoints, both Decide variants, resource
@@ -558,13 +549,13 @@ The additional native Q8 diagnostic exceeded its existing 5e-2 raw-logit bound
 (maximum 0.06692); native Q8 remains unqualified. CUDA Q8 retains its independent
 passing oracle and backend restrictions.
 
-The final HTTP run also passed sixteen simultaneous eight-input requests
-(128 inputs), a ninth-input rejection, invalid-last-input rejection and equal
-retries. Five-sample eight-input throughput ratios versus the same singleton
+The single-input HTTP regression passed typed decisions, sixteen concurrent
+requests, 512-token Decide inference, rejection at 513 tokens, and model
+eviction/reload. The final batch HTTP run also passed sixteen simultaneous
+eight-input requests (128 inputs), a ninth-input rejection, invalid-last-input
+rejection and equal retries. Five-sample eight-input throughput ratios versus the same singleton
 calls were 3.14x (base), 4.10x (multi), 1.85x (Decide FP32) and 1.76x (Decide Q8).
-These are descriptive local measurements. The retained
-[batch receipt](../../../../../docs/design/inference/history/gliner2/gliner25-gb10-batch-2026-10-28.json)
-records the binary hashes, model revisions, scope, checks and timings.
+These are descriptive local measurements.
 These serving correctness checks do not establish training or comparative-performance release
 qualification, or qualification on GPUs other than the measured GB10.
 
