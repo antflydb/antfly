@@ -15,7 +15,6 @@
 
 import math
 import io
-import os
 import unittest
 from unittest.mock import patch
 
@@ -55,15 +54,31 @@ class VectorValidationTests(unittest.TestCase):
                     "cuda_video_qualification.urllib.request.urlopen",
                     return_value=io.BytesIO(raw),
                 ),
+                patch(
+                    "cuda_video_qualification.Path.read_text",
+                    autospec=True,
+                    side_effect=lambda path: {
+                        "/proc/101/status": "Name:\tsupervisor\nVmRSS:\t10 kB\nVmHWM:\t12 kB\n",
+                        "/proc/101/task/101/children": "202",
+                        "/proc/202/status": "Name:\tworker\nVmRSS:\t100 kB\nVmHWM:\t120 kB\n",
+                        "/proc/202/task/202/children": "",
+                    }[str(path)],
+                ) as read_status,
             ):
                 if accepted:
-                    self.assertIn(
-                        "VmRSS",
-                        cleanup_snapshot("http://unused", os.getpid())["process"],
+                    snapshot = cleanup_snapshot("http://unused", 101)
+                    self.assertEqual(
+                        snapshot["process"], {"VmRSS": "10 kB", "VmHWM": "12 kB"}
                     )
+                    self.assertEqual(snapshot["tree_rss_kib"], 110)
+                    self.assertEqual(
+                        [row["pid"] for row in snapshot["process_tree"]], [101, 202]
+                    )
+                    self.assertEqual(snapshot["process_tree"][1]["hwm_kib"], 120)
                 else:
                     with self.assertRaises(ValueError):
-                        cleanup_snapshot("http://unused", os.getpid())
+                        cleanup_snapshot("http://unused", 101)
+                    read_status.assert_not_called()
 
 
 if __name__ == "__main__":
