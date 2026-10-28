@@ -678,7 +678,9 @@ pub const CublasLt = struct {
         if (in_dim == 1024 and out_dim == 6144 and rows >= 65) return 128;
         // Selected with cold weights on GB10; other projection shapes retain
         // the ordinary heuristic. These descriptors never add compute rows.
-        const query: u32 = if (in_dim == 1024 and out_dim == 6144 and rows >= 17 and rows <= 32)
+        const query: u32 = if (in_dim == 2560 and out_dim == 248320)
+            16
+        else if (in_dim == 1024 and out_dim == 6144 and rows >= 17 and rows <= 32)
             96
         else if (in_dim == 1024 and out_dim == 248320 and rows >= 33 and rows <= 64)
             32
@@ -1703,6 +1705,12 @@ test "LightOnOCR3 CUDA projection descriptor policy keeps actual rows and conser
     const Case = struct { rows: usize, inner: usize, out: usize, query: u32 };
     for ([_]Case{
         .{ .rows = 1, .inner = 2560, .out = 4096, .query = 0 },
+        .{ .rows = 1, .inner = 2560, .out = 248320, .query = 16 },
+        .{ .rows = 7, .inner = 2560, .out = 248320, .query = 16 },
+        .{ .rows = 16, .inner = 2560, .out = 248320, .query = 0 },
+        .{ .rows = 85, .inner = 2560, .out = 248320, .query = 16 },
+        .{ .rows = 128, .inner = 2560, .out = 248320, .query = 16 },
+        .{ .rows = 129, .inner = 2560, .out = 248320, .query = 0 },
         .{ .rows = 16, .inner = 1024, .out = 3072, .query = 0 },
         .{ .rows = 21, .inner = 1024, .out = 6144, .query = 96 },
         .{ .rows = 43, .inner = 1024, .out = 248320, .query = 32 },

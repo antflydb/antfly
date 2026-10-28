@@ -50,6 +50,13 @@ The vision kernels preserve the original bias, activation and residual rounding.
 They avoid cuBLASLt BF16 bias-epilogue cliffs observed against vLLM's actual Torch
 linear path. All raw measurements and settings are retained outside Git.
 
+The current source also adds asynchronous mixed-prefix/decode token readback,
+actual-row 4B head algorithm selection, and independently admitted event-based
+metadata staging. These changes are correctness-qualified. The table below still
+identifies the earlier frozen767 build; fresh comparisons of the current838 build
+were affected by competing GPU jobs and are excluded. No new throughput gain is
+claimed for the execution update yet.
+
 | Model | Native pages/s | Actual vLLM pages/s | Native versus reference mean |
 | --- | ---: | ---: | ---: |
 | LightOn 0.8B | 15.1768 / 15.1975 | 14.4855 / 14.4823 | +4.9% |
@@ -72,7 +79,7 @@ cache (`ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB=19456` and
 `ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE=1`), within unchanged memory limits.
 The 4B run retains a 16 GiB cache and disables that norm-weight cache.
 
-Qualification includes 268 default and 107 wide CUDA tests, both models' F32 vision
+Current qualification includes 269 default and 108 wide CUDA tests, both models' F32 vision
 checks at batches 1,1,2,3,8,16, and all 118 independent BF16 vision-block cases
 bit-for-bit, including 65,536 rows and batch 16. The head also matches independent
 IEEE F32 PyTorch logits in 12 real-checkpoint cases with exact token choices and
@@ -80,17 +87,23 @@ an unchanged 2e-4 winning-score limit. Readonly inputs, canaries, suppression,
 ties, alignment and alias checks remain enforced. The largest vision cases keep
 the original 60 GiB memory guard; the harness releases only unused test memory and
 its immutable input file-cache pages before checking it. Metal-enabled compilation
-and 9 CPU ownership/bounds checks pass; no new Metal GPU qualification is claimed.
+and 13 CPU ownership/bounds/readback checks pass; no new Metal GPU qualification is claimed. The 4B head descriptor also passes all
+128 actual batch sizes with and without suppression: 256 independent full-logit
+checks, exact tokens, readonly inputs and canaries, with maximum error 5.61e-6
+against the unchanged 2e-4 limit. All four existing upload rollback combinations,
+denied host admission, event reuse and synchronous-download rollback pass.
 
 The [compact manifest](followup-1331.json) records the 79 frozen runtime inputs,
-binary, checkpoint/fixture/report hashes, generator versions, exact controls and
-content-addressed evidence location. The 27.7 MB evidence bundle contains only the
-selected runtime source/binary, synthetic reports/settings and independent checks.
+binary, checkpoint/fixture/report hashes, generator versions and content-addressed
+evidence locations. The 26.5 MB current qualification bundle contains only selected
+runtime source/binary, synthetic correctness checks and ownership evidence. The
+separate `reproduction.performance_evidence` bundle retains the frozen767
+measurements and exact controls shown above.
 It remains on Glowworm and can be retrieved through the already authorized host:
 
 ```sh
-tailscale ssh glowworm 'cat ARTIFACT_PATH' > qualification767.tar.gz
-shasum -a 256 qualification767.tar.gz
+tailscale ssh glowworm 'cat ARTIFACT_PATH' > qualification838.tar.gz
+shasum -a 256 qualification838.tar.gz
 ```
 
 Replace `ARTIFACT_PATH` with `reproduction.evidence.remote_path` from the manifest

@@ -13464,6 +13464,25 @@ pub const NativeGenerationPipeline = struct {
         try waited;
     }
 
+    /// Mixed prefix/decode choices use the same independently owned token
+    /// bank and cancellation-safe pinned readback as multi-token decoding.
+    /// The scheduler retains all claimed pages until this forward publishes.
+    fn tryReadLightOnCudaPackedChoices(self: *NativeGenerationPipeline, logits: ops.CT, rows: usize) !?[]u32 {
+        if (comptime !build_options.enable_cuda) return null;
+        if (!self.gpu_token_burst_lighton_decode or self.execution_lock == null or self.lighton_cuda_execution_id == 0) return null;
+        const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+        const embedding = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(embedding);
+        var choices = (try C.beginLightOnTokenBurst(&self.cb, embedding, rows, 1, self.gpt_config.hidden_size, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds())) orelse return null;
+        defer choices.deinit();
+        try choices.argmax(logits, 0);
+        const output = try self.allocator.alloc(u32, rows);
+        errdefer self.allocator.free(output);
+        try self.readLightOnCudaBurst(&choices, output);
+        try self.cb.checkExecutionControl();
+        return output;
+    }
+
     fn readLightOnCudaBurst(self: *NativeGenerationPipeline, burst: anytype, output: []u32) !void {
         if (try burst.beginRead(output.len)) |queued| {
             var pending = queued;
@@ -13997,7 +14016,10 @@ pub const NativeGenerationPipeline = struct {
         if (cuda_packed and gpu_choices) {
             // Greedy prefix and decode rows share the existing suppressed
             // device argmax. Sampled prefixes retain admitted F32 logits.
-            const compact = try cb.argmaxRowsSuppress(logits, 0, head_rows.count, cfg.vocab_size, cfg.suppressTokenIds(), a) orelse return error.ResidentImageOperationUnavailable;
+            const compact = blk: {
+                if (host_rows == 0) if (try self.tryReadLightOnCudaPackedChoices(logits, head_rows.count)) |choices| break :blk choices;
+                break :blk try cb.argmaxRowsSuppress(logits, 0, head_rows.count, cfg.vocab_size, cfg.suppressTokenIds(), a) orelse return error.ResidentImageOperationUnavailable;
+            };
             if (head_rows.count == claimed.len) {
                 tokens = compact;
                 if (compact.len != claimed.len) return error.InvalidBatchDecodeState;
