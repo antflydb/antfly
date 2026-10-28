@@ -215,3 +215,58 @@ using stable partition ownership, explicit fan-out limits, per-shard accepted
 watermarks and a defined merge snapshot. Adding independent writers to one WAL
 HEAD or treating per-shard tokens as one global transaction is not a sharding
 protocol.
+
+## Qualified shared-runtime checkpoint
+
+Production source `d226557d07` passes 322 Node tests, 31 actual-workerd cases,
+610 native serverless tests (seven skips), seven focused multiprovider contracts
+(one live-provider skip) and 158 standalone object-store tests (two live-provider
+skips), with no native leaks. The exact final full WASM SHA-256 is
+`afdf4e9bd1a1ea9ecc8738ce4fa8724f5a28655fcc5a7fd152e452d54def865d`.
+The passing workerd log still contains a recovered local platform
+`SQLITE_NOMEM`; it does not establish that platform memory pressure is solved.
+
+The committed-source standard-GCS run passes transport conflicts, bootstrap,
+publication, lost-acknowledgement recovery, complete reopen, a second publication,
+native pruning and retained original receipt replay. Its private disposable
+bucket and test objects were deleted and absence verified. This is a small
+correctness fixture, not a larger-workload or colocated GCS latency result.
+
+The final 50,000-document file-backed fixture completes all nine stages,
+including cold text/vector/sparse queries, updates, deletion and compaction.
+It peaks at 869 object operations, 28,826,922 transferred bytes, 11,788,282 native
+working bytes and 27,590,656 linear-memory bytes per measured stage/call bounds.
+The local fixture writes 21,526,325,594 bytes to its temporary append-only backing
+file and removes that file afterward. A separate 50,000-row metadata test passes
+three collection cycles, reopen, hot-root and non-mutating observer checks;
+peak operations are 115 and peak WASM linear memory is 8 MiB.
+
+Both final frozen ANN populations pass matched recall/GET/byte comparisons at
+8, 32 and all probes. Synthetic recall is 0.45/0.86/1.0; model-embedding recall
+is 1.0 at every budget. Exact execution reduces mean GETs from 170.7 to 140.3
+for synthetic data and 40.9 to 39.4 for model embeddings. These comparisons also
+include earlier shared layout work; they do not isolate the new provider adapter
+as the cause. All compared mean transferred bytes are no greater than control.
+
+The affinity ablation uses the same final modules and four tenants. Delayed
+runs use 512 documents/tenant, 192 reads and 64 writes with fixed 20/100 ms
+binding delays; zero-delay runs use 64 documents/tenant, 96 reads and 32 writes.
+Values below are read/write p95 milliseconds:
+
+| Control combination | First order | Reverse order | Zero injected delay |
+| --- | ---: | ---: | ---: |
+| Derived overlays, foreground cache, opportunistic preparation | 909 / 1,167 | 563 / 1,156 | 184 / 184 |
+| Also idle-host affinity | 845 / 1,167 | 653 / 1,151 | 200 / 200 |
+| Also affinity and WAL document index | 971 / 1,256 | 772 / 1,251 | 395 / 387 |
+
+Affinity is not consistently faster and indexing costs more in this small-tail
+population. Keep both off for the smoke candidate; retain independent controls
+for other workloads. Read p50 also varies with order. Do not choose only the
+favorable run or infer a cloud SLO from these local populations. Fresh proof
+I/O and kernel queueing remain substantial spans in the slow requests, motivating
+bounded overlap of proof acquisition with execution admission.
+
+Reports, exact role bundles/bindings and failed/intermediate runs remain local
+under `examples/cloudflare-serverless/dist/qualification/multiprovider-lab/`.
+All 1,592 previously sealed artifacts remain hash-valid. No Cloudflare resources
+were created for this checkpoint; its prepared smoke pair has no gate result.
