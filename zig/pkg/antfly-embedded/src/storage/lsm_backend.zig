@@ -69,6 +69,12 @@ const CounterU64 = platform.atomic.Value(u64);
 // mutable memory can be higher because arenas retain overwritten values and
 // hash tables reserve capacity, so enforce a separate bounded safety limit.
 const mutable_memory_guard_multiplier: u64 = 2;
+/// Fixed capture bound shared by normal and retained immutable flushes.
+pub const max_immutable_flush_inputs: usize = 64;
+/// A dispatch yields to the executor between bursts, even under new arrivals.
+pub const max_background_maintenance_steps: usize = 8;
+const background_maintenance_burst_ns: u64 = 2 * std.time.ns_per_ms;
+const work_budget = @import("lsm_backend/work_budget.zig");
 const wal_retention_enforce_interval_ns: u64 = 250 * std.time.ns_per_ms;
 const wal_checkpoint_retry_initial_ns: u64 = 250 * std.time.ns_per_ms;
 const wal_checkpoint_retry_max_ns: u64 = 30 * std.time.ns_per_s;
@@ -317,7 +323,9 @@ pub const Options = struct {
     // its count. A count-only limit permits several memory-guard-sized
     // generations to accumulate when background flush falls behind.
     max_deferred_immutable_bytes: u64 = 0,
-    background_maintenance_max_steps: usize = 64,
+    /// Per-dispatch ceiling; the executor also caps bursts at eight steps and
+    /// checks its work budget between legacy physical operations.
+    background_maintenance_max_steps: usize = max_background_maintenance_steps,
     manifest_publication_max_waiters: usize = 64,
     // Aggregate logical bytes held by admitted commits, including writers
     // waiting for SST/manifest durability. Admission precedes any WAL append.
@@ -329,6 +337,7 @@ pub const Options = struct {
     // The merge borrows the epoch arenas and does not build a second combined
     // memtable.
     immutable_flush_window_bytes: u64 = 0,
+    /// Normal capture clamps this preference to max_immutable_flush_inputs.
     immutable_flush_window_max_memtables: usize = 16,
     direct_bulk_ingest: bool = true,
     // Optional size-tiered L0 merge fan-in for sustained sorted publication.
@@ -1921,7 +1930,7 @@ pub const Backend = struct {
         const Builder = @import("lsm_backend/registered_flush_builder.zig");
         const Batch = @import("lsm_backend/registered_flush_outputs.zig").Owner;
         const Checkpoint = @import("lsm_backend/registered_manifest_checkpoint.zig").Owner;
-        pub const max_inputs = 64;
+        pub const max_inputs = max_immutable_flush_inputs;
         backend: ?*Backend = null,
         states: [max_inputs]*const State = undefined,
         ranges: [max_inputs]WalSegmentRange = undefined,
@@ -5971,9 +5980,17 @@ pub const Backend = struct {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        defer self.immutable_flush_job_in_flight = false;
+        var progressed = false;
+        defer {
+            self.immutable_flush_job_in_flight = false;
+            // One publication window per dispatch. A hot writer can refill
+            // the queue during the unlocked build; it must not extend this
+            // same executor job indefinitely. Successor admission is a new
+            // queue turn, still owned by the same backend's durable lane.
+            if (progressed and !self.closing.load(.acquire)) self.scheduleImmutableFlushJob();
+        }
         if (self.options.backend.read_only) return;
-        while (try self.flushImmutableMemtableWindow(false)) {}
+        progressed = try self.flushImmutableMemtableWindow(false);
         _ = self.refreshCachedMaintenanceHintLocked();
     }
 
@@ -6017,10 +6034,15 @@ pub const Backend = struct {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         errdefer self.clearMaintenanceJobInFlight(false);
 
-        const max_steps = @max(@as(usize, 1), self.options.background_maintenance_max_steps);
+        const max_steps = @min(max_background_maintenance_steps, @max(@as(usize, 1), self.options.background_maintenance_max_steps));
+        const deadline = work_budget.after(self.manifestCoordinationIo(), background_maintenance_burst_ns);
         var steps: usize = 0;
         var made_progress = false;
-        while (steps < max_steps and !self.closing.load(.acquire)) : (steps += 1) {
+        // The first legacy step may itself exceed the burst deadline. Check
+        // between steps and never interpret this as physical preemption.
+        while (steps < max_steps and !self.closing.load(.acquire) and
+            (steps == 0 or work_budget.before(deadline))) : (steps += 1)
+        {
             const progressed = try self.runMaintenanceStep();
             if (!progressed) break;
             made_progress = true;
@@ -6048,7 +6070,7 @@ pub const Backend = struct {
         if (active_count == 0) return 0;
         const target_bytes = self.options.immutable_flush_window_bytes;
         if (target_bytes == 0 or self.root_dir == null or self.storage == null) return 1;
-        const max_count = @max(@as(usize, 1), self.options.immutable_flush_window_max_memtables);
+        const max_count = @min(max_immutable_flush_inputs, @max(@as(usize, 1), self.options.immutable_flush_window_max_memtables));
         var logical_bytes: u64 = 0;
         var count: usize = 0;
         for (self.activeImmutableMemtables()[0..@min(active_count, max_count)]) |state| {
@@ -33613,5 +33635,329 @@ test "maintenance original lifetime rejects score and work waits while the backe
             _ = try backend.runMaintenanceStepWithLifetime(&fresh);
             try std.testing.expectError(cause, lifetime.checkpoint());
         }
+    }
+}
+
+// Deterministic executor ordering around actual storage/flush callbacks. This
+// fixture supplies queueing only; publication, reads and recovery are native.
+const DispatchTestLane = if (builtin.is_test) struct {
+    jobs: [128]background_runtime_mod.Job = undefined,
+    count: usize = 0,
+    reject_flush: bool = false,
+    fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+        return .{ .ptr = self, .vtable = &.{ .submit = submit, .drain_owner = drainOwner, .close_owner = drainOwner, .poll = poll } };
+    }
+    fn submit(raw: *anyopaque, job: background_runtime_mod.Job) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.reject_flush and job.class == .commit_durable) {
+            self.reject_flush = false;
+            return error.ResourceBudgetExceeded;
+        }
+        if (self.count == self.jobs.len) return error.OutOfMemory;
+        self.jobs[self.count] = job;
+        self.count += 1;
+    }
+    fn pop(self: *@This(), index: usize) background_runtime_mod.Job {
+        const job = self.jobs[index];
+        for (index + 1..self.count) |i| self.jobs[i - 1] = self.jobs[i];
+        self.count -= 1;
+        return job;
+    }
+    fn runNext(self: *@This()) !u64 {
+        const job = self.pop(0);
+        defer job.deinit(job.ptr);
+        try job.execute();
+        return job.owner_id;
+    }
+    fn drainOwner(raw: *anyopaque, owner_id: u64) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        while (true) {
+            const index = for (self.jobs[0..self.count], 0..) |job, i| {
+                if (job.owner_id == owner_id) break i;
+            } else return;
+            const job = self.pop(index);
+            job.execute() catch {};
+            job.deinit(job.ptr);
+        }
+    }
+    fn poll(_: *anyopaque, _: usize) !usize {
+        return 0;
+    }
+    fn drainAll(self: *@This()) !void {
+        var turns: usize = 0;
+        while (self.count != 0 and turns < 256) : (turns += 1) _ = try self.runNext();
+        try std.testing.expectEqual(@as(usize, 0), self.count);
+    }
+} else void;
+
+test "lsm backend bounded background flush yields between windows and preserves interleaved readers and reopen" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var lane: DispatchTestLane = .{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 611);
+    const root = "/bounded-background-flush";
+    {
+        var backend = try Backend.open(std.testing.allocator, root, .{
+            .storage = storage.storage(),
+            .background_executor = &executor,
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+            .max_deferred_immutable_memtables = 128,
+            .compact_threshold_runs = 1000,
+            .l0_soft_limit_runs = 1000,
+            .l0_hard_limit_runs = 2000,
+        });
+        defer backend.close();
+        for (0..8) |i| {
+            var value: [8]u8 = undefined;
+            var txn = try backend.beginWrite();
+            defer txn.abort();
+            try txn.put(.{}, "shared", try std.fmt.bufPrint(&value, "v{d}", .{i}));
+            try txn.commit();
+        }
+        try std.testing.expectEqual(@as(usize, 8), backend.activeImmutableMemtableCount());
+        var reader = try backend.beginRead();
+        var reading = true;
+        defer if (reading) reader.abort();
+        const Peer = struct {
+            fn run(raw: *anyopaque) !void {
+                const done: *bool = @ptrCast(@alignCast(raw));
+                done.* = true;
+            }
+            fn drop(_: *anyopaque) void {}
+        };
+        var peer_ran = false;
+        try lane.lane().submit(.{ .owner_id = 612, .class = .maintenance, .ptr = &peer_ran, .run = Peer.run, .deinit = Peer.drop });
+        try std.testing.expectEqual(@as(u64, 611), try lane.runNext());
+        // A pre-existing peer gets the next queue opportunity. New arrivals
+        // cannot extend the running flush into an unbounded drain loop.
+        try std.testing.expectEqual(@as(usize, 7), backend.activeImmutableMemtableCount());
+        try std.testing.expect(backend.immutable_flush_job_in_flight);
+        try std.testing.expectEqual(@as(u64, 612), try lane.runNext());
+        try std.testing.expect(peer_ran);
+        {
+            var txn = try backend.beginWrite();
+            defer txn.abort();
+            try txn.put(.{}, "shared", "after");
+            try txn.commit();
+        }
+        try std.testing.expectEqualStrings("v7", try reader.get(.{}, "shared"));
+        var fresh = try backend.beginRead();
+        defer fresh.abort();
+        try std.testing.expectEqualStrings("after", try fresh.get(.{}, "shared"));
+        reader.abort();
+        reading = false;
+        try lane.drainAll();
+        try std.testing.expect(!backend.immutable_flush_job_in_flight);
+        try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+        try std.testing.expectEqual(@as(u64, 9), backend.snapshotWriteStats().immutable_flushes);
+    }
+    var reopened = try Backend.open(std.testing.allocator, root, .{ .storage = storage.storage() });
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("after", try read.get(.{}, "shared"));
+}
+
+test "lsm backend bounded background flush retains debt on rejected continuation no progress and close" {
+    for ([_]enum { refused, no_progress, closing }{ .refused, .no_progress, .closing }) |scenario| {
+        var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        var lane: DispatchTestLane = .{};
+        const executor = BackgroundExecutor.initLane(lane.lane(), 621);
+        const root = "/bounded-background-flush-exits";
+        var backend = try Backend.open(std.testing.allocator, root, .{
+            .storage = storage.storage(),
+            .background_executor = &executor,
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+            .max_deferred_immutable_memtables = 128,
+            .compact_threshold_runs = 1000,
+            .l0_soft_limit_runs = 1000,
+            .l0_hard_limit_runs = 2000,
+        });
+        var open = true;
+        defer if (open) backend.close();
+        for (0..3) |i| {
+            var key: [8]u8 = undefined;
+            var txn = try backend.beginWrite();
+            defer txn.abort();
+            try txn.put(.{}, try std.fmt.bufPrint(&key, "k{d}", .{i}), "value");
+            try txn.commit();
+        }
+        var artificial_build = false;
+        defer if (artificial_build) {
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            backend.finishImmutableFlushBuildLocked();
+            runtime_mod.unlockBackend(Backend, &backend, locked);
+        };
+        switch (scenario) {
+            .refused => lane.reject_flush = true,
+            .no_progress => {
+                backend.immutable_flush_build_in_flight = true;
+                artificial_build = true;
+            },
+            .closing => backend.closing.store(true, .release),
+        }
+        _ = try lane.runNext();
+        try std.testing.expect(!backend.immutable_flush_job_in_flight);
+        const expected: usize = if (scenario == .no_progress) 3 else 2;
+        try std.testing.expectEqual(expected, backend.activeImmutableMemtableCount());
+        for (lane.jobs[0..lane.count]) |job| try std.testing.expect(job.class != .commit_durable);
+        if (scenario == .no_progress) {
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            backend.finishImmutableFlushBuildLocked();
+            runtime_mod.unlockBackend(Backend, &backend, locked);
+            artificial_build = false;
+        }
+        if (scenario != .closing) {
+            // A real subsequent commit re-arms denied/no-op work. There is no
+            // self-resubmitting loop while another build owns the inputs.
+            var txn = try backend.beginWrite();
+            defer txn.abort();
+            try txn.put(.{}, "retry", "accepted");
+            try txn.commit();
+            try lane.drainAll();
+            try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+        }
+        backend.close();
+        open = false;
+        try std.testing.expectEqual(@as(usize, 0), lane.count);
+        var reopened = try Backend.open(std.testing.allocator, root, .{ .storage = storage.storage() });
+        defer reopened.close();
+        var read = try reopened.beginRead();
+        defer read.abort();
+        for (0..3) |i| {
+            var key: [8]u8 = undefined;
+            try std.testing.expectEqualStrings("value", try read.get(.{}, try std.fmt.bufPrint(&key, "k{d}", .{i})));
+        }
+    }
+}
+
+test "lsm backend bounded background capture caps configured windows before normal publication" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var lane: DispatchTestLane = .{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 631);
+    var backend = try Backend.open(std.testing.allocator, "/bounded-background-capture", .{
+        .storage = storage.storage(),
+        .background_executor = &executor,
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 128,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = std.math.maxInt(usize),
+        .compact_threshold_runs = 1000,
+        .l0_soft_limit_runs = 1000,
+        .l0_hard_limit_runs = 2000,
+    });
+    defer backend.close();
+    for (0..max_immutable_flush_inputs + 1) |i| {
+        var key: [16]u8 = undefined;
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{}, try std.fmt.bufPrint(&key, "k{d}", .{i}), "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(max_immutable_flush_inputs, backend.immutableFlushWindowCount(false));
+    _ = try lane.runNext();
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(u64, max_immutable_flush_inputs), backend.snapshotWriteStats().immutable_flush_input_memtables);
+    // A trailing partial window remains WAL-backed and visible, not forced
+    // into a second publication by the continuation boundary.
+    try std.testing.expect(!backend.immutable_flush_job_in_flight);
+    try lane.drainAll();
+    var read = try backend.beginRead();
+    defer read.abort();
+    var last: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("value", try read.get(.{}, try std.fmt.bufPrint(&last, "k{d}", .{max_immutable_flush_inputs})));
+}
+
+test "lsm backend bounded background maintenance queues a peer before continuing physical cleanup debt" {
+    const reclaim = @import("lsm_backend/memtable_reclamation.zig");
+    const Hook = struct {
+        var calls: usize = 0;
+        fn slice(_: *anyopaque) void {
+            calls += 1;
+            // Make one accepted legacy physical step exceed the burst budget.
+            // Its cleanup must join, then the dispatcher must yield the queue.
+            std.testing.io.sleep(.fromMilliseconds(3), .awake) catch {};
+        }
+    };
+    var lane: DispatchTestLane = .{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 641);
+    var backend = Backend.init(std.testing.allocator, .{
+        .background_executor = &executor,
+        .background_maintenance_max_steps = std.math.maxInt(usize),
+    });
+    defer backend.close();
+    var source: ActiveMemTable = .{};
+    defer source.deinit(std.testing.allocator);
+    for (0..4096) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        try source.upsert(std.testing.allocator, .{}, &key, "value", false);
+    }
+    const state = try std.testing.allocator.create(State);
+    state.* = source.clone(std.testing.allocator) catch |cause| {
+        std.testing.allocator.destroy(state);
+        return cause;
+    };
+    state.freezeMemoryAccounting();
+    reclaim.retire(&backend, state);
+    backend.scheduleMaintenanceJobLocked(true);
+    const Peer = struct {
+        fn run(_: *anyopaque) !void {}
+        fn drop(_: *anyopaque) void {}
+    };
+    var peer: u8 = 0;
+    try lane.lane().submit(.{ .owner_id = 642, .class = .maintenance, .ptr = &peer, .run = Peer.run, .deinit = Peer.drop });
+    Hook.calls = 0;
+    reclaim.test_slice_hook = Hook.slice;
+    defer reclaim.test_slice_hook = null;
+    try std.testing.expectEqual(@as(u64, 641), try lane.runNext());
+    try std.testing.expect(Hook.calls > 0 and Hook.calls <= max_background_maintenance_steps + 1);
+    try std.testing.expect(reclaim.pending(&backend));
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expectEqual(@as(u64, 642), try lane.runNext());
+    reclaim.test_slice_hook = null;
+    try lane.drainAll();
+    try std.testing.expect(!reclaim.pending(&backend));
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+}
+
+test "lsm backend bounded background threaded owner joins accepted windows before runtime teardown" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const root = "/bounded-background-native-owner";
+    var handle = try BackendHandle.openWithConfig(std.testing.allocator, root, .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 128,
+        .compact_threshold_runs = 1000,
+        .l0_soft_limit_runs = 1000,
+        .l0_hard_limit_runs = 2000,
+    }, .{ .background_runtime = .{ .backend = .io_threaded } });
+    var open = true;
+    defer if (open) handle.close();
+    for (0..12) |i| {
+        var key: [8]u8 = undefined;
+        var txn = try handle.ptr().beginWrite();
+        defer txn.abort();
+        try txn.put(.{}, try std.fmt.bufPrint(&key, "k{d}", .{i}), "value");
+        try txn.commit();
+    }
+    // The actual durable lane owns accepted callbacks through close. Closing
+    // fences successors, joins physical work, persists the tail, then retires Io.
+    handle.close();
+    open = false;
+    var reopened = try Backend.open(std.testing.allocator, root, .{ .storage = storage.storage() });
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    for (0..12) |i| {
+        var key: [8]u8 = undefined;
+        try std.testing.expectEqualStrings("value", try read.get(.{}, try std.fmt.bufPrint(&key, "k{d}", .{i})));
     }
 }

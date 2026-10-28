@@ -29763,3 +29763,33 @@ Legacy engine-vtable callers still have coarser lifetime coverage. Legacy physic
 work/scoring, startup funding/migration and the quiesced retained flush controller
 still require concurrent, bounded production integration before CPU admission can
 be enabled. The maintenance integration milestone and full goal remain open.
+
+
+## Finite normal background dispatches (2026-10-27)
+
+Normal detached immutable-flush jobs now publish one eligible window and return
+to their existing durable executor. A successful job queues its successor behind
+already queued peers; continuous writes no longer extend the same callback into
+an unbounded window-drain loop. Submission refusal clears the in-flight claim
+and retains immutable/WAL debt for a later trigger. No-progress work does not
+immediately resubmit, and closing prevents successor admission while accepted
+work and final persistence still join. Partial batching windows remain intact.
+Normal capture clamps configurable windows to the same 64-input bound as the
+retained controller. Maintenance jobs cap each dispatch at eight legacy steps,
+checking a two-millisecond burst budget between steps; the default is eight.
+
+Focused coverage runs actual native flush, reader, publication, reclamation and
+reopen code over MemoryStorage using a deterministic queue fixture. It verifies
+peer interleaving, pinned/fresh reader correctness across a new write, continuation
+refusal/retry, no-progress/close behavior, large configured input caps and cleanup
+burst handoff. A separate real io_threaded BackendHandle test commits twelve
+generations, closes the owned runtime and reopens all values, exercising accepted
+callback joins through actual runtime teardown. Queue order remains fixture
+coverage. The test root explicitly enables the existing implementation suite
+so selected legacy scheduling, no-op and IO-budget cases actually execute.
+
+These are production dispatch boundaries, not physical preemption or a proof of
+native executor FIFO fairness. Work within one legacy flush/compaction step,
+independent funding/retirement and concurrent retained publication still need
+integration before maintenance can hold shared CPU admission. The same milestone
+and full goal remain open; full qualification remains waived.

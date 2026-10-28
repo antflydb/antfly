@@ -4770,6 +4770,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-storage-read-admission-test", "Require physical LSM and Lite original read admission and cursor cleanup")
         .dependOn(&storage_read_admission_run.step);
 
+    const background_dispatch_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/background_maintenance_dispatch_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, background_dispatch_root, true, true);
+    background_dispatch_root.addImport("antfly_source_root", background_dispatch_root);
+    const background_dispatch_tests = b.addTest(.{
+        .name = "background-maintenance-dispatch-tests",
+        .root_module = background_dispatch_root,
+        .filters = &.{
+            "lsm backend bounded background",
+            "lsm backend schedules deferred immutable flush on configured background executor",
+            "lsm backend background flush waits for and merges a complete immutable window",
+            "lsm backend detached no-op maintenance does not resubmit forever",
+            "lsm backend schedules detached maintenance job for compaction debt",
+            "lsm backend background io budget",
+        },
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const background_dispatch_run = b.addRunArtifact(background_dispatch_tests);
+    background_dispatch_run.addArg("--require-no-skips");
+    b.step("antfly-background-maintenance-dispatch-test", "Verify finite normal flush/maintenance dispatches, continuation ownership and interleaved reads")
+        .dependOn(&background_dispatch_run.step);
+
     const maintenance_lifetime_tests = b.addTest(.{
         .name = "maintenance-original-lifetime-tests",
         .root_module = storage_read_admission_root,

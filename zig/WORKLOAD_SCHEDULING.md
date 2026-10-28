@@ -1805,3 +1805,14 @@ holder and require the waiter to reject without that holder releasing. Fresh
 attempts can proceed after release; rejected scopes are not revived. Shared CPU
 activation remains withheld until normal retained flush/compaction can run in
 bounded slices with safe suspension and independently owned cleanup.
+
+
+### Finite default background dispatches (2026-10-27)
+
+Detached flushes now return after one eligible publication window and requeue
+only after progress. Normal capture is capped at 64 immutable inputs. Maintenance
+bursts default to at most eight legacy steps and check elapsed time between
+steps, giving other queued owners a dispatch opportunity. Refusal and shutdown
+preserve pending work and physical joins. Existing publication/durable formats
+remain unchanged. Work within each physical step is still legacy; bounded,
+concurrent retained execution remains required before CPU admission activation.
