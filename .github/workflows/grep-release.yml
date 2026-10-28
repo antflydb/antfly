@@ -1,0 +1,193 @@
+name: Grep release
+
+# GitHub loads this controller from the default branch, never from a grep tag.
+on:
+  workflow_run:
+    workflows: ["Grep release request"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+jobs:
+  resolve:
+    name: Validate independent grep release
+    timeout-minutes: 10
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.identity.outputs.matrix }}
+      version: ${{ steps.identity.outputs.version }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+      source_date_epoch: ${{ steps.identity.outputs.source_date_epoch }}
+      zig_version: ${{ steps.toolchain.outputs.zig_version }}
+      python_build: ${{ steps.toolchain.outputs.python_build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/load-toolchain-policy
+        id: toolchain
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: grep-tag-request
+          path: dist/grep-tag-request
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate tag event, namespace and main ancestry
+        id: identity
+        run: |
+          python3 scripts/release/grep_release.py resolve \
+            --request dist/grep-tag-request/request.json \
+            --identity dist/grep-identity/grep-release-identity.json \
+            --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: grep-release-identity
+          path: dist/grep-identity/grep-release-identity.json
+          if-no-files-found: error
+
+  build:
+    name: Standalone grep (${{ matrix.id }})
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache/global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache
+      VERSION: ${{ needs.resolve.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+      SOURCE_DATE_EPOCH: ${{ needs.resolve.outputs.source_date_epoch }}
+      TARGET: ${{ matrix.target }}
+      ARCHIVE_SUFFIX: ${{ matrix.suffix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.source_commit }}
+          persist-credentials: false
+      - name: Check out pinned grep release tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .grep-controller
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+            scripts/packaging/package_grep_release.py
+            scripts/packaging/create_reproducible_tar.py
+            scripts/release/grep_release.py
+            scripts/release/release_channels.py
+          sparse-checkout-cone-mode: false
+      - name: Install Linux archive tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xz-utils
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ needs.resolve.outputs.python_build }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ needs.resolve.outputs.zig_version }}
+          use-cache: false
+      - name: Prepare verified grep build dependencies
+        uses: ./.grep-controller/.github/actions/prepare-zig-dependencies
+        with:
+          mirror-only: 'true'
+      - name: Build independently versioned grep
+        run: |
+          zig build --build-file zig/build.zig -Dgrep-only=true \
+            -Doptimize=fast -Dstrip=true -Dtarget="$TARGET" \
+            -Dgrep-version="$VERSION" --prefix "$GITHUB_WORKSPACE/zig/zig-out" grep
+      - name: Package standalone grep archive
+        run: |
+          python3 .grep-controller/scripts/packaging/package_grep_release.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --binary zig/zig-out/bin/antfly-grep \
+            --version "$VERSION" --target "$TARGET" --commit "$SOURCE_COMMIT" \
+            --mtime "$SOURCE_DATE_EPOCH" \
+            --output "dist/grep/antfly-grep_${VERSION}_${ARCHIVE_SUFFIX}.tar.gz"
+      - name: Install and run the exact release archive
+        run: |
+          python3 .grep-controller/scripts/release/grep_release.py smoke \
+            --archive "dist/grep/antfly-grep_${VERSION}_${ARCHIVE_SUFFIX}.tar.gz" \
+            --version "$VERSION" --target "$TARGET" --commit "$SOURCE_COMMIT" \
+            --work zig/.zig-cache/release-smoke
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: grep-archive-${{ matrix.id }}
+          path: dist/grep/*.tar.gz
+          if-no-files-found: error
+
+  seal:
+    name: Verify complete grep release payload
+    timeout-minutes: 20
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ needs.resolve.outputs.python_build }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: grep-release-identity
+          path: dist/grep-release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: grep-archive-*
+          merge-multiple: true
+          path: dist/grep-release
+      - name: Bind every platform archive to the source and build
+        run: python3 scripts/release/grep_release.py seal --directory dist/grep-release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: grep-release-bundle
+          path: dist/grep-release/
+          if-no-files-found: error
+
+  publish:
+    name: Publish independent grep release
+    timeout-minutes: 30
+    needs: [resolve, seal]
+    runs-on: ubuntu-latest
+    environment: release-promotion
+    permissions:
+      contents: write
+    concurrency:
+      group: grep-release-publication
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ needs.resolve.outputs.python_build }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: grep-release-bundle
+          path: dist/grep-release
+      - name: Create or verify immutable grep release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/release/grep_release.py publish --directory dist/grep-release
