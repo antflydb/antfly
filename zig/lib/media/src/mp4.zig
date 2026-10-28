@@ -28,8 +28,11 @@ pub const Limits = struct {
     max_tracks: usize = 64,
     max_packet_bytes: u32 = 16 * 1024 * 1024,
     max_dimension: u32 = 16_384,
+    /// Consumers opt into codecs whose decoding route they support. Preserve
+    /// the portable AVC/MJPEG envelope for existing readers.
+    codecs: std.EnumSet(Codec) = std.EnumSet(Codec).initMany(&.{ .avc, .mjpeg }),
 };
-pub const Codec = enum { avc, mjpeg };
+pub const Codec = enum { avc, mjpeg, hevc, av1 };
 pub const Track = struct {
     codec: Codec = .avc,
     inband_parameter_sets: bool = false,
@@ -39,6 +42,8 @@ pub const Track = struct {
     height: u16,
     /// AVC-only, borrowed from retained metadata; empty for complete MJPEG samples.
     avcc: []const u8,
+    /// HEVC hvcC or AV1 av1C, borrowed from retained metadata.
+    codec_config: []const u8 = &.{},
     nal_length_bytes: u3,
     pixel_aspect: struct { horizontal: u32 = 1, vertical: u32 = 1 } = .{},
     /// Raw colr payload; downstream preparation must qualify its color policy.
@@ -368,8 +373,9 @@ const Parser = struct {
         var cursor: usize = 8;
         for (0..count) |_| {
             const b = try self.box(bytes, cursor);
-            if (b.typ == tag("avc1") or b.typ == tag("avc3") or b.typ == tag("jpeg")) {
-                const codec: Codec = if (b.typ != tag("jpeg")) .avc else .mjpeg;
+            const known: ?Codec = if (b.typ == tag("avc1") or b.typ == tag("avc3")) .avc else if (b.typ == tag("jpeg")) .mjpeg else if (b.typ == tag("hvc1") or b.typ == tag("hev1")) .hevc else if (b.typ == tag("av01")) .av1 else null;
+            if (known) |codec| supported: {
+                if (!self.limits.codecs.contains(codec)) break :supported;
                 if (count != 1) return error.UnsupportedSampleDescription;
                 if (b.payload.len < 78) return error.MalformedMedia;
                 const width = u16be(b.payload[24..26]);
@@ -380,15 +386,21 @@ const Parser = struct {
                 if (u16be(b.payload[6..8]) != 1) return error.UnsupportedDataReference;
                 if (codec == .mjpeg and (u16be(b.payload[8..10]) != 0 or u16be(b.payload[40..42]) != 1)) return error.UnsupportedSampleDescription;
                 var child: usize = 78;
-                var avcc: ?[]const u8 = null;
+                var configuration: ?[]const u8 = null;
                 var color: []const u8 = &.{};
                 var horizontal: u32 = 1;
                 var vertical: u32 = 1;
                 while (child < b.payload.len) {
                     const c = try self.box(b.payload, child);
-                    if (c.typ == tag("avcC")) {
-                        if (avcc != null) return error.MalformedMedia;
-                        avcc = c.payload;
+                    if (c.typ == tag("avcC") or c.typ == tag("hvcC") or c.typ == tag("av1C")) {
+                        const expected = switch (codec) {
+                            .avc => tag("avcC"),
+                            .hevc => tag("hvcC"),
+                            .av1 => tag("av1C"),
+                            .mjpeg => return error.MalformedMedia,
+                        };
+                        if (c.typ != expected or configuration != null) return error.MalformedMedia;
+                        configuration = c.payload;
                     }
                     if (codec == .mjpeg and c.typ == tag("fiel") and (c.payload.len != 2 or c.payload[0] != 1)) return error.UnsupportedInterlacedVideo;
                     if (c.typ == tag("sinf")) return error.UnsupportedEncryptedMedia;
@@ -404,19 +416,178 @@ const Parser = struct {
                 }
                 var config: []const u8 = &.{};
                 var nal_len: u3 = 0;
-                if (codec == .avc) {
-                    config = avcc orelse return error.MalformedMedia;
-                    try validateAvcc(config);
-                    nal_len = @as(u3, @intCast(config[4] & 3)) + 1;
-                    if (nal_len == 3) return error.MalformedMedia;
-                } else if (avcc != null) return error.MalformedMedia;
-                t.track = .{ .inband_parameter_sets = b.typ == tag("avc3"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = config, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .color_info = color, .display_matrix = @splat(0) };
+                switch (codec) {
+                    .avc => {
+                        config = configuration orelse return error.MalformedMedia;
+                        try validateAvcc(config);
+                        nal_len = @as(u3, @intCast(config[4] & 3)) + 1;
+                    },
+                    .hevc => {
+                        config = configuration orelse return error.MalformedMedia;
+                        try validateHvcc(config);
+                        nal_len = @as(u3, @intCast(config[21] & 3)) + 1;
+                    },
+                    .av1 => {
+                        config = configuration orelse return error.MalformedMedia;
+                        try validateAv1c(config);
+                    },
+                    .mjpeg => {},
+                }
+                if (nal_len == 3) return error.MalformedMedia;
+                t.track = .{ .inband_parameter_sets = b.typ == tag("avc3") or b.typ == tag("hev1"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = if (codec == .avc) config else &.{}, .codec_config = if (codec == .hevc or codec == .av1) config else &.{}, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .color_info = color, .display_matrix = @splat(0) };
             }
             cursor = b.end;
         }
         if (cursor != bytes.len) return error.MalformedMedia;
     }
 };
+
+fn validateHvcc(config: []const u8) !void {
+    if (config.len < 23 or config[0] != 1) return error.MalformedMedia;
+    var cursor: usize = 23;
+    var parameter_sets: u3 = 0;
+    var arrays: u64 = 0;
+    for (0..config[22]) |_| {
+        if (config.len - cursor < 3 or config[cursor] & 0x40 != 0) return error.MalformedMedia;
+        const kind = config[cursor] & 0x3f;
+        // Decoder configuration carries parameter sets and SEI, never VCL
+        // pictures. Bound setup work independently of the metadata byte cap.
+        const ceiling: u16 = switch (kind) {
+            32, 33 => 16,
+            34 => 64,
+            39, 40 => 256,
+            else => return error.UnsupportedVideoCodec,
+        };
+        const flag = @as(u64, 1) << @as(u6, @intCast(kind));
+        if (arrays & flag != 0) return error.MalformedMedia;
+        arrays |= flag;
+        const count = u16be(config[cursor + 1 ..][0..2]);
+        if (count > ceiling) return error.ResourceLimitExceeded;
+        cursor += 3;
+        for (0..count) |_| {
+            const start = cursor + 2;
+            try configNal(config, &cursor);
+            if (cursor - start < 2 or config[start] & 0x80 != 0 or (config[start] >> 1) & 0x3f != kind or config[start + 1] & 7 == 0) return error.MalformedMedia;
+            if (kind >= 32 and kind <= 34) parameter_sets |= @as(u3, 1) << @as(u2, @intCast(kind - 32));
+        }
+    }
+    if (cursor != config.len or parameter_sets != 7) return error.MalformedMedia;
+}
+
+fn validateAv1c(config: []const u8) !void {
+    if (config.len < 4 or config[0] != 0x81 or config[1] >> 5 > 2 or config[3] & 0xe0 != 0 or (config[3] & 0x10 == 0 and config[3] & 0x0f != 0)) return error.MalformedMedia;
+    // av1-isobmff: config OBUs use low-overhead framing with explicit sizes;
+    // a sequence header, when present, is unique and first. Never feed coded
+    // pictures from configuration before the container's timed samples.
+    var cursor: usize = 4;
+    var sequence_seen = false;
+    while (cursor < config.len) {
+        const first = cursor;
+        const header = config[cursor];
+        cursor += 1;
+        if (header & 0x81 != 0 or header & 2 == 0) return error.MalformedMedia;
+        const kind = (header >> 3) & 15;
+        if (kind == 1) {
+            if (sequence_seen or first != 4) return error.MalformedMedia;
+            sequence_seen = true;
+        } else if (kind != 5 and kind != 15) return error.UnsupportedVideoCodec;
+        if (header & 4 != 0) {
+            if (cursor == config.len or config[cursor] & 7 != 0) return error.MalformedMedia;
+            cursor += 1;
+        }
+        var size: u64 = 0;
+        var ended = false;
+        for (0..8) |index| {
+            if (cursor == config.len) return error.MalformedMedia;
+            const byte = config[cursor];
+            cursor += 1;
+            size |= @as(u64, byte & 127) << @as(u6, @intCast(index * 7));
+            if (byte & 128 == 0) {
+                ended = true;
+                break;
+            }
+        }
+        if (!ended or size > config.len - cursor or (kind == 1 and size == 0)) return error.MalformedMedia;
+        cursor += @intCast(size);
+    }
+}
+
+test "mp4 HEVC configuration bounds parameter arrays and rejects truncated NALs" {
+    var config: [44]u8 = @splat(0);
+    config[0] = 1;
+    config[21] = 3;
+    config[22] = 3;
+    for (0..3) |index| {
+        const cursor = 23 + index * 7;
+        const kind: u8 = @intCast(32 + index);
+        config[cursor] = 0x80 | kind;
+        config[cursor + 2] = 1;
+        config[cursor + 4] = 2;
+        config[cursor + 5] = kind << 1;
+        config[cursor + 6] = 1;
+    }
+    try validateHvcc(&config);
+    for (0..config.len) |len| try std.testing.expectError(error.MalformedMedia, validateHvcc(config[0..len]));
+    var bad = config;
+    bad[23] = 0x80 | 33;
+    try std.testing.expectError(error.MalformedMedia, validateHvcc(&bad));
+    bad = config;
+    bad[25] = 17;
+    try std.testing.expectError(error.ResourceLimitExceeded, validateHvcc(&bad));
+    bad = config;
+    bad[29] = 0;
+    try std.testing.expectError(error.MalformedMedia, validateHvcc(&bad));
+}
+
+test "mp4 AV1 configuration bounds OBUs and excludes untimed frame payloads" {
+    try validateAv1c(&.{ 0x81, 0, 0x0c, 0 });
+    const config = [_]u8{ 0x81, 0, 0x0c, 0, 0x0a, 1, 0x80 };
+    try validateAv1c(&config);
+    for (0..4) |len| try std.testing.expectError(error.MalformedMedia, validateAv1c(config[0..len]));
+    for (5..config.len) |len| try std.testing.expectError(error.MalformedMedia, validateAv1c(config[0..len]));
+    try std.testing.expectError(error.MalformedMedia, validateAv1c(&.{ 0x81, 0, 0x0c, 0, 0x0a, 0x80 }));
+    try std.testing.expectError(error.UnsupportedVideoCodec, validateAv1c(&.{ 0x81, 0, 0x0c, 0, 0x32, 1, 0x80 }));
+    try std.testing.expectError(error.MalformedMedia, validateAv1c(&.{ 0x81, 0, 0x0c, 0, 0x0a, 1, 0x80, 0x0a, 1, 0x80 }));
+}
+
+test "mp4 HEVC and AV1 sample descriptions require explicit consumer codec support" {
+    inline for (.{ "hvc1", "hev1", "av01" }) |kind| {
+        var bytes: [146]u8 = @splat(0);
+        bytes[7] = 1;
+        @memcpy(bytes[12..16], kind);
+        bytes[23] = 1;
+        bytes[41] = 192;
+        bytes[43] = 192;
+        const hevc = !std.mem.eql(u8, kind, "av01");
+        const size: usize = if (hevc) 146 else 106;
+        std.mem.writeInt(u32, bytes[8..12], @intCast(size - 8), .big);
+        std.mem.writeInt(u32, bytes[94..98], @intCast(size - 94), .big);
+        @memcpy(bytes[98..102], if (hevc) "hvcC" else "av1C");
+        if (hevc) {
+            bytes[102] = 1;
+            bytes[123] = 3;
+            bytes[124] = 3;
+            for (0..3) |index| {
+                const cursor = 125 + index * 7;
+                bytes[cursor] = @intCast(32 + index);
+                bytes[cursor + 2] = 1;
+                bytes[cursor + 4] = 2;
+                bytes[cursor + 5] = @as(u8, @intCast(32 + index)) << 1;
+                bytes[cursor + 6] = 1;
+            }
+        } else @memcpy(bytes[102..106], &[_]u8{ 0x81, 0, 0x0c, 0 });
+        var parser = Parser{ .limits = .{}, .control = .{} };
+        var tables = Tables{};
+        try parser.description(bytes[0..size], &tables);
+        try std.testing.expect(tables.track == null);
+        parser.limits.codecs = std.EnumSet(Codec).initMany(&.{ .hevc, .av1 });
+        tables = .{};
+        try parser.description(bytes[0..size], &tables);
+        try std.testing.expectEqual(if (hevc) Codec.hevc else Codec.av1, tables.track.?.codec);
+        try std.testing.expectEqualStrings(bytes[102..size], tables.track.?.codec_config);
+        try std.testing.expectEqual(@as(u3, if (hevc) 4 else 0), tables.track.?.nal_length_bytes);
+    }
+}
 
 fn validateAvcc(config: []const u8) !void {
     if (config.len < 7 or config[0] != 1) return error.MalformedMedia;
