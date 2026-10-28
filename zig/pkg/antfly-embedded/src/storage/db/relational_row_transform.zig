@@ -241,8 +241,17 @@ pub const Program = struct {
             ordinal.* = if (old) |index| @intCast(index) else null;
             if (old) |index| {
                 const previous = from[index];
-                if (previous.column_type != column.column_type or previous.is_json != column.is_json or previous.json_kind != column.json_kind or previous.sql_element_type != column.sql_element_type)
+                if (previous.column_type != column.column_type or previous.is_json != column.is_json or previous.json_kind != column.json_kind or previous.sql_element_type != column.sql_element_type or previous.named_type_id != column.named_type_id)
                     return error.RelationalRewriteTypeChange;
+                if (column.named_type_id) |id| {
+                    const left = schema.namedType(source.tableSchema().*, id) orelse return error.RelationalRewriteTypeChange;
+                    const right = schema.namedType(target.tableSchema().*, id) orelse return error.RelationalRewriteTypeChange;
+                    if (!std.mem.eql(u8, &left.identity.origin_id, &right.identity.origin_id)) return error.RelationalRewriteTypeChange;
+                    for (left.definition.labels) |label| {
+                        const candidate = right.definition.byId(label.id) catch return error.RelationalRewriteTypeChange;
+                        if (!std.mem.eql(u8, label.text, candidate.text) or !std.mem.eql(u8, label.order_key, candidate.order_key)) return error.RelationalRewriteTypeChange;
+                    }
+                }
             }
         }
         if (policies.dropped_columns == .reject) for (from) |column| {
@@ -490,15 +499,22 @@ fn scalarCell(execution: *expressions.Execution, table: schema.TableSchema, colu
     if (value == .sql_array and (column.column_type != .sql_array or value.sql_array.element_type != column.sql_element_type)) return error.InvalidRelationalExpressionInput;
     const value_type: @import("../../section/typed_doc_values.zig").ValueType = switch (column.column_type) {
         .string, .blob, .numeric, .sql_array, .json, .numrange, .daterange, .tsrange, .tstzrange => .bytes_val,
-        .integer => .i64_val,
+        .integer, .enumeration => .i64_val,
         .number => .f64_val,
         .boolean => .bool_val,
         .datetime => .u64_val,
         else => return error.InvalidRelationalExpressionInput,
     };
+    const enum_record = if (column.named_type_id) |id| schema.namedType(table, id) orelse return error.InvalidRelationalExpressionInput else null;
+    if (value == .enumeration) {
+        const record = enum_record orelse return error.InvalidRelationalExpressionInput;
+        if (value.enumeration.type_id != record.identity.id or !std.mem.eql(u8, &value.enumeration.origin_id, &record.identity.origin_id)) return error.InvalidRelationalExpressionInput;
+        _ = try record.definition.byId(value.enumeration.symbol);
+    }
     return .{
         .ordinal = ordinal,
         .path = column.path,
+        .enum_record = enum_record,
         .value_type = value_type,
         .is_json = column.is_json,
         .is_numeric = column.column_type == .numeric,
@@ -517,6 +533,7 @@ fn scalarCell(execution: *expressions.Execution, table: schema.TableSchema, colu
                 _ = std.base64.standard.Encoder.encode(encoded, bytes);
                 break :blk .{ .bytes_val = encoded };
             },
+            .enumeration => |atom| .{ .i64_val = atom.symbol },
             .integer => |integer| .{ .i64_val = integer },
             .number => |number| .{ .f64_val = number },
             .boolean => |boolean| .{ .bool_val = boolean },
@@ -597,4 +614,29 @@ test "relational index system array rewrite results retain canonical bytes and r
     try std.testing.expectError(error.InvalidRelationalExpressionInput, scalarCell(&execution, .{}, wrong, 0, value));
     const nullable = try scalarCell(&execution, .{}, column, 0, .null);
     try std.testing.expect(nullable.is_null);
+}
+
+test "relational index system SQL USING rewrite enum transform cells retain identity without widening values or accepting integers" {
+    const a = std.testing.allocator;
+    const types = @import("../../system_catalog/named_types.zig");
+    var labels = try types.Owned.create(a, &.{ "z", "a" });
+    defer labels.deinit();
+    const record: types.Record = .{ .identity = try types.Identity.init(7, 2, 1, @splat(3)), .definition = labels.definition, .owner = .auth_disabled };
+    const column: schema.RelationalColumn = .{ .name = "state", .path = "state", .column_type = .enumeration, .named_type_id = 7, .allows_null = true };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &.{column}, .named_types = &.{record} };
+    var view = try @import("../../common/sql_enum_value.zig").View.init(a, record);
+    defer view.deinit(a);
+    var bytes: usize = expressions.max_allocated_bytes;
+    var execution = expressions.Execution.init(.failing, &bytes);
+    const atom = try view.input("a");
+    const cell = try scalarCell(&execution, table, column, 0, .{ .enumeration = atom });
+    try std.testing.expectEqual(@as(i64, 2), cell.value.i64_val);
+    try std.testing.expect(cell.enum_record != null);
+    try std.testing.expectEqual(expressions.max_allocated_bytes, bytes);
+    const sql_null = try scalarCell(&execution, table, column, 0, .null);
+    try std.testing.expect(sql_null.is_null and sql_null.enum_record != null);
+    try std.testing.expectError(error.InvalidRelationalExpressionInput, scalarCell(&execution, table, column, 0, .{ .integer = 2 }));
+    var impostor = atom.*;
+    impostor.origin_id = @splat(4);
+    try std.testing.expectError(error.InvalidRelationalExpressionInput, scalarCell(&execution, table, column, 0, .{ .enumeration = &impostor }));
 }

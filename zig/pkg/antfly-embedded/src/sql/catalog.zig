@@ -25,6 +25,7 @@ pub const named_types = @import("../system_catalog/named_types.zig");
 test {
     _ = named_types;
     _ = enum_values;
+    _ = @import("../storage/db/relational_enum_test.zig");
 }
 
 pub const cloneDocumentPath = @import("document_path.zig").clone;

@@ -23,6 +23,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const named_types = @import("../system_catalog/named_types.zig");
+const max_named_type_bytes = 16 * 1024 * 1024;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
 const docstore = @import("docstore.zig");
@@ -241,6 +243,8 @@ pub const RelationalColumnType = enum(u8) {
     daterange = 13,
     tsrange = 14,
     tstzrange = 15,
+    /// Four-byte immutable symbol ID; definition belongs to the schema epoch.
+    enumeration = 16,
 };
 
 pub const RelationalJsonKind = enum(u8) {
@@ -262,6 +266,7 @@ pub const RelationalColumn = struct {
     /// Null means no SQL declaration; never infer a width from stored values.
     sql_element_type: ?@import("../common/sql_builtin_type.zig").Type = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
+    named_type_id: ?u64 = null,
 };
 
 pub const IndexSortField = struct {
@@ -337,6 +342,8 @@ pub const TableSchema = struct {
     declared_fields: []const DeclaredField = &.{},
     full_text_documents: []const FullTextDocument = &.{},
     relational_columns: []const RelationalColumn = &.{},
+    /// Deduplicated immutable definitions sorted by local catalog ID.
+    named_types: []const named_types.Record = &.{},
     index_sort: []const IndexSortField = &.{},
 };
 
@@ -447,6 +454,7 @@ test "relational index system schema reader capabilities distinguish semantics f
 /// before treating its requirements as authority.
 pub fn requiredReaderVersion(schema: TableSchema) u32 {
     var version: u32 = 11;
+    if (schema.named_types.len != 0) version = 39;
     if (schema.declared_fields.len != 0 or schema.exact_fields.len != 0) version = 12;
     if (schema.storage_mode != .document or schema.requires_public_schema or schema.relational_columns.len != 0) version = 13;
     for (schema.full_text_documents) |document| {
@@ -483,6 +491,7 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         if (column.column_type == .sql_array) version = @max(version, 17);
         if (column.column_type == .numeric or column.sql_element_type == .numeric) version = @max(version, 20);
         if (column.numeric_modifier != null) version = @max(version, 23);
+        if (column.named_type_id != null or column.column_type == .enumeration) version = @max(version, 39);
         if (column.column_type == .sql_array and column.sql_element_type == .jsonb) version = @max(version, 31);
     }
     return version;
@@ -921,6 +930,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
                     try buf.appendSlice(alloc, &bytes);
                 }
             }
+            if (format_version >= 39) try appendU64(&buf, alloc, column.named_type_id orelse 0);
         }
     }
 
@@ -953,6 +963,16 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 36) try buf.append(alloc, @intFromBool(schema.requires_temporal_keys));
     if (format_version >= 37) try buf.append(alloc, @intFromBool(schema.requires_sequence_defaults));
     if (format_version >= 38) try buf.append(alloc, @intFromBool(schema.requires_document_expressions));
+    if (format_version >= 39) {
+        try appendU32(&buf, alloc, @intCast(schema.named_types.len));
+        const registry_start = buf.items.len;
+        for (schema.named_types) |record| {
+            const bytes = try record.encode(alloc);
+            defer alloc.free(bytes);
+            if (buf.items.len - registry_start +| bytes.len +| 4 > max_named_type_bytes) return error.InvalidSchema;
+            try appendStr(&buf, alloc, bytes);
+        }
+    }
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1285,6 +1305,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                 13 => if (fmt_version >= 35) .daterange else return error.UnsupportedVersion,
                 14 => if (fmt_version >= 35) .tsrange else return error.UnsupportedVersion,
                 15 => if (fmt_version >= 35) .tstzrange else return error.UnsupportedVersion,
+                16 => if (fmt_version >= 39) .enumeration else return error.UnsupportedVersion,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -1318,7 +1339,12 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                 pos += 4;
                 break :modifier constraint;
             } else null;
+            const named_type_id: ?u64 = if (fmt_version >= 39) id: {
+                const value = readU64(data, &pos);
+                break :id if (value == 0) null else value;
+            } else null;
             column.* = .{
+                .named_type_id = named_type_id,
                 .name = name.?,
                 .path = path.?,
                 .column_type = column_type,
@@ -1357,7 +1383,29 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk null;
     };
 
+    errdefer if (external) |source| {
+        var owned = source;
+        owned.deinit(alloc);
+    };
+    const type_records: []named_types.Record = if (fmt_version >= 39) records: {
+        var registry_pos = pos + 20;
+        const count = readU32(data, &registry_pos);
+        const records = try alloc.alloc(named_types.Record, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (records[0..initialized]) |*record| record.deinitOwned(alloc);
+            alloc.free(records);
+        }
+        for (records) |*record| {
+            var parsed = try named_types.Record.decode(alloc, readStr(data, &registry_pos));
+            defer parsed.deinit();
+            record.* = try parsed.value.cloneOwned(alloc);
+            initialized += 1;
+        }
+        break :records records;
+    } else &.{};
     const result: TableSchema = .{
+        .named_types = type_records,
         .decoded_format_version = fmt_version,
         .version = version,
         .external_base_source = external,
@@ -1595,7 +1643,7 @@ fn validateSerializedSchema(data: []const u8) !void {
         }
         try cursor.readBool(); // immutable public-validation provenance
         const column_count = try cursor.readU32();
-        try cursor.ensureCount(column_count, if (format_version >= 23) 15 else if (format_version >= 16) 14 else 13);
+        try cursor.ensureCount(column_count, if (format_version >= 39) 23 else if (format_version >= 23) 15 else if (format_version >= 16) 14 else 13);
         for (0..column_count) |_| {
             try cursor.readStr();
             try cursor.readStr();
@@ -1604,6 +1652,7 @@ fn validateSerializedSchema(data: []const u8) !void {
             if (column_tag == @backingInt(RelationalColumnType.sql_array) and format_version < 17) return error.UnsupportedVersion;
             if (column_tag == @backingInt(RelationalColumnType.numeric) and format_version < 20) return error.UnsupportedVersion;
             if (column_tag >= @backingInt(RelationalColumnType.numrange) and format_version < 35) return error.UnsupportedVersion;
+            if (column_tag == @backingInt(RelationalColumnType.enumeration) and format_version < 39) return error.UnsupportedVersion;
             try cursor.readBool();
             try cursor.readBool();
             try cursor.readBool();
@@ -1626,6 +1675,10 @@ fn validateSerializedSchema(data: []const u8) !void {
                     modifier.validate() catch return error.InvalidSchema;
                     cursor.pos += 4;
                 }
+            }
+            if (format_version >= 39) {
+                try cursor.ensure(8);
+                cursor.pos += 8;
             }
         }
     }
@@ -1653,10 +1706,56 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 36) try cursor.readBool();
     if (format_version >= 37) try cursor.readBool();
     if (format_version >= 38) try cursor.readBool();
+    if (format_version >= 39) {
+        const count = try cursor.readU32();
+        if (count > 4096) return error.InvalidSchema;
+        const registry_start = cursor.pos;
+        try cursor.ensureCount(count, 4);
+        for (0..count) |_| {
+            const start = cursor.pos;
+            try cursor.readStr();
+            if (cursor.pos - start - 4 > named_types.max_encoded_bytes or cursor.pos - registry_start > max_named_type_bytes) return error.InvalidSchema;
+        }
+    }
     try cursor.finish();
 }
 
+/// O(log n) lookup against the canonical schema-owned type directory.
+pub fn namedType(schema: TableSchema, id: u64) ?*const named_types.Record {
+    var lower: usize = 0;
+    var upper = schema.named_types.len;
+    while (lower < upper) {
+        const middle = lower + (upper - lower) / 2;
+        const record = &schema.named_types[middle];
+        if (record.identity.id == id) return record;
+        if (record.identity.id < id) lower = middle + 1 else upper = middle;
+    }
+    return null;
+}
+
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    if (schema.named_types.len > 4096) return error.InvalidSchema;
+    if (schema.named_types.len != 0 and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    var origins = std.AutoHashMapUnmanaged([16]u8, void).empty;
+    defer origins.deinit(alloc);
+    var previous_id: u64 = 0;
+    var registry_bytes: usize = 0;
+    for (schema.named_types) |record| {
+        try record.validate(alloc);
+        for (record.definition.labels) |label| {
+            registry_bytes = std.math.add(usize, registry_bytes, label.text.len + label.order_key.len) catch return error.InvalidSchema;
+            if (registry_bytes > max_named_type_bytes) return error.InvalidSchema;
+        }
+        if (record.identity.id <= previous_id) return error.InvalidSchema;
+        previous_id = record.identity.id;
+        if ((try origins.getOrPut(alloc, record.identity.origin_id)).found_existing) return error.InvalidSchema;
+    }
+    for (schema.relational_columns) |column| {
+        if ((column.column_type == .enumeration) != (column.named_type_id != null)) return error.InvalidSchema;
+        if (column.named_type_id) |id| {
+            if (namedType(schema, id) == null or column.sql_element_type != null or column.numeric_modifier != null or column.is_json or column.json_kind != .none) return error.InvalidSchema;
+        }
+    }
     if (schema.requires_document_expressions and (schema.storage_mode != .document or !schema.requires_public_schema)) return error.InvalidSchema;
     const expressions_authorized = schema.requires_public_schema and (schema.storage_mode == .relational or schema.requires_document_expressions);
     if (schema.requires_sequence_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
@@ -1743,6 +1842,11 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
 
 /// Free a schema returned by deserializeSchema.
 pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
+    for (s.named_types) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (s.named_types.len != 0) alloc.free(s.named_types);
     if (s.external_base_source) |source| {
         var owned = source;
         owned.deinit(alloc);

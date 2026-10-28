@@ -4594,6 +4594,7 @@ fn buildRelationalRowValueFromParsedInternal(
             output_alloc: Allocator,
             ordinal: usize,
             column: runtime_schema.RelationalColumn,
+            enum_view: ?*const @import("../../common/sql_enum_value.zig").View,
             found: std.json.Value,
             json_literal_null: bool,
             preserve_json_display: bool,
@@ -4609,6 +4610,7 @@ fn buildRelationalRowValueFromParsedInternal(
                     .is_json = column.is_json,
                     .is_dense_vector = column.column_type == .dense_vector,
                     .is_numeric = column.column_type == .numeric,
+                    .enum_record = if (enum_view) |view| &view.record else null,
                     .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
                     .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(column.column_type),
                     .is_null = true,
@@ -4623,7 +4625,11 @@ fn buildRelationalRowValueFromParsedInternal(
                 .none => return error.InvalidBatchRequest,
             };
 
-            const value = if (@import("../../sql/range_value.zig").kindFromType(column.column_type)) |kind| blk: {
+            const value = if (column.column_type == .enumeration) blk: {
+                if (found != .string) return error.SqlInvalidTextRepresentation;
+                const view = enum_view orelse return error.InvalidSchema;
+                break :blk typed_dv.TypedValue{ .i64_val = (try view.input(found.string)).symbol };
+            } else if (@import("../../sql/range_value.zig").kindFromType(column.column_type)) |kind| blk: {
                 const encoded = try @import("../../sql/range_storage.zig").encodeJsonAlloc(output_alloc, kind, found);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
@@ -4661,6 +4667,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 .is_json = column.is_json,
                 .is_dense_vector = column.column_type == .dense_vector,
                 .is_numeric = column.column_type == .numeric,
+                .enum_record = if (enum_view) |view| &view.record else null,
                 .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
                 .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(column.column_type),
                 .value = value,
@@ -4685,6 +4692,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 scratch,
                 ordinal,
                 columns[ordinal],
+                layout.enumView(ordinal),
                 found,
                 for (json_null_fields) |name| {
                     if (std.mem.eql(u8, name, entry.key_ptr.*)) break true;
@@ -4791,7 +4799,7 @@ pub fn validateRelationalRowValueForSchema(value: []const u8, table_schema: runt
 fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.ValueType {
     return switch (column_type) {
         .datetime => .u64_val,
-        .integer => .i64_val,
+        .integer, .enumeration => .i64_val,
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
@@ -4821,7 +4829,7 @@ fn relationalTypedValueAlloc(
     return switch (column_type) {
         // SQL arrays require the complete immutable column descriptor and are
         // prepared by makeCell, never inferred from this coarse type alone.
-        .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => error.InvalidBatchRequest,
+        .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange, .enumeration => error.InvalidBatchRequest,
         .string, .blob, .geoshape => switch (value) {
             .string => |text| .{ .bytes_val = text },
             else => null,

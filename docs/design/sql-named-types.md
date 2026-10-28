@@ -105,23 +105,50 @@ compares original declarations with PostgreSQL, permissions, search paths,
 cold metadata and a deliberately lost acknowledgement. This catalog campaign
 is separate from complete typed-row qualification.
 
-Still required before the original cases receive implementation credit:
+Native schema epochs now retain a deduplicated, ID-sorted type registry.
+ASCH encoding and semantic capability 39 fence these layouts. Schema decoding
+owns labels, ranks and principals independently of input buffers; validation
+bounds registry bytes and rejects dangling IDs, duplicate origins and incompatible
+column descriptors. One prepared atom directory is shared by every referencing
+column in an epoch.
 
-1. Add a deduplicated immutable named-type registry to native schema epochs and
-   a capability-gated schema encoding. Columns reference registry IDs; the
-   registry owns the exact definitions needed for old-row decoding and restore.
-2. Bind native enum columns to the four-byte symbol kernel in PreparedRow,
-   AROW projections, canonical restore validation and logical hashing. Reuse
-   each epoch's atom directory rather than allocating enum objects per row.
-3. Extend the existing tuple encoder, typed bounds and expression identity with
-   enum order/type identity. Cover indexed ordering, uniqueness and FKs.
-4. Bind named type intents in SQL columns, scalar casts and parameter/result
+Prepared native writes resolve labels through that directory and encode four-byte
+symbols in dense or sparse AROW. Projection and reconstruction resolve exact
+labels, including empty labels independently of SQL NULL and absent cells.
+Strict restore rejects unknown symbols even when the physical checksum is valid.
+Logical row hashes include durable type origin and symbol, so local catalog-ID
+remapping and additive type evolution preserve content identity.
+
+Ordered tuples use stable escaped rank bytes for row writes, typed bounds,
+native vectors and external label vectors. Their definition fingerprints retain
+type ID and origin without forcing a rebuild on ADD VALUE. Historical projection
+rejects incompatible symbol/rank definitions. Covering indexes retain only the
+referenced type definitions, bind type identity in forward-value fingerprints,
+and preserve INCLUDE fields through historical source projection. Transform
+cells retain identities, and cold page decoding validates symbol membership. Enum operands borrow cached
+atoms; shared logical value slots remain 32 bytes. A Debug measurement of 100,000
+sparse projected row/key operations used zero allocations after preparation
+(80-byte row, 64 schema columns, roughly 0.1 seconds on the development machine).
+
+Schema-pin tests release both producer buffers and the initial epoch owner before
+reading retained atoms. Allocation-failure enumeration includes schema decoding,
+compiled directories, tuple plans and covering-plan construction.
+
+These native storage tests do not qualify the public SQL feature. Still required
+before the original cases receive implementation credit:
+
+1. Bind SQL enum columns to schema-owned definitions through the public schema
+   compiler and immutable catalog dependencies. Current SQL scalar paths reject
+   enum columns rather than treating symbols as integers or labels as TEXT.
+2. Complete enum expression operations, uniqueness/FK type compatibility and
+   distributed integrity qualification over those public schemas.
+3. Bind named type intents in SQL columns, scalar casts and parameter/result
    descriptors. Resolve by immutable identity, retain prepared witnesses and
    wire actual scalar/array OIDs through the existing public/pgwire interfaces.
-5. Activate ADD VALUE across every dependent schema through the existing
+4. Activate ADD VALUE across every dependent schema through the existing
    coordinated schema/owner-ACK protocol. Pending or uncertain publication must
    retain a recoverable job handle; it cannot report ready from catalog commit.
-6. Add full row/default/index/restart/restore campaigns, dependent DROP
+5. Add full public row/default/index/restart/restore campaigns, dependent DROP
    RESTRICT/CASCADE, domain base/default/CHECK/NOT NULL validation and activation.
 
 The disposition ledger has not been changed for the enum/domain work. Passing

@@ -43,6 +43,7 @@ pub const Value = union(enum) {
     /// Borrowed canonical NUMERIC row bytes; display scale is not identity.
     numeric: []const u8,
     range: @import("../../sql/range_value.zig").Encoded,
+    enumeration: *const @import("../../common/sql_enum_value.zig").Value,
 };
 
 const NumericKeys = @import("../../common/sql_numeric_key_layout.zig");
@@ -72,6 +73,7 @@ const BoundKey = struct {
     descending: bool,
     nulls_first: bool,
     fold_ascii: bool,
+    enum_record: ?*const @import("../../system_catalog/named_types.zig").Record = null,
 };
 
 const CompiledExpression = struct {
@@ -182,7 +184,7 @@ pub const TuplePlan = struct {
                 return error.RelationalIndexColumnNotFound else 0;
             const column_type = if (expression) |compiled| compiled.plan.result_kind else table_schema.relational_columns[ordinal].column_type;
             switch (column_type) {
-                .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .numrange, .daterange, .tsrange, .tstzrange => {},
+                .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .numrange, .daterange, .tsrange, .tstzrange, .enumeration => {},
                 .json, .geopoint, .geoshape, .dense_vector, .sql_array => return error.UnsupportedRelationalIndexColumn,
             }
             var fold_ascii = false;
@@ -200,6 +202,7 @@ pub const TuplePlan = struct {
                     .default => definition.direction == .desc,
                 },
                 .fold_ascii = fold_ascii,
+                .enum_record = if (column_type == .enumeration) &(layout.enumView(ordinal) orelse return error.InvalidRelationalIndexDefinition).record else null,
             };
             initialized += 1;
         }
@@ -218,6 +221,11 @@ pub const TuplePlan = struct {
             hasher.update(name);
             if (key.expression) |expression| hasher.update(&expression.fingerprint);
             hasher.update(&.{ @backingInt(key.column_type), @intFromBool(key.descending), @intFromBool(key.nulls_first), @intFromBool(key.fold_ascii) });
+            if (key.enum_record) |record| {
+                std.mem.writeInt(u64, &size, record.identity.id, .little);
+                hasher.update(&size);
+                hasher.update(&record.identity.origin_id);
+            }
         }
         const has_sql_types = for (keys) |key| {
             if (key.expression == null and table_schema.relational_columns[key.ordinal].sql_element_type != null) break true;
@@ -246,6 +254,10 @@ pub const TuplePlan = struct {
         const left = self.keys[left_index];
         const right = other.keys[right_index];
         if (left.column_type != right.column_type or left.fold_ascii != right.fold_ascii) return false;
+        if (left.enum_record) |record| {
+            const rhs = right.enum_record orelse return false;
+            if (record.identity.id != rhs.identity.id or !std.mem.eql(u8, &record.identity.origin_id, &rhs.identity.origin_id)) return false;
+        } else if (right.enum_record != null) return false;
         if (left.expression) |expression| {
             const rhs = right.expression orelse return false;
             return std.mem.eql(u8, &expression.fingerprint, &rhs.fingerprint);
@@ -289,6 +301,16 @@ pub const TuplePlan = struct {
             if (source.relational_columns[ordinal].column_type != original.column_type or
                 source.relational_columns[ordinal].sql_element_type != self.columns[original.ordinal].sql_element_type)
                 return error.RelationalIndexColumnTypeMismatch;
+            if (original.enum_record) |record| {
+                const candidate = &(layout.enumView(ordinal) orelse return error.RelationalIndexColumnTypeMismatch).record;
+                if (record.identity.id != candidate.identity.id or !std.mem.eql(u8, &record.identity.origin_id, &candidate.identity.origin_id)) return error.RelationalIndexColumnTypeMismatch;
+                // Stable symbols/ranks must be identical in historical epochs.
+                const common = @min(record.definition.labels.len, candidate.definition.labels.len);
+                for (record.definition.labels[0..common], candidate.definition.labels[0..common]) |left, right| {
+                    if (left.id != right.id or !std.mem.eql(u8, left.text, right.text) or !std.mem.eql(u8, left.order_key, right.order_key)) return error.RelationalIndexColumnTypeMismatch;
+                }
+                key.enum_record = candidate;
+            }
             key.ordinal = @intCast(ordinal);
             initialized += 1;
         }
@@ -445,6 +467,7 @@ pub const TuplePlan = struct {
                 .boolean => .{ .boolean = value.bool_val },
                 .datetime => .{ .datetime = value.u64_val },
                 .integer => .{ .integer = value.i64_val },
+                .enumeration => .{ .enumeration = try (self.layout.enumView(key.ordinal) orelse return error.InvalidRelationalIndexBound).bySymbol(std.math.cast(u32, value.i64_val) orelse return error.InvalidSqlEnumSymbol) },
                 .number => .{ .number = value.f64_val },
                 .numeric => .{ .numeric = value.bytes_val },
                 .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../../sql/range_value.zig").kindFromType(key.column_type).?, .bytes = value.bytes_val } },
@@ -469,7 +492,7 @@ pub const TuplePlan = struct {
                 pos += try @import("../../sql/range_key.zig").prefixLen(kind, bytes[pos..], key.descending);
                 continue;
             }
-            if (key.column_type == .string or key.column_type == .blob) {
+            if (key.column_type == .string or key.column_type == .blob or key.column_type == .enumeration) {
                 const marker: u8 = if (key.descending) 0xff else 0;
                 while (true) {
                     if (pos == bytes.len) return error.InvalidRelationalIndexKey;
@@ -602,15 +625,24 @@ pub const BatchKeys = struct {
                     };
                     break :blk .{ .numeric = bytes };
                 }
-                break :blk expressions.Value.fromScalar(try vectorValue(vector, column.column_type, row));
+                if (column.column_type == .enumeration) break :blk .null;
+                break :blk expressions.Value.fromScalar(try vectorValue(vector, column.column_type, row, null));
             } else .null;
         }
         var has_null = false;
         for (self.plan.keys) |key| {
             const value = if (key.expression) |expression|
                 (try expression.plan.evaluateWithExecution(execution, self.values)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn
-            else
-                self.values[key.ordinal].scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
+            else if (key.column_type == .enumeration) enum_value: {
+                const input = self.inputs[key.ordinal] orelse break :enum_value @as(Value, .null);
+                const vector = self.batch.columns[input];
+                if (vector.nulls.isNull(row)) break :enum_value @as(Value, .null);
+                if (self.external_values) {
+                    const view = self.plan.layout.enumView(key.ordinal) orelse return error.InvalidRelationalIndexBound;
+                    break :enum_value Value{ .enumeration = try view.input(try vector.bytesAt(row)) };
+                }
+                break :enum_value try vectorValue(vector, .enumeration, row, self.plan.layout.enumView(key.ordinal));
+            } else self.values[key.ordinal].scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
             has_null = has_null or value == .null;
             try appendExecutionValue(alloc, out, start, self.plan.encoded_bytes_limit, key, value, execution, key.expression != null);
         }
@@ -618,9 +650,10 @@ pub const BatchKeys = struct {
     }
 };
 
-fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: schema.RelationalColumnType, row: usize) !Value {
+fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: schema.RelationalColumnType, row: usize, enum_view: ?*const @import("../../common/sql_enum_value.zig").View) !Value {
     if (vector.nulls.isNull(row)) return .null;
     return switch (kind) {
+        .enumeration => .{ .enumeration = try (enum_view orelse return error.InvalidRelationalIndexBound).bySymbol(std.math.cast(u32, try vector.integerAt(row)) orelse return error.InvalidSqlEnumSymbol) },
         .string => .{ .string = try vector.bytesAt(row) },
         .blob => .{ .blob = try vector.bytesAt(row) },
         .numeric => .{ .numeric = try vector.bytesAt(row) },
@@ -702,7 +735,16 @@ fn appendAdmittedValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: u
     var range_scratch = std.heap.ArenaAllocator.init(alloc);
     defer range_scratch.deinit();
     var range_bytes: ?[]const u8 = null;
+    var enum_bytes: ?[]const u8 = null;
     const encoded_size: usize = switch (value) {
+        .enumeration => |atom| block: {
+            const record = key.enum_record orelse return error.InvalidRelationalIndexBound;
+            if (key.column_type != .enumeration or atom.type_id != record.identity.id or !std.mem.eql(u8, &atom.origin_id, &record.identity.origin_id)) return error.InvalidRelationalIndexBound;
+            const label = try record.definition.byId(atom.symbol);
+            enum_bytes = label.order_key;
+            if (label.order_key.len > max_bytes) return error.RelationalIndexKeyTooLarge;
+            break :block 3 + label.order_key.len + std.mem.count(u8, label.order_key, "\x00");
+        },
         .range => |range| block: {
             const ranges = @import("../../sql/range_value.zig");
             var range_context: ranges.Context = .{ .alloc = range_scratch.allocator(), .parent = context, .max_output_bytes = max_bytes };
@@ -761,6 +803,7 @@ fn appendAdmittedValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: u
     try out.append(alloc, 0x80);
     var scalar: [16]u8 = undefined;
     const bytes: []const u8 = switch (value) {
+        .enumeration => enum_bytes.?,
         .string => |v| v,
         .blob => |v| v,
         .boolean => |v| blk: {
@@ -786,7 +829,7 @@ fn appendAdmittedValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: u
         },
         .null, .numeric, .range => unreachable,
     };
-    if (key.column_type == .string or key.column_type == .blob) {
+    if (key.column_type == .string or key.column_type == .blob or key.column_type == .enumeration) {
         try appendVariableScalar(alloc, out, bytes, key.descending, key.fold_ascii);
     } else {
         try out.ensureUnusedCapacity(alloc, bytes.len);

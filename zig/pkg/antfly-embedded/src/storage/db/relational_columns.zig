@@ -2482,7 +2482,7 @@ const Block = struct {
     fn valueType(self: *@This(), ordinal: u32) dv.ValueType {
         return switch (self.table.relational_columns[ordinal].column_type) {
             .datetime => .u64_val,
-            .integer => .i64_val,
+            .integer, .enumeration => .i64_val,
             .number => .f64_val,
             .boolean => .bool_val,
             .geopoint => .geo_point,
@@ -2498,7 +2498,7 @@ const Block = struct {
             if (column_view.bitmaps.len != 0) for (values, 0..) |*value, i| {
                 if (column_view.bitmaps[null_bytes + i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0) {
                     const col = self.table.relational_columns[ordinal];
-                    value.* = .{ .ordinal = ordinal, .path = col.path, .value_type = self.valueType(ordinal), .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .is_numeric = col.column_type == .numeric, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(col.column_type), .is_null = true, .value = undefined };
+                    value.* = .{ .ordinal = ordinal, .path = col.path, .value_type = self.valueType(ordinal), .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .is_numeric = col.column_type == .numeric, .enum_record = if (col.named_type_id) |id| schema.namedType(self.table, id) orelse return error.InvalidColumnSegment else null, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(col.column_type), .is_null = true, .value = undefined };
                 }
             };
             column_view.cells = values;
@@ -2643,8 +2643,13 @@ const Block = struct {
             const source = ref.source_first + row - first;
             if (source >= decoded.values.len) continue;
             const cell_value = decoded.values[source] orelse continue;
+            if (col.named_type_id) |id| {
+                const record = schema.namedType(self.table, id) orelse return error.InvalidColumnSegment;
+                if (cell_value != .i64_val) return error.InvalidColumnSegment;
+                _ = record.definition.byId(std.math.cast(u32, cell_value.i64_val) orelse return error.InvalidColumnSegment) catch return error.InvalidColumnSegment;
+            }
             if (values[row] != null or !column_view.present(row)) return error.InvalidColumnSegment;
-            values[row] = .{ .ordinal = ordinal, .path = col.path, .value_type = decoded.value_type, .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .is_numeric = col.column_type == .numeric, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(col.column_type), .value = cell_value };
+            values[row] = .{ .ordinal = ordinal, .path = col.path, .value_type = decoded.value_type, .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .is_numeric = col.column_type == .numeric, .enum_record = if (col.named_type_id) |id| schema.namedType(self.table, id) orelse return error.InvalidColumnSegment else null, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(col.column_type), .value = cell_value };
         }
         for (first..end) |i| if ((values[i] != null) != column_view.present(i)) return error.InvalidColumnSegment;
         column_view.loaded_pages.set(page);

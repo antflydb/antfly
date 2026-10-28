@@ -2494,6 +2494,7 @@ fn valueOrder(a: Value, b: Value, fold_ascii: bool) !std.math.Order {
 fn valueOrderWithContext(a: Value, b: Value, fold_ascii: bool, context: *exact.Context) !std.math.Order {
     return switch (a) {
         .null => unreachable,
+        .enumeration => error.InvalidRelationalExpressionType,
         .string => |left| orderBytes(left, b.string, fold_ascii, context),
         .blob => |value| orderBytes(value, b.blob, false, context),
         .numeric => |bytes| blk: {
@@ -2769,6 +2770,7 @@ const Compiler = struct {
                 self.frame(@tagName(node.literal));
                 var bytes: [8]u8 = undefined;
                 switch (node.literal) {
+                    .enumeration => return error.InvalidRelationalExpressionType,
                     .null => {},
                     .string, .blob, .numeric => |value_bytes| self.frame(value_bytes),
                     .boolean => |boolean| self.hash.update(&.{@intFromBool(boolean)}),
@@ -5030,6 +5032,7 @@ fn cloneJsonOutput(execution: *Execution, json: @import("../sql/row_value.zig").
 
 fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
     return switch (value) {
+        .enumeration => error.InvalidRelationalExpressionType,
         .null => .null,
         .string => |bytes| .{ .string = try alloc.dupe(u8, bytes) },
         .blob => |bytes| blk: {

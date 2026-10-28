@@ -42,6 +42,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const enum_values = @import("../../../common/sql_enum_value.zig");
+const named_types = @import("../../../system_catalog/named_types.zig");
 const geo_mod = @import("../../../search/geo.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const runtime_schema = @import("../../schema.zig");
@@ -89,6 +91,7 @@ pub const Cell = struct {
     /// Exact NUMERIC bytes, identified by the pinned layout rather than an
     /// on-row per-cell type tag. Never interpret these bytes as JSON or f64.
     is_numeric: bool = false,
+    enum_record: ?*const named_types.Record = null,
     /// Element identity is supplied by the pinned immutable layout, not read
     /// from an untrusted payload or inferred from JSON shape.
     sql_array_element_type: ?@import("../../../common/sql_builtin_type.zig").Type = null,
@@ -117,6 +120,8 @@ pub const PhysicalLayout = struct {
     hash_ordinals: []u32,
     /// Required columns, in physical ordinal order, for sparse validation.
     required_ordinals: []u32,
+    enum_views: []enum_values.View,
+    enum_indexes: []u32,
 
     const not_applicable = std.math.maxInt(u32);
 
@@ -130,6 +135,26 @@ pub const PhysicalLayout = struct {
         errdefer alloc.free(variable_indexes);
         const hash_ordinals = try alloc.alloc(u32, columns.len);
         errdefer alloc.free(hash_ordinals);
+        const enum_views = try alloc.alloc(enum_values.View, table_schema.named_types.len);
+        var enum_initialized: usize = 0;
+        errdefer {
+            for (enum_views[0..enum_initialized]) |*view| view.deinit(alloc);
+            alloc.free(enum_views);
+        }
+        for (table_schema.named_types, enum_views) |record, *view| {
+            view.* = try enum_values.View.init(alloc, record);
+            enum_initialized += 1;
+        }
+        const enum_indexes = try alloc.alloc(u32, if (enum_views.len == 0) 0 else columns.len);
+        errdefer alloc.free(enum_indexes);
+        @memset(enum_indexes, not_applicable);
+        for (columns, 0..) |column, ordinal| {
+            if ((column.column_type == .enumeration) != (column.named_type_id != null)) return error.InvalidSchema;
+            if (column.named_type_id) |id| {
+                const record = runtime_schema.namedType(table_schema, id) orelse return error.InvalidSchema;
+                enum_indexes[ordinal] = @intCast((@intFromPtr(record) - @intFromPtr(table_schema.named_types.ptr)) / @sizeOf(named_types.Record));
+            }
+        }
         var required_count: usize = 0;
         for (columns) |column| required_count += @intFromBool(column.required);
         const required_ordinals = try alloc.alloc(u32, required_count);
@@ -169,6 +194,8 @@ pub const PhysicalLayout = struct {
             .variable_indexes = variable_indexes,
             .hash_ordinals = hash_ordinals,
             .required_ordinals = required_ordinals,
+            .enum_views = enum_views,
+            .enum_indexes = enum_indexes,
         };
     }
 
@@ -177,7 +204,16 @@ pub const PhysicalLayout = struct {
         self.alloc.free(self.variable_indexes);
         self.alloc.free(self.hash_ordinals);
         self.alloc.free(self.required_ordinals);
+        for (self.enum_views) |*view| view.deinit(self.alloc);
+        self.alloc.free(self.enum_views);
+        self.alloc.free(self.enum_indexes);
         self.* = undefined;
+    }
+
+    pub fn enumView(self: *const PhysicalLayout, ordinal: usize) ?*const enum_values.View {
+        if (ordinal >= self.enum_indexes.len) return null;
+        const index = self.enum_indexes[ordinal];
+        return if (index == not_applicable) null else &self.enum_views[index];
     }
 
     /// Resolve a logical top-level name without rebuilding a map per request.
@@ -348,6 +384,11 @@ fn serializeOrdinalInternal(
             cell.sql_array_element_type != (if (column.column_type == .sql_array) column.sql_element_type else null) or
             cell.sql_range_kind != @import("../../../sql/range_value.zig").kindFromType(column.column_type))
             return error.InvalidRelationalRow;
+        if (cell.enum_record) |record| if (layout) |compiled| {
+            const declared = compiled.enumView(cell.ordinal) orelse return error.InvalidRelationalRow;
+            if (record.identity.id != declared.record.identity.id or !std.mem.eql(u8, &record.identity.origin_id, &declared.record.identity.origin_id)) return error.InvalidRelationalRow;
+            if (!cell.is_null) _ = try declared.bySymbol(std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidSqlEnumSymbol);
+        };
         if (validate_json_cells) try validateCell(alloc, cell);
         try validateSqlCell(column, cell, true);
         if (!cell.is_null and isVariableColumn(column)) {
@@ -899,6 +940,11 @@ fn jsonValueFromCellAlloc(
 ) !std.json.Value {
     if (cell.is_null) return .null;
     return switch (column.column_type) {
+        .enumeration => blk: {
+            const record = cell.enum_record orelse return error.InvalidRelationalRow;
+            const label = try record.definition.byId(std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidSqlEnumSymbol);
+            break :blk .{ .string = if (allocation == .alloc_always) try alloc.dupe(u8, label.text) else label.text };
+        },
         .sql_array => blk: {
             const kind = column.sql_element_type orelse return error.InvalidRelationalRow;
             const decoded = try @import("../../../sql/array_storage.zig").decodeLeaky(alloc, kind, cell.value.bytes_val, .{});
@@ -1038,7 +1084,7 @@ pub fn findCellByOrdinal(
 ) !?Cell {
     if (ordinal >= table_schema.relational_columns.len) return null;
     const parsed = try parseOrdinal(value, table_schema);
-    return try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal);
+    return try findParsedOrdinalCell(parsed, table_schema, ordinal);
 }
 
 pub fn findCellByOrdinalWithLayout(
@@ -1049,7 +1095,7 @@ pub fn findCellByOrdinalWithLayout(
 ) !?Cell {
     if (ordinal >= table_schema.relational_columns.len) return null;
     const parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout);
-    return try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal);
+    return try findParsedOrdinalCell(parsed, table_schema, ordinal);
 }
 
 /// Reconstruct only selected top-level columns. Callers preflight that field
@@ -1091,7 +1137,7 @@ fn projectParsedOrdinalPlanAlloc(
     var needs_comma = false;
     for (plan.ordinals) |ordinal_raw| {
         const ordinal: usize = ordinal_raw;
-        const cell = (try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal)) orelse continue;
+        const cell = (try findParsedOrdinalCell(parsed, table_schema, ordinal)) orelse continue;
         try appendValidatedCellValue(alloc, &out, cell, needs_comma);
         needs_comma = true;
     }
@@ -1188,9 +1234,8 @@ pub const OrdinalCellIterator = struct {
             self.next_sparse_entry += 1;
             const ordinal: usize = sparseOrdinalAt(self.parsed, entry_index);
             if (ordinal >= self.table_schema.relational_columns.len) return error.InvalidRelationalRow;
-            const column = self.table_schema.relational_columns[ordinal];
             const payload = try sparsePayloadSliceAtIndex(self.parsed, entry_index);
-            return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, sparseEntryIsNull(self.parsed, entry_index), self.validate_payloads);
+            return try ordinalCellFromPayloadWithValidation(self.table_schema, ordinal, payload, sparseEntryIsNull(self.parsed, entry_index), self.validate_payloads);
         }
 
         while (self.next_ordinal < self.table_schema.relational_columns.len) {
@@ -1202,7 +1247,7 @@ pub const OrdinalCellIterator = struct {
                 try ordinalPayloadSliceChecked(self.parsed, column, ordinal)
             else
                 ordinalPayloadSlice(self.parsed, self.table_schema.relational_columns, column, ordinal);
-            return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal), self.validate_payloads);
+            return try ordinalCellFromPayloadWithValidation(self.table_schema, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal), self.validate_payloads);
         }
         return null;
     }
@@ -1269,7 +1314,7 @@ pub const OrdinalRowView = struct {
                 if (end > self.verified_prefix) try groups.verify(@max(start, self.verified_prefix), end);
             }
         }
-        return try findParsedOrdinalCellWithValidation(self.parsed, self.table_schema.relational_columns, ordinal, !self.payloads_validated);
+        return try findParsedOrdinalCellWithValidation(self.parsed, self.table_schema, ordinal, !self.payloads_validated);
     }
 
     /// Shared logical interpretation for projection and predicate execution.
@@ -1525,6 +1570,7 @@ pub const OrdinalRowView = struct {
         if (cell.is_null) return Datum{};
         const column = self.table_schema.relational_columns[ordinal];
         return switch (column.column_type) {
+            .enumeration => error.SqlTypeMismatch,
             .sql_array => blk: {
                 const array = try alloc.create(@import("../../../sql/array_value.zig").Value);
                 array.* = try @import("../../../sql/array_storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
@@ -1923,64 +1969,49 @@ fn shouldUseSparseRepresentation(
     return sparse_body_len < dense_storage_len;
 }
 
-fn ordinalCell(
-    parsed: ParsedOrdinal,
-    columns: []const runtime_schema.RelationalColumn,
-    column: runtime_schema.RelationalColumn,
-    ordinal: usize,
-) !Cell {
-    const is_null = parsedOrdinalIsNull(parsed, ordinal);
-    const payload = ordinalPayloadSlice(parsed, columns, column, ordinal);
-    return try ordinalCellFromPayload(column, ordinal, payload, is_null);
-}
-
 fn findParsedOrdinalCell(
     parsed: ParsedOrdinal,
-    columns: []const runtime_schema.RelationalColumn,
+    table_schema: runtime_schema.TableSchema,
     ordinal: usize,
 ) !?Cell {
-    return try findParsedOrdinalCellWithValidation(parsed, columns, ordinal, true);
+    return try findParsedOrdinalCellWithValidation(parsed, table_schema, ordinal, true);
 }
 
 fn findParsedOrdinalCellWithValidation(
     parsed: ParsedOrdinal,
-    columns: []const runtime_schema.RelationalColumn,
+    table_schema: runtime_schema.TableSchema,
     ordinal: usize,
     validate_payload: bool,
 ) !?Cell {
+    const columns = table_schema.relational_columns;
     const column = columns[ordinal];
     if (parsed.capabilities & capability_sparse_slots != 0) {
         const entry_index = sparseEntryIndex(parsed, ordinal) orelse return null;
         const payload = try sparsePayloadSliceAtIndex(parsed, entry_index);
-        return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, sparseEntryIsNull(parsed, entry_index), validate_payload);
+        return try ordinalCellFromPayloadWithValidation(table_schema, ordinal, payload, sparseEntryIsNull(parsed, entry_index), validate_payload);
     }
     if (!bitmapBit(parsed.present, ordinal)) return null;
     const payload = if (parsed.layout != null)
         try ordinalPayloadSliceChecked(parsed, column, ordinal)
     else
         ordinalPayloadSlice(parsed, columns, column, ordinal);
-    return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal), validate_payload);
-}
-
-fn ordinalCellFromPayload(
-    column: runtime_schema.RelationalColumn,
-    ordinal: usize,
-    payload: []const u8,
-    is_null: bool,
-) !Cell {
-    return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, is_null, true);
+    return try ordinalCellFromPayloadWithValidation(table_schema, ordinal, payload, bitmapBit(parsed.nulls, ordinal), validate_payload);
 }
 
 fn ordinalCellFromPayloadWithValidation(
-    column: runtime_schema.RelationalColumn,
+    table_schema: runtime_schema.TableSchema,
     ordinal: usize,
     payload: []const u8,
     is_null: bool,
     validate_payload: bool,
 ) !Cell {
+    const column = table_schema.relational_columns[ordinal];
+    const record = if (column.named_type_id) |id| runtime_schema.namedType(table_schema, id) orelse return error.InvalidRelationalRow else null;
     const value_type = columnValueType(column.column_type);
     const typed_value = if (is_null)
         zeroValue(value_type)
+    else if (record != null)
+        if (payload.len == 4) typed_dv.TypedValue{ .i64_val = std.mem.readInt(u32, payload[0..4], .little) } else return error.InvalidRelationalRow
     else
         try decodeOrdinalPayload(payload, value_type);
     const cell: Cell = .{
@@ -1990,6 +2021,7 @@ fn ordinalCellFromPayloadWithValidation(
         .is_json = column.is_json,
         .is_dense_vector = column.column_type == .dense_vector,
         .is_numeric = column.column_type == .numeric,
+        .enum_record = record,
         .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
         .sql_range_kind = @import("../../../sql/range_value.zig").kindFromType(column.column_type),
         .is_null = is_null,
@@ -2150,6 +2182,11 @@ fn bitmapPopulation(bitmap: []const u8) usize {
 }
 
 fn encodeOrdinalFixed(out: []u8, cell: Cell) !void {
+    if (cell.enum_record != null) {
+        if (out.len != 4) return error.InvalidRelationalRow;
+        std.mem.writeInt(u32, out[0..4], std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidRelationalRow, .little);
+        return;
+    }
     var pos: usize = 0;
     switch (cell.value) {
         .datetime_ns => return error.InvalidRelationalRow,
@@ -2171,6 +2208,11 @@ fn encodeOrdinalFixed(out: []u8, cell: Cell) !void {
 }
 
 fn appendOrdinalPayload(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), cell: Cell) !void {
+    if (cell.enum_record != null) {
+        var bytes: [4]u8 = undefined;
+        try encodeOrdinalFixed(&bytes, cell);
+        return out.appendSlice(alloc, &bytes);
+    }
     var fixed: [17]u8 = undefined;
     var pos: usize = 0;
     switch (cell.value) {
@@ -2232,7 +2274,7 @@ fn decodeOrdinalPayload(payload: []const u8, value_type: typed_dv.ValueType) !ty
 fn columnValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.ValueType {
     return switch (column_type) {
         .datetime => .u64_val,
-        .integer => .i64_val,
+        .integer, .enumeration => .i64_val,
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
@@ -2243,13 +2285,14 @@ fn columnValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.Va
 fn isVariableColumn(column: runtime_schema.RelationalColumn) bool {
     return switch (column.column_type) {
         .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => true,
-        .datetime, .integer, .number, .boolean, .geopoint => false,
+        .datetime, .integer, .number, .boolean, .geopoint, .enumeration => false,
     };
 }
 
 fn fixedColumnWidth(column: runtime_schema.RelationalColumn) usize {
     return switch (column.column_type) {
         .datetime, .integer, .number => 8,
+        .enumeration => 4,
         .boolean => 1,
         .geopoint => 16,
         .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => 0,
@@ -2327,6 +2370,12 @@ fn cellValueIsSerializable(cell: Cell) bool {
 /// restore/read validation. A trusted physical checksum does not authorize a
 /// value outside its immutable declared SQL domain.
 fn validateSqlCell(column: runtime_schema.RelationalColumn, cell: Cell, validate_modifier_payloads: bool) !void {
+    if ((column.column_type == .enumeration) != (cell.enum_record != null)) return error.InvalidRelationalRow;
+    if (cell.enum_record) |record| {
+        if (column.named_type_id != record.identity.id or cell.value_type != .i64_val or cell.is_json or cell.is_numeric or cell.is_dense_vector or cell.sql_array_element_type != null or cell.sql_range_kind != null or column.sql_element_type != null) return error.InvalidRelationalRow;
+        if (!cell.is_null) _ = try record.definition.byId(std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidSqlEnumSymbol);
+        return;
+    }
     if (column.numeric_modifier) |modifier| modifier.validate() catch return error.InvalidRelationalRow;
     if (column.numeric_modifier != null and (column.sql_element_type != .numeric or
         (column.column_type != .numeric and column.column_type != .sql_array))) return error.InvalidRelationalRow;
@@ -2764,6 +2813,10 @@ pub const JsonMode = enum { physical, logical };
 
 pub fn writeCellValue(scratch: Allocator, writer: *std.Io.Writer, cell: Cell, mode: JsonMode) !void {
     if (cell.is_null) return writer.writeAll("null");
+    if (cell.enum_record) |record| {
+        const label = try record.definition.byId(std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidSqlEnumSymbol);
+        return writeJsonString(writer, label.text);
+    }
     if (cell.sql_range_kind) |kind| {
         if (cell.value_type != .bytes_val) return error.InvalidRelationalRow;
         const value = try @import("../../../sql/range_storage.zig").jsonValueAlloc(scratch, kind, cell.value.bytes_val);

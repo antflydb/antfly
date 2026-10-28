@@ -235,6 +235,43 @@ pub const Record = struct {
     definition: Definition,
     owner: @import("owners.zig").Owner,
 
+    /// Deep ownership for native schema epochs. No JSON arena or catalog
+    /// cursor is retained by an installed schema.
+    pub fn cloneOwned(self: Record, a: A) !Record {
+        const labels = try a.alloc(Label, self.definition.labels.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (labels[0..initialized]) |label| {
+                a.free(label.text);
+                a.free(label.order_key);
+            }
+            a.free(labels);
+        }
+        for (self.definition.labels, labels) |source, *label| {
+            const text = try a.dupe(u8, source.text);
+            errdefer a.free(text);
+            label.* = .{ .id = source.id, .text = text, .order_key = try a.dupe(u8, source.order_key) };
+            initialized += 1;
+        }
+        const owner: @FieldType(Record, "owner") = switch (self.owner) {
+            .auth_disabled => .auth_disabled,
+            .user => |principal| .{ .user = .{ .name = try a.dupe(u8, principal.name), .instance_id = principal.instance_id } },
+            .role => |principal| .{ .role = .{ .name = try a.dupe(u8, principal.name), .instance_id = principal.instance_id } },
+        };
+        return .{ .version = self.version, .identity = self.identity, .definition = .{ .labels = labels }, .owner = owner };
+    }
+    pub fn deinitOwned(self: *Record, a: A) void {
+        for (self.definition.labels) |label| {
+            a.free(label.text);
+            a.free(label.order_key);
+        }
+        a.free(self.definition.labels);
+        switch (self.owner) {
+            .auth_disabled => {},
+            .user, .role => |principal| a.free(principal.name),
+        }
+        self.* = undefined;
+    }
     pub fn validateHeader(self: Record) !void {
         if (self.version != 1) return error.InvalidSqlNamedType;
         try self.identity.validate();

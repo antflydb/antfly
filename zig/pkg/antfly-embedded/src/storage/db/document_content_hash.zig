@@ -271,6 +271,15 @@ fn hashRelationalCellCanonical(
         return;
     }
     switch (column.column_type) {
+        .enumeration => {
+            const record = cell.enum_record orelse return error.InvalidRelationalRow;
+            if (column.named_type_id != record.identity.id) return error.InvalidRelationalRow;
+            const symbol = std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidSqlEnumSymbol;
+            _ = try record.definition.byId(symbol);
+            hasher.update("antfly:sql-enum-symbol:v1\x00");
+            hasher.update(&record.identity.origin_id);
+            hashInt(hasher, u32, symbol);
+        },
         .numrange, .daterange, .tsrange, .tstzrange => {
             var none = std.heap.FixedBufferAllocator.init(&.{});
             const ranges = @import("../../sql/range_value.zig");

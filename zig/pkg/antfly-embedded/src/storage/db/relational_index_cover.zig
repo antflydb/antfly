@@ -19,6 +19,7 @@
 //! row. Physical addressing uses an immutable index-local layout.
 const std = @import("std");
 const schema = @import("../schema.zig");
+const named_types = @import("../../system_catalog/named_types.zig");
 const native = @import("../relational_index.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const Allocator = std.mem.Allocator;
@@ -44,6 +45,8 @@ pub const Plan = struct {
     source_layout: *const codec.PhysicalLayout,
     layout: codec.PhysicalLayout,
     fingerprint: [32]u8,
+    /// Borrow executable definitions from the pinned source; own only this directory.
+    named_types: []const named_types.Record,
 
     pub fn init(alloc: Allocator, source_table: schema.TableSchema, source_layout: *const codec.PhysicalLayout, keys: []const native.RelationalIndexKey, includes: []const []const u8) !Plan {
         if (includes.len == 0 or includes.len > 256 or keys.len + includes.len > 288) return error.InvalidRelationalIndexDefinition;
@@ -104,21 +107,42 @@ pub const Plan = struct {
                 }
             }
         }
-        const layout = try codec.PhysicalLayout.init(alloc, .{ .version = 1, .storage_mode = .relational, .relational_columns = columns });
+        var included = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer included.deinit(alloc);
+        var type_records = std.ArrayList(named_types.Record).empty;
+        defer type_records.deinit(alloc);
+        for (columns) |column| if (column.named_type_id) |id| {
+            const record = schema.namedType(source_table, id) orelse return error.InvalidSchema;
+            var encoded_id: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded_id, id, .little);
+            hash.update("named SQL type");
+            hash.update(&encoded_id);
+            hash.update(&record.identity.origin_id);
+            if (!(try included.getOrPut(alloc, id)).found_existing) try type_records.append(alloc, record.*);
+        };
+        std.mem.sort(named_types.Record, type_records.items, {}, struct {
+            fn less(_: void, left: named_types.Record, right: named_types.Record) bool {
+                return left.identity.id < right.identity.id;
+            }
+        }.less);
+        const registry = try type_records.toOwnedSlice(alloc);
+        errdefer alloc.free(registry);
+        const layout = try codec.PhysicalLayout.init(alloc, .{ .version = 1, .storage_mode = .relational, .requires_public_schema = registry.len != 0, .named_types = registry, .relational_columns = columns });
         var fingerprint: [32]u8 = undefined;
         hash.final(&fingerprint);
-        return .{ .alloc = alloc, .columns = columns, .ordinals = ordinals, .source_layout = source_layout, .layout = layout, .fingerprint = fingerprint };
+        return .{ .alloc = alloc, .columns = columns, .ordinals = ordinals, .source_layout = source_layout, .layout = layout, .fingerprint = fingerprint, .named_types = registry };
     }
 
     pub fn deinit(self: *Plan) void {
         self.layout.deinit();
+        self.alloc.free(self.named_types);
         self.alloc.free(self.columns);
         self.alloc.free(self.ordinals);
         self.* = undefined;
     }
 
     pub fn table(self: *const Plan) schema.TableSchema {
-        return .{ .version = 1, .storage_mode = .relational, .relational_columns = self.columns };
+        return .{ .version = 1, .storage_mode = .relational, .requires_public_schema = self.named_types.len != 0, .named_types = self.named_types, .relational_columns = self.columns };
     }
 
     pub fn contains(self: *const Plan, name: []const u8) bool {
@@ -129,13 +153,25 @@ pub const Plan = struct {
         if (source_table.storage_mode != .relational or source_table.version != layout.schema_version or source_table.relational_columns.len != layout.column_count) return error.RelationalRowSchemaMismatch;
         const ordinals = try alloc.alloc(?usize, self.columns.len);
         errdefer alloc.free(ordinals);
+        var checked_types = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer checked_types.deinit(alloc);
         for (self.columns, ordinals) |column, *ordinal| {
             ordinal.* = layout.ordinalForName(source_table.relational_columns, column.name);
             if (ordinal.*) |bound| {
                 const source_column = source_table.relational_columns[bound];
-                if (source_column.column_type != column.column_type or source_column.json_kind != column.json_kind or source_column.sql_element_type != column.sql_element_type or
+                if (source_column.column_type != column.column_type or source_column.json_kind != column.json_kind or source_column.sql_element_type != column.sql_element_type or source_column.named_type_id != column.named_type_id or
                     !@import("../../common/sql_builtin_type.zig").NumericModifier.eql(source_column.numeric_modifier, column.numeric_modifier) or
                     !std.mem.eql(u8, source_column.path, column.path)) return error.RelationalIndexColumnTypeMismatch;
+                if (column.named_type_id) |id| {
+                    if ((try checked_types.getOrPut(alloc, id)).found_existing) continue;
+                    const previous = schema.namedType(source_table, id) orelse return error.RelationalIndexColumnTypeMismatch;
+                    const current = schema.namedType(self.table(), id) orelse return error.RelationalIndexColumnTypeMismatch;
+                    if (!std.mem.eql(u8, &previous.identity.origin_id, &current.identity.origin_id)) return error.RelationalIndexColumnTypeMismatch;
+                    const common = @min(previous.definition.labels.len, current.definition.labels.len);
+                    for (previous.definition.labels[0..common], current.definition.labels[0..common]) |left, right| {
+                        if (left.id != right.id or !std.mem.eql(u8, left.text, right.text) or !std.mem.eql(u8, left.order_key, right.order_key)) return error.RelationalIndexColumnTypeMismatch;
+                    }
+                }
             } else if (column.required) return error.RelationalIndexColumnNotFound;
         }
         return .{ .alloc = alloc, .layout = layout, .ordinals = ordinals, .fingerprint = self.fingerprint };
