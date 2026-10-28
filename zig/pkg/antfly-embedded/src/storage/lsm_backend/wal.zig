@@ -3218,8 +3218,7 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
 
         pub fn waitWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !AppendResult {
             const admission = @import("../../common/read_admission.zig");
-            _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
-            _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+            _ = try original.physicalWaitAfterLifetime();
             while (true) {
                 try original.checkpoint();
                 if (comptime @import("builtin").is_test) if (test_hook) |hook| try hook(self, original);

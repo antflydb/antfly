@@ -27,6 +27,9 @@ pub const VTable = struct {
     deadline_ns: ?*const fn (*anyopaque) anyerror!?u64 = null,
     retirement_binding: ?*const fn (*anyopaque) anyerror!?Retirement.Binding = null,
     remote_executor: ?*const fn (*anyopaque) anyerror!?HttpExecutor = null,
+    /// Trusted finite original authority may retain its CPU at an owned
+    /// physical wait whose producer needs no retained service fence.
+    retained_physical_wait: ?*const fn (*anyopaque) anyerror!bool = null,
 };
 pub const Boundary = callback.Boundary(VTable);
 /// Explicit synchronous delegation to a separately owned execution. Retire
@@ -103,6 +106,24 @@ pub const Port = extern struct {
     /// Inspect support without running a potentially yielding CPU checkpoint.
     /// This does not grant authority to execute or wait; locked providers use
     /// it only to reject unsupported suspension after checking lifetime.
+    pub fn allowsRetainedPhysicalWait(self: Port) !bool {
+        try self.validate();
+        const payload: *const Payload = @ptrCast(@alignCast(self.payload));
+        if (!payload.vtable_contract.matches(.of(VTable))) return error.UnsupportedVersion;
+        const allowed = payload.vtable.retained_physical_wait orelse return false;
+        return Boundary.call("retained_physical_wait", payload.dispatch, allowed, .{payload.ptr});
+    }
+    /// An owned native I/O producer may poll finite original authority without
+    /// lending CPU. This is never permission to wait for a service lock, ledger
+    /// or another runnable owner. Missing permission remains unsupported.
+    pub fn physicalWaitAfterLifetime(self: Port) !?@import("execution_wait.zig").Boundary {
+        if (try self.executionWaitAfterLifetime()) |boundary| {
+            _ = (try self.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+            return boundary;
+        }
+        if (!try self.allowsRetainedPhysicalWait()) return error.ExecutionWaitUnsupported;
+        return null;
+    }
     pub fn hasExecutionWait(self: Port) !bool {
         try self.validate();
         const payload: *const Payload = @ptrCast(@alignCast(self.payload));
@@ -160,8 +181,12 @@ pub const ErrorRelay = struct {
         const original_payload: *const Payload = @ptrCast(@alignCast(original.payload));
         self.original = original;
         self.rejection = null;
-        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = lifetime, .wait_for_progress = wait, .deadline_ns = deadline, .retirement_binding = retirement, .remote_executor = remoteExecutor }, .execution_wait = original_payload.execution_wait, .delegation = original_payload.delegation };
+        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = lifetime, .wait_for_progress = wait, .deadline_ns = deadline, .retirement_binding = retirement, .remote_executor = remoteExecutor, .retained_physical_wait = retainedPhysicalWait }, .execution_wait = original_payload.execution_wait, .delegation = original_payload.delegation };
         return Port.init(&self.payload);
+    }
+    fn retainedPhysicalWait(raw: *anyopaque) !bool {
+        const self = try source(raw);
+        return self.original.allowsRetainedPhysicalWait() catch |cause| return self.reject(cause);
     }
     fn source(raw: *anyopaque) !*ErrorRelay {
         const self: *ErrorRelay = @ptrCast(@alignCast(raw));
@@ -453,7 +478,7 @@ pub const RejectionTrace = struct {
         self.original = original;
         self.failure = null;
         if (original == null) return null;
-        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = checkLifetime, .wait_for_progress = waitForProgress, .deadline_ns = deadlineNs, .retirement_binding = retirementBinding, .remote_executor = remoteExecutor } };
+        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = checkLifetime, .wait_for_progress = waitForProgress, .deadline_ns = deadlineNs, .retirement_binding = retirementBinding, .remote_executor = remoteExecutor, .retained_physical_wait = retainedPhysicalWait } };
         // Forward capability metadata as well as callbacks. Hiding a lending
         // boundary would bypass DocStore's retained-capture eligibility guard.
         // Invalid input stays a sticky failure without dereferencing its payload.
@@ -465,6 +490,14 @@ pub const RejectionTrace = struct {
             } else self.failure = error.UnsupportedVersion;
         } else |cause| self.failure = cause;
         return Port.init(&self.payload);
+    }
+    fn retainedPhysicalWait(raw: *anyopaque) !bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.failure) |cause| return cause;
+        return self.original.?.allowsRetainedPhysicalWait() catch |cause| {
+            self.failure = cause;
+            return cause;
+        };
     }
     fn originalDelegation(self: *@This()) Delegation {
         const source: *const Payload = @ptrCast(@alignCast(self.original.?.payload));
@@ -640,4 +673,37 @@ test "controlled dense finalization delegation relays retain separate capability
     try checked.endDelegation();
     try std.testing.expectEqual(error.NotFound, relay.errors.rejection.?);
     try std.testing.expectEqual(@as(usize, 2), probe.ends);
+}
+
+test "retained physical wait permission survives transparent relays but not captured dependencies" {
+    const std = @import("std");
+    const Owner = struct {
+        cause: ?anyerror = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cause) |cause| return cause;
+        }
+        fn retained(_: *anyopaque) !bool {
+            return true;
+        }
+    };
+    var owner: Owner = .{};
+    const payload: Payload = .{ .ptr = &owner, .vtable = &.{ .checkpoint = Owner.check, .check_lifetime = Owner.check, .retained_physical_wait = Owner.retained } };
+    const original = Port.init(&payload);
+    try std.testing.expect(try original.allowsRetainedPhysicalWait());
+    try std.testing.expect(!try original.hasExecutionSuspension());
+    try std.testing.expect(try original.physicalWaitAfterLifetime() == null);
+    var trace: RejectionTrace = .{};
+    const traced = trace.bind(original).?;
+    var relay: ErrorRelay = .{};
+    const relayed = try relay.bind(traced);
+    try std.testing.expect(try relayed.physicalWaitAfterLifetime() == null);
+    var capture: RetainedDependency = .{};
+    const captured = capture.bind(relayed).?;
+    try std.testing.expect(!try captured.allowsRetainedPhysicalWait());
+    try std.testing.expectError(error.ExecutionWaitUnsupported, captured.physicalWaitAfterLifetime());
+    owner.cause = error.DeadlineExceeded;
+    try std.testing.expectError(error.Canceled, relayed.physicalWaitAfterLifetime());
+    try std.testing.expectEqual(@as(?anyerror, error.DeadlineExceeded), relay.rejection);
+    try std.testing.expectEqual(@as(?anyerror, error.DeadlineExceeded), trace.failure);
 }

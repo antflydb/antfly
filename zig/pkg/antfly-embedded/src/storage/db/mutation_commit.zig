@@ -980,7 +980,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // portable runtime activation. Rechecking under apply also closes the
             // interval between the fast preflight above and lock acquisition.
             var publication_admission: mutation_admission.IntentCollection = .{};
-            const publication_control = publication_admission.bind(snapshot_controls, S.ownerField(self, "core").*.apply_mutex.io);
+            const publication_control = publication_admission.bindPublication(snapshot_controls, S.ownerField(self, "core").*.apply_mutex.io);
             var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
             defer prepared_artifacts.deinit();
             if (write_plan_snapshot == null and (S.ownerField(self, "core").*.index_manager.hasGroupSources() or opts.group_source_command != null) and

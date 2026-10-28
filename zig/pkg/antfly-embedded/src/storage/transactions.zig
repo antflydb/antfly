@@ -697,7 +697,7 @@ pub const TxnManager = struct {
     pub fn initTransactionRequiringPreparedEffectsWithBinding(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: prepared_effects.Requirement, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
         if (binding) |value| _ = try value.encode();
         var trace: BeginAdmissionTrace = .{};
-        self.initRequiredPreparationInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, requirement, binding, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
+        self.initRequiredPreparationInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, requirement, binding, extra_batch, trace.bind(original)) catch |err| return if (err == error.DurabilityOutcomeUnknown) err else trace.failure orelse err;
         if (trace.failure) |cause| return cause;
     }
 
@@ -936,7 +936,7 @@ pub const TxnManager = struct {
 
     pub fn writeIntentsExtraBatchWithAdmission(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
         var trace: MutationAdmissionTrace = .{};
-        return self.writeIntentsExtraBatchInner(txn_id, intents, predicates, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
+        return self.writeIntentsExtraBatchInner(txn_id, intents, predicates, extra_batch, trace.bind(original)) catch |err| return if (err == error.DurabilityOutcomeUnknown) err else trace.failure orelse err;
     }
 
     fn writeIntentsExtraBatchInner(
@@ -1205,7 +1205,7 @@ pub const TxnManager = struct {
         if (batch.expected_intent_revision) |revision| if (revision != contract.intent_revision) return error.IntentSnapshotChanged;
         batch.expected_intent_revision = contract.intent_revision;
         var trace: MutationAdmissionTrace = .{};
-        return self.resolveIntentsWithPreparedEffects(txn_id, .committed, timestamp, batch, &plan.fingerprint, trace.bind(original)) catch |err| return trace.failure orelse err;
+        return self.resolveIntentsWithPreparedEffects(txn_id, .committed, timestamp, batch, &plan.fingerprint, trace.bind(original)) catch |err| return if (err == error.DurabilityOutcomeUnknown) err else trace.failure orelse err;
     }
 
     fn resolveIntentsWithPreparedEffects(self: *TxnManager, txn_id: TxnId, status: TxnStatus, timestamp: u64, extra_batch: ResolutionExtraBatch, consumed: ?*const [32]u8, control: ?read_control.Port) !ResolutionOutcome {

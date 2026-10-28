@@ -18,15 +18,30 @@ const std = @import("std");
 const admission = @import("read_admission.zig");
 
 pub fn until(io: ?std.Io, original: admission.Port, context: *anyopaque, ready: *const fn (*anyopaque) anyerror!bool, event: ?*std.Io.Event) !void {
+    return untilWithPolicy(io, original, context, ready, event, false);
+}
+
+/// The native mailbox worker owns every producer dependency. A publication
+/// holding DB fences may explicitly retain CPU while waiting for this worker.
+pub fn untilPhysical(io: ?std.Io, original: admission.Port, context: *anyopaque, ready: *const fn (*anyopaque) anyerror!bool, event: ?*std.Io.Event) !void {
+    return untilWithPolicy(io, original, context, ready, event, true);
+}
+
+fn untilWithPolicy(io: ?std.Io, original: admission.Port, context: *anyopaque, ready: *const fn (*anyopaque) anyerror!bool, event: ?*std.Io.Event, comptime physical: bool) !void {
     var trace: admission.RejectionTrace = .{};
     const control = trace.bind(original).?;
-    const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
-    _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+    const boundary: ?@import("execution_wait.zig").Boundary = if (physical)
+        try control.physicalWaitAfterLifetime()
+    else blk: {
+        const lending = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        break :blk lending;
+    };
     while (true) {
         try control.checkpoint();
         if (try ready(context)) return;
         const lane = io orelse return error.BackendRuntimeUnavailable;
-        try boundary.beginWait();
+        if (boundary) |lending| try lending.beginWait();
         var failure: ?anyerror = null;
         while (true) {
             control.checkLifetime() catch |cause| {
@@ -51,7 +66,7 @@ pub fn until(io: ?std.Io, original: admission.Port, context: *anyopaque, ready: 
                 break;
             };
         }
-        boundary.endWait() catch |cause| {
+        if (boundary) |lending| lending.endWait() catch |cause| {
             if (failure) |first| return first;
             return trace.failure orelse cause;
         };

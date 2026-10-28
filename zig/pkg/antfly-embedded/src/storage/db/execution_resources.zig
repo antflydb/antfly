@@ -1013,6 +1013,7 @@ pub const PreparationProviderScope = struct {
     /// Restore the native admission cause after inference's transport aliases.
     /// Inspect only an already latched rejection; never poll after durability.
     pub fn originalFailure(self: *const @This(), fallback: anyerror) anyerror {
+        if (fallback == error.DurabilityOutcomeUnknown) return fallback;
         self.rejection.check() catch |cause| return cause;
         return fallback;
     }

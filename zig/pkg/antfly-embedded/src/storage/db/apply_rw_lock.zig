@@ -39,6 +39,10 @@ pub const ApplyRwLock = struct {
     pub const Acquisition = struct {
         lifetime: @import("../../search/work_authority.zig").Authority,
         execution_wait: ?@import("../../common/execution_wait.zig").Boundary = null,
+        /// The trusted lifetime enforces a finite deadline while CPU is held.
+        /// Only publication may use this for independent owned native I/O.
+        /// It grants no permission to wait for locks or resource progress.
+        retained_physical_wait: bool = false,
     };
 
     // One atomic word linearizes reader admission against writer closure.

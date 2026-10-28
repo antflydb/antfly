@@ -225,10 +225,10 @@ pub const Frame = struct {
         };
     }
     pub fn prepareForeground(self: *Frame, backend: anytype, incoming: *const @import("state.zig").ActiveMemTable, original: admission.Port) !void {
-        const boundary = (try original.executionWait()).?;
-        try boundary.beginWait();
+        const boundary = try original.physicalWaitAfterLifetime();
+        if (boundary) |lending| try lending.beginWait();
         const funded = self.credit.growBoundedOversized(@sizeOf(foreground_append.Owner), 1);
-        try boundary.endWait();
+        if (boundary) |lending| try lending.endWait();
         try funded;
         self.foreground_owner = &(try allocate(foreground_append.Owner, backend.allocator, 1, original))[0];
         self.foreground_owner.?.* = .{};

@@ -63,11 +63,12 @@ pub const Owner = struct {
         const record_len = try wal.stateRecordLenWithAdmission(incoming, original);
         if (backend.options.wal_hard_limit_bytes != 0 and record_len > backend.options.wal_hard_limit_bytes) return error.WalRecordTooLarge;
         const bound = try std.math.add(u64, try self.cpu.memoryBoundWithAdmission(original), try std.math.add(u64, record_len, try backend.storage.?.appendResourceBytes(record_len)));
-        const boundary = (try original.executionWait()).?;
-        // Capacity growth may wait on its own ledger; service guards are gone.
-        try boundary.beginWait();
+        const boundary = try original.physicalWaitAfterLifetime();
+        // Lending callers release CPU. Guarded publication keeps its original
+        // CPU and may refuse funding, without waiting for another runnable.
+        if (boundary) |lending| try lending.beginWait();
         const funded = credit.growBoundedOversized(bound, 1);
-        try boundary.endWait();
+        if (boundary) |lending| try lending.endWait();
         try funded;
         try self.cpu.resumeWithAdmission(backend.allocator, original);
         self.record = try wal.prepareStateRecordWithAdmission(backend.allocator, incoming, original);

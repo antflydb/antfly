@@ -164,13 +164,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const guarded_commit_tests = b.addTest(.{
         .name = "guarded-db-commit-tests",
         .root_module = guarded_commit_root,
-        .filters = &.{"guarded managed DB commit"},
+        .filters = &.{ "guarded managed DB commit", "retained physical wait", "guarded incremental publication" },
         .max_rss = 8 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const guarded_commit_run = b.addRunArtifact(guarded_commit_tests);
     guarded_commit_run.addArg("--require-no-skips");
-    b.step("antfly-guarded-db-commit-test", "Verify managed DB commit retirement and recovery with one ordinary CPU")
+    b.step("antfly-guarded-db-commit-test", "Verify original guarded WAL controls, protected joins and recovery with one ordinary CPU")
         .dependOn(&guarded_commit_run.step);
 
     const physical_metadata_root = b.createModule(.{

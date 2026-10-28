@@ -382,6 +382,14 @@ pub const IntentCollection = struct {
     original: ?lock.ApplyRwLock.Acquisition = null,
     io: ?@import("std").Io = null,
     payload: read.Payload = undefined,
+    retained_physical_wait: bool = false,
+    /// Publication retains the original finite authority and CPU while native
+    /// mailbox I/O runs independently of apply/snapshot/policy service fences.
+    pub fn bindPublication(self: *@This(), controls: ?lock.ApplyRwLock.Acquisition, io: ?@import("std").Io) ?read.Port {
+        const port = self.bind(controls, io) orelse return null;
+        self.retained_physical_wait = self.original.?.retained_physical_wait;
+        return port;
+    }
     pub fn bind(self: *@This(), controls: ?lock.ApplyRwLock.Acquisition, io: ?@import("std").Io) ?read.Port {
         return self.bindBeforeMutation(controls, io, null);
     }
@@ -401,9 +409,14 @@ pub const IntentCollection = struct {
         else
             retainedLeaseControls(controls);
         self.io = io;
+        self.retained_physical_wait = false;
         if (self.original == null) return null;
-        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = check, .wait_for_progress = if (pre_decision) waitPreDecision else wait, .check_lifetime = if (pre_decision) check else null }, .execution_wait = if (pre_decision) self.original.?.execution_wait else null };
+        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = check, .wait_for_progress = if (pre_decision) waitPreDecision else wait, .check_lifetime = check, .retained_physical_wait = retainedPhysicalWait }, .execution_wait = if (pre_decision) self.original.?.execution_wait else null };
         return read.Port.init(&self.payload);
+    }
+    fn retainedPhysicalWait(raw: *anyopaque) !bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.retained_physical_wait;
     }
     fn check(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -653,7 +666,7 @@ test "mutation apply admission original rejection and missing Io leave legacy fe
     try std.testing.expectError(error.MissingBackendRuntimeIo, lockApply(&owner, .{ .lifetime = .{ .context = &state, .check_fn = State.check } }));
     try std.testing.expectEqual(@as(usize, 0), state.checks);
     try lockApply(&owner, null);
-    ownerField(owner, "core").*.unlockApply();
+    ownerField(&owner, "core").*.unlockApply();
     try std.testing.expect(mutex.tryLockExclusive());
     mutex.unlockExclusive();
 }
@@ -800,7 +813,7 @@ test "mutation apply admission replication barrier preserves original CPU lifeti
                 try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
                 try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
                 try std.testing.expectEqual(@as(u64, 256), scheduler.stats().retained_bytes);
-                try std.testing.expectEqual(@as(usize, 0), ownerField(owner, "local_execution").*.row_policy_gate.readers.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), ownerField(&owner, "local_execution").*.row_policy_gate.readers.load(.acquire));
                 // A waiting BEGIN frees the sole ordinary slot as well as allowing
                 // reserved control work. No policy lease is held while it waits.
                 var ordinary: native.Execution = .{};
@@ -823,7 +836,7 @@ test "mutation apply admission replication barrier preserves original CPU lifeti
                 if (case == .canceled) canceled.store(true, .release);
                 if (case == .expired) Clock.current.store(20 * std.time.ns_per_s, .release);
                 if (case == .closed) scheduler.close();
-                if (case == .policy_changed) try ownerField(owner, "local_execution").*.row_policy_gate.beginPreparing(.disabled);
+                if (case == .policy_changed) try ownerField(&owner, "local_execution").*.row_policy_gate.beginPreparing(.disabled);
                 if (shared) |*lease| {
                     lease.release();
                     shared = null;
@@ -847,7 +860,7 @@ test "mutation apply admission replication barrier preserves original CPU lifeti
                     try std.testing.expectEqual(@as(?anyerror, expected), worker.err);
                     try std.testing.expect(!worker.acquired);
                 }
-                try std.testing.expectEqual(@as(usize, 0), ownerField(owner, "local_execution").*.row_policy_gate.readers.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), ownerField(&owner, "local_execution").*.row_policy_gate.readers.load(.acquire));
                 try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
                 try std.testing.expectEqual(@as(u64, 0), barrier.pendingExclusiveAcquisitions());
                 var reusable = barrier.tryAcquireExclusive() orelse return error.TestExpectedReleasedBarrier;
@@ -893,17 +906,17 @@ test "mutation apply admission retained resolution lease checks original lifetim
         .lifetime = .{ .context = &state, .check_fn = State.life },
         .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
     };
-    ownerField(owner, "core").*.apply_mutex.lockShared();
+    ownerField(&owner, "core").*.apply_mutex.lockShared();
     var held = true;
-    defer if (held) ownerField(owner, "core").*.apply_mutex.unlockShared();
+    defer if (held) ownerField(&owner, "core").*.apply_mutex.unlockShared();
     try std.testing.expectError(error.DeadlineExceeded, lockApply(&owner, retainedLeaseControls(original)));
     try std.testing.expect(original.execution_wait != null);
     try std.testing.expectEqual(@as(usize, 3), state.checks);
     try std.testing.expectError(error.DeadlineExceeded, checkLifetime(retainedLeaseControls(original)));
-    ownerField(owner, "core").*.apply_mutex.unlockShared();
+    ownerField(&owner, "core").*.apply_mutex.unlockShared();
     held = false;
-    try std.testing.expect(ownerField(owner, "core").*.apply_mutex.tryLockExclusive());
-    ownerField(owner, "core").*.apply_mutex.unlockExclusive();
+    try std.testing.expect(ownerField(&owner, "core").*.apply_mutex.tryLockExclusive());
+    ownerField(&owner, "core").*.apply_mutex.unlockExclusive();
 }
 
 test "mutation apply admission intent collection borrows original lifetime and prohibits CPU transfer" {

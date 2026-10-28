@@ -7640,7 +7640,8 @@ pub const Backend = struct {
     /// retain their existing non-lending policy until their phase handoff.
     pub fn publishMutableWithWalAdmission(self: *Backend, incoming: *ActiveMemTable, original: read_admission.Port, retired_without_commit: *bool) !bool {
         try original.checkpoint();
-        if (!try original.hasExecutionWait() or (try original.deadlineNs()) == null) return false;
+        const retained_cpu_wait = !try original.hasExecutionWait() and try original.allowsRetainedPhysicalWait();
+        if (!retained_cpu_wait and (!try original.hasExecutionWait() or (try original.deadlineNs()) == null)) return false;
         const owner = self.background_executor.runtime orelse return false;
         const manager = self.options.resource_manager orelse return false;
         if (!self.background_executor.canRunDetached() or owner.runnableOwner() == null or manager.allocator_host_source == null) return false;
@@ -7710,6 +7711,10 @@ pub const Backend = struct {
             };
         }
         written catch |cause| {
+            // The DB may no longer prove pre-decision rejection after an
+            // accepted append. Preserve that ambiguity across API cancellation
+            // translation; recovery owns the primary record from this point.
+            if (retained_cpu_wait and work.recovery) return error.DurabilityOutcomeUnknown;
             if (cause == error.WalRetentionLimitExceeded) {
                 self.write_stats.wal_pressure_rejections +|= 1;
                 self.wal_pressure_blocked = true;

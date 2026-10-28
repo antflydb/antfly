@@ -1318,7 +1318,7 @@ pub const ActiveMemTable = struct {
                 self.planned_bytes = try std.math.add(u64, self.planned_bytes, bytes);
                 self.planned_index += 1;
             }
-            const nodes = try self.candidate.ordered.prepareMemoryBound(self.source.entryCount());
+            const nodes = try self.candidate.ordered.incrementalPublicationMemoryBound(self.source.entryCount());
             const bound = try std.math.add(u64, nodes, self.planned_bytes);
             try original.checkpoint();
             self.allocation_bound = bound;

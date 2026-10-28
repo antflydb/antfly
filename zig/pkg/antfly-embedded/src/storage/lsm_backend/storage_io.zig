@@ -3251,8 +3251,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     const read_vtable: ControlFileReadOperation.VTable = .{ .wait_with_admission = waitRead, .deinit = retireOperation };
 
     fn requireControl(original: read_admission.Port) !void {
-        _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
-        _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        _ = try original.physicalWaitAfterLifetime();
         try original.checkpoint();
     }
 
@@ -3613,7 +3612,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
         std.debug.assert(self.active);
         // Only the atomic completion bit is inspected while CPU is parked.
-        try @import("../../common/cleanup_wait.zig").until(self.permit.io, original, self, ready, null);
+        try @import("../../common/cleanup_wait.zig").untilPhysical(self.permit.io, original, self, ready, null);
         if (self.invalidation_pending) {
             try self.permit.cache.fencePathRetainingEntries(self.permit.state.cache_namespace, self.permit.io, self.path[0..self.path_len], original);
             self.invalidation_pending = false;
@@ -3646,11 +3645,11 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     fn retireWithAdmission(raw: *anyopaque, original: read_admission.Port) !void {
         const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
         try requireControl(original);
+        const boundary = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
         if (self.active or self.private_owned) return error.ResourceBudgetExceeded;
         self.phase.store(.stopping, .release);
         self.wake.set(self.permit.io);
         if (!self.joined) {
-            const boundary = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
             try boundary.begin(boundary.ptr);
             self.future.await(self.permit.io);
             self.joined = true; // Commit the join before fallible reentry.

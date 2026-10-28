@@ -344,6 +344,24 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             return std.math.add(u64, @sizeOf(Account), try std.math.add(u64, nodes, vectors));
         }
 
+        /// Additional resident memory for one private fork edited in place,
+        /// replenishing only one edit's spare frontier at a time. No intermediate
+        /// candidate may be retained/published: each old node is then copied at
+        /// most once, and each insertion adds at most one private tree node.
+        pub fn incrementalPublicationMemoryBound(self: *const Self, edits: usize) !u64 {
+            const maximum_size = try std.math.add(usize, size(self.root), edits);
+            const tree_nodes = @min(try self.preparedNodeCount(edits), maximum_size);
+            // An AVL tree's height is below twice its node-count bit length.
+            // Include all one-edit spares even at the final grown tree height.
+            const height: usize = if (maximum_size == 0) 0 else 2 * (@as(usize, std.math.log2_int(usize, maximum_size)) + 1);
+            const frontier = if (edits == 0) 0 else 3 * height + 4;
+            const needed = try std.math.add(usize, tree_nodes, frontier);
+            const capacity = if (frontier == 0) 0 else std.ArrayListUnmanaged(*Node).growCapacity(frontier);
+            const vectors = try std.math.mul(u64, capacity, 2 * @sizeOf(*Node));
+            const nodes = try std.math.mul(u64, needed, @sizeOf(Node));
+            return std.math.add(u64, @sizeOf(Account), try std.math.add(u64, nodes, vectors));
+        }
+
         pub fn prepareEdits(self: *Self, allocator: std.mem.Allocator, edits: usize) !void {
             try self.prepareEditsControlled(allocator, edits, null);
         }

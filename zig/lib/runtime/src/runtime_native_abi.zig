@@ -146,7 +146,8 @@ const builtin = @import("builtin");
 // generation-stamped retention state independently of dedicated replay.
 // Periodic checkpoints retain admitted rotation and private retirement plans.
 // Foreground commits carry original admission across the native batch boundary.
-pub const abi_version: u32 = 162;
+// Finite guarded publication distinguishes retained CPU from lending physical waits.
+pub const abi_version: u32 = 163;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

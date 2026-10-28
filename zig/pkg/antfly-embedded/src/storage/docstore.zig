@@ -3221,6 +3221,9 @@ pub const DocStore = struct {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             self.putBatchWithReplayOnceAndParticipantAndMetadata(writes, deletes, replay, options, participant, metadata, original) catch |err| {
+                // A possibly accepted primary append cannot become a proven
+                // admission rejection merely because its original scope expired.
+                if (err == error.DurabilityOutcomeUnknown) return err;
                 // A foreign admission denial may share a backend retry name.
                 // Retrying it can swallow the original failure and commit.
                 if (trace.failure) |cause| return cause;
