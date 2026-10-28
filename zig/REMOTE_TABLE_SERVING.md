@@ -2034,6 +2034,14 @@ reuse does not materialize its expanded suffix stream. These lifetimes are
 independent of private captured-offset runs, which still outlive analysis only
 through compressed variant locators.
 
+The optional process-wide compiled-contribution cache serves a different
+representation: compact term dictionaries and positions, without original byte
+spans. Source capture and active document-local token leases take precedence;
+compiled contributions may replace analysis only when neither needs the token
+stream. This keeps cross-document acceleration available for ordinary builds
+and substring producers without dropping highlight offsets or retaining a
+second token owner. A warm-cache oracle covers both single and grouped bindings.
+
 No API options or result-size limits change. Native reader protocol 93 and
 compiled runtime ABI 69 fence the new source layout; older derived text
 publications rebuild through reconciliation. Qualification includes exact

@@ -5050,19 +5050,23 @@ test "introducer.substring stream admits only nonempty field contributions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var capture = SourceCapture.init(a, false, null, ".", null);
+    defer capture.deinit();
+    var reuse = AnalysisReuse.init(std.testing.allocator);
+    defer reuse.deinit();
     var fields: std.StringHashMapUnmanaged(FieldAcc) = .empty;
     defer {
         var entries = fields.valueIterator();
         while (entries.next()) |entry| entry.deinit();
     }
     for ([_]*const analysis_mod.Analyzer{ &analysis_mod.substring_analyzer, &analysis_mod.default_analyzer }) |analyzer| {
-        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "empty", analyzer, "", null, false, null, false);
-        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "punctuation", analyzer, "...", null, false, null, false);
+        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "empty", analyzer, "", null, false, &capture, 0, "source", null, &reuse, null, false);
+        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "punctuation", analyzer, "...", null, false, &capture, 0, "source", null, &reuse, null, false);
         try std.testing.expectEqual(@as(u32, 0), fields.count());
     }
-    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "NEEDLE", null, false, null, false);
+    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "NEEDLE", null, false, &capture, 0, "source", null, &reuse, null, false);
     const before = fields.get("source").?.token_offset;
-    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "", null, false, null, false);
+    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "", null, false, &capture, 0, "source", null, &reuse, null, false);
     try std.testing.expectEqual(before, fields.get("source").?.token_offset);
     try std.testing.expectEqual(@as(u32, 1), fields.count());
 }
