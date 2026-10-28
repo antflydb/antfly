@@ -5,6 +5,54 @@ image, and SDKs from tags. The intended long-term shape is that each supported
 OS, architecture, and libc ABI is built once and every downstream channel
 consumes those same archives.
 
+## Independent grep releases
+
+`antfly-grep` uses its own tags, versions and GitHub Releases:
+`antfly-grep/vX.Y.Z` for stable versions and
+`antfly-grep/vX.Y.Z-{alpha,beta,rc}.N` for prereleases. It is not built or bundled
+by Antfly server or embedded-library releases. Historical source commits retain
+their original packaging behavior.
+
+To request a release after these workflows have merged to `main`:
+
+```sh
+git fetch origin main
+git tag -a antfly-grep/v0.1.0-rc.1 origin/main -m 'Antfly Grep 0.1.0-rc.1'
+git push origin refs/tags/antfly-grep/v0.1.0-rc.1
+```
+
+The read-only `grep-release-request.yml` workflow emits a tag request. The
+`grep-release.yml` controller runs from the default branch, validates the actual
+tag event and source ancestry on `main`, and pins all release tools to its own
+commit. Archive builds have only repository read permission and the existing
+bucket-scoped dependency reader; they fetch verified Zig sources from GCS.
+Only the final publication job has repository write permission, behind the
+existing `release-promotion` environment approval.
+
+Each release builds five standalone archives, named
+`antfly-grep_<version>_<OS>_<arch>[_gnu].tar.gz`: Linux x86-64/ARM64 in portable
+musl and glibc 2.28+ variants, plus macOS 15+ ARM64. Every archive is installed
+and executed on its native architecture before publication. Qualification checks
+its independent version, help output, a matching search, a nonmatching search's
+exit status, and installed manpage/completion/schema files. GNU builds support
+optional dynamically loaded local inference; portable musl builds do not.
+
+A complete release contains those five archives, `grep-release.json` (source,
+controller, build identity and per-platform digests), and `SHA256SUMS`. Publication
+requires the exact platform set and verified checksums. Existing release assets
+are verified and never overwritten; use Re-run failed jobs on the same workflow
+run after a transient failure. A moved tag, changed control policy or different release bytes fail
+closed. Grep releases explicitly disable GitHub's repository-wide Latest marker,
+so Antfly's existing stable install channel is unaffected. Grep publication does
+not publish Antfly npm/PyPI packages, containers, Homebrew formulas or docs.
+
+Users download from the corresponding namespaced GitHub Release, verify their
+archive's matching entry in `SHA256SUMS` with `sha256sum --check` (or
+`shasum -a 256 --check`; see the grep README for a single-archive example), extract their
+platform archive, and run `./install.sh --prefix "$HOME/.local"`. The installer
+copies only grep and its supporting assets; no Antfly server or libantfly is
+required. Add the selected prefix's `bin` directory to `PATH`.
+
 ## Release Artifacts
 
 The canonical Zig runtime artifacts are tarballs named:
