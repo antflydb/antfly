@@ -1265,3 +1265,76 @@ the fixture oracle. The supplemental phrase E2E passes in 8.18 seconds; the othe
 36 real-file cases retain their successful full-suite qualification. All initial,
 slower and reversed-order observations remain recorded. Real-provider qualification
 continues to be deferred.
+
+### Streamed hidden highlights and covering-directory preparation
+
+Hidden highlights now consume authenticated source values field by field across
+all selected rows under each pack pin. The hydrator retains four field cursors;
+the consumer retains row-type context and finished snippets in amortized
+accumulators. Borrowed bodies are released after each callback. Matching keeps a
+per-value cancellation checkpoint, and final field order follows explicit
+highlight options. Projected-source highlighting still uses the shared matcher.
+
+Covering preparation shares authenticated decoded-directory leases with direct
+loads and submits cold directory misses through joined I/O waves of at most four
+jobs. Each directory has a 1 MiB decoded allowance. The caller admits directory
+wire bytes before preparation and selected stripe bytes before payload reads.
+Prepared leases remain alive until the wave is consumed. Cancellation, rejected
+budgets and provider errors join all tasks and release their leases/reservations.
+
+Native checks exercise 256 rows and eight streamed source fields with eight
+column opens and eight decodes, matching whole-selection projection. Directory
+checks observe one concurrent read when I/O scheduling is saturated and four
+with four admitted lanes; warm preparation and payload loading perform zero
+provider reads with both raw caches disabled. These are structural checks, not
+real-cloud latency measurements. Shared tests compare whole-row and streamed
+highlight output for aliases, arrays and explicit/default field selection, and
+exercise allocation failures.
+
+The focused runner uses independently written Parquet, eight approximately
+1 KiB text columns, 256 ranked hits, a narrow hidden-field control and a fully
+projected control. Run immutable executables in both orders from the repository
+root; reports retain individual samples, phase counters, input and executable
+hashes, and complete hit digests:
+
+```bash
+zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/hidden_highlights.py before-primary /path/to/reviewed-antfly BEFORE_SOURCE_COMMIT
+zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/hidden_highlights.py after-primary /path/to/final-antfly AFTER_SOURCE_COMMIT
+zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/hidden_highlights.py after-reverse /path/to/final-antfly AFTER_SOURCE_COMMIT
+zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/hidden_highlights.py before-reverse /path/to/reviewed-antfly BEFORE_SOURCE_COMMIT
+```
+
+The final executable includes the requested main merges. The comparison retains
+that provenance and does not claim a strictly isolated same-main source control.
+Local Debug timings do not qualify Release, real-cloud or archive-scale latency.
+
+The [hidden-highlight observation](native-hidden-highlights-v1-observation.json)
+records reviewed runtime `04c923a48b6f` (also the production source of the reviewed
+`d6b8d93` executable) and final runtime `afcde2f5f55f`, including main
+`073dfddf4866`. Their immutable executable SHA-256 values are retained in every
+run. Three warm samples per query shape were measured in each binary order;
+all 36 responses preserve complete hits and exact totals of 256. Query and
+Parquet hashes also match across all runs.
+
+Warm end-to-end medians, milliseconds:
+
+| Query shape | Before, primary | After, primary | Before, reverse | After, reverse |
+|---|---:|---:|---:|---:|
+| Eight hidden highlight fields | 914.67 | 287.50 | 918.31 | 291.76 |
+| Eight projected highlight fields | 271.13 | 274.73 | 276.56 | 253.71 |
+| One hidden highlight field | 123.33 | 125.67 | 122.49 | 104.19 |
+
+The wide hidden highlight phase falls from 838.47 to 201.73 ms in the primary
+order and 829.46 to 225.33 ms in reverse order. The projected control's highlight
+phase is 147.53 to 148.21 ms and 146.39 to 152.61 ms; the narrow hidden control is
+55.64 to 55.95 ms and 56.40 to 56.12 ms. All slower controls and individual samples
+are retained. The approximately 3.2x end-to-end improvement is specific to the
+wide hidden-field fixture; lower wall times in the reverse-order controls do
+not establish a general search improvement.
+
+The final merged runtime builds with Zig 0.17.0. Its 70 targeted native checks
+pass with zero failures, skips or leaks. All 30 real Parquet archive E2Es and all
+16 real Iceberg/SQL E2Es pass on the same frozen executable. Wide hidden
+highlights are compared with fully projected output in both directions, after
+restart, and with the original Parquet object unavailable. Subsequent changes
+record benchmark evidence and documentation only.

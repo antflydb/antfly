@@ -112,6 +112,7 @@ def sha(path):
 binary_hash = sha(binary)
 samples = []
 oracles = {}
+totals = {}
 with bench.managed_server(
     harness.StandaloneAntflyServer,
     binary,
@@ -156,8 +157,10 @@ with bench.managed_server(
                 digest = hashlib.sha256(encoded.encode()).hexdigest()
                 if mode in oracles:
                     assert oracles[mode] == digest
+                    assert totals[mode] == response["hits"]["total"]
                 else:
                     oracles[mode] = digest
+                    totals[mode] = response["hits"]["total"]
                     (out / f"{mode}-hits.json").write_text(encoded + "\n")
                 samples.append(
                     {
@@ -173,6 +176,7 @@ with bench.managed_server(
                         ]
                         - before["antfly_lake_query_hydration_nanoseconds_total"],
                         "hits_sha256": digest,
+                        "total": response["hits"]["total"],
                     }
                 )
     finally:
@@ -188,6 +192,7 @@ report = {
     "queries": queries,
     "samples": samples,
     "hit_oracles": oracles,
+    "totals": totals,
     "summary": {
         mode: {
             key: statistics.median(
