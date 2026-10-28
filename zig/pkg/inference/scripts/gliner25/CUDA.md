@@ -8,7 +8,7 @@ and decoding retain the shared bounded host stages and transfer diagnostics.
 
 ## Build
 
-From the repository root, using Zig 0.16.0:
+From the repository root, using the repository-pinned Zig toolchain:
 
 ```sh
 zig build --build-file zig/pkg/inference/build.zig bench-gliner25-cuda-build \
@@ -417,6 +417,150 @@ only.
 
 ## Release gates still required
 
+### Production serving checks on GB10
+
+The serving gate is separate from `test-gliner25-cuda`, which exercises kernel
+and training primitives. Build its standalone executable from the repository
+root, keeping caches and installed output in the worktree:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" zig build \
+  --build-file zig/pkg/inference/build.zig gliner25-production-cuda-test-build \
+  -Doptimize=ReleaseFast -Dcpu=baseline+sha2 \
+  -Dcuda=true -Dmetal=false -Dcuda-artifacts=fatbin \
+  --cache-dir .zig-cache/inference --prefix "$PWD/zig-out"
+```
+
+The GB10 CPU supports ARM SHA-256 instructions; `baseline+sha2` accelerates
+mandatory checkpoint authentication while retaining the baseline floating-point
+instruction set. Whole-file GLiNER verification also temporarily enables
+sequential mmap readahead and restores sparse access afterward. All bytes and
+digest comparisons remain mandatory.
+
+Set absolute paths for `ANTFLY_GLINER25_BASE_MODEL_DIR`,
+`ANTFLY_GLINER25_MULTI_V1_MODEL_DIR`, and `ANTFLY_GLINER_DECIDE_MODEL` to the pinned
+FP32 checkpoints. Set `ANTFLY_GLINER25_FAMILY_MODEL_DIR` to the same Decide
+directory for the typed-decision socket test and `ANTFLY_GLINER_DECIDE_Q8_MODEL`
+to the pinned `antflydb/GLiNER2.5-Decide` split Q8 bundle. Fixtures use private
+hardlinks, so the checkpoints and test workspace must share a filesystem.
+Run the complete gate with:
+
+```sh
+TERMITE_REQUIRE_CUDA_TESTS=1 \
+ANTFLY_GLINER25_REQUIRE_PRODUCTION_MODELS=1 \
+ANTFLY_GLINER_DECIDE_BACKEND=cuda \
+  ./zig-out/bin/gliner25-production-cuda-tests \
+    --test-filter CUDA --test-filter 'Decide published checkpoint' \
+    --test-filter 'Decide Q8 published bundle' \
+    --test-filter 'GLiNER2.5-Decide native parity'
+```
+
+`test-gliner25-production-cuda` builds and runs the same gate, setting these
+three controls automatically. Missing model paths fail the required-artifact
+inventory. Model-dependent tests bind exact file identities and frozen oracle
+outputs; backend assertions and transfer counters distinguish GPU execution
+from CPU fallback. Extraction and typed-decision socket checks retain the
+production qualification policy. They check concurrent responses, idle leases,
+and queued-request cancellation and retry. A build with skipped model
+tests is not qualification evidence.
+
+The `antflydb/GLiNER2.5-Decide` Q8 bundle is a separate artifact from FP32
+`fastino/GLiNER2.5-Decide`. Its encoder/head hashes, complete inventory, markers,
+geometry and every sidecar have their own qualification. Q8 is admitted only
+on CUDA, for classification and typed decisions; it does not gain NER or
+relationship extraction. CUDA legacy Decide serving, on either FP32 or Q8,
+admits up to eight request items, each with one prepared sequence of at most
+512 tokens. Existing
+native/Metal FP32 policy is unchanged. Q8 oracle checks require exact decisions,
+5e-2 raw-logit tolerance and 5e-3 confidence tolerance; the existing FP32 bounds
+are retained.
+
+Raw upstream snapshots do not include Antfly's capability manifest. Production
+pull and the private serving fixtures use the same exact-byte manifest
+synthesizer before loading the label-marker decision head. Setting a declared
+head by hand cannot replace live artifact/backend/geometry qualification.
+`ANTFLY_GLINER25_CUDA_MANIFEST_OUTPUT_DIR` optionally exports the canonical
+FP32/Q8 publication JSON from the tests for process-level evidence.
+
+Multilingual-v1 CUDA uses the same independently measured FP32 task profiles
+as native/Metal: single-window entities, mixed tasks and classification,
+including the measured descriptions, instruction contexts and source-word
+floors. The ten frozen pipeline cases and 29 family cases pass on GB10 with
+the unchanged 5e-4 FP32 bound, GPU launches and zero generic host tensor
+fallbacks. CUDA does not acquire the distinct multi-Decide checkpoint, reduced
+precisions, unmeasured feature unions or a multilingual long-document row.
+
+Explicit `schema_version:2` requests to `/ai/v1/extract` can carry up to eight
+inputs on the qualified CUDA single-window base and multi profiles, and on both
+legacy Decide precision variants. Base/multi preserve the existing per-item
+features and geometry: one measured profile must cover the complete request,
+including its physical padded sequence length. Separate profiles cannot be
+combined to authorize new task unions. Compatible boundary rows share an
+encoder/head forward; differing preprocessing/decoder options can split them
+into smaller physical groups. Decide packs distinct sequences with masked
+padding, gathers markers using each row's stride, and scatters variable task and
+label counts back into input order after one encoder/classifier forward.
+
+A review found that relation distance normalization used the padded word width,
+which changed a short document's confidences when batched beside a longer one.
+Both native and device scorer adapters now use each sample's actual word count
+for relation features, while retaining the padded stride for tensor row lookup.
+The existing confidence tolerances remain unchanged.
+
+This does not coalesce independent HTTP requests. `/ai/v1/decisions` retains its
+single-input wire format; explicit Decide classification batches use
+`/ai/v1/extract`. Base long-document requests still allow one input with internal
+window groups of up to four; multi long documents remain unqualified. Boundary
+capability discovery therefore retains its conservative one-item advertisement,
+so an automatic caller cannot infer long-document batching from the new
+single-window rows. Native/Metal batching and reduced precisions are unchanged.
+A ninth input returns HTTP 413; a batch has no partial-success response.
+
+Deploy with `ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda` so unavailable CUDA fails
+instead of selecting CPU. The constrained production executable is built with
+the `http-server` target, `-Dcuda=true -Dmetal=false -Doptimize=ReleaseFast
+-Dstrip=true -Dcpu=baseline+sha2`, and the same local cache/output options as
+above. The measured GB10 process profile uses four resident models and sixteen
+concurrent requests:
+
+```sh
+ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda \
+  ./zig-out/bin/antfly-inference-http-server run \
+    --host 127.0.0.1 --port 8080 --models-dir /path/to/published-models \
+    --ml-dir /path/to/runtime-state \
+    --max-loaded-models 4 --max-concurrent-requests 16 \
+    --process-memory-budget-mb 40960 --host-budget-mb 20480 \
+    --backend-budget-mb 24576 --combined-budget-mb 32768 \
+    --scratch-budget-mb 16384
+```
+
+The CUDA family service fixture uses the same 40 GiB process envelope and keeps
+its 6 GiB generation domain. Linux process admission accounts the leaf cgroup;
+run qualification after compilers have exited, or in a dedicated service cgroup.
+Native/Metal fixtures retain their existing 7 GiB worker envelope.
+
+On 2026-10-28 the expanded required-CUDA gate passed all 24 selected tests with
+zero skips, including native FP32 regression, 132 strict batch checks over the
+base and all multilingual profile endpoints, both Decide variants, resource
+leases and queued eight-input cancellation/retry. A separate run passed the
+same batch test on the pinned Transformers-wrapper base artifact. CUDA-disabled
+builds now fail the qualification target rather than producing a skipped gate.
+The additional native Q8 diagnostic exceeded its existing 5e-2 raw-logit bound
+(maximum 0.06692); native Q8 remains unqualified. CUDA Q8 retains its independent
+passing oracle and backend restrictions.
+
+The single-input HTTP regression passed typed decisions, sixteen concurrent
+requests, 512-token Decide inference, rejection at 513 tokens, and model
+eviction/reload. The final batch HTTP run also passed sixteen simultaneous
+eight-input requests (128 inputs), a ninth-input rejection, invalid-last-input
+rejection and equal retries. Five-sample eight-input throughput ratios versus the same singleton
+calls were 3.14x (base), 4.10x (multi), 1.85x (Decide FP32) and 1.76x (Decide Q8).
+These are descriptive local measurements.
+These serving correctness checks do not establish training or comparative-performance release
+qualification, or qualification on GPUs other than the measured GB10.
+
+### Existing base profiles
+
 CUDA serving now admits the exact FP32 `fastino/gliner2.5-base-v1` original
 checkpoint (`72ac19b486cd4557424c8d61114e7530c243e9b0`) and Transformers wrapper
 (`54785d51df8d86a0d8f2eb212fec15871aad2c4d`). The short single-window task profile
@@ -424,7 +568,8 @@ and bounded composition profile are separate. Composition retains the existing
 1024-token encoder ceiling and planner limits (one request item, at most 64
 windows); it does not inherit the older native/Metal 5708-token long-document row.
 Exact file identities, features and geometry remain mandatory on every request.
-Reduced precision and multilingual CUDA serving are not admitted by these rows.
+These base rows do not authorize reduced precision or a different checkpoint;
+multilingual and Decide profiles are qualified separately above.
 
 On 2026-10-25 the GB10/SM121 in Glowworm (driver 580.178.04) passed the ten frozen
 Python task cases for both artifacts at the unchanged FP32 confidence tolerance
