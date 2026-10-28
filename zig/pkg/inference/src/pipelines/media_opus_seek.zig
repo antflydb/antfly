@@ -42,7 +42,9 @@ pub const Index = struct {
     pub fn init(bytes: []const u8, max_packets: usize, admission: ?Admission) !Index {
         const owner = try create(admission);
         errdefer owner.destroy();
-        owner.demuxed = try opus.demuxOggAlloc(owner.arena.allocator(), bytes);
+        var packets = try audio.ogg.parsePacketsAlloc(owner.arena.allocator(), bytes);
+        defer packets.deinit();
+        owner.demuxed = try opus.takeOggPacketsAlloc(owner.arena.allocator(), &packets);
         try finish(owner, max_packets);
         return .{ .owner = owner };
     }
@@ -60,7 +62,7 @@ pub const Index = struct {
         }
         return owner;
     }
-    fn finish(owner: *Owner, max_packets: usize) !void {
+    pub fn finish(owner: *Owner, max_packets: usize) !void {
         if (owner.demuxed.packets.len == 0 or owner.demuxed.packets.len > max_packets) return error.UnsupportedAudioFormat;
         _ = try opus.initialFrameState(owner.demuxed.header.channels);
         owner.capacity = @intCast(@min(max_checkpoints, @max(2, (owner.demuxed.playable_frames + interval - 1) / interval + 2)));

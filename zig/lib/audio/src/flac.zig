@@ -243,7 +243,7 @@ fn parseRawFrameStream(bytes: []const u8) !ParsedStream {
     return error.UnsupportedAudioFormat;
 }
 
-fn parseStreamInfoBlock(payload: []const u8) !StreamInfo {
+pub fn parseStreamInfoBlock(payload: []const u8) !StreamInfo {
     if (payload.len != 34) return error.UnsupportedAudioFormat;
     const packed_info = readU64(payload[10..18]);
     var md5: [16]u8 = undefined;

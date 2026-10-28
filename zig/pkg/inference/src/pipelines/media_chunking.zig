@@ -837,6 +837,27 @@ pub const Runner = struct {
             try self.soundWindows(reader.provider());
             return;
         };
+        if (audio.detectFormatFromMime(mime) == .flac) {
+            const Flac = @import("media_flac_seek.zig").Index;
+            const admission: ?@import("media_opus_seek.zig").Admission = if (self.request.index_cache_admission) |quota| .{ .context = quota.context, .acquire = quota.acquire } else null;
+            const flac: ?Flac = Flac.initSource(&source, self.request.limits.max_index_packets, admission, self.control) catch |err| switch (err) {
+                error.UnsupportedStreamingAudioProfile => null,
+                else => return err,
+            };
+            if (flac) |value| {
+                var index = @import("media_audio_seek.zig").Index{ .flac = value };
+                defer index.deinit();
+                if (audio_key) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |quota| {
+                    _ = cache.audio_builds.fetchAdd(1, .monotonic);
+                    cache.remember(std.heap.smp_allocator, key, .{ .audio = index }, quota);
+                };
+                if (audio_build) |lease| lease.deinit();
+                audio_build = null;
+                var reader = @import("media_audio_seek.zig").Reader{ .index = &index, .source = &source, .control = self.control };
+                try self.soundWindows(reader.provider());
+                return;
+            }
+        }
         // Still/document decoders own a bounded contiguous input. Keep this
         // explicit spool separate from the source-backed coded-video path.
         const length = std.math.cast(usize, source.length()) orelse return error.ResourceLimitExceeded;
@@ -1921,19 +1942,38 @@ test "model aware media audio pages reuse admitted indexes and bind only the cur
     for ([_][]const u8{ "tone.mp3", "codec-corpus/tone-stereo.flac" }) |name| {
         const path = try std.fmt.allocPrint(a, "../../lib/audio/testdata/{s}", .{name});
         defer a.free(path);
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1024 * 1024));
+        const original = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1024 * 1024));
+        defer a.free(original);
+        const mp3 = std.mem.endsWith(u8, name, ".mp3");
+        // A large metadata block makes the recording exceed the working budget.
+        // Cold FLAC must skip it and read frames instead of spooling the source.
+        const padding = 1024 * 1024;
+        const bytes = if (mp3) try a.dupe(u8, original) else blk: {
+            const parsed = try @import("inference_audio").flac.parseStream(original);
+            const out = try a.alloc(u8, 46 + padding + original.len - parsed.data_offset);
+            @memcpy(out[0..42], original[0..42]);
+            out[4] = 0;
+            @memcpy(out[42..46], &[_]u8{ 0x81, 0x10, 0, 0 });
+            @memset(out[46..][0..padding], 0);
+            @memcpy(out[46 + padding ..], original[parsed.data_offset..]);
+            break :blk out;
+        };
         defer a.free(bytes);
         var cache: Cache = .{};
         defer cache.deinit();
         var provider = Provider{ .bytes = bytes };
         var next = Provider{ .bytes = bytes };
         var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = bytes.len, .immutable_binding = @splat(1) } } };
-        const mp3 = std.mem.endsWith(u8, name, ".mp3");
-        const request = Request{ .input = .{ .binary = .{ .mime_type = if (mp3) "audio/mpeg" else "audio/flac", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1 };
+        const request = Request{ .input = .{ .binary = .{ .mime_type = if (mp3) "audio/mpeg" else "audio/flac", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1, .max_working_bytes = 256 * 1024 };
         var first = Qualification{};
         var runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = Qualification.accept });
         const summary = try runner.run();
-        try std.testing.expectEqual(bytes.len, provider.read_bytes);
+        if (mp3) try std.testing.expectEqual(bytes.len, provider.read_bytes) else try std.testing.expect(provider.read_bytes < bytes.len);
+        const cold_read_bytes = provider.read_bytes;
+        if (!mp3) {
+            try std.testing.expect(cold_read_bytes < 16 * 1024);
+            std.debug.print("range FLAC source_bytes={d} cold_page_read_bytes={d} working_budget={d}\n", .{ bytes.len, cold_read_bytes, request.max_working_bytes });
+        }
         var cursor: [85]u8 = undefined;
         var resumed = request;
         resumed.continuation = summary.identity.cursor(summary.next_ordinal, &cursor);
@@ -1941,7 +1981,7 @@ test "model aware media audio pages reuse admitted indexes and bind only the cur
         var second = Qualification{};
         var replay = try Runner.init(a, resumed, second.executor(), .{}, .{ .context = &second, .accept = Qualification.accept });
         _ = try replay.run();
-        try std.testing.expectEqual(bytes.len, provider.read_bytes);
+        try std.testing.expectEqual(cold_read_bytes, provider.read_bytes);
         try std.testing.expectEqual(@as(usize, 1), second.seen);
         try std.testing.expectEqual(summary.next_ordinal, second.ordinals[0]);
         if (mp3) try std.testing.expectEqual(@as(usize, 0), next.read_bytes) else try std.testing.expect(next.read_bytes > 0 and next.read_bytes < bytes.len);

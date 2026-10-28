@@ -942,7 +942,21 @@ pub fn demuxOggAlloc(allocator: std.mem.Allocator, ogg_bytes: []const u8) !Demux
     return demuxOggPacketsAlloc(allocator, packet_sequence.packets);
 }
 
+/// Transfers packet payloads on success; failures leave the sequence untouched.
+/// The sequence and result must use the same allocator.
+pub fn takeOggPacketsAlloc(allocator: std.mem.Allocator, sequence: *ogg.PacketSequence) !Demuxed {
+    const value = try demuxOggPacketsImpl(allocator, sequence.packets, false);
+    for (sequence.packets[0..2]) |packet| allocator.free(packet.bytes);
+    allocator.free(sequence.packets);
+    sequence.packets = &.{};
+    return value;
+}
+
 pub fn demuxOggPacketsAlloc(allocator: std.mem.Allocator, ogg_packets: []const ogg.Packet) !Demuxed {
+    return demuxOggPacketsImpl(allocator, ogg_packets, true);
+}
+
+fn demuxOggPacketsImpl(allocator: std.mem.Allocator, ogg_packets: []const ogg.Packet, comptime duplicate: bool) !Demuxed {
     if (ogg_packets.len < 3) return error.UnsupportedAudioFormat;
     const header = try parseHead(ogg_packets[0].bytes);
     if (ogg_packets[1].bytes.len < 8 or !std.mem.eql(u8, ogg_packets[1].bytes[0..8], "OpusTags")) {
@@ -955,7 +969,7 @@ pub fn demuxOggPacketsAlloc(allocator: std.mem.Allocator, ogg_packets: []const o
     const packets = try allocator.alloc([]u8, audio_packets.len);
     var initialized: usize = 0;
     errdefer {
-        for (packets[0..initialized]) |packet| allocator.free(packet);
+        if (duplicate) for (packets[0..initialized]) |packet| allocator.free(packet);
         allocator.free(packets);
     }
     const packet_tocs = try allocator.alloc(Toc, audio_packets.len);
@@ -966,7 +980,7 @@ pub fn demuxOggPacketsAlloc(allocator: std.mem.Allocator, ogg_packets: []const o
     var total_decoded_frames: u64 = 0;
     var last_granule: ?u64 = null;
     for (audio_packets, 0..) |packet, i| {
-        packets[i] = try allocator.dupe(u8, packet.bytes);
+        packets[i] = if (duplicate) try allocator.dupe(u8, packet.bytes) else packet.bytes;
         initialized += 1;
         if (packet.bytes.len == 0) return error.UnsupportedAudioFormat;
         packet_tocs[i] = try parseToc(packet.bytes[0]);
@@ -1635,4 +1649,40 @@ test "decode checked-in stereo opus aliases to interleaved pcm on widened pure-z
     }
 
     try std.testing.expectEqual(first.samples.len, second.samples.len);
+}
+
+test "Opus packet adoption transfers payloads only on success" {
+    const a = std.testing.allocator;
+    var sequence = try ogg.parsePacketsAlloc(a, tone_opus_bytes);
+    defer sequence.deinit();
+    const payload = sequence.packets[2].bytes.ptr;
+    var taken = try takeOggPacketsAlloc(a, &sequence);
+    defer taken.deinit();
+    try std.testing.expectEqual(@as(usize, 0), sequence.packets.len);
+    try std.testing.expectEqual(payload, taken.packets[0].ptr);
+
+    var invalid = try ogg.parsePacketsAlloc(a, tone_opus_bytes);
+    defer invalid.deinit();
+    const count = invalid.packets.len;
+    invalid.packets[1].bytes[0] = 0;
+    try std.testing.expectError(error.UnsupportedAudioFormat, takeOggPacketsAlloc(a, &invalid));
+    try std.testing.expectEqual(count, invalid.packets.len);
+    invalid.packets[1].bytes[0] = 'O';
+    const last = &invalid.packets[invalid.packets.len - 1];
+    last.granule_applies = true;
+    last.page_granule_position = std.math.maxInt(u64);
+    try std.testing.expectError(error.UnsupportedAudioFormat, takeOggPacketsAlloc(a, &invalid));
+    try std.testing.expectEqual(count, invalid.packets.len);
+}
+
+test "Opus packet adoption releases allocations on failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var sequence = try ogg.parsePacketsAlloc(a, tone_opus_bytes);
+            defer sequence.deinit();
+            var taken = try takeOggPacketsAlloc(a, &sequence);
+            defer taken.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

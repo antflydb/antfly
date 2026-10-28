@@ -26,7 +26,49 @@ const Frame = audio.flac.WindowIndex.Frame;
 pub const Index = struct {
     owner: *Owner,
     pub fn init(bytes: []const u8, max_frames: usize, admission: ?Admission) !Index {
-        const parsed = try audio.flac.parseStream(bytes);
+        return initParsed(try audio.flac.parseStream(bytes), bytes.len, max_frames, admission);
+    }
+    /// Read only metadata headers and STREAMINFO. Padding, comments, pictures,
+    /// and the encoded tail remain in the current request's source.
+    pub fn initSource(source: *media.source.Source, max_frames: usize, admission: ?Admission, control: Control) !Index {
+        const length = std.math.cast(usize, source.length()) orelse return error.ResourceLimitExceeded;
+        var signature: [4]u8 = undefined;
+        try readExact(source, 0, &signature, control);
+        if (!std.mem.eql(u8, &signature, "fLaC")) return error.UnsupportedStreamingAudioProfile;
+        var offset: usize = 4;
+        var info: ?audio.flac.StreamInfo = null;
+        while (true) {
+            var header: [4]u8 = undefined;
+            try readExact(source, offset, &header, control);
+            offset = std.math.add(usize, offset, 4) catch return error.UnsupportedAudioFormat;
+            const size = (@as(usize, header[1]) << 16) | (@as(usize, header[2]) << 8) | header[3];
+            if (offset > length or size > length - offset) return error.IncompleteAudioStream;
+            if (header[0] & 0x7f == 0) {
+                if (info != null or size != 34) return error.UnsupportedAudioFormat;
+                var stream_info: [34]u8 = undefined;
+                try readExact(source, offset, &stream_info, control);
+                info = try audio.flac.parseStreamInfoBlock(&stream_info);
+            }
+            offset += size;
+            if (header[0] & 0x80 != 0) break;
+        }
+        return initParsed(.{ .stream_info = info orelse return error.UnsupportedAudioFormat, .data_offset = offset }, length, max_frames, admission);
+    }
+    fn readExact(source: *media.source.Source, offset: usize, out: []u8, control: Control) !void {
+        if (offset > source.length() or out.len > source.length() - offset) return error.IncompleteAudioStream;
+        var at: usize = 0;
+        while (at < out.len) {
+            try control.check();
+            const size = @min(out.len - at, @min(source.limits.max_read_bytes, source.limits.max_retained_bytes));
+            if (size == 0) return error.ResourceLimitExceeded;
+            var part = try source.read(offset + at, size);
+            defer part.deinit();
+            if (part.bytes.len == 0) return error.IncompleteAudioStream;
+            @memcpy(out[at..][0..part.bytes.len], part.bytes);
+            at += part.bytes.len;
+        }
+    }
+    fn initParsed(parsed: audio.flac.ParsedStream, length: usize, max_frames: usize, admission: ?Admission) !Index {
         if (parsed.stream_info.total_samples == 0) return error.UnsupportedStreamingAudioProfile;
         const sample_count = std.math.cast(usize, parsed.stream_info.total_samples) orelse return error.ResourceLimitExceeded;
         const min_block = @max(1, parsed.stream_info.min_block_size);
@@ -36,7 +78,7 @@ pub const Index = struct {
         errdefer if (lease) |*owned| owned.release();
         const backing = @import("antfly_platform").allocator.concurrentFallback();
         const owner = try backing.create(Owner);
-        owner.* = .{ .lease = lease, .admission = admission, .allocation = .{ .backing = backing, .admission_context = if (admission) |quota| quota.context else null, .admit = if (admission) |quota| quota.acquire else null, .trim_on_free = true }, .info = parsed.stream_info, .offset = parsed.data_offset, .length = bytes.len, .max_frames = rows };
+        owner.* = .{ .lease = lease, .admission = admission, .allocation = .{ .backing = backing, .admission_context = if (admission) |quota| quota.context else null, .admit = if (admission) |quota| quota.acquire else null, .trim_on_free = true }, .info = parsed.stream_info, .offset = parsed.data_offset, .length = length, .max_frames = rows };
         return .{ .owner = owner };
     }
     pub fn copy(self: Index, _: std.mem.Allocator) !Index {
@@ -94,7 +136,7 @@ pub const Owner = struct {
             try buffer.ensureTotalCapacity(a, size);
             while (buffer.items.len < size) {
                 try control.check();
-                var part = try source.?.read(offset + buffer.items.len, @min(size - buffer.items.len, source.?.limits.max_read_bytes));
+                var part = try source.?.read(offset + buffer.items.len, @min(size - buffer.items.len, @min(source.?.limits.max_read_bytes, source.?.limits.max_retained_bytes)));
                 defer part.deinit();
                 if (part.bytes.len == 0) return error.IncompleteAudioStream;
                 buffer.appendSliceAssumeCapacity(part.bytes);
@@ -210,4 +252,49 @@ test "model aware media progressive FLAC releases admission and rejects unknown 
     changed[21] &= 0xf0;
     @memset(changed[22..26], 0);
     try std.testing.expectError(error.UnsupportedStreamingAudioProfile, Index.init(changed, 100000, null));
+}
+
+test "model aware media range FLAC bounds metadata reads and detects truncation cancellation and unknown duration" {
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.flac", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    const Provider = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: media.source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset >= self.bytes.len) return 0;
+            const n = @min(out.len, self.bytes.len - @as(usize, @intCast(offset)));
+            @memcpy(out[0..n], self.bytes[@intCast(offset)..][0..n]);
+            return n;
+        }
+        fn cancel(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var provider = Provider{ .bytes = bytes };
+    var source = media.source.Source{ .allocator = a, .identity = "flac", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = bytes.len } }, .limits = .{ .max_read_bytes = 17, .max_retained_bytes = 17, .max_reads = 100000 } };
+    var index = try Index.initSource(&source, 100000, null, .{});
+    defer index.deinit();
+    try std.testing.expect(source.total_bytes < bytes.len / 2);
+    const samples = try a.alloc(f32, 1000);
+    defer a.free(samples);
+    try index.read(a, 0, samples.len, samples, &source, &.{}, .{});
+    var baseline = try audio.decodeBounded(a, bytes, .{}, 16 * 1024 * 1024);
+    defer baseline.deinit();
+    try std.testing.expectEqualSlices(f32, baseline.samples[0..samples.len], samples);
+    try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
+    try std.testing.expectError(error.Cancelled, Index.initSource(&source, 100000, null, .{ .check_fn = Provider.cancel }));
+    provider.bytes = bytes[0..7];
+    try std.testing.expectError(error.UnexpectedEndOfSource, Index.initSource(&source, 100000, null, .{}));
+    provider.bytes = bytes[0 .. index.owner.frames.items[0].offset + 1];
+    try std.testing.expectError(error.UnexpectedEndOfSource, index.read(a, 0, samples.len, samples, &source, &.{}, .{}));
+    const changed = try a.dupe(u8, bytes);
+    defer a.free(changed);
+    changed[21] &= 0xf0;
+    @memset(changed[22..26], 0);
+    provider.bytes = changed;
+    try std.testing.expectError(error.UnsupportedStreamingAudioProfile, Index.initSource(&source, 100000, null, .{}));
+    // A metadata extent beyond the declared source must fail before fetching it.
+    changed[5] = 0xff;
+    try std.testing.expectError(error.IncompleteAudioStream, Index.initSource(&source, 100000, null, .{}));
 }

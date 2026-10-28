@@ -31,9 +31,32 @@ pub const Index = union(enum) {
     pub fn initAdmitted(a: std.mem.Allocator, bytes: []const u8, max_frames: usize, admission: ?Admission) !Index {
         const format = audio.detectFormat(bytes) orelse return error.UnsupportedAudioFormat;
         if (format == .ogg or format == .opus) {
-            var streams = try audio.ogg.parsePacketStreamsAlloc(a, bytes);
+            const Progressive = @import("media_opus_seek.zig").Index;
+            const owner = try Progressive.create(admission);
+            var initial = Progressive{ .owner = owner };
+            var release_owner = true;
+            defer if (release_owner) initial.deinit();
+            const arena = owner.arena.allocator();
+            var streams = try audio.ogg.parsePacketStreamsAlloc(arena, bytes);
             defer streams.deinit();
             if (streams.streams.len != 1) return error.UnsupportedStreamingAudioProfile;
+            const sequence = &streams.streams[0];
+            if (sequence.packets.len == 0) return error.UnsupportedAudioFormat;
+            return switch (try audio.ogg.sniffFirstPacket(sequence.packets[0].bytes)) {
+                .opus => blk: {
+                    owner.demuxed = try audio.opus.takeOggPacketsAlloc(arena, sequence);
+                    try Progressive.finish(owner, max_frames);
+                    release_owner = false;
+                    break :blk .{ .opus = initial };
+                },
+                .vorbis => blk: {
+                    const index = try audio.vorbis.WindowIndex.initPackets(a, sequence.packets, max_frames);
+                    // Packet parsing was admitted, but Vorbis owns its independent
+                    // metadata and coded bytes after construction.
+                    break :blk .{ .vorbis = index };
+                },
+                else => error.UnsupportedAudioFormat,
+            };
         }
         return switch (format) {
             .mp3 => .{ .mp3 = try audio.mp3.pure_zig.WindowIndex.init(a, bytes, max_frames) },
@@ -49,11 +72,6 @@ pub const Index = union(enum) {
                 if (index.codec == .vorbis) index.retained_owner = initial else initial.deinit();
                 Progressive.refreshBytes(owner);
                 break :blk .{ .webm = index };
-            },
-            .ogg, .opus => switch (try audio.ogg.sniffCodec(a, bytes)) {
-                .opus => .{ .opus = try @import("media_opus_seek.zig").Index.init(bytes, max_frames, admission) },
-                .vorbis => .{ .vorbis = try audio.vorbis.WindowIndex.init(a, bytes, max_frames) },
-                else => error.UnsupportedAudioFormat,
             },
             else => error.UnsupportedAudioFormat,
         };
@@ -324,4 +342,29 @@ test "model aware media WebM owners roll back every failed admission during cons
         try std.testing.expectError(error.OutOfMemory, Index.initAdmitted(a, bytes, 100000, .{ .context = &failed, .acquire = Quota.acquire }));
         try std.testing.expectEqual(@as(usize, 0), failed.controller.snapshot().hostTotalBytes());
     }
+}
+
+test "model aware media Ogg admission precedes packet parsing and chained streams fall back" {
+    const Denied = struct {
+        fn acquire(_: *anyopaque, _: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            return error.OutOfMemory;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(error.OutOfMemory, Index.initAdmitted(std.testing.allocator, "OggS", 100000, .{ .context = &context, .acquire = Denied.acquire }));
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.opus", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    const chained = try std.mem.concat(a, u8, &.{ bytes, bytes });
+    defer a.free(chained);
+    // Use a different logical-stream serial in the second stream.
+    var offset = bytes.len;
+    while (offset < chained.len) {
+        chained[offset + 14] ^= 1;
+        const segments = chained[offset + 26];
+        var payload: usize = 0;
+        for (chained[offset + 27 ..][0..segments]) |size| payload += size;
+        offset += 27 + @as(usize, segments) + payload;
+    }
+    try std.testing.expectError(error.UnsupportedStreamingAudioProfile, Index.init(a, chained, 100000));
 }
