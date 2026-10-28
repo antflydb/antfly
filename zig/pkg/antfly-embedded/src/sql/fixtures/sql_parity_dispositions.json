@@ -3683,6 +3683,46 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-aggregate-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-aggregate-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-aggregate-kernel-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL user aggregate",
+        "-Dtest-filter=SQL original aggregate declarations",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-aggregate-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_aggregate_lifecycle_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_aggregate_lifecycle_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -5454,18 +5494,69 @@
     },
     {
       "id": "sql-0136",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged ordinary typed aggregate CREATE, DROP and conditional DROP execute through the native callable catalog. PostgreSQL and authenticated mounted tests compare complete typed results, SQL NULLs, empty input, FILTER/DISTINCT/ordering, transition/final/initializer semantics, exact errors and notices. Stable transition/final identities and both dependency edges survive rename, RESTRICT/CASCADE and cold rebuild. Public prepared overloads retain support generations; real lost-ACK recovery observes the exact committed operation without resubmission. The global unordered path retains running state without spooling; grouped/ordered paths use bounded spill. This qualifies the original ordinary declarations, not ordered-set, parallel-combine or window aggregate extensions.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_aggregate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original aggregates preserve typed transitions bounded states and cold dependency retirement",
+          "gate": "sql-aggregate-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_aggregate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original aggregates preserve typed transitions bounded states and cold dependency retirement",
+          "gate": "sql-aggregate-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL original aggregate declarations retain typed transition state and retirement",
+          "gate": "sql-aggregate-kernel-debug"
+        }
+      ]
     },
     {
       "id": "sql-0137",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged ordinary typed aggregate CREATE, DROP and conditional DROP execute through the native callable catalog. PostgreSQL and authenticated mounted tests compare complete typed results, SQL NULLs, empty input, FILTER/DISTINCT/ordering, transition/final/initializer semantics, exact errors and notices. Stable transition/final identities and both dependency edges survive rename, RESTRICT/CASCADE and cold rebuild. Public prepared overloads retain support generations; real lost-ACK recovery observes the exact committed operation without resubmission. The global unordered path retains running state without spooling; grouped/ordered paths use bounded spill. This qualifies the original ordinary declarations, not ordered-set, parallel-combine or window aggregate extensions.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_aggregate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original aggregates preserve typed transitions bounded states and cold dependency retirement",
+          "gate": "sql-aggregate-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_aggregate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original aggregates preserve typed transitions bounded states and cold dependency retirement",
+          "gate": "sql-aggregate-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL original aggregate declarations retain typed transition state and retirement",
+          "gate": "sql-aggregate-kernel-debug"
+        }
+      ]
     },
     {
       "id": "sql-0138",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged ordinary typed aggregate CREATE, DROP and conditional DROP execute through the native callable catalog. PostgreSQL and authenticated mounted tests compare complete typed results, SQL NULLs, empty input, FILTER/DISTINCT/ordering, transition/final/initializer semantics, exact errors and notices. Stable transition/final identities and both dependency edges survive rename, RESTRICT/CASCADE and cold rebuild. Public prepared overloads retain support generations; real lost-ACK recovery observes the exact committed operation without resubmission. The global unordered path retains running state without spooling; grouped/ordered paths use bounded spill. This qualifies the original ordinary declarations, not ordered-set, parallel-combine or window aggregate extensions.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_aggregate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original aggregates preserve typed transitions bounded states and cold dependency retirement",
+          "gate": "sql-aggregate-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_aggregate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original aggregates preserve typed transitions bounded states and cold dependency retirement",
+          "gate": "sql-aggregate-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL original aggregate declarations retain typed transition state and retirement",
+          "gate": "sql-aggregate-kernel-debug"
+        }
+      ]
     },
     {
       "id": "sql-0139",

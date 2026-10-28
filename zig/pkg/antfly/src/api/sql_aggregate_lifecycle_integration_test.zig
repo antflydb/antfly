@@ -51,6 +51,10 @@ const Campaign = struct {
         }
         try preparedOverloads(ctx, self.reference.prepared orelse return error.MissingAggregatePreparedWitness);
         try @import("sql_routine_lifecycle_integration_test.zig").lostAggregateAck(ctx);
+        // The fault probe shares a transition function with the oracle campaign.
+        // Retire it after receipt recovery so its dependency cannot alter the
+        // later exact PostgreSQL CASCADE notices.
+        try observe(ctx, .{ .sql = "DROP AGGREGATE lost_ack_aggregate(text)", .command_tag = "DROP AGGREGATE", .notices = &.{} }, false);
         for (self.reference.cold) |step| try observe(ctx, step, true);
         var reader = ctx.*;
         reader.headers = ctx.reader_headers;
@@ -116,7 +120,8 @@ fn preparedOverloads(ctx: *fixture.Context, reference: reference_support.Prepare
     }
     const initial = try preparedCreate(ctx, reference.statement);
     defer ctx.alloc.free(initial);
-    defer closePrepared(ctx, initial) catch {};
+    var initial_closed = false;
+    defer if (!initial_closed) closePrepared(ctx, initial) catch {};
     try preparedResult(ctx, initial, .{ .sql = reference.statement, .output = reference.before, .notices = &.{} });
     try observe(ctx, reference.mutation, false);
     // HTTP prepared resources retain immutable dependency manifests. A changed
@@ -132,8 +137,11 @@ fn preparedOverloads(ctx: *fixture.Context, reference: reference_support.Prepare
     try std.testing.expectEqualStrings("40001", diagnostic.value.code);
     const fresh = try preparedCreate(ctx, reference.statement);
     defer ctx.alloc.free(fresh);
-    defer closePrepared(ctx, fresh) catch {};
+    var fresh_closed = false;
+    defer if (!fresh_closed) closePrepared(ctx, fresh) catch {};
     try preparedResult(ctx, fresh, .{ .sql = reference.statement, .output = reference.after, .notices = &.{} });
     try closePrepared(ctx, fresh);
+    fresh_closed = true;
     try closePrepared(ctx, initial);
+    initial_closed = true;
 }

@@ -4052,3 +4052,42 @@ test "SQL text predicate parameter bindings never mutate prepared scan programs"
     try std.testing.expectError(error.InvalidSqlParameters, bindSearchScans(a, &.{scan}, &.{.{ .integer = 1 }}));
     try std.testing.expectError(error.InvalidSqlParameters, bindSearchScans(a, &.{scan}, &.{}));
 }
+
+test "SQL user aggregate derived CTE joins retain live reduction outputs" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const bindings = @import("routine_bindings.zig");
+    const definitions = @import("routine_definition.zig");
+    const transition = try definitions.prepare(arena.allocator(), .{ .id = 12, .generation = 1, .definition = .{ .arguments = &.{ .{ .type = .{ .scalar = .int64 } }, .{ .type = .{ .scalar = .int64 } } }, .result = .{ .scalar = .int64 }, .body = "SELECT $1+$2", .owner = .auth_disabled } }, null, null);
+    const integer = definitions.runtimeType(.{ .scalar = .int64 });
+    var aggregate: bindings.Aggregate = .{ .id = 13, .generation = 1, .arguments = &.{integer}, .state = integer, .output = integer, .transition = transition, .initial = scalar.Datum.json(.{ .integer = 0 }) };
+    const Callbacks = struct {
+        fn function(_: *anyopaque, _: Allocator, _: []const u8, _: []const bindings.Argument) anyerror!*const bindings.Resolved {
+            return error.UndefinedSqlFunction;
+        }
+        fn resolve(raw: *anyopaque, _: Allocator, _: []const u8, _: []const bindings.Argument) anyerror!?*const bindings.Aggregate {
+            return @ptrCast(@alignCast(raw));
+        }
+    };
+    const queries = [_][]const u8{
+        "SELECT mixed(id::bigint) AS total FROM (VALUES(1),(2),(3)) t(id)",
+        "WITH totals AS (SELECT mixed(id::bigint) AS total FROM (VALUES(1),(2),(3)) t(id)) SELECT total FROM totals",
+        "WITH totals AS (SELECT mixed(id::bigint) AS total FROM (VALUES(1),(2),(3)) t(id)) SELECT total FROM (VALUES(1),(2),(3)) t(id) CROSS JOIN totals ORDER BY id",
+    };
+    for (queries, 0..) |query, index| {
+        var fixture: SetTestBackend = .{};
+        var backend = fixture.backend();
+        backend.routine_resolver = .{ .ptr = &aggregate, .resolve = Callbacks.function, .resolve_aggregate = Callbacks.resolve };
+        var compiled = try @import("compiler.zig").compile(a, query, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        try std.testing.expectEqual(if (index == 2) @as(usize, 3) else 1, result.output.native_rows.?.len);
+        for (result.output.native_rows.?) |row| {
+            if (row[0].sql_null) std.debug.print("aggregate derived query returned NULL: {s}\n", .{query});
+            try std.testing.expect(!row[0].sql_null);
+            try std.testing.expectEqual(@as(i64, 6), row[0].value.integer);
+        }
+    }
+}

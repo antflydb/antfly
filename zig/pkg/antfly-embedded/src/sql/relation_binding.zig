@@ -449,6 +449,7 @@ const Builder = struct {
     alloc: Allocator,
     backend: catalog.Backend,
     parameters: []?ast.ColumnType,
+    bind_catalog_calls: bool = true,
     prepared_scope: ?[]const Column = null,
     prepared_demands: std.StringHashMapUnmanaged(void) = .empty,
     scans: std.ArrayList(catalog.StatementScan) = .empty,
@@ -1108,7 +1109,7 @@ const Builder = struct {
                     spec.order = order;
                 }
                 var aggregate = part.aggregate;
-                if (aggregate == null and !part.operator and !scalar.builtinFunction(part.name) and @import("aggregate_binding.zig").aggregateKind(part.name) == null and @import("aggregate_binding.zig").orderedKind(part.name) == null) {
+                if (self.bind_catalog_calls and aggregate == null and !part.operator and !scalar.builtinFunction(part.name) and @import("aggregate_binding.zig").aggregateKind(part.name) == null and @import("aggregate_binding.zig").orderedKind(part.name) == null) {
                     const resolver = self.backend.routine_resolver orelse if (self.backend.parameter_invocation) |invocation| invocation.routine_resolver else null;
                     if (resolver) |provider| if (provider.resolve_aggregate) |lookup| {
                         const order_count = if (part.within_group) |clause| clause.orders.len else 0;
@@ -1158,6 +1159,10 @@ const Builder = struct {
         result.set_operation = null;
         result.values_arms = &.{};
         result.table = .{ .table = "$sql_relation" };
+        // This boundary resolves catalog calls against its input identities.
+        // Re-entering relational lowering in describe would rename those inputs
+        // again while the derived iterator still reads the original source.
+        result.catalog_calls_bound = true;
         var projections: std.ArrayList(ast.Projection) = .empty;
         for (expanded) |projection| {
             if (projection.expression) |node_| {
@@ -2624,7 +2629,9 @@ test "SQL missing qualified relations differ from unknown fields and internal me
 /// use the same qualified-name and ambiguity rules as SELECT, then bind typed
 /// programs against the projected internal column ordinals.
 pub fn lowerBoundExpression(alloc: Allocator, columns: []const Column, expression_: *const ast.Scalar) !*const ast.Scalar {
-    var builder: Builder = .{ .alloc = alloc, .backend = undefined, .parameters = &.{} };
+    // Name normalization has no catalog owner. Callable classification belongs
+    // to the subsequent typed binding against the authorized statement backend.
+    var builder: Builder = .{ .alloc = alloc, .backend = undefined, .parameters = &.{}, .bind_catalog_calls = false };
     return builder.expression(columns, expression_, &.{});
 }
 

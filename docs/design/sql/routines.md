@@ -49,8 +49,8 @@ validates and prepares the body before writing catalog/index changes. Its
 preparation allocator is bounded. Deterministic definition failures are retained
 rejections; allocator/storage failures abort the transaction.
 
-Decoder floor 108 activates callable publication, retained annotations and
-operator dependencies with version 2 routine records. Linked control reaches the
+Decoder floor 109 activates callable publication, retained annotations and
+operator/aggregate dependencies with version 2 routine records. Linked control reaches the
 same concrete native owner through catalog projection interfaces, preserving
 request deadlines and cancellation. Routine records have no physical table,
 placement or storage binding. Parent schema/database emptiness checks include
@@ -152,3 +152,29 @@ its rejection does not imply that a callable shift function exists.
 Further activation should extend this same catalog, VM and outcome path, with
 PostgreSQL differential witnesses and native fault tests. It must not introduce
 another routine interpreter, coordinator or receipt journal.
+
+
+## User-defined aggregates
+
+Ordinary typed aggregates share the function signature namespace. Their records
+reference transition and optional final functions by immutable catalog and
+namespace IDs. Native publication validates every support signature at one
+catalog cut. The covering dependency directory tracks both edges, is rebuilt on
+restore, and supports bounded RESTRICT/CASCADE retirement after cold restart.
+Names reused after retirement cannot retarget an aggregate.
+
+Binding prepares typed transition/final programs once and casts INITCOND to the
+state domain before publication. Execution preserves strict NULL handling and
+first-nonnull initialization. Transition state, final results, cancellation and
+work use the existing scalar VM budgets. Prepared manifests retain the aggregate
+and support generations and namespace identities; replacements require a fresh
+HTTP prepared resource. Overload lookup distinguishes an ordinary function from
+an aggregate using its resolved argument types.
+
+An unordered, non-DISTINCT global aggregate keeps only its running state instead
+of sorting all inputs. Ordered, grouped and DISTINCT variants use the bounded
+spill machinery. Two alternating state arenas preserve owned values without
+retaining prior states. Partial aggregation is not inferred from an arbitrary
+transition function: a valid combine contract is required before that optimization
+can be enabled. Relational lowering classifies catalog calls once per boundary;
+derived and CTE consumers retain the same physical input identities.
