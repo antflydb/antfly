@@ -164,6 +164,8 @@ pub const Hydrator = struct {
                 return l.doc < r.doc;
             }
         }.less);
+        const sorted_docs = try scratch.allocator().alloc(u32, permutation.len);
+        for (permutation, sorted_docs) |entry, *doc| doc.* = entry.doc;
         for (fields) |field| for (permutation, 0..) |entry, at| {
             if (at % batch_limit == 0) try input.check();
             const i = entry.position;
@@ -177,7 +179,12 @@ pub const Hydrator = struct {
                 tail = field[dot + 1 ..];
                 cursor = try self.column(&segment.reader, field[0..dot]);
             };
+            const previous_chunk = if (cursor) |value| value.chunk else null;
             if (if (cursor) |value| try value.get(resolved.local_id) else null) |encoded| {
+                if (cursor) |value| if (value.chunk != previous_chunk) {
+                    const base = entry.doc - resolved.local_id;
+                    _ = value.prefetchSelected(sorted_docs[at + 1 ..], base, base + segment.reader.doc_count);
+                };
                 const root = try local.storage_typed_json.decodeBinary(row.allocator(), encoded);
                 const value = if (tail) |suffix| local.api_json_helpers.extractJsonPathValue(root, suffix) orelse return error.InvalidNativeLakeTextCorpus else root;
                 const target = &targets[i].?;

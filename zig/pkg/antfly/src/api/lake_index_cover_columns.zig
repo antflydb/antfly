@@ -418,7 +418,13 @@ test "external lake bounded window profiles covering stripes prune wide columns 
         try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
         try std.testing.expectEqual(@as(usize, 0), cache.physical.entries.count());
         const before = probe.calls;
-        var second = try load(a, store, ref, true, &.{ 0, 1 }, 3, .none, cached, 256 * 1024, &allowance, null);
+        const decoded_entries = cache.decoded.entries.count();
+        // A different projection and allowance must reuse its successful
+        // stripes even when no encoded cache can conceal a decode miss.
+        var narrow = try load(a, store, ref, true, &.{0}, 3, .none, cached, 128 * 1024, &allowance, null);
+        narrow.deinit();
+        var second = try load(a, store, ref, true, &.{ 0, 1 }, 3, .none, cached, 512 * 1024, &allowance, null);
+        try std.testing.expectEqual(decoded_entries, cache.decoded.entries.count());
         defer second.deinit();
         try std.testing.expectEqual(before, probe.calls);
         try std.testing.expectEqual(@as(i64, 9007199254740993), (try second.block.cell(0, 1)).value.integer);

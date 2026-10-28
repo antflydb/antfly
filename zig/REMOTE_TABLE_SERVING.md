@@ -1672,8 +1672,8 @@ existing source mode unless they explicitly select column storage.
 
 ### Bounded source batches and indexed chunk navigation
 
-Native source projection processes one requested column across at most 64 winning
-rows before moving to the next column. A compact ordinal permutation retains the
+Native source projection processes one requested column across the returned
+selection before moving to the next column, checking cancellation in 64-row tiles. A compact ordinal permutation retains the
 public rank order and validates every native row key under the current pack pin.
 Four reusable field cursors still bound live decoded state; a projection wider
 than four fields no longer reopens every column for every row. Legacy monolithic
@@ -1808,3 +1808,34 @@ those processing tiles. Metadata is proportional to the existing returned-hit
 set, never source-table cardinality. Legacy source documents are parsed once per
 returned row for the complete projection. Result order and hidden-field isolation
 retain the same contracts.
+
+
+### Projection-independent decoded stripes and selected source read-ahead
+
+A successful required decoded interpretation is identified by its immutable
+artifact, interpretation and authorization scope. Query workspace limits are
+admission policy, rather than value identity. Every required lookup/acquisition
+checks the retained decoded footprint against its own limit before returning a
+lease, including when it joins a wider loader. Failed required loads publish no
+value; a wider reader may retry with its own allowance. Optional interpretations
+that cache a deterministic size-decline value retain their policy-specific key.
+This keeps narrow and wide covering queries from storing duplicate successful
+stripes without letting warm-cache state bypass memory admission.
+
+Stored-source hydration keeps an ordinal vector proportional to returned hits.
+After each required chunk transition, its authenticated row-range directory
+identifies up to four subsequent chunks containing selected rows, with at most
+1 MiB of compressed hint bytes. A binary jump skips repeated IDs in the current
+chunk. Unselected intervening chunks, legacy columns and oversized values do not
+create speculative reads. Hints enter the existing query-owned native source
+queue, which owns shared I/O admission, deduplication, cancellation and joins.
+They perform no source decode and transfer no cursor/value ownership. Required
+reads continue validating every selected chunk and row identity, whether a hint
+was admitted, declined, canceled or completed.
+
+Phrase driver costing uses an upper bound for each position: the sum of observed
+document frequencies of its alternatives, capped at collection cardinality.
+The phrase ceiling is the minimum across positions. Unknown statistics retain
+the collection ceiling, and an empty phrase has ceiling zero. This estimate only
+chooses between ordered traversal and text candidates; positional matching,
+residual predicates, authorization, scoring and cursor proofs remain authoritative.

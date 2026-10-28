@@ -3635,7 +3635,25 @@ pub const TextNavigationPlan = struct {
                 }
                 break :blk @intCast(@min(count, sum));
             },
-            .phrase => count,
+            .phrase => blk: {
+                if (node.groups.len == 0) break :blk 0;
+                var upper = count;
+                // Every phrase position requires one alternative. Union
+                // ceilings within a position, then intersect across positions.
+                // Missing statistics remain unknown, never an exclusion proof.
+                for (node.groups) |group| {
+                    var sum: u64 = 0;
+                    for (group) |term| {
+                        const field = self.stats.fields.get(node.field) orelse {
+                            sum = count;
+                            break;
+                        };
+                        sum +|= if (field.frequencies.get(term)) |frequency| frequency.value else count;
+                    }
+                    upper = @min(upper, @as(u32, @intCast(@min(count, sum))));
+                }
+                break :blk upper;
+            },
             .boolean => blk: {
                 var upper = count;
                 for (node.must) |child| upper = @min(upper, self.nodeCandidateUpperBound(child));
@@ -11387,4 +11405,32 @@ test "producer top k batches score ties spanning distinct candidate tiles" {
         }
         try std.testing.expectEqual(@as(usize, 0), state.scalar_calls);
     }
+}
+
+test "external lake metadata navigation phrase ceilings union alternatives and preserve unknown statistics" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var field: StreamingBoolStats.Field = .{ .average = 10 };
+    try field.frequencies.put(sa, "rare", .{ .value = 20 });
+    try field.frequencies.put(sa, "alternative", .{ .value = 30 });
+    try field.frequencies.put(sa, "common", .{ .value = 9000 });
+    var phrase: LoweredText = .{ .kind = .phrase, .field = "body", .groups = &.{ &.{"common"}, &.{"rare"} } };
+    var plan: TextNavigationPlan = .{ .a = a, .arena = undefined, .query = .match_all, .config = .{}, .stats = .{ .a = sa, .count = 10000 }, .root = &phrase };
+    try plan.stats.fields.put(sa, "body", field);
+    try std.testing.expectEqual(@as(u32, 20), plan.candidateUpperBound());
+    phrase.groups = &.{ &.{ "rare", "alternative" }, &.{"common"} };
+    try std.testing.expectEqual(@as(u32, 50), plan.candidateUpperBound());
+    phrase.groups = &.{ &.{ "common", "unknown" }, &.{"rare"} };
+    try std.testing.expectEqual(@as(u32, 20), plan.candidateUpperBound());
+    phrase.groups = &.{ &.{"unknown"}, &.{"unknown"} };
+    try std.testing.expectEqual(@as(u32, 10000), plan.candidateUpperBound());
+    phrase.groups = &.{ &.{ "common", "common" }, &.{ "common", "common" } };
+    try std.testing.expectEqual(@as(u32, 10000), plan.candidateUpperBound());
+    phrase.field = "unobserved";
+    try std.testing.expectEqual(@as(u32, 10000), plan.candidateUpperBound());
+    phrase.groups = &.{};
+    try std.testing.expectEqual(@as(u32, 0), plan.candidateUpperBound());
+    std.debug.print("PHRASE_COST documents=10000 rare_upper=20 alternative_upper=50 unknown_upper=10000\n", .{});
 }

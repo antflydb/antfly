@@ -451,6 +451,46 @@ pub const Cursor = struct {
         self.records.deinit(self.reader.alloc);
         self.reader.deinit();
     }
+    pub const Prefetch = struct { ranges: usize = 0, bytes: u64 = 0 };
+    /// Hints for the next selected chunks, never intervening archive rows.
+    /// The enclosing segment authenticates this directory; required get still
+    /// validates decoded IDs. The source owns admission, cancellation and joins.
+    /// `docs` is sorted global ordinals within [base, end); no pointers escape.
+    pub fn prefetchSelected(self: *const Cursor, docs: []const u32, base: u32, end: u32) Prefetch {
+        var result: Prefetch = .{};
+        if (!self.reader.indexed) return result;
+        const view = self.reader.range orelse return result;
+        if (view.source != .ranges or view.source.ranges.prefetch == null) return result;
+        var position: usize = 0;
+        while (position < docs.len and result.ranges < 4) {
+            const doc = docs[position];
+            if (doc < base or doc >= end) break;
+            const chunk = self.reader.chunkForDoc(doc - base) orelse {
+                position += 1;
+                continue;
+            };
+            const last = @as(u64, base) + self.reader.bounds(chunk).last;
+            // Skip a dense selected chunk without scanning its rows or
+            // issuing duplicate hints for each winner.
+            var low = position + 1;
+            var high = docs.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (docs[mid] <= last) low = mid + 1 else high = mid;
+            }
+            position = low;
+            if (self.chunk == chunk) continue;
+            const start = if (chunk == 0) 0 else self.reader.endOffset(chunk - 1);
+            const length = self.reader.endOffset(chunk) - start;
+            // Oversized required values remain demand reads. Speculation has
+            // a byte cap as well as the existing four-task source queue.
+            if (length > 1024 * 1024 - result.bytes) continue;
+            view.source.prefetch(view.offset + self.reader.data_start + start, length);
+            result.ranges += 1;
+            result.bytes += length;
+        }
+        return result;
+    }
     pub fn get(self: *Cursor, doc: u32) !?[]const u8 {
         if (self.chunk != null and doc >= self.first and doc <= self.last) return self.find(doc);
         if (self.reader.indexed) {
@@ -775,4 +815,74 @@ test "external lake bounded window profiles indexed source navigation decodes on
     };
     try Run.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "external lake bounded window profiles source chunk prefetch selects exact ranges bounds bytes and preserves demand ownership" {
+    const Run = struct {
+        fn run(a: Allocator, large: bool) !void {
+            const segment = @import("../segment.zig");
+            var memory = segment.MemorySegmentSink.init(a);
+            defer memory.deinit();
+            var sink = memory.sink();
+            try sink.appendSlice("padding");
+            var writer = StreamingWriter.initIndexed(a, &sink, 1);
+            defer writer.deinit();
+            const payload = try a.alloc(u8, if (large) 700 * 1024 else 8);
+            defer a.free(payload);
+            var random = std.Random.DefaultPrng.init(17);
+            random.random().bytes(payload);
+            for (0..8) |i| try writer.add(@intCast(i * 2), payload);
+            try std.testing.expect(try writer.finish());
+            const State = struct {
+                bytes: []const u8,
+                reads: usize = 0,
+                hints: [4]struct { offset: u64, length: u64 } = undefined,
+                count: usize = 0,
+                fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (offset > self.bytes.len or out.len > self.bytes.len - offset) return error.EndOfStream;
+                    self.reads += 1;
+                    @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+                }
+                fn prefetch(raw: *anyopaque, offset: u64, length: u64) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    std.debug.assert(self.count < self.hints.len);
+                    self.hints[self.count] = .{ .offset = offset, .length = length };
+                    self.count += 1;
+                }
+                fn close(_: *anyopaque) void {}
+            };
+            var state: State = .{ .bytes = memory.out.items };
+            const source: @import("../segment_source.zig").Source = .{ .ranges = .{ .ptr = &state, .length = state.bytes.len, .read_into = State.read, .prefetch = State.prefetch, .close = State.close } };
+            const view = try @import("../segment_source.zig").View.init(source, 7, state.bytes.len - 7);
+            var cursor = Cursor.init(try DocValuesReader.initRanges(a, view));
+            defer cursor.deinit();
+            try std.testing.expectEqualSlices(u8, payload, (try cursor.get(0)).?);
+            const reads = state.reads;
+            const hint = cursor.prefetchSelected(&.{ 100, 100, 102, 102, 106, 108, 110, 114, 116 }, 100, 116);
+            try std.testing.expectEqual(reads, state.reads);
+            try std.testing.expectEqual(@as(usize, if (large) 1 else 4), hint.ranges);
+            try std.testing.expectEqual(hint.ranges, state.count);
+            try std.testing.expect(hint.bytes <= 1024 * 1024);
+            const selected = [_]u32{ 1, 3, 4, 5 };
+            for (state.hints[0..state.count], selected[0..state.count]) |range, chunk| {
+                const start = cursor.reader.endOffset(chunk - 1);
+                try std.testing.expectEqual(view.offset + cursor.reader.data_start + start, range.offset);
+                try std.testing.expectEqual(cursor.reader.endOffset(chunk) - start, range.length);
+            }
+            // Prefetch neither changes the live decoded chunk nor transfers
+            // value ownership; missing and out-of-segment IDs stay harmless.
+            try std.testing.expectEqual(@as(?u32, 0), cursor.chunk);
+            try std.testing.expectEqual(@as(usize, 1), cursor.decode_count);
+            try std.testing.expectEqual(@as(usize, 0), cursor.prefetchSelected(&.{116}, 100, 116).ranges);
+            try std.testing.expectEqualSlices(u8, payload, (try cursor.get(14)).?);
+            std.debug.print("SOURCE_PREFETCH large={} ranges={} bytes={} demand_reads_during_hint=0\n", .{ large, hint.ranges, hint.bytes });
+        }
+        fn faults(a: Allocator) !void {
+            try run(a, false);
+        }
+    };
+    try Run.run(std.testing.allocator, false);
+    try Run.run(std.testing.allocator, true);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.faults, .{});
 }
