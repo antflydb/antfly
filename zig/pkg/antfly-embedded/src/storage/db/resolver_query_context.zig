@@ -337,17 +337,37 @@ pub const Cache = struct {
     /// Remove only the observed generation. Active leases keep their immutable
     /// context alive, and a concurrent replacement is never evicted by a stale reader.
     pub fn invalidate(self: *Cache, key: [32]u8, expected: *const Context) void {
+        _ = self.invalidateObserved(key, expected, null);
+    }
+    /// A checkpoint advance is a certificate replacement even if the immutable
+    /// path context remains the same. Compare both observations under the
+    /// directory and checkpoint locks before removing the cache reference.
+    pub fn invalidateCanonical(self: *Cache, key: [32]u8, expected: *const Context, proof: CanonicalProof) bool {
+        return self.invalidateObserved(key, expected, CanonicalCheckpoint.of(proof));
+    }
+    fn invalidateObserved(self: *Cache, key: [32]u8, expected: *const Context, checkpoint: ?CanonicalCheckpoint) bool {
         self.lock();
         const current = self.entries.get(key);
         if (current == null or current.? != expected) {
             self.mutex.unlock();
-            return;
+            return false;
+        }
+        if (checkpoint) |observed| {
+            @import("antfly_platform").sync.lockYielding(&current.?.canonical_mutex);
+            const canonical = current.?.canonical_checkpoint orelse if (current.?.canonical) |proof| CanonicalCheckpoint.of(proof) else null;
+            if (canonical == null or !std.meta.eql(observed, canonical.?)) {
+                current.?.canonical_mutex.unlock();
+                self.mutex.unlock();
+                return false;
+            }
         }
         self.unlink(current.?);
         _ = self.entries.remove(key);
         self.bytes -= weight(current.?);
+        if (checkpoint != null) current.?.canonical_mutex.unlock();
         self.mutex.unlock();
         current.?.release();
+        return true;
     }
     pub fn acquire(self: *Cache, key: [32]u8, cacheable: bool, loader: Loader) !Lease {
         std.debug.assert(loader.estimated_bytes == null);
@@ -480,8 +500,8 @@ pub fn tryTailCanonical(key: [32]u8, loader: Loader) !?Lease {
     bounded.estimated_bytes = 1024 * 1024;
     return routing.tryAcquire(key, true, bounded);
 }
-pub fn invalidateTailCanonical(key: [32]u8, expected: *const Context) void {
-    routing.invalidate(key, expected);
+pub fn invalidateTailCanonical(key: [32]u8, expected: *const Context, proof: ?CanonicalProof) void {
+    if (proof) |observed| _ = routing.invalidateCanonical(key, expected, observed) else routing.invalidate(key, expected);
 }
 pub fn acquire(key: [32]u8, cacheable: bool, loader: Loader) !Lease {
     return shared.acquire(key, cacheable, loader);
@@ -749,7 +769,9 @@ test "native resolver authority canonical checkpoint rejects stale publication a
     var other_branch = advanced;
     other_branch.graph = @splat(9);
     try std.testing.expect(!lease.context.advanceCanonical(other_branch, .{ .sequence = 3, .graph = @splat(7), .routing = @splat(8) }));
-    cache.invalidate(@splat(121), lease.context);
+    try std.testing.expect(!cache.invalidateCanonical(@splat(121), lease.context, original));
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+    try std.testing.expect(cache.invalidateCanonical(@splat(121), lease.context, advanced));
     try std.testing.expectEqual(@as(u64, 2), lease.context.canonicalProof().?.sequence);
 }
 

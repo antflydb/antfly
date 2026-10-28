@@ -2330,7 +2330,7 @@ pub const Store = struct {
                     }
                     // Older snapshots do not displace a newer cached generation.
                     const replace = proof == null or proof.?.sequence <= journal_head.sequence;
-                    if (replace) query_context.invalidateTailCanonical(cache_key, lease.context);
+                    if (replace) query_context.invalidateTailCanonical(cache_key, lease.context, proof);
                     lease.release();
                     cached = null;
                     if (!replace) break;

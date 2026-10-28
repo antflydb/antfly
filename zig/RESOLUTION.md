@@ -2788,8 +2788,9 @@ and refuses backward sequences, so older or competing snapshots cannot replace a
 new certificate. The next unrelated head validates only the new suffix rather
 than replaying the result's entire lifetime. No checkpoint is advanced on failed
 ancestry, dependency, history-window or barrier validation.
-Removal compares the observed cache generation, preserving active leases and
-concurrent replacements. Older snapshots cannot evict newer entries in that lineage.
+Removal compares both the observed cache generation and validation checkpoint,
+preserving active leases, concurrent replacements and newer certificates on the
+same immutable path context. Older snapshots cannot evict newer entries in that lineage.
 Root sets, pin memberships, source proofs and grants are never cached in a terminal
 entry. Retained strings and dependencies own their bytes; bounded caller scratch
 and a 1-MiB reservation cover the largest frozen terminal result.
