@@ -4111,6 +4111,8 @@ pub const ChoiceDecisionQuestion = struct {
 
 /// Original-source coordinates; time intervals are half-open integer nanoseconds and text spans are UTF-8 byte offsets.
 pub const ChunkCoordinates = struct {
+    /// Source-scoped speaker of a chunk made with audio_speaker_turns; omitted for unassigned intervals.
+    speaker_index: ?i64 = null,
     kind: []const u8,
     start_byte: ?i64 = null,
     end_byte: ?i64 = null,
@@ -4141,6 +4143,7 @@ pub const ChunkCoordinates = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "speaker_index", "speaker_index", true },
         .{ "kind", "kind", false },
         .{ "start_byte", "start_byte", true },
         .{ "end_byte", "end_byte", true },
@@ -4174,6 +4177,10 @@ pub const ChunkCoordinates = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.speaker_index) |value| {
+            try jw.objectField("speaker_index");
+            try jw.write(value);
+        }
         try jw.objectField("kind");
         try jw.write(self.kind);
         if (self.start_byte) |value| {
@@ -4266,6 +4273,65 @@ pub const ChunkDescriptor = struct {
     ordinal: i64,
     coordinates: ChunkCoordinates,
     input_tokens: i64,
+};
+
+/// Source-wide online speaker clustering on a fixed 1.5 s grid with 3 s embedding windows. Identities are stable within a source and recipe. Silence and ambiguous voices remain unassigned. Analysis advances incrementally; admitted cached timelines and durable centroid/sample-position checkpoints are shared across matching outputs and continuations. Missing checkpoints reconstruct the required prefix deterministically.
+pub const ChunkDiarizationConfig = struct {
+    /// Speaker ONNX registry reference; defaults to 3D-Speaker CAM++. For kind=diarize the target model selects the speaker model.
+    model: ?[]const u8 = null,
+    /// Optional SHA-256 pin of the speaker ONNX file, including when paired with a transcription model.
+    model_identity: ?[]const u8 = null,
+    similarity_threshold: ?f32 = null,
+    ambiguity_margin: ?f32 = null,
+    min_rms: ?f32 = null,
+    max_speakers: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "model_identity", "model_identity", true },
+        .{ "similarity_threshold", "similarity_threshold", true },
+        .{ "ambiguity_margin", "ambiguity_margin", true },
+        .{ "min_rms", "min_rms", true },
+        .{ "max_speakers", "max_speakers", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
+            try jw.write(value);
+        }
+        if (self.similarity_threshold) |value| {
+            try jw.objectField("similarity_threshold");
+            try jw.write(value);
+        }
+        if (self.ambiguity_margin) |value| {
+            try jw.objectField("ambiguity_margin");
+            try jw.write(value);
+        }
+        if (self.min_rms) |value| {
+            try jw.objectField("min_rms");
+            try jw.write(value);
+        }
+        if (self.max_speakers) |value| {
+            try jw.objectField("max_speakers");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ChunkEmbeddingContext = struct {
@@ -4731,6 +4797,12 @@ pub const ChunkOutputLabel = struct {
 };
 
 pub const ChunkOutputResult = struct {
+    /// SHA-256 of the speaker ONNX bytes used for this output. Included in recipe identity for diarization and paired transcription or embedding boundaries.
+    speaker_model_revision: ?[]const u8 = null,
+    /// Speaker indices are shared across all windows of this source and diarization recipe.
+    speaker_scope: ?[]const u8 = null,
+    /// Timed voice annotations for kind=diarize, including unassigned intervals. No transcript is required.
+    speaker_spans: ?[]const ChunkSpeakerSpan = null,
     name: []const u8,
     kind: []const u8,
     required: bool,
@@ -4754,6 +4826,9 @@ pub const ChunkOutputResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "speaker_model_revision", "speaker_model_revision", true },
+        .{ "speaker_scope", "speaker_scope", true },
+        .{ "speaker_spans", "speaker_spans", true },
         .{ "name", "name", false },
         .{ "kind", "kind", false },
         .{ "required", "required", false },
@@ -4783,6 +4858,18 @@ pub const ChunkOutputResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.speaker_model_revision) |value| {
+            try jw.objectField("speaker_model_revision");
+            try jw.write(value);
+        }
+        if (self.speaker_scope) |value| {
+            try jw.objectField("speaker_scope");
+            try jw.write(value);
+        }
+        if (self.speaker_spans) |value| {
+            try jw.objectField("speaker_spans");
+            try jw.write(value);
+        }
         try jw.objectField("name");
         try jw.write(self.name);
         try jw.objectField("kind");
@@ -4850,7 +4937,10 @@ pub const ChunkOutputTarget = struct {
     task_type: ?[]const u8 = null,
     dimensions: ?i64 = null,
     language: ?[]const u8 = null,
+    /// Convenience option on transcription outputs; enables source-wide diarization with the default speaker model.
     diarize: ?bool = null,
+    /// Speaker settings for diarize or transcribe outputs; also accepted on the selected audio embedding boundary with audio_speaker_turns=true.
+    diarization: ?ChunkDiarizationConfig = null,
     top_k: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -4866,6 +4956,7 @@ pub const ChunkOutputTarget = struct {
         .{ "dimensions", "dimensions", true },
         .{ "language", "language", true },
         .{ "diarize", "diarize", true },
+        .{ "diarization", "diarization", true },
         .{ "top_k", "top_k", true },
     };
 
@@ -4915,6 +5006,10 @@ pub const ChunkOutputTarget = struct {
         }
         if (self.diarize) |value| {
             try jw.objectField("diarize");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
             try jw.write(value);
         }
         if (self.top_k) |value| {
@@ -4981,11 +5076,46 @@ pub const ChunkSourceReference = struct {
     }
 };
 
+pub const ChunkSpeakerSpan = struct {
+    start_ns: i64,
+    end_ns: i64,
+    /// Source-scoped voice index in order of first appearance; absent for silence or ambiguous audio.
+    speaker_index: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "start_ns", "start_ns", false },
+        .{ "end_ns", "end_ns", false },
+        .{ "speaker_index", "speaker_index", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("start_ns");
+        try jw.write(self.start_ns);
+        try jw.objectField("end_ns");
+        try jw.write(self.end_ns);
+        if (self.speaker_index) |value| {
+            try jw.objectField("speaker_index");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ChunkTranscriptSpan = struct {
     text: []const u8,
     start_ns: i64,
     end_ns: i64,
-    /// Speaker index local to this output sub-window; global identities require diarization stitching.
+    /// Source-scoped when the output carries speaker_scope=source. Older receipts without that marker use sub-window-local numbering.
     speaker_index: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -34666,6 +34796,8 @@ pub const MediaChunkPolicy = struct {
     tile_width: ?i64 = null,
     tile_height: ?i64 = null,
     tile_overlap: ?i64 = null,
+    /// Split audio chunks at detected speaker transitions, additionally respecting the boundary model limits. Requires a diarization-enabled boundary target, zero overlap_ns and zero audio_pause_ns. The boundary diarization recipe participates in plan identity. Analysis runs even with execute=false because these boundaries depend on audio inference.
+    audio_speaker_turns: ?bool = null,
     /// Optional minimum silence duration for choosing an earlier boundary; no samples are discarded.
     audio_pause_ns: ?i64 = null,
     audio_pause_search_ns: ?i64 = null,
@@ -34685,6 +34817,7 @@ pub const MediaChunkPolicy = struct {
         .{ "tile_width", "tile_width", true },
         .{ "tile_height", "tile_height", true },
         .{ "tile_overlap", "tile_overlap", true },
+        .{ "audio_speaker_turns", "audio_speaker_turns", true },
         .{ "audio_pause_ns", "audio_pause_ns", true },
         .{ "audio_pause_search_ns", "audio_pause_search_ns", true },
         .{ "audio_silence_milli", "audio_silence_milli", true },
@@ -34742,6 +34875,10 @@ pub const MediaChunkPolicy = struct {
         }
         if (self.tile_overlap) |value| {
             try jw.objectField("tile_overlap");
+            try jw.write(value);
+        }
+        if (self.audio_speaker_turns) |value| {
+            try jw.objectField("audio_speaker_turns");
             try jw.write(value);
         }
         if (self.audio_pause_ns) |value| {
@@ -34811,12 +34948,14 @@ pub const MediaOutputCoverageCounts = struct {
     embedding: ?MediaOutputCoverageValues = null,
     transcribe: ?MediaOutputCoverageValues = null,
     classify: ?MediaOutputCoverageValues = null,
+    diarize: ?MediaOutputCoverageValues = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "embedding", "embedding", true },
         .{ "transcribe", "transcribe", true },
         .{ "classify", "classify", true },
+        .{ "diarize", "diarize", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -34839,6 +34978,10 @@ pub const MediaOutputCoverageCounts = struct {
         }
         if (self.classify) |value| {
             try jw.objectField("classify");
+            try jw.write(value);
+        }
+        if (self.diarize) |value| {
+            try jw.objectField("diarize");
             try jw.write(value);
         }
         try jw.endObject();

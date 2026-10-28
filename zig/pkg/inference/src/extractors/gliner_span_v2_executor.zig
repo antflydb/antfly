@@ -44,6 +44,8 @@ const document = @import("../pipelines/gliner_boundary_long_document.zig");
 
 pub const Options = struct {
     modern_span_extraction: bool = false,
+    /// Qualified CUDA classification rows per physical forward; other routes stay serial.
+    cuda_batch_items: usize = 1,
     max_response_bytes: usize = 64 * 1024 * 1024,
     /// `max_sequence_tokens` is the hard per-sequence ceiling. It defaults to
     /// DeBERTa-v3's 512 pretraining positions, the same cap the legacy span
@@ -157,29 +159,63 @@ pub fn classificationLogitsProfiled(
     task_label_counts: []const usize,
     profile: ?*Profile,
 ) ![][]f64 {
+    const batches = try classificationBatchLogits(cb, allocator, config, &.{sample}, &.{task_label_counts}, profile);
+    defer allocator.free(batches);
+    return batches[0];
+}
+
+/// One padded encoder forward and one classifier/readback for distinct rows.
+/// Marker positions include each physical row's stride; padded keys are masked.
+/// Ragged task/label metadata is scattered back in the caller's original order.
+pub fn classificationBatchLogits(
+    cb: *const compute.ComputeBackend,
+    allocator: Allocator,
+    config: EncoderConfig,
+    samples: []const processor.Sample,
+    task_counts: []const []const usize,
+    profile: ?*Profile,
+) ![][][]f64 {
+    if (samples.len == 0 or samples.len != task_counts.len) return error.InvalidExtractionInput;
     var stage_start = if (profile != null) nowNs() else 0;
-    const seq_len = sample.input_ids.len;
     const H: usize = config.hiddenSize();
-    const labels = sample.classification_labels;
-    if (seq_len == 0 or labels.len == 0) return error.InvalidExtractionInput;
-    // The GLiNER CUDA encoder uses dynamic shared scores and supports up to
-    // 8192 keys; native and Metal retain their declared context bounds.
+    var seq_len: usize = 0;
+    var label_count: usize = 0;
+    for (samples) |sample| {
+        if (sample.input_ids.len == 0 or sample.classification_labels.len == 0) return error.InvalidExtractionInput;
+        seq_len = @max(seq_len, sample.input_ids.len);
+        label_count = try std.math.add(usize, label_count, sample.classification_labels.len);
+    }
     if (config == .modern_bert and cb.kind() == .cuda and seq_len > 8192)
         return error.UnsupportedModernBertCudaSequenceLength;
-
-    const attention_mask = try allocator.alloc(i64, seq_len);
+    const tokens = try std.math.mul(usize, samples.len, seq_len);
+    const ids = try allocator.alloc(i64, tokens);
+    defer allocator.free(ids);
+    const attention_mask = try allocator.alloc(i64, tokens);
     defer allocator.free(attention_mask);
-    @memset(attention_mask, 1);
+    @memset(ids, 0);
+    @memset(attention_mask, 0);
+    const positions = try allocator.alloc(u32, label_count);
+    defer allocator.free(positions);
+    var marker: usize = 0;
+    for (samples, 0..) |sample, row| {
+        const offset = row * seq_len;
+        @memcpy(ids[offset..][0..sample.input_ids.len], sample.input_ids);
+        @memset(attention_mask[offset..][0..sample.input_ids.len], 1);
+        for (sample.classification_labels) |label| {
+            if (label.marker_index >= sample.input_ids.len) return error.InvalidExtractionInput;
+            positions[marker] = std.math.cast(u32, offset + label.marker_index) orelse return error.InvalidExtractionInput;
+            marker += 1;
+        }
+    }
     const hidden = switch (config) {
         .deberta => |deberta| blk: {
-            // Same encoder and head mirror policy as the legacy span route.
             cb.preferEagerQuantMirrors(true);
-            break :blk try deberta_arch.forwardCtProfiled(cb, allocator, deberta, sample.input_ids, attention_mask, 1, seq_len, deberta_mod.glinerPrefersWeightMirrors(deberta), if (profile) |p| &p.encoder else null);
+            break :blk try deberta_arch.forwardCtProfiled(cb, allocator, deberta, ids, attention_mask, samples.len, seq_len, deberta_mod.glinerPrefersWeightMirrors(deberta), if (profile) |p| &p.encoder else null);
         },
         .modern_bert => |modern| blk: {
             var execution_config = modern;
             execution_config.metal_f16_weight_mirrors = true;
-            break :blk try modern_bert_arch.forwardCT(cb, allocator, execution_config, sample.input_ids, attention_mask, 1, seq_len);
+            break :blk try modern_bert_arch.forwardCT(cb, allocator, execution_config, ids, attention_mask, samples.len, seq_len);
         },
     };
     defer cb.free(hidden);
@@ -189,13 +225,6 @@ pub fn classificationLogitsProfiled(
         p.encoder_ns += now - stage_start;
         stage_start = now;
     }
-
-    const positions = try allocator.alloc(u32, labels.len);
-    defer allocator.free(positions);
-    for (labels, positions) |label, *position| {
-        if (label.marker_index >= seq_len) return error.InvalidExtractionInput;
-        position.* = @intCast(label.marker_index);
-    }
     // One Metal frame for the whole head instead of a synchronous command
     // buffer per op; the readback below happens after it completes.
     var head_frame_active = false;
@@ -203,11 +232,11 @@ pub fn classificationLogitsProfiled(
         head_frame_active = cb.decoderRuntimeBeginFrame() catch false;
     }
     errdefer if (head_frame_active) cb.decoderRuntimeCancelFrame() catch {};
-    const marker_states = (try cb.takeRows(hidden, positions, labels.len, H)) orelse gather: {
-        const ids = try allocator.alloc(i64, labels.len);
-        defer allocator.free(ids);
-        for (positions, ids) |position, *id| id.* = position;
-        break :gather try cb.embeddingLookup(hidden, ids, labels.len, H);
+    const marker_states = (try cb.takeRows(hidden, positions, label_count, H)) orelse gather: {
+        const marker_ids = try allocator.alloc(i64, label_count);
+        defer allocator.free(marker_ids);
+        for (positions, marker_ids) |position, *id| id.* = position;
+        break :gather try cb.embeddingLookup(hidden, marker_ids, label_count, H);
     };
     defer cb.free(marker_states);
 
@@ -215,10 +244,10 @@ pub fn classificationLogitsProfiled(
     defer cb.free(w0);
     const b0 = try cb.getWeight("classifier.0.bias");
     defer cb.free(b0);
-    const first = if (try cb.linearRelu(marker_states, w0, b0, labels.len, H, 2 * H)) |fused|
+    const first = if (try cb.linearRelu(marker_states, w0, b0, label_count, H, 2 * H)) |fused|
         fused
     else blk: {
-        const linear = try cb.linear(marker_states, w0, b0, labels.len, H, 2 * H);
+        const linear = try cb.linear(marker_states, w0, b0, label_count, H, 2 * H);
         defer cb.free(linear);
         break :blk try cb.relu(linear);
     };
@@ -227,7 +256,7 @@ pub fn classificationLogitsProfiled(
     defer cb.free(w2);
     const b2 = try cb.getWeight("classifier.2.bias");
     defer cb.free(b2);
-    const logits_ct = try cb.linear(first, w2, b2, labels.len, 2 * H, 1);
+    const logits_ct = try cb.linear(first, w2, b2, label_count, 2 * H, 1);
     defer cb.free(logits_ct);
     if (head_frame_active) {
         head_frame_active = false;
@@ -242,26 +271,37 @@ pub fn classificationLogitsProfiled(
     const logits = try cb.toFloat32(logits_ct, allocator);
     defer allocator.free(logits);
     if (profile) |p| p.readback_ns += nowNs() - stage_start;
-    if (logits.len != labels.len) return error.InvalidExtractionOutput;
+    if (logits.len != label_count) return error.InvalidExtractionOutput;
 
-    const rows = try allocator.alloc([]f64, task_label_counts.len);
+    const batches = try allocator.alloc([][]f64, samples.len);
     var built: usize = 0;
     errdefer {
-        for (rows[0..built]) |row| allocator.free(row);
-        allocator.free(rows);
+        for (batches[0..built]) |rows| freeRows(allocator, rows);
+        allocator.free(batches);
     }
-    for (task_label_counts, rows) |count, *row| {
-        row.* = try allocator.alloc(f64, count);
-        @memset(row.*, std.math.nan(f64));
+    var logit_start: usize = 0;
+    for (samples, task_counts, batches) |sample, counts, *batch| {
+        const rows = try allocator.alloc([]f64, counts.len);
+        var rows_built: usize = 0;
+        errdefer {
+            for (rows[0..rows_built]) |row| allocator.free(row);
+            allocator.free(rows);
+        }
+        for (counts, rows) |count, *row| {
+            row.* = try allocator.alloc(f64, count);
+            @memset(row.*, std.math.nan(f64));
+            rows_built += 1;
+        }
+        const labels = sample.classification_labels;
+        for (labels, logits[logit_start..][0..labels.len]) |label, logit| {
+            if (label.schema_index >= rows.len or label.label_index >= rows[label.schema_index].len) return error.InvalidExtractionOutput;
+            rows[label.schema_index][label.label_index] = logit;
+        }
+        logit_start += labels.len;
+        batch.* = rows;
         built += 1;
     }
-    for (labels, logits) |label, logit| {
-        if (label.schema_index >= rows.len or label.label_index >= rows[label.schema_index].len) return error.InvalidExtractionOutput;
-        rows[label.schema_index][label.label_index] = logit;
-    }
-    // presentClassifications rejects non-finite scores, so a label the
-    // processor did not emit cannot silently become a decision.
-    return rows;
+    return batches;
 }
 
 fn freeRows(allocator: Allocator, rows: [][]f64) void {
@@ -475,7 +515,8 @@ pub fn itemClassificationLogits(
 /// Conservative device scratch for one sequence of `tokens` on `config`:
 /// hidden-sized activations, the FFN intermediate, disentangled-attention
 /// score/c2p/p2c matrices (as if materialized), relative-position tables and
-/// the classifier head. Sequences run serially, so this bounds a request.
+/// the classifier head. The caller multiplies this per-row bound by the
+/// physical batch width before acquiring device admission.
 pub fn deviceScratchUpperBound(config: EncoderConfig, tokens: usize) !usize {
     const h: usize = config.hiddenSize();
     const i: usize = config.intermediateSize();
@@ -587,6 +628,45 @@ pub fn plan(allocator: Allocator, tokenizer: Tokenizer, request: *const wire.Req
     return .{ .items = items, .prompt_tokens = prompt_tokens };
 }
 
+fn canBatchClassifications(request: *const wire.Request, request_plan: *const Plan) bool {
+    for (request.items, request_plan.items) |item, prepared| {
+        if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0 or prepared.document != null or prepared.batches.len != 1 or prepared.ranges.len != 1) return false;
+    }
+    return true;
+}
+
+fn plannedClassificationBatch(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]ItemLogits {
+    const result = try allocator.alloc(ItemLogits, request.items.len);
+    var built: usize = 0;
+    errdefer {
+        for (result[0..built]) |*item| item.deinit(allocator);
+        allocator.free(result);
+    }
+    while (built < result.len) {
+        try progress(options, built, "encoder");
+        const n = @min(options.cuda_batch_items, result.len - built);
+        const samples = try allocator.alloc(processor.Sample, n);
+        defer allocator.free(samples);
+        const counts = try allocator.alloc([]const usize, n);
+        defer allocator.free(counts);
+        var counts_built: usize = 0;
+        defer for (counts[0..counts_built]) |row| allocator.free(row);
+        for (samples, counts, 0..) |*sample, *row, i| {
+            const classifications = request.items[built + i].compiled.schema.classifications;
+            const values = try allocator.alloc(usize, classifications.len);
+            for (classifications, values) |classification, *value| value.* = classification.task.labels.len;
+            row.* = values;
+            counts_built += 1;
+            sample.* = request_plan.items[built + i].batches[0].samples[0];
+        }
+        const rows = try classificationBatchLogits(cb, allocator, config, samples, counts, null);
+        defer allocator.free(rows);
+        for (rows, 0..) |row, i| result[built + i] = .{ .rows = row, .prompt_tokens = request_plan.items[built + i].prompt_tokens, .sequences = 1 };
+        built += n;
+    }
+    return result;
+}
+
 /// Runs a plan built by `plan` for the same request. The caller owns the
 /// managed backend, model lock and admission for the complete execution.
 pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]u8 {
@@ -596,6 +676,14 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
     try writer.begin(request.model);
+    const batched = if (cb.kind() == .cuda and options.cuda_batch_items > 1 and request.items.len > 1 and canBatchClassifications(request, request_plan))
+        try plannedClassificationBatch(cb, allocator, config, request, request_plan, options)
+    else
+        null;
+    defer if (batched) |items| {
+        for (items) |*item| item.deinit(allocator);
+        allocator.free(items);
+    };
     var remaining_values = options.pipeline.max_output_values;
     for (request.items, request_plan.items, 0..) |*item, *prepared_item, index| {
         if (remaining_values == 0) return error.ExtractionOutputLimitExceeded;
@@ -619,8 +707,8 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
             try writer.append(item.*, sample);
             continue;
         }
-        var logits = try preparedItemLogits(cb, allocator, config, item, prepared_item, null);
-        defer logits.deinit(allocator);
+        var logits = if (batched) |items| items[index] else try preparedItemLogits(cb, allocator, config, item, prepared_item, null);
+        defer if (batched == null) logits.deinit(allocator);
         const const_rows = try allocator.alloc([]const f64, logits.rows.len);
         defer allocator.free(const_rows);
         for (logits.rows, const_rows) |row, *out| out.* = row;
@@ -734,7 +822,7 @@ fn topTwoMargin(logits: []const std.json.Value) f64 {
 // Parity against testdata/gliner25/decide/cases.json, captured from upstream
 // gliner2==2.0.0 by scripts/gliner25/decide_oracle.py. Checks the exact
 // model-facing ids, every classifier logit, and the presented decisions.
-fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !void {
+fn testDecideParity(directory: []const u8, backend: enum { native, metal, cuda }, logit_tolerance: f64) !void {
     const a = std.testing.allocator;
     const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const bytes = try fixtures.fixtureBytes(a, "decide/cases.json");
@@ -743,7 +831,11 @@ fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !v
     defer fixture.deinit();
 
     const factory = @import("../architectures/session_factory.zig");
-    const session = if (metal) try factory.createMetalSession(a, directory) else try factory.createNativeSession(a, directory);
+    const session = switch (backend) {
+        .native => try factory.createNativeSession(a, directory),
+        .metal => try factory.createMetalSession(a, directory),
+        .cuda => try factory.createCudaSession(a, directory),
+    };
     defer session.close();
     const session_config = try factory.getGlinerSpanConfig(session);
     const config: EncoderConfig = switch (session_config) {
@@ -764,7 +856,7 @@ fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !v
     defer tokenizer.tokenizer().deinitTokenizer();
 
     // Accelerator sessions require process isolation for uninterruptible work.
-    const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
+    const watchdog = if (backend != .native) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 600 * std.time.ns_per_s };
@@ -799,8 +891,16 @@ fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !v
         const counts = try a.alloc(usize, classifications.len);
         defer a.free(counts);
         for (classifications, counts) |classification, *count| count.* = classification.task.labels.len;
+        const cuda_before = if (comptime @import("build_options").enable_cuda) factory.getCudaRuntimeStats(session) else null;
         const rows = try classificationLogits(cb, a, config, sample, counts);
         defer freeRows(a, rows);
+        if (comptime @import("build_options").enable_cuda) {
+            if (cuda_before) |before| {
+                const after = factory.getCudaRuntimeStats(session).?;
+                try std.testing.expect(after.kernel_launches > before.kernel_launches);
+                try std.testing.expectEqual(before.to_float32_calls + 1, after.to_float32_calls);
+            }
+        }
         const expected_rows = case.get("classifier_logits").?.array.items;
         try std.testing.expectEqual(expected_rows.len, rows.len);
         for (expected_rows, rows) |expected_row, row| {
@@ -831,7 +931,7 @@ fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !v
                 thresholdMargin(expected_row.array.items, task.task.threshold)
             else
                 topTwoMargin(expected_row.array.items);
-            if (margin < 2 * logit_tolerance) {
+            if (backend != .cuda and margin < 2 * logit_tolerance) {
                 std.debug.print("case {s} task {s}: near-tie (margin {d:.4}), decision not compared\n", .{ name, classification.name, margin });
                 continue;
             }
@@ -845,29 +945,29 @@ fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !v
             try std.testing.expectEqual(expected_labels.len, classification.labels.len);
             for (expected_labels, classification.labels) |want, got| {
                 try std.testing.expectEqualStrings(want.object.get("label").?.string, got.label);
-                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(want.object.get("confidence").?.float)), got.confidence, @as(f32, @floatCast(logit_tolerance)));
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(want.object.get("confidence").?.float)), got.confidence, @as(f32, @floatCast(if (backend == .cuda) @min(logit_tolerance, 5e-3) else logit_tolerance)));
             }
         }
     }
-    std.debug.print("GLiNER2.5-Decide {s} max classifier logit error {e}\n", .{ if (metal) "metal" else "native", max_logit_error });
+    std.debug.print("GLiNER2.5-Decide {s} max classifier logit error {e}\n", .{ @tagName(backend), max_logit_error });
     try std.testing.expect(max_logit_error <= logit_tolerance);
 }
 
 test "gliner span v2 GLiNER2.5-Decide native parity" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
-    try testDecideParity(directory, false, 2e-3);
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse @import("antfly_platform").env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
+    try testDecideParity(directory, .native, 2e-3);
 }
 
 test "gliner span v2 GLiNER2.5-Decide Metal parity" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
-    try testDecideParity(directory, true, 5e-3);
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse @import("antfly_platform").env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
+    try testDecideParity(directory, .metal, 5e-3);
 }
 
 // Span head + CountLSTM v1 parity on upstream's exact entity inputs, which
 // isolates the head from the legacy entity pipeline's prompt construction.
 test "gliner span v2 GLiNER2.5-Decide CountLSTM v1 entity head parity" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse @import("antfly_platform").env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
     const gliner_head = @import("../architectures/gliner_head.zig");
@@ -920,7 +1020,7 @@ test "gliner span v2 GLiNER2.5-Decide CountLSTM v1 entity head parity" {
 
 test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle native parity" {
     const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
-    try testDecideParity(directory, false, 5e-2);
+    try testDecideParity(directory, .native, 5e-2);
 }
 
 test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle Metal parity" {
@@ -928,7 +1028,7 @@ test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle Metal parity" {
     const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
     // Q8_0 encoder weights: decisions must match exactly; probabilities and
     // logits carry quantization error.
-    try testDecideParity(directory, true, 5e-2);
+    try testDecideParity(directory, .metal, 5e-2);
 }
 
 // Warm Metal latency breakdown: ANTFLY_GLINER25_DECIDE_BENCH=1 plus the model dir.
@@ -1035,7 +1135,7 @@ test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
 }
 
 test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequences" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse @import("antfly_platform").env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
     const session = try factory.createNativeSession(a, directory);
@@ -1107,7 +1207,7 @@ test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequen
 }
 
 test "gliner span v2 GLiNER2.5-Decide execute serves the wire response and enforces limits" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse @import("antfly_platform").env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
     const session = try factory.createNativeSession(a, directory);
@@ -1186,4 +1286,16 @@ test "decide typed envelope retains schema and text admission limits" {
     try std.testing.expectEqualStrings("true", parsed.items[0].compiled.schema.classifications[0].task.labels[1]);
     try std.testing.expectError(error.ExtractionTextLimitExceeded, wire.parseValue(a, input.value, .{ .limits = .{ .max_text_bytes_per_input = 1 } }));
     try std.testing.expectError(error.ExtractionSchemaLimitExceeded, wire.parseValue(a, input.value, .{ .limits = .{ .max_total_schema_bytes = 1 } }));
+}
+
+test "gliner span v2 GLiNER2.5-Decide CUDA classification oracle parity" {
+    if (!@import("build_options").enable_cuda) return error.SkipZigTest;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
+    try testDecideParity(directory, .cuda, 2e-3);
+}
+
+test "gliner span v2 GLiNER2.5-Decide Q8 CUDA classification oracle parity" {
+    if (!@import("build_options").enable_cuda) return error.SkipZigTest;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER_DECIDE_Q8_MODEL") orelse return error.SkipZigTest;
+    try testDecideParity(directory, .cuda, 5e-2);
 }

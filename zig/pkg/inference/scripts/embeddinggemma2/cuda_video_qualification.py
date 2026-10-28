@@ -55,8 +55,17 @@ def validate_vector(vector):
 
 
 def media_input(mime, data):
-    return [{"content": [{"type": "media", "mime_type": mime,
-                          "data": base64.b64encode(data).decode()}]}]
+    return [
+        {
+            "content": [
+                {
+                    "type": "media",
+                    "mime_type": mime,
+                    "data": base64.b64encode(data).decode(),
+                }
+            ]
+        }
+    ]
 
 
 def cleanup_snapshot(url, pid):
@@ -72,13 +81,20 @@ def cleanup_snapshot(url, pid):
             value = float(fields[1])
             if math.isfinite(value):
                 parsed[fields[0]] = value
-    for name in ("antfly_inference_embedding_groups_active",
-                 "antfly_admission_inference_in_flight_requests"):
+    for name in (
+        "antfly_inference_embedding_groups_active",
+        "antfly_admission_inference_in_flight_requests",
+    ):
         if parsed.get(name) != 0:
-            raise ValueError(f"request did not release admission: {name}={parsed.get(name)}")
+            raise ValueError(
+                f"request did not release admission: {name}={parsed.get(name)}"
+            )
     status = Path(f"/proc/{pid}/status").read_text()
-    memory = {line.split(":")[0]: line.split(":", 1)[1].strip()
-              for line in status.splitlines() if line.startswith(("VmRSS:", "VmHWM:"))}
+    memory = {
+        line.split(":")[0]: line.split(":", 1)[1].strip()
+        for line in status.splitlines()
+        if line.startswith(("VmRSS:", "VmHWM:"))
+    }
     # The CLI may supervise a worker. Measuring only the launched PID would
     # report the supervisor's few MiB instead of the inference process.
     tree = []
@@ -94,21 +110,38 @@ def cleanup_snapshot(url, pid):
             children = Path(f"/proc/{current}/task/{current}/children").read_text()
         except FileNotFoundError:
             continue
-        values = {line.split(":")[0]: line.split(":", 1)[1].strip()
-                  for line in current_status.splitlines() if ":" in line}
-        tree.append({"pid": current, "name": values["Name"],
-                     "rss_kib": int(values.get("VmRSS", "0 kB").split()[0]),
-                     "hwm_kib": int(values.get("VmHWM", "0 kB").split()[0])})
+        values = {
+            line.split(":")[0]: line.split(":", 1)[1].strip()
+            for line in current_status.splitlines()
+            if ":" in line
+        }
+        tree.append(
+            {
+                "pid": current,
+                "name": values["Name"],
+                "rss_kib": int(values.get("VmRSS", "0 kB").split()[0]),
+                "hwm_kib": int(values.get("VmHWM", "0 kB").split()[0]),
+            }
+        )
         pending.extend(int(child) for child in children.split())
-    return {"process": memory, "process_tree": tree,
-            "tree_rss_kib": sum(row["rss_kib"] for row in tree), "metrics": parsed}
+    return {
+        "process": memory,
+        "process_tree": tree,
+        "tree_rss_kib": sum(row["rss_kib"] for row in tree),
+        "metrics": parsed,
+    }
 
 
 def request(url, body, timeout, deadline_ms=None):
     req = urllib.request.Request(
-        url + "/ai/v1/embed", json.dumps(body).encode(),
-        {"Content-Type": "application/json",
-         "X-Antfly-Inference-Timeout-Ms": str(deadline_ms if deadline_ms is not None else int(timeout * 1000))},
+        url + "/ai/v1/embed",
+        json.dumps(body).encode(),
+        {
+            "Content-Type": "application/json",
+            "X-Antfly-Inference-Timeout-Ms": str(
+                deadline_ms if deadline_ms is not None else int(timeout * 1000)
+            ),
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -135,19 +168,25 @@ def main():
         parser.error("at least two iterations and a timeout in (0,600] are required")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result = {
-        "status": "running", "scope": "native CUDA repeatability and recovery",
+        "status": "running",
+        "scope": "native CUDA repeatability and recovery",
         "binary_sha256": sha256(args.binary),
         "tool_sha256": sha256(Path(__file__)),
-        "checkpoint_receipt": json.loads((args.model_dir / "embeddinggemma2_receipt.json").read_text()),
+        "checkpoint_receipt": json.loads(
+            (args.model_dir / "embeddinggemma2_receipt.json").read_text()
+        ),
         "clips": [{"path": str(p.resolve()), "sha256": sha256(p)} for p in args.clip],
-        "audio_sha256": sha256(args.audio), "cases": [],
+        "audio_sha256": sha256(args.audio),
+        "cases": [],
         "backend_budget_mb": args.backend_budget_mb,
         "scratch_budget_mb": args.scratch_budget_mb,
     }
     result["source_sha"] = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], text=True).strip()
-    result["source_diff_sha256"] = hashlib.sha256(subprocess.check_output(
-        ["git", "diff", "HEAD"])).hexdigest()
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    result["source_diff_sha256"] = hashlib.sha256(
+        subprocess.check_output(["git", "diff", "HEAD"])
+    ).hexdigest()
     result["gpu"] = subprocess.check_output(["nvidia-smi"], text=True)
     for item in result["checkpoint_receipt"]["files"]:
         if sha256(args.model_dir / item["path"]) != item["sha256"]:
@@ -156,21 +195,41 @@ def main():
         endpoint.bind(("127.0.0.1", 0))
         port = endpoint.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
-    command = [str(args.binary.resolve()), "inference", "run", "--port", str(port),
-               "--models-dir", str(args.model_dir.resolve().parent),
-               "--host-budget-mb", "8192", "--backend-budget-mb", str(args.backend_budget_mb),
-               "--combined-budget-mb", str(8192 + args.backend_budget_mb),
-               "--scratch-budget-mb", str(args.scratch_budget_mb),
-               "--process-memory-budget-mb", "16384"]
+    command = [
+        str(args.binary.resolve()),
+        "inference",
+        "run",
+        "--port",
+        str(port),
+        "--models-dir",
+        str(args.model_dir.resolve().parent),
+        "--host-budget-mb",
+        "8192",
+        "--backend-budget-mb",
+        str(args.backend_budget_mb),
+        "--combined-budget-mb",
+        str(8192 + args.backend_budget_mb),
+        "--scratch-budget-mb",
+        str(args.scratch_budget_mb),
+        "--process-memory-budget-mb",
+        "16384",
+    ]
     result["command"] = command
     baseline = {}
     identity = None
     failures = []
     log_path = args.output.with_suffix(".server.log")
     with log_path.open("w") as log:
-        process = subprocess.Popen(command, stdout=log, stderr=log, env=dict(
-            os.environ, ANTFLY_INFERENCE_REQUIRED_BACKEND="cuda",
-            ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS="1"))
+        process = subprocess.Popen(
+            command,
+            stdout=log,
+            stderr=log,
+            env=dict(
+                os.environ,
+                ANTFLY_INFERENCE_REQUIRED_BACKEND="cuda",
+                ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS="1",
+            ),
+        )
         try:
             deadline = time.monotonic() + 60
             while True:
@@ -186,27 +245,53 @@ def main():
             cases = [("text", text, 200), ("audio", audio, 200)]
             for iteration in range(args.iterations):
                 for index, clip in enumerate(args.clip):
-                    cases.append((f"video_{index}", media_input("video/mp4", clip.read_bytes()), 200))
-                cases.extend([
-                    ("corrupt", media_input("video/mp4", b"not an MP4"), 400),
-                    ("truncated", media_input("video/mp4", args.clip[0].read_bytes()[:32]), 400),
-                    ("text", text, 200), ("audio", audio, 200),
-                ])
-            cases.extend([
-                ("deadline", media_input("video/mp4", args.clip[-1].read_bytes()), 504),
-                ("text", text, 200), ("audio", audio, 200),
-            ])
+                    cases.append(
+                        (
+                            f"video_{index}",
+                            media_input("video/mp4", clip.read_bytes()),
+                            200,
+                        )
+                    )
+                cases.extend(
+                    [
+                        ("corrupt", media_input("video/mp4", b"not an MP4"), 400),
+                        (
+                            "truncated",
+                            media_input("video/mp4", args.clip[0].read_bytes()[:32]),
+                            400,
+                        ),
+                        ("text", text, 200),
+                        ("audio", audio, 200),
+                    ]
+                )
+            cases.extend(
+                [
+                    (
+                        "deadline",
+                        media_input("video/mp4", args.clip[-1].read_bytes()),
+                        504,
+                    ),
+                    ("text", text, 200),
+                    ("audio", audio, 200),
+                ]
+            )
             for name, inputs, expected_status in cases:
                 row = {"case": name, "expected_status": expected_status}
                 result["cases"].append(row)
                 started = time.monotonic()
                 try:
-                    status, response = request(url, {"model": args.model_dir.name, "input": inputs}, args.timeout,
-                                               deadline_ms=1 if name == "deadline" else None)
+                    status, response = request(
+                        url,
+                        {"model": args.model_dir.name, "input": inputs},
+                        args.timeout,
+                        deadline_ms=1 if name == "deadline" else None,
+                    )
                     row.update(http_status=status, seconds=time.monotonic() - started)
                     if status != expected_status:
                         row["response"] = response
-                        raise ValueError(f"expected HTTP {expected_status}, got {status}")
+                        raise ValueError(
+                            f"expected HTTP {expected_status}, got {status}"
+                        )
                     if status == 200:
                         vector = response["data"][0]["embedding"]
                         row["norm"] = validate_vector(vector)
@@ -216,9 +301,13 @@ def main():
                             raise ValueError("model identity changed")
                         identity = current_identity
                         if name in baseline:
-                            row["repeat_max_abs"] = max(abs(x-y) for x, y in zip(vector, baseline[name]))
+                            row["repeat_max_abs"] = max(
+                                abs(x - y) for x, y in zip(vector, baseline[name])
+                            )
                             if row["repeat_max_abs"] > 1e-5:
-                                raise ValueError("embedding changed across repeats/recovery")
+                                raise ValueError(
+                                    "embedding changed across repeats/recovery"
+                                )
                         baseline[name] = vector
                     else:
                         row["response"] = response
@@ -235,14 +324,21 @@ def main():
                 args.output.write_text(json.dumps(result, indent=2) + "\n")
             result["model_identity"] = identity
             if not failures and args.mixed_jobs:
-                mixed = [("text", text), ("audio", audio),
-                         ("video_0", media_input("video/mp4", args.clip[0].read_bytes()))]
+                mixed = [
+                    ("text", text),
+                    ("audio", audio),
+                    ("video_0", media_input("video/mp4", args.clip[0].read_bytes())),
+                ]
                 with ThreadPoolExecutor(max_workers=3) as executor:
                     submitted = {}
                     for index in range(args.mixed_jobs):
                         name, inputs = mixed[index % len(mixed)]
-                        future = executor.submit(request, url, {
-                            "model": args.model_dir.name, "input": inputs}, args.timeout)
+                        future = executor.submit(
+                            request,
+                            url,
+                            {"model": args.model_dir.name, "input": inputs},
+                            args.timeout,
+                        )
                         submitted[future] = name
                     for future in as_completed(submitted):
                         name = submitted[future]
@@ -253,12 +349,21 @@ def main():
                             row["http_status"] = status
                             if status != 200:
                                 row["response"] = response
-                                raise ValueError(f"mixed request returned HTTP {status}")
+                                raise ValueError(
+                                    f"mixed request returned HTTP {status}"
+                                )
                             vector = response["data"][0]["embedding"]
                             row["norm"] = validate_vector(vector)
-                            row["repeat_max_abs"] = max(abs(x-y) for x,y in zip(vector, baseline[name]))
-                            if response["model_identity"] != identity or row["repeat_max_abs"] > 1e-5:
-                                raise ValueError("mixed request changed identity or embedding")
+                            row["repeat_max_abs"] = max(
+                                abs(x - y) for x, y in zip(vector, baseline[name])
+                            )
+                            if (
+                                response["model_identity"] != identity
+                                or row["repeat_max_abs"] > 1e-5
+                            ):
+                                raise ValueError(
+                                    "mixed request changed identity or embedding"
+                                )
                             row["status"] = "pass"
                         except Exception as error:
                             row.update(status="failed", error=str(error))
