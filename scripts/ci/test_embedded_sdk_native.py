@@ -68,7 +68,8 @@ set -eu
 [ "$ANTFLY_LITE_REQUIRE_LIBRARY" = 1 ]
 [ "$ANTFLY_LIB_DIR" = "$EXPECTED_NATIVE_LIB" ]
 [ "$(dirname "$ANTFLY_LIBRARY")" = "$EXPECTED_NATIVE_LIB" ]
-[ "$*" = 'run --locked pytest -q --ignore=tests/test_inference.py' ]
+[ "$*" = "run --locked pytest -q --durations=25 --durations-min=1 --junitxml=$ANTFLY_SDK_NATIVE_REPORT_DIR/python.xml --ignore=tests/test_inference.py" ]
+[ -d "$ANTFLY_SDK_NATIVE_REPORT_DIR" ]
 [ -s "$ANTFLY_LIBRARY" ]
 printf 'native-test-invoked\n'
 """)
@@ -86,6 +87,7 @@ set -eu
                 "PATH": str(tools) + os.pathsep + os.environ["PATH"],
                 "ANTFLY_LIBRARY": "/nonexistent",
                 "EXPECTED_NATIVE_LIB": str(lib),
+                "ANTFLY_SDK_NATIVE_REPORT_DIR": str(root / "reports with spaces"),
             }
             result = subprocess.run(
                 ["bash", str(SCRIPT), str(root / "installation"), "python"],

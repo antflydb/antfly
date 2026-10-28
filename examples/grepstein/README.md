@@ -161,16 +161,24 @@ separate; it needs read access to the originals bucket.
 ./grepstein publish --state ./grepstein-corpus --bucket antfly-showcases-originals
 # Set ANTFLY_API_KEY securely to a write key for this instance/table.
 ./grepstein load --state ./grepstein-corpus --url "$ANTFLY_URL" \
-  --create-table --num-shards 4 --reader-config florence-reader.example.json \
+  --create-table --num-shards 4 --reader-config lightonocr-reader.example.json \
   --inference-url "$ANTFLY_INFERENCE_URL" \
   --inference-secret antfly.antfly_inference.api_key
 ./grepstein wait --url "$ANTFLY_URL"
 ./grepstein stats --state ./grepstein-corpus --url "$ANTFLY_URL"
 ```
 
-The showcase OCR profile uses digest-pinned Florence-2 on shared Antfly inference.
+The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
+inference, running Antfly v0.3.0-rc.5 or later. Its native `/read` contract uses
+an image-only prompt, so the extraction producer keeps `prompt_policy: plain`.
+The profile requests at most 1024 output tokens per page; truncated OCR returns
+an error instead of publishing incomplete text. Dense pages can need a separate
+larger-budget `/generate` workflow. Shared inference also offers the smaller
+`lightonocr3-0.8b` model; select its pinned identity in a copy of the reader profile
+when qualifying the latency/quality tradeoff. The LightOnOCR models return
+Markdown, including table structure, through the same native reader API.
 Set `ANTFLY_INFERENCE_URL` to a server-reachable inference root or `/ai/v1` URL;
-`--inference-url` binds the Florence profile and relation extractor to that endpoint.
+`--inference-url` binds the LightOnOCR profile and relation extractor to that endpoint.
 The Cloud connection uses the existing `antfly.antfly_inference.api_key` server
 keystore key. `--inference-secret` stores only a secret reference in the OCR,
 embedding and relation configs; self-hosted users select their own key name.
@@ -190,7 +198,7 @@ need OCR. The Vertex reader example remains available as an alternative.
 
 The relation stage defaults to pinned `fastino/gliner2.5-base-v1`, with entity and
 relation schemas and bounded long-document windowing. Colony must deploy its
-GLiNER2.5 and Florence GPU routes before the hosted pipeline is qualified. CUDA
+GLiNER2.5 and LightOnOCR GPU routes before the hosted pipeline is qualified. CUDA
 kernels alone do not qualify the GLiNER2.5 serving policy: use a runtime with
 measured CUDA production profiles, then verify the deployed L4 path. RC.2 rejects
 GLiNER2.5 CUDA. Preserve the existing GLiNER2 route for other callers.

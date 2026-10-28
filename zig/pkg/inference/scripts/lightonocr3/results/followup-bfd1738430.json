@@ -1,0 +1,13 @@
+{
+  "implementation_commit": "bfd1738430",
+  "qualification_runtime_base": "2f294280e0007ce74f31ecbb761989d0d076d5a1",
+  "archive_sha256": "4a31f803b03ded1dd2497b605a25ac879772dd694b739fddf08f900e94425c61",
+  "archive_bytes": 59403729,
+  "regular_files": 108,
+  "uri": "gs://antfly-image-artifacts-zig-build-artifacts/benchmarks/lightonocr3/followup-1308/bfd1738430/4a31f803b03ded1dd2497b605a25ac879772dd694b739fddf08f900e94425c61/qualification.tar.gz",
+  "generation": "1793085354884482",
+  "md5_base64": "6RKVHHkCAJVWXj8tBwuJSA==",
+  "scope": "Both LightOn models: 256 warmup requests and two 256-request selected-profile measurements; fresh actual vLLM reference with the same warmups and requests. Includes optional-prefill four-token chains and default-F32 functional checks. Default-F32 run191 rates are contended and excluded from performance conclusions. Sustained LightOn CUDA parity remains outstanding.",
+  "source_note": "All 44 frozen build187 runtime files match commit bfd1738430. The bundle retains source184 graph control and source187 token-chain binaries and source, exact public scripts and fixtures, commands, sanitized runtime settings, full native/vLLM reports, independent F32 baseline reports, native-library artifacts and Florence regression evidence. Unselected later experiments are excluded.",
+  "verification": "Uploaded object size and MD5 match local archive; every member has a SHA-256 in evidence-manifest.json."
+}

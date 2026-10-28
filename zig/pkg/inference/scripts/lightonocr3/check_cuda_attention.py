@@ -65,10 +65,15 @@ class Params(c.Structure):
             ]
         ]
         + [("pages", Page * 64)]
+        + [
+            ("graph_progress", c.c_uint64),
+            ("graph_step", c.c_uint32),
+            ("reserved", c.c_uint32),
+        ]
     )
 
 
-assert c.sizeof(Page) == 268 and c.sizeof(Params) == 17248
+assert c.sizeof(Page) == 268 and c.sizeof(Params) == 17264
 
 
 def launch(driver, name, grid, p):
@@ -98,7 +103,21 @@ def main():
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chunk128", action="store_true")
+    parser.add_argument("--grouped", action="store_true")
     args = parser.parse_args()
+    chunk_name = (
+        (
+            "lighton_attention_grouped_chunks128"
+            if args.chunk128
+            else "lighton_attention_grouped_chunks32"
+        )
+        if args.grouped
+        else (
+            "lighton_attention_chunks128"
+            if args.chunk128
+            else "lighton_attention_chunks"
+        )
+    )
     torch.manual_seed(371)
     torch.set_num_threads(4)
     d = Driver(args.artifact)
@@ -184,10 +203,8 @@ def main():
                 torch.cuda.synchronize()
                 launch(
                     d,
-                    "lighton_attention_chunks128"
-                    if args.chunk128
-                    else "lighton_attention_chunks",
-                    (h, b * chunks),
+                    chunk_name,
+                    (kh if args.grouped else h, b * chunks),
                     p,
                 )
                 launch(d, "lighton_attention_combine", (b * h, 1), p)
@@ -222,10 +239,8 @@ def main():
                 )
                 launch(
                     d,
-                    "lighton_attention_chunks128"
-                    if args.chunk128
-                    else "lighton_attention_chunks",
-                    (h, b * chunks),
+                    chunk_name,
+                    (kh if args.grouped else h, b * chunks),
                     p,
                 )
                 launch(d, "lighton_attention_combine", (b * h, 1), p)

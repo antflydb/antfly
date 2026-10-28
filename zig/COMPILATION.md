@@ -1824,3 +1824,31 @@ unchanged. This avoids a full expensive API retry without serializing the
 entire build or increasing the runner's memory budget. The run also exposed
 missing compiled metadata job-state projections; those compilation errors are
 separate from memory admission.
+
+### Native Linux Debug auth admission (2026-10-27)
+
+Main run [40586926751](https://github.com/antflydb/antfly/actions/runs/40586926751)
+used Nix's glibc-linked Zig 0.17.0 on native x86_64 GNU Debug. Read-only
+2-second `/proc` sampling retained the compiler's `VmHWM` through completion:
+
+| Compilation owner | Observed high-water bytes | Old claim | New claim |
+|---|---:|---:|---:|
+| `api-auth-tests` | 15,804,899,328 | 7 GiB | 17 GiB |
+| `antfly-inference-core` | 9,540,190,208 | 12 GiB | unchanged |
+
+The auth object and inference compiler overlapped because their declared claims
+summed to 19 GiB under the 20 GiB admission budget. The 24 GiB pod's cgroup peak
+reached 25,769,779,200 bytes. Auth's new floor rounds its observed high-water
+mark plus 10% up to a whole GiB. The runner and aggregate budget are unchanged:
+auth can still overlap 3 GiB of smaller work, while its unsafe overlap with the
+12 GiB inference compiler is excluded. Other owners and optimization/target
+profiles retain their claims. This is an admission correction, not a reduction
+in the compiler's own memory use.
+
+The preceding main unit runner in run
+[40566906276](https://github.com/antflydb/antfly/actions/runs/40566906276)
+reported lost communication. GKE's retained pod deletion status identifies an
+`OOMKilled` termination (exit 137) at 19:41:11 UTC against the same 24 GiB
+container limit; this was not merely a GitHub runner connectivity failure.
+Sampling the next run identifies the auth underclaim directly, rather than
+attributing a vanished runner to a test assertion or increasing runner size.

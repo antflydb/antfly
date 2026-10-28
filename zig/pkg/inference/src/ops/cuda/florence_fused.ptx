@@ -744,11 +744,12 @@ $L__BB3_20:
 
 $L__BB3_22:
 	bar.sync 	0;
+	ld.shared.f32 	%f8, [_ZZ21florence_cross_q1_f32E7scratch];
+	bar.sync 	0;
 	setp.ge.u32 	%p18, %r3, %r31;
 	mov.f32 	%f118, 0f00000000;
 	@%p18 bra 	$L__BB3_25;
 
-	ld.shared.f32 	%f8, [_ZZ21florence_cross_q1_f32E7scratch];
 	mov.u32 	%r67, _ZZ21florence_cross_q1_f32E6scores;
 	add.s32 	%r81, %r67, %r64;
 	mov.f32 	%f118, 0f00000000;

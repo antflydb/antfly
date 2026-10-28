@@ -4435,7 +4435,7 @@ pub const NativeFile = struct {
         var counters: [4096]u8 = undefined;
         var start: usize = 0;
         while (start < state.counts.items.len) {
-            const n = @min(counters.len / 4, state.counts.items.len - start);
+            const n: usize = @min(counters.len / 4, state.counts.items.len - start);
             for (state.counts.items[start..][0..n], 0..) |value, k|
                 std.mem.writeInt(u32, counters[k * 4 ..][0..4], value, .little);
             hash.update(counters[0 .. n * 4]);
@@ -9901,13 +9901,13 @@ pub const NativeFile = struct {
     }
 
     fn validateFreePagesSafeForCheckpointSlots(self: *NativeFile, free_pages: []const u64) !void {
-        var window: AllocatorProofWindow = undefined;
-        window.initInto(self);
-        defer window.deinit();
         // Append-only writes have nothing to reclaim. Walking both checkpoint
         // graphs here makes each small catalog write proportional to history.
         // Nonempty free maps still require the full protected-page proof.
         if (free_pages.len == 0) return;
+        var window: AllocatorProofWindow = undefined;
+        window.initInto(self);
+        defer window.deinit();
         var protected_pages = std.AutoHashMapUnmanaged(u64, void){};
         defer protected_pages.deinit(self.allocator);
 
@@ -17453,7 +17453,7 @@ test "lite sorted editor releases ownership on every allocation failure" {
             try std.testing.expectEqual((mutations.len + 2) / 3 * 3, ordinal);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Runner.run, .{ &file, batch, references });
+    try antfly_platform.allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, batch, references });
     // The direct editor never publishes; discard its private fixture pages.
     file.discardTransactionTail();
     try std.testing.expectEqual(pinned.document_index_root_page, file.activeCheckpoint().document_index_root_page);
@@ -17687,7 +17687,7 @@ test "lite sorted initial ingest allocation and partial write failures roll back
             try std.testing.expectEqual(mutations.len, snapshot.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Runner.run, .{ &file, batch });
+    try antfly_platform.allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, batch });
     try std.testing.expectEqual(before.document_root_page, file.activeCheckpoint().document_root_page);
     const large = try arena.allocator().alloc(DocumentMutation, 2048);
     for (large, 0..) |*m, i| m.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "ns\x00key-{d:0>8}", .{i}), .value = &(@as([100]u8, @splat('v'))) };
@@ -19724,5 +19724,31 @@ test "lite native sparse linked ranges walk forward across sorted cohorts and ca
         for (ranges, output) |range, value| try std.testing.expectEqualSlices(u8, bytes[@intCast(range.offset)..][0..range.length], value);
         try std.testing.expect(projected * 2 < scalar);
         std.debug.print("LINKED_RANGE_FORWARD indexed={any} scalar_backing={d} forward_backing={d} ranges={d}\n", .{ indexed, scalar, projected, ranges.len });
+    }
+}
+
+test "lite allocator fingerprint batches preserve canonical bytes across counter boundaries" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 1, 511, 512, 513, 1023, 1024, 1025, 2048, 2051 }) |count| {
+        var state = allocator_v4.State.init(a);
+        defer state.deinit();
+        try state.counts.resize(a, count);
+        state.root.covered_pages = count;
+        for (state.counts.items, 0..) |*value, i| value.* = @intCast(i * 17);
+        // The certificate format is unchanged: batching must hash exactly the
+        // same canonical stream as individual little-endian u32 counters.
+        var reference = std.crypto.hash.Blake3.init(.{});
+        reference.update("Antfly checked allocator v1");
+        var root: [128]u8 = undefined;
+        allocator_v4.State.encodeRoot(state.root, &root);
+        reference.update(&root);
+        for (state.counts.items) |value| {
+            var encoded: [4]u8 = undefined;
+            std.mem.writeInt(u32, &encoded, value, .little);
+            reference.update(&encoded);
+        }
+        var expected: [32]u8 = undefined;
+        reference.final(&expected);
+        try std.testing.expectEqualSlices(u8, &expected, &try NativeFile.allocatorFingerprint(&state));
     }
 }
