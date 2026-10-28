@@ -293,6 +293,13 @@ pub fn bootstrap(a: A, txn: anytype) !void {
                 for ([_][]const u8{ prefix, namespace_prefix, routes_prefix, profiles_prefix }) |scope| {
                     var cursor = try txn.openCursor();
                     defer cursor.close();
+                    // Discarded projections need only their keys. In particular,
+                    // static profile definitions can own large external values.
+                    cursor.setKeysOnly();
+                    const upper = try a.dupe(u8, scope);
+                    std.debug.assert(upper[upper.len - 1] == '/');
+                    upper[upper.len - 1] += 1;
+                    cursor.setUpperBound(upper);
                     var row = try seekEntry(&cursor, scope);
                     while (row) |entry| {
                         if (!std.mem.startsWith(u8, entry.key, scope)) break;

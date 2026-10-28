@@ -47,6 +47,8 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_group_sources;
     _ = @import("antfly_local_sources").storage_db_resolver_authority;
     _ = @import("antfly_local_sources").storage_db_resolver_curation;
+    _ = @import("antfly_local_sources").storage_db_resolver_query_context;
+    _ = @import("antfly_local_sources").storage_db_resolver_static_profiles;
     _ = @import("antfly_local_sources").storage_db_native_query_reuse;
     _ = @import("antfly_local_sources").storage_db_runtime_callbacks;
     _ = @import("antfly_local_sources").storage_db_replay_vector_collectors;

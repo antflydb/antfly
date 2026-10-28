@@ -1,7 +1,24 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hacker News · Antfly</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
-<body><main><header><h1>Hacker News search</h1><p>Powered by Antfly</p></header>
-<form id="search"><label for="q">Search stories and comments</label><div class="controls"><input id="q" name="q" type="search" required maxlength="256" placeholder="Search Hacker News"><select id="view" aria-label="Data source"><option value="all">All history + current</option><option value="recent">Recent</option><option value="history">Historical archive</option></select><button>Search</button></div></form>
-<p id="status" role="status" aria-live="polite"></p><ol id="results"></ol><button id="more" hidden>More results</button></main></body>
-</html>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hacker News Search · Antfly</title>
+<link rel="stylesheet" href="/app.css"><script type="module" src="/app.js"></script>
+</head>
+<body><main>
+<header><a class="brand" href="/" aria-label="Hacker News Search home"><span class="logo" aria-hidden="true">Y</span><span>Hacker News<br><strong>Search</strong></span></a><span class="powered">Powered by <a href="https://antfly.io">Antfly</a></span></header>
+<form id="search">
+<label class="search-label" for="q">Search Hacker News</label>
+<div class="search-box"><input id="q" name="q" type="search" required maxlength="256" placeholder="Search stories and comments" autocomplete="off"><button class="primary" type="submit">Search</button></div>
+<div class="filters">
+<label>Search <select id="type" name="type"><option value="all">Everything</option><option value="story">Stories</option><option value="comment">Comments</option></select></label>
+<label>by <select id="sort" name="sort"><option value="relevance">Relevance</option><option value="date">Date</option></select></label>
+<label>for <select id="range" name="range"><option value="all">All time</option><option value="day">Past 24 hours</option><option value="week">Past week</option><option value="month">Past 30 days</option><option value="year">Past year</option><option value="custom">Custom dates</option></select></label>
+<label class="source-filter">in <select id="view" name="view"><option value="all">All data</option><option value="recent">Recent</option><option value="history">Historical archive</option></select></label>
+</div>
+<div id="custom-dates" class="custom-dates" hidden><label>From <input id="from" name="from" type="date" min="1970-01-01"></label><label>Through <input id="to" name="to" type="date" min="1970-01-01"></label><span>Dates use UTC.</span></div>
+</form>
+<div class="result-bar"><p id="status" role="status" aria-live="polite">Search stories and comments from Hacker News.</p><button id="share" type="button" hidden>Copy search link</button></div>
+<ol id="results" aria-label="Search results"></ol><button id="more" type="button" hidden>More results</button>
+<footer>Independent Hacker News search, powered by Antfly. <a href="https://news.ycombinator.com/">Visit Hacker News</a></footer>
+</main></body></html>

@@ -16,11 +16,12 @@
 """PyIceberg file producer committing through Antfly's configured authority."""
 
 import json
-import os
 import uuid
 from urllib.error import HTTPError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from managed_api import authorization_headers, open_request as urlopen, validate_backend
 
 from pyiceberg.exceptions import CommitFailedException, NoSuchTableError
 from pyiceberg.table import CommitTableResponse, Table
@@ -40,12 +41,13 @@ class NativeCatalog(HackernewsCatalog):
 
     def __init__(self, state, warehouse, endpoint, table_name, **properties):
         super().__init__(state, warehouse, **properties)
-        self.endpoint = endpoint.rstrip("/") + "/tables/" + quote(table_name, safe="")
+        self.api_base = validate_backend(endpoint, bool(authorization_headers()))
+        self.endpoint = self.api_base + "/tables/" + quote(table_name, safe="")
 
     def _request(self, method, path, body=None):
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        if token := os.environ.get("ANTFLY_API_KEY"):
-            headers["Authorization"] = "Bearer " + token
+        headers.update(authorization_headers())
+        validate_backend(self.api_base, "Authorization" in headers)
         payload = None if body is None else json.dumps(body).encode()
         request = Request(self.endpoint + path, payload, headers, method=method)
         with urlopen(request, timeout=60) as response:
