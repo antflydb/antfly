@@ -1,0 +1,3967 @@
+{
+  "captured_at_utc": "2026-10-28T21:35:00.182818+00:00",
+  "runtime_source_commit": "d1faae6a39cb7db654d46451e211e1c1f581404f",
+  "merged_main": "e61aff2e88c21045676dc6042053dd07134c570b",
+  "control_source_commit": "cd851f5bf915b8fc1f56267e87aceca59f833443",
+  "control_tree": "0fbde34e746baa795c284dbf93e629fc86cfed10",
+  "control_reproduction": "git merge-tree --write-tree f828785768 e61aff2e88; git commit-tree TREE -p f828785768 -p e61aff2e88; build antfly at the resulting tree. The control contains the same main changes and excludes only the selective-offset/index-capture/string-encoding implementation commit.",
+  "comparison_scope": "Same-main whole-server warm local Debug comparison, old/new then new/old, shared host, no task-owned build/E2E/cleanup overlap. Seven samples per selective shape; three per other point/order. Synthetic real Parquet. No Release, cloud, empty-cache or archive-scale qualification. Publication readiness is a single observational sample per run, not an isolated ingestion CPU measurement.",
+  "environment": {
+    "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+    "architecture": "arm64",
+    "zig": "0.17.0",
+    "optimization": "Debug",
+    "python": "3.13.14",
+    "pyarrow": "25.0.1",
+    "provider": "local filesystem object store",
+    "cache": "warm"
+  },
+  "validation": {
+    "native_owner_executions": [
+      [
+        240,
+        0,
+        0,
+        0
+      ],
+      [
+        240,
+        0,
+        0,
+        0
+      ],
+      [
+        533,
+        0,
+        0,
+        0
+      ],
+      [
+        493,
+        0,
+        0,
+        0
+      ]
+    ],
+    "native_total_executions": 1506,
+    "native_failed": 0,
+    "native_leaked": 0,
+    "real_parquet_archive_e2e_passed": 32,
+    "real_iceberg_sql_e2e_passed": 16,
+    "e2e_skipped": 0,
+    "e2e_seconds": 368.26,
+    "apache_boundary_source_files": 2563,
+    "complete_result_oracles_equal_across_binaries": true,
+    "measured_http_samples": 388,
+    "selective_offset_probe": {
+      "tokens": 8192,
+      "term_tests": 64,
+      "selected": 32,
+      "blob_bytes": 37343,
+      "read_bytes": 814
+    },
+    "indexing_capture_probe": {
+      "captured": 1,
+      "bindings_reused": 1,
+      "spilled_bytes": 110
+    }
+  },
+  "summary": {
+    "selective-offsets": {
+      "exact_rare": [
+        {
+          "order": "a",
+          "old_ms": 39.188917,
+          "new_ms": 8.735667,
+          "speedup": 4.4860818298133385
+        },
+        {
+          "order": "b",
+          "old_ms": 39.917417,
+          "new_ms": 8.645166,
+          "speedup": 4.617310645047186
+        }
+      ],
+      "prefix_rare": [
+        {
+          "order": "a",
+          "old_ms": 50.796333,
+          "new_ms": 8.529417,
+          "speedup": 5.955428489426652
+        },
+        {
+          "order": "b",
+          "old_ms": 50.641208,
+          "new_ms": 8.247792,
+          "speedup": 6.139971522075242
+        }
+      ],
+      "wildcard_rare": [
+        {
+          "order": "a",
+          "old_ms": 68.663583,
+          "new_ms": 10.404834,
+          "speedup": 6.599200237120554
+        },
+        {
+          "order": "b",
+          "old_ms": 69.175792,
+          "new_ms": 10.380875,
+          "speedup": 6.663772755186822
+        }
+      ],
+      "fuzzy_rare": [
+        {
+          "order": "a",
+          "old_ms": 97.811791,
+          "new_ms": 10.75125,
+          "speedup": 9.097713382164864
+        },
+        {
+          "order": "b",
+          "old_ms": 98.523333,
+          "new_ms": 10.824125,
+          "speedup": 9.102198376312174
+        }
+      ]
+    },
+    "hidden-highlights": {
+      "hidden_wide": [
+        {
+          "order": "a",
+          "old_ms": 311.562417,
+          "new_ms": 307.125084,
+          "speedup": 1.01444796674439
+        },
+        {
+          "order": "b",
+          "old_ms": 303.102958,
+          "new_ms": 309.389291,
+          "speedup": 0.9796814783741173
+        }
+      ],
+      "projected_wide": [
+        {
+          "order": "a",
+          "old_ms": 304.146,
+          "new_ms": 279.999667,
+          "speedup": 1.086237006131868
+        },
+        {
+          "order": "b",
+          "old_ms": 291.247625,
+          "new_ms": 275.197541,
+          "speedup": 1.0583220472889328
+        }
+      ],
+      "hidden_narrow": [
+        {
+          "order": "a",
+          "old_ms": 130.3645,
+          "new_ms": 126.607708,
+          "speedup": 1.0296726957571967
+        },
+        {
+          "order": "b",
+          "old_ms": 119.536209,
+          "new_ms": 124.011125,
+          "speedup": 0.9639152051882443
+        }
+      ]
+    },
+    "highlight-kernels": {
+      "sparse_2048": [
+        {
+          "order": "a",
+          "old_ms": 11.119542,
+          "new_ms": 11.364791,
+          "speedup": 0.9784202806721214
+        },
+        {
+          "order": "b",
+          "old_ms": 10.760958,
+          "new_ms": 10.980708,
+          "speedup": 0.9799876292129798
+        }
+      ],
+      "dense_2048": [
+        {
+          "order": "a",
+          "old_ms": 11.952791,
+          "new_ms": 12.001292,
+          "speedup": 0.9959586851149026
+        },
+        {
+          "order": "b",
+          "old_ms": 12.031875,
+          "new_ms": 11.772541,
+          "speedup": 1.0220287192034412
+        }
+      ],
+      "sparse_8192": [
+        {
+          "order": "a",
+          "old_ms": 10.825209,
+          "new_ms": 10.719125,
+          "speedup": 1.0098967033223327
+        },
+        {
+          "order": "b",
+          "old_ms": 10.770458,
+          "new_ms": 10.391833,
+          "speedup": 1.0364348618766295
+        }
+      ],
+      "dense_8192": [
+        {
+          "order": "a",
+          "old_ms": 11.458583,
+          "new_ms": 11.993875,
+          "speedup": 0.9553695532094508
+        },
+        {
+          "order": "b",
+          "old_ms": 10.870542,
+          "new_ms": 10.619917,
+          "speedup": 1.0235995253070247
+        }
+      ],
+      "sparse_32768": [
+        {
+          "order": "a",
+          "old_ms": 12.340417,
+          "new_ms": 11.1585,
+          "speedup": 1.105920777882332
+        },
+        {
+          "order": "b",
+          "old_ms": 11.845083,
+          "new_ms": 10.160791,
+          "speedup": 1.1657638662186833
+        }
+      ],
+      "dense_32768": [
+        {
+          "order": "a",
+          "old_ms": 13.041958,
+          "new_ms": 12.811208,
+          "speedup": 1.018011572366946
+        },
+        {
+          "order": "b",
+          "old_ms": 13.062,
+          "new_ms": 12.014292,
+          "speedup": 1.0872051386798323
+        }
+      ],
+      "sparse_65536": [
+        {
+          "order": "a",
+          "old_ms": 13.506,
+          "new_ms": 10.683333,
+          "speedup": 1.2642122079317382
+        },
+        {
+          "order": "b",
+          "old_ms": 13.616083,
+          "new_ms": 10.407292,
+          "speedup": 1.3083214154075815
+        }
+      ],
+      "dense_65536": [
+        {
+          "order": "a",
+          "old_ms": 15.742791,
+          "new_ms": 14.991041,
+          "speedup": 1.0501466175697873
+        },
+        {
+          "order": "b",
+          "old_ms": 15.759667,
+          "new_ms": 13.669958,
+          "speedup": 1.1528687213230648
+        }
+      ],
+      "sparse_131072": [
+        {
+          "order": "a",
+          "old_ms": 16.5965,
+          "new_ms": 11.15225,
+          "speedup": 1.4881750319442264
+        },
+        {
+          "order": "b",
+          "old_ms": 17.068458,
+          "new_ms": 10.531875,
+          "speedup": 1.620647605483354
+        }
+      ],
+      "dense_131072": [
+        {
+          "order": "a",
+          "old_ms": 20.772541,
+          "new_ms": 17.677834,
+          "speedup": 1.1750614356939884
+        },
+        {
+          "order": "b",
+          "old_ms": 20.547709,
+          "new_ms": 16.624208,
+          "speedup": 1.236011303515933
+        }
+      ]
+    },
+    "source-pages": {
+      "sparsehead": [
+        {
+          "order": "a",
+          "old_ms": 9.15925,
+          "new_ms": 9.241875,
+          "speedup": 0.9910597146141881
+        },
+        {
+          "order": "b",
+          "old_ms": 9.023917,
+          "new_ms": 9.479042,
+          "speedup": 0.9519861817259594
+        }
+      ],
+      "sparsetail": [
+        {
+          "order": "a",
+          "old_ms": 8.913292,
+          "new_ms": 9.224125,
+          "speedup": 0.9663021695824806
+        },
+        {
+          "order": "b",
+          "old_ms": 9.103625,
+          "new_ms": 9.512458,
+          "speedup": 0.9570213082675371
+        }
+      ]
+    }
+  },
+  "reports": {
+    "selective-offsets": {
+      "old_a": {
+        "source_commit": "cd851f5bf915b8fc1f56267e87aceca59f833443",
+        "binary_sha256": "37532be658e22f17ea42d09e941c54e8969c056ac16b70c4644772ff5acde9a8",
+        "runner_sha256": "9ca867af683b027a71ca8c6d905a317ed9f1f851a61051ca95e727534eff1989",
+        "parquet_sha256": "c0cc1df7c3f5264c04dfc7f4e2073692ceaa3207bbec399d905ef8ec20e87769",
+        "body_bytes": 2095116,
+        "vocabulary_terms": 2049,
+        "publication_ns": 1467382083,
+        "queries": {
+          "exact_rare": {
+            "full_text_search": {
+              "match": "uniqueneedle",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "prefix_rare": {
+            "full_text_search": {
+              "prefix": "uniqueneed",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "wildcard_rare": {
+            "full_text_search": {
+              "wildcard": "uniqueneed?",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "fuzzy_rare": {
+            "full_text_search": {
+              "fuzzy": "uniqueneedlf",
+              "field": "body",
+              "fuzziness": 1
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          }
+        },
+        "samples": [
+          {
+            "sample": 0,
+            "case": "exact_rare",
+            "elapsed_ns": 39101458
+          },
+          {
+            "sample": 0,
+            "case": "prefix_rare",
+            "elapsed_ns": 50242292
+          },
+          {
+            "sample": 0,
+            "case": "wildcard_rare",
+            "elapsed_ns": 68115709
+          },
+          {
+            "sample": 0,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 98250334
+          },
+          {
+            "sample": 1,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 96531208
+          },
+          {
+            "sample": 1,
+            "case": "wildcard_rare",
+            "elapsed_ns": 69022667
+          },
+          {
+            "sample": 1,
+            "case": "prefix_rare",
+            "elapsed_ns": 50796333
+          },
+          {
+            "sample": 1,
+            "case": "exact_rare",
+            "elapsed_ns": 38980041
+          },
+          {
+            "sample": 2,
+            "case": "exact_rare",
+            "elapsed_ns": 39891708
+          },
+          {
+            "sample": 2,
+            "case": "prefix_rare",
+            "elapsed_ns": 49974916
+          },
+          {
+            "sample": 2,
+            "case": "wildcard_rare",
+            "elapsed_ns": 68663583
+          },
+          {
+            "sample": 2,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 97811791
+          },
+          {
+            "sample": 3,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 97764292
+          },
+          {
+            "sample": 3,
+            "case": "wildcard_rare",
+            "elapsed_ns": 68816625
+          },
+          {
+            "sample": 3,
+            "case": "prefix_rare",
+            "elapsed_ns": 51761917
+          },
+          {
+            "sample": 3,
+            "case": "exact_rare",
+            "elapsed_ns": 39188917
+          },
+          {
+            "sample": 4,
+            "case": "exact_rare",
+            "elapsed_ns": 39608000
+          },
+          {
+            "sample": 4,
+            "case": "prefix_rare",
+            "elapsed_ns": 51064875
+          },
+          {
+            "sample": 4,
+            "case": "wildcard_rare",
+            "elapsed_ns": 68469209
+          },
+          {
+            "sample": 4,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 98207750
+          },
+          {
+            "sample": 5,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 97333417
+          },
+          {
+            "sample": 5,
+            "case": "wildcard_rare",
+            "elapsed_ns": 67396292
+          },
+          {
+            "sample": 5,
+            "case": "prefix_rare",
+            "elapsed_ns": 49667000
+          },
+          {
+            "sample": 5,
+            "case": "exact_rare",
+            "elapsed_ns": 38958291
+          },
+          {
+            "sample": 6,
+            "case": "exact_rare",
+            "elapsed_ns": 40125458
+          },
+          {
+            "sample": 6,
+            "case": "prefix_rare",
+            "elapsed_ns": 51277541
+          },
+          {
+            "sample": 6,
+            "case": "wildcard_rare",
+            "elapsed_ns": 69035792
+          },
+          {
+            "sample": 6,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 99040166
+          }
+        ],
+        "hit_oracles": {
+          "exact_rare": "510bd6790653963b37fdf5c8caedbcfd2cbeeade8f94bc3f8ab26f49a2af57f9",
+          "prefix_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739",
+          "wildcard_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739",
+          "fuzzy_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739"
+        },
+        "summary": {
+          "exact_rare": 39188917,
+          "prefix_rare": 50796333,
+          "wildcard_rare": 68663583,
+          "fuzzy_rare": 97811791
+        },
+        "qualification": "Warm local Debug; seven samples per shape; synthetic real Parquet. Compare both binary orders and complete hit digests. Publication includes table admission and readiness polling and is a single observational sample per run. No task-owned build, E2E or cleanup overlap. No Release, cloud, empty-cache or archive-scale qualification."
+      },
+      "new_a": {
+        "source_commit": "d1faae6a39cb7db654d46451e211e1c1f581404f",
+        "binary_sha256": "0a24c2db06c63608842c99e21c7a2f2f9c00b87d2ec758138451c03e905affb3",
+        "runner_sha256": "9ca867af683b027a71ca8c6d905a317ed9f1f851a61051ca95e727534eff1989",
+        "parquet_sha256": "c0cc1df7c3f5264c04dfc7f4e2073692ceaa3207bbec399d905ef8ec20e87769",
+        "body_bytes": 2095116,
+        "vocabulary_terms": 2049,
+        "publication_ns": 1313332834,
+        "queries": {
+          "exact_rare": {
+            "full_text_search": {
+              "match": "uniqueneedle",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "prefix_rare": {
+            "full_text_search": {
+              "prefix": "uniqueneed",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "wildcard_rare": {
+            "full_text_search": {
+              "wildcard": "uniqueneed?",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "fuzzy_rare": {
+            "full_text_search": {
+              "fuzzy": "uniqueneedlf",
+              "field": "body",
+              "fuzziness": 1
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          }
+        },
+        "samples": [
+          {
+            "sample": 0,
+            "case": "exact_rare",
+            "elapsed_ns": 9022834
+          },
+          {
+            "sample": 0,
+            "case": "prefix_rare",
+            "elapsed_ns": 8315542
+          },
+          {
+            "sample": 0,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10281708
+          },
+          {
+            "sample": 0,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10703458
+          },
+          {
+            "sample": 1,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 13926292
+          },
+          {
+            "sample": 1,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10404834
+          },
+          {
+            "sample": 1,
+            "case": "prefix_rare",
+            "elapsed_ns": 8963584
+          },
+          {
+            "sample": 1,
+            "case": "exact_rare",
+            "elapsed_ns": 8792334
+          },
+          {
+            "sample": 2,
+            "case": "exact_rare",
+            "elapsed_ns": 8626542
+          },
+          {
+            "sample": 2,
+            "case": "prefix_rare",
+            "elapsed_ns": 8214292
+          },
+          {
+            "sample": 2,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10389292
+          },
+          {
+            "sample": 2,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 11065916
+          },
+          {
+            "sample": 3,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10675125
+          },
+          {
+            "sample": 3,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10081167
+          },
+          {
+            "sample": 3,
+            "case": "prefix_rare",
+            "elapsed_ns": 8533792
+          },
+          {
+            "sample": 3,
+            "case": "exact_rare",
+            "elapsed_ns": 8735667
+          },
+          {
+            "sample": 4,
+            "case": "exact_rare",
+            "elapsed_ns": 8591333
+          },
+          {
+            "sample": 4,
+            "case": "prefix_rare",
+            "elapsed_ns": 8276958
+          },
+          {
+            "sample": 4,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10547167
+          },
+          {
+            "sample": 4,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10751250
+          },
+          {
+            "sample": 5,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10582541
+          },
+          {
+            "sample": 5,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10443625
+          },
+          {
+            "sample": 5,
+            "case": "prefix_rare",
+            "elapsed_ns": 10154416
+          },
+          {
+            "sample": 5,
+            "case": "exact_rare",
+            "elapsed_ns": 8535500
+          },
+          {
+            "sample": 6,
+            "case": "exact_rare",
+            "elapsed_ns": 8783542
+          },
+          {
+            "sample": 6,
+            "case": "prefix_rare",
+            "elapsed_ns": 8529417
+          },
+          {
+            "sample": 6,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10486709
+          },
+          {
+            "sample": 6,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10835583
+          }
+        ],
+        "hit_oracles": {
+          "exact_rare": "510bd6790653963b37fdf5c8caedbcfd2cbeeade8f94bc3f8ab26f49a2af57f9",
+          "prefix_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739",
+          "wildcard_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739",
+          "fuzzy_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739"
+        },
+        "summary": {
+          "exact_rare": 8735667,
+          "prefix_rare": 8529417,
+          "wildcard_rare": 10404834,
+          "fuzzy_rare": 10751250
+        },
+        "qualification": "Warm local Debug; seven samples per shape; synthetic real Parquet. Compare both binary orders and complete hit digests. Publication includes table admission and readiness polling and is a single observational sample per run. No task-owned build, E2E or cleanup overlap. No Release, cloud, empty-cache or archive-scale qualification."
+      },
+      "new_b": {
+        "source_commit": "d1faae6a39cb7db654d46451e211e1c1f581404f",
+        "binary_sha256": "0a24c2db06c63608842c99e21c7a2f2f9c00b87d2ec758138451c03e905affb3",
+        "runner_sha256": "9ca867af683b027a71ca8c6d905a317ed9f1f851a61051ca95e727534eff1989",
+        "parquet_sha256": "c0cc1df7c3f5264c04dfc7f4e2073692ceaa3207bbec399d905ef8ec20e87769",
+        "body_bytes": 2095116,
+        "vocabulary_terms": 2049,
+        "publication_ns": 1203349459,
+        "queries": {
+          "exact_rare": {
+            "full_text_search": {
+              "match": "uniqueneedle",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "prefix_rare": {
+            "full_text_search": {
+              "prefix": "uniqueneed",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "wildcard_rare": {
+            "full_text_search": {
+              "wildcard": "uniqueneed?",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "fuzzy_rare": {
+            "full_text_search": {
+              "fuzzy": "uniqueneedlf",
+              "field": "body",
+              "fuzziness": 1
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          }
+        },
+        "samples": [
+          {
+            "sample": 0,
+            "case": "exact_rare",
+            "elapsed_ns": 8792584
+          },
+          {
+            "sample": 0,
+            "case": "prefix_rare",
+            "elapsed_ns": 8254167
+          },
+          {
+            "sample": 0,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10292708
+          },
+          {
+            "sample": 0,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10824125
+          },
+          {
+            "sample": 1,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10931375
+          },
+          {
+            "sample": 1,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10463917
+          },
+          {
+            "sample": 1,
+            "case": "prefix_rare",
+            "elapsed_ns": 8247792
+          },
+          {
+            "sample": 1,
+            "case": "exact_rare",
+            "elapsed_ns": 8721709
+          },
+          {
+            "sample": 2,
+            "case": "exact_rare",
+            "elapsed_ns": 8628083
+          },
+          {
+            "sample": 2,
+            "case": "prefix_rare",
+            "elapsed_ns": 8310000
+          },
+          {
+            "sample": 2,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10056750
+          },
+          {
+            "sample": 2,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10882584
+          },
+          {
+            "sample": 3,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10696542
+          },
+          {
+            "sample": 3,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10362000
+          },
+          {
+            "sample": 3,
+            "case": "prefix_rare",
+            "elapsed_ns": 8194084
+          },
+          {
+            "sample": 3,
+            "case": "exact_rare",
+            "elapsed_ns": 8645166
+          },
+          {
+            "sample": 4,
+            "case": "exact_rare",
+            "elapsed_ns": 8523709
+          },
+          {
+            "sample": 4,
+            "case": "prefix_rare",
+            "elapsed_ns": 8210708
+          },
+          {
+            "sample": 4,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10441125
+          },
+          {
+            "sample": 4,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10776708
+          },
+          {
+            "sample": 5,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10624125
+          },
+          {
+            "sample": 5,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10380875
+          },
+          {
+            "sample": 5,
+            "case": "prefix_rare",
+            "elapsed_ns": 9996583
+          },
+          {
+            "sample": 5,
+            "case": "exact_rare",
+            "elapsed_ns": 8715041
+          },
+          {
+            "sample": 6,
+            "case": "exact_rare",
+            "elapsed_ns": 8349125
+          },
+          {
+            "sample": 6,
+            "case": "prefix_rare",
+            "elapsed_ns": 8108834
+          },
+          {
+            "sample": 6,
+            "case": "wildcard_rare",
+            "elapsed_ns": 10587500
+          },
+          {
+            "sample": 6,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 10905875
+          }
+        ],
+        "hit_oracles": {
+          "exact_rare": "510bd6790653963b37fdf5c8caedbcfd2cbeeade8f94bc3f8ab26f49a2af57f9",
+          "prefix_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739",
+          "wildcard_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739",
+          "fuzzy_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739"
+        },
+        "summary": {
+          "exact_rare": 8645166,
+          "prefix_rare": 8247792,
+          "wildcard_rare": 10380875,
+          "fuzzy_rare": 10824125
+        },
+        "qualification": "Warm local Debug; seven samples per shape; synthetic real Parquet. Compare both binary orders and complete hit digests. Publication includes table admission and readiness polling and is a single observational sample per run. No task-owned build, E2E or cleanup overlap. No Release, cloud, empty-cache or archive-scale qualification."
+      },
+      "old_b": {
+        "source_commit": "cd851f5bf915b8fc1f56267e87aceca59f833443",
+        "binary_sha256": "37532be658e22f17ea42d09e941c54e8969c056ac16b70c4644772ff5acde9a8",
+        "runner_sha256": "9ca867af683b027a71ca8c6d905a317ed9f1f851a61051ca95e727534eff1989",
+        "parquet_sha256": "c0cc1df7c3f5264c04dfc7f4e2073692ceaa3207bbec399d905ef8ec20e87769",
+        "body_bytes": 2095116,
+        "vocabulary_terms": 2049,
+        "publication_ns": 1565060542,
+        "queries": {
+          "exact_rare": {
+            "full_text_search": {
+              "match": "uniqueneedle",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "prefix_rare": {
+            "full_text_search": {
+              "prefix": "uniqueneed",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "wildcard_rare": {
+            "full_text_search": {
+              "wildcard": "uniqueneed?",
+              "field": "body"
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          },
+          "fuzzy_rare": {
+            "full_text_search": {
+              "fuzzy": "uniqueneedlf",
+              "field": "body",
+              "fuzziness": 1
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body"
+              ],
+              "fragment_size": 100,
+              "max_fragments": 3
+            },
+            "limit": 1
+          }
+        },
+        "samples": [
+          {
+            "sample": 0,
+            "case": "exact_rare",
+            "elapsed_ns": 41857917
+          },
+          {
+            "sample": 0,
+            "case": "prefix_rare",
+            "elapsed_ns": 53903208
+          },
+          {
+            "sample": 0,
+            "case": "wildcard_rare",
+            "elapsed_ns": 72562250
+          },
+          {
+            "sample": 0,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 101863250
+          },
+          {
+            "sample": 1,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 98523333
+          },
+          {
+            "sample": 1,
+            "case": "wildcard_rare",
+            "elapsed_ns": 68695000
+          },
+          {
+            "sample": 1,
+            "case": "prefix_rare",
+            "elapsed_ns": 50982000
+          },
+          {
+            "sample": 1,
+            "case": "exact_rare",
+            "elapsed_ns": 39830459
+          },
+          {
+            "sample": 2,
+            "case": "exact_rare",
+            "elapsed_ns": 38899708
+          },
+          {
+            "sample": 2,
+            "case": "prefix_rare",
+            "elapsed_ns": 50362667
+          },
+          {
+            "sample": 2,
+            "case": "wildcard_rare",
+            "elapsed_ns": 69869000
+          },
+          {
+            "sample": 2,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 96974042
+          },
+          {
+            "sample": 3,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 97020250
+          },
+          {
+            "sample": 3,
+            "case": "wildcard_rare",
+            "elapsed_ns": 68325083
+          },
+          {
+            "sample": 3,
+            "case": "prefix_rare",
+            "elapsed_ns": 50423625
+          },
+          {
+            "sample": 3,
+            "case": "exact_rare",
+            "elapsed_ns": 39739375
+          },
+          {
+            "sample": 4,
+            "case": "exact_rare",
+            "elapsed_ns": 39917417
+          },
+          {
+            "sample": 4,
+            "case": "prefix_rare",
+            "elapsed_ns": 50167083
+          },
+          {
+            "sample": 4,
+            "case": "wildcard_rare",
+            "elapsed_ns": 69506791
+          },
+          {
+            "sample": 4,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 97793708
+          },
+          {
+            "sample": 5,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 101218917
+          },
+          {
+            "sample": 5,
+            "case": "wildcard_rare",
+            "elapsed_ns": 69175792
+          },
+          {
+            "sample": 5,
+            "case": "prefix_rare",
+            "elapsed_ns": 52904667
+          },
+          {
+            "sample": 5,
+            "case": "exact_rare",
+            "elapsed_ns": 39954542
+          },
+          {
+            "sample": 6,
+            "case": "exact_rare",
+            "elapsed_ns": 40077083
+          },
+          {
+            "sample": 6,
+            "case": "prefix_rare",
+            "elapsed_ns": 50641208
+          },
+          {
+            "sample": 6,
+            "case": "wildcard_rare",
+            "elapsed_ns": 68423959
+          },
+          {
+            "sample": 6,
+            "case": "fuzzy_rare",
+            "elapsed_ns": 99831375
+          }
+        ],
+        "hit_oracles": {
+          "exact_rare": "510bd6790653963b37fdf5c8caedbcfd2cbeeade8f94bc3f8ab26f49a2af57f9",
+          "prefix_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739",
+          "wildcard_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739",
+          "fuzzy_rare": "8db0e7b11454ebce777c885a9795366aff42862aebcd02573a78acaa7793a739"
+        },
+        "summary": {
+          "exact_rare": 39917417,
+          "prefix_rare": 50641208,
+          "wildcard_rare": 69175792,
+          "fuzzy_rare": 98523333
+        },
+        "qualification": "Warm local Debug; seven samples per shape; synthetic real Parquet. Compare both binary orders and complete hit digests. Publication includes table admission and readiness polling and is a single observational sample per run. No task-owned build, E2E or cleanup overlap. No Release, cloud, empty-cache or archive-scale qualification."
+      }
+    },
+    "hidden-highlights": {
+      "old_a": {
+        "source_commit": "cd851f5bf915b8fc1f56267e87aceca59f833443",
+        "binary_sha256": "37532be658e22f17ea42d09e941c54e8969c056ac16b70c4644772ff5acde9a8",
+        "runner_sha256": "48dae613ad30e22d5a94556d16d5a075b7fc39c2e2d689b810fe382f2cddfca4",
+        "parquet_sha256": "53ed5616d961a28fd4b3ce4037d6a86c967cb58f1c047c94154b037a2958377e",
+        "rows": 256,
+        "wide_fields": 8,
+        "queries": {
+          "hidden_wide": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                },
+                {
+                  "match": "needle",
+                  "field": "body1"
+                },
+                {
+                  "match": "needle",
+                  "field": "body2"
+                },
+                {
+                  "match": "needle",
+                  "field": "body3"
+                },
+                {
+                  "match": "needle",
+                  "field": "body4"
+                },
+                {
+                  "match": "needle",
+                  "field": "body5"
+                },
+                {
+                  "match": "needle",
+                  "field": "body6"
+                },
+                {
+                  "match": "needle",
+                  "field": "body7"
+                }
+              ]
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body0",
+                "body1",
+                "body2",
+                "body3",
+                "body4",
+                "body5",
+                "body6",
+                "body7"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          },
+          "projected_wide": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                },
+                {
+                  "match": "needle",
+                  "field": "body1"
+                },
+                {
+                  "match": "needle",
+                  "field": "body2"
+                },
+                {
+                  "match": "needle",
+                  "field": "body3"
+                },
+                {
+                  "match": "needle",
+                  "field": "body4"
+                },
+                {
+                  "match": "needle",
+                  "field": "body5"
+                },
+                {
+                  "match": "needle",
+                  "field": "body6"
+                },
+                {
+                  "match": "needle",
+                  "field": "body7"
+                }
+              ]
+            },
+            "fields": [
+              "id",
+              "body0",
+              "body1",
+              "body2",
+              "body3",
+              "body4",
+              "body5",
+              "body6",
+              "body7"
+            ],
+            "highlight": {
+              "fields": [
+                "body0",
+                "body1",
+                "body2",
+                "body3",
+                "body4",
+                "body5",
+                "body6",
+                "body7"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          },
+          "hidden_narrow": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                }
+              ]
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body0"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          }
+        },
+        "samples": [
+          {
+            "sample": 0,
+            "mode": "hidden_wide",
+            "elapsed_ns": 325456334,
+            "highlight_ns": 680473000,
+            "hydration_ns": 88507000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 0,
+            "mode": "projected_wide",
+            "elapsed_ns": 304146000,
+            "highlight_ns": 159940000,
+            "hydration_ns": 39232000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 0,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 126206709,
+            "highlight_ns": 59020000,
+            "hydration_ns": 16879000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 140952792,
+            "highlight_ns": 60327000,
+            "hydration_ns": 17555000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "projected_wide",
+            "elapsed_ns": 308705916,
+            "highlight_ns": 159203000,
+            "hydration_ns": 39261000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "hidden_wide",
+            "elapsed_ns": 305137458,
+            "highlight_ns": 222163000,
+            "hydration_ns": 16078000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "hidden_wide",
+            "elapsed_ns": 311562417,
+            "highlight_ns": 224024000,
+            "hydration_ns": 16549000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "projected_wide",
+            "elapsed_ns": 297464708,
+            "highlight_ns": 156850000,
+            "hydration_ns": 38473000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 130364500,
+            "highlight_ns": 59770000,
+            "hydration_ns": 17155000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          }
+        ],
+        "hit_oracles": {
+          "hidden_wide": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+          "projected_wide": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+          "hidden_narrow": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d"
+        },
+        "totals": {
+          "hidden_wide": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "projected_wide": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "hidden_narrow": {
+            "value": 256,
+            "relation": "exact"
+          }
+        },
+        "summary": {
+          "hidden_wide": {
+            "elapsed_ns": 311562417,
+            "highlight_ns": 224024000,
+            "hydration_ns": 16549000
+          },
+          "projected_wide": {
+            "elapsed_ns": 304146000,
+            "highlight_ns": 159203000,
+            "hydration_ns": 39232000
+          },
+          "hidden_narrow": {
+            "elapsed_ns": 130364500,
+            "highlight_ns": 59770000,
+            "hydration_ns": 17155000
+          }
+        },
+        "qualification": "Warm local Debug, three samples per shape, alternating query order. Compare identical query shapes across immutable binaries; projected-wide and hidden-narrow are separate controls. No build, E2E or cleanup from this task overlaps these measurements; the host is shared. This does not qualify cloud latency or archive scale."
+      },
+      "new_a": {
+        "source_commit": "d1faae6a39cb7db654d46451e211e1c1f581404f",
+        "binary_sha256": "0a24c2db06c63608842c99e21c7a2f2f9c00b87d2ec758138451c03e905affb3",
+        "runner_sha256": "48dae613ad30e22d5a94556d16d5a075b7fc39c2e2d689b810fe382f2cddfca4",
+        "parquet_sha256": "53ed5616d961a28fd4b3ce4037d6a86c967cb58f1c047c94154b037a2958377e",
+        "rows": 256,
+        "wide_fields": 8,
+        "queries": {
+          "hidden_wide": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                },
+                {
+                  "match": "needle",
+                  "field": "body1"
+                },
+                {
+                  "match": "needle",
+                  "field": "body2"
+                },
+                {
+                  "match": "needle",
+                  "field": "body3"
+                },
+                {
+                  "match": "needle",
+                  "field": "body4"
+                },
+                {
+                  "match": "needle",
+                  "field": "body5"
+                },
+                {
+                  "match": "needle",
+                  "field": "body6"
+                },
+                {
+                  "match": "needle",
+                  "field": "body7"
+                }
+              ]
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body0",
+                "body1",
+                "body2",
+                "body3",
+                "body4",
+                "body5",
+                "body6",
+                "body7"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          },
+          "projected_wide": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                },
+                {
+                  "match": "needle",
+                  "field": "body1"
+                },
+                {
+                  "match": "needle",
+                  "field": "body2"
+                },
+                {
+                  "match": "needle",
+                  "field": "body3"
+                },
+                {
+                  "match": "needle",
+                  "field": "body4"
+                },
+                {
+                  "match": "needle",
+                  "field": "body5"
+                },
+                {
+                  "match": "needle",
+                  "field": "body6"
+                },
+                {
+                  "match": "needle",
+                  "field": "body7"
+                }
+              ]
+            },
+            "fields": [
+              "id",
+              "body0",
+              "body1",
+              "body2",
+              "body3",
+              "body4",
+              "body5",
+              "body6",
+              "body7"
+            ],
+            "highlight": {
+              "fields": [
+                "body0",
+                "body1",
+                "body2",
+                "body3",
+                "body4",
+                "body5",
+                "body6",
+                "body7"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          },
+          "hidden_narrow": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                }
+              ]
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body0"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          }
+        },
+        "samples": [
+          {
+            "sample": 0,
+            "mode": "hidden_wide",
+            "elapsed_ns": 319703917,
+            "highlight_ns": 670643000,
+            "hydration_ns": 86588000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 0,
+            "mode": "projected_wide",
+            "elapsed_ns": 274560125,
+            "highlight_ns": 158792000,
+            "hydration_ns": 37152000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 0,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 124146584,
+            "highlight_ns": 58056000,
+            "hydration_ns": 16371000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 138081375,
+            "highlight_ns": 59454000,
+            "hydration_ns": 17220000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "projected_wide",
+            "elapsed_ns": 284396333,
+            "highlight_ns": 158890000,
+            "hydration_ns": 38208000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "hidden_wide",
+            "elapsed_ns": 303011625,
+            "highlight_ns": 220641000,
+            "hydration_ns": 16203000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "hidden_wide",
+            "elapsed_ns": 307125084,
+            "highlight_ns": 221864000,
+            "hydration_ns": 16218000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "projected_wide",
+            "elapsed_ns": 279999667,
+            "highlight_ns": 156472000,
+            "hydration_ns": 37291000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 126607708,
+            "highlight_ns": 58072000,
+            "hydration_ns": 16623000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          }
+        ],
+        "hit_oracles": {
+          "hidden_wide": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+          "projected_wide": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+          "hidden_narrow": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d"
+        },
+        "totals": {
+          "hidden_wide": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "projected_wide": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "hidden_narrow": {
+            "value": 256,
+            "relation": "exact"
+          }
+        },
+        "summary": {
+          "hidden_wide": {
+            "elapsed_ns": 307125084,
+            "highlight_ns": 221864000,
+            "hydration_ns": 16218000
+          },
+          "projected_wide": {
+            "elapsed_ns": 279999667,
+            "highlight_ns": 158792000,
+            "hydration_ns": 37291000
+          },
+          "hidden_narrow": {
+            "elapsed_ns": 126607708,
+            "highlight_ns": 58072000,
+            "hydration_ns": 16623000
+          }
+        },
+        "qualification": "Warm local Debug, three samples per shape, alternating query order. Compare identical query shapes across immutable binaries; projected-wide and hidden-narrow are separate controls. No build, E2E or cleanup from this task overlaps these measurements; the host is shared. This does not qualify cloud latency or archive scale."
+      },
+      "new_b": {
+        "source_commit": "d1faae6a39cb7db654d46451e211e1c1f581404f",
+        "binary_sha256": "0a24c2db06c63608842c99e21c7a2f2f9c00b87d2ec758138451c03e905affb3",
+        "runner_sha256": "48dae613ad30e22d5a94556d16d5a075b7fc39c2e2d689b810fe382f2cddfca4",
+        "parquet_sha256": "53ed5616d961a28fd4b3ce4037d6a86c967cb58f1c047c94154b037a2958377e",
+        "rows": 256,
+        "wide_fields": 8,
+        "queries": {
+          "hidden_wide": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                },
+                {
+                  "match": "needle",
+                  "field": "body1"
+                },
+                {
+                  "match": "needle",
+                  "field": "body2"
+                },
+                {
+                  "match": "needle",
+                  "field": "body3"
+                },
+                {
+                  "match": "needle",
+                  "field": "body4"
+                },
+                {
+                  "match": "needle",
+                  "field": "body5"
+                },
+                {
+                  "match": "needle",
+                  "field": "body6"
+                },
+                {
+                  "match": "needle",
+                  "field": "body7"
+                }
+              ]
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body0",
+                "body1",
+                "body2",
+                "body3",
+                "body4",
+                "body5",
+                "body6",
+                "body7"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          },
+          "projected_wide": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                },
+                {
+                  "match": "needle",
+                  "field": "body1"
+                },
+                {
+                  "match": "needle",
+                  "field": "body2"
+                },
+                {
+                  "match": "needle",
+                  "field": "body3"
+                },
+                {
+                  "match": "needle",
+                  "field": "body4"
+                },
+                {
+                  "match": "needle",
+                  "field": "body5"
+                },
+                {
+                  "match": "needle",
+                  "field": "body6"
+                },
+                {
+                  "match": "needle",
+                  "field": "body7"
+                }
+              ]
+            },
+            "fields": [
+              "id",
+              "body0",
+              "body1",
+              "body2",
+              "body3",
+              "body4",
+              "body5",
+              "body6",
+              "body7"
+            ],
+            "highlight": {
+              "fields": [
+                "body0",
+                "body1",
+                "body2",
+                "body3",
+                "body4",
+                "body5",
+                "body6",
+                "body7"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          },
+          "hidden_narrow": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                }
+              ]
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body0"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          }
+        },
+        "samples": [
+          {
+            "sample": 0,
+            "mode": "hidden_wide",
+            "elapsed_ns": 295169708,
+            "highlight_ns": 658764000,
+            "hydration_ns": 83341000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 0,
+            "mode": "projected_wide",
+            "elapsed_ns": 274073958,
+            "highlight_ns": 156735000,
+            "hydration_ns": 37335000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 0,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 124011125,
+            "highlight_ns": 57837000,
+            "hydration_ns": 16363000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 141034416,
+            "highlight_ns": 59050000,
+            "hydration_ns": 17240000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "projected_wide",
+            "elapsed_ns": 277124458,
+            "highlight_ns": 156195000,
+            "hydration_ns": 37279000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "hidden_wide",
+            "elapsed_ns": 322354458,
+            "highlight_ns": 235282000,
+            "hydration_ns": 16603000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "hidden_wide",
+            "elapsed_ns": 309389291,
+            "highlight_ns": 219748000,
+            "hydration_ns": 16639000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "projected_wide",
+            "elapsed_ns": 275197541,
+            "highlight_ns": 157254000,
+            "hydration_ns": 37751000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 110031083,
+            "highlight_ns": 60287000,
+            "hydration_ns": 16583000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          }
+        ],
+        "hit_oracles": {
+          "hidden_wide": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+          "projected_wide": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+          "hidden_narrow": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d"
+        },
+        "totals": {
+          "hidden_wide": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "projected_wide": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "hidden_narrow": {
+            "value": 256,
+            "relation": "exact"
+          }
+        },
+        "summary": {
+          "hidden_wide": {
+            "elapsed_ns": 309389291,
+            "highlight_ns": 235282000,
+            "hydration_ns": 16639000
+          },
+          "projected_wide": {
+            "elapsed_ns": 275197541,
+            "highlight_ns": 156735000,
+            "hydration_ns": 37335000
+          },
+          "hidden_narrow": {
+            "elapsed_ns": 124011125,
+            "highlight_ns": 59050000,
+            "hydration_ns": 16583000
+          }
+        },
+        "qualification": "Warm local Debug, three samples per shape, alternating query order. Compare identical query shapes across immutable binaries; projected-wide and hidden-narrow are separate controls. No build, E2E or cleanup from this task overlaps these measurements; the host is shared. This does not qualify cloud latency or archive scale."
+      },
+      "old_b": {
+        "source_commit": "cd851f5bf915b8fc1f56267e87aceca59f833443",
+        "binary_sha256": "37532be658e22f17ea42d09e941c54e8969c056ac16b70c4644772ff5acde9a8",
+        "runner_sha256": "48dae613ad30e22d5a94556d16d5a075b7fc39c2e2d689b810fe382f2cddfca4",
+        "parquet_sha256": "53ed5616d961a28fd4b3ce4037d6a86c967cb58f1c047c94154b037a2958377e",
+        "rows": 256,
+        "wide_fields": 8,
+        "queries": {
+          "hidden_wide": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                },
+                {
+                  "match": "needle",
+                  "field": "body1"
+                },
+                {
+                  "match": "needle",
+                  "field": "body2"
+                },
+                {
+                  "match": "needle",
+                  "field": "body3"
+                },
+                {
+                  "match": "needle",
+                  "field": "body4"
+                },
+                {
+                  "match": "needle",
+                  "field": "body5"
+                },
+                {
+                  "match": "needle",
+                  "field": "body6"
+                },
+                {
+                  "match": "needle",
+                  "field": "body7"
+                }
+              ]
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body0",
+                "body1",
+                "body2",
+                "body3",
+                "body4",
+                "body5",
+                "body6",
+                "body7"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          },
+          "projected_wide": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                },
+                {
+                  "match": "needle",
+                  "field": "body1"
+                },
+                {
+                  "match": "needle",
+                  "field": "body2"
+                },
+                {
+                  "match": "needle",
+                  "field": "body3"
+                },
+                {
+                  "match": "needle",
+                  "field": "body4"
+                },
+                {
+                  "match": "needle",
+                  "field": "body5"
+                },
+                {
+                  "match": "needle",
+                  "field": "body6"
+                },
+                {
+                  "match": "needle",
+                  "field": "body7"
+                }
+              ]
+            },
+            "fields": [
+              "id",
+              "body0",
+              "body1",
+              "body2",
+              "body3",
+              "body4",
+              "body5",
+              "body6",
+              "body7"
+            ],
+            "highlight": {
+              "fields": [
+                "body0",
+                "body1",
+                "body2",
+                "body3",
+                "body4",
+                "body5",
+                "body6",
+                "body7"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          },
+          "hidden_narrow": {
+            "full_text_search": {
+              "disjuncts": [
+                {
+                  "match": "needle",
+                  "field": "body0"
+                }
+              ]
+            },
+            "fields": [
+              "id"
+            ],
+            "highlight": {
+              "fields": [
+                "body0"
+              ]
+            },
+            "order_by": [
+              {
+                "field": "id"
+              }
+            ],
+            "limit": 256,
+            "profile": true
+          }
+        },
+        "samples": [
+          {
+            "sample": 0,
+            "mode": "hidden_wide",
+            "elapsed_ns": 328050459,
+            "highlight_ns": 461806000,
+            "hydration_ns": 73907000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 0,
+            "mode": "projected_wide",
+            "elapsed_ns": 271485417,
+            "highlight_ns": 383689000,
+            "hydration_ns": 54461000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 0,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 119536209,
+            "highlight_ns": 57865000,
+            "hydration_ns": 16283000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 131402333,
+            "highlight_ns": 58586000,
+            "hydration_ns": 16714000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "projected_wide",
+            "elapsed_ns": 304602625,
+            "highlight_ns": 156096000,
+            "hydration_ns": 38791000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 1,
+            "mode": "hidden_wide",
+            "elapsed_ns": 299031209,
+            "highlight_ns": 221901000,
+            "hydration_ns": 16142000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "hidden_wide",
+            "elapsed_ns": 303102958,
+            "highlight_ns": 238984000,
+            "hydration_ns": 16893000,
+            "hits_sha256": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "projected_wide",
+            "elapsed_ns": 291247625,
+            "highlight_ns": 168266000,
+            "hydration_ns": 40754000,
+            "hits_sha256": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          },
+          {
+            "sample": 2,
+            "mode": "hidden_narrow",
+            "elapsed_ns": 107756958,
+            "highlight_ns": 58848000,
+            "hydration_ns": 15941000,
+            "hits_sha256": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d",
+            "total": {
+              "value": 256,
+              "relation": "exact"
+            }
+          }
+        ],
+        "hit_oracles": {
+          "hidden_wide": "39746315aacd93f52c8c1060be7652631533c43ddda00bc3b3324ea5e4bbe513",
+          "projected_wide": "5f461830019f3e5e0b75ad7df0f1ffc4c28bb63dfc2c52d607647eb9c88bf796",
+          "hidden_narrow": "b5fe66a34656daa9dda2ddda216cd905ad9eca5b24e8356f81c3fb964697135d"
+        },
+        "totals": {
+          "hidden_wide": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "projected_wide": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "hidden_narrow": {
+            "value": 256,
+            "relation": "exact"
+          }
+        },
+        "summary": {
+          "hidden_wide": {
+            "elapsed_ns": 303102958,
+            "highlight_ns": 238984000,
+            "hydration_ns": 16893000
+          },
+          "projected_wide": {
+            "elapsed_ns": 291247625,
+            "highlight_ns": 168266000,
+            "hydration_ns": 40754000
+          },
+          "hidden_narrow": {
+            "elapsed_ns": 119536209,
+            "highlight_ns": 58586000,
+            "hydration_ns": 16283000
+          }
+        },
+        "qualification": "Warm local Debug, three samples per shape, alternating query order. Compare identical query shapes across immutable binaries; projected-wide and hidden-narrow are separate controls. No build, E2E or cleanup from this task overlaps these measurements; the host is shared. This does not qualify cloud latency or archive scale."
+      }
+    },
+    "highlight-kernels": {
+      "old_a": {
+        "source_commit": "cd851f5bf915b8fc1f56267e87aceca59f833443",
+        "binary_sha256": "37532be658e22f17ea42d09e941c54e8969c056ac16b70c4644772ff5acde9a8",
+        "runner_sha256": "340bc348911caff4a162ea96815968a5ec3e92376aaf20fbb6d2c863a05f092e",
+        "parquet_sha256": "40a4d42ef83532391740d4e6a0d2f4ce6f3aaa3fd84d9f6b5bd60c729ac2538f",
+        "rows": [
+          {
+            "id": 0,
+            "bytes": 2048,
+            "mode": "sparse",
+            "samples_ns": [
+              11119542,
+              12751917,
+              10603750
+            ],
+            "median_ms": 11.119542,
+            "hits_sha256": "690ff9552b729f777fb80e0286ef30fbaedfc75ca17f421ebb73635c6af218a8"
+          },
+          {
+            "id": 1,
+            "bytes": 2048,
+            "mode": "dense",
+            "samples_ns": [
+              11952791,
+              11870250,
+              11994167
+            ],
+            "median_ms": 11.952791,
+            "hits_sha256": "dc796ffc9d50470e03533f74d95ddb5e276e5ebf60b1ef0b3aa8f03c6f24aaa6"
+          },
+          {
+            "id": 2,
+            "bytes": 8192,
+            "mode": "sparse",
+            "samples_ns": [
+              10825209,
+              10818166,
+              10944958
+            ],
+            "median_ms": 10.825209,
+            "hits_sha256": "edc89d93de076f681081cb65eba6216d36665b624dc0ba6b3dc1aa1b4391a2ae"
+          },
+          {
+            "id": 3,
+            "bytes": 8192,
+            "mode": "dense",
+            "samples_ns": [
+              11237875,
+              12021417,
+              11458583
+            ],
+            "median_ms": 11.458583,
+            "hits_sha256": "4313a263d33a506501197c04029ecc715d7d0a27904122f35d29b6fec144198d"
+          },
+          {
+            "id": 4,
+            "bytes": 32768,
+            "mode": "sparse",
+            "samples_ns": [
+              12372917,
+              12325500,
+              12340417
+            ],
+            "median_ms": 12.340417,
+            "hits_sha256": "dfb08308cd6261b86e2ce80222172b27bf513bd3ec129671b53d52a2fb3dab38"
+          },
+          {
+            "id": 5,
+            "bytes": 32768,
+            "mode": "dense",
+            "samples_ns": [
+              13056416,
+              13041958,
+              12800375
+            ],
+            "median_ms": 13.041958,
+            "hits_sha256": "3c1c3f48b732e43c71d233b55f28a6fd22c41c775edc2d1e6dc00508b000e31b"
+          },
+          {
+            "id": 6,
+            "bytes": 65536,
+            "mode": "sparse",
+            "samples_ns": [
+              13568625,
+              13489834,
+              13506000
+            ],
+            "median_ms": 13.506,
+            "hits_sha256": "7b08f4f05eb8709d253be7369c8c8245da959729ff1e6d2202d46a1726ad8ae8"
+          },
+          {
+            "id": 7,
+            "bytes": 65536,
+            "mode": "dense",
+            "samples_ns": [
+              15670375,
+              15742791,
+              16315292
+            ],
+            "median_ms": 15.742791,
+            "hits_sha256": "27b1914ff9ee40fed497fc66d321173d0d66adb31f653e2e44ee4dbb702b919d"
+          },
+          {
+            "id": 8,
+            "bytes": 131072,
+            "mode": "sparse",
+            "samples_ns": [
+              16596500,
+              16575833,
+              16629709
+            ],
+            "median_ms": 16.5965,
+            "hits_sha256": "75b3c7ca9c04edfc13e9c475f06f74890316b98c737bdf0a900bcdd590c079f8"
+          },
+          {
+            "id": 9,
+            "bytes": 131072,
+            "mode": "dense",
+            "samples_ns": [
+              20772541,
+              20824542,
+              20636333
+            ],
+            "median_ms": 20.772541,
+            "hits_sha256": "070b4fd1e03819846e1258f11d9563d9fde8d468f4e7f391bb01ce47def7abc8"
+          }
+        ],
+        "deadline_warm_hits_sha256": "7f5506fdf3cd891bd57fee8db46b4c655f7dd86bc520109b7cbcb42bd88a5431",
+        "python": "3.13.14 (main, Jun 23 2026, 15:20:43) [Clang 22.1.3 ]",
+        "pyarrow": "25.0.1",
+        "deadlines": [
+          {
+            "sample": 0,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 99.480083,
+            "status": 200
+          },
+          {
+            "sample": 0,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 3.247375,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 0,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 115.197291,
+            "status": 200
+          },
+          {
+            "sample": 0,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.753042,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 1,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 114.197625,
+            "status": 200
+          },
+          {
+            "sample": 1,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.802708,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 1,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 100.921625,
+            "status": 200
+          },
+          {
+            "sample": 1,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.757833,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 2,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 99.249542,
+            "status": 200
+          },
+          {
+            "sample": 2,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.730042,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 2,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 114.383292,
+            "status": 200
+          },
+          {
+            "sample": 2,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 3.0185,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          }
+        ],
+        "qualification": "Warm local Debug, three samples per point, real synthetic Parquet. One hit and at most three snippets for each density point; 32 hits for deadline controls. No task-owned builds, E2E or cleanup overlap; shared host. Compare immutable binaries in both orders. No Release, cloud, empty-cache or archive-scale claim."
+      },
+      "new_a": {
+        "source_commit": "d1faae6a39cb7db654d46451e211e1c1f581404f",
+        "binary_sha256": "0a24c2db06c63608842c99e21c7a2f2f9c00b87d2ec758138451c03e905affb3",
+        "runner_sha256": "340bc348911caff4a162ea96815968a5ec3e92376aaf20fbb6d2c863a05f092e",
+        "parquet_sha256": "40a4d42ef83532391740d4e6a0d2f4ce6f3aaa3fd84d9f6b5bd60c729ac2538f",
+        "rows": [
+          {
+            "id": 0,
+            "bytes": 2048,
+            "mode": "sparse",
+            "samples_ns": [
+              11364791,
+              12465084,
+              10702167
+            ],
+            "median_ms": 11.364791,
+            "hits_sha256": "690ff9552b729f777fb80e0286ef30fbaedfc75ca17f421ebb73635c6af218a8"
+          },
+          {
+            "id": 1,
+            "bytes": 2048,
+            "mode": "dense",
+            "samples_ns": [
+              11564958,
+              12001292,
+              12640583
+            ],
+            "median_ms": 12.001292,
+            "hits_sha256": "dc796ffc9d50470e03533f74d95ddb5e276e5ebf60b1ef0b3aa8f03c6f24aaa6"
+          },
+          {
+            "id": 2,
+            "bytes": 8192,
+            "mode": "sparse",
+            "samples_ns": [
+              10700084,
+              10719125,
+              11232458
+            ],
+            "median_ms": 10.719125,
+            "hits_sha256": "edc89d93de076f681081cb65eba6216d36665b624dc0ba6b3dc1aa1b4391a2ae"
+          },
+          {
+            "id": 3,
+            "bytes": 8192,
+            "mode": "dense",
+            "samples_ns": [
+              11993875,
+              11228125,
+              12557708
+            ],
+            "median_ms": 11.993875,
+            "hits_sha256": "4313a263d33a506501197c04029ecc715d7d0a27904122f35d29b6fec144198d"
+          },
+          {
+            "id": 4,
+            "bytes": 32768,
+            "mode": "sparse",
+            "samples_ns": [
+              11158500,
+              11086417,
+              12179333
+            ],
+            "median_ms": 11.1585,
+            "hits_sha256": "dfb08308cd6261b86e2ce80222172b27bf513bd3ec129671b53d52a2fb3dab38"
+          },
+          {
+            "id": 5,
+            "bytes": 32768,
+            "mode": "dense",
+            "samples_ns": [
+              13142500,
+              12811208,
+              12427542
+            ],
+            "median_ms": 12.811208,
+            "hits_sha256": "3c1c3f48b732e43c71d233b55f28a6fd22c41c775edc2d1e6dc00508b000e31b"
+          },
+          {
+            "id": 6,
+            "bytes": 65536,
+            "mode": "sparse",
+            "samples_ns": [
+              11179958,
+              10631500,
+              10683333
+            ],
+            "median_ms": 10.683333,
+            "hits_sha256": "7b08f4f05eb8709d253be7369c8c8245da959729ff1e6d2202d46a1726ad8ae8"
+          },
+          {
+            "id": 7,
+            "bytes": 65536,
+            "mode": "dense",
+            "samples_ns": [
+              14991041,
+              15231833,
+              14301000
+            ],
+            "median_ms": 14.991041,
+            "hits_sha256": "27b1914ff9ee40fed497fc66d321173d0d66adb31f653e2e44ee4dbb702b919d"
+          },
+          {
+            "id": 8,
+            "bytes": 131072,
+            "mode": "sparse",
+            "samples_ns": [
+              11152250,
+              10659458,
+              11860125
+            ],
+            "median_ms": 11.15225,
+            "hits_sha256": "75b3c7ca9c04edfc13e9c475f06f74890316b98c737bdf0a900bcdd590c079f8"
+          },
+          {
+            "id": 9,
+            "bytes": 131072,
+            "mode": "dense",
+            "samples_ns": [
+              17503250,
+              17677834,
+              17827375
+            ],
+            "median_ms": 17.677834,
+            "hits_sha256": "070b4fd1e03819846e1258f11d9563d9fde8d468f4e7f391bb01ce47def7abc8"
+          }
+        ],
+        "deadline_warm_hits_sha256": "7f5506fdf3cd891bd57fee8db46b4c655f7dd86bc520109b7cbcb42bd88a5431",
+        "python": "3.13.14 (main, Jun 23 2026, 15:20:43) [Clang 22.1.3 ]",
+        "pyarrow": "25.0.1",
+        "deadlines": [
+          {
+            "sample": 0,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 83.895791,
+            "status": 200
+          },
+          {
+            "sample": 0,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.767375,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 0,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 88.501042,
+            "status": 200
+          },
+          {
+            "sample": 0,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.80025,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 1,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 88.451167,
+            "status": 200
+          },
+          {
+            "sample": 1,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.777917,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 1,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 81.742459,
+            "status": 200
+          },
+          {
+            "sample": 1,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 3.049833,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 2,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 81.897833,
+            "status": 200
+          },
+          {
+            "sample": 2,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.865083,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 2,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 86.509625,
+            "status": 200
+          },
+          {
+            "sample": 2,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.8105,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          }
+        ],
+        "qualification": "Warm local Debug, three samples per point, real synthetic Parquet. One hit and at most three snippets for each density point; 32 hits for deadline controls. No task-owned builds, E2E or cleanup overlap; shared host. Compare immutable binaries in both orders. No Release, cloud, empty-cache or archive-scale claim."
+      },
+      "new_b": {
+        "source_commit": "d1faae6a39cb7db654d46451e211e1c1f581404f",
+        "binary_sha256": "0a24c2db06c63608842c99e21c7a2f2f9c00b87d2ec758138451c03e905affb3",
+        "runner_sha256": "340bc348911caff4a162ea96815968a5ec3e92376aaf20fbb6d2c863a05f092e",
+        "parquet_sha256": "40a4d42ef83532391740d4e6a0d2f4ce6f3aaa3fd84d9f6b5bd60c729ac2538f",
+        "rows": [
+          {
+            "id": 0,
+            "bytes": 2048,
+            "mode": "sparse",
+            "samples_ns": [
+              10980708,
+              12539750,
+              10854750
+            ],
+            "median_ms": 10.980708,
+            "hits_sha256": "690ff9552b729f777fb80e0286ef30fbaedfc75ca17f421ebb73635c6af218a8"
+          },
+          {
+            "id": 1,
+            "bytes": 2048,
+            "mode": "dense",
+            "samples_ns": [
+              12088333,
+              11465167,
+              11772541
+            ],
+            "median_ms": 11.772541,
+            "hits_sha256": "dc796ffc9d50470e03533f74d95ddb5e276e5ebf60b1ef0b3aa8f03c6f24aaa6"
+          },
+          {
+            "id": 2,
+            "bytes": 8192,
+            "mode": "sparse",
+            "samples_ns": [
+              10391833,
+              10255583,
+              10536833
+            ],
+            "median_ms": 10.391833,
+            "hits_sha256": "edc89d93de076f681081cb65eba6216d36665b624dc0ba6b3dc1aa1b4391a2ae"
+          },
+          {
+            "id": 3,
+            "bytes": 8192,
+            "mode": "dense",
+            "samples_ns": [
+              10420292,
+              11247625,
+              10619917
+            ],
+            "median_ms": 10.619917,
+            "hits_sha256": "4313a263d33a506501197c04029ecc715d7d0a27904122f35d29b6fec144198d"
+          },
+          {
+            "id": 4,
+            "bytes": 32768,
+            "mode": "sparse",
+            "samples_ns": [
+              10389458,
+              10106834,
+              10160791
+            ],
+            "median_ms": 10.160791,
+            "hits_sha256": "dfb08308cd6261b86e2ce80222172b27bf513bd3ec129671b53d52a2fb3dab38"
+          },
+          {
+            "id": 5,
+            "bytes": 32768,
+            "mode": "dense",
+            "samples_ns": [
+              12247416,
+              12014292,
+              11838583
+            ],
+            "median_ms": 12.014292,
+            "hits_sha256": "3c1c3f48b732e43c71d233b55f28a6fd22c41c775edc2d1e6dc00508b000e31b"
+          },
+          {
+            "id": 6,
+            "bytes": 65536,
+            "mode": "sparse",
+            "samples_ns": [
+              10473125,
+              10308958,
+              10407292
+            ],
+            "median_ms": 10.407292,
+            "hits_sha256": "7b08f4f05eb8709d253be7369c8c8245da959729ff1e6d2202d46a1726ad8ae8"
+          },
+          {
+            "id": 7,
+            "bytes": 65536,
+            "mode": "dense",
+            "samples_ns": [
+              13927292,
+              13669958,
+              13595166
+            ],
+            "median_ms": 13.669958,
+            "hits_sha256": "27b1914ff9ee40fed497fc66d321173d0d66adb31f653e2e44ee4dbb702b919d"
+          },
+          {
+            "id": 8,
+            "bytes": 131072,
+            "mode": "sparse",
+            "samples_ns": [
+              10519334,
+              10531875,
+              10565583
+            ],
+            "median_ms": 10.531875,
+            "hits_sha256": "75b3c7ca9c04edfc13e9c475f06f74890316b98c737bdf0a900bcdd590c079f8"
+          },
+          {
+            "id": 9,
+            "bytes": 131072,
+            "mode": "dense",
+            "samples_ns": [
+              16864917,
+              16517708,
+              16624208
+            ],
+            "median_ms": 16.624208,
+            "hits_sha256": "070b4fd1e03819846e1258f11d9563d9fde8d468f4e7f391bb01ce47def7abc8"
+          }
+        ],
+        "deadline_warm_hits_sha256": "7f5506fdf3cd891bd57fee8db46b4c655f7dd86bc520109b7cbcb42bd88a5431",
+        "python": "3.13.14 (main, Jun 23 2026, 15:20:43) [Clang 22.1.3 ]",
+        "pyarrow": "25.0.1",
+        "deadlines": [
+          {
+            "sample": 0,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 81.273542,
+            "status": 200
+          },
+          {
+            "sample": 0,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.715125,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 0,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 87.04925,
+            "status": 200
+          },
+          {
+            "sample": 0,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.733041,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 1,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 86.388208,
+            "status": 200
+          },
+          {
+            "sample": 1,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.843417,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 1,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 81.584625,
+            "status": 200
+          },
+          {
+            "sample": 1,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.679708,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 2,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 81.255209,
+            "status": 200
+          },
+          {
+            "sample": 2,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.817333,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 2,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 88.246167,
+            "status": 200
+          },
+          {
+            "sample": 2,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.718333,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          }
+        ],
+        "qualification": "Warm local Debug, three samples per point, real synthetic Parquet. One hit and at most three snippets for each density point; 32 hits for deadline controls. No task-owned builds, E2E or cleanup overlap; shared host. Compare immutable binaries in both orders. No Release, cloud, empty-cache or archive-scale claim."
+      },
+      "old_b": {
+        "source_commit": "cd851f5bf915b8fc1f56267e87aceca59f833443",
+        "binary_sha256": "37532be658e22f17ea42d09e941c54e8969c056ac16b70c4644772ff5acde9a8",
+        "runner_sha256": "340bc348911caff4a162ea96815968a5ec3e92376aaf20fbb6d2c863a05f092e",
+        "parquet_sha256": "40a4d42ef83532391740d4e6a0d2f4ce6f3aaa3fd84d9f6b5bd60c729ac2538f",
+        "rows": [
+          {
+            "id": 0,
+            "bytes": 2048,
+            "mode": "sparse",
+            "samples_ns": [
+              10580458,
+              12339375,
+              10760958
+            ],
+            "median_ms": 10.760958,
+            "hits_sha256": "690ff9552b729f777fb80e0286ef30fbaedfc75ca17f421ebb73635c6af218a8"
+          },
+          {
+            "id": 1,
+            "bytes": 2048,
+            "mode": "dense",
+            "samples_ns": [
+              12149833,
+              12031875,
+              11879792
+            ],
+            "median_ms": 12.031875,
+            "hits_sha256": "dc796ffc9d50470e03533f74d95ddb5e276e5ebf60b1ef0b3aa8f03c6f24aaa6"
+          },
+          {
+            "id": 2,
+            "bytes": 8192,
+            "mode": "sparse",
+            "samples_ns": [
+              10770458,
+              12015625,
+              10340542
+            ],
+            "median_ms": 10.770458,
+            "hits_sha256": "edc89d93de076f681081cb65eba6216d36665b624dc0ba6b3dc1aa1b4391a2ae"
+          },
+          {
+            "id": 3,
+            "bytes": 8192,
+            "mode": "dense",
+            "samples_ns": [
+              11075625,
+              10870542,
+              10810459
+            ],
+            "median_ms": 10.870542,
+            "hits_sha256": "4313a263d33a506501197c04029ecc715d7d0a27904122f35d29b6fec144198d"
+          },
+          {
+            "id": 4,
+            "bytes": 32768,
+            "mode": "sparse",
+            "samples_ns": [
+              11684375,
+              11845083,
+              13175833
+            ],
+            "median_ms": 11.845083,
+            "hits_sha256": "dfb08308cd6261b86e2ce80222172b27bf513bd3ec129671b53d52a2fb3dab38"
+          },
+          {
+            "id": 5,
+            "bytes": 32768,
+            "mode": "dense",
+            "samples_ns": [
+              13168750,
+              13062000,
+              13058125
+            ],
+            "median_ms": 13.062,
+            "hits_sha256": "3c1c3f48b732e43c71d233b55f28a6fd22c41c775edc2d1e6dc00508b000e31b"
+          },
+          {
+            "id": 6,
+            "bytes": 65536,
+            "mode": "sparse",
+            "samples_ns": [
+              13616083,
+              14057209,
+              13594125
+            ],
+            "median_ms": 13.616083,
+            "hits_sha256": "7b08f4f05eb8709d253be7369c8c8245da959729ff1e6d2202d46a1726ad8ae8"
+          },
+          {
+            "id": 7,
+            "bytes": 65536,
+            "mode": "dense",
+            "samples_ns": [
+              15759667,
+              15440834,
+              15851083
+            ],
+            "median_ms": 15.759667,
+            "hits_sha256": "27b1914ff9ee40fed497fc66d321173d0d66adb31f653e2e44ee4dbb702b919d"
+          },
+          {
+            "id": 8,
+            "bytes": 131072,
+            "mode": "sparse",
+            "samples_ns": [
+              17068458,
+              17487500,
+              16927333
+            ],
+            "median_ms": 17.068458,
+            "hits_sha256": "75b3c7ca9c04edfc13e9c475f06f74890316b98c737bdf0a900bcdd590c079f8"
+          },
+          {
+            "id": 9,
+            "bytes": 131072,
+            "mode": "dense",
+            "samples_ns": [
+              20965291,
+              20547709,
+              19979167
+            ],
+            "median_ms": 20.547709,
+            "hits_sha256": "070b4fd1e03819846e1258f11d9563d9fde8d468f4e7f391bb01ce47def7abc8"
+          }
+        ],
+        "deadline_warm_hits_sha256": "7f5506fdf3cd891bd57fee8db46b4c655f7dd86bc520109b7cbcb42bd88a5431",
+        "python": "3.13.14 (main, Jun 23 2026, 15:20:43) [Clang 22.1.3 ]",
+        "pyarrow": "25.0.1",
+        "deadlines": [
+          {
+            "sample": 0,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 98.358042,
+            "status": 200
+          },
+          {
+            "sample": 0,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.83775,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 0,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 114.02775,
+            "status": 200
+          },
+          {
+            "sample": 0,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.787625,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 1,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 115.086375,
+            "status": 200
+          },
+          {
+            "sample": 1,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.800125,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 1,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 97.0965,
+            "status": 200
+          },
+          {
+            "sample": 1,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.893583,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 2,
+            "mode": "hidden",
+            "timeout_ms": 250,
+            "elapsed_ms": 98.472916,
+            "status": 200
+          },
+          {
+            "sample": 2,
+            "mode": "hidden",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.777958,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          },
+          {
+            "sample": 2,
+            "mode": "projected",
+            "timeout_ms": 250,
+            "elapsed_ms": 116.340708,
+            "status": 200
+          },
+          {
+            "sample": 2,
+            "mode": "projected",
+            "timeout_ms": 1,
+            "elapsed_ms": 2.805708,
+            "status": 504,
+            "response_text": "{\"code\":\"query_timeout\",\"error\":\"query_timeout\",\"message\":\"query timed out\",\"retryable\":true}"
+          }
+        ],
+        "qualification": "Warm local Debug, three samples per point, real synthetic Parquet. One hit and at most three snippets for each density point; 32 hits for deadline controls. No task-owned builds, E2E or cleanup overlap; shared host. Compare immutable binaries in both orders. No Release, cloud, empty-cache or archive-scale claim."
+      }
+    },
+    "source-pages": {
+      "old_a": {
+        "source_commit": "cd851f5bf915b8fc1f56267e87aceca59f833443",
+        "binary_sha256": "37532be658e22f17ea42d09e941c54e8969c056ac16b70c4644772ff5acde9a8",
+        "runner_sha256": "c84f724569e5e8475da0251465954bd63b1ce0f2a3550c0c6690c7ec82c5cfe0",
+        "parquet_sha256": "314c89a792b41da8f66cf7989ef5908e9b8e11ef0c7235c29a2b810e86a79580",
+        "rows": [
+          {
+            "case": "sparsehead",
+            "field_bytes": 8388626,
+            "samples": [
+              {
+                "sample": 0,
+                "timeout_ms": null,
+                "elapsed_ms": 9.15925,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 25,
+                "elapsed_ms": 11.026917,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.609875,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": null,
+                "elapsed_ms": 9.350292,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.513208,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.474959,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": null,
+                "elapsed_ms": 8.989916,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.178041,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.055458,
+                "status": 200
+              }
+            ],
+            "median_ms": 9.15925,
+            "hits_sha256": "d54e60522ec84d382997d3db98407edfdc0b24ccc1783e2c0d5b62291cc278f0"
+          },
+          {
+            "case": "sparsetail",
+            "field_bytes": 8388626,
+            "samples": [
+              {
+                "sample": 0,
+                "timeout_ms": null,
+                "elapsed_ms": 8.743625,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.037,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 50,
+                "elapsed_ms": 8.908917,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": null,
+                "elapsed_ms": 8.913292,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.023667,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.6285,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": null,
+                "elapsed_ms": 10.052417,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.132958,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.204167,
+                "status": 200
+              }
+            ],
+            "median_ms": 8.913292,
+            "hits_sha256": "9e0079f0763615ebde8c5705af9554afe8c7d27d60c7072b5966662aaffc6e71"
+          }
+        ],
+        "qualification": "Warm local Debug; three samples per point; synthetic real Parquet. Two sparse 8-MiB fields, matches at opposite ends, one returned hit per request. No task-owned build, E2E or cleanup overlap; shared host. No Release, cloud or archive-scale claim."
+      },
+      "new_a": {
+        "source_commit": "d1faae6a39cb7db654d46451e211e1c1f581404f",
+        "binary_sha256": "0a24c2db06c63608842c99e21c7a2f2f9c00b87d2ec758138451c03e905affb3",
+        "runner_sha256": "c84f724569e5e8475da0251465954bd63b1ce0f2a3550c0c6690c7ec82c5cfe0",
+        "parquet_sha256": "314c89a792b41da8f66cf7989ef5908e9b8e11ef0c7235c29a2b810e86a79580",
+        "rows": [
+          {
+            "case": "sparsehead",
+            "field_bytes": 8388626,
+            "samples": [
+              {
+                "sample": 0,
+                "timeout_ms": null,
+                "elapsed_ms": 9.649958,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 25,
+                "elapsed_ms": 11.019334,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.348459,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": null,
+                "elapsed_ms": 9.071917,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.371417,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 50,
+                "elapsed_ms": 8.981542,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": null,
+                "elapsed_ms": 9.241875,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 25,
+                "elapsed_ms": 8.883167,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 50,
+                "elapsed_ms": 8.90775,
+                "status": 200
+              }
+            ],
+            "median_ms": 9.241875,
+            "hits_sha256": "d54e60522ec84d382997d3db98407edfdc0b24ccc1783e2c0d5b62291cc278f0"
+          },
+          {
+            "case": "sparsetail",
+            "field_bytes": 8388626,
+            "samples": [
+              {
+                "sample": 0,
+                "timeout_ms": null,
+                "elapsed_ms": 9.202916,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.063292,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.323667,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": null,
+                "elapsed_ms": 9.224125,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.244667,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.449666,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": null,
+                "elapsed_ms": 11.555333,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.651375,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.5565,
+                "status": 200
+              }
+            ],
+            "median_ms": 9.224125,
+            "hits_sha256": "9e0079f0763615ebde8c5705af9554afe8c7d27d60c7072b5966662aaffc6e71"
+          }
+        ],
+        "qualification": "Warm local Debug; three samples per point; synthetic real Parquet. Two sparse 8-MiB fields, matches at opposite ends, one returned hit per request. No task-owned build, E2E or cleanup overlap; shared host. No Release, cloud or archive-scale claim."
+      },
+      "new_b": {
+        "source_commit": "d1faae6a39cb7db654d46451e211e1c1f581404f",
+        "binary_sha256": "0a24c2db06c63608842c99e21c7a2f2f9c00b87d2ec758138451c03e905affb3",
+        "runner_sha256": "c84f724569e5e8475da0251465954bd63b1ce0f2a3550c0c6690c7ec82c5cfe0",
+        "parquet_sha256": "314c89a792b41da8f66cf7989ef5908e9b8e11ef0c7235c29a2b810e86a79580",
+        "rows": [
+          {
+            "case": "sparsehead",
+            "field_bytes": 8388626,
+            "samples": [
+              {
+                "sample": 0,
+                "timeout_ms": null,
+                "elapsed_ms": 9.479042,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 25,
+                "elapsed_ms": 11.118959,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.616458,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": null,
+                "elapsed_ms": 9.429333,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 25,
+                "elapsed_ms": 8.945708,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 50,
+                "elapsed_ms": 8.956708,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": null,
+                "elapsed_ms": 12.189958,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 25,
+                "elapsed_ms": 8.675375,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 50,
+                "elapsed_ms": 8.625917,
+                "status": 200
+              }
+            ],
+            "median_ms": 9.479042,
+            "hits_sha256": "d54e60522ec84d382997d3db98407edfdc0b24ccc1783e2c0d5b62291cc278f0"
+          },
+          {
+            "case": "sparsetail",
+            "field_bytes": 8388626,
+            "samples": [
+              {
+                "sample": 0,
+                "timeout_ms": null,
+                "elapsed_ms": 9.512458,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.122208,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.0825,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": null,
+                "elapsed_ms": 9.212208,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.181542,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.19925,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": null,
+                "elapsed_ms": 9.873125,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.639208,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.599875,
+                "status": 200
+              }
+            ],
+            "median_ms": 9.512458,
+            "hits_sha256": "9e0079f0763615ebde8c5705af9554afe8c7d27d60c7072b5966662aaffc6e71"
+          }
+        ],
+        "qualification": "Warm local Debug; three samples per point; synthetic real Parquet. Two sparse 8-MiB fields, matches at opposite ends, one returned hit per request. No task-owned build, E2E or cleanup overlap; shared host. No Release, cloud or archive-scale claim."
+      },
+      "old_b": {
+        "source_commit": "cd851f5bf915b8fc1f56267e87aceca59f833443",
+        "binary_sha256": "37532be658e22f17ea42d09e941c54e8969c056ac16b70c4644772ff5acde9a8",
+        "runner_sha256": "c84f724569e5e8475da0251465954bd63b1ce0f2a3550c0c6690c7ec82c5cfe0",
+        "parquet_sha256": "314c89a792b41da8f66cf7989ef5908e9b8e11ef0c7235c29a2b810e86a79580",
+        "rows": [
+          {
+            "case": "sparsehead",
+            "field_bytes": 8388626,
+            "samples": [
+              {
+                "sample": 0,
+                "timeout_ms": null,
+                "elapsed_ms": 9.701958,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 25,
+                "elapsed_ms": 11.049166,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.403209,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": null,
+                "elapsed_ms": 9.017834,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.630042,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.079167,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": null,
+                "elapsed_ms": 9.023917,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.376292,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.279666,
+                "status": 200
+              }
+            ],
+            "median_ms": 9.023917,
+            "hits_sha256": "d54e60522ec84d382997d3db98407edfdc0b24ccc1783e2c0d5b62291cc278f0"
+          },
+          {
+            "case": "sparsetail",
+            "field_bytes": 8388626,
+            "samples": [
+              {
+                "sample": 0,
+                "timeout_ms": null,
+                "elapsed_ms": 9.02825,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.283958,
+                "status": 200
+              },
+              {
+                "sample": 0,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.516458,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": null,
+                "elapsed_ms": 9.103625,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 25,
+                "elapsed_ms": 9.213333,
+                "status": 200
+              },
+              {
+                "sample": 1,
+                "timeout_ms": 50,
+                "elapsed_ms": 9.562541,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": null,
+                "elapsed_ms": 10.0425,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 25,
+                "elapsed_ms": 8.977625,
+                "status": 200
+              },
+              {
+                "sample": 2,
+                "timeout_ms": 50,
+                "elapsed_ms": 8.868416,
+                "status": 200
+              }
+            ],
+            "median_ms": 9.103625,
+            "hits_sha256": "9e0079f0763615ebde8c5705af9554afe8c7d27d60c7072b5966662aaffc6e71"
+          }
+        ],
+        "qualification": "Warm local Debug; three samples per point; synthetic real Parquet. Two sparse 8-MiB fields, matches at opposite ends, one returned hit per request. No task-owned build, E2E or cleanup overlap; shared host. No Release, cloud or archive-scale claim."
+      }
+    }
+  },
+  "control_parents": [
+    "f82878576814371ef1a8663630b9540ac2f822ad",
+    "e61aff2e88c21045676dc6042053dd07134c570b"
+  ]
+}

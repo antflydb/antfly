@@ -1502,3 +1502,51 @@ builds, E2E runs and cache cleanup before timing. A publication observation incl
 admission and readiness polling; it is not an isolated ingestion CPU benchmark.
 The native `SOURCE_OFFSET_SELECT` and `SOURCE_ANALYSIS` probes independently check
 physical selection and reuse rather than inferring those properties from latency.
+
+The [selective-offset observation](selective-source-offsets-v1-observation.json)
+records **388 measured HTTP requests** from the final merged runtime
+`d1faae6a39cb7db654d46451e211e1c1f581404f` (binary SHA-256
+`0a24c2db06c63608842c99e21c7a2f2f9c00b87d2ec758138451c03e905affb3`).
+The control tree merges the pre-change branch `f828785768` with the **same main
+revision `e61aff2e88`**; its tree and reconstruction commands are retained in the
+observation. This isolates the selective offsets, indexing capture and string
+preparation change from main's resource-policy updates. All complete-result
+oracles match across binaries and both execution orders.
+
+Warm local Debug medians, milliseconds:
+
+| Shape | Old → new, primary order | Old → new, reverse order |
+|---|---:|---:|
+| Rare exact, 2-MiB vocabulary | 39.19 → 8.74 | 39.92 → 8.65 |
+| Rare prefix, 2-MiB vocabulary | 50.80 → 8.53 | 50.64 → 8.25 |
+| Rare wildcard, 2-MiB vocabulary | 68.66 → 10.40 | 69.18 → 10.38 |
+| Rare fuzzy, 2-MiB vocabulary | 97.81 → 10.75 | 98.52 → 10.82 |
+| Eight projected small fields, 256 hits | 304.15 → 280.00 | 291.25 → 275.20 |
+| Eight hidden small fields, 256 hits | 311.56 → 307.13 | 303.10 → 309.39 |
+| Sparse 128-KiB field | 16.60 → 11.15 | 17.07 → 10.53 |
+| Dense 128-KiB field | 20.77 → 17.68 | 20.55 → 16.62 |
+| Sparse 8-MiB field, matches at start | 9.16 → 9.24 | 9.02 → 9.48 |
+| Sparse 8-MiB field, matches at end | 8.91 → 9.22 | 9.10 → 9.51 |
+
+Rare-term shapes improve **4.49–9.10×**; projected-wide total latency improves
+**5.5–7.9%**. Hidden-wide stays within roughly 2%, and narrow controls vary within
+4%. The existing 8-MiB sparse controls cost another **0.08–0.46 ms (1–5%)**;
+they continue to satisfy their 25-ms and 50-ms requests. Dense 128-KiB improves
+15–19%. The 2–8-KiB kernel points remain within roughly 5%; all observations,
+including slower points and structured 1-ms timeouts, are retained. These are
+seven samples per rare-term point and three per control point, in both binary
+orders on a shared host, with no task-owned build, E2E or cleanup overlap. They
+do not qualify Release, cloud latency, empty caches or archive scale.
+
+Native probes independently show 8,192 token records narrowing to 32 selected
+occurrences, 64 term tests and **814 bytes read from a 37,343-byte vector**. A
+physical-binding alias test captures one analyzer variant, reuses it once and
+spills 110 bytes; it does not claim that separate physical indexes share every
+indexing analysis. Both public lake native owners pass: **533 integration and
+493 frontier cases**, each with its **240-case shared partition**; all report
+zero skips, failures and leaks. The combined command exits successfully. All
+**32 Parquet archive and 16 Iceberg SQL E2Es** pass without skips on this frozen
+binary, including rare exact/prefix/wildcard/fuzzy source spans with original
+objects unavailable after restart. Apache boundary checks cover 2,563 source
+files, and license, lint, formatting and whitespace checks pass. Subsequent
+changes only record evidence and normalize two headers inherited from main.
