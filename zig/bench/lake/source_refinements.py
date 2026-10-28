@@ -52,13 +52,12 @@ out = base / label
 out.mkdir(exist_ok=True)
 archive = shared / "archive.parquet"
 dense = "densecase " + "needle " * ((2 * 1024 * 1024) // 7)
+rng = random.Random(42)
+glyphs = ["§", "。", "🙂", "\u00a0", "é", "字"]
+words = ["".join(rng.choices(glyphs, k=256)) for _ in range(256)]
 unicode = (
     "unicodecase "
-    + "".join(
-        random.Random(42).choices(
-            [".", " ", "§", "。", "🙂", "\u00a0", "\n"], k=4 * 1024 * 1024
-        )
-    )
+    + " ".join(rng.choices(words, k=16384))
     .encode("utf-8")[: 8 * 1024 * 1024]
     .decode("utf-8", errors="ignore")
     + " needle"

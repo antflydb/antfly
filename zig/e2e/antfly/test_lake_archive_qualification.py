@@ -2020,7 +2020,12 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
     selective_body = (
         vocabulary * ((2 * 1024 * 1024) // len(vocabulary))
     ) + "uniqueneedle"
-    unicode_body = "unicodecase " + "🙂。 " * (1024 * 1024) + " needle"
+    unicode_block = "🙂。" * 128 + " "
+    unicode_payload = unicode_block * (
+        (8 * 1024 * 1024) // len(unicode_block.encode("utf-8"))
+    )
+    unicode_payload += "." * (8 * 1024 * 1024 - len(unicode_payload.encode("utf-8")))
+    unicode_body = "unicodecase " + unicode_payload + " needle"
     rows = pa.table(
         {
             "id": list(range(count + 3)),
@@ -2030,7 +2035,7 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
     root = tmp_path / "fixture"
     if source_format == "parquet":
         archive = tmp_path / "archive.parquet"
-        pq.write_table(rows, archive, row_group_size=16, use_dictionary=False)
+        pq.write_table(rows, archive, row_group_size=1, use_dictionary=False)
         uri = bench.import_fixture(root, [archive], "highlight-cpu")["manifest_uri"]
     else:
         pytest.importorskip("pyiceberg")
@@ -2053,7 +2058,9 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                 NestedField(2, "body", StringType(), required=False),
             ),
         )
-        table.append(rows)
+        # Each large scalar stays below the reader's 16-MiB page limit.
+        table.append(rows.slice(0, count + 2))
+        table.append(rows.slice(count + 2, 1))
         _export_table(table, root)
         uri = root.as_uri()
     definition = {
