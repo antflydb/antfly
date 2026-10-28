@@ -1602,3 +1602,14 @@ Repeat source runs with `mixed`, `opaque`, `escaped` and `unicode`; add
 These results do not measure inference quality/billing, cold storage, sustained
 cross-request throughput or other hosts. Allocation and admission bounds remain
 required even when CPU or latency improves.
+
+
+After release qualification, main advanced again. The follow-up merges
+`386c2761eafc0f8cbc4022b15c4f639f718d1024`, preserving both projection and new
+prompt-cache types in generated clients. Native API bindings were regenerated;
+93 generated-API steps and two tests passed. The source OpenAPI comparison, full
+Go SDK suite, Python export syntax, 2,578-file Apache boundary and storage control
+catalog passed. The merged native query/provider/gateway run passed all 76 build
+steps, including 208 query contracts, 31 provider cases and 67 gateway cases with
+no failures or leaks. The numerical tables above continue to identify the actual
+measured `0826126861ed` runtime; they are not measurements of this newer merge.

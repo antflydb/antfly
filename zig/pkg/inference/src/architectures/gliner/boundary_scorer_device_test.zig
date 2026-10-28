@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const c_file = @import("../../util/c_file.zig");
 const model = @import("../../models/gliner_boundary.zig");
 const engine = @import("boundary_engine_device.zig");
 const head = @import("boundary_device.zig");
@@ -60,6 +61,8 @@ fn parity(comptime variant: []const u8, comptime environment: [:0]const u8, comp
     defer a.free(path);
     var weights = fixtures.TensorFixture{ .allocator = a, .reader = try @import("../../models/safetensors.zig").MMapReader.openFileAbsolute(a, path) };
     defer weights.deinit();
+    c_file.MmapRegion.adviseBytesSequential(weights.reader.file_bytes);
+    defer c_file.MmapRegion.adviseBytesRandom(weights.reader.file_bytes);
     try expectPin(capture.value.model_files.@"model.safetensors", weights.reader.file_bytes);
     const tokenizer_bytes = try readPinned(a, directory, "tokenizer.json", capture.value.model_files.@"tokenizer.json");
     defer a.free(tokenizer_bytes);
@@ -142,6 +145,8 @@ fn cudaParity(comptime variant: []const u8, comptime environment: [:0]const u8, 
     defer a.free(path);
     var weights = fixtures.TensorFixture{ .allocator = a, .reader = try @import("../../models/safetensors.zig").MMapReader.openFileAbsolute(a, path) };
     defer weights.deinit();
+    c_file.MmapRegion.adviseBytesSequential(weights.reader.file_bytes);
+    defer c_file.MmapRegion.adviseBytesRandom(weights.reader.file_bytes);
     try expectPin(capture.value.model_files.@"model.safetensors", weights.reader.file_bytes);
     const tokenizer_bytes = try readPinned(a, directory, "tokenizer.json", capture.value.model_files.@"tokenizer.json");
     defer a.free(tokenizer_bytes);
@@ -159,11 +164,13 @@ fn cudaParity(comptime variant: []const u8, comptime environment: [:0]const u8, 
     const factory = @import("../session_factory.zig");
     const session = try factory.createGlinerCudaSessionWithPrecision(a, directory, .fp32);
     defer session.close();
+    try std.testing.expectEqual(.cuda, session.backend());
     // Offline evidence gathering uses the same CUDA session and device pipeline;
     // this does not widen the production serving qualification table.
     var cb = try factory.getComputeBackend(session, a);
     defer cb.deinit();
     for (capture.value.cases, 0..) |case, case_index| {
+        const cuda_before = factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats;
         errdefer std.debug.print(variant ++ " resident pipeline case: {s}\n", .{case.id});
         const schema_json = try std.json.Stringify.valueAlloc(a, case.schema, .{});
         defer a.free(schema_json);
@@ -182,6 +189,9 @@ fn cudaParity(comptime variant: []const u8, comptime environment: [:0]const u8, 
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.samples.len);
         try pipeline.expectSample(case.expected, result.samples[0], pipeline.fp32_confidence_tolerance);
+        const cuda_after = factory.getCudaRuntimeStats(session).?;
+        try std.testing.expect(cuda_after.kernel_launches > cuda_before.kernel_launches);
+        try std.testing.expectEqual(cuda_before.to_float32_calls, cuda_after.to_float32_calls);
         // The only encoder-owner readback is the scalar classification output.
         try std.testing.expectEqual(@as(usize, @intFromBool(prepared.classification_width > 0)), encoded.stats().result_download_calls);
         const stats = try scorer.stats();
@@ -198,6 +208,25 @@ fn cudaParity(comptime variant: []const u8, comptime environment: [:0]const u8, 
 
 test "gliner boundary device CUDA pinned base full inference pipeline parity" {
     try cudaParity("base", "ANTFLY_GLINER25_BASE_MODEL_DIR", "pipeline_cases_base.json", false);
+}
+
+test "gliner boundary device CUDA pinned multi full inference pipeline parity" {
+    try cudaParity("multi", "ANTFLY_GLINER25_MULTI_V1_MODEL_DIR", "pipeline_cases_multi.json", false);
+}
+
+test "GLiNER production CUDA required artifacts" {
+    const platform = @import("antfly_platform");
+    if (!platform.env.getenvBool("ANTFLY_GLINER25_REQUIRE_PRODUCTION_MODELS")) return error.SkipZigTest;
+    if (!build_options.enable_cuda) return error.CudaNotEnabled;
+    inline for (.{ "ANTFLY_GLINER25_BASE_MODEL_DIR", "ANTFLY_GLINER25_MULTI_V1_MODEL_DIR", "ANTFLY_GLINER_DECIDE_MODEL", "ANTFLY_GLINER_DECIDE_Q8_MODEL", "ANTFLY_GLINER25_FAMILY_MODEL_DIR" }) |name| {
+        const path = platform.env.getenv(name) orelse {
+            std.debug.print("production CUDA qualification requires {s}\n", .{name});
+            return error.MissingProductionQualificationModel;
+        };
+        if (!std.fs.path.isAbsolute(path)) return error.QualificationModelPathMustBeAbsolute;
+    }
+    const backend = platform.env.getenv("ANTFLY_GLINER_DECIDE_BACKEND") orelse return error.MissingRequiredCudaBackend;
+    try std.testing.expectEqualStrings("cuda", backend);
 }
 
 test "gliner boundary device CUDA pinned Transformers base full inference pipeline parity" {

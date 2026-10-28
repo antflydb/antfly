@@ -79,6 +79,10 @@ fn melScale(freq: f32) f32 {
 /// `torchaudio.compliance.kaldi.get_mel_banks` with the Nyquist bin zeroed.
 fn melBanksAlloc(allocator: std.mem.Allocator) ![]f32 {
     const banks = try allocator.alloc(f32, num_mel_bins * spectrum_bins);
+    fillMelBanks(banks);
+    return banks;
+}
+fn fillMelBanks(banks: []f32) void {
     @memset(banks, 0);
     const nyquist: f32 = @as(f32, @floatFromInt(sample_rate)) / 2.0;
     const fft_bin_width: f32 = @as(f32, @floatFromInt(sample_rate)) / @as(f32, @floatFromInt(padded_frame_length));
@@ -97,7 +101,6 @@ fn melBanksAlloc(allocator: std.mem.Allocator) ![]f32 {
             banks[bin * spectrum_bins + k] = @max(0.0, @min(up, down));
         }
     }
-    return banks;
 }
 
 /// Povey window: `hann(N, periodic=false) ** 0.85`.
@@ -163,10 +166,16 @@ pub fn kaldiFbankAlloc(allocator: std.mem.Allocator, samples: []const f32) ![]f3
     var window: [frame_length]f32 = undefined;
     poveyWindow(&window);
 
+    try fbankInto(samples, features, banks, &window, null);
+    return features;
+}
+fn fbankInto(samples: []const f32, features: []f32, banks: []const f32, window: *const [frame_length]f32, control: ?InferenceExecutionControl) !void {
+    const frames = features.len / num_mel_bins;
     var re: [padded_frame_length]f32 = undefined;
     var im: [padded_frame_length]f32 = undefined;
     var frame: [frame_length]f32 = undefined;
     for (0..frames) |t| {
+        if (t % 16 == 0) if (control) |active| try active.check();
         const base = t * frame_shift;
         var sum: f64 = 0;
         for (0..frame_length) |i| {
@@ -200,7 +209,6 @@ pub fn kaldiFbankAlloc(allocator: std.mem.Allocator, samples: []const f32) ![]f3
             out[bin] = @log(@max(@as(f32, @floatCast(energy)), log_floor));
         }
     }
-    return features;
 }
 
 /// Removes the per-utterance mean of every mel bin in place.
@@ -222,6 +230,12 @@ pub const Embedder = struct {
     /// Model runs are serialised: the native executor keeps per-session
     /// scratch, and diarization is a small tail on a transcription anyway.
     run_lock: std.atomic.Mutex = .unlocked,
+    workspace: ?*Workspace = null,
+    const Workspace = struct {
+        banks: [num_mel_bins * spectrum_bins]f32,
+        window: [frame_length]f32,
+        features: [((window_samples - frame_length) / frame_shift + 1) * num_mel_bins]f32,
+    };
 
     pub fn load(allocator: std.mem.Allocator, onnx_path: []const u8) !Embedder {
         var dims: onnx_graph.DimOverrides = .empty;
@@ -235,6 +249,7 @@ pub const Embedder = struct {
     }
 
     pub fn deinit(self: *Embedder) void {
+        if (self.workspace) |workspace| self.allocator.destroy(workspace);
         self.session.close();
     }
 
@@ -249,21 +264,24 @@ pub const Embedder = struct {
         control: ?InferenceExecutionControl,
     ) ![]f32 {
         if (samples.len != window_samples) return error.UnexpectedWindowLength;
-        const features = try kaldiFbankAlloc(allocator, samples);
-        defer allocator.free(features);
-        const frames = features.len / num_mel_bins;
-        subtractGlobalMean(features);
-
-        const shape = [_]i64{ 1, @intCast(frames), @intCast(num_mel_bins) };
-        var input = try Tensor.initFloat32(allocator, "x", &shape, features);
-        defer input.deinit();
-
-        if (control) |active| {
-            try active.lock(&self.run_lock);
-        } else {
+        // The same session gate owns preprocessing scratch and execution.
+        // No feature allocation, tensor copy, or constant rebuild on warm calls.
+        if (control) |active| try active.lock(&self.run_lock) else {
             while (!self.run_lock.tryLock()) std.atomic.spinLoopHint();
         }
         defer self.run_lock.unlock();
+        if (self.workspace == null) {
+            const workspace = try self.allocator.create(Workspace);
+            fillMelBanks(&workspace.banks);
+            poveyWindow(&workspace.window);
+            self.workspace = workspace;
+        }
+        const workspace = self.workspace.?;
+        try fbankInto(samples, &workspace.features, &workspace.banks, &workspace.window, control);
+        subtractGlobalMean(&workspace.features);
+        if (control) |active| try active.check();
+        const shape = [_]i64{ 1, @intCast(workspace.features.len / num_mel_bins), @intCast(num_mel_bins) };
+        const input = Tensor{ .allocator = self.allocator, .name = "x", .dtype = .f32, .shape = &shape, .data = std.mem.sliceAsBytes(&workspace.features), .owns_data = false, .owns_shape = false };
         const outputs = try self.session.runWithControl(&[_]Tensor{input}, allocator, control);
         defer {
             for (outputs) |*output| output.deinit();
@@ -848,6 +866,7 @@ test "diarization frees every copy when an allocation fails" {
             };
 
             var embedder = Embedder{ .allocator = allocator, .session = constantEmbeddingSession() };
+            defer embedder.deinit();
             const labelled = try diarizeSegmentsAlloc(allocator, &embedder, samples, &segments, .{}, null);
             long_transcription.freeSegments(allocator, labelled);
         }
@@ -950,4 +969,25 @@ test "speaker label formatting" {
     try std.testing.expectEqualStrings("SPEAKER_12", speakerLabel(&buf, 12));
     try std.testing.expectEqualStrings("SPEAKER_00", speakerLabelStatic(0));
     try std.testing.expectEqualStrings("SPEAKER_255", speakerLabelStatic(255));
+}
+
+test "model aware media speaker feature workspace reuses constants and matches reference preprocessing" {
+    const a = std.testing.allocator;
+    const samples = try a.alloc(f32, window_samples);
+    defer a.free(samples);
+    for (samples, 0..) |*value, i| value.* = 0.2 * @sin(@as(f32, @floatFromInt(i)) * 0.12);
+    const reference = try kaldiFbankAlloc(a, samples);
+    defer a.free(reference);
+    subtractGlobalMean(reference);
+    var embedder = Embedder{ .allocator = a, .session = constantEmbeddingSession() };
+    defer embedder.deinit();
+    const first = try embedder.embedAlloc(a, samples, .{});
+    defer a.free(first);
+    const workspace = embedder.workspace.?;
+    try std.testing.expectEqualSlices(f32, reference, &workspace.features);
+    const second = try embedder.embedAlloc(a, samples, .{});
+    defer a.free(second);
+    try std.testing.expect(workspace == embedder.workspace.?);
+    try std.testing.expectEqualSlices(f32, first, second);
+    try std.testing.expectEqualSlices(f32, reference, &workspace.features);
 }

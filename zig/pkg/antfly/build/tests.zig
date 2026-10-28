@@ -2273,6 +2273,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_connection_filters = &.{
         "HTTP connection record",
         "HTTP connection DISCARD",
+        "HTTP connection directory",
         "HTTP connection recovers",
         "HTTP connection keeps",
         "HTTP connection reconciles",

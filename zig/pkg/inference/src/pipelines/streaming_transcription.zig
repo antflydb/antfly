@@ -184,8 +184,60 @@ pub const Session = struct {
     /// Run endpointing and decoding over the buffered audio. Appends every
     /// produced event to `events`; the caller owns them. With `commit`, all
     /// buffered speech is finalized regardless of trailing silence and the
-    /// buffer is emptied.
+    /// buffer is emptied. Session state and events commit together: on error,
+    /// buffered audio, conditioning, counters and existing events are unchanged.
+    /// Decoder-side work (including its request token budget) is not rolled back.
     pub fn process(
+        self: *Session,
+        transcriber: anytype,
+        events: *std.ArrayListUnmanaged(Event),
+        commit: bool,
+    ) !void {
+        var staged = try self.stageProcessing();
+        defer {
+            // Processing borrows the original PCM allocation. Neither a failed
+            // candidate nor the old state after commit owns that buffer.
+            staged.buffer = .empty;
+            staged.deinit();
+        }
+        var staged_events = std.ArrayListUnmanaged(Event).empty;
+        defer {
+            for (staged_events.items) |*event| event.deinit(self.allocator);
+            staged_events.deinit(self.allocator);
+        }
+        try staged.processInPlace(transcriber, &staged_events, commit);
+        // Reserve before changing either owner; allocation failure rolls back
+        // the same way as a decoder or policy failure.
+        try events.ensureUnusedCapacity(self.allocator, staged_events.items.len);
+        var owned_buffer = self.buffer;
+        std.mem.copyForwards(f32, owned_buffer.items[0..staged.buffer.items.len], staged.buffer.items);
+        owned_buffer.items.len = staged.buffer.items.len;
+        staged.buffer = owned_buffer;
+        std.mem.swap(Session, self, &staged);
+        events.appendSliceAssumeCapacity(staged_events.items);
+        staged_events.items.len = 0;
+    }
+
+    /// Clone mutable decoder context and counters, but borrow the PCM. The
+    /// candidate advances a slice rather than compacting or freeing the audio;
+    /// only the successful transaction copies remaining samples to the front.
+    fn stageProcessing(self: *const Session) !Session {
+        var staged = self.*;
+        staged.buffer = .empty;
+        staged.previous_hypothesis = null;
+        staged.initial_prompt_tokens = null;
+        staged.previous_final_tokens = null;
+        staged.prefix = .empty;
+        errdefer staged.deinit();
+        if (self.previous_hypothesis) |value| staged.previous_hypothesis = try self.allocator.dupe(u8, value);
+        if (self.initial_prompt_tokens) |value| staged.initial_prompt_tokens = try self.allocator.dupe(i32, value);
+        if (self.previous_final_tokens) |value| staged.previous_final_tokens = try self.allocator.dupe(i32, value);
+        try staged.prefix.appendSlice(self.allocator, self.prefix.items);
+        staged.buffer = self.buffer;
+        return staged;
+    }
+
+    fn processInPlace(
         self: *Session,
         transcriber: anytype,
         events: *std.ArrayListUnmanaged(Event),
@@ -269,8 +321,9 @@ pub const Session = struct {
         const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (self.config.condition_on_previous) {
-            if (self.previous_final_tokens) |tokens| self.allocator.free(tokens);
-            self.previous_final_tokens = try self.allocator.dupe(i32, result.tokens);
+            const tokens = try self.allocator.dupe(i32, result.tokens);
+            if (self.previous_final_tokens) |previous| self.allocator.free(previous);
+            self.previous_final_tokens = tokens;
         }
         if (result.language) |code| _ = transcriber.lockLanguage(code);
         const segment_start_ms = vad.samplesToMs(self.config.sample_rate, self.buffer_start + start);
@@ -365,9 +418,10 @@ pub const Session = struct {
     fn drop(self: *Session, count: usize) void {
         const n = @min(count, self.buffer.items.len);
         if (n == 0) return;
-        const remaining = self.buffer.items.len - n;
-        std.mem.copyForwards(f32, self.buffer.items[0..remaining], self.buffer.items[n..]);
-        self.buffer.items.len = remaining;
+        // Called only on the processing candidate. Preserve the original
+        // samples until the caller commits the complete event batch.
+        self.buffer.items = self.buffer.items[n..];
+        self.buffer.capacity -= n;
         self.buffer_start += n;
         self.analyzed_len = 0;
     }
@@ -412,6 +466,7 @@ const test_rate: u32 = 16_000;
 const FakeTranscriber = struct {
     allocator: std.mem.Allocator,
     calls: usize = 0,
+    output_budget: @import("transcription_budget.zig").OutputTokenBudget = .{},
     /// Text returned per call, cycled. Empty list returns a length-derived text.
     scripted: []const []const u8 = &.{},
 
@@ -421,7 +476,9 @@ const FakeTranscriber = struct {
         var count: usize = 0;
         var it = std.mem.tokenizeScalar(u8, text, ' ');
         while (it.next()) |_| count += 1;
-        return allocator.alloc(i32, count);
+        const tokens = try allocator.alloc(i32, count);
+        @memset(tokens, 1);
+        return tokens;
     }
 
     pub fn lockLanguage(_: *FakeTranscriber, _: []const u8) bool {
@@ -429,6 +486,8 @@ const FakeTranscriber = struct {
     }
 
     pub fn transcribePcmConditioned(self: *FakeTranscriber, samples: []const f32, sample_rate: u32, prefix: []const i32) !transcription.TranscribeResult {
+        // Two generated text tokens and EOS per segment.
+        for (0..3) |_| try self.output_budget.consume();
         if (self.calls < self.prefix_lens.len) self.prefix_lens[self.calls] = prefix.len;
         defer self.calls += 1;
         const text = if (self.scripted.len > 0)
@@ -438,6 +497,7 @@ const FakeTranscriber = struct {
         errdefer self.allocator.free(text);
         // Two tokens per call stand in for the decoded text tokens.
         const tokens = try self.allocator.alloc(i32, 2);
+        errdefer self.allocator.free(tokens);
         @memset(tokens, @intCast(self.calls));
         return .{ .text = text, .language = try self.allocator.dupe(u8, "en"), .allocator = self.allocator, .tokens = tokens };
     }
@@ -662,4 +722,85 @@ test "streaming session conditions decodes on the prompt and the previous final"
     // First final: prompt only (3 tokens); second: prompt + previous final (2 tokens).
     try std.testing.expectEqual(@as(usize, 3), fake.prefix_lens[0]);
     try std.testing.expectEqual(@as(usize, 5), fake.prefix_lens[1]);
+}
+
+test "streaming transcription output rejection preserves audio context and events for retry" {
+    const a = std.testing.allocator;
+    var session = try Session.init(a, .{ .max_segment_ms = 3000, .partial_interval_ms = 1000, .initial_prompt = "terms" });
+    defer session.deinit();
+    var events = std.ArrayListUnmanaged(Event).empty;
+    defer freeEvents(a, &events);
+    const speech = try toneChunk(a, 1000, 0.2);
+    defer a.free(speech);
+    try session.append(speech, test_rate);
+    var first = FakeTranscriber{ .allocator = a };
+    try session.process(&first, &events, false);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    const hypothesis = try a.dupe(u8, session.previous_hypothesis.?);
+    defer a.free(hypothesis);
+    const analyzed = session.analyzed_len;
+    const sequence = session.next_sequence;
+    const decodes = session.decodes;
+    const partials = session.partials;
+    const initial = try a.dupe(i32, session.initial_prompt_tokens.?);
+    defer a.free(initial);
+    const prefix = try a.dupe(i32, session.prefix.items);
+    defer a.free(prefix);
+    const longer = try toneChunk(a, 7000, 0.2);
+    defer a.free(longer);
+    try session.append(longer, test_rate);
+    const buffered_audio = try a.dupe(f32, session.buffer.items);
+    defer a.free(buffered_audio);
+    const audio_pointer = session.buffer.items.ptr;
+    // One segment finishes, then the next segment exhausts this request's
+    // budget. Neither the finalized audio nor its unpublished event may vanish.
+    var limited = FakeTranscriber{ .allocator = a, .output_budget = .{ .remaining = 4 } };
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, session.process(&limited, &events, true));
+    try std.testing.expectEqual(@as(usize, 1), limited.calls);
+    try std.testing.expectEqual(@as(?usize, 0), limited.output_budget.remaining);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqual(@as(u64, 0), session.buffer_start);
+    try std.testing.expectEqual(audio_pointer, session.buffer.items.ptr);
+    try std.testing.expectEqualSlices(f32, buffered_audio, session.buffer.items);
+    try std.testing.expectEqualStrings(hypothesis, session.previous_hypothesis.?);
+    try std.testing.expectEqualSlices(i32, initial, session.initial_prompt_tokens.?);
+    try std.testing.expectEqualSlices(i32, prefix, session.prefix.items);
+    try std.testing.expect(session.previous_final_tokens == null);
+    try std.testing.expectEqual(analyzed, session.analyzed_len);
+    try std.testing.expectEqual(sequence, session.next_sequence);
+    try std.testing.expectEqual(decodes, session.decodes);
+    try std.testing.expectEqual(partials, session.partials);
+    try std.testing.expectEqual(@as(u64, 0), session.finals);
+    // A fresh HTTP append/commit has a fresh budget and recovers all the audio.
+    var retry = FakeTranscriber{ .allocator = a };
+    try session.process(&retry, &events, true);
+    try std.testing.expectEqual(@as(u64, 0), events.items[1].start_ms);
+    try std.testing.expectEqual(sequence, events.items[1].sequence);
+    try std.testing.expect(events.items[events.items.len - 1].end_ms >= 7900);
+    try std.testing.expectEqual(@as(usize, 0), session.buffer.items.len);
+    try std.testing.expectEqual(audio_pointer, session.buffer.items.ptr);
+}
+
+fn processAllocationFailureProbe(a: std.mem.Allocator) !void {
+    var session = try Session.init(a, .{ .max_segment_ms = 1000, .emit_partials = false, .initial_prompt = "names" });
+    defer session.deinit();
+    var events = std.ArrayListUnmanaged(Event).empty;
+    defer freeEvents(a, &events);
+    const speech = try toneChunk(a, 2000, 0.2);
+    defer a.free(speech);
+    try session.append(speech, test_rate);
+    const audio_pointer = session.buffer.items.ptr;
+    var fake = FakeTranscriber{ .allocator = a };
+    session.process(&fake, &events, true) catch |err| {
+        try std.testing.expectEqual(@as(u64, 0), session.buffer_start);
+        try std.testing.expectEqual(audio_pointer, session.buffer.items.ptr);
+        try std.testing.expectEqualSlices(f32, speech, session.buffer.items);
+        try std.testing.expectEqual(@as(usize, 0), events.items.len);
+        try std.testing.expectEqual(@as(u64, 0), session.next_sequence);
+        return err;
+    };
+}
+
+test "streaming transcription processing is atomic under allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, processAllocationFailureProbe, .{});
 }

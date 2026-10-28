@@ -41,6 +41,9 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 pub const TranscribeConfig = struct {
     vocab_size: usize = 51865,
     max_length: usize = 448,
+    /// Per audio item, including all windows, temperature retries, timestamps
+    /// and EOS. Exhaustion is an error, never a successful partial transcript.
+    max_output_tokens: ?usize = null,
     language: ?[]const u8 = null,
     sample_rate: usize = 16000,
     n_mels: usize = 80,
@@ -155,6 +158,7 @@ pub const TranscriptionPipeline = struct {
     tokenizer: tokenizer_mod.Tokenizer,
     config: TranscribeConfig,
     execution_control: ?InferenceExecutionControl = null,
+    output_token_budget: @import("transcription_budget.zig").OutputTokenBudget = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -169,6 +173,7 @@ pub const TranscriptionPipeline = struct {
             .decoder = decoder,
             .tokenizer = tokenizer,
             .config = config,
+            .output_token_budget = .{ .remaining = config.max_output_tokens },
         };
     }
 
@@ -246,6 +251,7 @@ pub const TranscriptionPipeline = struct {
         sample_rate: u32,
         prompt_prefix: []const i32,
     ) !TranscribeResult {
+        try self.output_token_budget.check();
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         var timing = Timing{};
@@ -416,6 +422,7 @@ pub const TranscriptionPipeline = struct {
         seed: usize,
         timing: *Timing,
     ) !Attempt {
+        try self.output_token_budget.check();
         const allocator = self.allocator;
         const max_len = self.config.max_length;
         if (max_len == 0) return error.InvalidTranscriptionMaxLength;
@@ -473,6 +480,7 @@ pub const TranscriptionPipeline = struct {
         const rules_active = self.config.timestamps and rules.timestamp_begin >= 0 and
             @as(usize, @intCast(rules.timestamp_begin)) < self.config.vocab_size;
 
+        var completed = false;
         while (dec_len < max_len) {
             if (forced_index < forced.len and forced[forced_index].position + offset == dec_len) {
                 if (forced[forced_index].token_id) |token_id| {
@@ -484,6 +492,7 @@ pub const TranscriptionPipeline = struct {
             }
 
             const generated_position = dec_len;
+            if (generated_position >= prompt_end) try self.output_token_budget.check();
             if (self.execution_control) |control| try control.update(.executing, @intCast(generated_position), @intCast(self.config.max_length));
             const step_started = platform.time.monotonicNs();
             const dynamic_language_slot = forced_index < forced.len and
@@ -622,7 +631,13 @@ pub const TranscriptionPipeline = struct {
             // Prompt slots are control tokens. Do not terminate before the
             // artifact-defined prompt is complete even if a malformed model
             // predicts EOS for a dynamic slot.
-            if (best_token == self.config.eos_token_id and generated_position >= prompt_end) break;
+            if (generated_position >= prompt_end) {
+                try self.output_token_budget.consume();
+                if (best_token == self.config.eos_token_id) {
+                    completed = true;
+                    break;
+                }
+            }
 
             dec_ids[dec_len] = best_token;
             dec_len += 1;
@@ -637,10 +652,15 @@ pub const TranscriptionPipeline = struct {
             // backend declines leaves the loop on the synchronous path.
             if (native_decoder) |*decoder| {
                 if (temperature == 0 and step_stats != null and generated_position == prompt_end and dec_len < max_len) {
-                    if (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) break;
+                    if (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) {
+                        completed = true;
+                        break;
+                    }
                 }
             }
         }
+
+        if (!completed) try self.output_token_budget.check();
 
         // The reference divides by the token count plus the EOT that ended it.
         const avg_logprob: f32 = @floatCast(logprob_sum / @as(f64, @floatFromInt(generated.items.len + 1)));
@@ -676,7 +696,7 @@ pub const TranscriptionPipeline = struct {
         timing: *Timing,
     ) !bool {
         const allocator = self.allocator;
-        const max_len = self.config.max_length;
+        const max_len = try self.output_token_budget.decodeEnd(dec_len.*, self.config.max_length);
         const trace = platform.env.getenvBool("TERMITE_WHISPER_TRACE_PIPELINE");
         if (!decoder.setPipelined(true)) {
             if (trace) std.debug.print("whisper_pipeline: declined (backend cannot pipeline)\n", .{});
@@ -758,6 +778,7 @@ pub const TranscriptionPipeline = struct {
             step_started = now;
             const token: i32 = @intCast(whisper_timestamps.statsId(&stats, whisper_timestamps.stats_choice_token) orelse 0);
             logprob_sum.* += stats[whisper_timestamps.stats_choice_logprob];
+            try self.output_token_budget.consume();
             if (token == self.config.eos_token_id) {
                 // The encoded lookahead, if any, predicted past the end.
                 if (lookahead) decoder.discard();
@@ -770,6 +791,7 @@ pub const TranscriptionPipeline = struct {
                 // Either the length limit or a backend that could not
                 // encode the lookahead; the cache is consistent with
                 // `dec_len` either way.
+                try self.output_token_budget.check();
                 return dec_len.* >= max_len;
             }
             try decoder.submit();
@@ -919,4 +941,10 @@ test "Whisper decoder prompts reject unsorted and out of bounds entries" {
     try std.testing.expectError(error.InvalidWhisperDecoderPrompt, validateForcedDecoderIds(&.{
         .{ .position = 8, .token_id = 10 },
     }, 8));
+}
+
+test "exhausted transcription fails before touching model resources" {
+    var pipeline = TranscriptionPipeline.init(std.testing.allocator, undefined, undefined, undefined, .{ .max_output_tokens = 1 });
+    try pipeline.output_token_budget.consume();
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, pipeline.transcribePcmConditioned(&.{0.1}, 16000, &.{}));
 }

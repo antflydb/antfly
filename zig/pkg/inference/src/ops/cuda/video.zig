@@ -97,6 +97,62 @@ pub const Sampler = struct {
 
 pub const Sampling = enum { presentation_seconds, embedding_gemma2 };
 
+pub const EmbeddingInspection = struct { width: u32, height: u32, frames: usize };
+
+test "embeddinggemma2 video container preflight shares six second sampling and cancellation" {
+    const bytes = @embedFile("../../testdata/video/closed.mp4");
+    const clip = try inspectEmbedding(std.testing.allocator, bytes, .{});
+    try std.testing.expectEqual(@as(usize, 6), clip.frames);
+    try std.testing.expect(clip.width > 0 and clip.height > 0);
+    const Cancel = struct {
+        fn check(_: ?*const anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, inspectEmbedding(std.testing.allocator, bytes, .{ .check_fn = Cancel.check }));
+    if (inspectEmbedding(std.testing.allocator, bytes[0..32], .{})) |_| return error.TestUnexpectedResult else |_| {}
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator, source: []const u8) !void {
+            _ = try inspectEmbedding(a, source, .{});
+        }
+    }.run, .{bytes});
+}
+
+/// Container-only inspection under the caller's host preprocessing permit.
+/// Uses the decoder's validation and sampler, without opening NVDEC.
+pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control) !EmbeddingInspection {
+    if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
+    var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
+    var reader = try media.mp4.Reader.init(allocator, &source, .{ .max_samples = 18_000, .max_dimension = 4096 });
+    defer reader.deinit();
+    try validateTrack(reader.track);
+    const end_us = try validateTimeline(reader.track, reader.packets);
+    const sampler = try embeddingSamplerForReader(&reader, end_us);
+    return .{ .width = reader.track.width, .height = reader.track.height, .frames = sampler.length };
+}
+
+fn validateTrack(track: anytype) !void {
+    if (track.codec != .avc or track.inband_parameter_sets or track.pixel_aspect.horizontal != track.pixel_aspect.vertical or
+        !std.mem.eql(i32, &track.display_matrix, &.{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 })) return error.UnsupportedVideoFormat;
+    _ = try containerColor(track.color_info);
+}
+
+fn embeddingSamplerForReader(reader: *const media.mp4.Reader, end_us: i64) !EmbeddingSampler {
+    const track = reader.track;
+    var frames: usize = 0;
+    var duration_us: i64 = 0;
+    for (reader.packets) |packet| {
+        const pts = try timestampUs(packet.pts, track.timescale);
+        if (pts < 0 or pts >= end_us) continue;
+        frames += 1;
+        const end = std.math.cast(i64, @as(i128, packet.pts) + packet.duration) orelse return error.InvalidVideoTimestamp;
+        duration_us = @max(duration_us, @min(end_us, try timestampUs(end, track.timescale)));
+    }
+    // An empty edit shifts presentation time without adding content samples.
+    const content_duration_us = try embeddingContentDurationUs(track, duration_us);
+    return EmbeddingSampler.init(frames, content_duration_us, end_us);
+}
+
 /// EmbeddingGemma2: floor(duration * 1 FPS) samples, capped uniformly to 32.
 /// Frame indices use the container's average frame rate, as the upstream processor does.
 pub const EmbeddingSampler = struct {
@@ -206,26 +262,12 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     var reader = try media.mp4.Reader.init(allocator, &source, .{ .max_samples = 18_000, .max_dimension = 4096 });
     defer reader.deinit();
     const track = reader.track;
-    if (track.codec != .avc or track.inband_parameter_sets or track.pixel_aspect.horizontal != track.pixel_aspect.vertical or
-        !std.mem.eql(i32, &track.display_matrix, &.{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 })) return error.UnsupportedVideoFormat;
+    try validateTrack(track);
     const color = try containerColor(track.color_info);
     if (reader.packets.len == 0) return error.EmptyVideo;
     state.sampler.end_us = try validateTimeline(track, reader.packets);
     if (sampling == .embedding_gemma2) {
-        var frames: usize = 0;
-        var duration_us: i64 = 0;
-        for (reader.packets) |packet| {
-            const pts = try timestampUs(packet.pts, track.timescale);
-            if (pts < 0 or pts >= state.sampler.end_us) continue;
-            frames += 1;
-            const end = std.math.cast(i64, @as(i128, packet.pts) + packet.duration) orelse return error.InvalidVideoTimestamp;
-            duration_us = @max(duration_us, @min(state.sampler.end_us, try timestampUs(end, track.timescale)));
-        }
-        // PyAV exposes an edit's media duration to the upstream processor. A
-        // leading empty edit shifts presentation timestamps but must not add
-        // samples or change the frame indices selected from the media itself.
-        const content_duration_us = try embeddingContentDurationUs(track, duration_us);
-        state.embedding_sampler = try EmbeddingSampler.init(frames, content_duration_us, state.sampler.end_us);
+        state.embedding_sampler = try embeddingSamplerForReader(&reader, state.sampler.end_us);
     }
     try ctx.makeCurrent();
     if (ctx.video_decoder_cache == null) {
