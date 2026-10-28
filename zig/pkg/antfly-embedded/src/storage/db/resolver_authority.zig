@@ -6854,14 +6854,19 @@ test "resolver curation dependency tail journal deduplicates converging chains a
     for (edges, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/tail-{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/tail-{d}", .{i + 1}) };
     try store.adoptNamespace(.{ .key_template = template, .revision = 1, .merges = edges });
     var loader: Store.InlineQueryProfile = .{ .aliases = &.{} };
-    const prepared = (try store.prepareQuery(template, .{ .id = "", .ptr = &loader, .load = Store.InlineQueryProfile.load }, true)).?;
+    const profile = try hash(a, "converging-source-merge-seek");
+    const prepared = (try store.prepareQuery(template, .{ .id = profile, .ptr = &loader, .load = Store.InlineQueryProfile.load }, true)).?;
     defer prepared.release();
     const journal = try store.pinEditRoot(template);
     try store.backend.put(store.backend.ptr, a, try std.mem.concat(a, u8, &.{ journal, "head" }), try encode(a, Store.PinEditHead{ .graph = prepared.graph_id, .indexed = true, .compact = true, .tails_indexed = true, .routing_indexed = true, .routing_origin = prepared.graph_id }));
     // Repeat every target in many events: one descriptor per target, never one
     // copy per retained slot. Old-slot expiration cannot delete newer owners.
     const targets = try a.alloc([]const u8, 128);
-    for (targets, 0..) |*key, i| key.* = edges[i].key;
+    for (targets, 0..) |*key, i| {
+        key.* = edges[i].key;
+        const projection = try store.pinProjectionRoot(template, profile);
+        try store.backend.put(store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}path/{s}", .{ projection, try hash(a, key.*) }), try encode(a, Store.PinPath{ .key = key.*, .root = "entity/tail-1024" }));
+    }
     for (0..300) |_| try store.appendPinEdit(template, prepared.graph_id, prepared.graph_id, &.{}, targets, targets);
     const prefix = try std.mem.concat(a, u8, &.{ journal, "tails/" });
     const page = try store.backend.scan(store.backend.ptr, a, prefix, null, 256);
