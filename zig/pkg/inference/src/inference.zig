@@ -365,27 +365,26 @@ test "non-device-scalar GQA attention never returns generated decode" {
     ctx.driver.fns.cuLaunchKernel = &Mocks.launchKernel;
 
     const buffer = buffer_mod.DeviceBuffer{ .ptr = 1, .len = 256 * @sizeOf(f32) };
-    const kind = try module.launchGqaAttentionF32(
-        &ctx,
-        buffer,
-        buffer,
-        buffer,
-        buffer,
-        .{},
-        .{},
-        1,
-        1,
-        1,
-        1,
-        1,
-        256,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-    );
+    const kind = try module.launchGqaAttentionF32(&ctx, &.{
+        .dst = buffer,
+        .q = buffer,
+        .k = buffer,
+        .v = buffer,
+        .attn_or_mask = .{},
+        .bias = .{},
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 1,
+        .num_heads = 1,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .query_position_offset = 0,
+        .kv_position_offset = 0,
+        .sliding_window = 0,
+        .total_sequence_len = 1,
+        .mask_len = 0,
+        .bias_mode = 0,
+    });
     try std.testing.expectEqual(kernels_mod.GqaAttentionLaunchKind.decode, kind);
     try std.testing.expect(kind != .decode_generated);
     try std.testing.expectEqual(@as(usize, 1), ctx.stats.kernel_launches);

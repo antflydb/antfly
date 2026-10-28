@@ -972,6 +972,85 @@ fn fastGqaPrefillEligible(profile: GqaPrefillProfile, batch: usize, q_seq_len: u
         gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
 }
 
+/// One checked host request for the existing GQA launch families. Native
+/// signatures still own their wire layout; schedules and physical KV policies
+/// remain at their existing launchers. Nothing retains this request after launch.
+pub const GqaAttentionRequest = struct {
+    const Wire = launch_abi.ArgumentsFor("PAGED_ATTENTION");
+    dst: buffer_mod.DeviceBuffer,
+    q: buffer_mod.DeviceBuffer,
+    k: buffer_mod.DeviceBuffer,
+    v: buffer_mod.DeviceBuffer,
+    attn_or_mask: buffer_mod.DeviceBuffer = .{},
+    bias: buffer_mod.DeviceBuffer = .{},
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    query_position_offset: usize = 0,
+    kv_position_offset: usize = 0,
+    sliding_window: usize = 0,
+    total_sequence_len: usize = 0,
+    mask_len: usize = 0,
+    bias_mode: u32 = 0,
+    decode_scalars: buffer_mod.DeviceBuffer = .{},
+    block_table: buffer_mod.DeviceBuffer = .{},
+    key_row_bytes: usize = 0,
+    base_key_row_bytes: usize = 0,
+    value_row_bytes: usize = 0,
+    block_count: usize = 0,
+    page_size_tokens: usize = 0,
+    format: u32 = 0,
+    value_format: u32 = 0,
+    physical_token_capacity: usize = 0,
+
+    inline fn wire(self: *const @This(), comptime omit_mask: bool) driver_mod.Error!Wire {
+        const Args = Wire;
+        var result: Args = undefined;
+        inline for (@typeInfo(Args).@"struct".field_names) |name| {
+            if (omit_mask and (comptime std.mem.eql(u8, name, "attn_or_mask") or std.mem.eql(u8, name, "bias") or std.mem.eql(u8, name, "mask_len") or std.mem.eql(u8, name, "bias_mode"))) {
+                @field(result, name) = 0;
+                continue;
+            }
+            const value = @field(self.*, name);
+            @field(result, name) = if (@TypeOf(value) == buffer_mod.DeviceBuffer) value.ptr else if (@TypeOf(value) == usize) try toU32(value) else value;
+        }
+        return result;
+    }
+
+    inline fn eligibility(self: *const @This(), comptime T: type) T {
+        var result: T = undefined;
+        inline for (@typeInfo(T).@"struct".field_names) |name| {
+            @field(result, name) = if (comptime std.mem.eql(u8, name, "block_table_present")) self.block_table.ptr != 0 else if (comptime std.mem.eql(u8, name, "decode_scalars_present")) self.decode_scalars.ptr != 0 else @field(self.*, name);
+        }
+        return result;
+    }
+
+    inline fn preflight(self: *const @This(), comptime storage: enum { dense, scalars, paged }) driver_mod.Error!usize {
+        const q_hidden = try checkedTensorElements(self.num_heads, self.head_dim);
+        const kv_hidden = if (storage != .paged) try checkedTensorElements(self.num_kv_heads, self.head_dim) else 0;
+        const q_count = try checkedTensorElements(try checkedTensorElements(self.batch, self.q_seq_len), q_hidden);
+        const kv_count = if (storage != .paged) try checkedTensorElements(try checkedTensorElements(self.batch, self.kv_seq_len), kv_hidden) else 0;
+        try checkBytes(self.dst, q_count);
+        try checkBytes(self.q, q_count);
+        if (storage == .paged) {
+            try checkRawBytes(self.k, try checkedTensorElements(self.physical_token_capacity, self.key_row_bytes));
+            try checkRawBytes(self.v, try checkedTensorElements(self.physical_token_capacity, self.value_row_bytes));
+            if (self.block_count != 0) try checkRawBytes(self.block_table, try checkedTensorElements(self.block_count, @sizeOf(u32)));
+        } else {
+            try checkBytes(self.k, kv_count);
+            try checkBytes(self.v, kv_count);
+        }
+        if (storage == .scalars) try checkRawBytes(self.decode_scalars, 5 * @sizeOf(u32));
+        if (self.mask_len != 0) try checkRawBytes(self.attn_or_mask, self.mask_len);
+        if (self.bias_mode != 0) try checkBytes(self.bias, try checkedTensorElements(if (self.bias_mode == 2) self.batch * self.num_heads else self.num_heads, try checkedTensorElements(self.q_seq_len, self.kv_seq_len)));
+        if (storage == .paged and self.decode_scalars.ptr != 0) try checkRawBytes(self.decode_scalars, 5 * @sizeOf(u32));
+        return q_count;
+    }
+};
+
 pub const GqaAttentionLaunchKind = enum {
     none,
     decode,
@@ -7985,56 +8064,38 @@ pub const KernelModule = struct {
     fn launchGeneratedGqaAttentionDecodeF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
-        dst: buffer_mod.DeviceBuffer,
-        q: buffer_mod.DeviceBuffer,
-        k: buffer_mod.DeviceBuffer,
-        v: buffer_mod.DeviceBuffer,
-        attn_or_mask: buffer_mod.DeviceBuffer,
-        bias: buffer_mod.DeviceBuffer,
-        decode_scalars_ptr_value: driver_mod.CUdeviceptr,
-        batch: usize,
-        q_seq_len: usize,
-        kv_seq_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        query_position_offset: usize,
-        kv_position_offset: usize,
-        sliding_window: usize,
-        total_sequence_len: usize,
-        mask_len: usize,
-        bias_mode: u32,
+        r: *const GqaAttentionRequest,
     ) driver_mod.Error!void {
-        const schedule = generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len);
+        const schedule = generatedGqaDecodeScheduleForKvSeqLen(r.kv_seq_len);
         if (schedule == .none) return error.InvalidCudaState;
         // Serial remains on the established bit-exact entry point. The explicit
         // split schedule only changes the two-stage launch topology and its
         // workspace layout, which is part of the graph-replay identity.
         const plan = switch (schedule) {
-            .serial, .split8 => switch (head_dim) {
+            .serial, .split8 => switch (r.head_dim) {
                 256 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split_kv_hd256_f32),
                 512 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split_kv_hd512_f32),
                 else => return error.InvalidCudaState,
             },
-            .split2 => switch (head_dim) {
+            .split2 => switch (r.head_dim) {
                 256 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split2_kv_hd256_f32),
                 512 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split2_kv_hd512_f32),
                 else => return error.InvalidCudaState,
             },
-            .split4 => switch (head_dim) {
+            .split4 => switch (r.head_dim) {
                 256 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split4_kv_hd256_f32),
                 512 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split4_kv_hd512_f32),
                 else => return error.InvalidCudaState,
             },
             .none => unreachable,
         };
-        const serial_function = switch (head_dim) {
+        const serial_function = switch (r.head_dim) {
             256 => self.gqa_attention_decode_scalars_generated_hd256_f32,
             512 => self.gqa_attention_decode_scalars_generated_hd512_f32,
             else => unreachable,
         };
         const stage1_function, const stage2_function = switch (schedule) {
-            .serial, .split8 => switch (head_dim) {
+            .serial, .split8 => switch (r.head_dim) {
                 256 => .{
                     self.gqa_attention_decode_split_kv_hd256_stage1_f32,
                     self.gqa_attention_decode_split_kv_hd256_stage2_f32,
@@ -8045,7 +8106,7 @@ pub const KernelModule = struct {
                 },
                 else => unreachable,
             },
-            .split2 => switch (head_dim) {
+            .split2 => switch (r.head_dim) {
                 256 => .{
                     self.gqa_attention_decode_split2_kv_hd256_stage1_f32,
                     self.gqa_attention_decode_split2_kv_hd256_stage2_f32,
@@ -8056,7 +8117,7 @@ pub const KernelModule = struct {
                 },
                 else => unreachable,
             },
-            .split4 => switch (head_dim) {
+            .split4 => switch (r.head_dim) {
                 256 => .{
                     self.gqa_attention_decode_split4_kv_hd256_stage1_f32,
                     self.gqa_attention_decode_split4_kv_hd256_stage2_f32,
@@ -8069,53 +8130,35 @@ pub const KernelModule = struct {
             },
             .none => unreachable,
         };
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var mask_ptr = attn_or_mask.ptr;
-        var bias_ptr = bias.ptr;
-        var decode_scalars_ptr = decode_scalars_ptr_value;
-        var batch_u32 = try toU32(batch);
-        var q_seq_len_u32 = try toU32(q_seq_len);
-        var kv_seq_len_u32 = try toU32(kv_seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var num_kv_heads_u32 = try toU32(num_kv_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var query_position_offset_u32 = try toU32(query_position_offset);
-        var kv_position_offset_u32 = try toU32(kv_position_offset);
-        var sliding_window_u32 = try toU32(sliding_window);
-        var total_sequence_len_u32 = try toU32(total_sequence_len);
-        var mask_len_u32 = try toU32(mask_len);
-        var bias_mode_u32 = bias_mode;
+        var arguments = try r.wire(false);
         var split_kv_min_tokens_u32 = generatedGqaDecodeSplitKvMinTokens();
 
-        const serial_grid = try toU32(try checkedTensorElements(batch, num_heads));
+        const serial_grid = try toU32(try checkedTensorElements(r.batch, r.num_heads));
         try ctx.makeCurrent();
         switch (schedule) {
             .serial => {
                 const function = serial_function orelse return error.CudaKernelUnavailable;
                 var serial_params = [_]?*anyopaque{
-                    @ptrCast(&dst_ptr),
-                    @ptrCast(&q_ptr),
-                    @ptrCast(&k_ptr),
-                    @ptrCast(&v_ptr),
-                    @ptrCast(&mask_ptr),
-                    @ptrCast(&bias_ptr),
-                    @ptrCast(&batch_u32),
-                    @ptrCast(&q_seq_len_u32),
-                    @ptrCast(&kv_seq_len_u32),
-                    @ptrCast(&num_heads_u32),
-                    @ptrCast(&num_kv_heads_u32),
-                    @ptrCast(&head_dim_u32),
-                    @ptrCast(&query_position_offset_u32),
-                    @ptrCast(&kv_position_offset_u32),
-                    @ptrCast(&sliding_window_u32),
-                    @ptrCast(&total_sequence_len_u32),
-                    @ptrCast(&mask_len_u32),
-                    @ptrCast(&bias_mode_u32),
+                    @ptrCast(&arguments.dst),
+                    @ptrCast(&arguments.q),
+                    @ptrCast(&arguments.k),
+                    @ptrCast(&arguments.v),
+                    @ptrCast(&arguments.attn_or_mask),
+                    @ptrCast(&arguments.bias),
+                    @ptrCast(&arguments.batch),
+                    @ptrCast(&arguments.q_seq_len),
+                    @ptrCast(&arguments.kv_seq_len),
+                    @ptrCast(&arguments.num_heads),
+                    @ptrCast(&arguments.num_kv_heads),
+                    @ptrCast(&arguments.head_dim),
+                    @ptrCast(&arguments.query_position_offset),
+                    @ptrCast(&arguments.kv_position_offset),
+                    @ptrCast(&arguments.sliding_window),
+                    @ptrCast(&arguments.total_sequence_len),
+                    @ptrCast(&arguments.mask_len),
+                    @ptrCast(&arguments.bias_mode),
                     @ptrCast(&split_kv_min_tokens_u32),
-                    @ptrCast(&decode_scalars_ptr),
+                    @ptrCast(&arguments.decode_scalars),
                 };
                 try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
                     function,
@@ -8146,40 +8189,40 @@ pub const KernelModule = struct {
                     @ptrCast(&partial_values_ptr),
                     @ptrCast(&partial_max_ptr),
                     @ptrCast(&partial_denom_ptr),
-                    @ptrCast(&q_ptr),
-                    @ptrCast(&k_ptr),
-                    @ptrCast(&v_ptr),
-                    @ptrCast(&mask_ptr),
-                    @ptrCast(&bias_ptr),
-                    @ptrCast(&batch_u32),
-                    @ptrCast(&q_seq_len_u32),
-                    @ptrCast(&kv_seq_len_u32),
-                    @ptrCast(&num_heads_u32),
-                    @ptrCast(&num_kv_heads_u32),
-                    @ptrCast(&head_dim_u32),
-                    @ptrCast(&query_position_offset_u32),
-                    @ptrCast(&kv_position_offset_u32),
-                    @ptrCast(&sliding_window_u32),
-                    @ptrCast(&total_sequence_len_u32),
-                    @ptrCast(&mask_len_u32),
-                    @ptrCast(&bias_mode_u32),
+                    @ptrCast(&arguments.q),
+                    @ptrCast(&arguments.k),
+                    @ptrCast(&arguments.v),
+                    @ptrCast(&arguments.attn_or_mask),
+                    @ptrCast(&arguments.bias),
+                    @ptrCast(&arguments.batch),
+                    @ptrCast(&arguments.q_seq_len),
+                    @ptrCast(&arguments.kv_seq_len),
+                    @ptrCast(&arguments.num_heads),
+                    @ptrCast(&arguments.num_kv_heads),
+                    @ptrCast(&arguments.head_dim),
+                    @ptrCast(&arguments.query_position_offset),
+                    @ptrCast(&arguments.kv_position_offset),
+                    @ptrCast(&arguments.sliding_window),
+                    @ptrCast(&arguments.total_sequence_len),
+                    @ptrCast(&arguments.mask_len),
+                    @ptrCast(&arguments.bias_mode),
                     @ptrCast(&split_kv_min_tokens_u32),
-                    @ptrCast(&decode_scalars_ptr),
+                    @ptrCast(&arguments.decode_scalars),
                 };
                 var stage2_params = [_]?*anyopaque{
-                    @ptrCast(&dst_ptr),
+                    @ptrCast(&arguments.dst),
                     @ptrCast(&partial_values_ptr),
                     @ptrCast(&partial_max_ptr),
                     @ptrCast(&partial_denom_ptr),
-                    @ptrCast(&batch_u32),
-                    @ptrCast(&num_heads_u32),
-                    @ptrCast(&head_dim_u32),
-                    @ptrCast(&kv_seq_len_u32),
+                    @ptrCast(&arguments.batch),
+                    @ptrCast(&arguments.num_heads),
+                    @ptrCast(&arguments.head_dim),
+                    @ptrCast(&arguments.kv_seq_len),
                     @ptrCast(&split_kv_min_tokens_u32),
-                    @ptrCast(&decode_scalars_ptr),
+                    @ptrCast(&arguments.decode_scalars),
                 };
                 const stage1_grid = try toU32(try checkedTensorElements(
-                    try checkedTensorElements(batch, num_heads),
+                    try checkedTensorElements(r.batch, r.num_heads),
                     plan.lowering.kv_splits,
                 ));
                 try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
@@ -8391,79 +8434,36 @@ pub const KernelModule = struct {
     pub fn launchGqaAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
-        dst: buffer_mod.DeviceBuffer,
-        q: buffer_mod.DeviceBuffer,
-        k: buffer_mod.DeviceBuffer,
-        v: buffer_mod.DeviceBuffer,
-        attn_or_mask: buffer_mod.DeviceBuffer,
-        bias: buffer_mod.DeviceBuffer,
-        batch: usize,
-        q_seq_len: usize,
-        kv_seq_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        query_position_offset: usize,
-        kv_position_offset: usize,
-        sliding_window: usize,
-        total_sequence_len: usize,
-        mask_len: usize,
-        bias_mode: u32,
+        r: *const GqaAttentionRequest,
     ) driver_mod.Error!GqaAttentionLaunchKind {
         const scalar_function = self.gqa_attention_f32 orelse return error.CudaKernelUnavailable;
-        const q_hidden = try checkedTensorElements(num_heads, head_dim);
-        const kv_hidden = try checkedTensorElements(num_kv_heads, head_dim);
-        const q_count = try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), q_hidden);
-        const kv_count = try checkedTensorElements(try checkedTensorElements(batch, kv_seq_len), kv_hidden);
-        try checkBytes(dst, q_count);
-        try checkBytes(q, q_count);
-        try checkBytes(k, kv_count);
-        try checkBytes(v, kv_count);
-        if (mask_len != 0) try checkRawBytes(attn_or_mask, mask_len);
-        if (bias_mode != 0) try checkBytes(bias, try checkedTensorElements(if (bias_mode == 2) batch * num_heads else num_heads, try checkedTensorElements(q_seq_len, kv_seq_len)));
+        const q_count = try r.preflight(.dense);
         if (q_count == 0) return .none;
 
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var mask_ptr = attn_or_mask.ptr;
-        var bias_ptr = bias.ptr;
-        var batch_u32 = try toU32(batch);
-        var q_seq_len_u32 = try toU32(q_seq_len);
-        var kv_seq_len_u32 = try toU32(kv_seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var num_kv_heads_u32 = try toU32(num_kv_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var query_position_offset_u32 = try toU32(query_position_offset);
-        var kv_position_offset_u32 = try toU32(kv_position_offset);
-        var sliding_window_u32 = try toU32(sliding_window);
-        var total_sequence_len_u32 = try toU32(total_sequence_len);
-        var mask_len_u32 = try toU32(mask_len);
-        var bias_mode_u32 = bias_mode;
-        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &mask_ptr, &bias_ptr, &batch_u32, &q_seq_len_u32, &kv_seq_len_u32, &num_heads_u32, &num_kv_heads_u32, &head_dim_u32, &query_position_offset_u32, &kv_position_offset_u32, &sliding_window_u32, &total_sequence_len_u32, &mask_len_u32, &bias_mode_u32 });
+        var arguments = try r.wire(false);
+        var params = launch_abi.addresses(.{ &arguments.dst, &arguments.q, &arguments.k, &arguments.v, &arguments.attn_or_mask, &arguments.bias, &arguments.batch, &arguments.q_seq_len, &arguments.kv_seq_len, &arguments.num_heads, &arguments.num_kv_heads, &arguments.head_dim, &arguments.query_position_offset, &arguments.kv_position_offset, &arguments.sliding_window, &arguments.total_sequence_len, &arguments.mask_len, &arguments.bias_mode });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention dst=0x{x} q=0x{x} k=0x{x} v=0x{x} mask=0x{x} bias=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} query_position_offset={d} kv_position_offset={d} sliding_window={d} total_sequence_len={d} mask_len={d} bias_mode={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
-                dst_ptr,
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                mask_ptr,
-                bias_ptr,
-                batch_u32,
-                q_seq_len_u32,
-                kv_seq_len_u32,
-                num_heads_u32,
-                num_kv_heads_u32,
-                head_dim_u32,
-                query_position_offset_u32,
-                kv_position_offset_u32,
-                sliding_window_u32,
-                total_sequence_len_u32,
-                mask_len_u32,
-                bias_mode_u32,
+                arguments.dst,
+                arguments.q,
+                arguments.k,
+                arguments.v,
+                arguments.attn_or_mask,
+                arguments.bias,
+                arguments.batch,
+                arguments.q_seq_len,
+                arguments.kv_seq_len,
+                arguments.num_heads,
+                arguments.num_kv_heads,
+                arguments.head_dim,
+                arguments.query_position_offset,
+                arguments.kv_position_offset,
+                arguments.sliding_window,
+                arguments.total_sequence_len,
+                arguments.mask_len,
+                arguments.bias_mode,
             });
         }
         // Generated decode consumes device-resident scalar parameters and is
@@ -8471,10 +8471,10 @@ pub const KernelModule = struct {
         // This host-scalar entry point must keep its normal decode topology.
         if (self.gqa_attention_prefill_fast_f32) |prefill_function| {
             if ((self.gqa_prefill_profile != .automatic or self.qwen3vl_automatic_prefill) and
-                fastGqaPrefillEligible(self.gqa_prefill_profile, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+                fastGqaPrefillEligible(self.gqa_prefill_profile, r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim, r.mask_len, r.bias_mode))
             {
-                const block: c_uint = if (head_dim <= 256) 256 else 512;
-                const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+                const block: c_uint = if (r.head_dim <= 256) 256 else 512;
+                const grid = try toU32(try checkedTensorElements(try checkedTensorElements(r.batch, r.q_seq_len), r.num_heads));
                 try ctx.makeCurrent();
                 try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
                     prefill_function,
@@ -8490,20 +8490,20 @@ pub const KernelModule = struct {
                     null,
                 ));
                 ctx.noteKernelLaunch();
-                self.noteGqaPrefillRouteActive(.prefill_fast, batch, q_seq_len, num_heads, num_kv_heads, head_dim);
+                self.noteGqaPrefillRouteActive(.prefill_fast, r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim);
                 return .prefill_fast;
             }
         }
-        if (self.gqa_prefill_profile.failClosed() and q_seq_len > 1) {
+        if (self.gqa_prefill_profile.failClosed() and r.q_seq_len > 1) {
             const reason: []const u8 = switch (self.gqa_prefill_profile) {
                 .required_tiled_f16_exact => "tiled-f16-exact-paged-f16-route-required",
                 .required_tiled_f16_warp => "tiled-f16-warp-paged-f16-route-required",
-                else => if (!gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+                else => if (!gqaPrefillShapeEligible(r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim, r.mask_len, r.bias_mode))
                     "shape-ineligible"
                 else
                     "kernel-unavailable",
             };
-            self.noteRequiredGqaPrefillRejected(reason, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
+            self.noteRequiredGqaPrefillRejected(reason, r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim, r.mask_len, r.bias_mode);
             return error.CudaKernelUnavailable;
         }
         if (self.gqa_attention_decode_f32) |decode_function| {
@@ -8511,9 +8511,9 @@ pub const KernelModule = struct {
             // one-item ABI. Batched or multi-token shapes must reach the
             // general scalar kernel below; the decode kernel rejects those
             // shapes device-side without writing `dst`.
-            if (fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
-                const block: c_uint = if (head_dim <= 256) 256 else 512;
-                const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+            if (fastGqaDecodeEligible(r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim, r.mask_len, r.bias_mode)) {
+                const block: c_uint = if (r.head_dim <= 256) 256 else 512;
+                const grid = try toU32(try checkedTensorElements(try checkedTensorElements(r.batch, r.q_seq_len), r.num_heads));
                 try ctx.makeCurrent();
                 try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
                     decode_function,
@@ -8540,104 +8540,37 @@ pub const KernelModule = struct {
     pub fn launchGqaAttentionDecodeScalarsF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
-        dst: buffer_mod.DeviceBuffer,
-        q: buffer_mod.DeviceBuffer,
-        k: buffer_mod.DeviceBuffer,
-        v: buffer_mod.DeviceBuffer,
-        attn_or_mask: buffer_mod.DeviceBuffer,
-        bias: buffer_mod.DeviceBuffer,
-        decode_scalars: buffer_mod.DeviceBuffer,
-        batch: usize,
-        q_seq_len: usize,
-        kv_seq_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        query_position_offset: usize,
-        kv_position_offset: usize,
-        sliding_window: usize,
-        total_sequence_len: usize,
-        mask_len: usize,
-        bias_mode: u32,
+        r: *const GqaAttentionRequest,
     ) driver_mod.Error!GqaAttentionLaunchKind {
         const fallback_function = self.gqa_attention_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
-        if (head_dim > 512) return error.CudaKernelUnavailable;
-        const q_hidden = try checkedTensorElements(num_heads, head_dim);
-        const kv_hidden = try checkedTensorElements(num_kv_heads, head_dim);
-        const q_count = try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), q_hidden);
-        const kv_count = try checkedTensorElements(try checkedTensorElements(batch, kv_seq_len), kv_hidden);
-        try checkBytes(dst, q_count);
-        try checkBytes(q, q_count);
-        try checkBytes(k, kv_count);
-        try checkBytes(v, kv_count);
-        try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
-        if (mask_len != 0) try checkRawBytes(attn_or_mask, mask_len);
-        if (bias_mode != 0) try checkBytes(bias, try checkedTensorElements(if (bias_mode == 2) batch * num_heads else num_heads, try checkedTensorElements(q_seq_len, kv_seq_len)));
+        if (r.head_dim > 512) return error.CudaKernelUnavailable;
+        const q_count = try r.preflight(.scalars);
         if (q_count == 0) return .none;
 
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var mask_ptr = attn_or_mask.ptr;
-        var bias_ptr = bias.ptr;
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var batch_u32 = try toU32(batch);
-        var q_seq_len_u32 = try toU32(q_seq_len);
-        var kv_seq_len_u32 = try toU32(kv_seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var num_kv_heads_u32 = try toU32(num_kv_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var query_position_offset_u32 = try toU32(query_position_offset);
-        var kv_position_offset_u32 = try toU32(kv_position_offset);
-        var sliding_window_u32 = try toU32(sliding_window);
-        var total_sequence_len_u32 = try toU32(total_sequence_len);
-        var mask_len_u32 = try toU32(mask_len);
-        var bias_mode_u32 = bias_mode;
-        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &mask_ptr, &bias_ptr, &batch_u32, &q_seq_len_u32, &kv_seq_len_u32, &num_heads_u32, &num_kv_heads_u32, &head_dim_u32, &query_position_offset_u32, &kv_position_offset_u32, &sliding_window_u32, &total_sequence_len_u32, &mask_len_u32, &bias_mode_u32, &decode_scalars_ptr });
-        if (generatedGqaDecodeEnabled() and mask_len == 0 and bias_mode == 0 and generatedGqaDecodeShapeEligible(batch, q_seq_len, head_dim, num_heads, num_kv_heads)) {
-            const generated_schedule = generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len);
+        var arguments = try r.wire(false);
+        var params = launch_abi.addresses(.{ &arguments.dst, &arguments.q, &arguments.k, &arguments.v, &arguments.attn_or_mask, &arguments.bias, &arguments.batch, &arguments.q_seq_len, &arguments.kv_seq_len, &arguments.num_heads, &arguments.num_kv_heads, &arguments.head_dim, &arguments.query_position_offset, &arguments.kv_position_offset, &arguments.sliding_window, &arguments.total_sequence_len, &arguments.mask_len, &arguments.bias_mode, &arguments.decode_scalars });
+        if (generatedGqaDecodeEnabled() and r.mask_len == 0 and r.bias_mode == 0 and generatedGqaDecodeShapeEligible(r.batch, r.q_seq_len, r.head_dim, r.num_heads, r.num_kv_heads)) {
+            const generated_schedule = generatedGqaDecodeScheduleForKvSeqLen(r.kv_seq_len);
             if (captureParamTraceIndex(ctx)) |trace_index| {
                 std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_generated_{s}_hd{d} dst=0x{x} q=0x{x} k=0x{x} v=0x{x} scalars=0x{x} split_kv_min_tokens={d}", .{
                     ctx.debug_graph_capture_id,
                     trace_index,
                     @tagName(generated_schedule),
-                    head_dim,
-                    dst_ptr,
-                    q_ptr,
-                    k_ptr,
-                    v_ptr,
-                    decode_scalars_ptr,
+                    r.head_dim,
+                    arguments.dst,
+                    arguments.q,
+                    arguments.k,
+                    arguments.v,
+                    arguments.decode_scalars,
                     generatedGqaDecodeSplitKvMinTokens(),
                 });
             }
-            try self.launchGeneratedGqaAttentionDecodeF32(
-                ctx,
-                dst,
-                q,
-                k,
-                v,
-                attn_or_mask,
-                bias,
-                decode_scalars.ptr,
-                batch,
-                q_seq_len,
-                kv_seq_len,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                query_position_offset,
-                kv_position_offset,
-                sliding_window,
-                total_sequence_len,
-                mask_len,
-                bias_mode,
-            );
+            try self.launchGeneratedGqaAttentionDecodeF32(ctx, r);
             return .decode_generated;
         }
         var function = fallback_function;
         var launch_kind: GqaAttentionLaunchKind = .decode;
-        if (fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
+        if (fastGqaDecodeEligible(r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim, r.mask_len, r.bias_mode)) {
             launch_kind = .decode_fast_fallback;
             if (!fastGqaDecodeDisabled()) {
                 if (self.gqa_attention_decode_scalars_fast_f32) |fast_function| {
@@ -8656,18 +8589,18 @@ pub const KernelModule = struct {
                 ctx.debug_graph_capture_id,
                 trace_index,
                 kernel_name,
-                dst_ptr,
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                decode_scalars_ptr,
-                query_position_offset_u32,
-                kv_seq_len_u32,
-                total_sequence_len_u32,
+                arguments.dst,
+                arguments.q,
+                arguments.k,
+                arguments.v,
+                arguments.decode_scalars,
+                arguments.query_position_offset,
+                arguments.kv_seq_len,
+                arguments.total_sequence_len,
             });
         }
-        const block: c_uint = if (head_dim <= 256) 256 else 512;
-        const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+        const block: c_uint = if (r.head_dim <= 256) 256 else 512;
+        const grid = try toU32(try checkedTensorElements(try checkedTensorElements(r.batch, r.q_seq_len), r.num_heads));
         try ctx.makeCurrent();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
             function,
@@ -8816,113 +8749,44 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, work_items, &params);
     }
 
-    inline fn pagedDecodeArguments(
-        request: anytype,
-        dst: buffer_mod.DeviceBuffer,
-        q: buffer_mod.DeviceBuffer,
-        k: buffer_mod.DeviceBuffer,
-        v: buffer_mod.DeviceBuffer,
-        block_table: buffer_mod.DeviceBuffer,
-        decode_scalars: buffer_mod.DeviceBuffer,
-        query_position_offset: usize,
-        kv_position_offset: usize,
-        total_sequence_len: usize,
-    ) driver_mod.Error!launch_abi.ArgumentsFor("PAGED_ATTENTION") {
-        return .{
-            .dst = dst.ptr,
-            .q = q.ptr,
-            .k = k.ptr,
-            .v = v.ptr,
-            .block_table = block_table.ptr,
-            .attn_or_mask = 0,
-            .bias = 0,
-            .batch = try toU32(request.batch),
-            .q_seq_len = try toU32(request.q_seq_len),
-            .kv_seq_len = try toU32(request.kv_seq_len),
-            .num_heads = try toU32(request.num_heads),
-            .num_kv_heads = try toU32(request.num_kv_heads),
-            .head_dim = try toU32(request.head_dim),
-            .query_position_offset = try toU32(query_position_offset),
-            .kv_position_offset = try toU32(kv_position_offset),
-            .sliding_window = try toU32(request.sliding_window),
-            .total_sequence_len = try toU32(total_sequence_len),
-            .key_row_bytes = try toU32(request.key_row_bytes),
-            .base_key_row_bytes = try toU32(request.base_key_row_bytes),
-            .value_row_bytes = try toU32(request.value_row_bytes),
-            .block_count = try toU32(request.block_count),
-            .page_size_tokens = try toU32(request.page_size_tokens),
-            .format = request.format,
-            .value_format = request.value_format,
-            .physical_token_capacity = try toU32(request.physical_token_capacity),
-            .mask_len = 0,
-            .bias_mode = 0,
-            .decode_scalars = decode_scalars.ptr,
-        };
-    }
-
     fn launchGqaAttentionDecodeSplitkOnlineSm89F32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
-        dst: buffer_mod.DeviceBuffer,
-        q: buffer_mod.DeviceBuffer,
-        k: buffer_mod.DeviceBuffer,
-        v: buffer_mod.DeviceBuffer,
-        block_table: buffer_mod.DeviceBuffer,
-        batch: usize,
-        q_seq_len: usize,
-        kv_seq_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        query_position_offset: usize,
-        kv_position_offset: usize,
-        sliding_window: usize,
-        total_sequence_len: usize,
-        mask_len: usize,
-        bias_mode: u32,
-        key_row_bytes: usize,
-        base_key_row_bytes: usize,
-        value_row_bytes: usize,
-        block_count: usize,
-        page_size_tokens: usize,
-        format: u32,
-        value_format: u32,
-        physical_token_capacity: usize,
-        decode_scalars: buffer_mod.DeviceBuffer,
+        r: *const GqaAttentionRequest,
     ) driver_mod.Error!?GqaAttentionLaunchKind {
-        if (!self.gqa_decode_profile.selectsSplitkOnlineSm89() or q_seq_len != 1) return null;
+        if (!self.gqa_decode_profile.selectsSplitkOnlineSm89() or r.q_seq_len != 1) return null;
         const layout = cuda_kernel_renderer.generatedSplitkOnlineDecodeWorkspaceLayout();
         const workspace_available = self.gqa_attention_decode_splitk_online_workspace.ptr != 0 and
             self.gqa_attention_decode_splitk_online_workspace.len >= layout.total_bytes;
         const request = GqaSplitkOnlineDecodeRequest{
             .compute_major = ctx.info.compute_major,
             .compute_minor = ctx.info.compute_minor,
-            .batch = batch,
-            .q_seq_len = q_seq_len,
-            .kv_seq_len = kv_seq_len,
-            .num_heads = num_heads,
-            .num_kv_heads = num_kv_heads,
-            .head_dim = head_dim,
-            .query_position_offset = query_position_offset,
-            .kv_position_offset = kv_position_offset,
-            .sliding_window = sliding_window,
-            .total_sequence_len = total_sequence_len,
-            .mask_len = mask_len,
-            .bias_mode = bias_mode,
-            .key_row_bytes = key_row_bytes,
-            .base_key_row_bytes = base_key_row_bytes,
-            .value_row_bytes = value_row_bytes,
-            .block_count = block_count,
-            .page_size_tokens = page_size_tokens,
-            .format = format,
-            .value_format = value_format,
-            .physical_token_capacity = physical_token_capacity,
-            .block_table_present = block_table.ptr != 0,
-            .decode_scalars_present = decode_scalars.ptr != 0,
+            .batch = r.batch,
+            .q_seq_len = r.q_seq_len,
+            .kv_seq_len = r.kv_seq_len,
+            .num_heads = r.num_heads,
+            .num_kv_heads = r.num_kv_heads,
+            .head_dim = r.head_dim,
+            .query_position_offset = r.query_position_offset,
+            .kv_position_offset = r.kv_position_offset,
+            .sliding_window = r.sliding_window,
+            .total_sequence_len = r.total_sequence_len,
+            .mask_len = r.mask_len,
+            .bias_mode = r.bias_mode,
+            .key_row_bytes = r.key_row_bytes,
+            .base_key_row_bytes = r.base_key_row_bytes,
+            .value_row_bytes = r.value_row_bytes,
+            .block_count = r.block_count,
+            .page_size_tokens = r.page_size_tokens,
+            .format = r.format,
+            .value_format = r.value_format,
+            .physical_token_capacity = r.physical_token_capacity,
+            .block_table_present = r.block_table.ptr != 0,
+            .decode_scalars_present = r.decode_scalars.ptr != 0,
             .workspace_available = workspace_available,
         };
         const eligibility = gqaSplitkOnlineDecodeEligibility(request);
-        const function = switch (head_dim) {
+        const function = switch (r.head_dim) {
             256 => self.gqa_attention_decode_splitk_online_sm89_hd256_f32,
             512 => self.gqa_attention_decode_splitk_online_sm89_hd512_f32,
             else => null,
@@ -8948,8 +8812,8 @@ pub const KernelModule = struct {
         var partial_values_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.partial_values_offset;
         var partial_max_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.partial_max_offset;
         var partial_denom_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.partial_denom_offset;
-        var arguments = try pagedDecodeArguments(request, dst, q, k, v, block_table, decode_scalars, query_position_offset, kv_position_offset, total_sequence_len);
-        var score_capacity_u32 = try toU32(if (head_dim == 256)
+        var arguments = try r.wire(true);
+        var score_capacity_u32 = try toU32(if (r.head_dim == 256)
             cuda_kernel_renderer.generated_splitk_online_decode_hd256_max_visible_tokens
         else
             cuda_kernel_renderer.generated_splitk_online_decode_hd512_max_visible_tokens);
@@ -8985,7 +8849,7 @@ pub const KernelModule = struct {
         }
         try ctx.makeCurrent();
         const grid_x = try toU32(try checkedTensorElements(
-            num_heads,
+            r.num_heads,
             cuda_kernel_renderer.generated_splitk_online_decode_splits,
         ));
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
@@ -9017,77 +8881,13 @@ pub const KernelModule = struct {
     pub fn launchGqaAttentionDecodeTurboquantF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
-        dst: buffer_mod.DeviceBuffer,
-        q: buffer_mod.DeviceBuffer,
-        k: buffer_mod.DeviceBuffer,
-        v: buffer_mod.DeviceBuffer,
-        block_table: buffer_mod.DeviceBuffer,
-        attn_or_mask: buffer_mod.DeviceBuffer,
-        bias: buffer_mod.DeviceBuffer,
-        batch: usize,
-        q_seq_len: usize,
-        kv_seq_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        query_position_offset: usize,
-        kv_position_offset: usize,
-        sliding_window: usize,
-        total_sequence_len: usize,
-        mask_len: usize,
-        bias_mode: u32,
-        key_row_bytes: usize,
-        base_key_row_bytes: usize,
-        value_row_bytes: usize,
-        block_count: usize,
-        page_size_tokens: usize,
-        format: u32,
-        value_format: u32,
-        physical_token_capacity: usize,
-        decode_scalars: buffer_mod.DeviceBuffer,
+        r: *const GqaAttentionRequest,
     ) anyerror!GqaAttentionLaunchResult {
-        if (head_dim > 512 or key_row_bytes == 0 or base_key_row_bytes == 0 or value_row_bytes == 0 or base_key_row_bytes > key_row_bytes) return error.CudaKernelUnavailable;
-        const q_hidden = try checkedTensorElements(num_heads, head_dim);
-        const q_count = try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), q_hidden);
-        try checkBytes(dst, q_count);
-        try checkBytes(q, q_count);
-        try checkRawBytes(k, try checkedTensorElements(physical_token_capacity, key_row_bytes));
-        try checkRawBytes(v, try checkedTensorElements(physical_token_capacity, value_row_bytes));
-        if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
-        if (mask_len != 0) try checkRawBytes(attn_or_mask, mask_len);
-        if (bias_mode != 0) try checkBytes(bias, try checkedTensorElements(if (bias_mode == 2) batch * num_heads else num_heads, try checkedTensorElements(q_seq_len, kv_seq_len)));
-        if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
+        if (r.head_dim > 512 or r.key_row_bytes == 0 or r.base_key_row_bytes == 0 or r.value_row_bytes == 0 or r.base_key_row_bytes > r.key_row_bytes) return error.CudaKernelUnavailable;
+        const q_count = try r.preflight(.paged);
         if (q_count == 0) return .{ .kind = .none };
 
-        const splitk_online_launch = try self.launchGqaAttentionDecodeSplitkOnlineSm89F32(
-            ctx,
-            dst,
-            q,
-            k,
-            v,
-            block_table,
-            batch,
-            q_seq_len,
-            kv_seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            query_position_offset,
-            kv_position_offset,
-            sliding_window,
-            total_sequence_len,
-            mask_len,
-            bias_mode,
-            key_row_bytes,
-            base_key_row_bytes,
-            value_row_bytes,
-            block_count,
-            page_size_tokens,
-            format,
-            value_format,
-            physical_token_capacity,
-            decode_scalars,
-        );
+        const splitk_online_launch = try self.launchGqaAttentionDecodeSplitkOnlineSm89F32(ctx, r);
         if (splitk_online_launch == .decode_splitk_online_sm89) {
             return .{ .kind = .decode_splitk_online_sm89 };
         }
@@ -9101,35 +8901,7 @@ pub const KernelModule = struct {
         // Optional split-K rejection is telemetry, not a route-selection
         // barrier. Preserve the normal score-prework/fast production
         // precedence so an exploratory profile cannot create a scalar cliff.
-        const score_prework_launch = try self.launchGqaAttentionDecodeTurboquantScorePreworkF32(
-            ctx,
-            dst,
-            q,
-            k,
-            v,
-            block_table,
-            batch,
-            q_seq_len,
-            kv_seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            query_position_offset,
-            kv_position_offset,
-            sliding_window,
-            total_sequence_len,
-            mask_len,
-            bias_mode,
-            key_row_bytes,
-            base_key_row_bytes,
-            value_row_bytes,
-            block_count,
-            page_size_tokens,
-            format,
-            value_format,
-            physical_token_capacity,
-            decode_scalars,
-        );
+        const score_prework_launch = try self.launchGqaAttentionDecodeTurboquantScorePreworkF32(ctx, r);
         switch (score_prework_launch) {
             .none => {},
             .serial => return .{ .kind = .decode_generated_score_prework, .splitk_online_fallback = splitk_online_fallback },
@@ -9138,96 +8910,50 @@ pub const KernelModule = struct {
             .tiled64 => return .{ .kind = .decode_generated_score_prework_tiled64, .splitk_online_fallback = splitk_online_fallback },
         }
 
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var block_table_ptr = block_table.ptr;
-        var mask_ptr = attn_or_mask.ptr;
-        var bias_ptr = bias.ptr;
-        var batch_u32 = try toU32(batch);
-        var q_seq_len_u32 = try toU32(q_seq_len);
-        var kv_seq_len_u32 = try toU32(kv_seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var num_kv_heads_u32 = try toU32(num_kv_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var query_position_offset_u32 = try toU32(query_position_offset);
-        var kv_position_offset_u32 = try toU32(kv_position_offset);
-        var sliding_window_u32 = try toU32(sliding_window);
-        var total_sequence_len_u32 = try toU32(total_sequence_len);
-        var mask_len_u32 = try toU32(mask_len);
-        var bias_mode_u32 = bias_mode;
-        var key_row_bytes_u32 = try toU32(key_row_bytes);
-        var base_key_row_bytes_u32 = try toU32(base_key_row_bytes);
-        var value_row_bytes_u32 = try toU32(value_row_bytes);
-        var block_count_u32 = try toU32(block_count);
-        var page_size_tokens_u32 = try toU32(page_size_tokens);
-        var format_u32 = format;
-        var value_format_u32 = value_format;
-        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &block_table_ptr, &mask_ptr, &bias_ptr, &batch_u32, &q_seq_len_u32, &kv_seq_len_u32, &num_heads_u32, &num_kv_heads_u32, &head_dim_u32, &query_position_offset_u32, &kv_position_offset_u32, &sliding_window_u32, &total_sequence_len_u32, &mask_len_u32, &bias_mode_u32, &key_row_bytes_u32, &base_key_row_bytes_u32, &value_row_bytes_u32, &block_count_u32, &page_size_tokens_u32, &format_u32, &value_format_u32, &physical_token_capacity_u32, &decode_scalars_ptr });
+        var arguments = try r.wire(false);
+        var params = launch_abi.addresses(.{ &arguments.dst, &arguments.q, &arguments.k, &arguments.v, &arguments.block_table, &arguments.attn_or_mask, &arguments.bias, &arguments.batch, &arguments.q_seq_len, &arguments.kv_seq_len, &arguments.num_heads, &arguments.num_kv_heads, &arguments.head_dim, &arguments.query_position_offset, &arguments.kv_position_offset, &arguments.sliding_window, &arguments.total_sequence_len, &arguments.mask_len, &arguments.bias_mode, &arguments.key_row_bytes, &arguments.base_key_row_bytes, &arguments.value_row_bytes, &arguments.block_count, &arguments.page_size_tokens, &arguments.format, &arguments.value_format, &arguments.physical_token_capacity, &arguments.decode_scalars });
         // A qualified split-K or score-prework route does not depend on the
         // unrelated scalar baseline symbol. Resolve it only when normal route
         // selection actually needs that fallback family.
         const fallback_function = self.gqa_attention_decode_turboquant_f32 orelse return error.CudaKernelUnavailable;
         var function = fallback_function;
         var launch_kind: GqaAttentionLaunchKind = .decode;
-        const prefill_storage_eligible = (format == 0 or format == 2) and
-            base_key_row_bytes == key_row_bytes and decode_scalars.ptr == 0;
+        const prefill_storage_eligible = (r.format == 0 or r.format == 2) and
+            r.base_key_row_bytes == r.key_row_bytes and r.decode_scalars.ptr == 0;
         const prefill_shape_eligible = gqaPrefillShapeEligible(
-            batch,
-            q_seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            mask_len,
-            bias_mode,
+            r.batch,
+            r.q_seq_len,
+            r.num_heads,
+            r.num_kv_heads,
+            r.head_dim,
+            r.mask_len,
+            r.bias_mode,
         );
-        const f16_prefill_request = GqaF16PrefillRequest{
-            .batch = batch,
-            .q_seq_len = q_seq_len,
-            .kv_seq_len = kv_seq_len,
-            .num_heads = num_heads,
-            .num_kv_heads = num_kv_heads,
-            .head_dim = head_dim,
-            .mask_len = mask_len,
-            .bias_mode = bias_mode,
-            .key_row_bytes = key_row_bytes,
-            .base_key_row_bytes = base_key_row_bytes,
-            .value_row_bytes = value_row_bytes,
-            .block_count = block_count,
-            .page_size_tokens = page_size_tokens,
-            .format = format,
-            .value_format = value_format,
-            .physical_token_capacity = physical_token_capacity,
-            .block_table_present = block_table.ptr != 0,
-            .decode_scalars_present = decode_scalars.ptr != 0,
-        };
+        const f16_prefill_request = r.eligibility(GqaF16PrefillRequest);
         const f16_prefill_eligibility = gqaF16PrefillEligibility(f16_prefill_request);
         const flash_prefill_request = GqaFlashPrefillRequest{
             .base = f16_prefill_request,
             .compute_major = ctx.info.compute_major,
             .compute_minor = ctx.info.compute_minor,
-            .query_position_offset = query_position_offset,
-            .kv_position_offset = kv_position_offset,
-            .sliding_window = sliding_window,
-            .total_sequence_len = total_sequence_len,
+            .query_position_offset = r.query_position_offset,
+            .kv_position_offset = r.kv_position_offset,
+            .sliding_window = r.sliding_window,
+            .total_sequence_len = r.total_sequence_len,
         };
         const flash_prefill_eligibility = gqaFlashPrefillEligibility(flash_prefill_request);
-        const repeat_active = self.attention_match_repeat and q_seq_len > 1;
+        const repeat_active = self.attention_match_repeat and r.q_seq_len > 1;
         if (repeat_active and (!attentionMatchRepeatEligible(flash_prefill_request) or
             self.gqa_prefill_profile != .tiled_f16_exact))
             return error.CudaKernelUnavailable;
-        const flash_prefill_function = switch (head_dim) {
-            256 => if (num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd256_f32 else self.gqa_attention_prefill_flash_sm89_hd256_f32,
-            512 => if (num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd512_f32 else self.gqa_attention_prefill_flash_sm89_hd512_f32,
+        const flash_prefill_function = switch (r.head_dim) {
+            256 => if (r.num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd256_f32 else self.gqa_attention_prefill_flash_sm89_hd256_f32,
+            512 => if (r.num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd512_f32 else self.gqa_attention_prefill_flash_sm89_hd512_f32,
             else => null,
         };
         const flash_prefill_launch = selectGqaFlashPrefillLaunch(
             self.gqa_prefill_profile,
             flash_prefill_eligibility,
-            flash_prefill_function != null and (num_kv_heads != 2 or self.gqa_prefill_profile != .automatic),
+            flash_prefill_function != null and (r.num_kv_heads != 2 or self.gqa_prefill_profile != .automatic),
         );
         const f16_prefill_launch = selectGqaF16PrefillLaunch(
             self.gqa_prefill_profile,
@@ -9240,7 +8966,7 @@ pub const KernelModule = struct {
         // falls through silently and keeps the historical unset (`off`)
         // launch topology; only the explicit `flash-f16-sm89` profile tags
         // fallback launch kinds for telemetry.
-        if (self.gqa_prefill_profile.selectsFlashF16Sm89() and q_seq_len > 1) {
+        if (self.gqa_prefill_profile.selectsFlashF16Sm89() and r.q_seq_len > 1) {
             if (flash_prefill_launch == .prefill_flash_f16_sm89) {
                 function = flash_prefill_function.?;
                 launch_kind = .prefill_flash_f16_sm89;
@@ -9253,7 +8979,7 @@ pub const KernelModule = struct {
             }
         }
         if (repeat_active) {
-            function = (if (head_dim == 256) self.gqa_repeat_hd256 else self.gqa_repeat_hd512) orelse
+            function = (if (r.head_dim == 256) self.gqa_repeat_hd256 else self.gqa_repeat_hd512) orelse
                 return error.CudaKernelUnavailable;
             launch_kind = .prefill_tiled_f16_exact;
         } else if (self.gqa_prefill_profile != .off and prefill_storage_eligible and prefill_shape_eligible) {
@@ -9277,8 +9003,8 @@ pub const KernelModule = struct {
                     // head_dim-512 global layers and TILE_M=32 need sm80+.
                     if (ctx.driver.fns.cuFuncSetAttribute != null) {
                         const sm80_plus = ctx.info.compute_major >= 8;
-                        const mma_hd_ok = head_dim <= 256 or (head_dim <= 512 and sm80_plus);
-                        if (head_dim <= 256 and sm80_plus and mmaM32GqaPrefillEnabled()) {
+                        const mma_hd_ok = r.head_dim <= 256 or (r.head_dim <= 512 and sm80_plus);
+                        if (r.head_dim <= 256 and sm80_plus and mmaM32GqaPrefillEnabled()) {
                             if (self.gqa_attention_prefill_turboquant_mma_m32_f32) |mma_m32_function| {
                                 function = mma_m32_function;
                                 launch_kind = .prefill_mma_m32;
@@ -9311,13 +9037,13 @@ pub const KernelModule = struct {
                         qwen3VlAutomaticM32GqaPrefillEligible(
                             ctx.info.compute_major,
                             ctx.info.compute_minor,
-                            batch,
-                            q_seq_len,
-                            num_heads,
-                            num_kv_heads,
-                            head_dim,
-                            mask_len,
-                            bias_mode,
+                            r.batch,
+                            r.q_seq_len,
+                            r.num_heads,
+                            r.num_kv_heads,
+                            r.head_dim,
+                            r.mask_len,
+                            r.bias_mode,
                         ))
                     {
                         if (self.gqa_attention_prefill_turboquant_mma_m32_f32) |mma_m32_function| {
@@ -9331,7 +9057,7 @@ pub const KernelModule = struct {
         }
         if (repeat_active and launch_kind != .prefill_tiled_f16_exact) return error.CudaKernelUnavailable;
         if (requiredGqaPrefillLaunch(self.gqa_prefill_profile)) |required_launch| {
-            if (q_seq_len > 1 and launch_kind != required_launch) {
+            if (r.q_seq_len > 1 and launch_kind != required_launch) {
                 const reason: []const u8 = switch (self.gqa_prefill_profile) {
                     .required_tiled_f16_exact, .required_tiled_f16_warp => requiredGqaF16PrefillRejectionReason(self.gqa_prefill_profile, f16_prefill_eligibility),
                     .required_flash_f16_sm89 => requiredGqaFlashPrefillRejectionReason(flash_prefill_eligibility, flash_prefill_function != null),
@@ -9345,14 +9071,14 @@ pub const KernelModule = struct {
                 switch (self.gqa_prefill_profile) {
                     .required_tiled_f16_exact, .required_tiled_f16_warp => self.noteRequiredGqaF16PrefillRejected(reason, f16_prefill_request),
                     .required_flash_f16_sm89 => self.noteGqaFlashPrefillTelemetry(.rejected, reason, flash_prefill_request),
-                    else => self.noteRequiredGqaPrefillRejected(reason, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode),
+                    else => self.noteRequiredGqaPrefillRejected(reason, r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim, r.mask_len, r.bias_mode),
                 }
                 return error.CudaKernelUnavailable;
             }
         }
-        if ((format == 0 or format == 2) and
-            base_key_row_bytes == key_row_bytes and
-            fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+        if ((r.format == 0 or r.format == 2) and
+            r.base_key_row_bytes == r.key_row_bytes and
+            fastGqaDecodeEligible(r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim, r.mask_len, r.bias_mode))
         {
             launch_kind = .decode_fast_fallback;
             if (!fastGqaDecodeDisabled()) {
@@ -9378,45 +9104,45 @@ pub const KernelModule = struct {
                 ctx.debug_graph_capture_id,
                 trace_index,
                 kernel_name,
-                dst_ptr,
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                block_table_ptr,
-                mask_ptr,
-                bias_ptr,
-                decode_scalars_ptr,
-                batch_u32,
-                q_seq_len_u32,
-                kv_seq_len_u32,
-                num_heads_u32,
-                num_kv_heads_u32,
-                head_dim_u32,
-                key_row_bytes_u32,
-                base_key_row_bytes_u32,
-                value_row_bytes_u32,
-                block_count_u32,
-                page_size_tokens_u32,
-                format_u32,
-                value_format_u32,
+                arguments.dst,
+                arguments.q,
+                arguments.k,
+                arguments.v,
+                arguments.block_table,
+                arguments.attn_or_mask,
+                arguments.bias,
+                arguments.decode_scalars,
+                arguments.batch,
+                arguments.q_seq_len,
+                arguments.kv_seq_len,
+                arguments.num_heads,
+                arguments.num_kv_heads,
+                arguments.head_dim,
+                arguments.key_row_bytes,
+                arguments.base_key_row_bytes,
+                arguments.value_row_bytes,
+                arguments.block_count,
+                arguments.page_size_tokens,
+                arguments.format,
+                arguments.value_format,
             });
         }
-        var block: c_uint = if (head_dim <= 256) 256 else 512;
-        var grid_x = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+        var block: c_uint = if (r.head_dim <= 256) 256 else 512;
+        var grid_x = try toU32(try checkedTensorElements(try checkedTensorElements(r.batch, r.q_seq_len), r.num_heads));
         var grid_y: c_uint = 1;
         var shared_bytes: c_uint = 0;
         if (launch_kind == .prefill_tiled) {
             // Tiled prefill: grid = (num_heads, ceil(q_seq_len / TILE_M)), TILE_M = 16.
             // Dynamic smem holds one BF16 K/V tile: tile_n * (head_dim + 2) * 2 bytes.
             block = 256;
-            grid_x = try toU32(num_heads);
-            grid_y = try toU32((q_seq_len + 15) / 16);
-            const tile_n: usize = if (head_dim <= 256) 32 else 16;
-            shared_bytes = try toU32(tile_n * (head_dim + 2) * @sizeOf(u16));
+            grid_x = try toU32(r.num_heads);
+            grid_y = try toU32((r.q_seq_len + 15) / 16);
+            const tile_n: usize = if (r.head_dim <= 256) 32 else 16;
+            shared_bytes = try toU32(tile_n * (r.head_dim + 2) * @sizeOf(u16));
         } else if (launch_kind == .prefill_tiled_f16_exact and repeat_active) {
             block = 256;
             grid_x = 8;
-            grid_y = try toU32((q_seq_len + 7) / 8);
+            grid_y = try toU32((r.q_seq_len + 7) / 8);
         } else if (launch_kind == .prefill_mma) {
             // MMA prefill: same grid shape as tiled. Dynamic smem holds the
             // f16 Q tile (16*hd), one tile_n-key f16 K/V tile (tile_n*(hd+8)),
@@ -9424,39 +9150,39 @@ pub const KernelModule = struct {
             // output tile (16*hd). tile_n is 64 for head_dim <= 256 (224*hd +
             // 7936 bytes) and 32 for the 512-dim global layers (160*hd + 7424).
             block = 256;
-            grid_x = try toU32(num_heads);
-            grid_y = try toU32((q_seq_len + 15) / 16);
-            shared_bytes = if (head_dim <= 256)
-                try toU32(224 * head_dim + 7936)
+            grid_x = try toU32(r.num_heads);
+            grid_y = try toU32((r.q_seq_len + 15) / 16);
+            shared_bytes = if (r.head_dim <= 256)
+                try toU32(224 * r.head_dim + 7936)
             else
-                try toU32(160 * head_dim + 7424);
+                try toU32(160 * r.head_dim + 7424);
         } else if (launch_kind == .prefill_mma_m32) {
             // TILE_M=32 MMA prefill: 32 query rows per block, 64-key tiles.
             // Dynamic smem: 320*hd + 14848 bytes (96768 at head_dim 256).
             block = 256;
-            grid_x = try toU32(num_heads);
-            grid_y = try toU32((q_seq_len + 31) / 32);
-            shared_bytes = try toU32(320 * head_dim + 14848);
+            grid_x = try toU32(r.num_heads);
+            grid_y = try toU32((r.q_seq_len + 31) / 32);
+            shared_bytes = try toU32(320 * r.head_dim + 14848);
         } else if (launch_kind == .prefill_tiled_f16_exact) {
             // Exact path preserves the baseline reduction order: one thread
             // per head dimension, one 16-query tile per CTA.
-            block = try toU32(head_dim);
-            grid_x = try toU32(num_heads);
-            grid_y = try toU32((q_seq_len + 15) / 16);
+            block = try toU32(r.head_dim);
+            grid_x = try toU32(r.num_heads);
+            grid_y = try toU32((r.q_seq_len + 15) / 16);
         } else if (launch_kind == .prefill_tiled_f16_warp) {
             // Eight warps own two queries each and replay 32-key QK spans.
             block = 256;
-            grid_x = try toU32(num_heads);
-            grid_y = try toU32((q_seq_len + 15) / 16);
+            grid_x = try toU32(r.num_heads);
+            grid_y = try toU32((r.q_seq_len + 15) / 16);
         } else if (launch_kind == .prefill_flash_f16_sm89) {
-            const plan = cuda_kernel_renderer.flashPrefillPlanFor(switch (head_dim) {
-                256 => if (num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 else .gqa_prefill_flash_sm89_hd256_swa512_f32,
-                512 => if (num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd512_global_f32 else .gqa_prefill_flash_sm89_hd512_global_f32,
+            const plan = cuda_kernel_renderer.flashPrefillPlanFor(switch (r.head_dim) {
+                256 => if (r.num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 else .gqa_prefill_flash_sm89_hd256_swa512_f32,
+                512 => if (r.num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd512_global_f32 else .gqa_prefill_flash_sm89_hd512_global_f32,
                 else => unreachable,
             });
             block = @intCast(plan.launch.threads_per_block);
-            grid_x = try toU32(num_heads);
-            grid_y = try toU32(std.math.divCeil(usize, q_seq_len, @as(usize, plan.launch.output_rows_per_block)) catch
+            grid_x = try toU32(r.num_heads);
+            grid_y = try toU32(std.math.divCeil(usize, r.q_seq_len, @as(usize, plan.launch.output_rows_per_block)) catch
                 return error.CudaKernelUnavailable);
             shared_bytes = @intCast(plan.launch.dynamic_shared_memory_bytes);
         }
@@ -9464,7 +9190,7 @@ pub const KernelModule = struct {
         if (launch_kind == .prefill_flash_f16_sm89 and shared_bytes > 48 * 1024) {
             // Both E4B specializations exceed the default limit. Track the
             // concrete function so a JIT replacement receives its own opt-in.
-            const slot: usize = if (head_dim == 256) 0 else 1;
+            const slot: usize = if (r.head_dim == 256) 0 else 1;
             if (self.gqa_prefill_flash_e4b_smem_functions[slot] != function) {
                 const set_attr = ctx.driver.fns.cuFuncSetAttribute orelse return error.CudaKernelUnavailable;
                 try ctx.driver.check(set_attr(function, 8, @intCast(shared_bytes)));
@@ -9486,9 +9212,9 @@ pub const KernelModule = struct {
             try ctx.driver.check(set_attr(function, 8, 96768));
             self.gqa_prefill_mma_m32_smem_opted_in = true;
         }
-        const split_active = repeat_active and self.attention_match_repeat_split and head_dim == 512;
+        const split_active = repeat_active and self.attention_match_repeat_split and r.head_dim == 512;
         if (split_active) {
-            try self.launchAttentionMatchSplit(ctx, dst, q, k, v, block_table, q_seq_len, query_position_offset, kv_seq_len, physical_token_capacity);
+            try self.launchAttentionMatchSplit(ctx, r.dst, r.q, r.k, r.v, r.block_table, r.q_seq_len, r.query_position_offset, r.kv_seq_len, r.physical_token_capacity);
         } else {
             try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
                 function,
@@ -9507,22 +9233,22 @@ pub const KernelModule = struct {
         }
         if (repeat_active and platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_VERIFY_ATTENTION")) {
             // Bounded short-prompt diagnostic; never used by latency runs.
-            if (q_seq_len > 32 or kv_seq_len > 64 or physical_token_capacity > 64) return error.InvalidCudaState;
-            const count = q_seq_len * num_heads * head_dim;
+            if (r.q_seq_len > 32 or r.kv_seq_len > 64 or r.physical_token_capacity > 64) return error.InvalidCudaState;
+            const count = r.q_seq_len * r.num_heads * r.head_dim;
             const bytes = count * @sizeOf(f32);
             var reference = try buffer_mod.DeviceBuffer.alloc(ctx, bytes);
             defer reference.free(ctx);
-            var host = try buffer_mod.HostBuffer.alloc(ctx, 3 * bytes + k.len);
+            var host = try buffer_mod.HostBuffer.alloc(ctx, 3 * bytes + r.k.len);
             defer host.free(ctx);
-            const saved_dst = dst_ptr;
-            dst_ptr = reference.ptr;
-            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.gqa_attention_prefill_turboquant_fast_f32 orelse return error.CudaKernelUnavailable, try toU32(q_seq_len * num_heads), 1, 1, try toU32(head_dim), 1, 1, 0, ctx.stream, &params, null));
+            const saved_dst = arguments.dst;
+            arguments.dst = reference.ptr;
+            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.gqa_attention_prefill_turboquant_fast_f32 orelse return error.CudaKernelUnavailable, try toU32(r.q_seq_len * r.num_heads), 1, 1, try toU32(r.head_dim), 1, 1, 0, ctx.stream, &params, null));
             ctx.noteKernelLaunch();
-            dst_ptr = saved_dst;
-            try dst.copyToHost(ctx, host.bytes()[0..bytes]);
+            arguments.dst = saved_dst;
+            try r.dst.copyToHost(ctx, host.bytes()[0..bytes]);
             try reference.copyToHost(ctx, host.bytes()[bytes..][0..bytes]);
-            try q.copyToHost(ctx, host.bytes()[2 * bytes ..][0..bytes]);
-            try k.copyToHost(ctx, host.bytes()[3 * bytes ..]);
+            try r.q.copyToHost(ctx, host.bytes()[2 * bytes ..][0..bytes]);
+            try r.k.copyToHost(ctx, host.bytes()[3 * bytes ..]);
             try ctx.synchronize();
             const a = std.mem.bytesAsSlice(f32, @as([]align(@alignOf(f32)) u8, @alignCast(host.bytes()[0..bytes])));
             const b = std.mem.bytesAsSlice(f32, @as([]align(@alignOf(f32)) u8, @alignCast(host.bytes()[bytes..][0..bytes])));
@@ -9533,11 +9259,11 @@ pub const KernelModule = struct {
             var qmax: f32 = 0;
             var kmax: f32 = 0;
             for (query) |value| qmax = @max(qmax, @abs(value));
-            for (keys[0 .. kv_seq_len * num_kv_heads * head_dim]) |value| kmax = @max(kmax, @abs(@as(f32, value)));
-            for (0..q_seq_len * num_heads) |row| {
+            for (keys[0 .. r.kv_seq_len * r.num_kv_heads * r.head_dim]) |value| kmax = @max(kmax, @abs(@as(f32, value)));
+            for (0..r.q_seq_len * r.num_heads) |row| {
                 var err: f64 = 0;
                 var norm: f64 = 0;
-                for (a[row * head_dim ..][0..head_dim], b[row * head_dim ..][0..head_dim]) |av, bv| {
+                for (a[row * r.head_dim ..][0..r.head_dim], b[row * r.head_dim ..][0..r.head_dim]) |av, bv| {
                     if (!std.math.isFinite(av) or !std.math.isFinite(bv)) return error.InvalidCudaState;
                     const delta = @as(f64, av) - @as(f64, bv);
                     max_abs = @max(max_abs, @abs(delta));
@@ -9546,10 +9272,10 @@ pub const KernelModule = struct {
                 }
                 max_relative = @max(max_relative, @sqrt(err / @max(norm, 1e-30)));
             }
-            std.log.info("attention_match_attention ordinal={d} dim={d} max_absolute={d} max_relative_l2={d} qmax={d} kmax={d}", .{ self.attention_match_repeat_launches, head_dim, max_abs, max_relative, qmax, kmax });
+            std.log.info("attention_match_attention ordinal={d} dim={d} max_absolute={d} max_relative_l2={d} qmax={d} kmax={d}", .{ self.attention_match_repeat_launches, r.head_dim, max_abs, max_relative, qmax, kmax });
         }
         if (repeat_active and !split_active) self.attention_match_repeat_launches += 1;
-        self.noteGqaPrefillRouteActive(launch_kind, batch, q_seq_len, num_heads, num_kv_heads, head_dim);
+        self.noteGqaPrefillRouteActive(launch_kind, r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim);
         switch (launch_kind) {
             .prefill_flash_f16_sm89 => self.noteGqaFlashPrefillTelemetry(
                 .active,
@@ -9574,52 +9300,9 @@ pub const KernelModule = struct {
     pub fn launchGqaAttentionDecodeTurboquantScorePreworkF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
-        dst: buffer_mod.DeviceBuffer,
-        q: buffer_mod.DeviceBuffer,
-        k: buffer_mod.DeviceBuffer,
-        v: buffer_mod.DeviceBuffer,
-        block_table: buffer_mod.DeviceBuffer,
-        batch: usize,
-        q_seq_len: usize,
-        kv_seq_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        query_position_offset: usize,
-        kv_position_offset: usize,
-        sliding_window: usize,
-        total_sequence_len: usize,
-        mask_len: usize,
-        bias_mode: u32,
-        key_row_bytes: usize,
-        base_key_row_bytes: usize,
-        value_row_bytes: usize,
-        block_count: usize,
-        page_size_tokens: usize,
-        format: u32,
-        value_format: u32,
-        physical_token_capacity: usize,
-        decode_scalars: buffer_mod.DeviceBuffer,
+        r: *const GqaAttentionRequest,
     ) driver_mod.Error!GeneratedGqaScorePreworkLaunchKind {
-        const request = GeneratedGqaScorePreworkRequest{
-            .batch = batch,
-            .q_seq_len = q_seq_len,
-            .kv_seq_len = kv_seq_len,
-            .num_heads = num_heads,
-            .num_kv_heads = num_kv_heads,
-            .head_dim = head_dim,
-            .sliding_window = sliding_window,
-            .mask_len = mask_len,
-            .bias_mode = bias_mode,
-            .key_row_bytes = key_row_bytes,
-            .base_key_row_bytes = base_key_row_bytes,
-            .value_row_bytes = value_row_bytes,
-            .block_count = block_count,
-            .page_size_tokens = page_size_tokens,
-            .format = format,
-            .value_format = value_format,
-            .physical_token_capacity = physical_token_capacity,
-        };
+        const request = r.eligibility(GeneratedGqaScorePreworkRequest);
         const selection = switch (generatedGqaScorePreworkDecisionFor(
             request,
             self.gqa_score_prework_mode,
@@ -9643,12 +9326,12 @@ pub const KernelModule = struct {
             .invalid_config_rejected => return error.InvalidCudaState,
         };
 
-        const plan = switch (head_dim) {
+        const plan = switch (r.head_dim) {
             256 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_score_prework_hd256_f32),
             512 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_score_prework_hd512_f32),
             else => return .none,
         };
-        const score_function, const serial_consume_function, const tiled64_consume_function = switch (head_dim) {
+        const score_function, const serial_consume_function, const tiled64_consume_function = switch (r.head_dim) {
             256 => .{
                 self.gqa_attention_decode_score_prework_hd256_f32,
                 self.gqa_attention_decode_score_prework_consume_hd256_f32,
@@ -9668,7 +9351,7 @@ pub const KernelModule = struct {
                     generatedGqaScorePreworkConfiguredModeName(selection),
                     selection.consumer,
                     selection.route,
-                    head_dim,
+                    r.head_dim,
                     "score_symbol_unavailable",
                 );
                 return error.CudaKernelUnavailable;
@@ -9690,7 +9373,7 @@ pub const KernelModule = struct {
                     generatedGqaScorePreworkConfiguredModeName(selection),
                     .tiled64,
                     selection.route,
-                    head_dim,
+                    r.head_dim,
                     "consumer_symbol_unavailable",
                 );
                 return error.CudaKernelUnavailable;
@@ -9708,30 +9391,30 @@ pub const KernelModule = struct {
                     generatedGqaScorePreworkConfiguredModeName(selection),
                     selection.consumer,
                     selection.route,
-                    head_dim,
+                    r.head_dim,
                     "consumer_symbol_unavailable",
                 );
                 return error.CudaKernelUnavailable;
             }
             return .none;
         };
-        const workspace_bytes = selection.workspaceBytes(num_heads) orelse return error.InvalidCudaState;
+        const workspace_bytes = selection.workspaceBytes(r.num_heads) orelse return error.InvalidCudaState;
         if (self.gqa_attention_generated_workspace.ptr == 0 or
             self.gqa_attention_generated_workspace.len < workspace_bytes)
         {
             return error.InvalidCudaState;
         }
 
-        const q_count = try checkedTensorElements(num_heads, head_dim);
-        try checkBytes(dst, q_count);
-        try checkBytes(q, q_count);
-        try checkRawBytes(k, try checkedTensorElements(physical_token_capacity, key_row_bytes));
-        try checkRawBytes(v, try checkedTensorElements(physical_token_capacity, value_row_bytes));
-        if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
-        if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
+        const q_count = try checkedTensorElements(r.num_heads, r.head_dim);
+        try checkBytes(r.dst, q_count);
+        try checkBytes(r.q, q_count);
+        try checkRawBytes(r.k, try checkedTensorElements(r.physical_token_capacity, r.key_row_bytes));
+        try checkRawBytes(r.v, try checkedTensorElements(r.physical_token_capacity, r.value_row_bytes));
+        if (r.block_count != 0) try checkRawBytes(r.block_table, try checkedTensorElements(r.block_count, @sizeOf(u32)));
+        if (r.decode_scalars.ptr != 0) try checkRawBytes(r.decode_scalars, 5 * @sizeOf(u32));
 
         var scores_ptr = self.gqa_attention_generated_workspace.ptr;
-        var arguments = try pagedDecodeArguments(request, dst, q, k, v, block_table, decode_scalars, query_position_offset, kv_position_offset, total_sequence_len);
+        var arguments = try r.wire(true);
         var score_capacity_u32: u32 = selection.score_capacity;
         var chunk_count_u32: u32 = cuda_kernel_renderer.generated_attention_score_prework_chunks;
         var chunk_size_u32: u32 = @intCast(
@@ -9751,11 +9434,11 @@ pub const KernelModule = struct {
         if (plan.launch.grid != .batch_query_heads_by_splits or consume_launch.grid != expected_consume_grid) {
             return error.InvalidCudaState;
         }
-        const score_grid_x = try toU32(try checkedTensorElements(num_heads, plan.lowering.kv_splits));
-        const consume_grid_x = try toU32(num_heads);
+        const score_grid_x = try toU32(try checkedTensorElements(r.num_heads, plan.lowering.kv_splits));
+        const consume_grid_x = try toU32(r.num_heads);
         const consume_grid_y: u32 = switch (consumer) {
             .serial => 1,
-            .tiled64 => try toU32(head_dim / consume_launch.output_cols_per_block),
+            .tiled64 => try toU32(r.head_dim / consume_launch.output_cols_per_block),
         };
 
         if (captureParamTraceIndex(ctx)) |trace_index| {
@@ -9829,7 +9512,7 @@ pub const KernelModule = struct {
                 generatedGqaScorePreworkConfiguredModeName(selection),
                 .tiled64,
                 selection.route,
-                head_dim,
+                r.head_dim,
                 "none",
             ),
             .serial => switch (serial_launch_kind) {
@@ -9838,7 +9521,7 @@ pub const KernelModule = struct {
                     generatedGqaScorePreworkConfiguredModeName(selection),
                     .serial,
                     selection.route,
-                    head_dim,
+                    r.head_dim,
                     "none",
                 ),
                 .serial_tiled64_ineligible_fallback => noteGeneratedGqaScorePreworkConsumerEvent(
@@ -9846,7 +9529,7 @@ pub const KernelModule = struct {
                     generatedGqaScorePreworkConfiguredModeName(selection),
                     .serial,
                     selection.route,
-                    head_dim,
+                    r.head_dim,
                     "consumer_ineligible",
                 ),
                 .serial_tiled64_symbol_fallback => noteGeneratedGqaScorePreworkConsumerEvent(
@@ -9854,7 +9537,7 @@ pub const KernelModule = struct {
                     generatedGqaScorePreworkConfiguredModeName(selection),
                     .serial,
                     selection.route,
-                    head_dim,
+                    r.head_dim,
                     "consumer_symbol_unavailable",
                 ),
                 .none, .tiled64 => unreachable,
@@ -17840,37 +17523,36 @@ fn smokeTurboquantKvFormat(
         if (!std.mem.eql(u8, value_actual_row, value_expected_row)) return error.CudaSmokeMismatch;
     }
 
-    _ = try module.launchGqaAttentionDecodeTurboquantF32(
-        ctx,
-        out,
-        q,
-        k_dst,
-        v_dst,
-        block_table,
-        .{},
-        .{},
-        1,
-        1,
-        token_count,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        1,
-        0,
-        0,
-        token_count,
-        0,
-        0,
-        key_row_bytes,
-        base_key_row_bytes,
-        value_row_bytes,
-        block_table_host.len,
-        page_size_tokens,
-        format,
-        value_format,
-        physical_token_capacity,
-        .{},
-    );
+    _ = try module.launchGqaAttentionDecodeTurboquantF32(ctx, &.{
+        .dst = out,
+        .q = q,
+        .k = k_dst,
+        .v = v_dst,
+        .block_table = block_table,
+        .attn_or_mask = .{},
+        .bias = .{},
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = token_count,
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .query_position_offset = 1,
+        .kv_position_offset = 0,
+        .sliding_window = 0,
+        .total_sequence_len = token_count,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = key_row_bytes,
+        .base_key_row_bytes = base_key_row_bytes,
+        .value_row_bytes = value_row_bytes,
+        .block_count = block_table_host.len,
+        .page_size_tokens = page_size_tokens,
+        .format = format,
+        .value_format = value_format,
+        .physical_token_capacity = physical_token_capacity,
+        .decode_scalars = .{},
+    });
     try ctx.synchronize();
     const out_host = try allocator.alloc(f32, q_host.len);
     defer allocator.free(out_host);
@@ -19198,7 +18880,26 @@ fn smokeGqaAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaCont
     try q.copyFromHost(ctx, std.mem.sliceAsBytes(&q_data));
     try k.copyFromHost(ctx, std.mem.sliceAsBytes(&k_data));
     try v.copyFromHost(ctx, std.mem.sliceAsBytes(&v_data));
-    _ = try module.launchGqaAttentionF32(ctx, output, q, k, v, .{}, .{}, batch, q_seq_len, kv_seq_len, num_heads, num_kv_heads, head_dim, 0, 0, 0, kv_seq_len, 0, 0);
+    _ = try module.launchGqaAttentionF32(ctx, &.{
+        .dst = output,
+        .q = q,
+        .k = k,
+        .v = v,
+        .attn_or_mask = .{},
+        .bias = .{},
+        .batch = batch,
+        .q_seq_len = q_seq_len,
+        .kv_seq_len = kv_seq_len,
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .query_position_offset = 0,
+        .kv_position_offset = 0,
+        .sliding_window = 0,
+        .total_sequence_len = kv_seq_len,
+        .mask_len = 0,
+        .bias_mode = 0,
+    });
     try ctx.synchronize();
 
     const out = try allocator.alloc(f32, q_data.len);
@@ -21706,7 +21407,27 @@ test "CUDA dense fast attention scalar replay rereads positions lengths and valu
     };
     // HD32 deliberately selects the native fast route, rather than generated
     // HD256/512 schedules. Host fallbacks stay fixed while device scalars vary.
-    const route = try module.launchGqaAttentionDecodeScalarsF32(&ctx, output, query, key, value, .{}, .{}, scalars, 1, 1, capacity, heads, kv_heads, dim, capacity - 1, 0, 0, capacity, 0, 0);
+    const route = try module.launchGqaAttentionDecodeScalarsF32(&ctx, &.{
+        .dst = output,
+        .q = query,
+        .k = key,
+        .v = value,
+        .attn_or_mask = .{},
+        .bias = .{},
+        .decode_scalars = scalars,
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = capacity,
+        .num_heads = heads,
+        .num_kv_heads = kv_heads,
+        .head_dim = dim,
+        .query_position_offset = capacity - 1,
+        .kv_position_offset = 0,
+        .sliding_window = 0,
+        .total_sequence_len = capacity,
+        .mask_len = 0,
+        .bias_mode = 0,
+    });
     try std.testing.expectEqual(GqaAttentionLaunchKind.decode_fast, route);
     var graph = try graph_mod.endCapture(&ctx);
     capturing = false;
@@ -22388,7 +22109,16 @@ test "CUDA Q8 row column and tensor core tiles cover every output and guard" {
 }
 
 test "CUDA paged decode wires preserve dynamic addresses and reject dimension overflow" {
-    const request: GeneratedGqaScorePreworkRequest = .{
+    const request: GqaAttentionRequest = .{
+        .dst = .{ .ptr = 0x1000 },
+        .q = .{ .ptr = 0x2000 },
+        .k = .{ .ptr = 0x3000 },
+        .v = .{ .ptr = 0x4000 },
+        .block_table = .{ .ptr = 0x5000 },
+        .decode_scalars = .{ .ptr = 0x6000 },
+        .query_position_offset = 16,
+        .kv_position_offset = 4,
+        .total_sequence_len = 21,
         .mask_len = 0,
         .bias_mode = 0,
         .batch = @as(usize, 1),
@@ -22407,8 +22137,7 @@ test "CUDA paged decode wires preserve dynamic addresses and reject dimension ov
         .value_format = @as(u32, 4),
         .physical_token_capacity = @as(usize, 48),
     };
-    const B = buffer_mod.DeviceBuffer;
-    var arguments = try KernelModule.pagedDecodeArguments(request, B{ .ptr = 0x1000 }, B{ .ptr = 0x2000 }, B{ .ptr = 0x3000 }, B{ .ptr = 0x4000 }, B{ .ptr = 0x5000 }, B{ .ptr = 0x6000 }, 16, 4, 21);
+    var arguments = try request.wire(false);
     const params = launch_abi.fieldsFor("PAGED_ATTENTION", &arguments);
     try std.testing.expectEqual(@as(usize, 28), params.len);
     // The driver reads the original field addresses at launch/capture time.
@@ -22422,10 +22151,12 @@ test "CUDA paged decode wires preserve dynamic addresses and reject dimension ov
     try std.testing.expectEqual(@as(u32, 21), arguments.total_sequence_len);
     try std.testing.expectEqual(@as(u32, 48), arguments.physical_token_capacity);
     const overflow = @as(usize, std.math.maxInt(u32)) + 1;
-    try std.testing.expectError(error.InvalidCudaState, KernelModule.pagedDecodeArguments(request, .{}, .{}, .{}, .{}, .{}, .{}, overflow, 0, 0));
+    var overflow_position = request;
+    overflow_position.query_position_offset = overflow;
+    try std.testing.expectError(error.InvalidCudaState, overflow_position.wire(false));
     var invalid = request;
     invalid.physical_token_capacity = overflow;
-    try std.testing.expectError(error.InvalidCudaState, KernelModule.pagedDecodeArguments(invalid, .{}, .{}, .{}, .{}, .{}, .{}, 0, 0, 0));
+    try std.testing.expectError(error.InvalidCudaState, invalid.wire(false));
 }
 
 test "attention match repeat rejects unsupported cache and query contracts" {
@@ -22522,4 +22253,79 @@ test "E4B Flash warp decode selection preserves compressed and E2B routes" {
     module.gqa_attention_decode_turboquant_split_stage2_f32 = @ptrFromInt(1);
     module.gqa_attention_decode_f16_warp_stage1_f32 = null;
     try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+}
+
+test "CUDA GQA request preserves dense scalar and physical paged preflight contracts" {
+    const request = GqaAttentionRequest{
+        .dst = .{ .ptr = 0x1000, .len = 2048 },
+        .q = .{ .ptr = 0x2000, .len = 2048 },
+        .k = .{ .ptr = 0x3000, .len = 2560 },
+        .v = .{ .ptr = 0x4000, .len = 2560 },
+        .attn_or_mask = .{ .ptr = 0x5000, .len = 7 },
+        .bias = .{ .ptr = 0x6000, .len = 160 },
+        .decode_scalars = .{ .ptr = 0x7000, .len = 20 },
+        .batch = 1,
+        .q_seq_len = 2,
+        .kv_seq_len = 5,
+        .num_heads = 4,
+        .num_kv_heads = 2,
+        .head_dim = 64,
+        .mask_len = 7,
+        .bias_mode = 2,
+    };
+    try std.testing.expectEqual(@as(usize, 512), try request.preflight(.dense));
+    try std.testing.expectEqual(@as(usize, 512), try request.preflight(.scalars));
+    inline for (.{ "dst", "q", "k", "v", "attn_or_mask", "bias" }) |name| {
+        var short = request;
+        @field(short, name).len -= 1;
+        try std.testing.expectError(error.InvalidCudaState, short.preflight(.dense));
+    }
+    var short_scalars = request;
+    short_scalars.decode_scalars.len = 19;
+    try std.testing.expectError(error.InvalidCudaState, short_scalars.preflight(.scalars));
+    var empty = request;
+    empty.q_seq_len = 0;
+    empty.dst = .{};
+    empty.q = .{};
+    empty.decode_scalars = .{};
+    try std.testing.expectEqual(@as(usize, 0), try empty.preflight(.dense));
+    try std.testing.expectError(error.InvalidCudaState, empty.preflight(.scalars));
+    var paged = request;
+    paged.block_table = .{ .ptr = 0x8000, .len = 20 };
+    paged.key_row_bytes = 128;
+    paged.base_key_row_bytes = 64;
+    paged.value_row_bytes = 512;
+    paged.physical_token_capacity = 20;
+    paged.block_count = 5;
+    paged.page_size_tokens = 4;
+    paged.v.len = 10240;
+    try std.testing.expectEqual(@as(usize, 512), try paged.preflight(.paged));
+    inline for (.{ "k", "v", "block_table", "decode_scalars" }) |name| {
+        var short = paged;
+        @field(short, name).len -= 1;
+        try std.testing.expectError(error.InvalidCudaState, short.preflight(.paged));
+    }
+    paged.physical_token_capacity = std.math.maxInt(usize);
+    try std.testing.expectError(error.InvalidCudaState, paged.preflight(.paged));
+    const masked = try request.wire(false);
+    const unmasked = try request.wire(true);
+    try std.testing.expectEqual(@as(u64, 0x5000), masked.attn_or_mask);
+    try std.testing.expectEqual(@as(u32, 7), masked.mask_len);
+    try std.testing.expectEqual(@as(u64, 0), unmasked.attn_or_mask);
+    try std.testing.expectEqual(@as(u64, 0), unmasked.bias);
+    try std.testing.expectEqual(@as(u32, 0), unmasked.mask_len);
+    try std.testing.expectEqual(@as(u32, 0), unmasked.bias_mode);
+}
+
+test "CUDA GQA launch family matches independent dense and compressed oracles" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    try smokeGqaAttentionF32(std.testing.allocator, &ctx, &module);
+    for (0..3) |format| try smokeTurboquantKvFormat(std.testing.allocator, &ctx, &module, @intCast(format));
 }
