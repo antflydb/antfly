@@ -2368,6 +2368,12 @@ pub const OwnedQueryRequest = struct {
     req: db_mod.types.SearchRequest = .{},
     native_cut: ?std.json.Parsed(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child) = null,
 
+    /// Physical preparation for a consumer borrowing encoded native sources.
+    /// Ordinary wire queries retain their established source projection path.
+    pub fn prepareEncodedDelivery(self: *OwnedQueryRequest, alloc: std.mem.Allocator) !void {
+        try prepareSourceOnlyProjection(alloc, &self.req, &self.projection_plan, false);
+    }
+
     pub fn deinit(self: *OwnedQueryRequest, alloc: std.mem.Allocator) void {
         if (self.projection_plan) |plan| {
             plan.deinit();
@@ -3190,7 +3196,7 @@ fn parseQueryRequestWithDeadlineCore(
     }
     try validateScoreSortHasScoreBearingSource(req);
 
-    try prepareSourceOnlyProjection(alloc, &req, &projection_owner, worker_projection_fields != null);
+    if (worker_projection_fields != null) try prepareSourceOnlyProjection(alloc, &req, &projection_owner, true);
     return .{
         .projection_plan = projection_owner,
         .fields = fields,
@@ -16878,8 +16884,8 @@ fn consumerTests() type {
 
             try std.testing.expect(parsed.req.include_all_fields);
             try std.testing.expect(parsed.req.include_stored);
-            try std.testing.expect(parsed.req.defer_stored_projection);
-            try std.testing.expectEqual(@as(usize, 0), parsed.projection_plan.?.bindings.len);
+            try std.testing.expect(!parsed.req.defer_stored_projection);
+            try std.testing.expect(parsed.projection_plan == null);
             try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
         }
 
@@ -20470,6 +20476,8 @@ test "api query contract source only projection preserves public shape and worke
     const a = std.testing.allocator;
     var original = try parsePublicQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[\"arr.1.n\"]}");
     defer original.deinit(a);
+    try std.testing.expect(original.projection_plan == null);
+    try original.prepareEncodedDelivery(a);
     const plan = original.projection_plan.?;
     try std.testing.expectEqual(@as(usize, 0), plan.bindings.len);
     try std.testing.expect(field_projection.storageEligible(original.req));
@@ -20521,6 +20529,7 @@ test "api query contract source only projection preserves public shape and worke
     try std.testing.expect(empty.projection_plan == null);
     var ordered = try parsePublicQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[\"image\"],\"order_by\":[{\"field\":\"_id\"}]}");
     defer ordered.deinit(a);
+    try ordered.prepareEncodedDelivery(a);
     try std.testing.expect(ordered.projection_plan == null);
     try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(a, null, "docs", "{\"select\":{}}"));
 }
@@ -20529,6 +20538,8 @@ test "api query contract source only column delivery keeps payload outside metad
     const a = std.testing.allocator;
     var parsed = try parsePublicQueryRequest(a, null, "docs", "{\"fields\":[\"body\"]}");
     defer parsed.deinit(a);
+    try std.testing.expect(parsed.projection_plan == null);
+    try parsed.prepareEncodedDelivery(a);
     try std.testing.expectEqual(@as(usize, 0), parsed.projection_plan.?.bindings.len);
     const body = try a.alloc(u8, 1024 * 1024);
     defer a.free(body);

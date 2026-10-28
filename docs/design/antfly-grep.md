@@ -1362,8 +1362,11 @@ single-shard encoded-response shortcut. Legacy providers without the optional
 callback retain their owned wire response; no process-local consumer enters a
 shard RPC or a new public endpoint.
 
-Source-only public queries use the same private projection IR with zero named
-scalar bindings. This admits source masks to bounded native hydration without
+A native encoded-result consumer can prepare source-only masks with the same
+private projection IR and zero named scalar bindings. Ordinary public wire
+queries retain their established projection path. Preparation belongs to the
+physical delivery plan after catalog/lake routing, not public query parsing.
+This admits source masks to bounded native hydration without
 computing an unused identity. Completion fingerprints remain private worker
 transport metadata; public source-only responses omit `_computed`. Count-only,
 empty-source and unsupported execution shapes retain their existing paths, as
@@ -1378,9 +1381,20 @@ original deadlines. Named scalar expressions never downgrade. Consumer failures
 are normalized to `QueryDeliveryFailed` and cannot trigger this compatibility
 retry; the gateway retains the original failure classification locally.
 
-Implicit source-only preparation leaves ordered, retained/cursor and offset
+Encoded-delivery source preparation leaves ordered, retained/cursor and offset
 queries on their existing projection path. Native consumers with retained cuts
 or graph dialects also retain finalized wire responses, preserving carrier-owned
 continuation and exhaustion semantics. Private worker source programs still
 reconstruct their exact completion fingerprint, including during authenticated
 hydration; public source-only planning does not make a new pagination contract.
+
+Release qualification of `106b1e4b254c` caught ordinary-read regressions when
+source-only programs were injected during all public parsing: Unicode ordinary
+CPU rose 69% and escaped-string ordinary CPU rose 26%. That executable and its
+reports remain in ignored `output/projection-followup/delivery-global-106b/`;
+it is not the final qualified build. Source-program preparation now belongs to
+native encoded-result delivery, after lake routing. Ordinary wire reads keep
+their existing physical plan. Media groups estimated below 64 KiB encoded use
+owned-wire delivery; larger groups request the borrowed result view. Estimates
+choose a representation only: actual source/wire budgets, authorization,
+identity, digest, MIME and decoded bounds are enforced in both paths.

@@ -4744,6 +4744,12 @@ pub const AntflyApiHandler = struct {
                     }
                 }.cancelled };
                 var collector: MediaResult = .{ .ctx = self.ctx, .a = a, .references = references, .group = group, .output = output, .wire = .empty, .legacy = legacy, .flat = flat };
+                // Representation choice only: small groups retain the cheaper
+                // owned-wire path. Declared sizes never authorize or validate
+                // content; actual wire/source and decoded limits apply in both.
+                var encoded_estimate: usize = 0;
+                for (group.references.items) |slot| encoded_estimate +|= std.base64.standard.Encoder.calcSize(@min(references[slot].byte_length, 64 * 1024));
+                const borrow_result = encoded_estimate >= 64 * 1024;
                 // Ordinary admission, catalog binding, policy and read-cut execution
                 // feed the in-process consumer; unsupported producers retain wire.
                 var response = try self.server.consumePublicTableQuery(first.table, query, self.identity, &cancellation, .{
@@ -4751,7 +4757,7 @@ pub const AntflyApiHandler = struct {
                     .start_fn = MediaResult.start,
                     .write_fn = MediaResult.write,
                     .max_bytes = 32 * 1024 * 1024,
-                    .typed_result = .{ .ptr = &collector, .consume = MediaResult.consume },
+                    .typed_result = if (borrow_result) .{ .ptr = &collector, .consume = MediaResult.consume } else null,
                 });
                 defer response.deinit(self.server.alloc);
                 if (collector.projection_missing and !legacy and group.identity_images.items.len == 0) {

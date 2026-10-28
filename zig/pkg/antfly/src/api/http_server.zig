@@ -15744,6 +15744,11 @@ pub const ApiHttpServer = struct {
             if (try @import("lake_index_text_query.zig").executeWithDelivery(alloc, self, table, query_req.req, lake_request, delivery)) |result| return result;
         }
         if (query_req.req.remote_snapshot != null and query_req.req.native_query_cut == null) return error.InvalidQueryRequest;
+        // Source-program preparation is a physical delivery choice, not a
+        // change to every ordinary public query. Wire consumers keep the native
+        // reader's owned-response shortcut; lake delivery was handled above.
+        const native_delivery = if (delivery) |sink| (if (sink.typed_result != null) sink else null) else null;
+        if (native_delivery != null) try query_req.prepareEncodedDelivery(alloc);
         return (queryWithTransientReadRetryAndDelivery(
             alloc,
             self.sharedApiIo(),
@@ -15752,7 +15757,7 @@ pub const ApiHttpServer = struct {
             query_req.req,
             .read_index,
             .{ .resolve = self },
-            delivery,
+            native_delivery,
         ) catch |err| switch (err) {
             // Public filter syntax is validated and attributed during request
             // normalization. A later InvalidArgument can originate from any
@@ -60340,6 +60345,7 @@ test "httpx inference gateway native delivery preserves retries and source only 
     const a = std.testing.allocator;
     var parsed = try query_contract.parsePublicQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[\"images.preview\"]}");
     defer parsed.deinit(a);
+    try parsed.prepareEncodedDelivery(a);
     const Fake = struct {
         attempts: usize = 0,
         legacy: bool = false,

@@ -1015,8 +1015,10 @@ Consumers must bound encoded input before parsing it and retain owned copies of
 anything used afterward. Computed identities stay separate from both source
 representations. This changes no public JSON schema or authorization boundary.
 
-A public source mask can compile to the private projection IR with zero named
-outputs. Its worker completion fingerprint attests final source preparation,
+For a native consumer borrowing encoded results, a public source mask can
+compile to the private projection IR with zero named outputs. This is physical
+delivery preparation after catalog/lake routing; ordinary wire queries retain
+their established plan and do not implicitly compile a scalar program. Its worker completion fingerprint attests final source preparation,
 while public `_computed` remains absent. Native synchronous delivery is an
 optional method on the same table-read boundary, not an alternate authorization
 route. Bound, provisioned and hosted readers preserve read cuts and producer
