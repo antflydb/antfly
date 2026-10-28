@@ -109,6 +109,12 @@ pub fn create(b: *std.Build) ?Artifacts {
         }),
     });
     b.step("memory-test", "Run native memory policy, temporal, isolation and replay contracts").dependOn(&b.addRunArtifact(memory_tests).step);
+    const memory_dependency_tests = b.addTest(.{
+        .root_module = memory_tests.root_module,
+        .filters = &.{ "resolver curation dependency", "resolver curation incremental repairs" },
+    });
+    b.step("memory-dependency-test", "Verify bounded resolver dependency repair, read proofs and upgrade recovery")
+        .dependOn(&b.addRunArtifact(memory_dependency_tests).step);
     @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
     @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);
     const vopr_mod = shared.vopr_mod;
@@ -148,7 +154,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const usermgr_mod = shared.usermgr_mod;
     const fst_mod = shared.fst_mod;
     const regex_mod = shared.regex_mod;
-    @import("pkg/antfly-grep/build.zig").addConfigured(b, target, optimize, shared.antfly_version, strip);
+    @import("pkg/antfly-grep/build.zig").addConfigured(b, target, optimize, @import("pkg/antfly-grep/build.zig").releaseVersion(b), strip);
     const jsonschema_mod = shared.jsonschema_mod;
     const toon_mod = shared.toon_mod;
     const mcp_mod = shared.mcp_mod;

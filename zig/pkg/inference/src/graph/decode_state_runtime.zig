@@ -692,10 +692,16 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn appendGeneratedToken(self: *NativeDecodeState) !void {
+        const lock = if (self.isPaged()) self.lockPagedKv() else null;
+        defer if (lock) |mutex| mutex.unlock();
+        try self.appendGeneratedTokenWithKvLockHeld();
+    }
+
+    /// Graph replay holds the common KV lock before its owner mutex, through
+    /// readback; page retirement follows the same lock order.
+    pub fn appendGeneratedTokenWithKvLockHeld(self: *NativeDecodeState) !void {
         self.total_tokens += 1;
         if (self.isPaged()) {
-            const lock = self.lockPagedKv();
-            defer if (lock) |mutex| mutex.unlock();
             try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, 1);
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);

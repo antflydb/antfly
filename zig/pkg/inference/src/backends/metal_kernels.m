@@ -17108,21 +17108,22 @@ static size_t termite_metal_decode_gqa_split_effective_default_min_kv_tokens(
 
 int termite_metal_pipelined_decode_frame_device_default(void);
 
-static bool termite_metal_pipelined_decode_frame_enabled(void) {
+static bool termite_metal_pipelined_decode_frame_enabled(termite_metal_decode_runtime *runtime) {
     if (termite_metal_env_flag_truthy(
             getenv("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"))) return false;
     return termite_metal_env_flag_truthy(
                getenv("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME")) ||
         termite_metal_a4b_high_memory_fast_path_enabled() ||
-        termite_metal_pipelined_decode_frame_device_default() != 0;
+        termite_metal_pipelined_decode_frame_device_default() != 0 ||
+        (runtime != NULL && runtime->lightonocr3_projections_enabled);
 }
 
-static bool termite_metal_a4b_decode_gqa_split_frame_scratch_enabled(void) {
+static bool termite_metal_a4b_decode_gqa_split_frame_scratch_enabled(termite_metal_decode_runtime *runtime) {
     if (termite_metal_env_flag_truthy(
             getenv("TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"))) return false;
     return termite_metal_env_flag_truthy(
                getenv("TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH")) ||
-        termite_metal_pipelined_decode_frame_enabled();
+        termite_metal_pipelined_decode_frame_enabled(runtime);
 }
 
 static bool termite_metal_a4b_decode_gqa_split_enabled(void) {
@@ -29517,6 +29518,22 @@ void termite_metal_decode_runtime_set_lightonocr3_projections(termite_metal_deco
         return;
     runtime->lightonocr3_projections_enabled = enabled != 0;
     if (runtime->lightonocr3_projections_enabled) termite_metal_initialize_lightonocr3_local(runtime);
+    runtime->fast_prepared_frame_enabled =
+        termite_metal_fast_prepared_frame_enabled_for_device(runtime->device, runtime->apple_gpu_family) ||
+        (runtime->lightonocr3_projections_enabled &&
+         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME")));
+    runtime->decode_gqa_split_frame_scratch_enabled =
+        termite_metal_a4b_decode_gqa_split_frame_scratch_enabled(runtime);
+    // Model selection follows runtime construction. LightOn overlap needs
+    // a second scratch bank even when the generic device default is serial.
+    if (runtime->lightonocr3_projections_enabled &&
+        runtime->decode_gqa_split_frame_scratch_enabled &&
+        runtime->attention_decode_gqa_split_scratch_buffer != nil &&
+        runtime->attention_decode_gqa_split_scratch_buffer_alt == nil) {
+        runtime->attention_decode_gqa_split_scratch_buffer_alt =
+            antfly_observe_metal_buffer([runtime->device newBufferWithLength:runtime->attention_decode_gqa_split_scratch_capacity
+                                                                  options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+    }
     if (runtime->lightonocr3_projections_enabled) termite_metal_initialize_lightonocr3_recurrent(runtime);
     if (runtime->lightonocr3_projections_enabled &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS")) &&
@@ -30171,7 +30188,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
                 ? runtime->decode_gqa_split_min_kv_override
                 : TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS;
         runtime->decode_gqa_split_frame_scratch_enabled =
-            termite_metal_a4b_decode_gqa_split_frame_scratch_enabled();
+            termite_metal_a4b_decode_gqa_split_frame_scratch_enabled(runtime);
         runtime->trace_decode_gqa_split_schedule = termite_metal_env_flag_enabled(
             getenv("TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE"));
         bool decode_gqa_split_swa_override_valid = true;
@@ -50099,7 +50116,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
     // completed, so the runtime-owned route and MoE scratch buffers remain
     // command-queue ordered. Keep every other dual-frame use fail-closed.
     if (runtime->active_frame_cb == nil ||
-        (runtime->submitted_frame_cb != nil && !termite_metal_pipelined_decode_frame_enabled())) return -3;
+        (runtime->submitted_frame_cb != nil && !termite_metal_pipelined_decode_frame_enabled(runtime))) return -3;
     if (rows != 1 || hidden_size == 0 || hidden_size > UINT32_MAX ||
         inter_size == 0 || inter_size > UINT32_MAX || num_experts == 0 || num_experts > UINT32_MAX ||
         top_k == 0 || top_k > 8u || top_k > num_experts ||
@@ -50838,7 +50855,7 @@ static int termite_metal_decode_runtime_select_moe_routes_device_impl(
         top_k == 0 || top_k > 8 || top_k > num_experts) return -3;
     if (no_host_output &&
         (runtime->active_frame_cb == nil ||
-         (runtime->submitted_frame_cb != nil && !termite_metal_pipelined_decode_frame_enabled()))) return -3;
+         (runtime->submitted_frame_cb != nil && !termite_metal_pipelined_decode_frame_enabled(runtime)))) return -3;
     if (optimistic &&
         (rows != 1 ||
          runtime->moe_checkpoint_layer_miss_buffer == nil ||
@@ -69364,7 +69381,7 @@ static int termite_metal_decode_runtime_begin_frame_internal(
     if (runtime->active_frame_cb != nil) return -3;
     termite_metal_decode_runtime_reset_a4b_concurrent_ffn_scope(runtime);
     runtime->a4b_route_slots_fold_valid = 0u;
-    if (runtime->submitted_frame_cb != nil && !runtime->whisper_pipelined_frames && !termite_metal_pipelined_decode_frame_enabled()) return -4;
+    if (runtime->submitted_frame_cb != nil && !runtime->whisper_pipelined_frames && !termite_metal_pipelined_decode_frame_enabled(runtime)) return -4;
     if (runtime->submitted_frame_cb != nil && !runtime->whisper_pipelined_frames && runtime->pipelined_decode_frame_reported == 0) {
         fprintf(
             stderr,
@@ -73949,7 +73966,7 @@ size_t termite_metal_buffer_allocated_size(void *handle) {
 }
 
 int termite_metal_decode_runtime_stream_frames_available(termite_metal_decode_runtime *runtime) {
-    return runtime != NULL && termite_metal_pipelined_decode_frame_enabled() &&
+    return runtime != NULL && termite_metal_pipelined_decode_frame_enabled(runtime) &&
         runtime->decode_gqa_split_frame_scratch_enabled &&
         runtime->attention_decode_gqa_split_scratch_buffer != nil &&
         runtime->attention_decode_gqa_split_scratch_buffer_alt != nil;

@@ -263,12 +263,20 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     // Round each peak + 10% to whole GiB rather than applying a blanket bump
     // that would suppress unrelated compilation parallelism. See COMPILATION.md.
     const floors = [_]struct { name: []const u8, gib: usize }{
+        // Run 40624165216: native Nix glibc Zig 0.17.0 GNU Debug CAPI
+        // consumer object peaked at 17,141,358,592 bytes. Peak + 10%,
+        // rounded to whole GiB, fits the 20 GiB scheduler with room for
+        // small compilers instead of forcing a failed-claim recompilation.
+        .{ .name = test_owner_names.capi_contract, .gib = 18 },
         .{ .name = "public-api-parity", .gib = 20 },
         .{ .name = "data-runtime-tests", .gib = 14 },
         .{ .name = "standalone-runtime-owner-tests", .gib = 16 },
         .{ .name = "data-runtime-implementation-tests", .gib = 18 },
         .{ .name = "antfly-hosted-initial-fk-recovery", .gib = 14 },
         .{ .name = "sql-tests-local", .gib = 9 },
+        // Run 40586926751: native Nix Zig 0.17.0 GNU Debug auth compiler
+        // reached 15,804,899,328 bytes. Peak + 10%, rounded to whole GiB.
+        .{ .name = "api-auth-tests", .gib = 17 },
     };
     const gib: usize = for (floors) |floor| {
         if (std.mem.eql(u8, name, floor.name)) break floor.gib;
@@ -504,6 +512,26 @@ test "linked LLVM Debug test reservations cover native peaks without lowering au
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("unmeasured", linux, linux, .debug, 7 * gib));
 }
 
+test "native Linux Debug auth admission covers measured peak and retains small-owner overlap" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const musl = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const gib = 1024 * 1024 * 1024;
+    const peak: usize = 15_804_899_328;
+    const claim = testCompileMaxRss("api-auth-tests", linux, linux, .debug, 7 * gib);
+    const required = peak + (peak + 9) / 10;
+    try std.testing.expect(claim >= required and claim < required + gib);
+    // Auth cannot safely overlap the 12 GiB inference owner under CI's
+    // unchanged 20 GiB budget; small compiles still use the remaining space.
+    try std.testing.expect(claim + 12 * gib > 20 * gib);
+    try std.testing.expect(claim + 3 * gib <= 20 * gib);
+    try std.testing.expectEqual(24 * gib, testCompileMaxRss("api-auth-tests", linux, linux, .debug, 24 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-auth-tests", linux, linux, .safe, 7 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-auth-tests", linux, musl, .debug, 7 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-auth-tests", macos, linux, .debug, 7 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-derived-coverage-tests", linux, linux, .debug, 7 * gib));
+}
+
 test "native Darwin Debug test reservations cover measured peaks without unsafe overlap" {
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
@@ -541,7 +569,7 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, macos, linux, .debug, 12 * gib));
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, linux, macos, .debug, 12 * gib));
         // Some implementation closures now have independent Linux evidence.
-        const linux_floor: usize = if (std.mem.eql(u8, name, "data-runtime-implementation-tests")) 18 else if (std.mem.eql(u8, name, "antfly-hosted-initial-fk-recovery")) 14 else 7;
+        const linux_floor: usize = if (std.mem.eql(u8, name, "data-runtime-implementation-tests")) 18 else if (std.mem.eql(u8, name, "antfly-hosted-initial-fk-recovery")) 14 else if (std.mem.eql(u8, name, "api-auth-tests")) 17 else 7;
         try std.testing.expectEqual(linux_floor * gib, testCompileMaxRss(name, linux, linux, .debug, 7 * gib));
     }
 }
@@ -653,4 +681,13 @@ test "qualified local claims are independent of consumers and preserve three com
     // 28.75 GiB fits this host's 28.8 GiB compiler budget. Rounding each
     // claim to a whole GiB, or inheriting the consumer claim, prevents it.
     try std.testing.expect(consumer + root_local + data_local <= 36 * gib * 4 / 5);
+}
+
+test "native Linux CAPI test reservation covers the measured compiler without consuming the whole budget" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const peak: usize = 17_141_358_592;
+    const claim = testCompileMaxRss(test_owner_names.capi_contract, linux, linux, .debug, 7 * 1024 * 1024 * 1024);
+    try std.testing.expect(claim >= peak + peak / 10);
+    try std.testing.expect(claim + 2 * 1024 * 1024 * 1024 <= 20 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 7 * 1024 * 1024 * 1024), testCompileMaxRss(test_owner_names.capi_contract, linux, linux, .fast, 7 * 1024 * 1024 * 1024));
 }

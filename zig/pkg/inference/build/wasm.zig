@@ -169,6 +169,12 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     });
     wasm_runtime_abi_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_lib.root_module.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
+    const wasm_document_runs_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/document_runs.zig" })),
+        .target = wasm_target,
+        .optimize = .safe,
+    });
+    wasm_lib.root_module.addImport("antfly_document_runs", wasm_document_runs_mod);
     wasm_lib.root_module.addImport("antfly_platform", wasm_platform_mod);
     wasm_lib.root_module.addImport("antfly_document_runs", b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/document_runs.zig" })),

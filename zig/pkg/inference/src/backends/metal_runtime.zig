@@ -13720,7 +13720,7 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid ="));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid = 0u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_device_default() != 0"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_enabled();"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_enabled(runtime);"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "scratch_runtime->submitted_frame_cb != nil || output_offset"));
 
     const variants = [_]struct {

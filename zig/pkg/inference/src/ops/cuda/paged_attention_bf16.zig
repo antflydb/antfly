@@ -39,9 +39,12 @@ pub const Params = extern struct {
     row_values: u32 = 0,
     capacity: u32 = 0,
     pages: [64]Page = @splat(.{}),
+    graph_progress: driver.CUdeviceptr = 0,
+    graph_step: u32 = 0,
+    reserved: u32 = 0,
 };
 comptime {
-    if (@sizeOf(Page) != 268 or @sizeOf(Params) != 17248 or @offsetOf(Params, "pages") != 92)
+    if (@sizeOf(Page) != 268 or @sizeOf(Params) != 17264 or @offsetOf(Params, "pages") != 92)
         @compileError("LightOn CUDA attention packet ABI changed");
 }
 
@@ -51,6 +54,9 @@ const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighto
     .combine_d128 = "lighton_attention_combine",
     .write_suffix = "lighton_attention_write_suffix",
     .chunks128_d128 = "lighton_attention_chunks128",
+    .advance_graph = "lighton_graph_advance",
+    .grouped_chunks32_d128 = "lighton_attention_grouped_chunks32",
+    .grouped_chunks128_d128 = "lighton_attention_grouped_chunks128",
 });
 
 pub const Module = struct {
@@ -69,6 +75,14 @@ pub const Module = struct {
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
         try self.program.init(ctx);
     }
+    pub fn advanceGraph(self: *Module, ctx: *context.CudaContext, positions: driver.CUdeviceptr, progress: driver.CUdeviceptr, count: u32) !void {
+        if (count == 0 or count > 384) return error.InvalidShape;
+        var p = positions;
+        var c = progress;
+        var n = count;
+        var args = [_]?*anyopaque{ &p, &c, &n };
+        try self.program.launch(ctx, .advance_graph, 1, 1, 512, &args);
+    }
     pub fn writeSuffix(self: *Module, ctx: *context.CudaContext, params: *Params) !void {
         var args = [_]?*anyopaque{@ptrCast(params)};
         try self.program.launch(ctx, .write_suffix, (params.row_values + 127) / 128, params.items, 128, &args);
@@ -76,7 +90,13 @@ pub const Module = struct {
     }
     pub fn run(self: *Module, ctx: *context.CudaContext, params: *Params, chunk128: bool) !void {
         var args = [_]?*anyopaque{@ptrCast(params)};
-        try self.program.launch(ctx, if (chunk128) .chunks128_d128 else .chunks_d128, params.heads, params.items * params.chunks, 128, &args);
+        // Retain main's qualified grouped-CTA eligibility and geometry.
+        const grouped = (params.heads == 8 and !chunk128 and params.items >= 8) or
+            (params.heads == 16 and chunk128 and params.items >= 16);
+        const entry: Program.Entry = if (grouped)
+            (if (chunk128) .grouped_chunks128_d128 else .grouped_chunks32_d128)
+        else if (chunk128) .chunks128_d128 else .chunks_d128;
+        try self.program.launch(ctx, entry, if (grouped) params.kv_heads else params.heads, params.items * params.chunks, 128, &args);
         try self.program.launch(ctx, .combine_d128, params.items * params.heads, 1, 128, &args);
         self.calls += 1;
         self.chunk128_calls += @intFromBool(chunk128);

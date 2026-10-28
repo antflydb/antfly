@@ -245,6 +245,9 @@ const AttentionPlan = struct {
 pub const CublasLt = struct {
     // Immutable serving policy, scoped by the owning CUDA model profile.
     florence_canonical_f16_decode: bool = false,
+    lighton_canonical_gdn_decode: bool = false,
+    canonical_gdn_calls: usize = 0,
+    canonical_gdn_plans: usize = 0,
     canonical_f16_calls: usize = 0,
     canonical_f16_plans: usize = 0,
     canonical_f16_declines: usize = 0,
@@ -265,6 +268,7 @@ pub const CublasLt = struct {
     plan_cache_hits: usize = 0,
     plan_cache_misses: usize = 0,
     uncached_plans: usize = 0,
+    plan_cache_refreshes: usize = 0,
     // Bias pointers are invocation data in a cached descriptor. Serialize
     // biased submissions through the API call that consumes that descriptor;
     // ordinary serving plans never share this descriptor kind.
@@ -284,6 +288,27 @@ pub const CublasLt = struct {
         defer self.tensor_core_plans_mutex.unlock();
         if (capacity < self.tensor_core_plans.count()) return error.CublasLtUnsupported;
         self.plan_cache_capacity = capacity;
+    }
+
+    /// Caller owns the complete backend execution lane and has retired every
+    /// graph that could reference these plans. Refresh only at that boundary,
+    /// never by evicting a descriptor borrowed by an asynchronous invocation.
+    /// The configured capacity and retained hash-map allocation stay unchanged.
+    pub fn reserveTensorCorePlanSlots(self: *CublasLt, ctx: *context_mod.CudaContext, slots: usize) Error!bool {
+        if (slots == 0 or slots > self.plan_cache_capacity or self.allocator == null) return false;
+        spinLock(&self.tensor_core_plans_mutex);
+        const refresh = self.tensor_core_plans.count() > self.plan_cache_capacity - slots;
+        self.tensor_core_plans_mutex.unlock();
+        if (!refresh) return false;
+        if (ctx.streamCaptureActive() catch return error.CublasLtError) return error.CublasLtUnsupported;
+        ctx.synchronize() catch return error.CublasLtError;
+        spinLock(&self.tensor_core_plans_mutex);
+        defer self.tensor_core_plans_mutex.unlock();
+        var plans = self.tensor_core_plans.valueIterator();
+        while (plans.next()) |plan| self.destroyTensorCorePlan(plan.*);
+        self.tensor_core_plans.clearRetainingCapacity();
+        self.plan_cache_refreshes += 1;
+        return true;
     }
 
     const Table = struct {
@@ -432,6 +457,10 @@ pub const CublasLt = struct {
         _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, .{}, .dense, null);
     }
 
+    pub fn matmulBf16WeightBiasF32Out(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) Error!void {
+        _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_32F, .{}, .dense_bias, bias);
+    }
+
     /// Shape/alignment/workspace-specific bounded tuning, cached for replay.
     pub fn matmulBf16WeightBf16OutWithTuning(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) Error!MatmulSelection {
         return self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, tuning, .dense, null);
@@ -533,7 +562,7 @@ pub const CublasLt = struct {
         bias: ?buffer_mod.DeviceBuffer,
         residual: ?buffer_mod.DeviceBuffer,
     ) Error!MatmulSelection {
-        const canonical_decode = self.canonicalDecodeRows(kind, input_type, output_type, 1, rows, tuning) != 0;
+        const canonical_decode = input_type == CUDA_R_16F and self.canonicalDecodeRows(kind, input_type, output_type, 1, rows, in_dim, out_dim, tuning) != 0;
         // Count the entire invocation's failure, including validation, capture
         // misses, descriptor/probe discovery and a rejected actual submission.
         // Nested descriptor-only probes do not represent another invocation.
@@ -542,7 +571,7 @@ pub const CublasLt = struct {
         };
         if (residual != null and (tuning.enabled or bias != null or kind != .dense or input_type != CUDA_R_16BF or output_type != CUDA_R_32F)) return error.CublasLtUnsupported;
         if (bias != null) {
-            if ((input_type != CUDA_R_32F and input_type != CUDA_R_16F) or output_type != CUDA_R_32F or tuning.enabled) return error.CublasLtUnsupported;
+            if ((input_type != CUDA_R_32F and input_type != CUDA_R_16F and input_type != CUDA_R_16BF) or output_type != CUDA_R_32F or tuning.enabled) return error.CublasLtUnsupported;
             spinLock(&self.bias_submission_mutex);
         }
         defer if (bias != null) self.bias_submission_mutex.unlock();
@@ -594,7 +623,7 @@ pub const CublasLt = struct {
         var alpha: f32 = 1.0;
         var beta: f32 = if (residual != null) 1.0 else 0.0;
         const workspace_ptr: ?*anyopaque = if (workspace.ptr != 0 and plan.workspace_size > 0)
-            @ptrFromInt(workspace.ptr)
+            try devicePointer(workspace.ptr)
         else
             null;
         ctx.makeCurrent() catch return error.CublasLtError;
@@ -602,14 +631,14 @@ pub const CublasLt = struct {
             self.handle,
             plan.op_desc,
             &alpha,
-            @ptrFromInt(weight.ptr),
+            try devicePointer(weight.ptr),
             plan.a_desc,
-            @ptrFromInt(input.ptr),
+            try devicePointer(input.ptr),
             plan.b_desc,
             &beta,
-            @ptrFromInt(if (residual) |value| value.ptr else dst.ptr),
+            try devicePointer(if (residual) |value| value.ptr else dst.ptr),
             plan.c_desc,
-            @ptrFromInt(dst.ptr),
+            try devicePointer(dst.ptr),
             plan.d_desc,
             &plan.algo,
             workspace_ptr,
@@ -630,7 +659,13 @@ pub const CublasLt = struct {
         return plan.selection;
     }
 
-    fn canonicalDecodeRows(self: *const CublasLt, kind: TensorCorePlanKind, input_type: c_int, output_type: c_int, batch_count: usize, rows: usize, tuning: MatmulTuning) u32 {
+    fn canonicalDecodeRows(self: *const CublasLt, kind: TensorCorePlanKind, input_type: c_int, output_type: c_int, batch_count: usize, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) u32 {
+        // Query a descriptor at M128, but execute only the real rows. GB10's
+        // M65..127 heuristic for the 0.8B GDN projection can select a slower
+        // tile. AlgoCheck below still validates the exact original layouts.
+        if (self.lighton_canonical_gdn_decode and kind == .dense and input_type == CUDA_R_16BF and
+            output_type == CUDA_R_32F and batch_count == 1 and rows >= 65 and rows <= 128 and
+            in_dim == 1024 and out_dim == 6144 and !tuning.enabled) return 128;
         return if (self.florence_canonical_f16_decode and input_type == CUDA_R_16F and output_type == CUDA_R_32F and
             (kind == .dense or kind == .dense_bias) and batch_count == 1 and rows >= 1 and rows <= 64 and !tuning.enabled) 32 else 0;
     }
@@ -670,9 +705,11 @@ pub const CublasLt = struct {
             .alignment_c_bytes = cappedPointerAlignment(invocation.dst.ptr),
             .alignment_d_bytes = @min(cappedPointerAlignment(invocation.dst.ptr), cappedPointerAlignment(if (invocation.bias) |value| value.ptr else invocation.dst.ptr)),
             .tuning_fingerprint = effective_tuning.fingerprint(),
-            .canonical_rows = self.canonicalDecodeRows(kind, input_type, output_type, batch_count, rows, effective_tuning),
+            .canonical_rows = self.canonicalDecodeRows(kind, input_type, output_type, batch_count, rows, in_dim, out_dim, effective_tuning),
         };
-        if (key.canonical_rows != 0) self.canonical_f16_calls += 1;
+        if (key.canonical_rows != 0) {
+            if (key.input_type == CUDA_R_16BF) self.canonical_gdn_calls += 1 else self.canonical_f16_calls += 1;
+        }
 
         // Keep the steady-state path to one short plan-map lookup. The much
         // longer tuning mutex is taken only after a cache miss, then the map
@@ -803,10 +840,10 @@ pub const CublasLt = struct {
 
         var heuristics: [maximum_matmul_heuristics]MatmulHeuristicResult = undefined;
         var returned: c_int = 0;
+        const gdn_probe = key.canonical_rows != 0 and key.input_type == CUDA_R_16BF;
         const requested: c_int = if (tuning.enabled)
             @intCast(tuning.candidate_count)
-        else
-            1;
+        else if (gdn_probe and key.rows != key.canonical_rows) 2 else 1;
         if (key.canonical_rows != 0 and key.rows != key.canonical_rows) {
             // Query only descriptors at the canonical row count. No probe
             // GEMM executes and no extra device storage is allocated. The
@@ -814,10 +851,26 @@ pub const CublasLt = struct {
             var probe_key = key;
             probe_key.rows = key.canonical_rows;
             probe_key.canonical_rows = 0;
-            const probe = try self.createTensorCorePlan(probe_key, .{}, ctx, invocation);
+            const probe = self.createTensorCorePlan(probe_key, .{}, ctx, invocation) catch |err| {
+                if (!gdn_probe or err != error.CublasLtUnsupported) return err;
+                // A library may decline the descriptor probe while supporting
+                // the real shape. Preserve its ordinary cuBLAS route.
+                var ordinary_key = key;
+                ordinary_key.canonical_rows = 0;
+                const ordinary = try self.createTensorCorePlan(ordinary_key, tuning, ctx, invocation);
+                self.destroyTensorCorePlan(plan);
+                return ordinary;
+            };
             defer self.destroyTensorCorePlan(probe);
             heuristics[0] = .{ .algo = probe.algo, .workspace_size = probe.workspace_size, .state = CUBLAS_STATUS_SUCCESS, .waves_count = 0, .reserved = @splat(0) };
             returned = 1;
+            if (gdn_probe) {
+                // Keep the ordinary exact-shape heuristic as a fallback when
+                // the preferred tile cannot execute these actual buffers.
+                var ordinary_count: c_int = 0;
+                try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, plan.op_desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.d_desc, pref, 1, heuristics[1..].ptr, &ordinary_count));
+                if (ordinary_count == 1) returned = 2;
+            }
         } else {
             try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, plan.op_desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.d_desc, pref, requested, &heuristics, &returned));
         }
@@ -859,7 +912,9 @@ pub const CublasLt = struct {
         const fallback = firstUsableHeuristicIndex(candidates, invocation.workspace.len) orelse {
             return error.CublasLtUnsupported;
         };
-        if (key.canonical_rows != 0) self.canonical_f16_plans += 1;
+        if (key.canonical_rows != 0) {
+            if (gdn_probe) self.canonical_gdn_plans += 1 else self.canonical_f16_plans += 1;
+        }
 
         var selected = fallback;
         var timed_selection = false;
@@ -1012,7 +1067,7 @@ pub const CublasLt = struct {
         var alpha: f32 = 1.0;
         var beta: f32 = 0.0;
         const workspace_ptr: ?*anyopaque = if (invocation.workspace.ptr != 0 and workspace_size > 0)
-            @ptrFromInt(invocation.workspace.ptr)
+            try devicePointer(invocation.workspace.ptr)
         else
             null;
         ctx.makeCurrent() catch return error.CublasLtError;
@@ -1020,14 +1075,14 @@ pub const CublasLt = struct {
             self.handle,
             plan.op_desc,
             &alpha,
-            @ptrFromInt(invocation.weight.ptr),
+            try devicePointer(invocation.weight.ptr),
             plan.a_desc,
-            @ptrFromInt(invocation.input.ptr),
+            try devicePointer(invocation.input.ptr),
             plan.b_desc,
             &beta,
-            @ptrFromInt(invocation.dst.ptr),
+            try devicePointer(invocation.dst.ptr),
             plan.c_desc,
-            @ptrFromInt(invocation.dst.ptr),
+            try devicePointer(invocation.dst.ptr),
             plan.d_desc,
             &algo,
             workspace_ptr,
@@ -1101,20 +1156,20 @@ pub const CublasLt = struct {
         try checkRawBytes(workspace, plan.workspace_size);
         var alpha: f32 = 1.0;
         var beta: f32 = 0.0;
-        const workspace_ptr: ?*anyopaque = if (workspace.ptr != 0 and plan.workspace_size > 0) @ptrFromInt(workspace.ptr) else null;
+        const workspace_ptr: ?*anyopaque = if (workspace.ptr != 0 and plan.workspace_size > 0) try devicePointer(workspace.ptr) else null;
         ctx.makeCurrent() catch return error.CublasLtError;
         const submit_status = self.fns.cublasLtMatmul(
             self.handle,
             plan.op_desc,
             &alpha,
-            @ptrFromInt(weight_f16.ptr),
+            try devicePointer(weight_f16.ptr),
             plan.a_desc,
-            @ptrFromInt(input_f16.ptr),
+            try devicePointer(input_f16.ptr),
             plan.b_desc,
             &beta,
-            @ptrFromInt(dst.ptr),
+            try devicePointer(dst.ptr),
             plan.c_desc,
-            @ptrFromInt(dst.ptr),
+            try devicePointer(dst.ptr),
             plan.d_desc,
             &plan.algo,
             workspace_ptr,
@@ -1299,9 +1354,9 @@ pub const CublasLt = struct {
     fn submitAttentionPlan(self: *CublasLt, ctx: *context_mod.CudaContext, plan: AttentionPlan, dst: buffer_mod.DeviceBuffer, a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, alpha_value: f32) Error!void {
         var alpha = alpha_value;
         var beta: f32 = 0;
-        const workspace_ptr: ?*anyopaque = if (plan.workspace > 0) @ptrFromInt(workspace.ptr) else null;
+        const workspace_ptr: ?*anyopaque = if (plan.workspace > 0) try devicePointer(workspace.ptr) else null;
         ctx.makeCurrent() catch return error.CublasLtError;
-        try self.check(self.fns.cublasLtMatmul(self.handle, plan.op, &alpha, @ptrFromInt(a.ptr), plan.a, @ptrFromInt(b.ptr), plan.b, &beta, @ptrFromInt(dst.ptr), plan.d, @ptrFromInt(dst.ptr), plan.d, &plan.algo, workspace_ptr, plan.workspace, ctx.stream));
+        try self.check(self.fns.cublasLtMatmul(self.handle, plan.op, &alpha, try devicePointer(a.ptr), plan.a, try devicePointer(b.ptr), plan.b, &beta, try devicePointer(dst.ptr), plan.d, try devicePointer(dst.ptr), plan.d, &plan.algo, workspace_ptr, plan.workspace, ctx.stream));
     }
 
     pub fn matmulF32WeightF32Out(
@@ -1325,7 +1380,7 @@ pub const CublasLt = struct {
 
     fn setBias(self: *const CublasLt, desc: MatmulDesc, bias: buffer_mod.DeviceBuffer) Error!void {
         const epilogue: c_int = CUBLASLT_EPILOGUE_BIAS;
-        const pointer: *const anyopaque = @ptrFromInt(bias.ptr);
+        const pointer: *const anyopaque = try devicePointer(bias.ptr);
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, @sizeOf(c_int)));
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, @ptrCast(&pointer), @sizeOf(@TypeOf(pointer))));
     }
@@ -1379,6 +1434,12 @@ fn requireDisjoint(
     const a_end = std.math.add(u64, a.ptr, a_len) catch return error.CublasLtUnsupported;
     const b_end = std.math.add(u64, b.ptr, b_len) catch return error.CublasLtUnsupported;
     if (a.ptr < b_end and b.ptr < a_end) return error.CublasLtUnsupported;
+}
+
+// Device addresses stay 64-bit until crossing the native C pointer ABI.
+fn devicePointer(address: driver_mod.CUdeviceptr) Error!*anyopaque {
+    const native = std.math.cast(usize, address) orelse return error.CublasLtError;
+    return @ptrFromInt(native);
 }
 
 fn stridedPointerAlignment(ptr: driver_mod.CUdeviceptr, stride: usize, element_bytes: usize, batches: usize) u32 {

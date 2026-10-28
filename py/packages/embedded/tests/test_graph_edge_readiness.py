@@ -36,6 +36,10 @@ from antfly_embedded._library import find_library
 
 pytestmark = pytest.mark.usefixtures("require_native")
 
+# Persisted resolver pin indexes require this feature epoch, not the latest
+# reader supported by the library (plain databases must still remain at 1).
+LITE_RESOLVER_PIN_INDEX_READER_VERSION = 23
+
 
 def _index(stats: dict, name: str) -> dict:
     return next(item for item in stats["indexes"] if item["name"] == name)
@@ -869,6 +873,7 @@ def test_same_name_and_template_across_source_tables(tmp_path, storage, shared):
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
 def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, storage):
+    expected_reader = LITE_RESOLVER_PIN_INDEX_READER_VERSION if storage == antfly_embedded.Storage.LITE else 3
     options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
     path = tmp_path / ("replace.aflite" if storage == antfly_embedded.Storage.LITE else "replace")
     with _open_graph_test(path, options) as db:
@@ -878,9 +883,9 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         config["resolvers"][0]["promote"] = True
         config["replaces"] = "knowledge_v1"
         db.add_index(config)
-        # Lite persists resolver projection jobs; directory storage retains
+        # Lite persists resolver pin indexes; directory storage retains
         # the identity catalog's reader requirement without that file format.
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
         before = db.list_resolver_identities()
         # Existing-target replacement must reject non-graph old indexes before
         # registering changed inline resolver config, for either storage mode.
@@ -893,7 +898,7 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         assert db.list_resolver_identities() == before
         db.add_index(config)
     with _open_graph_test(path, options) as db:
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
         assert db.list_resolver_identities() == before
 
 
@@ -1318,7 +1323,19 @@ def test_pending_replacement_name_is_reserved_and_cancellable(tmp_path, storage)
         assert "old" in {i["name"] for i in db.list_indexes()}
         db.run_until_idle()
         assert not db.pending_work_stats()["replacements"]
-        db.add_index(dict(config, replaces="old"))
+        # Cancellation retires the shadow before its asynchronous artifact
+        # cleanup releases the name. Draining replay is not that cleanup fence.
+        # Retry only the documented retirement debt, without hiding other Busy
+        # errors or weakening the final replacement/edge assertions.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                db.add_index(dict(config, replaces="old"))
+                break
+            except antfly_embedded.BusyError as error:
+                assert "IndexArtifactCleanupPending" in str(error)
+                assert time.monotonic() < deadline, str(error)
+                time.sleep(0.01)
         db.run_until_idle()
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "s:0000", "R", 0)] == ["new"]
 
@@ -1416,6 +1433,7 @@ def test_named_replacement_does_not_permanently_upgrade_root(tmp_path, storage, 
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
 def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
+    expected_reader = LITE_RESOLVER_PIN_INDEX_READER_VERSION if storage == antfly_embedded.Storage.LITE else 3
     path = tmp_path / ("aggregate-fence.aflite" if storage == antfly_embedded.Storage.LITE else "aggregate-fence")
     options = antfly_embedded.OpenOptions(storage=storage)
     graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
@@ -1429,10 +1447,10 @@ def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
         with db.open_table("source") as table:
             table.add_index(_resolver_graph("knowledge", "concepts", destination="source"))
         assert db.cancel_replacement("new")
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
     with _open_graph_test(path, options) as db:
         # Permanent aggregation is durable, even before opening the child.
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
 
 
 @pytest.mark.parametrize("promote", [False, True])

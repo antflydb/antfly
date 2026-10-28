@@ -22,12 +22,14 @@ const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighto
     .bias_gelu_bf16 = "lighton_vision_bias_gelu_bf16",
     .bias_residual_f32 = "lighton_vision_bias_residual_f32",
     .split_qkv_rope_2d_bf16 = "lighton_vision_qkv_rope_bf16",
+    .learned_positions = "lighton_vision_learned_positions_f32",
 });
 
 pub const Module = struct {
     program: Program = .{},
     calls: usize = 0,
     qkv_calls: usize = 0,
+    position_calls: usize = 0,
 
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
         try self.program.init(ctx);
@@ -57,6 +59,19 @@ pub const Module = struct {
         var d = dim;
         var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &n, &d };
         try self.program.launch(ctx, .bias_residual_f32, (count + 255) / 256, 1, 256, &args);
+    }
+    pub fn learnedPositions(self: *Module, ctx: *context.CudaContext, pointers: [3]driver.CUdeviceptr, grid_x: u32, grid_y: u32, merge: u32, side: u32, dim: u32, bf16: bool) !void {
+        var p = pointers;
+        var x = grid_x;
+        var y = grid_y;
+        var m = merge;
+        var source_side = side;
+        var d = dim;
+        var kind: u32 = @intFromBool(bf16);
+        var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &x, &y, &m, &source_side, &d, &kind };
+        const count = grid_x * grid_y * dim;
+        try self.program.launch(ctx, .learned_positions, (count + 255) / 256, 1, 256, &args);
+        self.position_calls += 1;
     }
     pub fn qkvRope(self: *Module, ctx: *context.CudaContext, pointers: [5]driver.CUdeviceptr, rows: u32, heads: u32, dim: u32, theta: f32) !void {
         var p = pointers;

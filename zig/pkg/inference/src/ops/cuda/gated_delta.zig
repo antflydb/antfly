@@ -21,6 +21,9 @@ pub const State = struct {
     ctx: ?*context.CudaContext = null,
     history: [2]buffer.DeviceBuffer = .{ .{}, .{} },
     recurrent: buffer.DeviceBuffer = .{},
+    /// One physical owner for pooled history, recurrence and owned weight
+    /// snapshots. Their descriptors are borrowed, non-overlapping views.
+    packed_storage: buffer.DeviceBuffer = .{},
     weights: [4]buffer.DeviceBuffer = .{ .{}, .{}, .{}, .{} },
     owns_weights: [4]bool = @splat(true),
     // The compute/session owner already outlives ctx and every page state.
@@ -40,6 +43,11 @@ pub const State = struct {
     }
 
     fn releaseOwned(self: *State, ctx: *context.CudaContext, value: *buffer.DeviceBuffer) void {
+        // A packed view must never become an independently cached alias.
+        if (value.borrowed) {
+            value.free(ctx);
+            return;
+        }
         if (!self.failed) if (self.release_buffer) |release| {
             release(self.release_context.?, value);
             return;
@@ -52,6 +60,7 @@ pub const State = struct {
             for (&self.history) |*value| self.releaseOwned(ctx, value);
             self.releaseOwned(ctx, &self.recurrent);
             for (&self.weights, self.owns_weights) |*value, owned| if (owned) self.releaseOwned(ctx, value);
+            self.releaseOwned(ctx, &self.packed_storage);
         }
         if (self.admission) |*lease| lease.release();
         self.* = .{};
@@ -137,6 +146,8 @@ const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighto
 
 pub const Module = struct {
     program: Program = .{},
+    bf16_prefill: ?@import("lighton_prefill.zig").Module = null,
+    bf16_prefill_configured: bool = false,
 
     prefix_shared_qk_calls: usize = 0,
     ragged_batch_calls: usize = 0,
@@ -158,17 +169,25 @@ pub const Module = struct {
         try self.program.launch(ctx, .split_projections, (count + 255) / 256, 1, 256, &args);
     }
 
-    pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        if (self.program.module != null) {
-            self.program.deinit(ctx);
-            self.* = .{};
+    /// Resolve the opt-in library once per compute owner, before any claim
+    /// can mutate histories. An invalid requested library is a hard error.
+    pub fn configureBf16Prefill(self: *Module, ctx: *context.CudaContext, path: ?[]const u8) !void {
+        if (self.bf16_prefill_configured) return;
+        if (path) |name| {
+            if (ctx.info.compute_major != 12 or ctx.info.compute_minor != 1) return error.LightOnPrefillUnsupportedDevice;
+            self.bf16_prefill = try @import("lighton_prefill.zig").Module.init(name);
         }
+        self.bf16_prefill_configured = true;
+    }
+
+    pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
+        if (self.bf16_prefill) |*prefill| prefill.deinit(ctx);
+        self.program.deinit(ctx);
+        self.* = .{};
     }
 
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
-        const loaded = self.program.module != null;
         try self.program.init(ctx);
-        if (!loaded) self.* = .{ .program = self.program };
     }
 
     fn launch(self: *Module, ctx: *context.CudaContext, entry: Program.Entry, grid_x: usize, grid_y: usize, args: []?*anyopaque) !void {
@@ -192,13 +211,22 @@ pub const Module = struct {
     }
 
     pub fn runRaggedWithDecodeFusion(self: *Module, ctx: *context.CudaContext, params: *RaggedParams, rows: u32, fused_decode: bool) !void {
+        return self.runRaggedWithPrefill(ctx, params, rows, fused_decode, 0, 0);
+    }
+
+    pub fn runRaggedWithPrefill(self: *Module, ctx: *context.CudaContext, params: *RaggedParams, rows: u32, fused_decode: bool, scratch: driver.CUdeviceptr, scratch_bytes: usize) !void {
         var packet = [_]?*anyopaque{@ptrCast(params)};
         const channels: usize = (2 * params.base.key_heads + params.base.value_heads) * 128;
         var decode_pages: usize = 0;
         if (fused_decode) for (params.lengths[0..params.base.items]) |n| {
             decode_pages += @intFromBool(n == 1);
         };
-        if (decode_pages > 0) {
+        if (scratch_bytes != 0) {
+            const prefill = if (self.bf16_prefill) |*value| value else return error.LightOnPrefillUnavailable;
+            try prefill.run(params, scratch, scratch_bytes, ctx.info.selected_device, ctx.stream);
+            try self.launch(ctx, .ragged_prefix_gated_norm, rows * params.base.value_heads, 1, &packet);
+            if (decode_pages > 0) try self.launchFusedDecode(ctx, params, &packet, decode_pages);
+        } else if (decode_pages > 0) {
             if (decode_pages < params.base.items) {
                 try self.launch(ctx, .ragged_prefix_conv, channels / 128, rows, &packet);
                 try self.launch(ctx, .ragged_recurrent_prefix_only, 4, params.base.items * params.base.value_heads, &packet);

@@ -70,11 +70,38 @@ jobs:
       suite: ${{ inputs.full_validation && 'full' || 'zig' }}
 
   grep-qualification:
-    name: native grep qualification
-    needs: admission
-    if: ${{ !cancelled() && needs.admission.result == 'success' && inputs.validation_scope != 'inference-e2e' && (inputs.pr_number == '' || github.run_attempt == 1) }}
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      inputs.validation_scope != 'inference-e2e' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      ( inputs.full_validation ||
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (inputs.pr_number == '' && github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
+      github.event.schedule == '0 8 * * *' ||
+      (!inputs.full_validation &&
+      (inputs.pr_number != '' || github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) ) }}
+    name: zig-${{ matrix.suite }} / grep
+    needs: [admission, changes]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      matrix:
+        # Select one profile so full validation does not build/test grep twice.
+        include: >-
+          ${{ fromJSON(
+          (inputs.full_validation ||
+          github.event_name == 'merge_group' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (inputs.pr_number == '' && github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
+          github.event.schedule == '0 8 * * *') &&
+          '[{"suite":"full","cases":5000}]' ||
+          '[{"suite":"base","cases":500}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -96,11 +123,14 @@ jobs:
           echo 'e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849  '"$RUNNER_TEMP/ripgrep-15.2.0-x86_64-unknown-linux-musl/rg" | sha256sum --check
           echo "$RUNNER_TEMP/ripgrep-15.2.0-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
       - name: Native tests and generated differential campaign
+        env:
+          DIFFERENTIAL_CASES: ${{ matrix.cases }}
         run: |
           zig build --build-file zig/build.zig -Dgrep-only=true -Doptimize=ReleaseFast -Dstrip=true grep grep-test
           mkdir -p zig/zig-out/grep-qualification
-          python3 zig/pkg/antfly-grep/tests/differential.py zig/zig-out/bin/antfly-grep "$(command -v rg)" --seed 116417 --cases 5000 --output zig/zig-out/grep-qualification/differential.json
+          python3 zig/pkg/antfly-grep/tests/differential.py zig/zig-out/bin/antfly-grep "$(command -v rg)" --seed 116417 --cases "$DIFFERENTIAL_CASES" --output zig/zig-out/grep-qualification/differential.json
       - name: Benchmark native CPU and cache configurations
+        if: matrix.suite == 'full'
         shell: bash
         run: |
           python3 zig/pkg/antfly-grep/bench/compare.py zig/zig-out/bin/antfly-grep --extended --codecs --mib 8 --rounds 7 --quiet --output zig/zig-out/grep-qualification/warm.json
@@ -112,11 +142,12 @@ jobs:
       - name: Verify standalone release contents
         run: |
           python3 -m unittest discover -s scripts/packaging -p test_grep_packaging.py
+          python3 -m unittest discover -s scripts/release -p test_grep_release.py
           python3 scripts/packaging/package_grep_release.py --binary zig/zig-out/bin/antfly-grep --output zig/zig-out/grep-qualification/antfly-grep-linux-x86_64.tar.gz
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: native-grep-qualification
+          name: zig-${{ matrix.suite }}-grep
           path: zig/zig-out/grep-qualification/
 
   changes:
@@ -591,7 +622,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -900,7 +931,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -1010,13 +1041,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
-      - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      # These are the same large native CAPI test objects as the full gate.
+      # Keep the compiler allocator and measured admission profile identical.
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
 
       - name: Restore ARC Zig cache dirs
         id: cache
@@ -1167,10 +1205,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Install Nix
-        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1583,10 +1621,10 @@ jobs:
           bash "$helper" build-essential pkg-config ca-certificates git curl xz-utils file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Install Nix
-        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1899,12 +1937,12 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.rust_version }}
       - name: Set up Python
         if: matrix.sdk == 'python'
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
         if: matrix.sdk == 'python'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Set up Node
         if: matrix.sdk == 'typescript'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1918,7 +1956,17 @@ jobs:
       - name: Test embedded SDK against the installed C ABI
         env:
           ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/embedded-sdk-native-models
+          ANTFLY_SDK_NATIVE_REPORT_DIR: ${{ runner.temp }}/embedded-sdk-native-reports
         run: scripts/ci/test-embedded-sdk-native.sh "${RUNNER_TEMP}/native-sdk" "${{ matrix.sdk }}"
+
+      - name: Retain Python native test results and timings
+        if: always() && matrix.sdk == 'python'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: embedded-sdk-python-results-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/embedded-sdk-native-reports
+          if-no-files-found: ignore
+          retention-days: 14
 
   pgwire-driver-conformance:
     if: >-
@@ -1962,11 +2010,11 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.rust_version }}
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Test standard PostgreSQL drivers against candidate runtime
         run: >-
           uv run --no-project --with requests --with pytest
@@ -1993,7 +2041,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e
       - name: Restore common E2E duration history
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -2112,7 +2160,7 @@ jobs:
           ln -s "$cache_root/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2271,7 +2319,7 @@ jobs:
           ln -s "$cache_root/home-antfly-low-fd" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2593,7 +2641,7 @@ jobs:
           ln -s "$home_cache_root/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
