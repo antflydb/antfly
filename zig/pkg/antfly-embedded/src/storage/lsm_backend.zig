@@ -7347,6 +7347,36 @@ pub const Backend = struct {
         return @import("lsm_backend/manifest_credit.zig").estimate(self.allocator, self.options, self.root_dir.?.len, incoming, bulk);
     }
 
+    /// Original caller CPU performs planning outside Backend.mu, including
+    /// guarded DB scopes which cannot lend CPU. Partial scratch moves into the
+    /// existing protected retirement queue before the staged input may expire.
+    pub fn prepareManifestCreditWithAdmission(self: *Backend, incoming: anytype, bulk: anytype, original: read_admission.Port) !u64 {
+        try original.checkpoint();
+        if (self.root_dir == null) return 0;
+        const planner = @import("lsm_backend/manifest_credit.zig");
+        if (self.options.run_partition_prefix_bytes == 0 and self.options.run_partition_key == null) {
+            var scalar = planner.OwnedEstimate.init(self.allocator, null);
+            return scalar.estimate(self.options, self.root_dir.?.len, incoming, bulk, original);
+        }
+        const owner = self.background_executor.runtime;
+        if (self.options.resource_manager == null or owner == null or owner.?.runnableOwner() == null or
+            !self.background_executor.canRunDetached() or
+            (self.options.run_partition_key != null and self.options.run_partition_key_with_admission == null))
+        {
+            const result = try self.prepareManifestCredit(incoming, bulk);
+            try original.checkpoint();
+            return result;
+        }
+        const frame = try @import("lsm_backend/manifest_edit_preparation.zig").Frame.create(self);
+        defer {
+            const locked = runtime_mod.lockBackend(Backend, self);
+            self.retireManifestPreparation(frame);
+            self.notePotentialMaintenanceDebtLocked();
+            runtime_mod.unlockBackend(Backend, self, locked);
+        }
+        return frame.estimateCredit(self, incoming, bulk, original);
+    }
+
     fn manifestCreditFits(self: *const Backend, extra: u64) bool {
         if (self.root_dir == null) return true;
         if (self.manifest_journal.segment_count >= @import("lsm_backend/manifest_set.zig").max_segments - 1) return false;

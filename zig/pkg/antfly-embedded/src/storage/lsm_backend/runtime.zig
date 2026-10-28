@@ -472,6 +472,13 @@ pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
+fn prepareCommitManifestCredit(backend: anytype, incoming: *const ActiveMemTable, bulk: *const State, control: ?read_admission.Port) !u64 {
+    if (comptime @hasDecl(@TypeOf(backend.*), "prepareManifestCreditWithAdmission")) if (control) |original|
+        return backend.prepareManifestCreditWithAdmission(incoming, bulk, original);
+    if (comptime @hasDecl(@TypeOf(backend.*), "prepareManifestCredit")) return backend.prepareManifestCredit(incoming, bulk);
+    return 0;
+}
+
 fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, control: ?read_admission.Port, retired_without_commit: *bool) !bool {
     if (incoming.entryCount() == 0) return false;
     if (comptime @hasDecl(@TypeOf(backend.*), "publishMutableWithWalAdmission")) if (control) |original| {
@@ -5240,7 +5247,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.bulk_index.deinit(self.allocator);
                 self.prefix_index.deinit(self.allocator);
             };
-            const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
+            const wire_credit = try prepareCommitManifestCredit(self.backend, &self.mutable, &self.bulk_appends, control);
             const locked = if (control) |original|
                 if (try original.hasExecutionWait()) try lockBackendWithAdmission(BackendType, self.backend, original) else lockBackend(BackendType, self.backend)
             else
@@ -11283,7 +11290,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.batch_scratch.deinit(self.metadata_allocator);
                 self.probe_scratch.deinit(self.metadata_allocator);
             };
-            const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
+            const wire_credit = try prepareCommitManifestCredit(self.backend, &self.mutable, &self.bulk_appends, control);
             const locked = if (control) |original|
                 if (try original.hasExecutionWait()) try lockBackendWithAdmission(BackendType, self.backend, original) else lockBackend(BackendType, self.backend)
             else

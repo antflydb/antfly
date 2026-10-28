@@ -69,6 +69,224 @@ pub fn estimate(allocator: std.mem.Allocator, options: anytype, root_len: usize,
     return bytes;
 }
 
+const admission = @import("../../common/read_admission.zig");
+const resources = @import("../resource_manager.zig");
+pub var test_hook: ?*const fn (*OwnedEstimate, admission.Port) anyerror!void = null;
+pub var test_retire_hook: ?*const fn (*OwnedEstimate, admission.Port) anyerror!void = null;
+
+/// One synchronous planning attempt. Keys borrow only the producer's staged
+/// entries during estimate(); retirement follows owned next pointers and never
+/// dereferences those borrowed labels. The allocator and every partial table
+/// survive rejection in the backend's existing preparation retirement queue.
+pub const OwnedEstimate = struct {
+    const Node = struct { next: ?*Node, hash: u64, key: Key, group: Group = .{} };
+    const Slots = []?*Node;
+    backing: std.mem.Allocator,
+    budget: ?resources.BudgetedAllocator = null,
+    nodes: ?*Node = null,
+    count: usize = 0,
+    slots: Slots = &.{},
+    pending_slots: Slots = &.{},
+    old_slots: Slots = &.{},
+    old_offset: usize = 0,
+    pending_offset: usize = 0,
+    slots_offset: usize = 0,
+    retired: bool = false,
+    retiring: bool = false,
+
+    pub fn init(backing: std.mem.Allocator, manager: ?*resources.ResourceManager) @This() {
+        return .{ .backing = backing, .budget = if (manager) |m| resources.BudgetedAllocator.init(m, .lsm_table_builder_working_set, backing, 1) else null };
+    }
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return if (self.budget) |*budget| budget.threadSafeNoReclaimAllocator() else self.backing;
+    }
+    fn checkpoint(self: *@This(), original: admission.Port) !void {
+        try original.checkpoint();
+        if (comptime @import("builtin").is_test) if (test_hook) |hook| try hook(self, original);
+    }
+    fn hashKey(self: *@This(), key: Key, original: admission.Port) !u64 {
+        var hash = std.hash.Wyhash.init(0);
+        hash.update(std.mem.asBytes(&key.namespace_present));
+        for ([_][]const u8{ key.namespace, key.prefix, key.domain }) |part| {
+            hash.update(std.mem.asBytes(&part.len));
+            var offset: usize = 0;
+            while (offset < part.len) {
+                try self.checkpoint(original);
+                const end = offset + @min(part.len - offset, 16 * 1024);
+                hash.update(part[offset..end]);
+                offset = end;
+            }
+        }
+        return hash.final();
+    }
+    fn equal(self: *@This(), a: Key, b: Key, original: admission.Port) !bool {
+        if (a.namespace_present != b.namespace_present) return false;
+        for ([_][]const u8{ a.namespace, a.prefix, a.domain }, [_][]const u8{ b.namespace, b.prefix, b.domain }) |left, right| {
+            if (left.len != right.len) return false;
+            var offset: usize = 0;
+            while (offset < left.len) {
+                try self.checkpoint(original);
+                const end = offset + @min(left.len - offset, 16 * 1024);
+                if (!std.mem.eql(u8, left[offset..end], right[offset..end])) return false;
+                offset = end;
+            }
+        }
+        return true;
+    }
+    fn retirementCheckpoint(self: *@This(), original: ?admission.Port) !void {
+        if (original) |port| {
+            try port.checkpoint();
+            if (comptime @import("builtin").is_test) if (self.retiring) if (test_retire_hook) |hook| try hook(self, port);
+        }
+    }
+    fn retireSlots(self: *@This(), slots: *Slots, offset: *usize, credits: ?*usize, original: ?admission.Port) !bool {
+        const bytes = std.mem.sliceAsBytes(slots.*);
+        while (offset.* < bytes.len) {
+            if (credits) |remaining| if (remaining.* == 0) return false;
+            try self.retirementCheckpoint(original);
+            if (credits) |remaining| remaining.* -= 1;
+            const end = offset.* + @min(bytes.len - offset.*, 16 * 1024);
+            @memset(bytes[offset.*..end], undefined);
+            offset.* = end;
+        }
+        if (bytes.len != 0) {
+            if (credits) |remaining| if (remaining.* == 0) return false;
+            try self.retirementCheckpoint(original);
+            if (credits) |remaining| remaining.* -= 1;
+            self.allocator().rawFree(bytes, .of(?*Node), @returnAddress());
+        }
+        slots.* = &.{};
+        offset.* = 0;
+        return true;
+    }
+    fn grow(self: *@This(), original: admission.Port) !void {
+        const capacity = if (self.slots.len == 0) 8 else try std.math.mul(usize, self.slots.len, 2);
+        const bytes = try std.math.mul(usize, capacity, @sizeOf(?*Node));
+        try self.checkpoint(original);
+        const raw = self.allocator().rawAlloc(bytes, .of(?*Node), @returnAddress()) orelse return error.OutOfMemory;
+        self.pending_slots = @as([*]?*Node, @ptrCast(@alignCast(raw)))[0..capacity];
+        var offset: usize = 0;
+        while (offset < capacity) {
+            try self.checkpoint(original);
+            const end = offset + @min(capacity - offset, (16 * 1024) / @sizeOf(?*Node));
+            @memset(self.pending_slots[offset..end], null);
+            offset = end;
+        }
+        var cursor = self.nodes;
+        while (cursor) |node| : (cursor = node.next) {
+            var slot: usize = @as(usize, @truncate(node.hash)) & (capacity - 1);
+            while (self.pending_slots[slot] != null) {
+                try self.checkpoint(original);
+                slot = (slot + 1) & (capacity - 1);
+            }
+            try self.checkpoint(original);
+            self.pending_slots[slot] = node;
+        }
+        self.old_slots = self.slots;
+        self.slots = self.pending_slots;
+        self.pending_slots = &.{};
+        const complete = try self.retireSlots(&self.old_slots, &self.old_offset, null, original);
+        std.debug.assert(complete);
+    }
+    fn group(self: *@This(), key: Key, original: admission.Port) !*Group {
+        const hash = try self.hashKey(key, original);
+        if (self.slots.len != 0) {
+            var slot: usize = @as(usize, @truncate(hash)) & (self.slots.len - 1);
+            while (self.slots[slot]) |node| {
+                try self.checkpoint(original);
+                if (node.hash == hash and try self.equal(node.key, key, original)) return &node.group;
+                slot = (slot + 1) & (self.slots.len - 1);
+            }
+        }
+        if (self.count >= self.slots.len / 2) try self.grow(original);
+        try self.checkpoint(original);
+        const node = try self.allocator().create(Node);
+        node.* = .{ .next = self.nodes, .hash = hash, .key = key };
+        self.nodes = node;
+        self.count += 1;
+        var slot: usize = @as(usize, @truncate(hash)) & (self.slots.len - 1);
+        while (self.slots[slot] != null) {
+            try self.checkpoint(original);
+            slot = (slot + 1) & (self.slots.len - 1);
+        }
+        self.slots[slot] = node;
+        return &node.group;
+    }
+    fn add(target: *Group, entry: anytype) void {
+        const names = @as(u64, entry.key.len) +| if (entry.namespace_name) |name| name.len else @as(usize, 0);
+        target.rows +|= 1;
+        target.logical +|= 32 +| names +| entry.value.len;
+        target.physical +|= 256 +| 8 *| names +| 2 *| entry.value.len;
+        target.bound_bytes = @max(target.bound_bytes, names);
+    }
+    pub fn estimate(self: *@This(), options: anytype, root_len: usize, first: anytype, second: anytype, original: admission.Port) !u64 {
+        try self.checkpoint(original);
+        var unpartitioned: Group = .{};
+        const partitioned = options.run_partition_prefix_bytes != 0 or options.run_partition_key != null;
+        inline for (.{ first, second }) |state| {
+            for (0..state.entryCount()) |i| {
+                // The scalar path touches fixed metadata only. Bound its CPU
+                // work by rows without dispatching authority for every field.
+                if (partitioned or i % 64 == 0) try self.checkpoint(original);
+                const entry = state.entryAt(i);
+                if (!partitioned) {
+                    add(&unpartitioned, entry);
+                    continue;
+                }
+                const domain = if (options.run_partition_key != null) blk: {
+                    const extract = options.run_partition_key_with_admission orelse return error.ExecutionWaitUnsupported;
+                    break :blk try extract(entry.key, original);
+                } else "";
+                const target = try self.group(.{ .namespace = entry.namespace_name orelse "", .namespace_present = entry.namespace_name != null, .prefix = entry.key[0..@min(options.run_partition_prefix_bytes, entry.key.len)], .domain = domain }, original);
+                add(target, entry);
+            }
+        }
+        if (!partitioned) {
+            try self.checkpoint(original);
+            return if (unpartitioned.rows == 0) 0 else 128 +| groupWire(options, root_len, unpartitioned);
+        }
+        if (self.count == 0) return 0;
+        var bytes: u64 = 128;
+        var cursor = self.nodes;
+        while (cursor) |node| : (cursor = node.next) {
+            try self.checkpoint(original);
+            bytes +|= groupWire(options, root_len, node.group);
+        }
+        return bytes;
+    }
+    pub fn retireStep(self: *@This(), credits: *usize, original: ?admission.Port) !bool {
+        if (self.retired) return true;
+        self.retiring = true;
+        try self.retirementCheckpoint(original);
+        // old_slots can already be partially poisoned by an interrupted grow.
+        if (!try self.retireSlots(&self.old_slots, &self.old_offset, credits, original)) return false;
+        if (!try self.retireSlots(&self.pending_slots, &self.pending_offset, credits, original)) return false;
+        if (!try self.retireSlots(&self.slots, &self.slots_offset, credits, original)) return false;
+        while (self.nodes) |node| {
+            if (credits.* == 0) return false;
+            try self.retirementCheckpoint(original);
+            credits.* -= 1;
+            self.nodes = node.next;
+            self.allocator().destroy(node);
+        }
+        if (credits.* == 0) return false;
+        try self.retirementCheckpoint(original);
+        credits.* -= 1;
+        if (self.budget) |*budget| {
+            std.debug.assert(budget.live_bytes == 0);
+            budget.deinit();
+            self.budget = null;
+        }
+        self.retired = true;
+        return true;
+    }
+    pub fn retireWithAdmission(self: *@This(), original: ?admission.Port) !void {
+        var credits: usize = std.math.maxInt(usize);
+        const complete = try self.retireStep(&credits, original);
+        std.debug.assert(complete);
+    }
+};
+
 fn groupWire(options: anytype, root_len: usize, group: Group) u64 {
     const logical_limit = @max(@as(u64, 1), @min(options.max_run_file_bytes, @import("../lsm/table_file.zig").max_entry_data_len));
     const physical_limit = @max(@as(u64, 1), @min(options.max_run_file_physical_bytes, @import("repository.zig").maxRunFileReadBytes()));

@@ -29,6 +29,7 @@ const Comparison = @import("run_comparison.zig").Cursor;
 const platform = @import("antfly_platform");
 const Run = repository.Run;
 const storage_io = @import("storage_io.zig");
+pub const credit_planning = @import("manifest_credit.zig");
 pub const foreground_append = @import("foreground_wal_append.zig");
 pub const wal_retirement = @import("normal_wal_retirement.zig");
 pub const checkpoint_rotation = @import("normal_checkpoint_rotation.zig");
@@ -49,6 +50,7 @@ pub const Frame = struct {
     append_path: [std.fs.max_path_bytes]u8 = undefined,
     append_path_len: usize = 0,
     deadline_ns: u64 = 0,
+    credit_owner: ?*credit_planning.OwnedEstimate = null,
     foreground_owner: ?*foreground_append.Owner = null,
     foreground_meter: ?*@import("memory_account.zig").Account = null,
     foreground_spare_bytes: u64 = 0,
@@ -199,6 +201,16 @@ pub const Frame = struct {
         };
         written catch |cause| {
             if (self.append_pending != null) self.joinAppendIndependently(owner) catch {};
+            return cause;
+        };
+    }
+    pub fn estimateCredit(self: *Frame, backend: anytype, incoming: anytype, bulk: anytype, original: admission.Port) !u64 {
+        try original.checkpoint();
+        try self.credit.growBoundedOversized(@sizeOf(credit_planning.OwnedEstimate), 1);
+        self.credit_owner = &(try allocate(credit_planning.OwnedEstimate, backend.allocator, 1, original))[0];
+        self.credit_owner.?.* = .init(backend.allocator, backend.options.resource_manager);
+        return self.credit_owner.?.estimate(backend.options, backend.root_dir.?.len, incoming, bulk, original) catch |cause| {
+            if (self.credit_owner.?.budget.?.budget_denied) return error.ResourceBudgetExceeded;
             return cause;
         };
     }
@@ -515,6 +527,14 @@ pub const Frame = struct {
                 if (!try reclaimer.stepWithAdmission(a, credits, original)) return false;
                 @field(self, fields[1]) = null;
             }
+        }
+        if (self.credit_owner) |work| {
+            if (!try work.retireStep(credits, original)) return false;
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            a.destroy(work);
+            self.credit_owner = null;
         }
         if (self.foreground_owner) |work| {
             if (credits.* == 0) return false;

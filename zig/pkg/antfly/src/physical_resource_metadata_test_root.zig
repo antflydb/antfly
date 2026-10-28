@@ -7819,12 +7819,14 @@ test "physical cache metadata registered flush publication periodic checkpoint p
     try normalAdmittedPeriodicCheckpoint(.plan_partial);
 }
 
-fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, partial, concurrent, namespace_erased, docstore, docstore_gate, guarded, staging_spares, cancel_io, cancel_append, pressure, retirement_resume, prepare_reject, pressure_cold, pressure_cached, pressure_limit, pressure_soft, pressure_rotate, pressure_legacy, pressure_cancel, pressure_stale, pressure_bootstrap }) !void {
+fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, partial, concurrent, namespace_erased, docstore, docstore_gate, guarded, staging_spares, cancel_io, cancel_append, pressure, retirement_resume, prepare_reject, pressure_cold, pressure_cached, pressure_limit, pressure_soft, pressure_rotate, pressure_legacy, pressure_cancel, pressure_stale, pressure_bootstrap, credit_partitioned, credit_guarded, credit_reject, credit_cleanup_retry }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
     const preparation = local.storage_lsm_backend_compaction_publication.manifest_edit_preparation;
     const foreground = preparation.foreground_append;
+    const planner = preparation.credit_planning;
+    const credit_mode = mode == .credit_partitioned or mode == .credit_guarded or mode == .credit_reject or mode == .credit_cleanup_retry;
     const owners = @import("api/runnable_owner_execution.zig");
     const platform = @import("antfly_platform");
     const scheduler = local.common_request_admission.runnable_scheduler;
@@ -7849,6 +7851,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         .storage = native.storage(),
         .resource_manager = &resources.resource_manager,
         .flush_threshold = 1 << 20,
+        .run_partition_prefix_bytes = if (credit_mode) 64 else 0,
         .defer_flush_on_commit = true,
         .wal_sync_on_commit = mode == .sync,
         .wal_hard_limit_bytes = if (mode == .pressure) 512 else 0,
@@ -7866,13 +7869,24 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         var execution: *owners.State = undefined;
         var store_gate: std.atomic.Mutex = .unlocked;
         var cancelled: std.atomic.Value(bool) = .init(false);
+        fn lockMetadata(original: read_admission.Port) !void {
+            // Another owned cleanup can briefly hold metadata. A successful
+            // bounded acquisition proves this callback did not retain the
+            // mutex itself, without assuming every other owner is idle.
+            const until = platform.time.monotonicNs() +| std.time.ns_per_s;
+            while (!backend.mu.tryLock()) {
+                try original.checkpoint();
+                if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
         fn cancellation(raw: ?*const anyopaque) callconv(.c) u8 {
             const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
             return @intFromBool(flag.load(.acquire));
         }
         fn append(op: *foreground.Operation, original: read_admission.Port) !void {
             try original.checkpoint();
-            try std.testing.expect(backend.mu.tryLock());
+            try lockMetadata(original);
             backend.mu.unlock();
             if (op.stage == .retention_checkpoint) retention_scans += 1;
             if (((selected == .cancel_append and op.stage == .append) or
@@ -7888,6 +7902,32 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         fn wake(_: *anyopaque) void {
             wakes += 1;
         }
+        var producer_done: std.atomic.Value(bool) = .init(false);
+        var plans: usize = 0;
+        var plan_retire_refused: bool = false;
+        var plan_retire_resumed: bool = false;
+        fn plan(work: *planner.OwnedEstimate, original: read_admission.Port) !void {
+            try original.checkpoint();
+            plans += 1;
+            try lockMetadata(original);
+            backend.mu.unlock();
+            try std.testing.expectEqual(selected != .credit_guarded and selected != .guarded, try original.hasExecutionWait());
+            if (selected == .credit_reject and work.count >= 32 and work.pending_slots.len != 0) return error.Canceled;
+        }
+        fn retirePlan(work: *planner.OwnedEstimate, original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (selected == .credit_reject and !producer_done.load(.acquire)) return error.ResourceBudgetExceeded;
+            try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().cleanup_runnable_slots);
+            try lockMetadata(original);
+            backend.mu.unlock();
+            if (selected == .credit_cleanup_retry) {
+                if (work.slots_offset >= 16 * 1024 and !plan_retire_refused) {
+                    plan_retire_refused = true;
+                    return error.ResourceBudgetExceeded;
+                }
+                if (plan_retire_refused and work.slots.len == 0 and work.nodes != null) plan_retire_resumed = true;
+            }
+        }
         var retire_calls: usize = 0;
         var retire_refused: bool = false;
         var retire_resumed: bool = false;
@@ -7896,7 +7936,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
             try original.checkpoint();
             retire_calls += 1;
             try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().cleanup_runnable_slots);
-            try std.testing.expect(backend.mu.tryLock());
+            try lockMetadata(original);
             backend.mu.unlock();
             if (owner.input_index) |index| {
                 if (retire_refused) {
@@ -7916,7 +7956,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         fn hook(owner: *foreground.Owner, original: read_admission.Port) !void {
             try original.checkpoint();
             _ = calls.fetchAdd(1, .monotonic);
-            try std.testing.expect(backend.mu.tryLock());
+            try lockMetadata(original);
             try std.testing.expect(backend.foreground_commit_pending);
             backend.mu.unlock();
             if (owner.operation == null) {
@@ -7933,7 +7973,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
             _ = joined.fetchAdd(1, .monotonic);
             try original.checkpoint();
             try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().cleanup_runnable_slots);
-            try std.testing.expect(backend.mu.tryLock());
+            try lockMetadata(original);
             backend.mu.unlock();
             if (selected == .accepted_reject and joined.load(.acquire) == 1) return error.ResourceBudgetExceeded;
         }
@@ -7942,6 +7982,12 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     H.backend = handle.ptr();
     H.execution = &state;
     H.calls.store(0, .release);
+    H.plans = 0;
+    H.producer_done.store(false, .release);
+    H.plan_retire_refused = false;
+    H.plan_retire_resumed = false;
+    planner.test_hook = H.plan;
+    planner.test_retire_hook = H.retirePlan;
     H.retention_scans = 0;
     H.wakes = 0;
     H.retire_calls = 0;
@@ -7965,6 +8011,8 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         foreground.test_hook = null;
         foreground.test_abort_hook = null;
         foreground.test_retire_hook = null;
+        planner.test_hook = null;
+        planner.test_retire_hook = null;
     }
     var seed = try handle.ptr().beginWrite();
     defer seed.abort();
@@ -8024,7 +8072,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
             defer pass.deinit();
             var scope = try pass.admissionScope(std.testing.io);
             var payload = scope.payload();
-            if (self.selected == .guarded) payload.execution_wait = null;
+            if (self.selected == .guarded or self.selected == .credit_guarded) payload.execution_wait = null;
             const original = read_admission.Port.init(&payload);
             if (self.selected == .docstore or self.selected == .docstore_gate) {
                 var runtime = try self.backend.runtimeStore(std.testing.allocator, .{});
@@ -8046,12 +8094,20 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
             defer write.abort();
             try write.put(.{}, "first", self.value);
             if (self.selected == .staging_spares) try write.mutable.ordered.prepareEdits(std.testing.allocator, 1);
-            if (self.selected == .retirement_resume or self.selected == .prepare_reject) {
+            if (self.selected == .retirement_resume or self.selected == .prepare_reject or
+                self.selected == .credit_partitioned or self.selected == .credit_guarded or self.selected == .credit_reject or self.selected == .credit_cleanup_retry)
+            {
                 for (0..1024) |i| {
                     var key: [32]u8 = undefined;
                     const name = try std.fmt.bufPrint(&key, "retired-{d}", .{i});
                     try write.put(.{}, name, "owned staged value");
                 }
+            }
+            if (self.selected == .credit_partitioned or self.selected == .credit_guarded or self.selected == .credit_cleanup_retry) {
+                // Compare production planning with the existing grouping oracle.
+                const expected = try self.backend.prepareManifestCredit(&write.mutable, &write.bulk_appends);
+                const actual = try self.backend.prepareManifestCreditWithAdmission(&write.mutable, &write.bulk_appends, original);
+                try std.testing.expectEqual(expected, actual);
             }
             try write.commitWithAdmission(original);
         }
@@ -8108,9 +8164,15 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         joined = true;
         try std.testing.expectError(error.NotFound, read.get(.{}, "first"));
     } else worker.run();
+    // commit() has unwound its transaction abort and released staged labels.
+    // Rejected planning must retire its borrowed-key scratch only after this.
+    H.producer_done.store(true, .release);
     if (mode == .accepted_reject) {
         try std.testing.expectEqual(@as(?anyerror, error.ResourceBudgetExceeded), worker.failure);
         try std.testing.expect(H.joined.load(.acquire) >= 2);
+    } else if (mode == .credit_reject) {
+        try std.testing.expectEqual(@as(?anyerror, error.Canceled), worker.failure);
+        try std.testing.expectEqual(debt_before, handle.ptr().manifest_unpublished_wire_bytes);
     } else if (mode == .prepare_reject) {
         try std.testing.expectEqual(@as(?anyerror, error.ResourceBudgetExceeded), worker.failure);
         try std.testing.expectEqual(debt_before, handle.ptr().manifest_unpublished_wire_bytes);
@@ -8128,10 +8190,10 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     } else if (mode == .pressure) {
         try std.testing.expectEqual(@as(?anyerror, error.WalRecordTooLarge), worker.failure);
     } else if (worker.failure) |cause| return cause;
-    if (mode == .guarded) try std.testing.expectEqual(@as(usize, 0), H.calls.load(.acquire)) else if (mode != .pressure) try std.testing.expect(H.calls.load(.acquire) > 0);
+    if (mode == .guarded or mode == .credit_guarded or mode == .credit_reject) try std.testing.expectEqual(@as(usize, 0), H.calls.load(.acquire)) else if (mode != .pressure) try std.testing.expect(H.calls.load(.acquire) > 0);
     try std.testing.expect(!handle.ptr().foreground_commit_pending and handle.ptr().active_foreground_preparation == null);
     const after = handle.ptr().snapshotWriteStats();
-    const successful = mode != .accepted_reject and mode != .partial and mode != .pressure and mode != .cancel_io and mode != .cancel_append and mode != .prepare_reject and mode != .pressure_limit and mode != .pressure_rotate and mode != .pressure_cancel;
+    const successful = mode != .accepted_reject and mode != .partial and mode != .pressure and mode != .cancel_io and mode != .cancel_append and mode != .prepare_reject and mode != .credit_reject and mode != .pressure_limit and mode != .pressure_rotate and mode != .pressure_cancel;
     try std.testing.expectEqual(before.wal_append_records + @intFromBool(successful), after.wal_append_records);
     try std.testing.expectEqual(before.wal_segment_syncs + @intFromBool(successful and mode == .sync), after.wal_segment_syncs);
     if (successful) try std.testing.expect(resources.resource_manager.sliceStats(.lsm_wal_retention).used_bytes >= retained_before + after.wal_append_bytes - before.wal_append_bytes);
@@ -8154,7 +8216,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         worker.run();
         if (worker.failure) |cause| return cause;
     }
-    if (mode == .retirement_resume or mode == .prepare_reject) {
+    if (mode == .retirement_resume or mode == .prepare_reject or credit_mode) {
         // Close has a legitimate quiesced fallback. Join the normal admitted
         // reclamation path first so this case cannot pass through that fallback.
         const until = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
@@ -8173,6 +8235,8 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     open = false;
     RegisteredOutputFixture.drain(&resources.resource_manager);
     if (mode == .retirement_resume) try std.testing.expect(H.retire_refused and H.retire_resumed);
+    if (credit_mode) try std.testing.expect(H.plans != 0);
+    if (mode == .credit_cleanup_retry) try std.testing.expect(H.plan_retire_refused and H.plan_retire_resumed);
     if (mode == .retirement_resume or mode == .prepare_reject) try std.testing.expect(H.retire_calls > 1);
     try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
@@ -8307,4 +8371,93 @@ test "physical cache metadata registered flush publication foreground WAL reject
 
 test "physical cache metadata registered flush publication foreground WAL pressure inventory bootstraps empty controls without phantom retention" {
     try foregroundAdmittedCommit(.pressure_bootstrap);
+}
+
+test "physical cache metadata registered flush publication foreground WAL partitioned manifest credit matches normal grouping before native append" {
+    try foregroundAdmittedCommit(.credit_partitioned);
+}
+
+test "physical cache metadata registered flush publication foreground WAL guarded manifest credit keeps original CPU without lending" {
+    try foregroundAdmittedCommit(.credit_guarded);
+}
+
+test "physical cache metadata registered flush publication foreground WAL manifest credit rejection retains partial rehash for owned cleanup" {
+    try foregroundAdmittedCommit(.credit_reject);
+}
+
+test "physical cache metadata registered flush publication foreground WAL manifest credit cleanup resumes poisoned tables under protected CPU" {
+    try foregroundAdmittedCommit(.credit_cleanup_retry);
+}
+
+test "physical cache metadata registered flush publication manifest credit preserves mixed partition grouping across allocation and lifetime failures" {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const state = local.storage_lsm_backend_state;
+    const planner = local.storage_lsm_backend_compaction_publication.manifest_edit_preparation.credit_planning;
+    const a = std.testing.allocator;
+    var first: state.ActiveMemTable = .{ .ordered_enabled = false };
+    defer first.deinit(a);
+    var second: state.State = .{};
+    defer second.deinit(a);
+    const name = try a.alloc(u8, 70 * 1024 + 9);
+    defer a.free(name);
+    @memset(name, 'n');
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        const label = try std.fmt.bufPrint(&key, "row:{c}-{d}", .{ @as(u8, if (i % 2 == 0) 'A' else 'B'), i });
+        const ns = local.storage_backend_types.Namespace{ .name = switch (i % 3) {
+            0 => null,
+            1 => "",
+            else => name,
+        } };
+        if (i < 32) try first.upsert(a, ns, label, "value", i % 4 == 0) else try second.upsert(a, ns, label, "value", i % 4 == 0);
+    }
+    const Control = struct {
+        checks: usize = 0,
+        reject_at: ?usize = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const point = self.checks;
+            self.checks += 1;
+            if (self.reject_at == point) return error.Canceled;
+        }
+        fn payload(self: *@This()) read_admission.Payload {
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = check } };
+        }
+        fn domain(key: []const u8) []const u8 {
+            return key[4..5];
+        }
+        fn admittedDomain(key: []const u8, original: read_admission.Port) ![]const u8 {
+            try original.checkpoint();
+            return domain(key);
+        }
+    };
+    const Fixture = struct {
+        fn run(allocator: std.mem.Allocator, options: lsm.Options, one: *const state.ActiveMemTable, two: *const state.State, expected: u64) !void {
+            var work = planner.OwnedEstimate.init(allocator, null);
+            defer work.retireWithAdmission(null) catch unreachable;
+            var control: Control = .{};
+            const payload = control.payload();
+            const actual = try work.estimate(options, 57, one, two, .init(&payload));
+            try std.testing.expectEqual(expected, actual);
+        }
+    };
+    for ([_]usize{ 0, 4, 64 }) |prefix| {
+        const options: lsm.Options = .{ .run_partition_prefix_bytes = prefix, .run_partition_key = if (prefix == 0) null else Control.domain, .run_partition_key_with_admission = if (prefix == 0) null else Control.admittedDomain, .max_run_file_entries = 3, .max_run_file_bytes = 1024, .max_run_file_physical_bytes = 128 * 1024 };
+        const expected = try planner.estimate(a, options, 57, &first, &second);
+        try std.testing.checkAllAllocationFailures(a, Fixture.run, .{ options, &first, &second, expected });
+        const points: []const usize = if (prefix == 0) &.{ 0, 1, 2, 3 } else &.{ 0, 1, 4, 8, 16, 32, 64, 128 };
+        for (points) |point| {
+            var work = planner.OwnedEstimate.init(a, null);
+            defer work.retireWithAdmission(null) catch unreachable;
+            var control: Control = .{ .reject_at = point };
+            const payload = control.payload();
+            try std.testing.expectError(error.Canceled, work.estimate(options, 57, &first, &second, .init(&payload)));
+            // Each cleanup credit frees one node or poisons one bounded slice.
+            while (true) {
+                var credits: usize = 1;
+                if (try work.retireStep(&credits, null)) break;
+            }
+        }
+    }
 }
