@@ -587,6 +587,24 @@ musl executable supports lexical/HTTP searches and reports
 `DynamicInferenceRequiresDynamicLibc` for local inference. `--version` records
 the compilation target and linkage.
 
+## Continuous integration
+
+The shared Zig workflow runs one native Linux x86-64 grep qualification job for
+its admitted suite:
+
+- `zig-base / grep` runs `grep-test` (unit, CLI, hardening, compatibility and
+  integration fixtures), a seeded 500-case differential campaign against pinned
+  ripgrep, and standalone packaging checks.
+- `zig-full / grep` runs the same checks with 5,000 differential cases and adds
+  the extended/codecs, single-CPU, cold-cache-advice, and 1/2/4/8-worker repository
+  benchmarks.
+
+Each job is required by its `zig-base` or `zig-full` aggregate. Full runs select
+only the full profile, reusing its build for correctness and benchmarks. Base
+runs follow the Zig change filter; inference-only validation skips grep. Reports
+and the standalone archive are uploaded as `zig-base-grep` or `zig-full-grep`.
+Server-backed indexed-search tests continue in the Antfly E2E base/full suites.
+
 ## Generated conformance, hardening and profiling
 
 `tests/differential.py` generates reproducible PCRE2 patterns, malformed syntax,
