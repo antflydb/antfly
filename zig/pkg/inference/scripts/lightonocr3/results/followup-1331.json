@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "scope": "Draft PR1331 selected CUDA follow-up. Three synthetic pages; separate isolated native/vLLM measurements. Parity remains outstanding for both models. No full BF16 decoder, representative OCR accuracy or Metal GPU throughput claim. Raw experiments remain outside tracked source.",
+  "scope": "Draft PR1331: current_build records the qualified exact-rounding vision GEMM update. Top-level results/reproduction retain the prior snapshot559/565 comparison. Three synthetic pages; no representative OCR accuracy or full BF16 decoder claim. Fresh reference and isolated current 4B measurements remain pending.",
   "hardware": {
     "gpu": "NVIDIA GB10, DGX Spark, SM12.1",
     "driver": "580.178.04",
@@ -409,6 +409,121 @@
       "isolation_sha256": "2f5da94be6e45fd1ff8f4657b1e99caa5c134df5592141053571ea3addca7fe5",
       "foreign_processes": 0,
       "scope": "Current licensed checker against unchanged measured production attention PTX; both real checkpoints."
+    }
+  },
+  "current_build": {
+    "snapshot": 682,
+    "runtime_binary_sha256": "24e2ab91e401087ee75d6a9a6a00ed64c897bd2d4d753eb1d0f2db4519a0f462",
+    "source_sha256_delta_from_prior_reproduction": {
+      "zig/pkg/inference/src/ops/cuda/cublaslt.zig": "6f894b276dbad67b3cdf2e233883de63f2d14d2ab913425a2ac62c8ef03cf43c",
+      "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "4dedcba469b2766e263ab6378094bc589b530f874ba2766902afee4c8f57e522",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.zig": "bd710e41bd82b4895cc88a40b48fe96d22a6f74d7fa5e95ab08de8d29e6a419c",
+      "zig/pkg/inference/src/ops/cuda/buffer_cache.zig": "2155e95606e14c48a0cb07d7903f9a442d588862b215d2658ea16dbd5a76aa7b",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_gemm.zig": "13202f7999690fa690b7067e6e4438f26c8e416980e27afd2eb7683ccc0664b9",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_gemm.py": "fb71916d4960fbb580f183dc282d6a6f19eda94ce81e2336b005745cd03f5e1e",
+      "zig/pkg/inference/src/lighton_vision_bf16_qualification.zig": "32a97c96e510b89a6c2cef86ebdf1d8d885b4f2f3a8ea74dd28608f16ae70504",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_up_768_f32.ptx": "68480879138cb63be79523632c8a405a6deda5002579860606b2273b9eb5da58",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_up_768_bf16.ptx": "cc6361839c10e1e78fc246ed6e3461af08c0490e71432b68c31d632dab07e423",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_up_1024_f32.ptx": "694c4e0bc70785b061c3be0eb61323bbbdbf0d49e77f9ec36a190548e76d8b8b",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_up_1024_bf16.ptx": "9e8cc8c56b6379a4b8a4ce72f4bd750246b16ee91b059583ef169c3d66f7c3fd"
+    },
+    "source_paths_removed_from_prior_reproduction": [],
+    "full_source_manifest_sha256": "da4438803c82c3d055e6d714b8aca38850c694f0bbc5f1227c9155170044bac4",
+    "source_archive_sha256": "c1497b5458e2e4e29743eb6a94691e908273de60ec6c7fe0a1d3bf355e41519e",
+    "source_identity": "Apply the listed source fingerprint delta/removals to reproduction.runtime_source_sha256 to identify all 70 frozen build inputs. Public runtime source matches this snapshot. Private GDN vector/cache-policy tests and vendor GELU experiments are excluded. The published generator has the license-only normalization recorded below; its AST is unchanged.",
+    "changes": [
+      "SM121 tensor-core vision up GEMM plus original-order GELU; retain BF16 rounding before GELU in BF16 vision mode. No global workspace, KV/state writes or inactive request rows. Existing fused-vision control retains the fallback.",
+      "O(1) ordinary buffer-cache byte accounting; unchanged reuse order and admission limits.",
+      "Cold-cache selected 0.8B GDN/head cuBLAS descriptor choices; no 4B descriptor change."
+    ],
+    "qualification": {
+      "cuda_default": {
+        "selected": 279,
+        "passed": 265,
+        "skipped": 14
+      },
+      "cuda_wide": {
+        "selected": 107,
+        "passed": 106,
+        "skipped": 1
+      },
+      "actual_BF16_vision_block_HF_cases": 118,
+      "bit_exact_BF16_cases": 118,
+      "BF16_oracle_report_sha256": "48055347d433645fa0a1760ab5a3bddfafbb5023ee16e5e203f439271812a12c",
+      "BF16_oracle_library_sha256": "74e79b6489ab0b4c80c9e4ef11479e19fe65e05305d4fb7beb7a6a02233ab271",
+      "BF16_oracle_foreign_processes": 0,
+      "cuda_suite_foreign_processes": 0,
+      "F32_absolute_tolerance": 0.0002,
+      "real_F32_features_and_prompts": "Both models, batches1,1,2,3,8,16",
+      "real_BF16_invoice": "Both models passed",
+      "bounds_readonly_alias_and_canaries": "Passed; original numerical and negative-control criteria retained",
+      "Metal_compile_and_CPU_checks": {
+        "binary_sha256": "8cd710e466492ca7517c20455611561b33d5f964d47ea3cb05b55e046d0e26d6",
+        "CPU_ownership_admission_checks": 7,
+        "GPU_performance_claim": false
+      }
+    },
+    "vision_up_generation": {
+      "triton": "3.7.1",
+      "libdevice_sha256": "91334d6e12748f6cb5bbf0a1cd965a56bcd93dc4f496d2e5c5f8c6e523094356",
+      "kernels": [
+        {
+          "file": "lighton_vision_up_768_f32.ptx",
+          "sha256": "68480879138cb63be79523632c8a405a6deda5002579860606b2273b9eb5da58",
+          "shared_bytes": 24576,
+          "threads": 128
+        },
+        {
+          "file": "lighton_vision_up_768_bf16.ptx",
+          "sha256": "cc6361839c10e1e78fc246ed6e3461af08c0490e71432b68c31d632dab07e423",
+          "shared_bytes": 24576,
+          "threads": 128
+        },
+        {
+          "file": "lighton_vision_up_1024_f32.ptx",
+          "sha256": "694c4e0bc70785b061c3be0eb61323bbbdbf0d49e77f9ec36a190548e76d8b8b",
+          "shared_bytes": 24576,
+          "threads": 128
+        },
+        {
+          "file": "lighton_vision_up_1024_bf16.ptx",
+          "sha256": "9e8cc8c56b6379a4b8a4ce72f4bd750246b16ee91b059583ef169c3d66f7c3fd",
+          "shared_bytes": 24576,
+          "threads": 128
+        }
+      ],
+      "ptx_version": "9.0",
+      "target": "sm121a",
+      "global_scratch_bytes": 0,
+      "profile_scratch_bytes": 0,
+      "source_sha256": "fb71916d4960fbb580f183dc282d6a6f19eda94ce81e2336b005745cd03f5e1e"
+    },
+    "current_08": {
+      "profile": "BF16 vision; F32 decoder projection outputs/residual/recurrent state; existing partial BF16 prefill retained",
+      "measured_pages_per_second": [
+        14.4186,
+        14.6407
+      ],
+      "warmup_pages_per_second": 13.1891,
+      "temp_cache_MiB": 19456,
+      "norm_weight_cache": true,
+      "request_and_memory_admission_limits": "Unchanged",
+      "report_sha256": "06fbef651f369d4d941a8845740975d35c71480866e660adf519fb412fbc6d42",
+      "controls_sha256": "b30cdd21b06842cb85777d49ba17871ee2200dedf1dda4d73790a88d21a00f49",
+      "foreign_processes": 0,
+      "serial184_bytes_and_vLLM560_raw_text": "All outputs match",
+      "vision_up_calls": 2640,
+      "vision_block_calls": 2640,
+      "counter_scope": "Process lifetime;694 revalidation verifies every block used the fused up projection and all existing runtime/capacity gates. Original report bytes unchanged.",
+      "reference_status": "Previous vLLM560 mean14.4377pps; new native mean14.52965pps. Fresh reference pending; no robust speedup claim."
+    },
+    "current_4B": "All correctness checks pass. BF16 vision measured 4.2852/4.2871 pages/s with no foreign processes and remains unselected. F32 sustained run overlapped foreign training; excluded pending a clean repeat.",
+    "raw_evidence": "Retained outside Git; not yet published.",
+    "generator_license_normalization": {
+      "qualified_source_sha256": "fb71916d4960fbb580f183dc282d6a6f19eda94ce81e2336b005745cd03f5e1e",
+      "published_source_sha256": "64b24ca76d0b963eb7dd992509c80ad4865f9dcf44c831cd673ee48172692718",
+      "scope": "Required repository Apache license-header normalization only; Python AST unchanged. Runtime PTX and compiled CUDA source bytes unchanged.",
+      "regenerated_PTX": "All four published files regenerated byte-identically with the licensed generator and pinned compiler/math library."
     }
   }
 }

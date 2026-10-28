@@ -54,6 +54,24 @@ state remain F32. The 4B preset retains F32 vision because BF16 vision did not
 produce a repeatable throughput gain. `ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=f32`
 selects the original vision path.
 
+The current head additionally fuses the vision up projection with GELU on SM12.1,
+retaining both the original F32 arithmetic and the BF16 pre-activation rounding.
+It uses no global workspace and retains the existing fused-vision rollback.
+The new build passes 265 default and 106 wide CUDA checks, both models' original
+real-checkpoint checks, and all 118 independent BF16 vision-block cases bit-for-bit.
+It also preserves ordinary cache reuse while accounting cached bytes in constant
+time, and selects two cold-qualified 0.8B projection descriptors.
+
+The current 0.8B measurement is **14.4186 / 14.6407 pages/s**, with the same output,
+capacity and admission gates. It uses a 19 GiB temporary-cache budget and norm-weight
+caching (`ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB=19456` and
+`ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE=1`), within unchanged memory limits.
+The prior vLLM mean is 14.4377 pages/s. A fresh reference is pending, so this narrow
+lead does not establish a repeatable win. Current 4B timing overlapped another GPU
+job and is excluded; its next isolated comparison is pending.
+
+The table below records the preceding snapshot559/565, before this vision-GEMM change:
+
 | Model | Native pages/s | Actual vLLM pages/s | Selected vision |
 | --- | ---: | ---: | --- |
 | LightOn 0.8B | 14.1538 / 13.9947 | 14.3536 / 14.5218 | BF16 blocks |
@@ -66,8 +84,8 @@ on three synthetic pages. Native uses actual wide four-token
 chains, unchanged operator byte limits, a 1,024-entry cuBLAS plan bound and zero
 uncached/scalar fallbacks. The optional BF16 FFN/recurrent prefill and F16-query,
 F32-output paged prefill extensions remain enabled. This is a partial precision
-profile. Reaching the fresh vLLM means still requires about 2.6% more throughput
-for 0.8B and 7.0% for 4B. CUDA parity and representative OCR accuracy remain outstanding.
+profile. At that preceding snapshot, reaching the vLLM means required about 2.6% more
+throughput for 0.8B and 7.0% for 4B. CUDA parity and representative OCR accuracy remain outstanding.
 
 The [compact manifest](followup-1331.json) records source, binary, checkpoint,
 fixture and report hashes. The cleaned vision block matches the independent
@@ -76,7 +94,7 @@ checkpoint layer, batches up to 16 and 65,536 rows. Wrong-row, cross-image,
 alias and alignment controls are rejected. These checks qualify the matching
 cuDNN backend; they do not establish Flash Attention equivalence.
 
-Default F32 CUDA regression: 275 selected, 261 passed, 14 skips; wide regression:
+The preceding snapshot's F32 CUDA regression: 275 selected, 261 passed, 14 skips; wide regression:
 104 selected, 103 passed, one skip. The new attention-input PTX also passes 40
 independent Transformers cases using every checkpoint Q/K norm pair and text/image
 coordinates. Maximum error is below 2e-6 against the unchanged 2e-4 bound; inputs
@@ -187,3 +205,18 @@ python3 zig/pkg/inference/scripts/lightonocr3/check_cuda_lighton_attention_input
 
 This check uses the fixed F32 numerical budget. It does not allocate or access KV
 or recurrent state, pad inactive request rows, or measure OCR throughput.
+
+The SM12.1 vision up/GELU kernels are generated offline with Triton 3.7.1 and the
+pinned CUDA 13.0 libdevice. Regeneration requires no GPU; serving requires neither
+Python nor Triton. PTX 9.0 targets the qualified driver. From the repository root:
+
+```sh
+TRITON_CACHE_DIR="$PWD/.zig-cache/triton-vision" python3 \
+  zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_gemm.py \
+  --libdevice /usr/local/cuda-13.0/nvvm/libdevice/libdevice.10.bc \
+  --output zig/pkg/inference/src/ops/cuda
+```
+
+The generator asserts the math-library fingerprint, 128 threads, 24 KiB shared
+memory and zero global/profile scratch. Keep its generated manifest with external
+qualification evidence; it is not needed by serving binaries.
