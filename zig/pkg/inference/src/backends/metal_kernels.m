@@ -18418,6 +18418,59 @@ static const size_t termite_metal_pipeline_clear_indices[ANTFLY_METAL_PIPELINE_C
 };
 #undef ANTFLY_METAL_CLEAR_ENTRY
 
+// Cache only catalog slots, not arbitrary function names: two runtime fields
+// may intentionally refer to the same shader yet rely on distinct identities.
+// Named hot fields remain unchanged. Each retained library owns a fixed array
+// bounded by the catalog, and at most four library namespaces are retained.
+@interface AntflyMetalPipelineStateCache : NSObject {
+@public
+    id<MTLComputePipelineState> __strong slots[ANTFLY_METAL_PIPELINE_COUNT];
+}
+@end
+@implementation AntflyMetalPipelineStateCache
+@end
+
+static AntflyMetalPipelineStateCache *termite_metal_pipeline_cache_for(
+    id<MTLDevice> device, id<MTLLibrary> library
+) {
+    if (device == nil || library == nil || library.device != device) return nil;
+    static dispatch_once_t once;
+    static NSObject *lock;
+    static NSMapTable<id<MTLLibrary>, AntflyMetalPipelineStateCache *> *libraries;
+    dispatch_once(&once, ^{
+        lock = [NSObject new];
+        libraries = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory];
+    });
+    @synchronized (lock) {
+        AntflyMetalPipelineStateCache *cache = [libraries objectForKey:library];
+        if (cache == nil) {
+            if (libraries.count >= 4) [libraries removeAllObjects];
+            cache = [AntflyMetalPipelineStateCache new];
+            [libraries setObject:cache forKey:library];
+        }
+        return cache;
+    }
+}
+
+static id<MTLComputePipelineState> termite_metal_make_catalog_pipeline(
+    id<MTLDevice> device, id<MTLLibrary> library, size_t index
+) {
+    if (index >= ANTFLY_METAL_PIPELINE_COUNT) return nil;
+    const termite_metal_pipeline_binding *binding = &termite_metal_pipeline_bindings[index];
+    AntflyMetalPipelineStateCache *cache = termite_metal_pipeline_cache_for(device, library);
+    if (cache == nil) return termite_metal_make_pipeline(device, library, binding->name);
+    // A library is immutable. Publish successful compilation once, with the
+    // original diagnostic registration; failed preparation remains retryable.
+    @synchronized (cache) {
+        id<MTLComputePipelineState> pipeline = cache->slots[index];
+        if (pipeline == nil) {
+            pipeline = termite_metal_make_pipeline(device, library, binding->name);
+            cache->slots[index] = pipeline;
+        }
+        return pipeline;
+    }
+}
+
 // Typed addresses preserve ARC ownership; no cast from byte storage to a
 // strong Objective-C slot is valid. This switch is cold lifecycle code only.
 static id<MTLComputePipelineState> __strong *termite_metal_catalog_slot(
@@ -18436,7 +18489,7 @@ static void termite_metal_load_pipeline_catalog(termite_metal_decode_runtime *ru
     for (size_t i = first; i < first + count; ++i) {
         const termite_metal_pipeline_binding *binding = &termite_metal_pipeline_bindings[i];
         id<MTLComputePipelineState> __strong *slot = termite_metal_catalog_slot(runtime, i);
-        *slot = termite_metal_make_pipeline(device, binding->precise ? precise_library : library, binding->name);
+        *slot = termite_metal_make_catalog_pipeline(device, binding->precise ? precise_library : library, i);
     }
 }
 
