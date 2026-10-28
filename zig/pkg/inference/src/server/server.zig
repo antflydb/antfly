@@ -11487,8 +11487,10 @@ pub const Node = struct {
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
         if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
-            options.cuda_batch_items = gliner_decide_qualification.cuda_batch_items;
+            options.classification_batch_items = gliner_decide_qualification.cuda_batch_items;
             options.max_sequences_per_item = 1;
+        } else if (backend == .metal and qualified_variant == .decide_deberta) {
+            options.classification_batch_items = gliner_decide_qualification.metal_batch_items;
         }
         const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
         const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
@@ -11544,7 +11546,7 @@ pub const Node = struct {
         var device_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (device_lease) |*owned| owned.release();
         if (backend == .metal or backend == .cuda) {
-            const device_bytes = try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), @min(options.cuda_batch_items, request.items.len));
+            const device_bytes = try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options));
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
                 self.config.generation_budget_overrides.scratch_limit_bytes,
@@ -25915,6 +25917,7 @@ test {
     _ = @import("gliner_boundary_concurrency_test.zig");
     _ = @import("gliner_boundary_metal_socket_test.zig");
     _ = @import("gliner_family_cuda_socket_test.zig");
+    _ = @import("gliner_family_metal_batch_test.zig");
     _ = @import("gliner_boundary_queued_cancellation_test.zig");
     _ = @import("embed_direct_vs_http_bench_test.zig");
 }
@@ -28597,15 +28600,22 @@ fn resolvedInferenceExecutorContract(
     }
     const max_images = if (modalities.image) executorMaxImages(resolved_task) else 0;
     var implementation = resolvedExecutorBatchImplementation(resolved_task, executor_kind);
-    if (build_options.enable_cuda and node.session_manager.required_backend == .cuda and
+    const cuda_decide_batch = build_options.enable_cuda and node.session_manager.required_backend == .cuda;
+    const metal_decide_batch = build_options.enable_metal and node.session_manager.required_backend == .metal;
+    if ((cuda_decide_batch or metal_decide_batch) and
         std.mem.eql(u8, resolved_task, "extract") and
         manifest.gliner_classification_head == .label_marker_mlp and manifest.gliner_span_encoder_family == .deberta)
     {
-        // Legacy Decide has one uniform CUDA classification envelope. Boundary
-        // discovery stays conservative: its single-window batches and one-item
-        // long-document profiles cannot share an unconditional batch promise.
-        // Listing metadata never substitutes for exact live artifact checks.
-        implementation = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .per_item_failures = false };
+        // Metal preserves the existing public request cardinality and chunks
+        // physical forwards at eight rows. CUDA's qualified request cap is
+        // independently eight. Boundary discovery stays conservative because
+        // its long-document profiles still require one input per request.
+        implementation = .{
+            .mode = .native,
+            .preferred_items = if (metal_decide_batch) gliner_decide_qualification.metal_batch_items else gliner_decide_qualification.cuda_batch_items,
+            .max_items = if (metal_decide_batch) resolvedTaskMaxItems(resolved_task) else gliner_decide_qualification.cuda_batch_items,
+            .per_item_failures = false,
+        };
     }
     return .{
         .task = resolved_task,

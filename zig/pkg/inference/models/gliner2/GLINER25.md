@@ -140,6 +140,31 @@ follow from how these bounds were measured:
   smallest real section (`zig/SCHEMA.md`'s 20-byte "Related Docs" after link
   stripping) and a one-character document.
 
+### Metal request batches
+
+The exact FP32 base artifacts (original and Transformers wrapper) and
+multilingual-v1 profiles have separate Metal single-window rows for 2–8 input
+items. They preserve every existing per-item feature and geometry bound.
+Multilingual feature profiles remain independent; batching does not admit a
+union of otherwise incompatible profiles. Reduced precision, Multi-Decide,
+and multi-item long-document requests retain their existing qualification.
+
+Compatible consecutive items share a padded encoder/head pass and retain
+their original output order. Different execution options start another
+physical group. Token and aggregate-work ceilings can split a group further.
+Resident Metal workspace admission uses the maximum physical `batch *
+padded_sequence_tokens` across those groups before execution starts.
+
+`GLiNER production Metal distinct input batches` tests the public HTTP path
+with exact pinned checkpoints, distinct inputs and schemas, 2/4/8 items,
+reversed order, singleton parity, device allocation counts, workspace reuse,
+released request leases, and rejection of nine-item boundary requests before
+GPU work. Multilingual coverage includes the classifier/entity floors,
+endpoint captures, and extended short/long profiles. Decide additionally
+exercises 9-, 17-, and 128-item requests using bounded physical groups.
+Boundary batch discovery remains conservative because windowed requests have
+an independent one-item contract.
+
 ### Long-document execution
 
 `extractors/gliner_boundary_long_executor.zig` plans overlapping windows,
