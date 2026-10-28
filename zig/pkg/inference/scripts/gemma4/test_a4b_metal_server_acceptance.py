@@ -291,9 +291,11 @@ class ContractTests(unittest.TestCase):
             residency_mode="streamed",
             memory_budget_mb=2048,
         )
-        self.assertEqual(1, config["admission"]["inference"]["max_concurrent_requests"])
-        self.assertEqual("off", config["generation_batching"]["mode"])
-        self.assertFalse(config["prompt_cache"]["enabled"])
+        self.assertEqual(
+            1, config["resources"]["inference"]["admission"]["max_concurrent_requests"]
+        )
+        self.assertEqual("off", config["inference"]["generation_batching"]["mode"])
+        self.assertFalse(config["inference"]["prompt_cache"]["enabled"])
         self.assertEqual(
             {
                 "kind": "generator",
@@ -302,7 +304,7 @@ class ContractTests(unittest.TestCase):
                 "residency_mode": "streamed",
                 "memory_budget_mb": 2048,
             },
-            config["preload"][0],
+            config["inference"]["preload"][0],
         )
 
     def test_request_is_deterministic_metal_without_prompt_cache(self) -> None:

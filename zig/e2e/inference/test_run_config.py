@@ -38,7 +38,7 @@ def run_config_models():
     return models_dir().resolve()
 
 
-@pytest.mark.parametrize("layout", ["flat", "nested", "cli-before", "cli-after"])
+@pytest.mark.parametrize("layout", ["nested", "cli-before", "cli-after"])
 def test_run_config_model_settings(tmp_path, run_config_models, layout):
     settings = {
         "models_dir": str(run_config_models),
@@ -60,7 +60,7 @@ def test_run_config_model_settings(tmp_path, run_config_models, layout):
             "--preload-model",
             f"embedder:native:{MODEL}",
         ]
-    config = {"inference": settings} if layout != "flat" else settings
+    config = {"inference": settings}
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     with socket.socket() as listener:

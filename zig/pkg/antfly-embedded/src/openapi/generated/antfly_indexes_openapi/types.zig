@@ -10436,12 +10436,14 @@ pub const MediaOutputCoverageCounts = struct {
     embedding: ?MediaOutputCoverageValues = null,
     transcribe: ?MediaOutputCoverageValues = null,
     classify: ?MediaOutputCoverageValues = null,
+    diarize: ?MediaOutputCoverageValues = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "embedding", "embedding", true },
         .{ "transcribe", "transcribe", true },
         .{ "classify", "classify", true },
+        .{ "diarize", "diarize", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10464,6 +10466,10 @@ pub const MediaOutputCoverageCounts = struct {
         }
         if (self.classify) |value| {
             try jw.objectField("classify");
+            try jw.write(value);
+        }
+        if (self.diarize) |value| {
+            try jw.objectField("diarize");
             try jw.write(value);
         }
         try jw.endObject();

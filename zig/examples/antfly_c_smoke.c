@@ -17,6 +17,7 @@
 #define _DARWIN_C_SOURCE 1
 #include "antfly.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -157,13 +158,23 @@ static int run_signal_lifetime_smoke(void) {
     if (!failed) failed = expect_ok(antfly_lite_create(second_path, &second), "signal second open");
     antfly_db_close(first);
     if (!failed) {
-        sigaction(SIGIO, NULL, &active);
-        failed = active.sa_handler == SIG_IGN || active.sa_handler == SIG_DFL;
-        if (!failed) raise(SIGIO);
+        if (sigaction(SIGIO, NULL, &active) != 0) {
+            perror("inspect live foreign executor SIGIO disposition");
+            failed = 1;
+        } else {
+            failed = active.sa_handler == SIG_IGN || active.sa_handler == SIG_DFL;
+            if (failed) fprintf(stderr, "SIGIO disposition was restored while a peer database was still open\n");
+            else if (raise(SIGIO) != 0) { perror("wake live foreign executor"); failed = 1; }
+        }
     }
     antfly_db_close(second);
-    sigaction(SIGIO, NULL, &active);
-    if (active.sa_handler != SIG_IGN) failed = 1;
+    if (sigaction(SIGIO, NULL, &active) != 0) {
+        perror("inspect final foreign executor SIGIO disposition");
+        failed = 1;
+    } else if (active.sa_handler != SIG_IGN) {
+        fprintf(stderr, "SIGIO disposition was not restored after the last database closed\n");
+        failed = 1;
+    }
     sigaction(SIGIO, &original, NULL);
     remove(first_path);
     remove(second_path);
@@ -171,8 +182,16 @@ static int run_signal_lifetime_smoke(void) {
     snprintf(second_path, sizeof(second_path), "%s/second.aflite.lock", directory);
     remove(first_path);
     remove(second_path);
-    if (rmdir(directory) != 0) failed = 1;
-    if (failed) fprintf(stderr, "foreign executor signal lifetime was not retained/restored\n");
+    /* Maintenance leaves this coordination inode in place so concurrent owners
+     * cannot acquire different locks. Both owners are closed and this fixture
+     * owns the entire directory, so it is now safe to remove the guard. */
+    snprintf(first_path, sizeof(first_path), "%s/.aflite-lease-publication.lock", directory);
+    remove(first_path);
+    if (rmdir(directory) != 0) {
+        fprintf(stderr, "signal smoke directory cleanup failed: %s\n", strerror(errno));
+        failed = 1;
+    }
+    if (failed) fprintf(stderr, "foreign executor signal smoke failed\n");
     return failed;
 #else
     return 0;

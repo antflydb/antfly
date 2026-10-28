@@ -3968,6 +3968,94 @@ pub const VacuumImage = struct {
 
 pub const ReaderCoordinator = @import("reader_coordinator.zig").Coordinator;
 
+var test_header_fingerprint_hashes: std.atomic.Value(u64) = .init(0);
+
+test "lite header fingerprints cache unchanged state and fence every header field" {
+    var file: NativeFile = .{ .allocator = std.testing.allocator, .io_impl = undefined, .path = undefined, .file = undefined, .header = .{} };
+    const original = file.header;
+    const expected = NativeFile.fingerprintHeader(original);
+    const before = test_header_fingerprint_hashes.load(.monotonic);
+    for (0..64) |_| try std.testing.expectEqual(expected, file.headerFingerprint());
+    try std.testing.expectEqual(before + 1, test_header_fingerprint_hashes.load(.monotonic));
+    inline for (@typeInfo(Header).@"struct".field_names, @typeInfo(Header).@"struct".field_types) |field, Field| {
+        if (comptime std.mem.eql(u8, field, "checkpoints")) {
+            inline for (0..checkpoint_slot_count) |slot| {
+                inline for (@typeInfo(CheckpointSlot).@"struct".field_names) |checkpoint_field| {
+                    file.header = original;
+                    @field(file.header.checkpoints[slot], checkpoint_field) += 1;
+                    try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
+                    try std.testing.expect(!std.mem.eql(u8, &expected, &file.headerFingerprint()));
+                }
+            }
+        } else {
+            file.header = original;
+            if (comptime Field == bool) @field(file.header, field) = !@field(original, field) else @field(file.header, field) += 1;
+            try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
+            try std.testing.expect(!std.mem.eql(u8, &expected, &file.headerFingerprint()));
+        }
+    }
+    file.header = original;
+    file.transaction_header = original;
+    file.transaction_header.?.checkpoints[1].commit_sequence = 99;
+    try std.testing.expectEqual(NativeFile.fingerprintHeader(file.transaction_header.?), file.headerFingerprint());
+    // Abort restores the committed key; no stale transaction digest may survive.
+    file.transaction_header = null;
+    try std.testing.expectEqual(expected, file.headerFingerprint());
+}
+
+test "lite header fingerprint cache publishes coherent keys and digests to concurrent readers" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const Shared = struct {
+        cache: HeaderFingerprintCache = .{},
+        failed: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This(), worker: usize) void {
+            for (0..64) |i| {
+                var header: Header = .{};
+                header.checkpoints[worker % checkpoint_slot_count].commit_sequence = @intCast(i % 3);
+                const expected = NativeFile.fingerprintHeader(header);
+                const digest = self.cache.lookup(header) orelse blk: {
+                    self.cache.remember(header, expected);
+                    break :blk expected;
+                };
+                if (!std.mem.eql(u8, &expected, &digest)) self.failed.store(true, .monotonic);
+            }
+        }
+    };
+    var shared: Shared = .{};
+    var tasks: [4]std.Io.Future(void) = undefined;
+    var started: usize = 0;
+    defer for (tasks[0..started]) |*task| task.await(std.testing.io);
+    for (&tasks, 0..) |*task, worker| {
+        task.* = try std.testing.io.concurrent(Shared.run, .{ &shared, worker });
+        started += 1;
+    }
+    for (&tasks) |*task| task.await(std.testing.io);
+    started = 0;
+    try std.testing.expect(!shared.failed.load(.monotonic));
+}
+
+// NativeFile generations can serve concurrent readers. Cache only a complete
+// structural header match, including the inactive recovery slot and transaction
+// header. A publication, rollback or reload therefore invalidates naturally;
+// persisted certificate bytes and the canonical digest remain unchanged.
+const HeaderFingerprintCache = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    cached: ?struct { header: Header, digest: [32]u8 } = null,
+
+    fn lookup(self: *HeaderFingerprintCache, header: Header) ?[32]u8 {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.cached) |entry| if (std.meta.eql(entry.header, header)) return entry.digest;
+        return null;
+    }
+
+    fn remember(self: *HeaderFingerprintCache, header: Header, digest: [32]u8) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.cached = .{ .header = header, .digest = digest };
+    }
+};
+
 pub const NativeFile = struct {
     allocator: Allocator,
     /// The default constructors own this Threaded runtime. Borrowed-I/O
@@ -3987,6 +4075,7 @@ pub const NativeFile = struct {
     reader_window_lock: ?std.Io.File = null,
     reader_window_previous_frontier: ?u64 = null,
     header: Header,
+    header_fingerprint_cache: HeaderFingerprintCache = .{},
     transaction_header: ?Header = null,
     // Lease-only metadata transactions may append without proving free-page
     // reuse. General mutations still validate before any physical reuse.
@@ -4412,6 +4501,7 @@ pub const NativeFile = struct {
     const allocator_certificate_size = 72;
 
     fn fingerprintHeader(header: Header) [32]u8 {
+        if (builtin.is_test) _ = test_header_fingerprint_hashes.fetchAdd(1, .monotonic);
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, header);
         var digest: [32]u8 = undefined;
@@ -4420,7 +4510,13 @@ pub const NativeFile = struct {
     }
 
     fn headerFingerprint(self: *NativeFile) [32]u8 {
-        return fingerprintHeader(self.transaction_header orelse self.header);
+        const header = self.transaction_header orelse self.header;
+        if (self.header_fingerprint_cache.lookup(header)) |digest| return digest;
+        // Hash outside the cache lock. Concurrent first readers may duplicate
+        // this bounded work; hits never hash or wait behind a hash operation.
+        const digest = fingerprintHeader(header);
+        self.header_fingerprint_cache.remember(header, digest);
+        return digest;
     }
 
     /// Hash the complete canonical allocator state, not the physical encoding

@@ -1204,7 +1204,7 @@ fn boundaryIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.
     return boundary_bundle.Identity{
         .backbone = config.backbone,
         .precision = .fp32,
-        .weight = boundary_bundle.Digest.of(reader.file_bytes),
+        .weight = boundary_bundle.Digest.ofMapped(reader.file_bytes),
         .sidecars = sidecars,
     };
 }
@@ -1310,7 +1310,7 @@ fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.Mo
             all_f32 = false;
             break;
         };
-        weight = decide_qualification.Digest.of(reader.file_bytes);
+        weight = decide_qualification.Digest.ofMapped(reader.file_bytes);
         inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 };
     }
     const identity = decide_qualification.Identity{

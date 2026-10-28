@@ -154,6 +154,8 @@ Without it, a diarization request fails with `SPEAKER_MODEL_UNAVAILABLE` rather 
 
 As an enrichment, the labels are durable. Each transcript phrase keeps the speaker who said it, and every chunk cut from a phrase carries `_speaker` alongside `_start_time_ms` and `_end_time_ms`, so a search hit says who was talking. A chunk that straddles a turn carries no label rather than crediting the wrong person. Providers that name speakers their own way, such as Vertex, are renumbered into the same `SPEAKER_NN` order.
 
+For audio and video chunking, `/ai/v1/chunk` also supports standalone `diarize` outputs, source-scoped speaker indices across windows, and optional boundaries at detected speaker turns. See [Speaker Diarization and Turn Boundaries](/docs/guides/media-pass#speaker-diarization-and-turn-boundaries).
+
 ## Tradeoffs
 
 The decision is how the transcript is chunked, because a chunk is what search returns and what an embedding represents. `chunk_size` counts characters of transcript for the default chunker; 256 is about fifteen seconds of speech and gives one idea per hit with a tight time range, while 1024 keeps a whole topic together for an answer agent at the cost of a range that spans a minute or more. Chunks are cut on text boundaries, not silence, so a chunk can straddle a topic change; the timing on each chunk spans from the first sentence it overlaps to the last, which is what a player needs even when the cut is imperfect.

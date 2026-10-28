@@ -111,7 +111,7 @@ def sync_detailed(
 ]:
     r"""Chunk content with optional model-aware embeddings
 
-     Splits content into chunks. Without `embedding`, the fixed chunker and
+     Splits content into chunks. Without `embedding` or `outputs`, the fixed chunker and
     legacy response remain unchanged. With `embedding`, the resolved target
     model constrains boundaries for text, PDF pages, images or explicit tiles,
     composited GIF frames, audio windows and consecutive video windows.
@@ -124,6 +124,18 @@ def sync_detailed(
     terminal record must not be treated as complete source coverage.
     Continuations bind the original source version and semantic plan;
     retries may deterministically recompute and must deduplicate chunk IDs.
+
+    Named `outputs` independently embed, transcribe, classify, or diarize
+    each source. A `diarize` target returns source-scoped `speaker_spans`
+    without ASR. On transcription outputs, `diarize: true` enables the same
+    source-scoped voice identities. Set `policy.audio_speaker_turns: true`
+    with a diarization-enabled boundary target to split audio at detected
+    turns while respecting model limits. Speaker analysis runs before the
+    first chunk only as far as that chunk requires; matching outputs share
+    embeddings and timelines. Continuations reuse cached speaker state and
+    boundary directories, with durable checkpoints for recovery. Adding speaker
+    annotations alone preserves parent IDs; enabling speaker boundaries
+    binds the speaker model revision and settings into the plan.
 
     ## Models
 
@@ -162,7 +174,7 @@ def sync(
 ) -> InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
     r"""Chunk content with optional model-aware embeddings
 
-     Splits content into chunks. Without `embedding`, the fixed chunker and
+     Splits content into chunks. Without `embedding` or `outputs`, the fixed chunker and
     legacy response remain unchanged. With `embedding`, the resolved target
     model constrains boundaries for text, PDF pages, images or explicit tiles,
     composited GIF frames, audio windows and consecutive video windows.
@@ -175,6 +187,18 @@ def sync(
     terminal record must not be treated as complete source coverage.
     Continuations bind the original source version and semantic plan;
     retries may deterministically recompute and must deduplicate chunk IDs.
+
+    Named `outputs` independently embed, transcribe, classify, or diarize
+    each source. A `diarize` target returns source-scoped `speaker_spans`
+    without ASR. On transcription outputs, `diarize: true` enables the same
+    source-scoped voice identities. Set `policy.audio_speaker_turns: true`
+    with a diarization-enabled boundary target to split audio at detected
+    turns while respecting model limits. Speaker analysis runs before the
+    first chunk only as far as that chunk requires; matching outputs share
+    embeddings and timelines. Continuations reuse cached speaker state and
+    boundary directories, with durable checkpoints for recovery. Adding speaker
+    annotations alone preserves parent IDs; enabling speaker boundaries
+    binds the speaker model revision and settings into the plan.
 
     ## Models
 
@@ -210,7 +234,7 @@ async def asyncio_detailed(
 ]:
     r"""Chunk content with optional model-aware embeddings
 
-     Splits content into chunks. Without `embedding`, the fixed chunker and
+     Splits content into chunks. Without `embedding` or `outputs`, the fixed chunker and
     legacy response remain unchanged. With `embedding`, the resolved target
     model constrains boundaries for text, PDF pages, images or explicit tiles,
     composited GIF frames, audio windows and consecutive video windows.
@@ -223,6 +247,18 @@ async def asyncio_detailed(
     terminal record must not be treated as complete source coverage.
     Continuations bind the original source version and semantic plan;
     retries may deterministically recompute and must deduplicate chunk IDs.
+
+    Named `outputs` independently embed, transcribe, classify, or diarize
+    each source. A `diarize` target returns source-scoped `speaker_spans`
+    without ASR. On transcription outputs, `diarize: true` enables the same
+    source-scoped voice identities. Set `policy.audio_speaker_turns: true`
+    with a diarization-enabled boundary target to split audio at detected
+    turns while respecting model limits. Speaker analysis runs before the
+    first chunk only as far as that chunk requires; matching outputs share
+    embeddings and timelines. Continuations reuse cached speaker state and
+    boundary directories, with durable checkpoints for recovery. Adding speaker
+    annotations alone preserves parent IDs; enabling speaker boundaries
+    binds the speaker model revision and settings into the plan.
 
     ## Models
 
@@ -259,7 +295,7 @@ async def asyncio(
 ) -> InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
     r"""Chunk content with optional model-aware embeddings
 
-     Splits content into chunks. Without `embedding`, the fixed chunker and
+     Splits content into chunks. Without `embedding` or `outputs`, the fixed chunker and
     legacy response remain unchanged. With `embedding`, the resolved target
     model constrains boundaries for text, PDF pages, images or explicit tiles,
     composited GIF frames, audio windows and consecutive video windows.
@@ -272,6 +308,18 @@ async def asyncio(
     terminal record must not be treated as complete source coverage.
     Continuations bind the original source version and semantic plan;
     retries may deterministically recompute and must deduplicate chunk IDs.
+
+    Named `outputs` independently embed, transcribe, classify, or diarize
+    each source. A `diarize` target returns source-scoped `speaker_spans`
+    without ASR. On transcription outputs, `diarize: true` enables the same
+    source-scoped voice identities. Set `policy.audio_speaker_turns: true`
+    with a diarization-enabled boundary target to split audio at detected
+    turns while respecting model limits. Speaker analysis runs before the
+    first chunk only as far as that chunk requires; matching outputs share
+    embeddings and timelines. Continuations reuse cached speaker state and
+    boundary directories, with durable checkpoints for recovery. Adding speaker
+    annotations alone preserves parent IDs; enabling speaker boundaries
+    binds the speaker model revision and settings into the plan.
 
     ## Models
 

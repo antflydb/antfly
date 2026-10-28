@@ -1182,6 +1182,40 @@ For HTTP serving, set `ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda` so ordinary
 requests use CUDA. A CUDA-specific preload alone does not force that selection.
 Configure backend and scratch budgets for the model plus video workspace.
 
+CUDA video admits container inspection under a host-only preprocessing permit,
+then plans execution from the inspected geometry and sampled frame count. The
+device request covers the bounded media arena, RGB/patch staging, pending vision
+inputs, and projected rows. Compressed MP4 bytes remain host input. The encoder
+phase reduces the reservation after decoding/projection; retained NVDEC surfaces
+have a separate cache lease against the same budgets. This replaces the fixed
+1.5 GiB workspace and maximum-length preflight for short clips. It does not
+change sampling, token packing, or embedding arithmetic.
+
+Admission failure logs identify preflight, retry after cache reclamation, or
+encoder phase, with estimated request bytes, occupancy snapshots, and limits.
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS=1` also reports tracked physical
+device allocation high water and retained decoder bytes. These counters include
+the explicit NVDEC policy envelope, not driver-private allocation measurements.
+
+Run repeatability, invalid-input recovery, text/audio controls, cleanup metrics,
+and concurrent mixed traffic against an owned server with:
+
+```bash
+python3 zig/pkg/inference/scripts/embeddinggemma2/cuda_video_qualification.py \
+  --binary zig/zig-out/bin/antfly --model-dir /path/to/embeddinggemma2 \
+  --clip zig/pkg/inference/src/testdata/video/closed.mp4 \
+  --clip zig/pkg/inference/scripts/embeddinggemma2/testdata/video/video-h264.mp4 \
+  --audio zig/lib/audio/testdata/tone.wav \
+  --output .benchmark-results/video-cuda/qualification.json
+```
+
+Repeat `--clip` for additional durations and production reproductions. Use
+`--scratch-budget-mb 1024 --mixed-jobs 0` to check serial constrained admission;
+concurrent requests still compete for that cap. Evidence includes checkpoint
+receipt verification, binary/tool/input hashes, source SHA and diff hash, GPU
+identity, vectors, recovery outcomes, process RSS, and cleanup metrics. This
+runner does not establish independent reference parity or qualify another GPU.
+
 The checked-in six-second fixture at `src/testdata/video/closed.mp4` and its
 provenance record cover decoder, sampling, cancellation, and resident preprocessing
 regressions. CUDA tests also compare RGB conversion and resized patches against the

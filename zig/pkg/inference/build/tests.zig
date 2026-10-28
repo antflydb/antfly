@@ -41,7 +41,10 @@ pub fn create(ctx: Context) Suite {
         ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
     const tests = b.addTest(.{
-        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if ((ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) or ctx.backend.enable_cuda) 14 else 9) * 1024 * 1024 * 1024,
+        // Zig 0.17's focused CUDA serving suite reached 19.57 GB on aarch64
+        // Linux. Reserve 24 GiB so the scheduler admits its measured compiler
+        // footprint and leaves room for the socket/reference coverage.
+        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -300,6 +303,49 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     cuda_step.dependOn(&run_gliner25_cuda_tests.step);
     cuda_step.dependOn(&quant_kernel_codegen_test_check.step);
     cuda_step.dependOn(&cuda_artifact_source_policy_check.step);
+    // Serving qualification is separate from the optimizer/kernel gate above.
+    // A passing run requires real pinned artifacts and the production policy;
+    // opt-in fixtures must not silently turn a release gate into skips.
+    const production_cuda_filters = [_][]const u8{
+        "production CUDA required artifacts",
+        "CUDA pinned base full inference",
+        "CUDA pinned multi full inference",
+        "GLiNER bounded window composition pinned CUDA",
+        "frozen CUDA family profiles",
+        "CUDA boundary multi profiles",
+        "CUDA boundary batch rows",
+        "GLiNER production CUDA distinct input batches",
+        "Decide published checkpoint",
+        "Decide Q8 published bundle",
+        "Decide Q8 CUDA classification oracle",
+        "GLiNER2.5-Decide native parity",
+        "Decide Q8 CUDA qualification binds",
+        "Decide CUDA legacy geometry",
+        "exact DeBERTa CUDA qualification",
+        "GLiNER2.5-Decide CUDA classification oracle parity",
+        "GLiNER production CUDA typed decisions",
+        "GLiNER production CUDA extraction through concurrent HTTP",
+        "pinned CUDA extraction direct and HTTP",
+    };
+    const gliner25_production_cuda_tests = b.addTest(.{
+        .name = "gliner25-production-cuda-tests",
+        .max_rss = 24 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &production_cuda_filters,
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    ctx.step("gliner25-production-cuda-test-build", "Build pinned GLiNER2.5 production CUDA serving qualification").dependOn(&b.addInstallArtifact(gliner25_production_cuda_tests, .{}).step);
+    const run_gliner25_production_cuda_tests = ctx.addRunArtifact(gliner25_production_cuda_tests);
+    for (production_cuda_filters) |filter| run_gliner25_production_cuda_tests.addArgs(&.{ "--test-filter", filter });
+    run_gliner25_production_cuda_tests.setEnvironmentVariable("TERMITE_REQUIRE_CUDA_TESTS", "1");
+    run_gliner25_production_cuda_tests.setEnvironmentVariable("ANTFLY_GLINER25_REQUIRE_PRODUCTION_MODELS", "1");
+    run_gliner25_production_cuda_tests.setEnvironmentVariable("ANTFLY_GLINER_DECIDE_BACKEND", "cuda");
+    const production_cuda_step = ctx.step("test-gliner25-production-cuda", "Require pinned GLiNER2.5 CUDA parity and production serving checks");
+    if (ctx.backend.enable_cuda) {
+        production_cuda_step.dependOn(&run_gliner25_production_cuda_tests.step);
+    } else {
+        production_cuda_step.dependOn(&b.addFail("GLiNER2.5 production CUDA qualification requires -Dcuda=true; skipped GPU tests cannot qualify serving").step);
+    }
     // A focused server/library filter need not match an executable-root test.
     // The default aggregate still owns the complete executable-root suites.
     if (selected_test_filters.len == 0) {

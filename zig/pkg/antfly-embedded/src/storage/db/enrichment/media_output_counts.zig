@@ -17,32 +17,36 @@
 const std = @import("std");
 pub const Values = @import("inference_chunker").outputs.CoverageValues;
 pub const Counts = @import("inference_chunker").outputs.CoverageCounts;
-pub const encoded_len = 132;
+pub const encoded_len = 164;
 pub fn key(a: std.mem.Allocator, scope: []const u8) ![]u8 {
     return std.fmt.allocPrint(a, "\x00\x00__metadata__:enrichment_output_counts:{s}", .{scope});
 }
 pub fn encode(counts: Counts) [encoded_len]u8 {
     var raw: [encoded_len]u8 = undefined;
-    @memcpy(raw[0..4], "AMO1");
+    @memcpy(raw[0..4], "AMO2");
     var position: usize = 4;
-    inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+    inline for (.{ "embedding", "transcribe", "classify", "diarize" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
         std.mem.writeInt(u64, raw[position..][0..8], @field(@field(counts, kind), name), .little);
         position += 8;
     };
-    std.crypto.hash.sha2.Sha256.hash(raw[0..100], raw[100..132], .{});
+    std.crypto.hash.sha2.Sha256.hash(raw[0..132], raw[132..164], .{});
     return raw;
 }
 pub fn decode(raw: []const u8) !Counts {
-    if (raw.len != encoded_len or !std.mem.eql(u8, raw[0..4], "AMO1")) return error.InvalidEnrichmentState;
+    const legacy = raw.len == 132 and std.mem.eql(u8, raw[0..4], "AMO1");
+    if (!legacy and (raw.len != encoded_len or !std.mem.eql(u8, raw[0..4], "AMO2"))) return error.InvalidEnrichmentState;
+    const checksum_at: usize = if (legacy) 100 else 132;
     var checksum: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(raw[0..100], &checksum, .{});
-    if (!std.mem.eql(u8, &checksum, raw[100..132])) return error.InvalidEnrichmentState;
+    std.crypto.hash.sha2.Sha256.hash(raw[0..checksum_at], &checksum, .{});
+    if (!std.mem.eql(u8, &checksum, raw[checksum_at..])) return error.InvalidEnrichmentState;
     var counts = Counts{};
     var position: usize = 4;
-    inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
-        @field(@field(counts, kind), name) = std.mem.readInt(u64, raw[position..][0..8], .little);
-        position += 8;
-    };
+    inline for (.{ "embedding", "transcribe", "classify", "diarize" }) |kind| {
+        if (!legacy or comptime !std.mem.eql(u8, kind, "diarize")) inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+            @field(@field(counts, kind), name) = std.mem.readInt(u64, raw[position..][0..8], .little);
+            position += 8;
+        };
+    }
     return counts;
 }
 test "model aware media output counters are checksummed saturating and independent by kind" {
@@ -51,4 +55,16 @@ test "model aware media output counters are checksummed saturating and independe
     try std.testing.expectEqualDeep(counts, try decode(&raw));
     raw[10] ^= 1;
     try std.testing.expectError(error.InvalidEnrichmentState, decode(&raw));
+}
+
+test "model aware media speaker coverage reads legacy counters without inventing diarization" {
+    var legacy: [132]u8 = @splat(0);
+    @memcpy(legacy[0..4], "AMO1");
+    std.mem.writeInt(u64, legacy[4..12], 9, .little);
+    std.crypto.hash.sha2.Sha256.hash(legacy[0..100], legacy[100..132], .{});
+    const decoded = try decode(&legacy);
+    try std.testing.expectEqual(@as(u64, 9), decoded.embedding.complete);
+    try std.testing.expectEqual(@as(u64, 0), decoded.diarize.complete);
+    const upgraded = decoded.add(.{ .diarize = .{ .complete = 3, .failed = 1 } });
+    try std.testing.expectEqualDeep(upgraded, try decode(&encode(upgraded)));
 }

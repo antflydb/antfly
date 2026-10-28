@@ -45,6 +45,11 @@ const Value = std.json.Value;
 // emergency reserve while continuing to use real physical telemetry.
 const service_worker_memory_bytes = 7 * 1024 * 1024 * 1024;
 const service_generation_memory_bytes = 6 * 1024 * 1024 * 1024;
+// GB10 serving is validated with a 40 GiB process/cgroup envelope. Keep the
+// same 6 GiB generation domain below; the Metal comparison retains its 7 GiB
+// dedicated-worker envelope. Linux process policy samples the leaf cgroup,
+// which can also contain the full qualification process and its file cache.
+const cuda_service_worker_memory_bytes = 40 * 1024 * 1024 * 1024;
 
 const OwnershipSnapshot = struct {
     model: memory.AdmissionAmounts = .{},
@@ -75,7 +80,8 @@ fn ownershipSnapshot(node: *Node) OwnershipSnapshot {
 fn reportWorkerAdmissionFailure(node: *Node, err: anyerror) void {
     const process = platform.process_memory.pressureSnapshot();
     const host = memory.currentSystemMemoryInfo();
-    const worker = memory.currentSystemMemoryInfoForLimit(service_worker_memory_bytes, .explicit);
+    const worker_limit = if (node.config.process_memory_limit_bytes > 0) node.config.process_memory_limit_bytes else service_worker_memory_bytes;
+    const worker = memory.currentSystemMemoryInfoForLimit(worker_limit, .explicit);
     const admitted = if (node.model_manager.resource_domain) |domain| domain.admission.snapshot() else memory.AdmissionAmounts{};
     const owned = ownershipSnapshot(node);
     std.debug.print(
@@ -201,7 +207,7 @@ fn dispatchDecide(a: Allocator, node: *Node, raw: []const u8) !httpx.Response {
     return node.decide(&context);
 }
 
-fn expectEntities(a: Allocator, json: []const u8, expected: pipeline.ExpectedSample) !void {
+pub fn expectEntities(a: Allocator, json: []const u8, expected: pipeline.ExpectedSample) !void {
     var parsed = try std.json.parseFromSlice(Value, a, json, .{});
     defer parsed.deinit();
     const data = parsed.value.object.get("data").?.array.items;
@@ -231,6 +237,13 @@ fn expectCached(node: *Node, directory: []const u8, pins: pipeline.PublishedMode
     try std.testing.expectEqualStrings(directory, loaded.model_dir);
     try std.testing.expectEqual(@as(usize, 0), loaded.active_handles);
     try std.testing.expectEqual(backend, loaded.session.backend());
+    if (comptime build_options.enable_cuda) {
+        if (backend == .cuda) {
+            const stats = factory.getCudaRuntimeStats(loaded.session) orelse return error.MissingCudaRuntimeStats;
+            try std.testing.expect(stats.kernel_launches > 0);
+            try std.testing.expectEqual(@as(usize, 0), stats.to_float32_calls);
+        }
+    }
     try std.testing.expectEqual(model.Backbone.multi, (try factory.getGlinerBoundaryConfig(loaded.session)).backbone);
     const identity = try factory.getGlinerBoundaryIdentity(loaded.session);
     try std.testing.expectEqual(.fp32, identity.precision);
@@ -293,6 +306,7 @@ fn requireBackend(node: *Node, comptime backend: BackendType) void {
 }
 
 fn requireAvailable(comptime backend: BackendType) !void {
+    if (backend == .cuda and !build_options.enable_cuda) return error.SkipZigTest;
     if (backend != .metal) return;
     if (comptime !build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
@@ -551,7 +565,11 @@ fn familyExtractionServiceParity(comptime backend: BackendType) !void {
     defer if (perf_config) |*config| config.deinit();
     const runtime_cpu_thread_budget = if (perf_config != null) try runtimeCpuThreadBudget() else 1;
     const perf_source_head = if (perf_config != null) try perf.sourceHead() else "";
-    for (profiles) |profile| {
+    const worker_memory_bytes = if (backend == .cuda) cuda_service_worker_memory_bytes else service_worker_memory_bytes;
+    // CUDA evidence here covers multi-v1. The distinct multi-Decide checkpoint
+    // retains its own backend qualification and must be exercised separately.
+    const selected_profiles = if (backend == .cuda) profiles[0..1] else &profiles;
+    for (selected_profiles) |profile| {
         if (perf_config) |config| if (!config.profileEnabled(profile.name)) continue;
         const requested = platform.env.getenv(profile.environment) orelse return error.SkipZigTest;
         const directory = try realDirectory(a, requested);
@@ -572,7 +590,7 @@ fn familyExtractionServiceParity(comptime backend: BackendType) !void {
             .max_concurrent_requests = 1,
             .keep_alive_ms = 30 * 60 * 1000,
             .process_termination_available = true,
-            .process_memory_limit_bytes = service_worker_memory_bytes,
+            .process_memory_limit_bytes = worker_memory_bytes,
             .process_memory_limit_provenance = .explicit,
             .generation_budget_overrides = .{ .host_limit_bytes = service_generation_memory_bytes, .backend_limit_bytes = service_generation_memory_bytes, .scratch_limit_bytes = service_generation_memory_bytes, .combined_limit_bytes = service_generation_memory_bytes, .kv_limit_bytes = service_generation_memory_bytes },
         });
@@ -600,7 +618,7 @@ fn familyExtractionServiceParity(comptime backend: BackendType) !void {
         }
         const cached = try expectCached(&node, directory, profile.pins, backend);
         const resident = try expectIdle(&node);
-        if (backend == .metal)
+        if (backend != .native)
             try std.testing.expect(resident.backend_weight_bytes >= profile.pins.@"model.safetensors".size_bytes)
         else
             try std.testing.expect(resident.host_weight_bytes >= profile.pins.@"model.safetensors".size_bytes);
@@ -675,6 +693,10 @@ test "GLiNER2.5 multilingual family pinned native extraction direct and HTTP ser
 
 test "GLiNER2.5 multilingual family pinned Metal extraction direct and HTTP service parity" {
     try familyExtractionServiceParity(.metal);
+}
+
+test "GLiNER2.5 multilingual family pinned CUDA extraction direct and HTTP service parity" {
+    try familyExtractionServiceParity(.cuda);
 }
 
 fn familyDecisionServiceParity(comptime backend: BackendType) !void {

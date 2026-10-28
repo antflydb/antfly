@@ -38,7 +38,10 @@ const Capture = struct {
 
 fn parity(comptime backend: enum { native, metal, cuda }) !void {
     const accelerated = backend != .native;
-    const directory = platform.env.getenv("ANTFLY_GLINER_WINDOW_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER_WINDOW_MODEL_DIR") orelse if (backend == .cuda and platform.env.getenvBool("ANTFLY_GLINER25_REQUIRE_PRODUCTION_MODELS"))
+        platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.MissingProductionQualificationModel
+    else
+        return error.SkipZigTest;
     const capture_path = platform.env.getenv("ANTFLY_GLINER_WINDOW_CAPTURE");
     const variant = platform.env.getenv("ANTFLY_GLINER_WINDOW_VARIANT") orelse "base";
     const fixtures = @import("gliner_graph_qualification_fixtures.zig");

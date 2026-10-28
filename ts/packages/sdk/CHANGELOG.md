@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — unreleased
+## 0.2.1
 
 ### LangChain integration foundations
 
@@ -16,6 +16,6 @@
   error policy and cancellation signal. Dense embedding and reranking calls
   propagate cancellation.
 
-This work belongs to the SDK's already-declared, unreleased 0.2.0 version. Publish
-and validate that SDK release before the LangChain and LangGraph packages; the
-registry-only release checks intentionally reject an unavailable dependency.
+The historical 0.2.0 Git tag refers to an older failed release and remains intact.
+This 0.2.1 release contains the merged SDK foundations. Validate the registry
+release before releasing the LangChain and LangGraph packages.

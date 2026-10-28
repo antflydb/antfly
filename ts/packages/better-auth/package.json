@@ -1,0 +1,78 @@
+{
+  "name": "@antfly/better-auth",
+  "version": "0.1.0",
+  "description": "Better Auth adapter and user-scoped content for Antfly",
+  "type": "module",
+  "license": "Apache-2.0",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./embedded": {
+      "types": "./dist/embedded.d.ts",
+      "import": "./dist/embedded.js"
+    },
+    "./remote": {
+      "types": "./dist/remote.d.ts",
+      "import": "./dist/remote.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    }
+  },
+  "bin": {
+    "antfly-auth": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "test": "vitest run test/contracts.test.ts",
+    "lint": "biome check .",
+    "test:integration": "vitest run --maxWorkers=1 test/integration.test.ts test/upstream.test.ts",
+    "test:remote": "vitest run --maxWorkers=1 test/remote.test.ts test/upstream.test.ts"
+  },
+  "dependencies": {
+    "@antfly/sdk": "workspace:*",
+    "@better-auth/core": "~1.7.14"
+  },
+  "peerDependencies": {
+    "better-auth": "~1.7.14",
+    "@antfly/embedded": "^0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@antfly/embedded": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "better-auth": "1.7.14",
+    "@better-auth/test-utils": "1.7.14",
+    "@antfly/embedded": "workspace:*",
+    "@types/node": "^25.9.3",
+    "tsup": "^8.5.1",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.9"
+  },
+  "engines": {
+    "node": ">=24.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/better-auth"
+  },
+  "keywords": [
+    "antfly",
+    "better-auth",
+    "authentication",
+    "embedded",
+    "search"
+  ]
+}

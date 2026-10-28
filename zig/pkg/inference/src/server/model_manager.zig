@@ -5905,13 +5905,25 @@ pub const ModelManager = struct {
         return self.reclaimOneActiveCacheForAdmission(pressure);
     }
 
+    fn tightenUnifiedDeviceAdmission(self: *const ModelManager) void {
+        if (backends.cudaUsesUnifiedMemory())
+            self.admissionController().tightenUnifiedLimit(unifiedDeviceAdmissionLimit(self.process_memory_limit_bytes, self.admission_limit_overrides.combined_limit_bytes));
+    }
+
+    fn physicalRunLimits(self: *const ModelManager, backend_class: runtime.tier.memory.BackendClass, limits: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
+        if (backend_class != .gpu) return limits;
+        return backends.clampPhysicalMemoryLimits(.cuda, limits, self.process_memory_limit_bytes);
+    }
+
     fn acquireAmountsWithEviction(
         self: *ModelManager,
         backend_class: runtime.tier.memory.BackendClass,
-        limits: runtime.tier.memory.Limits,
+        requested_limits: runtime.tier.memory.Limits,
         amounts: runtime.tier.memory.AdmissionAmounts,
     ) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
+        const limits = self.physicalRunLimits(backend_class, requested_limits);
+        self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admissionController().tryAcquireWithPressure(
             backend_class,
@@ -5953,9 +5965,13 @@ pub const ModelManager = struct {
 
     fn acquireRequestsWithEviction(
         self: *ModelManager,
-        requests: []const runtime.tier.memory.AdmissionRequest,
+        requested: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
+        const requests = try self.allocator.dupe(runtime.tier.memory.AdmissionRequest, requested);
+        defer self.allocator.free(requests);
+        for (requests) |*request| request.limits = self.physicalRunLimits(request.backend_class, request.limits);
+        self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admissionController().tryAcquireRequestsWithPressure(
             requests,
@@ -6459,12 +6475,12 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         backend_runtime: backends.BackendRuntime,
     ) runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            admissionBackendClassForRuntime(backend_runtime),
+        var limits = backends.defaultMemoryLimits(
+            backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
         limits = runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
-        return limits;
+        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, limits, self.process_memory_limit_bytes);
     }
 
     /// Apply architecture/artifact residency floors before attaching the hard
@@ -6477,8 +6493,8 @@ pub const ModelManager = struct {
         backend_runtime: backends.BackendRuntime,
         load_plan_floor: runtime.tier.memory.Limits,
     ) !runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            admissionBackendClassForRuntime(backend_runtime),
+        var limits = backends.defaultMemoryLimits(
+            backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
         limits = try session_factory.widenBudgetLimitsForModelPath(
@@ -6488,7 +6504,13 @@ pub const ModelManager = struct {
             backend_runtime.backend,
         );
         limits = runtime.tier.memory.maxCompositeLimits(limits, load_plan_floor);
-        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
+        const resolved = backends.clampPhysicalMemoryLimits(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes);
+        std.log.info("inference memory policy backend={s} requested={any} resolved={any} process_max_bytes={d} cuda_device_bytes={d} unified={} automatic_fallback={}", .{
+            @tagName(backend_runtime.backend),                                               self.admission_limit_overrides,                          resolved,
+            self.process_memory_limit_bytes,                                                 backends.cudaDeviceMemoryBytes(backend_runtime.backend), backends.cudaUsesUnifiedMemory(),
+            backend_runtime.backend == .cuda and backends.cudaDeviceMemoryBytes(.cuda) == 0,
+        });
+        return resolved;
     }
 
     /// Architecture sessions may carry a minimum safe cache/workspace floor
@@ -6500,12 +6522,12 @@ pub const ModelManager = struct {
         backend_runtime: backends.BackendRuntime,
         session: backends.Session,
     ) runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            admissionBackendClassForRuntime(backend_runtime),
+        var limits = backends.defaultMemoryLimits(
+            backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
         limits = session_factory.widenBudgetLimitsForSession(session, limits);
-        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
+        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes);
     }
 
     /// Lazily loaded composite-model components participate in the same
@@ -10801,6 +10823,14 @@ fn loadSessionForPreferredBackends(
             rememberPreferredLoadError(&first_err, err);
             continue;
         };
+        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
+            if (err == error.ProcessIsolationRequired) {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            }
+            return err;
+        };
+        defer hard_cancellation.deinit();
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
         // This attempt owns admission until the successful result explicitly
         // takes it. Includes cancellation, guard-arm failure, and fallback.
@@ -10852,14 +10882,6 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
         }
-        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
-            if (err == error.ProcessIsolationRequired) {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            }
-            return err;
-        };
-        defer hard_cancellation.deinit();
         var close_protection = manager.prepareSessionClose(backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
                 rememberPreferredLoadError(&first_err, err);
@@ -15321,4 +15343,19 @@ test "model aware media host index cache pressure releases idle leases before pr
     try std.testing.expectEqual(@as(usize, 3), cache.calls);
     try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+}
+
+fn unifiedDeviceAdmissionLimit(process_limit: usize, combined_override: usize) usize {
+    const physical = runtime.tier.memory.defaultSharedAdmissionLimitsWithProcessLimit(process_limit).host_limit_bytes;
+    return if (combined_override == 0) physical else @min(physical, combined_override);
+}
+
+test "integrated CUDA combined override constrains simultaneous CPU and GPU leases" {
+    const limit = unifiedDeviceAdmissionLimit(16 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
+    try std.testing.expect(limit <= 8 * 1024 * 1024 * 1024);
+    var controller: runtime.tier.memory.AdmissionController = .{};
+    controller.tightenUnifiedLimit(limit);
+    var cpu = try controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = limit / 2 + 1 }, false);
+    defer cpu.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, .{}, .{ .backend_weight_bytes = limit / 2 + 1 }, false));
 }

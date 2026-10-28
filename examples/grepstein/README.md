@@ -168,14 +168,16 @@ separate; it needs read access to the originals bucket.
 ./grepstein stats --state ./grepstein-corpus --url "$ANTFLY_URL"
 ```
 
-The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
+The showcase OCR profile uses the CUDA-qualified, revision-pinned LightOnOCR-3-0.8B on shared Antfly
 inference, running Antfly v0.3.0-rc.5 or later. Its native `/read` contract uses
 an image-only prompt, so the extraction producer keeps `prompt_policy: plain`.
-The profile requests at most 1024 output tokens per page; truncated OCR returns
+The profile requests at most 512 output tokens per page; truncated OCR returns
 an error instead of publishing incomplete text. Dense pages can need a separate
-larger-budget `/generate` workflow. Shared inference also offers the smaller
-`lightonocr3-0.8b` model; select its pinned identity in a copy of the reader profile
-when qualifying the latency/quality tradeoff. The LightOnOCR models return
+larger-budget `/generate` workflow. LightOnOCR-3-4B remains a candidate until
+the exact released runtime passes load, OCR, model-switching, and memory checks
+on the shared L4 reader pool. Use `zig/tools/qualify_reader_generator_pools.py`
+for native execution checks before promoting its pinned identity in this profile.
+The LightOnOCR models return
 Markdown, including table structure, through the same native reader API.
 Set `ANTFLY_INFERENCE_URL` to a server-reachable inference root or `/ai/v1` URL;
 `--inference-url` binds the LightOnOCR profile and relation extractor to that endpoint.

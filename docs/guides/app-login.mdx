@@ -1,0 +1,132 @@
+---
+title: Application login with Better Auth
+description: Keep identities, sessions, and personal document search in Antfly.
+---
+
+Use `@antfly/better-auth` with Better Auth's standard server and browser APIs. Antfly stores users, accounts, sessions, verification tokens, and application documents. The first recipe needs one persistent Node 24+ process and a database file.
+
+```ts
+import { betterAuth } from "better-auth";
+import {
+  getDatabase, antflyAdapter, prepareAuthSchema,
+  prepareContentSchema, createUserContent,
+} from "@antfly/better-auth/embedded";
+import { authOptions } from "./auth.config.ts";
+
+const db = await getDatabase("./data/app.aflite");
+const options = { ...authOptions, database: antflyAdapter(db) };
+await prepareAuthSchema(db, options);
+const tables = { documents: { fields: ["title", "body"] } };
+await prepareContentSchema(db, tables, options);
+const auth = betterAuth(options);
+const requireUser = createUserContent({ auth, db, tables });
+// Mount auth routes and start listening only after schema setup succeeds.
+```
+
+Install `@antfly/better-auth`, `@antfly/embedded`, and `better-auth@~1.7.14`. Define `authOptions` in a side-effect-free configuration module:
+
+```ts
+import { authDefaults } from "@antfly/better-auth";
+export const authOptions = {
+  ...authDefaults,
+  secret: process.env.BETTER_AUTH_SECRET,
+  baseURL: "https://app.example.com",
+  trustedOrigins: ["https://app.example.com"],
+};
+```
+
+Use a durable random secret of at least 32 characters. Mount Better Auth's `toNodeHandler(auth)` at `/api/auth/*splat` in Express 5, **before** `express.json()`. This recipe is ESM. The standard `createAuthClient` from `better-auth/client` handles signup, signin, sessions, and signout.
+
+See [the runnable Express example](https://github.com/antflydb/antfly/tree/main/ts/examples/express-auth). The onboarding target is signup, login, one document creation, and owner-scoped search in under ten minutes with at most three application files. This is an acceptance target, not a measured human onboarding result.
+
+## Access the signed-in user's documents
+
+```ts
+const mine = await requireUser(request);
+const document = await mine.documents.create({ title: "Notes", body: "My first document" });
+const matches = await mine.documents.searchText({ query: "document", limit: 10 });
+await mine.documents.update(document._id, { body: "Updated notes" });
+```
+
+`requireUser` calls `auth.api.getSession`. Create the scoped handle for each request; do not cache it across requests. Ownership uses the stable user ID, never an email or a submitted owner field. The restricted handle supports `create`, `get`, `list`, `update`, `delete`, and `searchText`. Writes include the owner predicate atomically; full-text searches apply the owner filter before the limit. Only declared content fields are returned. Owner IDs, raw database handles, query filters, counts, snippets, joins, and vector queries are not exposed. Unsupported query options fail closed. Add your application's same-origin/CSRF checks to cookie-authenticated content mutation routes, as the examples do.
+
+The underlying database handle is a trusted server capability. This helper does not implement database-wide row-level access control. Do not expose Antfly credentials or unrestricted database routes to browsers.
+
+## Defaults
+
+| Setting | Default |
+| --- | --- |
+| Session expiration | 7 days |
+| Session update age | 1 day |
+| Cookie session cache | Disabled; revocation reads the database |
+| Cookies | HttpOnly, SameSite=Lax, host-only; Better Auth enables Secure for HTTPS |
+| Rate limiting | Enabled, in memory for one process; database-backed for remote apps |
+| Initial signups | Email/password, unverified email; no email-based privilege claims |
+| IDs | Better Auth string IDs |
+
+## Consumer account flows
+
+Replace `authDefaults` with `consumerAuthOptions` before opening public registration:
+
+```ts
+import { consumerAuthOptions } from "@antfly/better-auth";
+export const authOptions = {
+  ...consumerAuthOptions({
+    sendMail: async ({ to, subject, text }) => mailProvider.send({ to, subject, text }),
+    google: { clientId: process.env.GOOGLE_CLIENT_ID!, clientSecret: process.env.GOOGLE_CLIENT_SECRET! },
+  }),
+  secret: process.env.BETTER_AUTH_SECRET,
+  baseURL: "https://app.example.com",
+  trustedOrigins: ["https://app.example.com"],
+};
+```
+
+This requires email verification and enables password recovery, verified email changes, account deletion, and optional Google login. Mail is queued after successful database transactions. Use reliable delivery in your callback and provide your product's verification/reset pages. Configure Google's authorized redirect URL as `https://app.example.com/api/auth/callback/google`. Credentials and delivery infrastructure remain application-owned. Account linking uses Better Auth's verified-provider rules; no provider receives an unconditional trusted-provider exemption.
+
+Deleting an account removes its auth records and sessions. Define your application's content retention/deletion policy separately; the content helper does not silently delete business data.
+
+## Schema maintenance
+
+Fresh schema setup finishes before routes become available. Auth tables retain relational constraints but have **no document retrieval indexes**, preventing passwords and session tokens from entering search. Startup checks existing tables and blocks incompatible schema or retrieval-index drift.
+
+```sh
+antfly-auth check --config ./auth.config.ts --database ./data/app.aflite
+antfly-auth apply --config ./auth.config.ts --database ./data/app.aflite
+```
+
+`check` opens the file read-only. Stop the app before explicit maintenance with `apply`. Both commands use Better Auth's schema declarations, including renamed models/fields and plugin declarations. The config must export `authOptions` or a default options object, without starting an app or opening a writable database. Better Auth's own `migrate` command does not manage this adapter.
+
+`apply` creates missing tables, adds optional unconstrained columns, and removes retrieval indexes from auth tables. Incompatible populated schemas require explicit review; it does not silently drop columns or rewrite data. After changing plugin configuration, run `check` before deployment. A schema declaration is not proof that every plugin flow is supported.
+
+The embedded engine coordinates access with per-operation leases; concurrent processes can wait or report that the database is busy. Keep one application process responsible for the file. `getDatabase(path)` caches canonical paths across hot reloads; close the shared handle only at application shutdown. `embeddedDatabase(nativeHandle)` wraps a caller-owned handle without taking ownership of its lifetime.
+
+## Remote deployment
+
+Use `remoteDatabase(new AntflyClient(...))` from `@antfly/better-auth/remote` and the same adapter/schema/content helpers. No native library is imported. Set `rateLimit.storage` to `"database"`, or pass `remote: true` to `consumerAuthOptions`. Initialize schema once before starting multiple application instances.
+
+Use a server release containing the concurrent SQL connection-directory fix shipped with this integration, together with the updated SDK. SQL transactions must stay on one stable API owner endpoint. The transport retains the HTTP connection ID and active transaction session ID. Arbitrary round-robin routing is unsupported. For committed-but-pending writes, the transport reads the matching transaction receipt until visibility is confirmed. Fresh schema setup similarly checks the receipt’s table identity and schema generation before serving requests. Pending, repair-required, and uncertain writes are never replayed; unresolved outcomes fail closed.
+
+See [the Next.js remote example](https://github.com/antflydb/antfly/tree/main/ts/examples/nextjs-auth). Next.js may use embedded Antfly only as a standalone persistent Node deployment with the same platform restrictions as Express.
+
+## Support and testing
+
+| Surface | Initial support |
+| --- | --- |
+| Better Auth | One supported minor: 1.7; baseline 1.7.14 |
+| Embedded runtime | Node 24+, macOS arm64, glibc Linux arm64/x64 |
+| Embedded deployment | One persistent process; Docker `node:24-slim`, VPS, or volume-backed host |
+| Remote recipe | Node runtime, Next.js; stable Antfly API owner |
+| Authentication | Email/password, database sessions, verification/recovery, email change, account deletion, Google configuration |
+| Content | Owner-scoped CRUD and full-text search |
+| Plugins | Schema extension supported; additional plugin workflows require qualification |
+| Not yet | Windows, Alpine/musl, Bun, Deno, Workers/Cloudflare, browser-native/desktop auth packaging, non-TypeScript integrations |
+
+`createTestAuth()` from `@antfly/better-auth/testing` provides an isolated temporary database and cleanup. Pass a second argument of `true` to capture consumer-flow mail. Always call `close()` in teardown. Real password hashing remains enabled.
+
+The adapter uses Better Auth's full-snapshot consume fallback, a native guarded arithmetic increment, and dedicated SQL sessions for transactions. Transaction callbacks are never retried. Failed signup transactions roll back both user and account writes. Errors returned from adapter operations are sanitized; inspect database health and schema status rather than retrying an unknown write.
+
+Repository maintainers own the adapter alongside the TypeScript SDK. Supported-version checks gate package releases; scheduled latest/beta checks are compatibility signals. Upgrade the supported minor deliberately after the shared transport and consumer-flow tests pass. Security fixes take priority over expanding the support matrix.
+
+## Prior art
+
+[Convex's Better Auth integration](https://labs.convex.dev/better-auth) is prior art for keeping identities and application data in one backend while retaining Better Auth's client APIs. This integration follows the same separation: Better Auth owns authentication, and Antfly supplies persistence and narrowly scoped content access. It uses stable user identities, completes account transactions before external effects, and distinguishes extensible schema configuration from tested runtime/framework/plugin support.

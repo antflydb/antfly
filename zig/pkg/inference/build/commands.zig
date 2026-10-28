@@ -78,7 +78,12 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const http_default_memory_gib: usize = if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
         (if (ctx.optimize == .small) 10 else 14)
     else if (ctx.hasAccelerator()) 8 else 6;
-    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else http_default_memory_gib * 1024;
+    // The Zig 0.17 stripped CUDA server measured 12.08 GB on GB10/aarch64.
+    // Reserve 14 GiB for this profile; retain the existing other-host claims.
+    const aarch64_cuda_http_release = ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.backend.enable_cuda and
+        ctx.optimize == .fast and ctx.strip;
+    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (aarch64_cuda_http_release) 14 * 1024 else http_default_memory_gib * 1024;
     const http_server = b.addExecutable(.{
         .name = "antfly-inference-http-server",
         .max_rss = http_compile_memory_mb * 1024 * 1024,

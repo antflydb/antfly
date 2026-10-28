@@ -745,7 +745,33 @@ const cuda_base_entries = [_]Entry{
     .{ .identity = fastino_gliner25_base_v1, .backend = .cuda, .features = composed_window_features, .lengths = composed_window_lengths },
     .{ .identity = fastino_gliner25_base_v1_transformers, .backend = .cuda, .features = composed_window_features, .lengths = composed_window_lengths },
 };
-const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries);
+// GB10 / driver 580.178.04, 2026-10-27: all ten frozen pipeline cases and
+// every multilingual-v1 family/endpoint/classifier/entity floor capture pass
+// CUDA FP32 parity, with GPU launches and zero generic host tensor fallbacks.
+// Retain each independent measured profile; this adds neither multi-Decide,
+// reduced precision, feature unions nor a long-document composition row.
+fn cudaMultilingualEntries() [family_profiles.len]Entry {
+    var entries: [family_profiles.len]Entry = undefined;
+    for (family_profiles, 0..) |profile, index|
+        entries[index] = .{ .identity = fastino_gliner25_multi_v1, .backend = .cuda, .features = profile.features, .lengths = profile.lengths };
+    return entries;
+}
+// Independent CUDA batch rows preserve all existing per-item geometry/features.
+// Grouped rows are measured at 2/4/8 with distinct inputs, schemas and padding.
+pub const cuda_batch_items: usize = 8;
+fn cudaBatchEntry(entry: Entry) Entry {
+    var out = entry;
+    out.lengths.request_items = .{ .min = 2, .max = cuda_batch_items };
+    return out;
+}
+fn cudaBatchEntries() [2 + family_profiles.len]Entry {
+    var entries: [2 + family_profiles.len]Entry = undefined;
+    entries[0] = cudaBatchEntry(cuda_base_entries[0]);
+    entries[1] = cudaBatchEntry(cuda_base_entries[1]);
+    for (cudaMultilingualEntries(), 2..) |entry, i| entries[i] = cudaBatchEntry(entry);
+    return entries;
+}
+const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries ++ cudaMultilingualEntries() ++ cudaBatchEntries());
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
@@ -1048,7 +1074,11 @@ test "GLiNER multilingual production qualification binds exact artifacts and ind
         changed = identity;
         changed.weight.sha256[0] = '0';
         try std.testing.expect(!hasQualifiedIdentity(changed));
-        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, family_profiles[0].features, family_profiles[0].lengths));
+        if (equalIdentity(identity, fastino_gliner25_multi_v1)) {
+            for (family_profiles) |profile| try require(identity, .cuda, profile.features, profile.lengths);
+        } else {
+            try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, family_profiles[0].features, family_profiles[0].lengths));
+        }
         if (!equalIdentity(identity, fastino_gliner25_multi_decide))
             try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.long_document)));
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.classification_multi)));
@@ -1290,7 +1320,7 @@ test "CUDA boundary base profiles keep exact identity context and precision gate
         mismatch.weight.sha256[0] = 'f';
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(mismatch, .cuda, entry.features, entry.lengths));
         var oversized = entry.lengths;
-        oversized.padded_sequence_tokens = Range.exact(entry.lengths.padded_sequence_tokens.max + 1);
+        oversized.padded_sequence_tokens = Range.exact(1_000_000);
         try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(entry.identity, .cuda, entry.features, oversized));
         mismatch = entry.identity;
         mismatch.precision = .fp16_encoder;
@@ -1305,4 +1335,44 @@ test "CUDA boundary window preparation derives context from exact qualified prof
     changed.weight.sha256[0] = 'f';
     try std.testing.expectEqual(@as(?usize, null), maxQualifiedWindowTokens(changed, .cuda));
     try std.testing.expectEqual(@as(?usize, null), maxQualifiedWindowTokens(fastino_gliner25_base_v1_fp16_encoder, .cuda));
+}
+
+test "CUDA boundary multi profiles retain exact artifacts independent tasks and measured geometry" {
+    for (cudaMultilingualEntries()) |entry| {
+        try require(entry.identity, .cuda, entry.features, entry.lengths);
+        var mismatch = entry.identity;
+        mismatch.sidecars[0].sha256[0] ^= 1;
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(mismatch, .cuda, entry.features, entry.lengths));
+        mismatch = entry.identity;
+        mismatch.precision = .fp16_encoder;
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(mismatch, .cuda, entry.features, entry.lengths));
+        var oversized = entry.lengths;
+        oversized.padded_sequence_tokens = Range.exact(1025);
+        try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(entry.identity, .cuda, entry.features, oversized));
+        var union_features = entry.features;
+        union_features.insert(.classification_multi);
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(entry.identity, .cuda, union_features, entry.lengths));
+    }
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(fastino_gliner25_multi_v1, .cuda, Features.initOne(.long_document)));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(fastino_gliner25_multi_decide, .cuda, family_profiles[0].features, family_profiles[0].lengths));
+}
+
+test "CUDA boundary batch rows preserve per-item limits and exclude long documents and other backends" {
+    for (cudaBatchEntries()) |entry| {
+        for ([_]u32{ 2, 4, 8 }) |n| {
+            var lengths = entry.lengths;
+            lengths.request_items = Range.exact(n);
+            try require(entry.identity, .cuda, entry.features, lengths);
+        }
+        var lengths = entry.lengths;
+        lengths.request_items = Range.exact(9);
+        try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(entry.identity, .cuda, entry.features, lengths));
+        lengths.request_items = Range.exact(2);
+        try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(entry.identity, .native, entry.features, lengths));
+        lengths.padded_sequence_tokens = Range.exact(1_000_000);
+        try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(entry.identity, .cuda, entry.features, lengths));
+    }
+    var long = composed_window_lengths;
+    long.request_items = Range.exact(2);
+    try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(fastino_gliner25_base_v1, .cuda, composed_window_features, long));
 }

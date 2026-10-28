@@ -186,6 +186,9 @@ SOURCE_MODULES = {
     "antfly_indexes_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_indexes_openapi/root.zig",
     ),
+    "antfly_resources_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_resources_openapi/root.zig",
+    ),
     "antfly_inference_config_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_inference_config_openapi/root.zig",
     ),

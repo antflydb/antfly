@@ -130,6 +130,11 @@ def walk_refs(value: object, rename_schema) -> object:
                     out[key] = prefix + rename_schema(child[len(prefix) :])
                 elif child.startswith(shared_generating_prefix):
                     out[key] = prefix + child[len(shared_generating_prefix) :]
+                elif child.startswith("./config.yaml#/"):
+                    out[key] = (
+                        "specs/openapi/inference/config.yaml#/"
+                        + child.split("#/", 1)[1]
+                    )
                 elif child.startswith(ai_extraction_prefix):
                     out[key] = (
                         "specs/openapi/ai/extraction.yaml#/components/schemas/"
