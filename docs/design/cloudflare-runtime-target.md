@@ -47,7 +47,8 @@ Fix this first. The observed budget-one cancellation means reducing the number
 of records is insufficient in at least one slow-storage case. Identify the
 minimum unit's actual phase/dependency cost before prescribing its split.
 
-Introduce a durable native publication plan containing source identity, the WAL
+Extend existing prefix/job checkpointing with continuations inside a large input
+record or artifact. Introduce a durable native publication plan containing source identity, the WAL
 prefix, policy/schema identity, stable output attempt identity, completed output
 references, a bounded continuation and terminal status. Each invocation builds
 or uploads a bounded unit, persists progress and yields with deadline headroom.
@@ -83,6 +84,11 @@ freshly. Avoid per-object coordinator RPCs once the operation has an authenticat
 native view. Retain separate bounded heavy-query admission where required.
 
 ## 3. Minimize the native write transaction's dependent calls
+
+The existing [object backend](antfly-object-storage-backend.md) already commits
+through a conditionally created immutable journal slot. Its throttled checkpoint
+is a recovery hint. Preserve that protocol, including takeover/seal checks; a
+logical HEAD must not become a hot mutable R2 object rewritten for every step.
 
 Keep one client mutation call into the tenant sequencer. Progressively combine
 native WAL preparation, operation-receipt handling and metadata transaction
@@ -142,6 +148,10 @@ indefinitely. Expiry is a cleanup trigger, not permission to delete resources
 outside the approved scope. Production retention follows its own explicit policy.
 
 ## Validate changes locally, then use short cloud confirmation
+
+The earlier latency matrices enable injected delay after seeding. They do not
+establish bulk-preparation headroom. Apply the declared storage model to seeding
+and publication as well as steady reads/writes in the next fixture.
 
 Replace a uniform-delay-only model with locally replayable storage delay,
 correlated slow periods, queue lag, source changes, lease expiry and interrupted

@@ -21,10 +21,18 @@ export default {
      !env.API_TOKEN||request.headers.get("Authorization")!=="Bearer "+env.API_TOKEN||
      env.COORDINATOR_BACKEND!=="r2"||!env.ANTFLY_INCARNATION?.startsWith("qualification-"))
    return new Response("unauthorized",{status:401});
-  const page=await env.DATABASE.list({limit:1000});
-  if(page.objects.length)await env.DATABASE.delete(page.objects.map(item=>item.key));
-  // Require an empty observation after deletion; truncation alone is not proof
-  // that the bucket is empty or that a failed delete completed.
-  return Response.json({done:page.objects.length===0,deleted:page.objects.length,bytes:page.objects.reduce((sum,object)=>sum+object.size,0)});
+  const started=Date.now();let deleted=0,bytes=0;
+  // R2 can return fewer objects than requested. Bound both total work and
+  // continuation count while amortizing the client round trip across small pages.
+  for(let step=0;step<8&&deleted<1000;step++){
+   const page=await env.DATABASE.list({limit:1000-deleted});
+   if(!page.objects.length){if(page.truncated)throw Error("EmptyTruncatedCleanupPage");break;}
+   await env.DATABASE.delete(page.objects.map(item=>item.key));
+   deleted+=page.objects.length;bytes+=page.objects.reduce((sum,object)=>sum+object.size,0);
+   if(Date.now()-started>=2000)break;
+  }
+  // An empty invocation is the final proof; do not infer completion from a
+  // partial listing, or before an awaited delete has completed.
+  return Response.json({done:deleted===0,deleted,bytes});
  }
 };

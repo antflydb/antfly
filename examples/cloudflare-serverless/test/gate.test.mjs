@@ -299,7 +299,7 @@ test("cleanup-only draining rejects unauthorized and non-disposable calls before
 test("cleanup-only draining bounds deletes and confirms emptiness after completed storage operations",async()=>{
  const drain=(await import("../qualification/drain-worker.mjs")).default;
  let rows=Array.from({length:1005},(_,i)=>({key:"object/"+i,size:2})),fail=false;
- const env={API_TOKEN:"disposable",ANTFLY_INCARNATION:"qualification-drain",COORDINATOR_BACKEND:"r2",DATABASE:{async list({limit}){assert.equal(limit,1000);return{objects:rows.slice(0,limit),truncated:rows.length>limit};},async delete(keys){if(fail)throw Error("DeletionUnavailable");assert.ok(keys.length<=1000);const removed=new Set(keys);rows=rows.filter(r=>!removed.has(r.key));}}};
+ const env={API_TOKEN:"disposable",ANTFLY_INCARNATION:"qualification-drain",COORDINATOR_BACKEND:"r2",DATABASE:{async list({limit}){assert.ok(limit>=1&&limit<=1000);const count=Math.min(limit,259);return{objects:rows.slice(0,count),truncated:rows.length>count};},async delete(keys){if(fail)throw Error("DeletionUnavailable");assert.ok(keys.length<=1000);const removed=new Set(keys);rows=rows.filter(r=>!removed.has(r.key));}}};
  const request=()=>new Request("https://cleanup.invalid/_qualification/drain",{method:"POST",headers:{Authorization:"Bearer disposable"}});
  fail=true;await assert.rejects(drain.fetch(request(),env),/DeletionUnavailable/);assert.equal(rows.length,1005);fail=false;
  assert.deepEqual(await(await drain.fetch(request(),env)).json(),{done:false,deleted:1000,bytes:2000});
