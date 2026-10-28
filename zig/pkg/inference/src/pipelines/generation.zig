@@ -13403,9 +13403,7 @@ pub const NativeGenerationPipeline = struct {
         {
             const hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(&self.cb, self.allocator, self.gpt_config, input_ids, if (wide) 1 else claimed.len, if (wide) claimed.len else 1, first_context, "gpt.cuda_token_burst");
             defer self.cb.free(hidden);
-            const logits = try self.cb.linearNoBias(hidden, head, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
-            defer self.cb.free(logits);
-            try burst.argmax(logits, 0);
+            try burst.projectArgmax(hidden, head, 0);
         }
         for (1..burst.steps) |step| {
             try self.cb.checkExecutionControl();
@@ -13435,9 +13433,7 @@ pub const NativeGenerationPipeline = struct {
             const embedded = try burst.embedding(step - 1);
             const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(&self.cb, self.allocator, self.gpt_config, embedded, .{}, if (wide) 1 else claimed.len, if (wide) claimed.len else 1, &context.context, null);
             defer self.cb.free(hidden.hidden);
-            const logits = try self.cb.linearNoBias(hidden.hidden, head, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
-            defer self.cb.free(logits);
-            try burst.argmax(logits, step);
+            try burst.projectArgmax(hidden.hidden, head, step);
         }
         var host: [max_gpu_token_burst_width * 128]u32 = undefined;
         try self.readLightOnCudaBurst(burst, host[0 .. burst.steps * claimed.len]);

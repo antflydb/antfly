@@ -23,6 +23,7 @@ import ctypes as c
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 import torch
 from safetensors import safe_open
@@ -225,6 +226,23 @@ try:
                         per_image = height * width
                         rows = per_image * batch
                         if rows == 65536:
+                            # The checkpoint hash above reads the full file.
+                            # On UMA, its reclaimable page cache also reduces
+                            # CUDA free memory. Retire only unused test memory
+                            # and these immutable inputs' closed file pages.
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                            if hasattr(os, "posix_fadvise"):
+                                for checkpoint_dir in [args.model_08, args.model_4b]:
+                                    with (checkpoint_dir / "model.safetensors").open(
+                                        "rb"
+                                    ) as checkpoint:
+                                        os.posix_fadvise(
+                                            checkpoint.fileno(),
+                                            0,
+                                            0,
+                                            os.POSIX_FADV_DONTNEED,
+                                        )
                             free, _ = torch.cuda.mem_get_info()
                             assert free >= 60 * 1024**3, (
                                 "Insufficient memory for required maximum-shape independent cuDNN reference",

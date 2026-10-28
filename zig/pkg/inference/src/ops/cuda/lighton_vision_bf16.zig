@@ -66,7 +66,7 @@ pub const Layout = struct {
 };
 
 pub const Request = struct {
-    fused_up: bool = true,
+    fused_mlp: bool = true,
     input: buffer.DeviceBuffer,
     output: buffer.DeviceBuffer,
     // norm1 weight/bias, QKV weight/bias, out weight/bias,
@@ -96,6 +96,7 @@ pub const Module = struct {
     functions: [4]driver.CUfunction = @splat(null),
     blocks: usize = 0,
     up: @import("lighton_vision_gemm.zig").Module = .{},
+    down: @import("lighton_vision_gemm.zig").DownModule = .{},
 
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
         if (self.module != null) return;
@@ -113,6 +114,7 @@ pub const Module = struct {
 
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
         self.up.deinit(ctx);
+        self.down.deinit(ctx);
         if (self.module != null) {
             ctx.makeCurrent() catch return;
             _ = ctx.driver.fns.cuModuleUnload(self.module);
@@ -199,7 +201,7 @@ pub const Module = struct {
         try blas.matmulBf16WeightBiasBf16Out(ctx, projected, s[5], w[4], w[5], gemm_workspace, r.rows, r.hidden, r.hidden);
         try self.add(ctx, s[6], r.input, projected, r.rows * r.hidden);
         try self.norm(ctx, s[0], s[6], w[6], w[7], r.rows, r.hidden, r.epsilon);
-        if (r.fused_up and @import("lighton_vision_gemm.zig").supported(ctx.info.compute_major, ctx.info.compute_minor, r.rows, r.hidden, r.intermediate)) {
+        if (r.fused_mlp and @import("lighton_vision_gemm.zig").supported(ctx.info.compute_major, ctx.info.compute_minor, r.rows, r.hidden, r.intermediate)) {
             try self.up.run(ctx, .{ .input = s[0], .weight = w[8], .bias = w[9], .output = s[7], .rows = r.rows, .hidden = r.hidden, .wide = r.intermediate, .round_before_gelu = true });
         } else {
             try blas.matmulBf16WeightBiasBf16Out(ctx, s[7], s[0], w[8], w[9], gemm_workspace, r.rows, r.hidden, r.intermediate);
@@ -208,8 +210,12 @@ pub const Module = struct {
             var gelu_args = [_]?*anyopaque{ &gelu[0], &gelu[1], &count };
             try self.launch(ctx, 2, (r.rows * r.intermediate + 255) / 256, &gelu_args);
         }
-        try blas.matmulBf16WeightBiasBf16Out(ctx, s[0], s[7], w[10], w[11], gemm_workspace, r.rows, r.intermediate, r.hidden);
-        try self.add(ctx, r.output, s[6], s[0], r.rows * r.hidden);
+        if (r.fused_mlp and @import("lighton_vision_gemm.zig").supportedDown(ctx.info.compute_major, ctx.info.compute_minor, r.rows, r.hidden, r.intermediate, true)) {
+            try self.down.run(ctx, .{ .input = s[7], .weight = w[10], .bias = w[11], .residual = s[6], .output = r.output, .rows = r.rows, .hidden = r.hidden, .wide = r.intermediate, .bf16_io = true });
+        } else {
+            try blas.matmulBf16WeightBiasBf16Out(ctx, s[0], s[7], w[10], w[11], gemm_workspace, r.rows, r.intermediate, r.hidden);
+            try self.add(ctx, r.output, s[6], s[0], r.rows * r.hidden);
+        }
         self.blocks += 1;
     }
 };

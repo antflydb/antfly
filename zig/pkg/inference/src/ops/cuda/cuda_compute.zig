@@ -2393,7 +2393,7 @@ pub const CudaCompute = struct {
         }
         if (input.dtype == .f32) try self.kernels.launchF32ToBf16(&self.ctx, converted, input.buffer, count);
         if (cached == null) try copyFromHostTracked(self, position_buffer, std.mem.sliceAsBytes(positions));
-        try self.lighton_vision_bf16.block(&self.ctx, &self.cublaslt.?, attention, key, arena, layout, cublasLtWorkspace(self), .{ .input = source, .output = output, .weights = w, .positions = position_buffer, .rows = rows, .hidden = hidden, .intermediate = intermediate, .batch = batch, .epsilon = eps, .theta = theta, .attention_workspace = vendor_workspace, .fused_up = self.lighton_fused_vision_mlp_enabled });
+        try self.lighton_vision_bf16.block(&self.ctx, &self.cublaslt.?, attention, key, arena, layout, cublasLtWorkspace(self), .{ .input = source, .output = output, .weights = w, .positions = position_buffer, .rows = rows, .hidden = hidden, .intermediate = intermediate, .batch = batch, .epsilon = eps, .theta = theta, .attention_workspace = vendor_workspace, .fused_mlp = self.lighton_fused_vision_mlp_enabled });
         return createTensorWithDType(self, output, shape, count, .bf16);
     }
 
@@ -2428,6 +2428,8 @@ pub const CudaCompute = struct {
         hidden: usize,
         vocab: usize,
         drained: bool = false,
+        head_partial: buffer_mod.DeviceBuffer = .{},
+        head_indices: buffer_mod.DeviceBuffer = .{},
 
         pub fn deinit(burst: *@This()) void {
             // Cancellation and encoding failures must retain the token bank
@@ -2436,7 +2438,50 @@ pub const CudaCompute = struct {
             const cb = burst.owner.computeBackend();
             cb.free(burst.bank);
             releaseDeviceBuffer(burst.owner, &burst.suppress);
+            releaseDeviceBuffer(burst.owner, &burst.head_partial);
+            releaseDeviceBuffer(burst.owner, &burst.head_indices);
             burst.* = undefined;
+        }
+        pub fn projectArgmax(burst: *@This(), hidden: CT, head: CT, step: usize) !void {
+            if (step >= burst.steps) return error.InvalidShape;
+            const self = burst.owner;
+            const cb = self.computeBackend();
+            const input = tensorFromCt(hidden);
+            const weight = tensorFromCt(head);
+            const fused = @import("lighton_head.zig");
+            if (!self.lighton_fused_head_disabled and fused.supported(self.ctx.info.compute_major, self.ctx.info.compute_minor, burst.rows, burst.hidden, burst.vocab) and
+                weight.dtype == .bf16 and weight.quant_type == null and !weight.strict_resident_training and
+                !input.strict_resident_training and !self.resident_training_cache and self.lazy_host_store == null and
+                !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
+            {
+                try ensureF32(input);
+                try ensureCount(input, try checkedMul(burst.rows, burst.hidden));
+                try ensureCount(weight, try checkedMul(burst.hidden, burst.vocab));
+                const bytes = try checkedMul(try checkedMul(burst.rows, fused.tiles), 4);
+                // Ordinary admitted temporary allocations, retained only for
+                // this burst. Allocation pressure takes the dense fallback.
+                if (burst.head_partial.ptr == 0) burst.head_partial = allocDeviceBuffer(self, bytes) catch .{};
+                if (burst.head_partial.ptr != 0 and burst.head_indices.ptr == 0)
+                    burst.head_indices = allocDeviceBuffer(self, bytes) catch .{};
+                if (burst.head_partial.ptr != 0 and burst.head_indices.ptr != 0) {
+                    const bank = tensorFromCt(burst.bank).buffer;
+                    const output_bytes = burst.rows * @sizeOf(u32);
+                    const request = fused.Request{ .input = input.buffer, .weight = weight.buffer, .partial = burst.head_partial, .indices = burst.head_indices, .suppress = burst.suppress, .output = .{ .ptr = bank.ptr + step * output_bytes, .len = output_bytes }, .rows = burst.rows, .suppress_count = burst.suppress_count };
+                    try fused.validate(request);
+                    burst.drained = false;
+                    try self.lighton_head.run(&self.ctx, request);
+                    self.stats.launch_argmax += 1;
+                    return;
+                }
+                // No fused launch has consumed these buffers if allocation
+                // was declined. Let the ordinary cache reclaim them before
+                // the dense fallback needs its larger logits allocation.
+                releaseDeviceBuffer(self, &burst.head_partial);
+                releaseDeviceBuffer(self, &burst.head_indices);
+            }
+            const logits = try cb.linearNoBias(hidden, head, burst.rows, burst.hidden, burst.vocab);
+            defer cb.free(logits);
+            try burst.argmax(logits, step);
         }
         pub fn argmax(burst: *@This(), logits: CT, step: usize) !void {
             if (step >= burst.steps) return error.InvalidShape;
@@ -3149,14 +3194,18 @@ pub const CudaCompute = struct {
             };
             try self.lighton_vision_fused.gelu(&self.ctx, .{ activated.ptr, projected.ptr, tensors[3].buffer.ptr }, @intCast(wide), @intCast(hidden));
         }
-        blas.matmulBf16WeightF32Out(&self.ctx, dst, activated, tensors[4].buffer, cublasLtWorkspace(self), rows, hidden, dim) catch |err| switch (err) {
-            error.CublasLtUnsupported => {
-                cb.free(output);
-                return null;
-            },
-            else => return err,
-        };
-        try self.lighton_vision_fused.residual(&self.ctx, .{ dst.ptr, dst.ptr, tensors[5].buffer.ptr, input.buffer.ptr }, @intCast(count), @intCast(dim));
+        if (@import("lighton_vision_gemm.zig").supportedDown(self.ctx.info.compute_major, self.ctx.info.compute_minor, rows, dim, hidden, false)) {
+            try self.lighton_vision_down.run(&self.ctx, .{ .input = activated, .weight = tensors[4].buffer, .bias = tensors[5].buffer, .residual = input.buffer, .output = dst, .rows = rows, .hidden = dim, .wide = hidden, .bf16_io = false });
+        } else {
+            blas.matmulBf16WeightF32Out(&self.ctx, dst, activated, tensors[4].buffer, cublasLtWorkspace(self), rows, hidden, dim) catch |err| switch (err) {
+                error.CublasLtUnsupported => {
+                    cb.free(output);
+                    return null;
+                },
+                else => return err,
+            };
+            try self.lighton_vision_fused.residual(&self.ctx, .{ dst.ptr, dst.ptr, tensors[5].buffer.ptr, input.buffer.ptr }, @intCast(count), @intCast(dim));
+        }
         self.lighton_vision_fused.calls += 1;
         return output;
     }
@@ -4009,6 +4058,9 @@ pub const CudaCompute = struct {
     lighton_norm_weight_cache_misses: usize = 0,
     lighton_vision_fused: @import("lighton_vision.zig").Module = .{},
     lighton_vision_up: @import("lighton_vision_gemm.zig").Module = .{},
+    lighton_vision_down: @import("lighton_vision_gemm.zig").DownModule = .{},
+    lighton_head: @import("lighton_head.zig").Module = .{},
+    lighton_fused_head_disabled: bool = false,
     lighton_precision: @import("lighton_vision_bf16.zig").Precision = .f32,
     lighton_vision_bf16: @import("lighton_vision_bf16.zig").Module = .{},
     lighton_attention_inputs: @import("lighton_attention_inputs.zig").Module = .{},
@@ -5102,6 +5154,7 @@ pub const CudaCompute = struct {
             .lighton_attention_chunk128 = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128"),
             .lighton_batched_kv_write_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_KV_WRITE"),
             .lighton_gemm_bucket_rows = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_GEMM_BUCKET_ROWS"),
+            .lighton_fused_head_disabled = platform.env.getenvBool("ANTFLY_CUDA_DISABLE_LIGHTON_FUSED_HEAD"),
             .lighton_bf16_decode_outputs = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_DECODE_OUTPUTS"),
             .lighton_bf16_projection_outputs = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS"),
             .lighton_bf16_prefill_ffn = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN"),
@@ -5236,12 +5289,18 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_model_graph_captures={d} cuda_model_graph_replays={d} cuda_model_graph_admission_denials={d} cuda_model_graph_wide_replays={d} cuda_model_graph_max_replay_rows={d}\n", .{ self.lighton_decode_graph.captures, self.lighton_decode_graph.replays, self.lighton_decode_graph.admission_denials, self.lighton_decode_graph.wide_replays, self.lighton_decode_graph.max_replay_rows });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_model_graph_enabled={d} state_pool={d} lazy={d} training={d}\n", .{ @intFromBool(self.lighton_decode_graph_enabled), @intFromBool(self.lighton_state_pool_enabled), @intFromBool(self.lazy_host_store != null), @intFromBool(self.resident_training_cache) });
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_fused_head_calls={d}\n", .{self.lighton_head.calls});
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_vision_down_gemm_calls={d}\n", .{self.lighton_vision_down.calls + self.lighton_vision_bf16.down.calls});
         self.lighton_decode_graph.invalidate(&self.ctx);
         self.lighton_activation.deinit(&self.ctx);
         self.lighton_vision_bf16.deinit(&self.ctx);
         self.lighton_attention_inputs.deinit(&self.ctx);
         self.lighton_vision_fused.deinit(&self.ctx);
+        self.lighton_head.deinit(&self.ctx);
         self.lighton_vision_up.deinit(&self.ctx);
+        self.lighton_vision_down.deinit(&self.ctx);
 
         self.florence_fused.deinit(&self.ctx);
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
@@ -34217,7 +34276,7 @@ test "LightOnOCR3 CUDA fused vision MLP preserves the original BF16 boundaries a
         const db = try cb.fromFloat32(zero_values[0..dim]);
         defer cb.free(db);
         const weights = [_]CT{ nw, nb, up, ub, down, db };
-        for ([_]usize{ 129, 2592 }) |rows| {
+        for ([_]usize{ 129, 2592, 8192, 17280 }) |rows| {
             const input_values = try a.alloc(f32, rows * dim);
             defer a.free(input_values);
             for (input_values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.017) * 0.7;
@@ -34248,7 +34307,9 @@ test "LightOnOCR3 CUDA fused vision MLP preserves the original BF16 boundaries a
             compute.capability_profile = .lightonocr3;
             try std.testing.expectError(error.InvalidTensorShape, CudaCompute.lightOnVisionMlp(&cb, input, weights, rows, dim, hidden, 0));
         }
-        try std.testing.expectEqual(@as(usize, 2), compute.lighton_vision_fused.calls);
+        try std.testing.expectEqual(@as(usize, 4), compute.lighton_vision_fused.calls);
+        const expected_down_calls: usize = if (@import("lighton_vision_gemm.zig").supportedDown(compute.ctx.info.compute_major, compute.ctx.info.compute_minor, 8192, dim, hidden, false)) 2 else 0;
+        try std.testing.expectEqual(expected_down_calls, compute.lighton_vision_down.calls);
     }
 }
 
@@ -36015,4 +36076,55 @@ test "LightOnOCR3 CUDA vision output residual preserves original F32 biased proj
         try compute.ctx.synchronize();
         try std.testing.expectEqualSlices(u16, matrix, weight_after);
     }
+}
+
+test "LightOnOCR3 CUDA fused head matches dense projection with suppressed ties and odd token bank offsets" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    compute.capability_profile = .lightonocr3;
+    const cb = compute.computeBackend();
+    const hidden = 1024;
+    const vocab = 248320;
+    const matrix = try a.alloc(u16, vocab * hidden);
+    defer a.free(matrix);
+    @memset(matrix, 0);
+    for ([_]usize{ 2, 17, 256, 248319 }) |token| matrix[token * hidden] = 0x3f80;
+    const shape = [_]i64{ vocab, hidden };
+    const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &shape, .name = "fused-head.embedding", .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertBf16WeightFromTensor(try a.dupe(u8, tensor.name), &tensor);
+    try compute.ctx.synchronize();
+    const weight = try cb.getWeight(tensor.name);
+    defer cb.free(weight);
+    for ([_]usize{ 7, 65, 128 }) |rows| {
+        const values = try a.alloc(f32, rows * hidden);
+        defer a.free(values);
+        @memset(values, 0);
+        for (0..rows) |row| values[row * hidden] = 1;
+        const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), hidden });
+        defer cb.free(input);
+        for ([_]bool{ false, true }) |suppressed| {
+            const ids: []const i32 = if (suppressed) &.{ 2, 17, -1, 300000 } else &.{};
+            var burst = (try CudaCompute.beginLightOnTokenBurst(&cb, weight, rows, 2, hidden, vocab, ids)) orelse return error.UnsupportedOperation;
+            defer burst.deinit();
+            compute.lighton_fused_head_disabled = true;
+            const before = compute.lighton_head.calls;
+            try burst.projectArgmax(input, weight, 0);
+            try std.testing.expectEqual(before, compute.lighton_head.calls);
+            compute.lighton_fused_head_disabled = false;
+            // An odd row count puts the second bank column at 4B alignment.
+            try burst.projectArgmax(input, weight, 1);
+            try std.testing.expectEqual(before + 1, compute.lighton_head.calls);
+            var tokens: [256]u32 = undefined;
+            try burst.read(tokens[0 .. rows * 2]);
+            try std.testing.expectEqualSlices(u32, tokens[0..rows], tokens[rows .. rows * 2]);
+            for (tokens[0..rows]) |token| try std.testing.expectEqual(@as(u32, if (suppressed) 256 else 2), token);
+        }
+        const unchanged = try cb.toFloat32(input, a);
+        defer a.free(unchanged);
+        try std.testing.expectEqualSlices(f32, values, unchanged);
+    }
+    try std.testing.expectEqual(@as(usize, 6), compute.lighton_head.calls);
 }

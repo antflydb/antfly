@@ -34,7 +34,7 @@ must receive fresh checks before inheriting any performance claim.
 
 Paths above are under `zig/pkg/inference/scripts/lightonocr3/`. The Metal runs
 are paired comparisons. CUDA rows are separate capacity screens, not adjacent
-paired runs; LightOn CUDA parity remains outstanding. All use three synthetic
+paired runs; the current LightOn comparison is below. All use three synthetic
 invoice, receipt and shipping fixtures, not a representative OCR evaluation.
 Native accepts encoded images; references may accept decoded PIL images or use
 HTTP. Metal Florence uses Q4_K/F16 encoder versus an FP16 MLX proxy. CUDA Florence
@@ -44,67 +44,59 @@ rare CUDA Florence receipt mismatch is not definitively root-caused.
 
 ## CUDA follow-up qualification
 
-[Follow-up #1331](https://github.com/antflydb/antfly/pull/1331) keeps 0.8B vision-block
-activations BF16 on SM12.1 and avoids the 4B joined-projection split copies.
-It also fuses F32 language attention preparation and projection/residual operations.
-The F32 vision output retains the ordinary GEMM and combines bias/residual in one
-pass, avoiding the slower large-shape cuBLASLt bias epilogue.
-Patch embedding, the final vision merger, decoder projection outputs and recurrent
-state remain F32. The 4B preset retains F32 vision because BF16 vision did not
-produce a repeatable throughput gain. `ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=f32`
-selects the original vision path.
+[Follow-up #1331](https://github.com/antflydb/antfly/pull/1331) fuses the 0.8B
+output projection/top-token selection and both vision MLP projections on SM12.1.
+The vision kernels preserve the original bias, activation and residual rounding.
+They avoid cuBLASLt BF16 bias-epilogue cliffs observed against vLLM's actual Torch
+linear path. All raw measurements and settings are retained outside Git.
 
-The current head additionally fuses the vision up projection with GELU on SM12.1,
-retaining both the original F32 arithmetic and the BF16 pre-activation rounding.
-It uses no global workspace and retains the existing fused-vision rollback.
-The new build passes 265 default and 106 wide CUDA checks, both models' original
-real-checkpoint checks, and all 118 independent BF16 vision-block cases bit-for-bit.
-It also preserves ordinary cache reuse while accounting cached bytes in constant
-time, and selects two cold-qualified 0.8B projection descriptors.
+| Model | Native pages/s | Actual vLLM pages/s | Native versus reference mean |
+| --- | ---: | ---: | ---: |
+| LightOn 0.8B | 15.1768 / 15.1975 | 14.4855 / 14.4823 | +4.9% |
+| LightOn 4B | 4.6341 / 4.5643 | 4.6563 / 4.6574 | -1.2% |
 
-The current 0.8B measurement is **14.4186 / 14.6407 pages/s**, with the same output,
-capacity and admission gates. It uses a 19 GiB temporary-cache budget and norm-weight
-caching (`ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB=19456` and
+0.8B exceeds the fresh reference on these fixtures. 4B remains slightly behind;
+this PR does not claim that both models beat vLLM. These are isolated DGX Spark
+GB10 runs with 256 warmup requests and two 256-request measurements, 128 native
+physical slots and at most 128 active vLLM sequences. All native outputs match the
+frozen native serial bytes and complete raw vLLM reference text. All rounds use
+actual wide four-token chains, unchanged operator byte limits, a 1,024-entry plan
+bound and no uncached/scalar fallbacks. No competing GPU process was observed.
+
+Both rows select `ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=bf16_vision`. Patch embedding,
+the final vision merger, decoder projection outputs/residuals and recurrent state
+remain F32; existing optional BF16 prefill and F16-query/F32-output paged prefill
+remain enabled. This is a partial precision profile. `f32` selects the conservative
+vision path. The 0.8B run also uses a 19 GiB temporary-cache budget and norm-weight
+cache (`ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB=19456` and
 `ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE=1`), within unchanged memory limits.
-The prior vLLM mean is 14.4377 pages/s. A fresh reference is pending, so this narrow
-lead does not establish a repeatable win. Current 4B timing overlapped another GPU
-job and is excluded; its next isolated comparison is pending.
+The 4B run retains a 16 GiB cache and disables that norm-weight cache.
 
-The table below records the preceding snapshot559/565, before this vision-GEMM change:
+Qualification includes 268 default and 107 wide CUDA tests, both models' F32 vision
+checks at batches 1,1,2,3,8,16, and all 118 independent BF16 vision-block cases
+bit-for-bit, including 65,536 rows and batch 16. The head also matches independent
+IEEE F32 PyTorch logits in 12 real-checkpoint cases with exact token choices and
+an unchanged 2e-4 winning-score limit. Readonly inputs, canaries, suppression,
+ties, alignment and alias checks remain enforced. The largest vision cases keep
+the original 60 GiB memory guard; the harness releases only unused test memory and
+its immutable input file-cache pages before checking it. Metal-enabled compilation
+and 9 CPU ownership/bounds checks pass; no new Metal GPU qualification is claimed.
 
-| Model | Native pages/s | Actual vLLM pages/s | Selected vision |
-| --- | ---: | ---: | --- |
-| LightOn 0.8B | 14.1538 / 13.9947 | 14.3536 / 14.5218 | BF16 blocks |
-| LightOn 4B | 4.3075 / 4.3297 | 4.6198 / 4.6258 | F32 |
+The [compact manifest](followup-1331.json) records the 79 frozen runtime inputs,
+binary, checkpoint/fixture/report hashes, generator versions, exact controls and
+content-addressed evidence location. The 27.7 MB evidence bundle contains only the
+selected runtime source/binary, synthetic reports/settings and independent checks.
+It remains on Glowworm and can be retrieved through the already authorized host:
 
-These are separate isolated runs on DGX Spark GB10: 256 warmup requests and two
-256-request measurements, 128 physical native slots and at most 128 active vLLM
-sequences. Native timed outputs match independent native serial bytes and raw vLLM text
-on three synthetic pages. Native uses actual wide four-token
-chains, unchanged operator byte limits, a 1,024-entry cuBLAS plan bound and zero
-uncached/scalar fallbacks. The optional BF16 FFN/recurrent prefill and F16-query,
-F32-output paged prefill extensions remain enabled. This is a partial precision
-profile. At that preceding snapshot, reaching the vLLM means required about 2.6% more
-throughput for 0.8B and 7.0% for 4B. CUDA parity and representative OCR accuracy remain outstanding.
+```sh
+tailscale ssh glowworm 'cat ARTIFACT_PATH' > qualification767.tar.gz
+shasum -a 256 qualification767.tar.gz
+```
 
-The [compact manifest](followup-1331.json) records source, binary, checkpoint,
-fixture and report hashes. The cleaned vision block matches the independent
-Transformers/PyTorch cuDNN reference bit-for-bit in all 118 cases across every
-checkpoint layer, batches up to 16 and 65,536 rows. Wrong-row, cross-image,
-alias and alignment controls are rejected. These checks qualify the matching
-cuDNN backend; they do not establish Flash Attention equivalence.
-
-The preceding snapshot's F32 CUDA regression: 275 selected, 261 passed, 14 skips; wide regression:
-104 selected, 103 passed, one skip. The new attention-input PTX also passes 40
-independent Transformers cases using every checkpoint Q/K norm pair and text/image
-coordinates. Maximum error is below 2e-6 against the unchanged 2e-4 bound; inputs
-and output canaries remain unchanged. Both original real-checkpoint feature/prompt
-checks pass at batch sizes 1, 2, 3, 8 and 16. Metal compilation and seven focused
-CPU ownership/admission/profile checks pass; no new Metal GPU speed is claimed.
-Raw follow-up reports remain outside the source tree and are not yet published.
-Earlier versioned evidence remains in [followup.json](followup.json),
-[the wide-cohort bundle](followup-bfd1738430.json) and
-[the 64-page bundle](followup-736f721b59.json).
+Replace `ARTIFACT_PATH` with `reproduction.evidence.remote_path` from the manifest
+and verify `reproduction.evidence.sha256` before extraction. Extract into a separate
+evidence directory. These are three synthetic invoice/receipt/shipping pages;
+representative OCR accuracy and broader workloads still need evaluation.
 
 ## Reproduce
 
@@ -220,3 +212,27 @@ TRITON_CACHE_DIR="$PWD/.zig-cache/triton-vision" python3 \
 The generator asserts the math-library fingerprint, 128 threads, 24 KiB shared
 memory and zero global/profile scratch. Keep its generated manifest with external
 qualification evidence; it is not needed by serving binaries.
+
+The head and vision down kernels are generated offline with Triton 3.7.1/PTX 9.0;
+serving requires neither Python nor Triton. Generate outside tracked source paths:
+
+```sh
+TRITON_CACHE_DIR="$PWD/.zig-cache/triton-ocr" python3 \
+  zig/pkg/inference/src/ops/cuda/prototypes/lighton_head.py \
+  --output .zig-cache/generated-lighton-head
+cp .zig-cache/generated-lighton-head/*.ptx zig/pkg/inference/src/ops/cuda/
+TRITON_CACHE_DIR="$PWD/.zig-cache/triton-ocr" python3 \
+  zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_down.py \
+  --output .zig-cache/generated-lighton-down
+cp .zig-cache/generated-lighton-down/*.ptx zig/pkg/inference/src/ops/cuda/
+python3 zig/pkg/inference/scripts/lightonocr3/check_cuda_lighton_head.py \
+  --model-dir "$MODEL_08" \
+  --partial-ptx zig/pkg/inference/src/ops/cuda/lighton_head_top1_partial.ptx \
+  --finish-ptx zig/pkg/inference/src/ops/cuda/lighton_head_top1_finish.ptx \
+  --output "$NEW_REPORT_JSON"
+```
+
+The head uses 256 threads/32 KiB shared memory plus a small reduction; vision down
+uses 128 threads/48 KiB. Both generators assert zero global/profile scratch. The
+existing fused-vision control selects the original path when disabled;
+`ANTFLY_CUDA_DISABLE_LIGHTON_FUSED_HEAD=1` restores dense head projection/argmax.
