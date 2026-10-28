@@ -1873,7 +1873,7 @@ pub const RuntimeConfig = struct {
     http_max_body_mb: ?i64 = null,
     /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
     api_url: ?[]const u8 = null,
-    /// API key used when calling an authenticated shared Antfly inference API.
+    /// Client-only API key used when calling an authenticated shared Antfly inference API. Both standalone inference executables accept and ignore this field when serving models.
     api_key: ?[]const u8 = null,
     /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
     models_dir: ?[]const u8 = null,

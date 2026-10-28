@@ -60,6 +60,10 @@ const InferenceSettings = struct {
         ttl_ms: u64 = 300_000,
     };
 
+    // Shared DB-client settings are accepted for config portability. A serving
+    // process never proxies to this URL or uses this client credential.
+    api_url: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
     models_dir: ?[]const u8 = null,
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
@@ -866,10 +870,9 @@ fn printUsage(usage_name: []const u8) void {
     , .{ usage_name, usage_name });
 }
 
-test "run config parses shared scraping fields and ignores api_url" {
+test "run config parses shared scraping fields and ignores canonical client settings" {
     const raw =
         \\{
-        \\  "api_url": "http://127.0.0.1:8082",
         \\  "resources": {
         \\    "inference": {
         \\      "admission": {
@@ -878,6 +881,8 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    }
         \\  },
         \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8082",
+        \\    "api_key": "unused-client-credential",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
         \\    "content_security": {

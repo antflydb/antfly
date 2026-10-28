@@ -30023,7 +30023,7 @@ export interface components {
              * @example http://localhost:8080
              */
             api_url?: string;
-            /** @description API key used when calling an authenticated shared Antfly inference API. */
+            /** @description Client-only API key used when calling an authenticated shared Antfly inference API. Both standalone inference executables accept and ignore this field when serving models. */
             api_key?: string;
             /**
              * @description Base directory containing model subdirectories. Antfly inference auto-discovers models from:

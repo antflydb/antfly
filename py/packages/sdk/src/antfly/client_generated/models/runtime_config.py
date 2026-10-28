@@ -34,7 +34,8 @@ class RuntimeConfig:
             (the default in standalone mode). `antfly inference run` ignores
             this field; it configures the client side only.
              Example: http://localhost:8080.
-        api_key (str | Unset): API key used when calling an authenticated shared Antfly inference API.
+        api_key (str | Unset): Client-only API key used when calling an authenticated shared Antfly inference API. Both
+            standalone inference executables accept and ignore this field when serving models.
         models_dir (str | Unset): Base directory containing model subdirectories. Antfly inference auto-discovers models
             from:
             - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`

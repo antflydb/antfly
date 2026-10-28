@@ -67,6 +67,8 @@ class ResourcePolicyContractTests(unittest.TestCase):
     def test_execution_settings_use_canonical_lifetime_and_batching(self):
         config = self.resolve(self.schemas["InferenceConfig"])["properties"]
         runtime = self.resolve(config["inference"])["properties"]
+        self.assertEqual(runtime["api_url"]["type"], "string")
+        self.assertEqual(runtime["api_key"]["type"], "string")
         self.assertIn("keep_alive", runtime)
         self.assertNotIn("keep_alive_ms", runtime)
         batching = self.resolve(runtime["generation_batching"])["properties"]

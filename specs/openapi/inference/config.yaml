@@ -1467,7 +1467,7 @@ components:
           example: "http://localhost:8080"
         api_key:
           type: string
-          description: "API key used when calling an authenticated shared Antfly inference API."
+          description: "Client-only API key used when calling an authenticated shared Antfly inference API. Both standalone inference executables accept and ignore this field when serving models."
         models_dir:
           type: string
           description: |

@@ -85,6 +85,10 @@ matching prior behavior. `kernel_jit` takes the same fields as standalone's
 ```
 
 Pull the referenced models into that directory before starting the process.
+Client-only `inference.api_url` and `inference.api_key` may stay in a shared
+configuration file: both inference serving executables accept and ignore them.
+The database uses those fields when it acts as a client.
+
 Both inference executables read model settings under `inference` and resource
 policy under `resources`. Flat settings and `keep_alive_ms` are rejected.
 For example, migrate this older config:
