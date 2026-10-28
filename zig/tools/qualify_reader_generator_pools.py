@@ -14,7 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bounded native GPU qualification; does not provision, scale, or deploy pools."""
+"""Bounded native GPU qualification; does not provision, scale, or deploy pools.
+
+Requires canonical candidate policies: output=512 tokens/item, input=8192
+ tokens/item, decoded pixels=4,000,000/batch, max dimension=2048, request
+ concurrency=1. Rejection fixtures stay below endpoint/model hard limits.
+"""
 
 import argparse
 import base64
@@ -91,38 +96,45 @@ class Probe:
         )
         return instances
 
-    def accepted(self, url, path, body, expected=None):
-        status, result = self.request(url, path, body)
-        assert status == 200, f"inference failed: {status} {result}"
+    @staticmethod
+    def validate_success(path, result, expected=None):
         if path == "/read":
-            text = " ".join(item.get("text", "") for item in result.get("data", []))
-            assert all(value in text.lower() for value in expected), (
+            items = result.get("data", [])
+            assert items, "OCR returned no items"
+            assert all(not item.get("error") for item in items), (
+                "OCR returned item errors"
+            )
+            text = " ".join(item.get("text", "") for item in items)
+            assert all(value in text.lower() for value in expected or []), (
                 "OCR fixture fields missing"
             )
         else:
-            text = result["choices"][0]["message"]["content"]
+            choice = result["choices"][0]
+            text = choice["message"]["content"]
             assert "READY" in text.upper(), "generation did not answer the fixture"
-            assert result["choices"][0].get("finish_reason") != "length", (
-                "generation was truncated"
-            )
+            assert choice.get("finish_reason") != "length", "generation was truncated"
+        assert text.strip(), "empty inference result"
+        return text
+
+    def accepted(self, url, path, body, expected=None):
+        status, result = self.request(url, path, body)
+        assert status == 200, f"inference failed: {status} {result}"
+        text = self.validate_success(path, result, expected)
         return {
             "status": status,
             "text": text,
             "instances": self.instances(url, body["model"]),
         }
 
-    def rejected(self, url, path, body):
+    def rejected(self, url, path, body, expected_code):
         status, result = self.request(url, path, body)
-        assert status in (400, 413), (
-            f"input policy did not reject request: {status} {result}"
+        assert status == 413 and result.get("error") == expected_code, (
+            f"expected deployment {expected_code}, got {status} {result}"
         )
-        assert result.get("error") not in (
-            "MODEL_RESOURCE_LIMIT",
-            "MODEL_RESOURCE_BUSY",
-        ), "model admission failed before input policy could be qualified"
+        assert result.get("retryable") is False, "policy failure must not be retryable"
         return {"status": status, "error": result}
 
-    def overload(self, url, path, body):
+    def overload(self, url, path, body, expected=None):
         barrier = threading.Barrier(2)
 
         def call(_):
@@ -133,11 +145,21 @@ class Probe:
             results = list(pool.map(call, range(2)))
         statuses = sorted(status for status, _ in results)
         assert statuses == [200, 503], (
-            f"expected one success and one bounded rejection: {statuses}"
+            f"expected one success and one bounded rejection: {results}"
+        )
+        success = next(result for status, result in results if status == 200)
+        self.validate_success(path, success, expected)
+        failure = next(result for status, result in results if status == 503)
+        assert (
+            failure.get("error") == "SERVICE_UNAVAILABLE"
+            and failure.get("reason") == "inference_admission"
+        ), f"expected request-concurrency rejection, got {failure}"
+        assert failure.get("retryable") is True, (
+            "concurrency rejection must be retryable"
         )
         status, _ = self.request(url, "/models")
         assert status == 200, "discovery unhealthy after overload"
-        return {"statuses": statuses}
+        return {"statuses": statuses, "rejection": failure}
 
     def record(self, name, action):
         start = time.monotonic()
@@ -174,7 +196,7 @@ def main():
     if args.reader_url:
         body = {
             "images": [{"url": image_url(args.invoice.read_bytes())}],
-            "max_tokens": 1024,
+            "max_tokens": 512,
         }
         # Exercise cold/request-time loads, repeated work, and both switch directions.
         for model in [READERS[0], READERS[1], READERS[1], READERS[0]]:
@@ -190,7 +212,10 @@ def main():
         probe.record(
             "reader oversized output",
             lambda: probe.rejected(
-                args.reader_url, "/read", dict(request, max_tokens=1025)
+                args.reader_url,
+                "/read",
+                dict(request, max_tokens=513),
+                "OUTPUT_TOKEN_LIMIT_EXCEEDED",
             ),
         )
         probe.record(
@@ -198,12 +223,15 @@ def main():
             lambda: probe.rejected(
                 args.reader_url,
                 "/read",
-                dict(request, images=[{"url": image_url(blank_png(2049, 2049))}]),
+                dict(request, images=[{"url": image_url(blank_png(2048, 2000))}]),
+                "DECODED_PIXELS_EXCEEDED",
             ),
         )
         probe.record(
             "reader concurrent overload",
-            lambda: probe.overload(args.reader_url, "/read", request),
+            lambda: probe.overload(
+                args.reader_url, "/read", request, ["invoice", "12345", "42.00"]
+            ),
         )
     if args.generator_url:
         request = {
@@ -238,7 +266,10 @@ def main():
         probe.record(
             "generator oversized output",
             lambda: probe.rejected(
-                args.generator_url, "/generate", dict(request, max_tokens=1025)
+                args.generator_url,
+                "/generate",
+                dict(request, max_tokens=513),
+                "OUTPUT_TOKEN_LIMIT_EXCEEDED",
             ),
         )
         probe.record(
@@ -247,6 +278,7 @@ def main():
                 args.generator_url,
                 "/generate",
                 dict(request, messages=[{"role": "user", "content": " x" * 9000}]),
+                "INPUT_TOKEN_LIMIT_EXCEEDED",
             ),
         )
         probe.record(

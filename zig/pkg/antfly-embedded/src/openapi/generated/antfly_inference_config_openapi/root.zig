@@ -4,7 +4,6 @@
 pub const types = @import("types.zig");
 
 pub const A4bResidencyMode = types.A4bResidencyMode;
-pub const AdmissionConfig = types.AdmissionConfig;
 pub const AudioChunkConfig = types.AudioChunkConfig;
 pub const BackendRuntimes = types.BackendRuntimes;
 pub const ChatMessage = types.ChatMessage;
@@ -52,7 +51,6 @@ pub const PromptCacheConfig = types.PromptCacheConfig;
 pub const ReadRequest = types.ReadRequest;
 pub const ReadResponse = types.ReadResponse;
 pub const ReadResult = types.ReadResult;
-pub const RequestAdmissionConfig = types.RequestAdmissionConfig;
 pub const RerankRequest = types.RerankRequest;
 pub const RerankResponse = types.RerankResponse;
 pub const RewriteRequest = types.RewriteRequest;

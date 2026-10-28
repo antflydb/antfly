@@ -5907,7 +5907,7 @@ pub const ModelManager = struct {
 
     fn tightenUnifiedDeviceAdmission(self: *const ModelManager) void {
         if (backends.cudaUsesUnifiedMemory())
-            self.admissionController().tightenUnifiedLimit(runtime.tier.memory.defaultSharedAdmissionLimitsWithProcessLimit(self.process_memory_limit_bytes).host_limit_bytes);
+            self.admissionController().tightenUnifiedLimit(unifiedDeviceAdmissionLimit(self.process_memory_limit_bytes, self.admission_limit_overrides.combined_limit_bytes));
     }
 
     fn physicalRunLimits(self: *const ModelManager, backend_class: runtime.tier.memory.BackendClass, limits: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
@@ -6504,7 +6504,13 @@ pub const ModelManager = struct {
             backend_runtime.backend,
         );
         limits = runtime.tier.memory.maxCompositeLimits(limits, load_plan_floor);
-        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes);
+        const resolved = backends.clampPhysicalMemoryLimits(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes);
+        std.log.info("inference memory policy backend={s} requested={any} resolved={any} process_max_bytes={d} cuda_device_bytes={d} unified={} automatic_fallback={}", .{
+            @tagName(backend_runtime.backend),                                               self.admission_limit_overrides,                          resolved,
+            self.process_memory_limit_bytes,                                                 backends.cudaDeviceMemoryBytes(backend_runtime.backend), backends.cudaUsesUnifiedMemory(),
+            backend_runtime.backend == .cuda and backends.cudaDeviceMemoryBytes(.cuda) == 0,
+        });
+        return resolved;
     }
 
     /// Architecture sessions may carry a minimum safe cache/workspace floor
@@ -15337,4 +15343,19 @@ test "model aware media host index cache pressure releases idle leases before pr
     try std.testing.expectEqual(@as(usize, 3), cache.calls);
     try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+}
+
+fn unifiedDeviceAdmissionLimit(process_limit: usize, combined_override: usize) usize {
+    const physical = runtime.tier.memory.defaultSharedAdmissionLimitsWithProcessLimit(process_limit).host_limit_bytes;
+    return if (combined_override == 0) physical else @min(physical, combined_override);
+}
+
+test "integrated CUDA combined override constrains simultaneous CPU and GPU leases" {
+    const limit = unifiedDeviceAdmissionLimit(16 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
+    try std.testing.expect(limit <= 8 * 1024 * 1024 * 1024);
+    var controller: runtime.tier.memory.AdmissionController = .{};
+    controller.tightenUnifiedLimit(limit);
+    var cpu = try controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = limit / 2 + 1 }, false);
+    defer cpu.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, .{}, .{ .backend_weight_bytes = limit / 2 + 1 }, false));
 }

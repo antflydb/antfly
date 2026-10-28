@@ -463,6 +463,19 @@ pub const LoadedReader = union(enum) {
         return batch;
     }
 
+    /// The same completion budget used by each reader when max_tokens is omitted.
+    pub fn defaultMaxTokens(self: *LoadedReader) !?usize {
+        return switch (self.*) {
+            .vision => |*reader| blk: {
+                const prefix: usize = if (reader.core.dec_config.forced_bos_token_id == null) 1 else 2;
+                if (reader.core.dec_config.max_length <= prefix) return error.InvalidMaxTokens;
+                break :blk reader.core.dec_config.max_length - prefix;
+            },
+            .moondream => 256,
+            .multistage => null,
+        };
+    }
+
     /// Return the exact per-item textual input length produced by this loaded
     /// reader. Multi-stage OCR has no text input; every generative reader uses
     /// the same prompt builder and tokenizer as execution.

@@ -115,7 +115,7 @@ const InferenceRuntimeConfig = struct {
     embedded_enabled: bool = true,
     /// Environment forwarded only when a server host launches its worker.
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
-    max_concurrent_requests: ?usize = null,
+    resources: inference.platform.resource_policy.Resources = .{},
     kernel_jit: inference.graph.kernel_jit.Config = .{},
     prompt_cache: inference.server.PromptCacheConfig = .{},
 };
@@ -900,8 +900,18 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     if (context.has_max_loaded_models != 0)
         node_config.max_loaded_models = std.math.cast(usize, context.max_loaded_models) orelse
             return error.InvalidInferenceModelCacheConfig;
-    if (runtime_config.value.max_concurrent_requests) |limit|
-        node_config.max_concurrent_requests = limit;
+    try runtime_config.value.resources.validate();
+    const policy = runtime_config.value.resources.inference;
+    node_config.max_concurrent_requests = policy.admission.max_concurrent_requests;
+    node_config.max_work_units = policy.admission.workCapacity();
+    node_config.request_limits = policy.request_limits;
+    const configured_limits = policy.memory.limits(inference.runtime.tier.memory.Limits);
+    // CLI/bridge overrides take precedence field by field, while physical caps
+    // are applied by ModelManager after backend discovery.
+    inline for (comptime std.meta.fieldNames(inference.runtime.tier.memory.Limits)) |field| {
+        if (@field(node_config.generation_budget_overrides, field) == 0)
+            @field(node_config.generation_budget_overrides, field) = @field(configured_limits, field);
+    }
 
     state.* = .{
         .alloc = alloc,

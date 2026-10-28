@@ -249,7 +249,7 @@ The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chu
 
 ## Capacity, Admission, and Memory
 
-- **Request admission.** `admission.inference.max_concurrent_requests` (default 32; `--max-concurrent-requests` on `antfly inference run`; 0 disables the limit) bounds concurrent inference requests. The same value sizes a weighted work budget, so a few heavy requests can exhaust capacity before the count is reached. Standalone shares one budget across direct enrichment and query calls, `/ai/v1`, and `/ml/v1`. Requests are never queued. When capacity is exhausted, HTTP callers get `503` with `Retry-After: 1` and a JSON body carrying `retryable: true`.
+- **Request admission.** `resources.inference.admission.max_concurrent_requests` (default 32; `--max-concurrent-requests` on `antfly inference run`; 0 disables the limit) bounds concurrent inference requests. `resources.inference.admission.max_work_units` independently sizes weighted work/media capacity; when omitted it derives from request concurrency. A few heavy requests can exhaust work capacity before the request count is reached. Standalone shares one budget across direct enrichment and query calls, `/ai/v1`, and `/ml/v1`. Requests are never queued. When capacity is exhausted, HTTP callers get `503` with `Retry-After: 1` and a JSON body carrying `retryable: true`.
 - **Model residency.** At most `max_loaded_models` models stay loaded (default 10; 0 means unlimited), and the least recently used idle model is evicted to make room. Idle models unload after `inference.keep_alive` (default `5m`; `"0"` disables idle unloading); `antfly inference run` also accepts the operator's flat `keep_alive_ms` spelling (integer milliseconds; `0` disables idle unloading), and `keep_alive` wins if both are set. Concurrent requests for the same unloaded model share one load.
 - **Memory.** Model loads and requests reserve memory before they allocate. The reservation comes from one process envelope shared with storage and caches. Set the envelope with `--process-memory-budget-mb` or `ANTFLY_PROCESS_MEMORY_BUDGET_MB` on `antfly standalone` or `antfly inference run`. Otherwise the cgroup limit is used, and host memory without a cgroup limit. In Kubernetes Burstable pods, set it below the container limit. A request that can never fit returns `MODEL_RESOURCE_LIMIT`. Temporary pressure returns a retryable `MODEL_RESOURCE_BUSY` once idle models have been evicted.
 - **Query priority.** Background enrichment yields to query-time work in the same database process. Embedding backfill pauses (up to 5 s) while a query-time embed is running, and background generation pauses while an interactive generate or chat request is in flight. Backfill that receives `503` retries with backoff.
@@ -343,3 +343,12 @@ Relation models may advertise `untyped_entities` in their model capabilities.
 These models emit generic `ENTITY` nodes and accept relation names without typed
 endpoints. Antfarm uses this capability for REBEL artifacts, including renamed
 installations, while preserving typed schemas for other relation models.
+
+Resource policy lives under `resources.inference`: `memory` contains byte-based
+host/device/combined/KV/scratch ceilings, `admission` controls concurrent requests
+and weighted work, and `request_limits` contains `max_items_per_request`,
+`max_input_tokens_per_item`, `max_output_tokens_per_item`, and
+`max_decoded_pixels_per_batch`. Per-request item ceilings preserve native batching
+across independent callers. Model loading, prompt caching, and generation batching
+remain under `inference`. The DB and standalone inference use the same policy;
+the previous resource config locations are rejected.

@@ -22,6 +22,7 @@ pub const filesystem = @import("filesystem.zig");
 pub const inference_process_supervisor = @import("inference_process_supervisor.zig");
 pub const one_shot_process = @import("one_shot_process.zig");
 pub const process = @import("process.zig");
+pub const resource_policy = @import("resource_policy.zig");
 pub const process_memory = @import("process_memory.zig");
 pub const sync = @import("sync.zig");
 pub const time = @import("time.zig");

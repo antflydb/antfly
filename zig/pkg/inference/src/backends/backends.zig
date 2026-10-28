@@ -132,7 +132,7 @@ const memory_policy = @import("../runtime/tier/memory.zig");
 var cuda_memory_bytes = std.atomic.Value(usize).init(0);
 var cuda_unified_memory = std.atomic.Value(bool).init(false);
 
-pub fn discreteDeviceMemoryBytes(backend: BackendType) usize {
+pub fn cudaDeviceMemoryBytes(backend: BackendType) usize {
     if (!build_options.enable_cuda) return 0;
     if (backend != .cuda) return 0;
     const cached = cuda_memory_bytes.load(.acquire);
@@ -154,7 +154,7 @@ pub fn cudaUsesUnifiedMemory() bool {
 pub fn defaultMemoryLimits(backend: BackendType, process_limit: usize) memory_policy.Limits {
     const class: memory_policy.BackendClass = if (backend.usesGpuHostedSession()) .gpu else .cpu;
     const defaults = memory_policy.defaultLimitsForBackendWithProcessLimit(class, process_limit);
-    const bytes = discreteDeviceMemoryBytes(backend);
+    const bytes = cudaDeviceMemoryBytes(backend);
     var limits = memory_policy.limitsForDiscreteDevice(defaults, bytes, process_limit);
     if (bytes != 0 and cuda_unified_memory.load(.acquire))
         limits = memory_policy.clampUnifiedDeviceLimits(limits, limits.host_limit_bytes);
@@ -162,7 +162,7 @@ pub fn defaultMemoryLimits(backend: BackendType, process_limit: usize) memory_po
 }
 
 pub fn clampPhysicalMemoryLimits(backend: BackendType, limits: memory_policy.Limits, process_limit: usize) memory_policy.Limits {
-    const bytes = discreteDeviceMemoryBytes(backend);
+    const bytes = cudaDeviceMemoryBytes(backend);
     var out = memory_policy.clampDiscreteDeviceLimits(limits, bytes, process_limit);
     if (bytes != 0 and cuda_unified_memory.load(.acquire))
         out = memory_policy.clampUnifiedDeviceLimits(out, memory_policy.defaultSharedAdmissionLimitsWithProcessLimit(process_limit).host_limit_bytes);

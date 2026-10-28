@@ -76,8 +76,7 @@ pub const Config = struct {
     log: ?logging_openapi.Config = null,
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
-    admission: AdmissionConfig = .{},
-    graph_execution: graph_work_budget.Limits = .{},
+    resources: platform.resource_policy.Resources = .{},
     mcp: McpConfig = .{},
     pgwire: ?PgwireConfig = null,
     backup: BackupConfig = .{},
@@ -120,18 +119,6 @@ pub const Config = struct {
         }
     };
 
-    pub const RequestAdmissionConfig = struct {
-        /// Zero disables this foreground admission class. Transport safeguards
-        /// and inference admission remain independent.
-        max_concurrent_requests: u32,
-    };
-
-    pub const AdmissionConfig = struct {
-        query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
-        write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
-        inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
-    };
-
     pub const McpConfig = struct {
         /// Zero disables the serialized MCP tool-result compatibility guard.
         max_tool_result_bytes: u32 = default_mcp_max_tool_result_bytes,
@@ -150,18 +137,6 @@ pub const Config = struct {
         /// durable writer lease remains a separate cleanup safety envelope.
         operation_timeout_ms: u64 = default_backup_operation_timeout_ms,
     };
-
-    fn graphExecutionLimitsFromOpenApi(value: ?common_openapi.GraphExecutionConfig) !graph_work_budget.Limits {
-        const config = value orelse return .{};
-        var limits: graph_work_budget.Limits = .{};
-        inline for (comptime std.meta.fieldNames(graph_work_budget.Limits)) |reflected_name| {
-            if (@field(config, reflected_name)) |configured| {
-                @field(limits, reflected_name) = std.math.cast(usize, configured) orelse return error.InvalidConfig;
-            }
-        }
-        try limits.validate();
-        return limits;
-    }
 
     pub const MetadataConfig = struct {
         pub const NodeUrl = struct {
@@ -459,6 +434,8 @@ pub const Config = struct {
         // openapi path.
         prompt_cache_configured: bool = false,
         max_loaded_models: ?i64 = null,
+        http_max_body_mb: usize = 10,
+        pool_size: usize = 2,
 
         pub fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -837,45 +814,19 @@ pub const Config = struct {
             .max_timeout_ms = try optionalU32Field(policy.object, "max_timeout_ms") orelse 3_600_000,
         } else .{};
         try public_inference.validate();
-        var canonical_inference_max_concurrent_requests: ?u32 = null;
-        if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
-            const admission_object = switch (admission_value) {
-                .object => |object| object,
-                else => return error.InvalidConfig,
-            };
-            if (admission_object.get("query") != null) {
-                try validateObjectMemberFields(admission_object, "query", &.{"max_concurrent_requests"});
-            }
-            if (admission_object.get("write") != null) {
-                try validateObjectMemberFields(admission_object, "write", &.{"max_concurrent_requests"});
-            }
-            if (admission_object.get("inference") != null) {
-                try validateObjectMemberFields(admission_object, "inference", &.{"max_concurrent_requests"});
-                canonical_inference_max_concurrent_requests = try optionalU32Field(
-                    admission_object.get("inference").?.object,
-                    "max_concurrent_requests",
-                );
+        for ([_][]const u8{ "admission", "graph_execution", "memory", "request_limits", "process_memory_budget_mb" }) |old| {
+            if (root.contains(old)) return error.InvalidConfig;
+        }
+        if (root.get("inference")) |value| {
+            if (value != .object) return error.InvalidConfig;
+            for ([_][]const u8{ "admission", "max_concurrent_requests", "memory", "request_limits" }) |old| {
+                if (value.object.contains(old)) return error.InvalidConfig;
             }
         }
-        var legacy_inference_max_concurrent_requests: ?u32 = null;
-        if (root.get("inference")) |inference_value| {
-            const inference_object = switch (inference_value) {
-                .object => |object| object,
-                else => return error.InvalidConfig,
-            };
-            if (inference_object.get("admission") != null) return error.InvalidConfig;
-            legacy_inference_max_concurrent_requests = try optionalU32Field(
-                inference_object,
-                "max_concurrent_requests",
-            );
-        }
-        if (canonical_inference_max_concurrent_requests != null and
-            legacy_inference_max_concurrent_requests != null and
-            canonical_inference_max_concurrent_requests.? != legacy_inference_max_concurrent_requests.?)
-        {
-            return error.InvalidConfig;
-        }
+        const resources = if (root.get("resources")) |value|
+            platform.resource_policy.Resources.parse(alloc, value) catch return error.InvalidConfig
+        else
+            platform.resource_policy.Resources{};
         var mcp_max_tool_result_bytes = default_mcp_max_tool_result_bytes;
         if (root.get("mcp")) |mcp_value| {
             try validateObjectMemberFields(root, "mcp", &.{"max_tool_result_bytes"});
@@ -1024,32 +975,7 @@ pub const Config = struct {
                 .key = if (tls.key) |value| try alloc.dupe(u8, value) else null,
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
-            .admission = .{
-                .query = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
-                    if (admission.query) |query|
-                        if (query.max_concurrent_requests) |value|
-                            std.math.cast(u32, value) orelse return error.InvalidConfig
-                        else
-                            default_query_max_concurrent_requests
-                    else
-                        default_query_max_concurrent_requests
-                else
-                    default_query_max_concurrent_requests },
-                .write = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
-                    if (admission.write) |write|
-                        if (write.max_concurrent_requests) |value|
-                            std.math.cast(u32, value) orelse return error.InvalidConfig
-                        else
-                            default_write_max_concurrent_requests
-                    else
-                        default_write_max_concurrent_requests
-                else
-                    default_write_max_concurrent_requests },
-                .inference = .{ .max_concurrent_requests = canonical_inference_max_concurrent_requests orelse
-                    legacy_inference_max_concurrent_requests orelse
-                    default_inference_max_concurrent_requests },
-            },
-            .graph_execution = try graphExecutionLimitsFromOpenApi(validated.value.graph_execution),
+            .resources = resources,
             .mcp = .{ .max_tool_result_bytes = mcp_max_tool_result_bytes },
             .backup = .{ .operation_timeout_ms = backup_operation_timeout_ms },
             .metadata = try parseMetadataConfig(
@@ -1077,6 +1003,8 @@ pub const Config = struct {
                 .prompt_cache = prompt_cache,
                 .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
                 .max_loaded_models = inference.max_loaded_models,
+                .http_max_body_mb = if (inference.http_max_body_mb) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 10,
+                .pool_size = if (inference.pool_size) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 2,
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -2733,17 +2661,14 @@ test "common config extracts antfly settings" {
         \\  },
         \\  "storage": {
         \\    "engine": "local",
-        \\    "local": { "base_dir": "antflydb" }
+        \\    "local": {
+        \\      "base_dir": "antflydb"
+        \\    }
         \\  },
         \\  "replication_factor": 1,
         \\  "default_shards_per_table": 1,
         \\  "max_shard_size_bytes": 1024,
         \\  "max_shards_per_table": 4,
-        \\  "admission": {
-        \\    "query": { "max_concurrent_requests": 11 },
-        \\    "write": { "max_concurrent_requests": 5 },
-        \\    "inference": { "max_concurrent_requests": 7 }
-        \\  },
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
@@ -2764,16 +2689,41 @@ test "common config extracts antfly settings" {
         \\    "keep_alive": "1m30s",
         \\    "max_loaded_models": 4,
         \\    "preload": [
-        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
+        \\      {
+        \\        "kind": "generator",
+        \\        "name": "antflydb/gemma-e2b",
+        \\        "backend": "metal",
+        \\        "format": "gguf",
+        \\        "quantization": "q4_k"
+        \\      }
         \\    ],
         \\    "content_security": {
-        \\      "allowed_hosts": ["models.example.com"],
+        \\      "allowed_hosts": [
+        \\        "models.example.com"
+        \\      ],
         \\      "block_private_ips": true
         \\    },
         \\    "s3_credentials": {
         \\      "endpoint": "s3.amazonaws.com",
         \\      "access_key_id": "antfly-key",
         \\      "secret_access_key": "antfly-secret"
+        \\    }
+        \\  },
+        \\  "resources": {
+        \\    "query": {
+        \\      "admission": {
+        \\        "max_concurrent_requests": 11
+        \\      }
+        \\    },
+        \\    "write": {
+        \\      "admission": {
+        \\        "max_concurrent_requests": 5
+        \\      }
+        \\    },
+        \\    "inference": {
+        \\      "admission": {
+        \\        "max_concurrent_requests": 7
+        \\      }
         \\    }
         \\  }
         \\}
@@ -2788,9 +2738,9 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
-    try std.testing.expectEqual(@as(u32, 11), cfg.admission.query.max_concurrent_requests);
-    try std.testing.expectEqual(@as(u32, 5), cfg.admission.write.max_concurrent_requests);
-    try std.testing.expectEqual(@as(u32, 7), cfg.admission.inference.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 11), cfg.resources.query.admission.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 5), cfg.resources.write.admission.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 7), cfg.resources.inference.admission.max_concurrent_requests);
     try std.testing.expectEqual(Config.InferenceConfig.KernelJitConfig.Mode.shadow, cfg.inference.kernel_jit.mode);
     try std.testing.expectEqualStrings("/tmp/antfly-jit", cfg.inference.kernel_jit.cache_dir.?);
     try std.testing.expectEqual(@as(usize, 256), cfg.inference.kernel_jit.max_cache_bytes_mb);
@@ -2817,47 +2767,29 @@ test "common config extracts antfly settings" {
 
 test "common config preserves disabled foreground admission" {
     var cfg = try Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"query":{"max_concurrent_requests":0},"write":{"max_concurrent_requests":0},"inference":{"max_concurrent_requests":0}}}
+        \\{"resources":{"query":{"admission":{"max_concurrent_requests":0}},"write":{"admission":{"max_concurrent_requests":0}},"inference":{"admission":{"max_concurrent_requests":0}}}}
     );
     defer cfg.deinit();
-    try std.testing.expectEqual(@as(u32, 0), cfg.admission.query.max_concurrent_requests);
-    try std.testing.expectEqual(@as(u32, 0), cfg.admission.write.max_concurrent_requests);
-    try std.testing.expectEqual(@as(u32, 0), cfg.admission.inference.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), cfg.resources.query.admission.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), cfg.resources.write.admission.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), cfg.resources.inference.admission.max_concurrent_requests);
 }
 
 test "common config rejects unknown admission settings" {
     try std.testing.expectError(
         error.InvalidConfig,
         Config.parseFromSlice(std.testing.allocator,
-            \\{"admission":{"query":{"max_concurent_requests":1}}}
+            \\{"resources":{"query":{"admission":{"max_concurent_requests":1}}}}
         ),
     );
     try std.testing.expectError(
         error.InvalidConfig,
         Config.parseFromSlice(std.testing.allocator,
-            \\{"admission":{"writes":{"max_concurrent_requests":1}}}
+            \\{"resources":{"writes":{"admission":{"max_concurrent_requests":1}}}}
         ),
     );
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
         \\{"inference":{"admission":{"max_concurrent_requests":1}}}
-    ));
-}
-
-test "common config migrates the legacy inference admission spelling" {
-    var legacy = try Config.parseFromSlice(std.testing.allocator,
-        \\{"inference":{"api_url":"http://127.0.0.1:8090","max_concurrent_requests":7}}
-    );
-    defer legacy.deinit();
-    try std.testing.expectEqual(@as(u32, 7), legacy.admission.inference.max_concurrent_requests);
-
-    var matching = try Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"inference":{"max_concurrent_requests":7}},"inference":{"api_url":"http://127.0.0.1:8090","max_concurrent_requests":7}}
-    );
-    defer matching.deinit();
-    try std.testing.expectEqual(@as(u32, 7), matching.admission.inference.max_concurrent_requests);
-
-    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"inference":{"max_concurrent_requests":8}},"inference":{"api_url":"http://127.0.0.1:8090","max_concurrent_requests":7}}
     ));
 }
 
@@ -3638,13 +3570,13 @@ test "common config parses minimal config with admission defaults" {
     try std.testing.expect(cfg.storage.local_base_dir == null);
     try std.testing.expect(cfg.health_enabled);
     try std.testing.expectEqual(@as(?u16, default_health_port), cfg.health_port);
-    try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.admission.query.max_concurrent_requests);
-    try std.testing.expectEqual(default_write_max_concurrent_requests, cfg.admission.write.max_concurrent_requests);
-    try std.testing.expectEqual(default_inference_max_concurrent_requests, cfg.admission.inference.max_concurrent_requests);
-    try std.testing.expectEqual(graph_work_budget.default_max_explored_nodes, cfg.graph_execution.max_explored_nodes);
-    try std.testing.expectEqual(graph_work_budget.default_max_explored_edges, cfg.graph_execution.max_explored_edges);
-    try std.testing.expectEqual(graph_work_budget.default_max_retained_state_bytes, cfg.graph_execution.max_retained_state_bytes);
-    try std.testing.expectEqual(graph_work_budget.default_max_distinct_identities, cfg.graph_execution.max_distinct_identities);
+    try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.resources.query.admission.max_concurrent_requests);
+    try std.testing.expectEqual(default_write_max_concurrent_requests, cfg.resources.write.admission.max_concurrent_requests);
+    try std.testing.expectEqual(default_inference_max_concurrent_requests, cfg.resources.inference.admission.max_concurrent_requests);
+    try std.testing.expectEqual(graph_work_budget.default_max_explored_nodes, cfg.resources.query.request_limits.graph.max_explored_nodes);
+    try std.testing.expectEqual(graph_work_budget.default_max_explored_edges, cfg.resources.query.request_limits.graph.max_explored_edges);
+    try std.testing.expectEqual(graph_work_budget.default_max_retained_state_bytes, cfg.resources.query.request_limits.graph.max_retained_state_bytes);
+    try std.testing.expectEqual(graph_work_budget.default_max_distinct_identities, cfg.resources.query.request_limits.graph.max_distinct_identities);
     try std.testing.expectEqual(default_mcp_max_tool_result_bytes, cfg.mcp.max_tool_result_bytes);
     try std.testing.expectEqual(default_backup_operation_timeout_ms, cfg.backup.operation_timeout_ms);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
@@ -3687,18 +3619,18 @@ test "common config validates backup operation timeout" {
 
 test "common config parses operator-owned graph execution ceilings" {
     var cfg = try Config.parseFromSlice(std.testing.allocator,
-        \\{"graph_execution":{"max_explored_nodes":4096,"max_explored_edges":8192,"max_explored_edge_bytes":1048576,"max_scanned_anchors":2048,"max_intermediate_states":1024,"max_retained_state_bytes":2097152,"max_distinct_identities":512,"max_distinct_state_bytes":524288}}
+        \\{"resources":{"query":{"request_limits":{"graph":{"max_explored_nodes":4096,"max_explored_edges":8192,"max_explored_edge_bytes":1048576,"max_scanned_anchors":2048,"max_intermediate_states":1024,"max_retained_state_bytes":2097152,"max_distinct_identities":512,"max_distinct_state_bytes":524288}}}}}
     );
     defer cfg.deinit();
 
-    try std.testing.expectEqual(@as(usize, 4096), cfg.graph_execution.max_explored_nodes);
-    try std.testing.expectEqual(@as(usize, 8192), cfg.graph_execution.max_explored_edges);
-    try std.testing.expectEqual(@as(usize, 1_048_576), cfg.graph_execution.max_explored_edge_bytes);
-    try std.testing.expectEqual(@as(usize, 2048), cfg.graph_execution.max_scanned_anchors);
-    try std.testing.expectEqual(@as(usize, 1024), cfg.graph_execution.max_intermediate_states);
-    try std.testing.expectEqual(@as(usize, 2_097_152), cfg.graph_execution.max_retained_state_bytes);
-    try std.testing.expectEqual(@as(usize, 512), cfg.graph_execution.max_distinct_identities);
-    try std.testing.expectEqual(@as(usize, 524_288), cfg.graph_execution.max_distinct_state_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.resources.query.request_limits.graph.max_explored_nodes);
+    try std.testing.expectEqual(@as(usize, 8192), cfg.resources.query.request_limits.graph.max_explored_edges);
+    try std.testing.expectEqual(@as(usize, 1_048_576), cfg.resources.query.request_limits.graph.max_explored_edge_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.resources.query.request_limits.graph.max_scanned_anchors);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.resources.query.request_limits.graph.max_intermediate_states);
+    try std.testing.expectEqual(@as(usize, 2_097_152), cfg.resources.query.request_limits.graph.max_retained_state_bytes);
+    try std.testing.expectEqual(@as(usize, 512), cfg.resources.query.request_limits.graph.max_distinct_identities);
+    try std.testing.expectEqual(@as(usize, 524_288), cfg.resources.query.request_limits.graph.max_distinct_state_bytes);
 }
 
 test "common config parses MCP tool result compatibility budget" {
@@ -4155,4 +4087,17 @@ test "external lake connection capabilities preserve explicit workflow names" {
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fault.run, .{raw});
+}
+
+test "common config resources share byte and inference request policy" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"resources":{"memory":{"max_bytes":536870912},"inference":{"memory":{"max_device_bytes":21474836480},"admission":{"max_concurrent_requests":1,"max_work_units":8},"request_limits":{"max_output_tokens_per_item":64}}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 536870912), cfg.resources.memory.max_bytes);
+    try std.testing.expectEqual(@as(usize, 21474836480), cfg.resources.inference.memory.max_device_bytes);
+    try std.testing.expectEqual(@as(?usize, 64), cfg.resources.inference.request_limits.max_output_tokens_per_item);
+    inline for (.{ "{\"admission\":{}}", "{\"graph_execution\":{}}", "{\"inference\":{\"max_concurrent_requests\":1}}" }) |raw| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
+    }
 }

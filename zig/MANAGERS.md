@@ -994,37 +994,66 @@ Unknown capacity retains conservative defaults; it never means unlimited VRAM.
 Model tuning floors and explicit overrides cannot exceed discovered physical
 capacity. Explicit lower limits remain authoritative.
 
-Standalone `antfly inference run --config` accepts the following deployment
-policy, also passed unchanged through Colony's `InferencePool.spec.config`:
+Database configuration and `antfly inference run --config` share a canonical
+`resources` policy. Workload budgets are distinct from model execution settings:
 
 ```json
 {
-  "memory": {"host": 20480, "backend": 21504, "kv": 1024, "scratch": 2048},
-  "request_limits": {
-    "max_items": 1,
-    "max_input_tokens": 8192,
-    "max_output_tokens": 1024,
-    "max_decoded_pixels": 4194304
+  "resources": {
+    "memory": {"max_bytes": 34359738368},
+    "query": {
+      "admission": {"max_concurrent_requests": 32},
+      "request_limits": {"graph": {"max_explored_nodes": 100000}}
+    },
+    "write": {"admission": {"max_concurrent_requests": 16}},
+    "inference": {
+      "memory": {
+        "max_host_bytes": 21474836480,
+        "max_device_bytes": 22548578304,
+        "max_kv_bytes": 1073741824,
+        "max_scratch_bytes": 2147483648
+      },
+      "admission": {"max_concurrent_requests": 1, "max_work_units": 8},
+      "request_limits": {
+        "max_items_per_request": 1,
+        "max_input_tokens_per_item": 8192,
+        "max_output_tokens_per_item": 512,
+        "max_decoded_pixels_per_batch": 4000000
+      }
+    }
   },
-  "max_loaded_models": 1,
-  "admission": {"inference": {"max_concurrent_requests": 1, "max_work_units": 8}}
+  "inference": {"max_loaded_models": 1}
 }
 ```
 
-Memory values are MiB; omitted/zero fields retain automatic policy. CLI budget
-flags override their corresponding configuration field, including an explicit
-zero. An omitted combined override is recomputed from the effective host and
-device limits. Request ceilings must be positive, and narrow the manifest
-contract in both discovery and execution; existing transport, media admission,
-and model ceilings may narrow them further. These settings do not establish
-that a model fits: qualify cold load, request workspace, model switching, and
-overload rejection using the exact released image and hardware.
+All resource memory values are bytes. Omitted/zero memory fields select
+automatic policy. CLI MiB budget flags override their corresponding field,
+including explicit zero. The whole-process envelope and physical capacity
+remain authoritative. Integrated CUDA enforces a lower combined override
+across simultaneous CPU/GPU leases. Model-load logs expose requested and
+resolved limits, CUDA capacity, unified-memory status, and automatic fallback.
 
-`admission.inference.max_work_units` sets weighted work/media capacity separately
-from `max_concurrent_requests`. `--max-work-units` overrides the JSON value.
-Omitting it preserves the legacy capacity derived from request concurrency;
-zero disables weighted admission while retaining the configured request-count
-limit. Media admission uses 16 MiB per work unit and also weights image/output
-work. Eight units let a single request admit a full 2048×2048 scan under the
-separate pixel and content-security ceilings. This budget is independent of
-model host/device memory accounting.
+Admission limits count simultaneous requests and weighted work independently.
+Omitted `max_work_units` derives capacity from request concurrency; explicit zero
+disables weighted accounting. Neither setting changes model residency limits.
+Request ceilings must be positive and narrow model capabilities in discovery
+and execution. Input/output token limits are per item; decoded pixels are
+aggregate across a batch and also bound execution microbatches. Public item
+limits are checked before splitting a caller batch into tickets; independent
+callers may still combine into a larger native microbatch. Omitted reader
+output lengths resolve to a model default narrowed by policy before execution.
+LightOn continuous and cohort readers validate the expanded prompt token count
+before reserving page execution resources.
+
+There are no configuration aliases for the old top-level `admission`,
+`graph_execution`, `memory`, or `request_limits` locations. Model execution
+settings belong under `inference`; transport/download and storage-cache
+safeguards retain their own explicitly named settings.
+
+`zig/tools/qualify_reader_generator_pools.py` is a bounded native probe, not a
+deployment tool. Use candidate policies with output=512 (below /read's hard
+1024-token limit), input=8192, decoded pixels=4,000,000, and dimension=2048.
+It checks exact policy error codes and the exact concurrency-rejection reason,
+validates the winning response during overload, and verifies discovery remains
+available. GPU model fit and peak memory still require exact-release hardware
+qualification; unit tests do not establish that a 4B reader fits an L4.
