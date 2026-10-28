@@ -90,6 +90,61 @@ pub const Prepared = struct {
     }
 };
 
+/// An optional immutable working set, never an authority or a live session.
+/// Entries own all their bytes and are consumed once. Eviction is a cache miss;
+/// the caller must perform the ordinary fresh read in that case.
+pub const PreparedCache = struct {
+    pub const max_entries = 4;
+    pub const max_bytes = 256 * 1024;
+    const Entry = struct { token: [16]u8, domain: [32]u8, prepared: Prepared };
+    entries: [max_entries]?Entry = @splat(null),
+    next: usize = 0,
+    bytes: usize = 0,
+
+    fn size(value: Prepared) usize {
+        return @sizeOf(Entry) + value.id.len + if (value.body) |body| body.len else @as(usize, 0);
+    }
+    fn remove(self: *PreparedCache, a: A, index: usize) void {
+        if (self.entries[index]) |*entry| {
+            self.bytes -= size(entry.prepared);
+            entry.prepared.deinit(a);
+            self.entries[index] = null;
+        }
+    }
+    pub fn deinit(self: *PreparedCache, a: A) void {
+        for (0..max_entries) |i| self.remove(a, i);
+    }
+    pub fn put(self: *PreparedCache, a: A, namespace: []const u8, token: [16]u8, value: Prepared) !bool {
+        if (!value.materialized or value.id.len > 1024 or size(value) > max_bytes) return false;
+        // Duplicate tickets cannot select a different, older entry.
+        for (self.entries, 0..) |entry, i| if (entry) |item| {
+            if (std.mem.eql(u8, &item.token, &token)) self.remove(a, i);
+        };
+        self.remove(a, self.next);
+        while (self.bytes + size(value) > max_bytes) {
+            self.next = (self.next + 1) % max_entries;
+            self.remove(a, self.next);
+        }
+        var copy = value;
+        copy.id = try a.dupe(u8, value.id);
+        errdefer a.free(copy.id);
+        copy.body = if (value.body) |body| try a.dupe(u8, body) else null;
+        self.entries[self.next] = .{ .token = token, .domain = PageStore.namespaceDomain(namespace), .prepared = copy };
+        self.bytes += size(copy);
+        self.next = (self.next + 1) % max_entries;
+        return true;
+    }
+    pub fn take(self: *PreparedCache, namespace: []const u8, id: []const u8, token: [16]u8) ?Prepared {
+        for (&self.entries) |*slot| if (slot.*) |entry| {
+            if (!std.mem.eql(u8, &entry.token, &token) or !std.mem.eql(u8, &entry.domain, &PageStore.namespaceDomain(namespace)) or !std.mem.eql(u8, entry.prepared.id, id)) continue;
+            slot.* = null;
+            self.bytes -= size(entry.prepared);
+            return entry.prepared;
+        };
+        return null;
+    }
+};
+
 test "serverless native read plan authenticates bounded immutable inputs and binds namespace and document" {
     const a = std.testing.allocator;
     var memory = @import("objectstore").MemoryClient.init(a);
@@ -118,4 +173,34 @@ test "serverless native read plan authenticates bounded immutable inputs and bin
     try std.testing.expectEqual(null, missing.body);
     try std.testing.expectEqual(null, missing.fact);
     try std.testing.expectEqual(@as(u64, 0), writes);
+}
+
+test "serverless native read plan cache owns bytes and bounds tickets by namespace and document" {
+    const a = std.testing.allocator;
+    var cache: PreparedCache = .{};
+    defer cache.deinit(a);
+    const token: [16]u8 = @splat(1);
+    var id = [_]u8{'a'};
+    var body = [_]u8{'b'};
+    const value: Prepared = .{ .id = &id, .fact = null, .root = .{ .domain = PageStore.namespaceDomain("docs"), .policy_fingerprint = @splat(0) }, .body = &body };
+    try std.testing.expect(try cache.put(a, "docs", token, value));
+    body[0] = 'c';
+    try std.testing.expectEqual(null, cache.take("other", "a", token));
+    try std.testing.expectEqual(null, cache.take("docs", "b", token));
+    var taken = cache.take("docs", "a", token).?;
+    defer taken.deinit(a);
+    try std.testing.expectEqualStrings("b", taken.body.?);
+    try std.testing.expectEqual(null, cache.take("docs", "a", token));
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    const large = try a.alloc(u8, 128 * 1024);
+    defer a.free(large);
+    var bounded = value;
+    bounded.body = large;
+    for (0..10) |i| {
+        try std.testing.expect(try cache.put(a, "docs", @splat(@intCast(i)), bounded));
+        try std.testing.expect(cache.bytes <= PreparedCache.max_bytes);
+    }
+    try std.testing.expectEqual(null, cache.take("docs", "a", @splat(0)));
+    cache.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
 }

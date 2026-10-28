@@ -54,7 +54,9 @@ export class RequestPool {
   }
   if(selected<0)return;
   const job=this.pending.splice(selected,1)[0];this.lastKey=job.options.fairKey;
-  const slot=idle.find(s=>s.host&&s.hostKey===job.hostKey&&s.hostReservationBytes===job.reservationBytes)??idle.find(s=>!s.host)??idle[0];
+  const compatible=s=>s.host&&s.hostKey===job.hostKey&&s.hostReservationBytes===job.reservationBytes;
+  // Best-effort immutable-cache affinity never waits for a busy host.
+  const slot=idle.find(s=>compatible(s)&&s.host.poolIdentity===job.options.preferredHostIdentity)??idle.find(compatible)??idle.find(s=>!s.host)??idle[0];
   if(slot.host&&(slot.hostKey!==job.hostKey||slot.hostReservationBytes!==job.reservationBytes))slot.host=null;
   // Count busy reservations, including hosts still being instantiated, and
   // retained idle hosts. Evict idle variants before reserving more memory.
@@ -70,7 +72,7 @@ export class RequestPool {
   job.cleanup();
   const stage=(name,start)=>{try{job.options.onStage?.({name,duration_ms:performance.now()-start});}catch{}};
   stage("kernel_queue",job.queuedAt);
-  try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");if(!slot.host){const start=performance.now();slot.host=await this.create(job);slot.hostKey=job.hostKey;slot.hostReservationBytes=job.reservationBytes;stage("wasm_instantiate",start);}if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");return await (job.run?job.run(slot.host):slot.host.request(job.input,job.options));}
+  try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");if(!slot.host){const start=performance.now();slot.host=await this.create(job);slot.host.poolIdentity=Symbol("kernel");slot.hostKey=job.hostKey;slot.hostReservationBytes=job.reservationBytes;stage("wasm_instantiate",start);}if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");return await (job.run?job.run(slot.host):slot.host.request(job.input,job.options));}
   finally{
    const release=()=>{if(slot.host&&(!slot.host.usable()||slot.host.memoryBytes()>=job.recycleBytes))slot.host=null;this.reservedBytes-=job.reservationBytes;slot.activeReservationBytes=0;slot.busy=false;this.drain();};
    const draining=slot.host?.draining?.();

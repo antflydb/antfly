@@ -490,3 +490,11 @@ and disjoint invocation accounting. The local delayed large-record comparison
 improves publication substantially; ordinary full-corpus read/write latency is
 flat. See [shared object-backed publication](shared-object-publication.md) for
 the contracts, rollout flags, measurements and remaining cloud requirements.
+
+### Detached native read follow-up
+
+Fresh authority waits no longer need to retain speculative query stacks. The
+optional two-stage protocol uses Antfly's bounded native prepared cache and
+best-effort idle-kernel affinity. A held tenant's authority fetch no longer blocks
+another tenant's independent read under the existing app reservation. See
+[detached native reads](detached-native-reads.md) for the protocol and evidence.

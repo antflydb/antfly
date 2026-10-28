@@ -19,6 +19,7 @@ const wasm_allocator = std.heap.wasm_allocator;
 var working_set_peak: usize = 0;
 var decoded_manifests: @import("serverless/manifest/decoded_cache.zig").Cache = .{};
 var shared_read_leases: @import("serverless/manifest/read_lease.zig").Cache = .{};
+var prepared_reads: @import("serverless/query/read_plan.zig").PreparedCache = .{};
 var serving_scope: ?[32]u8 = null;
 // A kernel is serialized by the host pool. These caches own no request pointers
 // and must never cross a bucket/prefix boundary when a kernel is reused.
@@ -33,6 +34,7 @@ fn prepareServingScope(bucket: []const u8, prefix: []const u8) void {
     const digest = hasher.finalResult();
     if (serving_scope == null or !std.mem.eql(u8, &serving_scope.?, &digest)) {
         decoded_manifests.deinit(wasm_allocator);
+        prepared_reads.deinit(wasm_allocator);
         shared_read_leases = .{};
         serving_scope = digest;
     }
@@ -43,6 +45,9 @@ export fn antfly_host_manifest_cache_hits() u64 {
 }
 export fn antfly_host_manifest_cache_bytes() usize {
     return decoded_manifests.retainedBytes();
+}
+export fn antfly_host_prepared_read_cache_bytes() usize {
+    return prepared_reads.bytes;
 }
 pub fn resetWorkingSetMetrics() void {
     working_set_peak = 0;
@@ -138,6 +143,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         canonical_point_bodies: bool = false,
         native_write_plan: ?@import("serverless/wal/write_plan.zig").Input = null,
         native_read_plan_mode: bool = false,
+        native_read_prepare: ?[16]u8 = null,
+        native_read_resume: ?[16]u8 = null,
+        native_read_spent_bytes: u64 = 0,
         native_read_plan: ?@import("serverless/query/read_plan.zig").Plan = null,
         compaction_probe_only: bool = false,
         wal_inline_tail: bool = false,
@@ -479,11 +487,19 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         const required = if (req.required_visibility) |text| try visibility.Token.decode(text) else null;
         const read_plan = @import("serverless/query/read_plan.zig");
         var prepared_read: ?read_plan.Prepared = null;
-        defer if (prepared_read) |*value| value.deinit(a);
-        var read_allowance: u64 = 16 * 1024 * 1024;
+        var prepared_allocator = a;
+        defer if (prepared_read) |*value| value.deinit(prepared_allocator);
+        const max_read_bytes: u64 = 16 * 1024 * 1024;
+        if (req.native_read_spent_bytes > max_read_bytes) return error.InvalidNativeReadPlan;
+        var read_allowance: u64 = max_read_bytes - req.native_read_spent_bytes;
         if (req.native_read_plan_mode) {
             if (req.op != .lookup or req.cursor != null) return error.InvalidNativeReadPlan;
-            if (req.native_read_plan) |plan| {
+            if (req.native_read_prepare != null and req.native_read_resume != null) return error.InvalidNativeReadPlan;
+            if (req.native_read_resume) |ticket| {
+                if (req.native_read_plan != null) return error.InvalidNativeReadPlan;
+                prepared_read = prepared_reads.take(req.namespace, req.doc_id, ticket);
+                prepared_allocator = wasm_allocator;
+            } else if (req.native_read_plan) |plan| {
                 var no_writes: u64 = 0;
                 var pages = @import("serverless/graph_segment/page_store.zig").PageStore{
                     .domain = @import("serverless/graph_segment/page_store.zig").PageStore.namespaceDomain(req.namespace),
@@ -497,8 +513,12 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
                     else => return err,
                 };
             }
-            try host.readViewBarrier();
-        } else if (req.native_read_plan != null) return error.InvalidNativeReadPlan;
+            if (req.native_read_prepare) |ticket| {
+                const retained = if (prepared_read) |value| try prepared_reads.put(wasm_allocator, req.namespace, ticket, value) else false;
+                return std.json.Stringify.valueAlloc(a, .{ .__read_prepared = retained, .__read_spent_bytes = max_read_bytes - read_allowance }, .{});
+            }
+            if (req.native_read_resume == null) try host.readViewBarrier();
+        } else if (req.native_read_plan != null or req.native_read_prepare != null or req.native_read_resume != null or req.native_read_spent_bytes != 0) return error.InvalidNativeReadPlan;
         const live = try @import("serverless/query/live_session.zig").Session.open(a, &runtime, &wal, req.namespace, .{
             .io = host_io,
             .cancellation = cancellation,

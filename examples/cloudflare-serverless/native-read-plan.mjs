@@ -25,6 +25,16 @@ export class NativeReadPlans {
  remember(env,plan){if(!plan){this.buckets.get(env.DATABASE)?.delete(this.key(env));return;}const encoded=JSON.stringify(plan);if(encoded.length>4096||plan.format!==1)return;let map=this.buckets.get(env.DATABASE);if(!map)this.buckets.set(env.DATABASE,map=new Map());const key=this.key(env);map.delete(key);while(map.size>=8)map.delete(map.keys().next().value);map.set(key,{at:this.clock(),plan:structuredClone(plan)});}
 }
 
+// Preparation owns no authority-bearing transport and returns its WASM slot
+// before waiting for fresh admission.
+export function withNativeReadPreparation(transport,{onMetrics=()=>{}}={}){
+ return async(request,body)=>{
+  if(request.op==='bucket_exists'&&request.bucket==='database')return transport(request,body);
+  if(!['get','head'].includes(request.op)||request.bucket!=='database'||!/^antfly\/artifacts\/(sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(request.key??''))throw new ObjectStoreError(3,'immutable read preparation only');
+  onMetrics({native_read_plan_prepared_reads:1});return transport(request,body);
+ };
+}
+
 // Native code issues the barrier only after immutable preparation. Fresh
 // admission is already running independently. Once the barrier resolves, the
 // ordinary native live reader validates HEAD, floors, pins and the WAL overlay.

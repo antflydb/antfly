@@ -20,12 +20,12 @@ const KiB=1024,MiB=1024*KiB;
 // that maximum, not its observed high-water mark. Bound completions before
 // Asyncify copies them into native memory, as well as native live allocations.
 export async function withPointReadLane(kernel,run,options={}){
- let capacity=false,workingSetLimited=false,usedOperations=0,usedBytes=0,planned=false;
+ let capacity=false,workingSetLimited=false,usedOperations=0,usedBytes=0,planned=false,operationLimit=1024,transferLimit=32*MiB;
  const accounting=(host,input,requestOptions)=>{
   if(!planned)return host.request(input,requestOptions);
-  if(usedOperations>=1024||usedBytes>=32*MiB)throw Error("ObjectIoBudgetExceeded");
+  if(usedOperations>=operationLimit||usedBytes>=transferLimit)throw Error("ObjectIoBudgetExceeded");
   const observe=requestOptions.onMetrics;
-  return host.request(input,{...requestOptions,maxOperations:Math.min(requestOptions.maxOperations??1024,1024-usedOperations),maxTransferBytes:Math.min(requestOptions.maxTransferBytes??32*MiB,32*MiB-usedBytes),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;observe?.(sample);}});
+  return host.request(input,{...requestOptions,maxOperations:Math.min(requestOptions.maxOperations??1024,operationLimit-usedOperations),maxTransferBytes:Math.min(requestOptions.maxTransferBytes??32*MiB,transferLimit-usedBytes),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;observe?.(sample);}});
  };
  try{
   return await kernel.withHost(host=>{
@@ -33,6 +33,7 @@ export async function withPointReadLane(kernel,run,options={}){
    const limited={...host,request:(input,requestOptions={})=>{
     if(input.op!=="lookup")throw Error("PointReadOperationUnsupported");
     planned=input.native_read_plan_mode===true;
+    operationLimit=requestOptions.maxOperations??1024;transferLimit=requestOptions.maxTransferBytes??32*MiB;
     workingSetLimited=input.working_set_bytes==null||input.working_set_bytes>128*KiB;
     return accounting(host,{...input,working_set_bytes:Math.min(input.working_set_bytes??128*KiB,128*KiB)},{...requestOptions,maxTransferBytes:Math.min(requestOptions.maxTransferBytes??MiB,MiB),transport:async(request,body)=>{
     if(!["get","head","bucket_exists","read_view_barrier"].includes(request.op))throw Error("PointReadWriteForbidden");

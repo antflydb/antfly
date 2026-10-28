@@ -1103,3 +1103,22 @@ test('native publication batching stops before a large record and fences its sou
  await assert.rejects(host.request(request('publish',{publication_batch_version:plan.__publication_batch_version})),/PublicationBatchSourceChanged/);
  const job=await host.request(probe);assert.ok(job.job_id);assert.equal(job.wal_end_lsn,'1');
 });
+
+test('detached native preparation releases its call and validates fresh overlays, roots and cache misses',async()=>{
+ const {host:writer,transport}=await setup();
+ let artifactReads=0;const reader=await instantiateHost(module,async(req,body)=>{if(req.op==='get'&&req.key.includes('/artifacts/'))artifactReads++;assert.notEqual(req.op,'read_view_barrier','detached reads must never suspend a query stack on authority');return transport(req,body);});
+ const mutate=async(op,body)=>writer.request(request('mutate',{operation_id:op,mutations:[{kind:body===null?'delete':'upsert',doc_id:'one',...(body===null?{}:{body})}]}));
+ await mutate('detached-seed','{"text":"old"}');await writer.request(request('publish',{paged_text:true}));
+ const seed=await writer.request(request('lookup',{doc_id:'one',native_read_plan_mode:true}),{transport:async(req,body)=>req.op==='read_view_barrier'?{}:transport(req,body)});
+ const plan=seed.__read_plan,prepare=async(n,id='one')=>{const token=Array(16).fill(n),result=await reader.request(request('lookup',{doc_id:id,native_read_plan_mode:true,native_read_plan:plan,native_read_prepare:token}));assert.equal(result.__read_prepared,true);assert.equal(result.body,undefined);return{token,spent:result.__read_spent_bytes};};
+ const resume=(p,id='one',extra={})=>reader.request(request('lookup',{doc_id:id,native_read_plan_mode:true,native_read_resume:p.token,native_read_spent_bytes:p.spent,...extra}));
+ await reader.request(request('lookup',{doc_id:'one'}));
+ const retained=await prepare(11);artifactReads=0;await resume(retained);const hitReads=artifactReads;artifactReads=0;await resume(retained);assert.ok(artifactReads>hitReads,'consuming a retained preparation must save immutable artifact reads relative to a ticket miss');
+ const first=await prepare(1);await mutate('detached-update','{"text":"fresh"}');assert.equal((await resume(first)).body,'{"text":"fresh"}');
+ const changed=await prepare(2);await writer.request(request('publish',{paged_text:true}));assert.equal((await resume(changed)).body,'{"text":"fresh"}');
+ // Wrong-document and wrong-namespace tickets convey no membership or body.
+ const different=await prepare(3);assert.equal((await resume(different,'missing')).body,null);assert.equal((await resume(different,'one',{namespace:'other'})).body,null);
+ const evicted=await prepare(4);for(let i=5;i<10;i++)await prepare(i);assert.equal((await resume(evicted)).body,'{"text":"fresh"}');
+ const deleted=await prepare(10);await mutate('detached-delete',null);assert.equal((await resume(deleted)).body,null);
+ await assert.rejects(resume(deleted,'one',{native_read_spent_bytes:16*1024*1024+1}),/InvalidNativeReadPlan/);
+});

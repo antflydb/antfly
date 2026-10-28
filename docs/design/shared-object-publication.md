@@ -183,3 +183,10 @@ socket access passes. Neither failure is represented as a successful run.
 The cloud gate remains unpassed. Fresh module-bound cloud trials and complete
 invocation coverage are still required; older cloud reports cannot qualify
 these modules. No Cloudflare deployment is created for this implementation.
+
+
+The next read-scheduling change is [detached native preparation](detached-native-reads.md).
+It releases the physical query slot before waiting for fresh authority and retains
+only bounded authenticated immutable work in native memory. The original barrier
+protocol remains supported; this opt-in path addresses cross-tenant slot starvation
+without introducing retained mutable snapshots or a second storage format.

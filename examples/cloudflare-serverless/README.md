@@ -316,6 +316,13 @@ HTTP input cannot enable them. Deploy compatible native modules to all services
 before activation. Keep the compatible collector when disabling flags; drain or
 cancel active jobs and finish collector frontiers before downgrading binaries.
 
+`NATIVE_READ_DETACHED=true`, used with `NATIVE_READ_PLAN=true`, splits immutable
+preparation from fresh execution so waiting for authority holds no query WASM
+slot. A bounded native cache retains authenticated preparations; eviction and
+kernel replacement fall back to fresh reads. It defaults off pending qualification.
+See [the detached native read design](../../docs/design/detached-native-reads.md)
+for resource accounting, rollout and the stalled-tenant regression.
+
 With publication continuations enabled, `publish` returns `job_id`, `phase`,
 `offset` and `has_more` while work remains. Resume with `publication_job_id`,
 inspect with `publication_action: "status"`, or cancel with

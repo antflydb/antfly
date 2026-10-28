@@ -872,13 +872,13 @@ test('native speculative permits resume after aged work drains without another r
 });
 
 test('native point promotion shares its original I/O allowance and waits for fresh authority',async()=>{
- const{withPointReadLane}=await import('../point-read-lane.mjs');let attempts=0,fresh=false;
+ const{withPointReadLane}=await import('../point-read-lane.mjs');for(const prior of[0,100]){let attempts=0,fresh=false;
  const kernel={withHost:async run=>run({request:async(input,options)=>{
-  attempts++;if(attempts===1){options.onMetrics({operations:1000,transferred_bytes:31*1024*1024});throw Error('HostedWorkingSetBudgetExceeded');}
+  attempts++;if(attempts===1){options.onMetrics({operations:1000-prior,transferred_bytes:31*1024*1024});throw Error('HostedWorkingSetBudgetExceeded');}
   assert.equal(fresh,true);assert.equal(options.maxOperations,24);assert.equal(options.maxTransferBytes,1024*1024);return{body:'large'};
  }})};
- const result=await withPointReadLane(kernel,host=>host.request({op:'lookup',native_read_plan_mode:true,working_set_bytes:1024*1024},{}),{beforePromote:async()=>{fresh=true;}});
- assert.equal(result.body,'large');assert.equal(attempts,2);
+ const result=await withPointReadLane(kernel,host=>host.request({op:'lookup',native_read_plan_mode:true,working_set_bytes:1024*1024},{maxOperations:1024-prior}),{beforePromote:async()=>{fresh=true;}});
+ assert.equal(result.body,'large');assert.equal(attempts,2);}
 });
 
 test('native write plans retain one I/O budget across preparation, recovery and final metadata commit',async()=>{
@@ -889,4 +889,18 @@ test('native write plans retain one I/O budget across preparation, recovery and 
  const remaining={operations:1000,bytes:31*1024*1024};await store.transaction(tx=>tx.put('durable','after'),{ioBudget:remaining});
  assert.ok(remaining.operations>1000&&remaining.operations<=1024);assert.ok(remaining.bytes>31*1024*1024&&remaining.bytes<=32*1024*1024);
  assert.equal(await store.transaction(tx=>tx.get('durable')),'after');
+});
+
+test('immutable preparation transport cannot access authority, write or wait on a read barrier',async()=>{
+ const{withNativeReadPreparation}=await import('../native-read-plan.mjs');const calls=[],transport=withNativeReadPreparation(async req=>{calls.push(req);return{};});
+ await transport({op:'get',bucket:'database',key:'antfly/artifacts/sha256/aa/'+'b'.repeat(62)});
+ for(const req of[{op:'get',bucket:'database',key:'antfly/progress/docs/HEAD'},{op:'put',bucket:'database',key:'antfly/artifacts/sha256/aa/'+'b'.repeat(62)},{op:'read_view_barrier'},{op:'get',bucket:'other',key:'antfly/artifacts/sha256/aa/'+'b'.repeat(62)}])await assert.rejects(transport(req),/immutable read preparation only/);
+ assert.equal(calls.length,1);
+});
+test('kernel cache affinity prefers an idle matching host and never waits for a busy one',async()=>{
+ const{RequestPool}=await import('../request-pool.mjs');let created=0;const pool=new RequestPool(async()=>({usable:()=>true,memoryBytes:()=>1,number:++created}),2);
+ let entered,release;const ready=new Promise(r=>entered=r),gate=new Promise(r=>release=r);
+ const first=await pool.withHost(host=>host.poolIdentity),held=pool.withHost(async host=>{assert.equal(host.poolIdentity,first);entered();await gate;},{preferredHostIdentity:first});await ready;
+ const second=await pool.withHost(host=>host.poolIdentity,{preferredHostIdentity:first});assert.notEqual(first,second);release();await held;
+ assert.equal(await pool.withHost(host=>host.poolIdentity,{preferredHostIdentity:second}),second);
 });

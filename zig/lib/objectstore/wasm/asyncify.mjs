@@ -224,6 +224,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
         transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs, io_draining: Boolean(draining),
         wasm_linear_bytes: wasm.memory.buffer.byteLength,
         decoded_manifest_cache_hits: Number(wasm.antfly_host_manifest_cache_hits?.() ?? 0)-manifestCacheHitsBefore,
+        prepared_read_cache_bytes: wasm.antfly_host_prepared_read_cache_bytes?.() ?? 0,
         decoded_manifest_cache_bytes: wasm.antfly_host_manifest_cache_bytes?.() ?? 0,
         working_set_peak_bytes: wasm.antfly_host_working_set_peak_bytes?.() ?? null});
       // Observation must never alter an accepted mutation or poison its lane.
