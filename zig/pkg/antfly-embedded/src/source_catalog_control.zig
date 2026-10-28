@@ -162,6 +162,7 @@ pub const search_stemmers = @import("search/stemmers.zig");
 pub const search_stemmers_validation_test = @import("search/stemmers_validation_test.zig");
 pub const search_stopwords = @import("search/stopwords.zig");
 pub const search_wildcard = @import("search/wildcard.zig");
+pub const section_source_column = @import("section/source_column.zig");
 pub const section_doc_values = @import("section/doc_values.zig");
 pub const section_inverted = @import("section/inverted.zig");
 pub const section_nested = @import("section/nested.zig");
