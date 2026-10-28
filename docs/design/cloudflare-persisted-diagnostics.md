@@ -223,3 +223,26 @@ The verifier preserves schema-one and schema-two compatibility. Pagination still
 uses the documented raw metadata cursor and fails closed if a repeated or
 incomplete page cannot reconcile the exact population. This identity correction
 does not repair ingestion sampling.
+
+## Fresh native protocol window
+
+The October 27 native deployment produces stable, unsampled persisted windows
+for all eight roles during one interior minute. Acknowledged HTTP attempt/Ray
+identities reconcile when window membership explicitly uses response completion.
+`reconcileInvocations` retains request-start membership as its default; reports
+record the selected basis. This is not an arbitrary clock tolerance and does
+not forgive missing or unexpected identities.
+
+`independent-counters.mjs` now captures the exact disposable Worker scopes and
+bounded minute twice, checking integer totals, sample intervals and settlement.
+It deliberately fails on empty adaptive results and on DO/Worker population
+mismatches. Durable Object RPC totals need a separate namespace-scoped dataset;
+Worker totals alone cannot cover mixed builder invocations. Confidence sample
+sizes corroborate two active DO scopes, but quiet-role and whole-execution
+coverage are still unproven. The collector cannot pass the qualification gate.
+
+See [the live diagnostic](cloudflare-native-live.md) for immutable report IDs,
+latencies, the preserved setup-cutoff failure and the validated idempotent seed
+resume. Metrics sanitization now retains bounded publication progress, native
+WAL plan spans, numeric CPU/wall times and deployment UUIDs; it still discards
+request bodies, headers, credentials and arbitrary strings.

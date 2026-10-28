@@ -759,3 +759,13 @@ a new query. The app authenticates cursor state before dispatch and uses
 Configure signing secrets through Worker secrets. Key rotation invalidates cursors.
 The [exact-scan design](../../docs/design/cloudflare-gates.md#bounded-exhaustive-vector-search)
 details admission limits and the FP32/FP16 comparison caveat.
+
+For a bounded live test of large-record publication across physical actor
+replacement, run `node qualification/native-protocol-live.mjs CANDIDATE_RUN_JSON`
+on a sealed, paused disposable candidate with native write plans and publication
+continuations enabled. Its root namespace must be empty. The driver writes a
+private source snapshot and report, uses root epochs 0–2, and leaves tenants a–d
+untouched. Retire that root identity and purge its pending test notifications
+before measuring the tenant corpus. Clean up the disposable deployment with the
+gate lifecycle tool afterward. Results and qualification limits are documented
+in [the live native diagnostic](../../docs/design/cloudflare-native-live.md).

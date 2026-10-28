@@ -1,10 +1,12 @@
 # Cloudflare runtime: next architecture steps
 
-This is a proposed implementation order following the
-[latency experiments](cloudflare-latency-experiments.md). The experiments remain
-unqualified: full-size preparation stalls, the smaller corpus misses latency
-targets, and transport/diagnostic completeness is unresolved. These proposals
-are not claims that the fixes are already implemented.
+This is the implementation order following the
+[latency experiments](cloudflare-latency-experiments.md). The latest
+[live native protocol diagnostic](cloudflare-native-live.md) publishes the full
+2,048-document corpus and completes large-record recovery. Qualification remains
+incomplete: read p95 exceeds one second, large-record publication has substantial
+checkpoint overhead, and invocation accounting does not yet cover every event
+population. Sections below distinguish implemented protocols from proposed work.
 
 ## Keep one native engine and one durable truth
 
@@ -471,3 +473,11 @@ The local evidence manifest also binds the final modules, source snapshots,
 service bundles, test logs and preserved exploratory runs. Cloud gate work still
 requires fresh disposable deployments, refreshed module-bound scale/ANN runs,
 complete accounting and the unchanged paired hour-long/cold populations.
+
+### Live Cloudflare follow-up
+
+The fresh native protocol deployment completes large-record publication across
+actor replacement and substantially improves the full-corpus paired diagnostic.
+Read p95 is still 1,138 ms and invocation accounting remains incomplete, so this
+is not a gate pass. The evidence, limitations and next design changes are in
+[the live native protocol diagnostic](cloudflare-native-live.md).

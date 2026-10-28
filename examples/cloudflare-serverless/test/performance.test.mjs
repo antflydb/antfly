@@ -537,10 +537,13 @@ test('warm observation completion preserves its original deadline through final 
 
 test('ambiguous metadata deadlines retain native reservations and recover the late durable commit', {timeout:5000},async()=>{
  const{RequestPool}=await import('../request-pool.mjs'),{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs'),compact=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-compact.wasm',import.meta.url)));
- const bucket=new Bucket(),raw=createR2Transport({database:bucket});let created=0,hold=false,release,entered;const held=new Promise(r=>release=r),started=new Promise(r=>entered=r);
- const pool=new RequestPool(async()=>{created++;return instantiateHost(compact,null);},1,{maxReservedBytes:16*1024*1024,reservationBytes:16*1024*1024,recycleBytes:12*1024*1024}),store=new R2CoordinatorStore(module,bucket,'late-native-commit',{kernel:pool,transport:async(req,body)=>{if(hold&&req.op==='put'&&req.key.endsWith('.json')&&JSON.parse(new TextDecoder().decode(body)).kind==='commit'){entered();await held;}return raw(req,body);}});
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let now=Date.now(),created=0,hold=false,release,entered;const held=new Promise(r=>release=r),started=new Promise(r=>entered=r);
+ const pool=new RequestPool(async()=>{created++;return instantiateHost(compact,null,{clock:()=>now});},1,{clock:()=>now,maxReservedBytes:16*1024*1024,reservationBytes:16*1024*1024,recycleBytes:12*1024*1024}),store=new R2CoordinatorStore(module,bucket,'late-native-commit',{clock:()=>now,kernel:pool,transport:async(req,body)=>{if(hold&&req.op==='put'&&req.key.endsWith('.json')&&JSON.parse(new TextDecoder().decode(body)).kind==='commit'){entered();now+=25;await held;}return raw(req,body);}});
+ // Advance the injected clock only once the indeterminate PUT is in flight.
+ // Scheduler contention before that point must not turn this into a different
+ // cancellation test or prevent the suspension from being reached.
  await store.transaction(tx=>tx.put('value',1));hold=true;
- const writing=store.transaction(tx=>{tx.put('value',2);store.deadline=Date.now()+25;});const failed=assert.rejects(writing,/DeadlineExceeded/);await started;
+ const writing=store.transaction(tx=>{tx.put('value',2);store.deadline=now+25;});const failed=assert.rejects(writing,/DeadlineExceeded/);await started;
  try{await failed;assert.ok(store.ioDrain);assert.equal(pool.reservedBytes,16*1024*1024);assert.equal(pool.slots[0].busy,true);assert.equal(pool.slots[0].host.usable(),false);assert.ok(pool.memoryBytes()>0);await assert.rejects(store.transaction(tx=>tx.put('value',3)),/CoordinatorRecovering/);assert.equal(created,1,'a draining host must not open replacement capacity');}
  finally{hold=false;release();await failed;await store.ioDrain;}
  assert.equal(pool.reservedBytes,0);assert.equal(await store.transaction(tx=>tx.get('value')),2,'fresh native recovery must authenticate the late commit');assert.equal(created,2);assert.equal(pool.reservedBytes,0);

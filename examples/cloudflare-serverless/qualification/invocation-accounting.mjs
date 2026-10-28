@@ -32,8 +32,10 @@ export class InvocationLedger{
  finish(row,{transportError=false}={}){if(row){row.finished_at=this.clock();row.transport_error=transportError;}}
  report(){return{schema:1,overflow:this.overflow,attempts:this.rows.map(row=>({...row}))};}
 }
-export function reconcileInvocations(run,ledger,windows,{roleCounts,timeframe}={}){
+export function reconcileInvocations(run,ledger,windows,{roleCounts,timeframe,ledgerTimeBasis='started_at'}={}){
  const failures=[],observed={},seen=new Map();
+ if(!['started_at','response_at'].includes(ledgerTimeBasis))throw Error('InvalidInvocationLedgerTimeBasis');
+ const attemptTime=row=>ledgerTimeBasis==='response_at'?(row.response_at??row.finished_at):row.started_at;
  const validRange=range=>Number.isSafeInteger(range?.from)&&Number.isSafeInteger(range?.to)&&range.from>=0&&range.to>=range.from;
  const sameRange=(a,b)=>validRange(a)&&validRange(b)&&a.from===b.from&&a.to===b.to;
  if(!validRange(timeframe))failures.push('InvocationTimeframeMissing');
@@ -55,14 +57,14 @@ export function reconcileInvocations(run,ledger,windows,{roleCounts,timeframe}={
   const http=rows.filter(row=>row.event_type==='fetch'),byAttempt=new Map(),expected=new Set();
   for(const row of http){if(!row.attempt_id_sha256)failures.push('InvocationAttemptIdentityMissing');else{if(byAttempt.has(row.attempt_id_sha256))failures.push('InvocationAttemptRepeated');byAttempt.set(row.attempt_id_sha256,row);}}
   const attemptIds=new Set();
-  for(const row of ledger.attempts){if(!validRange(timeframe)||!Number.isSafeInteger(row.started_at)||row.started_at<timeframe.from||row.started_at>timeframe.to)failures.push('InvocationAttemptTimeframeMismatch');const id=attemptIdentity(row.id),invocation=byAttempt.get(id);if(!id||attemptIds.has(id))failures.push('InvocationAttemptRepeated');attemptIds.add(id);expected.add(id);
+  for(const row of ledger.attempts){if(!validRange(timeframe)||!Number.isSafeInteger(attemptTime(row))||attemptTime(row)<timeframe.from||attemptTime(row)>timeframe.to)failures.push('InvocationAttemptTimeframeMismatch');const id=attemptIdentity(row.id),invocation=byAttempt.get(id);if(!id||attemptIds.has(id))failures.push('InvocationAttemptRepeated');attemptIds.add(id);expected.add(id);
    if(row.status!==null){if(!row.ray_id_sha256)failures.push('AcknowledgedRayMissing');if(!invocation)failures.push('AcknowledgedInvocationMissing');else if(invocation.ray_id_sha256!==row.ray_id_sha256)failures.push('InvocationRayMismatch');if((row.status>=200&&row.status<300||row.version_id)&&row.version_id!==run.version)failures.push('ResponseVersionMismatch');}
    // An unacknowledged attempt can be classified as unobserved only when the
    // independent, unsampled app total also reconciles every stored invocation.
-   if(row.transport_error&&!invocation&&!roleCounts?.app)failures.push('InvocationTransportAmbiguous');
+   if(row.transport_error&&!invocation&&(ledgerTimeBasis==='response_at'||!roleCounts?.app))failures.push('InvocationTransportAmbiguous');
   }
   if(http.some(row=>!expected.has(row.attempt_id_sha256)))failures.push('UnexpectedHttpInvocation');
   if(ledger.attempts.some(row=>row.finished_at===null))failures.push('InvocationAttemptUnsettled');
  }
- return{schema:1,qualification:false,complete:failures.length===0,failures:[...new Set(failures)],observed,acknowledged_http:ledger.attempts.filter(row=>row.status!==null).length};
+ return{schema:1,qualification:false,ledger_time_basis:ledgerTimeBasis,complete:failures.length===0,failures:[...new Set(failures)],observed,acknowledged_http:ledger.attempts.filter(row=>row.status!==null).length};
 }

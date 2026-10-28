@@ -79,3 +79,16 @@ test('completed live diagnostic evidence rejects altered missing or substituted 
   await rm(artifacts[0].path);assert.equal(await verifyDiagnosticArtifacts(proof,runs,id,dir),false);
  }finally{await rm(dir,{recursive:true,force:true});}
 });
+
+test('native protocol diagnostics preserve bounded progress and timing labels without arbitrary strings',()=>{
+ const id='a'.repeat(32),events=[{event:'antfly.trace',scope:'wal',spans:[{name:'native_wal_plan',duration_ms:12},{name:'native_wal_finalize',duration_ms:4},{name:'rpc:openPublicationPlan',duration_ms:3},{name:'private document text',duration_ms:1}]},{event:'antfly.publication_progress',job_id:id,phase:'text',offset:1024,published:false,body:'private document text'},{event:'antfly.publication_batch_plan',operations:20,transferred_bytes:400}];
+ const safe=sanitizeTailEvent({logs:events.map(value=>({message:[JSON.stringify(value)]}))}),values=safe.logs.map(log=>JSON.parse(log.message[0]));
+ assert.deepEqual(values[0].spans.slice(0,3).map(span=>span.name),['native_wal_plan','native_wal_finalize','rpc:openPublicationPlan']);assert.equal(values[0].spans[3].name,undefined);
+ assert.equal(values[1].job_id,id);assert.equal(values[1].phase,'text');assert.equal(values[1].offset,1024);assert.equal(values[1].body,undefined);assert.ok(!JSON.stringify(safe).includes('private document text'));
+});
+
+test('diagnostic tails retain finite platform timing and version fields without copying provider context',()=>{
+ const id='01234567-0123-4567-89ab-0123456789ab',safe=sanitizeTailEvent({outcome:'ok',cpuTime:3,wallTime:90,scriptVersion:{id,private:'discard'},request:{body:'discard'}});
+ assert.deepEqual(safe,{outcome:'ok',cpuTime:3,wallTime:90,scriptVersion:{id}});
+ assert.deepEqual(sanitizeTailEvent({outcome:'ok',cpuTime:Infinity,wallTime:-1,scriptVersion:{id:'discard'}}),{outcome:'ok'});
+});

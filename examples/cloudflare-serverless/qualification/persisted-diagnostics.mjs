@@ -61,6 +61,7 @@ export function sanitizePersistedEvent(row, worker, timeframe) {
     if(typeof row.source.message==='string')messages.push(row.source.message);
   }
   const event = sanitizeTailEvent({outcome: invocation ? context.outcome : undefined,
+    cpuTime:context?.cpuTimeMs??context?.cpuTime,wallTime:context?.wallTimeMs??context?.wallTime,scriptVersion:context?.scriptVersion,
     truncated: context?.truncated === true,
     logs: [{timestamp: row.timestamp, message: messages.filter(v => typeof v === 'string')}],
     // Only the provider's error field is an exception. Scanning serialized

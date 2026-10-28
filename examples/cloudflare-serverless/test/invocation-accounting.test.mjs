@@ -47,3 +47,12 @@ test('attempt tags round-trip full UUID entropy while avoiding documented log re
  for(const id of['00000000-0000-0000-0000-000000000000','ffffffff-ffff-ffff-ffff-ffffffffffff',...Array.from({length:100},()=>crypto.randomUUID())]){const parameter=attemptParameter(id);assert.match(parameter,/^q[0-9a-z]{25}$/);assert.doesNotMatch(parameter,/^[0-9a-f+-_]{32,}$/i);assert.equal(requestAttemptIdentity('https://fixture.invalid/?__antfly_qualification_attempt='+parameter),attemptIdentity(id));}
  for(const parameter of['REDACTED','q'+'z'.repeat(25),'q123','q'+'0'.repeat(24)+'-'])assert.equal(requestAttemptIdentity('https://fixture.invalid/?__antfly_qualification_attempt='+parameter),null);
 });
+
+test('completion-window audits retain acknowledged requests that started before the provider log window',()=>{
+ const f=fixture(),attempt=f.ledger.attempts[0],from=attempt.started_at+1000;f.timeframe={from,to:from+1000};attempt.response_at=from+100;attempt.finished_at=from+105;
+ for(const window of f.windows){window.timeframe=f.timeframe;window.rows[0].timestamp=from+95;f.roleCounts[window.role].timeframe=f.timeframe;}
+ assert.equal(reconcileInvocations(f.run,f.ledger,f.windows,f).complete,false);
+ const options={...f,ledgerTimeBasis:'response_at'};assert.equal(reconcileInvocations(f.run,f.ledger,f.windows,options).complete,true);
+ f.windows[0].rows[0].attempt_id_sha256='f'.repeat(64);assert.equal(reconcileInvocations(f.run,f.ledger,f.windows,options).complete,false);
+ assert.throws(()=>reconcileInvocations(f.run,f.ledger,f.windows,{...f,ledgerTimeBasis:'unknown'}),/TimeBasis/);
+});
