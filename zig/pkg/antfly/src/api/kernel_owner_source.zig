@@ -4669,7 +4669,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             route.admission_deadline_io = null;
             retained.* = .{ .alloc = alloc, .source = self.source, .owner = owner, .native = native, .route = route, .group = self.group, .table = name, .pending_validation = .init(input.defer_validation), .frozen_proof = self.frozen_proof, .capture_state = state };
             if (!input.defer_validation) try validate(self);
-            return .{ .ptr = retained, .vtable = &.{ .invoke = RoutedGraphRead.invoke, .release = RoutedGraphRead.close, .open_sql = RoutedGraphRead.openSql } };
+            return .{ .ptr = retained, .vtable = &.{ .invoke = RoutedGraphRead.invoke, .invoke_typed = RoutedGraphRead.invokeTyped, .release = RoutedGraphRead.close, .open_sql = RoutedGraphRead.openSql } };
         }
 
         fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
@@ -4708,6 +4708,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         capture_state: ?*GraphCaptureState = null,
         frozen_proof: ?read_gate.ReadSafetyBarrier.FrozenProof = null,
         fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+            return invokeChecked(false, ptr, alloc, alloc, body);
+        }
+        fn invokeTyped(ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, request: @import("cypher").rpc.Request) !@import("cypher").rpc.Reply {
+            return invokeChecked(true, ptr, alloc, scratch, request);
+        }
+        /// Both transports share the cohort finalization and route checks.
+        fn invokeChecked(comptime typed: bool, ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, input: if (typed) @import("cypher").rpc.Request else []const u8) anyerror!(if (typed) @import("cypher").rpc.Reply else []u8) {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const state = if (self.pending_validation.load(.acquire)) self.capture_state orelse return error.CypherSnapshotNotReady else null;
             if (state) |capture| {
@@ -4719,9 +4726,12 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (self.pending_validation.load(.acquire)) {
                     if (!capture.active) return error.CypherSnapshotNotReady;
                     try capture.cancellation.check();
-                    var request = try std.json.parseFromSlice(@import("cypher").rpc.Request, alloc, body, .{});
-                    defer request.deinit();
-                    if (request.value.operation != .validate) return error.CypherSnapshotNotReady;
+                    const operation = if (typed) input.operation else operation: {
+                        var parsed = try std.json.parseFromSlice(@import("cypher").rpc.Request, alloc, input, .{});
+                        defer parsed.deinit();
+                        break :operation parsed.value.operation;
+                    };
+                    if (operation != .validate) return error.CypherSnapshotNotReady;
                     if (self.frozen_proof) |proof| {
                         const barrier = self.source.read_safety_barrier;
                         const validate_proof = barrier.vtable.validate_frozen orelse return error.SqlStatementSnapshotRequired;
@@ -4736,8 +4746,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 }
             }
             if (!finalizing) try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
-            const result = try self.native.invoke(alloc, body);
-            errdefer alloc.free(result);
+            const result = if (typed) try self.native.invokeTypedWithScratch(alloc, scratch, input) else try self.native.invoke(alloc, input);
+            errdefer if (!typed) alloc.free(result);
             if (finalizing) {
                 try RetainedStatementFence.validateLocal(state.?.fence.?);
                 try state.?.cancellation.check();

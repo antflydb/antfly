@@ -2030,6 +2030,24 @@ pub const Adapter = struct {
         const role_revision = if (self.identity.*) |principal| if (principal.live_user_manager) |manager| @as(?u64, manager.rowPolicyRoleRevision()) else null else null;
         const inputs = try owned.alloc(port.GraphTable, tables.items.len);
         for (tables.items, inputs) |table, *input| input.* = .{ .name = table.physical_name, .table_id = table.id, .schema_version = table.schema_version, .principal_proof = (try self.rowPolicyProof(owned, table)) orelse "", .database = table.scope.?.database, .filter_query_json = (try http_server.resolveEffectiveRowFilterJson(owned, self.identity.*, table.physical_name)) orelse "" };
+        for (inputs) |*input| {
+            var selected: ?[]const []const u8 = &.{};
+            for (requests) |request| {
+                const binding = request.table.graph orelse continue;
+                const indexes = try cypher.dependencies.indexesForTable(owned, binding.definition.query, binding.graph, input.name);
+                if (indexes == null) {
+                    selected = null;
+                    break;
+                }
+                var unioned: std.ArrayList([]const u8) = .empty;
+                try unioned.appendSlice(owned, selected.?);
+                for (indexes.?) |name| {
+                    if (!cypher.dependencies.contains(selected, name)) try unioned.append(owned, name);
+                }
+                selected = unioned.items;
+            }
+            input.indexes = if (self.range_reads != null) null else selected;
+        }
         var nonce: [32]u8 = undefined;
         try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
         const now = @import("antfly_platform").time.realtimeNs();
@@ -4433,6 +4451,8 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
             try std.testing.expect(input.partial_graph);
             try std.testing.expectEqual(@as(usize, 1), input.tables.len);
             try std.testing.expectEqualStrings("docs", input.tables[0].name);
+            try std.testing.expect(input.tables[0].indexes != null);
+            try std.testing.expectEqual(@as(usize, 0), input.tables[0].indexes.?.len);
             const cut = try a.create(Cut);
             cut.* = .{ .a = a, .fake = self };
             self.captures += 1;

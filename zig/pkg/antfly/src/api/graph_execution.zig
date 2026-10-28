@@ -92,7 +92,11 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     var channel: AuthorityChannel = .{ .read_owner = &read, .server = server, .identity = identity, .context = context, .name = name, .record_id = record.id, .tables = tables.items, .writes = writes and !compiled.query.explain, .role_revision = role_revision };
     const needed = try cypher.dependencies.required(scratch, compiled.query, graph);
     var read_tables: std.ArrayList(port.GraphTable) = .empty;
-    for (tables.items) |table| if (cypher.dependencies.contains(needed, table.name)) try read_tables.append(scratch, table);
+    for (tables.items) |table| if (cypher.dependencies.contains(needed, table.name)) {
+        var selected = table;
+        selected.indexes = if (writes) null else try cypher.dependencies.indexesForTable(scratch, compiled.query, graph, table.name);
+        try read_tables.append(scratch, selected);
+    };
     if (!compiled.query.explain and read_tables.items.len != 0) {
         const source = server.table_reads orelse return error.CypherSnapshotRequired;
         var nonce: [32]u8 = undefined;

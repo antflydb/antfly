@@ -7275,9 +7275,9 @@ pub const HostedProvisionedTableReadSource = struct {
                 const owner: *@This() = @ptrCast(@alignCast(raw));
                 return owner.read.invoke(page_alloc, body);
             }
-            fn invokeTyped(raw: *anyopaque, page_alloc: std.mem.Allocator, request: @import("cypher").rpc.Request) !@import("cypher").rpc.Reply {
+            fn invokeTyped(raw: *anyopaque, page_alloc: std.mem.Allocator, scratch: std.mem.Allocator, request: @import("cypher").rpc.Request) !@import("cypher").rpc.Reply {
                 const owner: *@This() = @ptrCast(@alignCast(raw));
-                return owner.read.invokeTyped(page_alloc, request);
+                return owner.read.invokeTypedWithScratch(page_alloc, scratch, request);
             }
             fn openSql(raw: *anyopaque, view_alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !table_read_source.RelationalReadView {
                 const owner: *@This() = @ptrCast(@alignCast(raw));

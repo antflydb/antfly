@@ -609,6 +609,8 @@ pub const OpenOptions = struct {
     /// An authenticated restore decoder needs rows and schema layouts, never
     /// source projections. Do not open intentionally omitted index artifacts.
     primary_only_readonly: bool = false,
+    /// Immutable query cuts retain the full catalog while opening only these assets.
+    query_indexes: ?[]const []const u8 = null,
     initial_owner_range: ?range_state_mod.InitialOwnerRange = null,
     initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
     map_size: usize = 256 * 1024 * 1024,
@@ -4350,7 +4352,7 @@ pub const DB = struct {
                 db.requestManagedAdmissionMaterialization();
             }
 
-            if (opts.primary_only_readonly and opts.open_mode != .query_readonly) return error.UnsupportedOperation;
+            if ((opts.primary_only_readonly or opts.query_indexes != null) and opts.open_mode != .query_readonly) return error.UnsupportedOperation;
             if (opts.open_mode == .query_readonly) {
                 const pending_merge = db.core.store.get(alloc, graph_merge_import_recovery_key) catch |err| switch (err) {
                     error.NotFound => null,
@@ -4365,7 +4367,7 @@ pub const DB = struct {
                 try db.core.loadIndexCatalogOnly();
             } else if (opts.open_mode == .query_readonly) {
                 const load_indexes_started_ns = monotonicTimeNs();
-                try db.core.loadIndexesNoBackfill();
+                if (opts.query_indexes) |names| try db.core.index_manager.loadSelectedNoBackfill(db.core.store, names) else try db.core.loadIndexesNoBackfill();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             } else {
                 const load_indexes_started_ns = monotonicTimeNs();
@@ -20802,6 +20804,7 @@ pub const DB = struct {
                 guarded = false;
                 var readonly = try DB.open(self.alloc, path, .{
                     .open_mode = .query_readonly,
+                    .query_indexes = request.indexes,
                     .physical_root_mode = .external_backend,
                     .storage = lease.view,
                     .backend_runtime = self.backend_runtime,
@@ -20831,6 +20834,7 @@ pub const DB = struct {
         defer if (!transferred) reader.deinit();
         var readonly = try DB.open(self.alloc, path, .{
             .open_mode = .query_readonly,
+            .query_indexes = request.indexes,
             .backend_runtime = self.backend_runtime,
             .identity_namespace = origin,
             .prefer_existing_identity_namespace = true,
@@ -20932,6 +20936,7 @@ pub const DB = struct {
                 fence.primary.admission != self.core.snapshot_admission or fence.replay.admission != self.core.snapshot_replay_admission)
                 return error.InvalidArgument;
         }
+        const selected_indexes = if (query_cut) |request| request.indexes else null;
         const seal_only = backup_seal_only or query_cut != null;
         // Out-of-line payloads require their immutable physical authority even
         // for the embedded snapshot API; a primary-only KV copy is incomplete.
@@ -21016,7 +21021,7 @@ pub const DB = struct {
             // Migration may have started while portable maintenance drained.
             try self.ensurePrimaryOnlySnapshotLocked();
             try self.core.syncStore(true);
-            try self.core.index_manager.syncAll(true);
+            try self.core.index_manager.syncSelected(true, selected_indexes);
             var primary_snapshot = try self.core.pinPortableSnapshot();
             defer primary_snapshot.deinit();
             self.core.unlockApply();
@@ -21086,13 +21091,16 @@ pub const DB = struct {
             } else {
                 // Never drain a producer while the distributed cohort freezes
                 // replay. Admission must converge before capturing fences.
-                if (self.enrichment_runtime) |runtime| try runtime.requireHealthyForQueryCapture();
+                if (selected_indexes == null or selected_indexes.?.len != 0) if (self.enrichment_runtime) |runtime| try runtime.requireHealthyForQueryCapture();
                 const managed = try self.core.managedIndexes(self.alloc);
                 defer {
                     for (managed) |index| self.alloc.free(@constCast(index.name));
                     self.alloc.free(managed);
                 }
-                for (managed) |index| if (try self.core.loadAppliedSequence(self.alloc, index.name) < target_sequence) return error.CypherSnapshotNotReady;
+                for (managed) |index| {
+                    if (!@import("cypher").dependencies.contains(selected_indexes, index.name)) continue;
+                    if (try self.core.loadAppliedSequence(self.alloc, index.name) < target_sequence) return error.CypherSnapshotNotReady;
+                }
             }
             try ensureSnapshotActive(cancellation);
 
@@ -21158,12 +21166,13 @@ pub const DB = struct {
             try @import("relational_integrity_topology.zig").requireDrained(&read, &manager, expected);
         }
         try self.core.syncStore(true);
-        try self.core.index_manager.syncAll(true);
+        try self.core.index_manager.syncSelected(true, selected_indexes);
         if (self.loadIndexRepairState(self.alloc)) |repair_state_value| {
             var repair_state = repair_state_value;
             defer repair_state.deinit(self.alloc);
-            if (repair_state.entries.items.len != 0)
-                return error.NativeBackupRepairStateNotQuiescent;
+            for (repair_state.entries.items) |entry| {
+                if (@import("cypher").dependencies.contains(selected_indexes, entry.intent.index_name)) return error.NativeBackupRepairStateNotQuiescent;
+            }
         } else |err| switch (err) {
             error.FileNotFound, error.DurableIndexRepairStateUnavailable => {},
             else => return err,
@@ -21172,7 +21181,7 @@ pub const DB = struct {
         // Pin the primary MVCC/read-snapshot while the selected revision is
         // fenced. Its corpus-sized serialization happens only after writers
         // resume and therefore does not extend write unavailability.
-        const query_reuse_digest = if (query_cut != null) try self.nativeQueryReuseDigestLocked(self.alloc) else null;
+        const query_reuse_digest = if (query_cut != null and selected_indexes == null) try self.nativeQueryReuseDigestLocked(self.alloc) else null;
         var primary_snapshot = try self.core.pinNativeSnapshot();
         defer primary_snapshot.deinit();
         if (comptime builtin.os.tag == .freestanding) {
@@ -21198,7 +21207,11 @@ pub const DB = struct {
         defer types.freeIndexConfigs(self.alloc, configs);
         const projections = try self.alloc.alloc(native_backup.Projection, configs.len);
         defer self.alloc.free(projections);
-        for (configs, 0..) |cfg, i| {
+        var projection_count: usize = 0;
+        for (configs) |cfg| {
+            if (!@import("cypher").dependencies.contains(selected_indexes, cfg.name)) continue;
+            const i = projection_count;
+            projection_count += 1;
             const checkpoint = try self.core.loadProjectionCheckpoint(self.alloc, cfg.name);
             if (checkpoint.status != .clean or
                 checkpoint.config_hash != types.indexConfigHash(cfg) or
@@ -21242,7 +21255,7 @@ pub const DB = struct {
                 .repair_reason = "",
             };
         }
-        std.mem.sort(native_backup.Projection, projections, {}, struct {
+        std.mem.sort(native_backup.Projection, projections[0..projection_count], {}, struct {
             fn lessThan(_: void, lhs: native_backup.Projection, rhs: native_backup.Projection) bool {
                 return std.mem.order(u8, lhs.name, rhs.name) == .lt;
             }
@@ -21254,11 +21267,12 @@ pub const DB = struct {
         // without reading corpus or WAL payloads under the mutation fence.
         const generated_native_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-native-pin", .{staging_root});
         defer self.alloc.free(generated_native_pin_root);
-        var generated_checkpoints = try self.core.index_manager.pinNativeBackupCheckpoints(
+        var generated_checkpoints = try self.core.index_manager.pinSelectedNativeBackupCheckpoints(
             io,
             generated_native_pin_root,
             capture_target_sequence,
             cancellation,
+            selected_indexes,
         );
         defer generated_checkpoints.deinit();
         const generated_metadata_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-metadata-pin", .{staging_root});
@@ -21293,7 +21307,7 @@ pub const DB = struct {
             // checkpoint are now retained independently of live publication.
             // Compute reuse eligibility under the fence, then let writers and
             // maintenance resume before WAL sealing, inventory and fsyncs.
-            const reuse_digest = if (query_cut != null) reuse: {
+            const reuse_digest = if (query_cut != null and selected_indexes == null) reuse: {
                 const final_digest = try self.nativeQueryReuseDigestLocked(self.alloc);
                 break :reuse if (query_reuse_digest != null and final_digest != null and std.mem.eql(u8, &query_reuse_digest.?, &final_digest.?)) query_reuse_digest else null;
             } else null;
@@ -21332,7 +21346,7 @@ pub const DB = struct {
                 .artifact_format = primary_snapshot.artifactFormat(),
                 .artifact_version = primary_snapshot.artifactVersion(),
                 .source_backend = @tagName(self.primary_backend),
-            }, projections, cancellation);
+            }, projections[0..projection_count], cancellation);
             try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
             published = true;
             return total;

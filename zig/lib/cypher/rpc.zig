@@ -54,7 +54,49 @@ pub const Request = struct {
     include_relationships: bool = false,
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
-pub const Reply = struct { read_failure: ?BudgetFailure = null, search_failure: ?BudgetFailure = null, exact_keys: bool = false, stable_ties: bool = true, encounter_owners: ?[]const usize = null, cursors: ?[]const ?[]const u8 = null, cursor_trace: ?b.CursorTrace = null, ordered: bool = false, estimate: ?usize = null, population: ?u64 = null, unfiltered: bool = false, work: usize = 0, relationships: []const wire.Value = &.{}, values: []const wire.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
+pub const Reply = struct {
+    read_failure: ?BudgetFailure = null,
+    search_failure: ?BudgetFailure = null,
+    exact_keys: bool = false,
+    stable_ties: bool = true,
+    encounter_owners: ?[]const usize = null,
+    cursors: ?[]const ?[]const u8 = null,
+    cursor_trace: ?b.CursorTrace = null,
+    ordered: bool = false,
+    estimate: ?usize = null,
+    population: ?u64 = null,
+    unfiltered: bool = false,
+    work: usize = 0,
+    relationships: []const wire.Value = &.{},
+    values: []const wire.Value = &.{},
+    next: ?[]const u8 = null,
+    examined: ?usize = null,
+    scores: []const f64 = &.{},
+    approximate: bool = false,
+    /// Copy only reply data across a runtime boundary, after owner-local
+    /// scratch (including per-document decoding) has been reclaimed.
+    pub fn clone(self: Reply, a: A) !Reply {
+        var out = self;
+        const values = try a.dupe(wire.Value, self.values);
+        for (values) |*item| item.value = try item.value.clone(a);
+        out.values = values;
+        const relationships = try a.dupe(wire.Value, self.relationships);
+        for (relationships) |*item| item.value = try item.value.clone(a);
+        out.relationships = relationships;
+        out.scores = try a.dupe(f64, self.scores);
+        if (self.next) |next| out.next = try a.dupe(u8, next);
+        if (self.encounter_owners) |owners| out.encounter_owners = try a.dupe(usize, owners);
+        if (self.cursors) |cursors| {
+            const copied = try a.dupe(?[]const u8, cursors);
+            for (copied) |*cursor| if (cursor.*) |bytes| {
+                cursor.* = try a.dupe(u8, bytes);
+            };
+            out.cursors = copied;
+        }
+        if (self.cursor_trace) |trace| out.cursor_trace = (try trace.clone(a)).*;
+        return out;
+    }
+};
 pub const Channel = struct { typed: ?*const fn (*anyopaque, A, Request) anyerror!Reply = null, ptr: *anyopaque, call: *const fn (*anyopaque, A, []const u8) anyerror![]u8, checkpoint: ?*const fn (*anyopaque) anyerror!void = null };
 pub const Version = struct { incarnation: u64, revision: u64 };
 pub const Client = struct {

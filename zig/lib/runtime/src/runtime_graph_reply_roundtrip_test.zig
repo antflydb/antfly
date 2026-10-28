@@ -21,18 +21,32 @@ const rpc = @import("cypher").rpc;
 const value = @import("cypher").value;
 const wire = @import("cypher").wire;
 const callbacks = @import("runtime_callback_abi.zig");
-const Methods = struct { invoke_typed: *const fn (*anyopaque, std.mem.Allocator, rpc.Request) anyerror!rpc.Reply };
+const Methods = struct { invoke_typed: *const fn (*anyopaque, std.mem.Allocator, std.mem.Allocator, rpc.Request) anyerror!rpc.Reply };
 const Boundary = callbacks.Boundary(Methods);
 const Descriptor = extern struct { dispatch: callbacks.CallbackDispatch, invoke: *const anyopaque };
-fn invoke(_: *anyopaque, a: std.mem.Allocator, request: rpc.Request) !rpc.Reply {
+fn invoke(_: *anyopaque, a: std.mem.Allocator, scratch: std.mem.Allocator, request: rpc.Request) !rpc.Reply {
+    var owner_arena = std.heap.ArenaAllocator.init(scratch);
+    defer owner_arena.deinit();
+    const owned = owner_arena.allocator();
+    // Total decoding exceeds the caller's fixed scratch capacity many times.
+    // Reclamation must use this runtime's arena identity and explicit backing.
+    for (0..64) |_| {
+        var document = std.heap.ArenaAllocator.init(@import("cypher").backend.reclaimingAllocator(owned));
+        defer document.deinit();
+        const bytes = try document.allocator().alloc(u8, 128 * 1024);
+        bytes[0] = 1;
+    }
     if (request.graph_incarnation != 7) return error.CatalogGenerationChanged;
     if (request.operation == .scan_ordered) return .{ .read_failure = .work, .search_failure = .anchors, .work = 2 };
     if (request.order.len != 1 or request.order[0].after.?.value.integer != 9 or request.filters.len != 1 or request.filters[0].op != .eq) return error.InvalidArgument;
-    const node = try a.create(value.Node);
+    const node = try owned.create(value.Node);
     node.* = .{ .identity = request.identity.? };
-    const values = try a.alloc(wire.Value, 1);
+    const values = try owned.alloc(wire.Value, 1);
     values[0] = .{ .value = .{ .node = node } };
-    return .{ .values = values, .work = 2 };
+    const cursors = try owned.alloc(?[]const u8, 2);
+    cursors[0] = null;
+    cursors[1] = try owned.dupe(u8, "after");
+    return (rpc.Reply{ .values = values, .work = 2, .cursors = cursors }).clone(a);
 }
 fn descriptor() callconv(.c) *const Descriptor {
     const Holder = struct {
@@ -52,15 +66,22 @@ test "typed graph callback preserves payloads across independently compiled runt
     defer arena.deinit();
     var marker: u8 = 0;
     const a = arena.allocator();
+    const scratch_storage = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(scratch_storage);
+    var scratch = std.heap.FixedBufferAllocator.init(scratch_storage);
     const identity: value.Identity = .{ .table = "docs", .key = "opaque" };
     var request: rpc.Request = .{ .operation = .get, .graph_incarnation = 7, .graph_revision = 1, .identity = identity, .order = &.{.{ .property = "score", .after = .{ .value = .{ .integer = 9 } } }}, .filters = &.{.{ .property = "score", .value = .{ .integer = 9 } }} };
-    const reply = try Boundary.call("invoke_typed", producer.dispatch, method, .{ &marker, a, request });
+    const reply = try Boundary.call("invoke_typed", producer.dispatch, method, .{ &marker, a, scratch.allocator(), request });
+    try std.testing.expectEqual(@as(usize, 0), scratch.end_index);
+    @memset(scratch_storage, 0xa5);
+    try std.testing.expect(reply.cursors.?[0] == null);
+    try std.testing.expectEqualStrings("after", reply.cursors.?[1].?);
     try std.testing.expectEqual(@as(usize, 2), reply.work);
     try std.testing.expect(reply.values[0].value.node.identity.eql(identity));
     request.operation = .scan_ordered;
-    const failed = try Boundary.call("invoke_typed", producer.dispatch, method, .{ &marker, a, request });
+    const failed = try Boundary.call("invoke_typed", producer.dispatch, method, .{ &marker, a, scratch.allocator(), request });
     try std.testing.expectEqual(rpc.BudgetFailure.work, failed.read_failure.?);
     try std.testing.expectEqual(rpc.BudgetFailure.anchors, failed.search_failure.?);
     request.graph_incarnation = 8;
-    try std.testing.expectError(error.CatalogGenerationChanged, Boundary.call("invoke_typed", producer.dispatch, method, .{ &marker, a, request }));
+    try std.testing.expectError(error.CatalogGenerationChanged, Boundary.call("invoke_typed", producer.dispatch, method, .{ &marker, a, scratch.allocator(), request }));
 }

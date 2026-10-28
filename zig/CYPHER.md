@@ -4210,3 +4210,51 @@ outside this gate; completed publishers defer without blocking. Capture waits
 honor cancellation. A deterministic regression attempts publication between
 manifest selection and file pinning, then seals the old manifest after the
 new checkpoint has retired its live WAL path.
+
+
+### Typed local leaves and demand-scoped owner cuts
+
+The production local-owner chain now forwards typed graph calls through the
+statement source, retained route wrapper, checked runtime callback boundary and
+native snapshot. Native wire calls adapt the same typed operations; observations
+keep their separate wire reply contract. Normalize/project replies allocate their
+nodes and value arrays in the reply arena. Both transports share route validation
+and the frozen-cohort finalization handshake, including before/after authority
+and cancellation checks. Remote leaves retain their bounded JSON transport.
+
+Read-only physical planning collects adjacency index names across all patterns,
+including reverse/wildcard edges, expression patterns, subqueries and UNION arms.
+Each physical table receives its own set. SQL GRAPH_TABLE unions those sets across
+all graph relations in the statement. Procedures, writes and transactional SQL
+retain conservative complete capture. Primary rows, scalar layouts, catalog,
+schema, policies and authoritative out-of-line source payloads remain retained.
+
+A scoped owner cut synchronizes, checks readiness/repair, pins and opens only
+selected managed index assets. Its full immutable index catalog remains available
+for graph identity validation, so omitting an unused graph projection does not
+weaken catalog binding. Primary-only cuts can avoid unrelated producer failures;
+selected graph cuts conservatively retain producer-recovery health checks.
+Manifest validation binds the exact index selection, preventing a scoped cut
+from reopening with broader asset authority. Scoped cuts never advertise a
+complete-corpus reuse proof. Ordinary backup and resumable search captures keep
+the existing full-generation behavior.
+
+Typed runtime callbacks carry separate reply and reclaimable scratch allocators.
+Each native owner constructs its scratch arena locally, so per-document decoders
+can recognize and peel its arena vtable even when the caller belongs to another
+compiled runtime. Only canonical reply values/cursors are cloned into the caller's
+reply arena before owner scratch is released. This preserves payload pruning for
+wide schemaless documents without a JSON codec hop. The independent-runtime ABI
+fixture repeatedly decodes 8 MiB through a 1 MiB scratch buffer and overwrites that
+buffer before checking the reply, guarding both reclamation and reply ownership.
+
+
+Qualification for typed local leaves and scoped owner cuts: 492 optimized core
+Cypher tests pass, together with the independent-runtime callback fixture in
+Debug and ReleaseFast. Four native capture/SQL/cleanup fixtures and 12 transport
+regressions pass, including the legacy wire allocator guard. The complete native
+Python suite passes 1,513 tests with four skips. All 20 public end-to-end tests
+pass, including authenticated replicated owners, graph writes and recovery,
+SQL GRAPH_TABLE, semantic/hybrid search, operator ceilings and the wide-document
+8 MiB memory regression. The final optimized CLI/library build passes all 87
+steps; the library exports exactly 137 public C functions and no internal symbols.

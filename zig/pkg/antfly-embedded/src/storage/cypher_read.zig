@@ -34,8 +34,10 @@ pub const Input = struct {
     principal_proof: []const u8 = "",
     database: []const u8 = "default",
     filter_query_json: []const u8 = "",
+    /// Null retains every managed projection; empty retains primary data only.
+    indexes: ?[]const []const u8 = null,
 };
-pub const Table = struct { name: []const u8, table_id: u64, schema_version: u32, principal_proof: []const u8 = "", database: []const u8 = "default", filter_query_json: []const u8 = "" };
+pub const Table = struct { indexes: ?[]const []const u8 = null, name: []const u8, table_id: u64, schema_version: u32, principal_proof: []const u8 = "", database: []const u8 = "default", filter_query_json: []const u8 = "" };
 pub const Statement = struct {
     partial_graph: bool = false,
     catalog_json: []const u8,
@@ -54,7 +56,7 @@ pub const Read = struct {
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
     pub const VTable = struct {
         invoke: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8,
-        invoke_typed: ?*const fn (*anyopaque, std.mem.Allocator, rpc.Request) anyerror!rpc.Reply = null,
+        invoke_typed: ?*const fn (*anyopaque, std.mem.Allocator, std.mem.Allocator, rpc.Request) anyerror!rpc.Reply = null,
         release: *const fn (*anyopaque) void,
         open_sql: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, @import("db/types.zig").ScanOptions) anyerror!@import("relational_read_view.zig").View = null,
     };
@@ -63,7 +65,12 @@ pub const Read = struct {
         return Abi.call("invoke", self.boundary_dispatch, self.vtable.invoke, .{ self.ptr, a, request });
     }
     pub fn invokeTyped(self: Read, a: std.mem.Allocator, request: rpc.Request) !rpc.Reply {
-        if (self.vtable.invoke_typed) |callback| return Abi.call("invoke_typed", self.boundary_dispatch, callback, .{ self.ptr, a, request });
+        return self.invokeTypedWithScratch(a, @import("cypher").backend.reclaimingAllocator(a), request);
+    }
+    /// Scratch is an explicitly reclaimable allocator, separate from the
+    /// reply arena. Arena vtable identities are local to each native runtime.
+    pub fn invokeTypedWithScratch(self: Read, a: std.mem.Allocator, scratch: std.mem.Allocator, request: rpc.Request) !rpc.Reply {
+        if (self.vtable.invoke_typed) |callback| return Abi.call("invoke_typed", self.boundary_dispatch, callback, .{ self.ptr, a, scratch, request });
         const body = try std.json.Stringify.valueAlloc(a, request, .{});
         defer a.free(body);
         if (body.len > 1 << 20) return error.CypherRequestTooLarge;

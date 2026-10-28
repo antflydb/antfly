@@ -157,12 +157,12 @@ pub const Statement = struct {
             hash.update(&identity);
             var digest: [32]u8 = undefined;
             hash.final(&digest);
-            const read = try self.fence.captureGraph(a, .{ .defer_validation = self.fence.graph_finalizes_validation, .catalog_json = statement.input.catalog_json, .catalogs_json = statement.input.catalogs_json, .table = self.plan.table.name, .table_id = self.plan.table.table_id, .schema_version = self.plan.table.schema_version, .cut_id = std.fmt.bytesToHex(digest, .lower), .expires_ms = statement.input.expires_ms, .ttl_now_ns = statement.input.ttl_now_ns, .principal_proof = self.plan.table.principal_proof, .database = self.plan.table.database, .filter_query_json = self.plan.table.filter_query_json });
+            const read = try self.fence.captureGraph(a, .{ .defer_validation = self.fence.graph_finalizes_validation, .indexes = self.plan.table.indexes, .catalog_json = statement.input.catalog_json, .catalogs_json = statement.input.catalogs_json, .table = self.plan.table.name, .table_id = self.plan.table.table_id, .schema_version = self.plan.table.schema_version, .cut_id = std.fmt.bytesToHex(digest, .lower), .expires_ms = statement.input.expires_ms, .ttl_now_ns = statement.input.ttl_now_ns, .principal_proof = self.plan.table.principal_proof, .database = self.plan.table.database, .filter_query_json = self.plan.table.filter_query_json });
             errdefer read.deinit();
             self.read = read;
             const snapshot = try a.create(Owner);
             snapshot.* = .{ .a = a, .statement = statement, .read = read, .client = undefined };
-            snapshot.client = .{ .channel = .{ .ptr = snapshot, .call = Owner.call }, .incarnation = statement.graph.incarnation, .revision = statement.graph.revision, .allowed_versions = statement.versions };
+            snapshot.client = .{ .channel = .{ .ptr = snapshot, .call = Owner.call, .typed = Owner.callTyped }, .incarnation = statement.graph.incarnation, .revision = statement.graph.revision, .allowed_versions = statement.versions };
             return .{ .backend = snapshot.client.backend(), .ptr = snapshot, .validate = Owner.validate, .close = Owner.close, .validation_covered_by_source = true };
         }
     };
@@ -184,6 +184,22 @@ pub const Statement = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try validate(ptr);
             return self.invoke(a, body);
+        }
+        fn callTyped(ptr: *anyopaque, a: std.mem.Allocator, request: cypher.rpc.Request) !cypher.rpc.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try validate(ptr);
+            if (self.read.vtable.invoke_typed == null) {
+                // Legacy local owners still need the reclaimable wire path;
+                // forwarding a foreign reply arena would retain row scratch.
+                const body = try std.json.Stringify.valueAlloc(a, request, .{});
+                defer a.free(body);
+                if (body.len > 1 << 20) return error.CypherRequestTooLarge;
+                const response = try self.invoke(a, body);
+                defer a.free(response);
+                if (response.len > 32 << 20) return error.CypherResponseTooLarge;
+                return std.json.parseFromSliceLeaky(cypher.rpc.Reply, a, response, .{ .allocate = .alloc_always });
+            }
+            return self.read.invokeTyped(a, request);
         }
         fn invoke(self: *@This(), a: std.mem.Allocator, body: []const u8) ![]u8 {
             // Arena vtables have different addresses across compiled libraries.
@@ -247,21 +263,32 @@ pub const Statement = struct {
         try backend.vtable.bind(backend.ptr, arena.allocator(), graph);
         return (cypher.rpc.Owner{ .backend = backend, .graph = graph, .table = "" }).execute(a, body);
     }
-    fn invokeTyped(ptr: *anyopaque, a: std.mem.Allocator, request: cypher.rpc.Request) !cypher.rpc.Reply {
+    fn invokeTyped(ptr: *anyopaque, a: std.mem.Allocator, scratch: std.mem.Allocator, request: cypher.rpc.Request) !cypher.rpc.Reply {
+        const local_scratch = cypher.backend.reclaimingAllocator(a);
+        if (local_scratch.ptr == scratch.ptr and local_scratch.vtable == scratch.vtable) return invokeTypedLocal(ptr, a, request);
+        // Hosted callers may also belong to an independent runtime. Preserve
+        // their scratch capability without making local callers copy twice.
+        var arena = std.heap.ArenaAllocator.init(scratch);
+        defer arena.deinit();
+        return (try invokeTypedLocal(ptr, arena.allocator(), request)).clone(a);
+    }
+    fn invokeTypedLocal(ptr: *anyopaque, a: std.mem.Allocator, request: cypher.rpc.Request) !cypher.rpc.Reply {
         const self = cast(ptr);
         try checkpoint(ptr);
         const graph = for (self.graphs) |entry| {
             if (entry.incarnation == request.graph_incarnation and entry.revision == request.graph_revision) break entry;
         } else return error.CatalogGenerationChanged;
         switch (request.operation) {
-            // These operations have dedicated owner semantics and keep their
-            // existing wire routing. Observations have a different reply type.
             .normalize, .project => {
-                const body = try std.json.Stringify.valueAlloc(a, request, .{});
-                defer a.free(body);
-                const response = try invoke(ptr, a, body);
-                defer a.free(response);
-                return std.json.parseFromSliceLeaky(cypher.rpc.Reply, a, response, .{ .allocate = .alloc_always });
+                const permitted = for (graph.labels) |label| {
+                    if (std.mem.eql(u8, label.table, request.table)) break true;
+                } else false;
+                if (!permitted and request.operation != .project) return error.Forbidden;
+                for (self.set.targets, self.set.snapshots) |target, snapshot| {
+                    if (!std.mem.eql(u8, target.table, request.table)) continue;
+                    return Owner.callTyped(snapshot.ptr, a, request);
+                }
+                return error.CypherInvalidOwner;
             },
             .observe, .observe_ranges => return error.CypherObservationsUnavailable,
             else => {},
@@ -299,3 +326,23 @@ pub const Statement = struct {
         backing.destroy(self);
     }
 };
+
+test "graph admission batches preserve reclaimable allocators for legacy owner callbacks" {
+    const Legacy = struct {
+        fn invoke(_: *anyopaque, a: std.mem.Allocator, _: []const u8) ![]u8 {
+            var probe = std.heap.ArenaAllocator.init(a);
+            defer probe.deinit();
+            try std.testing.expect(a.vtable != probe.allocator().vtable);
+            return std.json.Stringify.valueAlloc(a, cypher.rpc.Reply{ .work = 3 }, .{});
+        }
+        fn release(_: *anyopaque) void {}
+    };
+    var statement: Statement = undefined;
+    statement.input = .{ .catalog_json = "", .tables = &.{}, .cut_id = @splat('a'), .expires_ms = std.math.maxInt(u64), .ttl_now_ns = 1 };
+    var marker: u8 = 0;
+    var owner: Statement.Owner = .{ .a = std.testing.allocator, .statement = &statement, .read = .{ .ptr = &marker, .vtable = &.{ .invoke = Legacy.invoke, .release = Legacy.release } }, .client = undefined };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const reply = try Statement.Owner.callTyped(&owner, arena.allocator(), .{ .operation = .validate, .graph_incarnation = 1, .graph_revision = 1 });
+    try std.testing.expectEqual(@as(usize, 3), reply.work);
+}

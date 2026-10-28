@@ -67,7 +67,7 @@ pub fn Snapshot(comptime DB: type) type {
                 var lease = authority;
                 lease.release();
             }
-            var cut: @import("native_query_cut.zig").Request = .{ .id = &copied.cut_id, .table_id = copied.table_id, .expires_ms = copied.expires_ms, .create = true };
+            var cut: @import("native_query_cut.zig").Request = .{ .id = &copied.cut_id, .table_id = copied.table_id, .expires_ms = copied.expires_ms, .create = true, .indexes = copied.indexes };
             stage = "capture";
             // Install cleanup before capture so a failed publication/open/bind
             // cannot leave a statement generation consuming admission capacity.
@@ -90,7 +90,7 @@ pub fn Snapshot(comptime DB: type) type {
             stage = "bind";
             try backend.vtable.bind(backend.ptr, owned, graph);
             self.arena = arena;
-            return .{ .ptr = self, .vtable = &.{ .invoke = invoke, .release = release, .open_sql = openSql } };
+            return .{ .ptr = self, .vtable = &.{ .invoke = invoke, .invoke_typed = invokeTyped, .release = release, .open_sql = openSql } };
         }
         fn cast(ptr: *anyopaque) *Self {
             return @ptrCast(@alignCast(ptr));
@@ -251,71 +251,101 @@ pub fn Snapshot(comptime DB: type) type {
             }
             return relationship;
         }
-        fn invoke(ptr: *anyopaque, a: std.mem.Allocator, request: []const u8) ![]u8 {
+        fn invoke(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
+            if (body.len > 1 << 20) return error.CypherRequestTooLarge;
+            var arena = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const request = try std.json.parseFromSliceLeaky(cypher.rpc.Request, scratch, body, .{});
             const self = cast(ptr);
-            try checkpoint(ptr);
-            var scratch = std.heap.ArenaAllocator.init(a);
-            defer scratch.deinit();
-            const header = try std.json.parseFromSliceLeaky(struct { graph_incarnation: u64, graph_revision: u64, operation: []const u8 }, scratch.allocator(), request, .{ .ignore_unknown_fields = true });
+            if (request.operation == .observe or request.operation == .observe_ranges) {
+                try checkpoint(ptr);
+                _ = try self.selectGraph(scratch, request);
+                const observations = @import("cypher_write_observation.zig");
+                const observation = if (request.operation == .observe_ranges) try observations.captureRanges(Self, self, scratch) else try observations.capture(Self, self, scratch);
+                return std.json.Stringify.valueAlloc(a, observation, .{});
+            }
+            const reply = try invokeTypedLocal(ptr, scratch, request);
+            const encoded = try std.json.Stringify.valueAlloc(a, reply, .{});
+            errdefer a.free(encoded);
+            if (encoded.len > 32 << 20) return error.CypherResponseTooLarge;
+            return encoded;
+        }
+        fn selectGraph(self: *Self, a: std.mem.Allocator, request: cypher.rpc.Request) !cypher.catalog.Graph {
             const selected = for (self.graphs) |graph| {
-                if (graph.incarnation == header.graph_incarnation and graph.revision == header.graph_revision) break graph;
+                if (graph.incarnation == request.graph_incarnation and graph.revision == request.graph_revision) break graph;
             } else return error.CatalogGenerationChanged;
             self.graph = selected;
             const backend = self.adapter.backend();
-            try backend.vtable.bind(backend.ptr, scratch.allocator(), selected);
-            if (std.mem.eql(u8, header.operation, "project")) {
-                const input = try std.json.parseFromSliceLeaky(cypher.rpc.Request, scratch.allocator(), request, .{});
+            try backend.vtable.bind(backend.ptr, a, selected);
+            return selected;
+        }
+        fn invokeTyped(ptr: *anyopaque, a: std.mem.Allocator, temporary: std.mem.Allocator, input: cypher.rpc.Request) !cypher.rpc.Reply {
+            // Build the owner arena in this runtime. Foreign arena vtables
+            // cannot be peeled by the native adapter's per-document scratch.
+            var arena = std.heap.ArenaAllocator.init(temporary);
+            defer arena.deinit();
+            const reply = try invokeTypedLocal(ptr, arena.allocator(), input);
+            return reply.clone(a);
+        }
+        fn invokeTypedLocal(ptr: *anyopaque, a: std.mem.Allocator, input: cypher.rpc.Request) !cypher.rpc.Reply {
+            const self = cast(ptr);
+            try checkpoint(ptr);
+            const selected = try self.selectGraph(a, input);
+            const backend = self.adapter.backend();
+            if (input.operation == .project) {
                 const identity = input.identity orelse return error.CypherInvalidDocument;
                 if (!std.mem.eql(u8, identity.table, self.input.table) or !std.mem.eql(u8, input.table, self.input.table)) return error.Forbidden;
                 const document = input.document orelse return error.CypherInvalidDocument;
-                if (!try self.db.permitsCypherDocument(scratch.allocator(), document, input.json_null_fields, self.input.principal_proof, self.input.database))
-                    return std.json.Stringify.valueAlloc(a, .{ .values = @as([]const cypher.wire.Value, &.{}) }, .{});
+                if (!try self.db.permitsCypherDocument(a, document, input.json_null_fields, self.input.principal_proof, self.input.database))
+                    return .{};
                 if (self.input.filter_query_json.len != 0) {
-                    var filter = try @import("../../search/pattern_filter.zig").PreparedPatternFilter.init(scratch.allocator(), self.input.filter_query_json);
+                    var filter = try @import("../../search/pattern_filter.zig").PreparedPatternFilter.init(a, self.input.filter_query_json);
                     defer filter.deinit();
-                    if (!try filter.matchesJson(scratch.allocator(), identity.key, document))
-                        return std.json.Stringify.valueAlloc(a, .{ .values = @as([]const cypher.wire.Value, &.{}) }, .{});
+                    if (!try filter.matchesJson(a, identity.key, document))
+                        return .{};
                 }
-                const value = try cypher.value.Value.fromJson(scratch.allocator(), document);
+                const value = try cypher.value.Value.fromJson(a, document);
                 if (value != .map) return error.CypherInvalidDocument;
-                const node: cypher.value.Node = .{ .identity = identity, .properties = try cypher.value.entityProperties(scratch.allocator(), value.map) };
-                var meter: cypher.backend.Meter = .{ .a = scratch.allocator(), .backend = backend, .limit = input.max_work };
+                const node: cypher.value.Node = .{ .identity = identity, .properties = try cypher.value.entityProperties(a, value.map) };
+                var meter: cypher.backend.Meter = .{ .a = a, .backend = backend, .limit = input.max_work };
                 self.adapter.work = meter.work();
                 defer self.adapter.work = null;
-                var membership = self.adapter.valueWork(scratch.allocator());
+                var membership = self.adapter.valueWork(a);
                 var labels: std.ArrayList([]const u8) = .empty;
-                for (selected.labels) |label| if (try selected.admits(&node, label.name, &membership)) try labels.append(scratch.allocator(), label.name);
-                var projected = node;
+                for (selected.labels) |label| if (try selected.admits(&node, label.name, &membership)) try labels.append(a, label.name);
+                const projected = try a.create(cypher.value.Node);
+                projected.* = node;
                 projected.labels = labels.items;
                 if (!input.include_relationships) {
                     try checkpoint(ptr);
-                    return std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .values = &.{cypher.wire.Value{ .value = .{ .node = &projected } }} }, .{});
+                    const values = try a.alloc(cypher.wire.Value, 1);
+                    values[0] = .{ .value = .{ .node = projected } };
+                    return .{ .work = meter.units, .values = values };
                 }
-                const derived = try self.db.cypherDocumentRelationships(scratch.allocator(), selected, &projected);
-                const relationships = try scratch.allocator().alloc(cypher.wire.Value, derived.len);
+                const derived = try self.db.cypherDocumentRelationships(a, selected, projected);
+                const relationships = try a.alloc(cypher.wire.Value, derived.len);
                 for (derived, relationships) |edge, *out| out.* = .{ .value = .{ .relationship = edge }, .include_native = true };
                 try checkpoint(ptr);
-                return std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .values = &.{cypher.wire.Value{ .value = .{ .node = &projected } }}, .relationships = relationships }, .{});
+                const values = try a.alloc(cypher.wire.Value, 1);
+                values[0] = .{ .value = .{ .node = projected } };
+                return .{ .work = meter.units, .values = values, .relationships = relationships };
             }
-            if (std.mem.eql(u8, header.operation, "normalize")) {
-                const input = try std.json.parseFromSliceLeaky(cypher.rpc.Request, scratch.allocator(), request, .{});
+            if (input.operation == .normalize) {
                 const identity = input.identity orelse return error.CypherInvalidDocument;
                 if (!std.mem.eql(u8, identity.table, self.input.table) or !std.mem.eql(u8, input.table, self.input.table)) return error.Forbidden;
                 const document = input.document orelse return error.CypherInvalidDocument;
                 if (document != .object) return error.CypherInvalidDocument;
-                const value = try cypher.value.Value.fromJson(scratch.allocator(), document);
-                const node: cypher.value.Node = .{ .identity = identity, .properties = value.map };
-                const normalized = try self.db.normalizeCypherNode(scratch.allocator(), selected, &node, input.apply_defaults);
+                const value = try cypher.value.Value.fromJson(a, document);
+                const node = try a.create(cypher.value.Node);
+                node.* = .{ .identity = identity, .properties = value.map };
+                const normalized = try self.db.normalizeCypherNode(a, selected, node, input.apply_defaults);
                 try checkpoint(ptr);
-                return std.json.Stringify.valueAlloc(a, .{ .values = &.{cypher.wire.Value{ .value = .{ .node = normalized } }} }, .{});
+                const values = try a.alloc(cypher.wire.Value, 1);
+                values[0] = .{ .value = .{ .node = normalized } };
+                return .{ .values = values };
             }
-            if (std.mem.eql(u8, header.operation, "observe") or std.mem.eql(u8, header.operation, "observe_ranges")) {
-                const observations = @import("cypher_write_observation.zig");
-                const observation = if (std.mem.eql(u8, header.operation, "observe_ranges")) try observations.captureRanges(Self, self, scratch.allocator()) else try observations.capture(Self, self, scratch.allocator());
-                return std.json.Stringify.valueAlloc(a, observation, .{});
-            }
-            const result = try (cypher.rpc.Owner{ .backend = backend, .graph = selected, .table = self.input.table }).execute(a, request);
-            errdefer a.free(result);
+            const result = try (cypher.rpc.Owner{ .backend = backend, .graph = selected, .table = self.input.table }).executeTyped(a, input);
             try checkpoint(ptr);
             return result;
         }

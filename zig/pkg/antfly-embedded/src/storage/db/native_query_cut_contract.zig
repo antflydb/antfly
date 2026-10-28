@@ -81,6 +81,8 @@ pub const Request = struct {
     table_id: u64,
     expires_ms: u64,
     create: bool = false,
+    /// Internal statement cuts may omit unrelated managed projection assets.
+    indexes: ?[]const []const u8 = null,
     /// Authenticated original generation identity. Execution may move to a
     /// replacement range, but physical document IDs remain in this namespace.
     origin: ?Namespace = null,

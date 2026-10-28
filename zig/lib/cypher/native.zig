@@ -230,9 +230,11 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         return err;
                     };
                 }
-                if ((try self.selected(table)).core.graphIndex(relationship.index) == null) return error.IndexNotFound;
+                // Binding validates the full catalog, including intentionally
+                // unopened projections in a demand-scoped immutable cut.
+                const configured = (try (try self.selected(table)).cypherGraphIndexIdentity(a, relationship.index)) orelse return error.IndexNotFound;
                 if (relationship.identity) |expected| {
-                    const actual = (try (try self.selected(table)).cypherGraphIndexIdentity(a, relationship.index)) orelse return error.IndexNotFound;
+                    const actual = configured;
                     if (expected.incarnation != actual.incarnation or expected.config_hash != actual.config_hash) return error.CatalogGenerationChanged;
                 }
             }

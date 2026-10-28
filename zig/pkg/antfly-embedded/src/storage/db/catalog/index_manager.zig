@@ -8640,11 +8640,15 @@ pub const IndexManager = struct {
     }
 
     pub fn syncAll(self: *IndexManager, force: bool) !void {
-        for (self.text_indexes.items) |*entry| try entry.persistent.sync(force);
-        for (self.dense_indexes.items) |*entry| try entry.index.sync(force);
-        for (self.sparse_indexes.items) |*entry| try entry.index.sync(force);
-        for (self.graph_indexes.items) |*entry| try entry.index.sync(force);
-        for (self.algebraic_indexes.items) |*entry| try entry.index.sync(force);
+        return self.syncSelected(force, null);
+    }
+
+    pub fn syncSelected(self: *IndexManager, force: bool, selected: ?[]const []const u8) !void {
+        for (self.text_indexes.items) |*entry| if (selectedIndex(selected, entry.config.name)) try entry.persistent.sync(force);
+        for (self.dense_indexes.items) |*entry| if (selectedIndex(selected, entry.config.name)) try entry.index.sync(force);
+        for (self.sparse_indexes.items) |*entry| if (selectedIndex(selected, entry.config.name)) try entry.index.sync(force);
+        for (self.graph_indexes.items) |*entry| if (selectedIndex(selected, entry.config.name)) try entry.index.sync(force);
+        for (self.algebraic_indexes.items) |*entry| if (selectedIndex(selected, entry.config.name)) try entry.index.sync(force);
     }
 
     pub fn syncGraphIndexes(self: *IndexManager, force: bool) !void {
@@ -8819,6 +8823,17 @@ pub const IndexManager = struct {
         capture_target_sequence: u64,
         cancellation: CancellationToken,
     ) !NativeBackupCheckpoints {
+        return self.pinSelectedNativeBackupCheckpoints(io, native_pin_root, capture_target_sequence, cancellation, null);
+    }
+
+    pub fn pinSelectedNativeBackupCheckpoints(
+        self: *IndexManager,
+        io: std.Io,
+        native_pin_root: []const u8,
+        capture_target_sequence: u64,
+        cancellation: CancellationToken,
+        selected: ?[]const []const u8,
+    ) !NativeBackupCheckpoints {
         if (comptime builtin.os.tag == .freestanding) return error.Unsupported;
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
@@ -8828,6 +8843,7 @@ pub const IndexManager = struct {
         }
         defer self.native_backup_pin_mu.unlock();
 
+        try fs_paths.createDirPathPortable(io, native_pin_root);
         var result = NativeBackupCheckpoints{ .alloc = self.alloc };
         errdefer result.deinit();
         var native_specs = std.ArrayListUnmanaged(native_backup.ExplicitPinSpec).empty;
@@ -8839,6 +8855,7 @@ pub const IndexManager = struct {
         }
         var has_native_dense = false;
         for (self.text_indexes.items) |*entry| {
+            if (!selectedIndex(selected, entry.config.name)) continue;
             try result.artifacts.ensureUnusedCapacity(self.alloc, 3);
             const main_name = try self.alloc.dupe(u8, entry.config.name);
             const wal_name = self.alloc.dupe(u8, entry.config.name) catch |err| {
@@ -8876,6 +8893,7 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items) |*entry| {
+            if (!selectedIndex(selected, entry.config.name)) continue;
             if (try entry.index.nativeBackupGeneration(self.alloc, capture_target_sequence)) |generation_value| {
                 var generation = generation_value;
                 defer generation.deinit();
@@ -9052,6 +9070,7 @@ pub const IndexManager = struct {
             }
         }
         for (self.sparse_indexes.items) |*entry| {
+            if (!selectedIndex(selected, entry.config.name)) continue;
             try result.artifacts.ensureUnusedCapacity(self.alloc, 1);
             const name = try self.alloc.dupe(u8, entry.config.name);
             const checkpoint = entry.index.pinNativeCheckpoint() catch |err| {
@@ -9061,6 +9080,7 @@ pub const IndexManager = struct {
             result.artifacts.appendAssumeCapacity(.{ .index_name = name, .backend_root = "", .checkpoint = .{ .lsm = checkpoint } });
         }
         for (self.graph_indexes.items) |*entry| {
+            if (!selectedIndex(selected, entry.config.name)) continue;
             try result.artifacts.ensureUnusedCapacity(self.alloc, 2);
             const outgoing_name = try self.alloc.dupe(u8, entry.config.name);
             const reverse_name = self.alloc.dupe(u8, entry.config.name) catch |err| {
@@ -11748,6 +11768,46 @@ pub const IndexManager = struct {
 
     pub fn loadDeferredBackfill(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, false, false);
+    }
+
+    fn selectedIndex(names: ?[]const []const u8, name: []const u8) bool {
+        for (names orelse return true) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
+        return false;
+    }
+
+    /// Keep the complete immutable catalog for binding and identity checks,
+    /// opening only the assets selected by the statement's physical plan.
+    pub fn loadSelectedNoBackfill(self: *IndexManager, store: anytype, names: []const []const u8) !void {
+        try self.loadCatalogOnly(store);
+        self.bindPrimaryStore(store, true);
+        const configs = self.status_only_index_configs;
+        self.status_only_index_configs = &.{};
+        defer {
+            for (configs) |*cfg| cfg.deinit(self.alloc);
+            self.alloc.free(configs);
+        }
+        var retained: std.ArrayList(types.IndexConfig) = .empty;
+        errdefer {
+            for (retained.items) |*cfg| cfg.deinit(self.alloc);
+            retained.deinit(self.alloc);
+        }
+        for (names) |name| {
+            const found = for (configs) |cfg| {
+                if (std.mem.eql(u8, cfg.name, name)) break true;
+            } else false;
+            if (!found) return error.IndexNotFound;
+        }
+        for (configs) |cfg| {
+            if (selectedIndex(names, cfg.name)) {
+                try self.openConfiguredIndex(store, cfg, false, true);
+            } else {
+                var copy = try types.IndexConfig.clone(self.alloc, cfg);
+                errdefer copy.deinit(self.alloc);
+                try retained.append(self.alloc, copy);
+            }
+        }
+        self.status_only_index_configs = try retained.toOwnedSlice(self.alloc);
+        try self.refreshGeneratedEnrichmentTargetCache();
     }
 
     pub fn loadNoBackfill(self: *IndexManager, store: anytype) !void {

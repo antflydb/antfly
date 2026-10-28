@@ -160,3 +160,94 @@ test "dependencies retain nested patterns, unions, procedures and write cohorts"
         if (case.count) |count| try std.testing.expectEqual(count, found.?.len) else try std.testing.expect(found == null);
     }
 }
+
+/// Physical adjacency dependencies. Null deliberately keeps every projection
+/// for writes/procedures whose storage dependencies cannot be proved here.
+/// Primary rows, scalar layouts, catalog and policy fences are always retained.
+pub fn indexesForTable(a: std.mem.Allocator, query: ast.Query, graph: catalog.Graph, table: []const u8) !?[]const []const u8 {
+    const Demand = struct {
+        a: std.mem.Allocator,
+        graph: catalog.Graph,
+        table: []const u8,
+        names: std.StringHashMapUnmanaged(void) = .empty,
+        full: bool = false,
+        fn walk(self: *@This(), value: anytype) anyerror!void {
+            const T = @TypeOf(value);
+            if (T == ast.Clause) switch (value.operation) {
+                .match, .project, .unwind, .subquery => {},
+                else => self.full = true,
+            };
+            if (T == ast.Edge) {
+                for (self.graph.relationships) |mapping| {
+                    if (!std.mem.eql(u8, self.graph.label(mapping.source_label).?.table, self.table)) continue;
+                    const matches = value.types.len == 0 or for (value.types) |name| {
+                        if (std.mem.eql(u8, name, mapping.name)) break true;
+                    } else false;
+                    if (matches) try self.names.put(self.a, mapping.index, {});
+                }
+            }
+            switch (@typeInfo(T)) {
+                .pointer => |p| {
+                    if (p.size == .one) try self.walk(value.*);
+                    if (p.size == .slice and p.child != u8) for (value) |item| try self.walk(item);
+                },
+                .@"struct" => |fields| inline for (fields.field_names) |name| try self.walk(@field(value, name)),
+                .@"union" => switch (value) {
+                    inline else => |payload| try self.walk(payload),
+                },
+                .optional => if (value) |item| {
+                    try self.walk(item);
+                },
+                else => {},
+            }
+        }
+    };
+    var demand: Demand = .{ .a = a, .graph = graph, .table = table };
+    defer demand.names.deinit(a);
+    try demand.walk(query);
+    if (demand.full) return null;
+    const names = try a.alloc([]const u8, demand.names.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| a.free(name);
+        a.free(names);
+    }
+    var keys = demand.names.keyIterator();
+    for (names) |*name| {
+        name.* = try a.dupe(u8, keys.next().?.*);
+        initialized += 1;
+    }
+    std.mem.sort([]const u8, names, {}, struct {
+        fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.less);
+    return names;
+}
+
+test "physical dependencies retain nested and wildcard edges and fail broad for procedures and writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{ .{ .name = "A", .table = "a" }, .{ .name = "B", .table = "b" } }, .relationships = &.{ .{ .name = "R", .index = "r", .source_label = "A", .target_label = "B", .stored_type = "r" }, .{ .name = "S", .index = "s", .source_label = "B", .target_label = "A", .stored_type = "s" } } };
+    const Case = struct { query: []const u8, a_count: ?usize, b_count: ?usize };
+    for ([_]Case{
+        .{ .query = "MATCH(n:A) RETURN n", .a_count = 0, .b_count = 0 },
+        .{ .query = "MATCH(n:A)-[:R]->(m:B) RETURN m", .a_count = 1, .b_count = 0 },
+        .{ .query = "MATCH(n:A)<-[:R]-(m:B) RETURN m", .a_count = 1, .b_count = 0 },
+        .{ .query = "MATCH(n)-[]-(m) RETURN n", .a_count = 1, .b_count = 1 },
+        .{ .query = "MATCH(n:A) RETURN EXISTS { MATCH(m:B)-[:S]->(x:A) RETURN x }", .a_count = 0, .b_count = 1 },
+        .{ .query = "MATCH(n:A)-[:R]->(m:B) RETURN n UNION MATCH(n:B)-[:S]->(m:A) RETURN n", .a_count = 1, .b_count = 1 },
+        .{ .query = "CALL antfly.search($table,{query:'x'}) YIELD node RETURN node", .a_count = null, .b_count = null },
+        .{ .query = "MATCH(n:A) SET n.x=1 RETURN n", .a_count = null, .b_count = null },
+        .{ .query = "MATCH(n:A) DETACH DELETE n", .a_count = null, .b_count = null },
+    }) |case| {
+        var diagnostic: @import("compiler.zig").Diagnostic = .{};
+        var compiled = try @import("compiler.zig").compile(a, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const left = try indexesForTable(a, compiled.query, graph, "a");
+        const right = try indexesForTable(a, compiled.query, graph, "b");
+        try std.testing.expectEqual(case.a_count, if (left) |names| names.len else null);
+        try std.testing.expectEqual(case.b_count, if (right) |names| names.len else null);
+    }
+}

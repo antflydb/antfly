@@ -95,6 +95,12 @@ pub fn validateWithSourceProof(a: A, io: std.Io, root: []const u8, request: Requ
     defer parsed.deinit();
     const manifest = parsed.value;
     if (manifest.version != 1 or !manifest.namespace.eql(namespace) or manifest.request.table_id != request.table_id or manifest.request.expires_ms != request.expires_ms or !std.mem.eql(u8, manifest.request.id, request.id)) return error.CatalogGenerationChanged;
+    if ((manifest.request.indexes == null) != (request.indexes == null)) return error.CatalogGenerationChanged;
+    if (request.indexes) |expected| {
+        const actual = manifest.request.indexes.?;
+        if (expected.len != actual.len) return error.CatalogGenerationChanged;
+        for (expected, actual) |lhs, rhs| if (!std.mem.eql(u8, lhs, rhs)) return error.CatalogGenerationChanged;
+    }
     if (manifest.files.len > seal.max_files) return error.CatalogGenerationChanged;
     for (manifest.files) |file| {
         try cancellation.check();
