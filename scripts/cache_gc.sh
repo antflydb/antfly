@@ -31,12 +31,19 @@
 # Zig and Rust dirs are removed when idle for GC_MAX_AGE_DAYS (default 3) or
 # larger than GC_MAX_GB (default 20). Anything written in the last
 # GC_ACTIVE_MINUTES (default 30) is assumed to belong to a running build and
-# is skipped.
+# is skipped. Native compiler/build-driver activity also skips this run entirely;
+# a long optimization pass can leave all cache directory mtimes unchanged.
 #
 # Usage: scripts/cache_gc.sh            (or: make gc)
 #        DRY_RUN=1 scripts/cache_gc.sh  (or: make gc DRY_RUN=1)
 
 set -uo pipefail
+
+source "$(dirname "$0")/cache_gc_activity.sh"
+if native_builds_active; then
+    echo "Native build active or process inspection unavailable; skipping cache cleanup."
+    exit 0
+fi
 
 DRY_RUN="${DRY_RUN:-0}"
 GC_MAX_AGE_DAYS="${GC_MAX_AGE_DAYS:-3}"

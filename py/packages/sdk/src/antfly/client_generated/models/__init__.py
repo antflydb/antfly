@@ -296,12 +296,18 @@ from .decision_evidence_image_type import DecisionEvidenceImageType
 from .decision_evidence_message import DecisionEvidenceMessage
 from .decision_evidence_message_role import DecisionEvidenceMessageRole
 from .decision_evidence_message_type import DecisionEvidenceMessageType
+from .decision_evidence_table_image import DecisionEvidenceTableImage
+from .decision_evidence_table_image_detail import DecisionEvidenceTableImageDetail
+from .decision_evidence_table_image_type import DecisionEvidenceTableImageType
 from .decision_evidence_text import DecisionEvidenceText
 from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
 from .decision_similarity import DecisionSimilarity
+from .decision_table_source import DecisionTableSource
+from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
+from .decision_table_source_mime_type import DecisionTableSourceMimeType
 from .decision_usage import DecisionUsage
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
 from .dense_native_storage_phase import DenseNativeStoragePhase
@@ -1941,6 +1947,10 @@ from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
 from .prepare_native_kv_checkpoint_x_antfly_kv_encoding import PrepareNativeKvCheckpointXAntflyKVEncoding
 from .prior_artifact_context import PriorArtifactContext
+from .projection_expression import ProjectionExpression
+from .projection_expression_case_item import ProjectionExpressionCaseItem
+from .projection_expression_cast import ProjectionExpressionCast
+from .projection_expression_cast_type import ProjectionExpressionCastType
 from .prompt_cache_config import PromptCacheConfig
 from .prompt_cache_config_mode import PromptCacheConfigMode
 from .provenance_decision import ProvenanceDecision
@@ -2040,7 +2050,9 @@ from .query_request import QueryRequest
 from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
 from .query_request_foreign_sources import QueryRequestForeignSources
+from .query_request_params import QueryRequestParams
 from .query_request_query import QueryRequestQuery
+from .query_request_select import QueryRequestSelect
 from .query_responses import QueryResponses
 from .query_result import QueryResult
 from .query_result_base import QueryResultBase
@@ -2788,12 +2800,18 @@ __all__ = (
     "DecisionEvidenceMessage",
     "DecisionEvidenceMessageRole",
     "DecisionEvidenceMessageType",
+    "DecisionEvidenceTableImage",
+    "DecisionEvidenceTableImageDetail",
+    "DecisionEvidenceTableImageType",
     "DecisionEvidenceText",
     "DecisionEvidenceTextType",
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
     "DecisionSimilarity",
+    "DecisionTableSource",
+    "DecisionTableSourceFilterQuery",
+    "DecisionTableSourceMimeType",
     "DecisionUsage",
     "DeleteArtifactEnrichmentResponse201",
     "DenseNativeStoragePhase",
@@ -4211,6 +4229,10 @@ __all__ = (
     "PrefixQuery",
     "PrepareNativeKvCheckpointXAntflyKVEncoding",
     "PriorArtifactContext",
+    "ProjectionExpression",
+    "ProjectionExpressionCaseItem",
+    "ProjectionExpressionCast",
+    "ProjectionExpressionCastType",
     "PromptCacheConfig",
     "PromptCacheConfigMode",
     "ProvenanceDecision",
@@ -4308,7 +4330,9 @@ __all__ = (
     "QueryRequestAggregations",
     "QueryRequestEmbeddings",
     "QueryRequestForeignSources",
+    "QueryRequestParams",
     "QueryRequestQuery",
+    "QueryRequestSelect",
     "QueryResponses",
     "QueryResult",
     "QueryResultBase",

@@ -51,7 +51,9 @@ if TYPE_CHECKING:
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
+    from ..models.query_request_params import QueryRequestParams
     from ..models.query_request_query import QueryRequestQuery
+    from ..models.query_request_select import QueryRequestSelect
     from ..models.query_string_query import QueryStringQuery
     from ..models.read_requirements import ReadRequirements
     from ..models.regexp_query import RegexpQuery
@@ -227,6 +229,13 @@ class StatefulQueryRequest:
                 When omitted, Antfly uses the balanced default effort (`0.5`) unless
                 lower-level vector search overrides are provided internally.
                  Default: 0.5. Example: 0.5.
+            select (QueryRequestSelect | Unset): Pure named output expressions evaluated after final filtering, ranking and
+                pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar
+                engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with
+                evaluate.compute are rejected. Does not change hit membership or paging.
+            params (QueryRequestParams | Unset): Request-local values bound by select expressions through param. Parameters
+                are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and
+                1024 named parameters.
             fields (list[str] | Unset): List of fields to include in the results. If not specified, all fields are returned.
                 Use to reduce response size and improve performance. This field is required when
                 hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
@@ -522,6 +531,8 @@ class StatefulQueryRequest:
     aggregations: QueryRequestAggregations | Unset = UNSET
     embeddings: QueryRequestEmbeddings | Unset = UNSET
     search_effort: float | Unset = 0.5
+    select: QueryRequestSelect | Unset = UNSET
+    params: QueryRequestParams | Unset = UNSET
     fields: list[str] | Unset = UNSET
     hierarchy: QueryHierarchy | Unset = UNSET
     highlight: QueryHighlight | Unset = UNSET
@@ -825,6 +836,14 @@ class StatefulQueryRequest:
 
         search_effort = self.search_effort
 
+        select: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.select, Unset):
+            select = self.select.to_dict()
+
+        params: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.params, Unset):
+            params = self.params.to_dict()
+
         fields: list[str] | Unset = UNSET
         if not isinstance(self.fields, Unset):
             fields = self.fields
@@ -951,6 +970,10 @@ class StatefulQueryRequest:
             field_dict["embeddings"] = embeddings
         if search_effort is not UNSET:
             field_dict["search_effort"] = search_effort
+        if select is not UNSET:
+            field_dict["select"] = select
+        if params is not UNSET:
+            field_dict["params"] = params
         if fields is not UNSET:
             field_dict["fields"] = fields
         if hierarchy is not UNSET:
@@ -1047,7 +1070,9 @@ class StatefulQueryRequest:
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
+        from ..models.query_request_params import QueryRequestParams
         from ..models.query_request_query import QueryRequestQuery
+        from ..models.query_request_select import QueryRequestSelect
         from ..models.query_string_query import QueryStringQuery
         from ..models.read_requirements import ReadRequirements
         from ..models.regexp_query import RegexpQuery
@@ -1982,6 +2007,20 @@ class StatefulQueryRequest:
 
         search_effort = d.pop("search_effort", UNSET)
 
+        _select = d.pop("select", UNSET)
+        select: QueryRequestSelect | Unset
+        if isinstance(_select, Unset):
+            select = UNSET
+        else:
+            select = QueryRequestSelect.from_dict(_select)
+
+        _params = d.pop("params", UNSET)
+        params: QueryRequestParams | Unset
+        if isinstance(_params, Unset):
+            params = UNSET
+        else:
+            params = QueryRequestParams.from_dict(_params)
+
         fields = cast(list[str], d.pop("fields", UNSET))
 
         _hierarchy = d.pop("hierarchy", UNSET)
@@ -2123,6 +2162,8 @@ class StatefulQueryRequest:
             aggregations=aggregations,
             embeddings=embeddings,
             search_effort=search_effort,
+            select=select,
+            params=params,
             fields=fields,
             hierarchy=hierarchy,
             highlight=highlight,

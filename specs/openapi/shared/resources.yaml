@@ -226,4 +226,3 @@ components:
             Request count zero disables only the request-count gate. An explicit
             max_work_units remains authoritative. Excess work is rejected with
             503 and Retry-After; it is not queued.
-

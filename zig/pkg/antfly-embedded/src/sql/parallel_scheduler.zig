@@ -23,6 +23,7 @@ const A = std.mem.Allocator;
 pub const LockedAllocator = struct {
     backing: A,
     mutex: std.atomic.Mutex = .unlocked,
+    shared_mutex: ?*std.atomic.Mutex = null,
     /// Immutable parent identity for admission through this synchronizing wrapper.
     pub fn parentAllocator(a: std.mem.Allocator) ?std.mem.Allocator {
         if (a.vtable.alloc != allocate) return null;
@@ -32,30 +33,33 @@ pub const LockedAllocator = struct {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
     }
     fn lock(self: *LockedAllocator) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        while (!(self.shared_mutex orelse &self.mutex).tryLock()) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *LockedAllocator) void {
+        (self.shared_mutex orelse &self.mutex).unlock();
     }
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.backing.rawAlloc(len, alignment, ra);
     }
     fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.backing.rawResize(bytes, alignment, len, ra);
     }
     fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.backing.rawRemap(bytes, alignment, len, ra);
     }
     fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         self.backing.rawFree(bytes, alignment, ra);
     }
 };
@@ -654,4 +658,38 @@ test "SQL publication IO phases release CPU retain memory and fence canceled res
     try first.enter(io);
     try std.testing.expectError(error.ConcurrencyUnavailable, first.beginIo(io, 3));
     try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+}
+
+test "SQL shared allocator lock protects overlapping parent and child regions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var child: LockedAllocator = .{ .backing = arena.allocator() };
+    var parent: LockedAllocator = .{ .backing = arena.allocator(), .shared_mutex = &child.mutex };
+    var go: std.Io.Event = .unset;
+    var child_values: [64][]u8 = undefined;
+    var parent_values: [64][]u8 = undefined;
+    const Worker = struct {
+        fn run(io: std.Io, gate: *std.Io.Event, a: std.mem.Allocator, output: *[64][]u8) anyerror!void {
+            try gate.wait(io);
+            for (output) |*value| {
+                value.* = try a.alloc(u8, 2048);
+                @memset(value.*, 0xaa);
+            }
+        }
+    };
+    const io = std.testing.io;
+    var future: ?std.Io.Future(anyerror!void) = try io.concurrent(Worker.run, .{ io, &go, child.allocator(), &child_values });
+    defer if (future) |*active| {
+        active.cancel(io) catch {};
+    };
+    go.set(io);
+    for (&parent_values) |*value| {
+        value.* = try parent.allocator().alloc(u8, 2048);
+        @memset(value.*, 0xbb);
+    }
+    const result = future.?.await(io);
+    future = null;
+    try result;
+    for (child_values) |value| for (value) |byte| try std.testing.expectEqual(@as(u8, 0xaa), byte);
+    for (parent_values) |value| for (value) |byte| try std.testing.expectEqual(@as(u8, 0xbb), byte);
 }

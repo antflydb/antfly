@@ -197,7 +197,10 @@ Antfly appends `_id` as the deterministic tie-breaker. Continue with the returne
 `search_after`. The opaque hierarchy position is bound
 to the complete source hierarchy revision (all unit artifacts, generations, ordered unit keys, and unit fingerprints),
 so Antfly rejects a cursor after any participating artifact changes instead of mixing units from different revisions.
-The public API reports that case as `409` with `error: "hierarchy_cursor_stale"` and
+Traversal uses this source-revision cursor directly on both directory and Lite storage; it does not create a retained
+whole-table snapshot. Pass `_sort` as `search_after` without adding `remote_snapshot`. Ordinary sorted-search pagination
+continues to require the retained snapshot token returned by its first page. Authorization is checked on every traversal request.
+The public API reports a changed source revision as `409` with `error: "hierarchy_cursor_stale"` and
 `action: "restart_hierarchy_traversal"`. Restart the request without `search_after`; retrying the same cursor cannot succeed.
 
 The legacy hierarchy controls remain accepted for existing callers, but they cannot be mixed with `group_by` or
