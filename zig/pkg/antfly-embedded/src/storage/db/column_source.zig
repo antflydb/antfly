@@ -28,8 +28,11 @@ pub const Page = struct {
     len: usize,
     selection: ?[]const usize = null,
     owner: ?rows.ColumnOwner = null,
+    native_leases: std.ArrayListUnmanaged(rows.ColumnOwner) = .empty,
     pub fn retainedBytes(self: *const Page) usize {
-        return @sizeOf(Page) +| self.arena.queryCapacity() +| (if (self.owner) |owner| owner.retained_bytes else 0);
+        var total = @sizeOf(Page) +| self.arena.queryCapacity() +| (if (self.owner) |owner| owner.retained_bytes else 0);
+        for (self.native_leases.items) |lease| total +|= lease.retained_bytes;
+        return total;
     }
     pub fn retain(self: *Page) void {
         _ = self.refs.fetchAdd(1, .monotonic);
@@ -38,6 +41,8 @@ pub const Page = struct {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const a = self.a;
         if (self.owner) |owner| owner.release();
+        for (self.native_leases.items) |lease| lease.release();
+        self.native_leases.deinit(a);
         self.arena.deinit();
         a.destroy(self);
     }
@@ -45,6 +50,78 @@ pub const Page = struct {
         std.debug.assert(index < self.len);
         self.retain();
         return .{ .page = self, .index = if (self.selection) |selection| selection[index] else index };
+    }
+    const NativeCells = struct {
+        values: []std.json.Value,
+        fn read(raw: *const anyopaque, index: usize) !std.json.Value {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (index >= self.values.len) return error.RowSourceColumnLengthMismatch;
+            return self.values[index];
+        }
+    };
+    /// Build result vectors over retained native payloads. Containers decode in
+    /// this page's arena; scalar strings borrow an explicit chunk/page lease.
+    pub fn native(a: A, names: []const []const u8, count: usize) !*Page {
+        const self = try a.create(Page);
+        self.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = count };
+        errdefer self.release();
+        const pa = self.arena.allocator();
+        const columns = try pa.alloc(rows.ColumnVector, names.len);
+        for (columns, names) |*column, name| {
+            const cells = try pa.create(NativeCells);
+            cells.values = try pa.alloc(std.json.Value, count);
+            @memset(cells.values, .null);
+            column.* = .{ .name = try pa.dupe(u8, name), .values = .{ .encoded = .{ .ptr = cells, .begin = 0, .count = count, .kind = .json, .read = NativeCells.read } } };
+        }
+        self.columns = columns;
+        return self;
+    }
+    pub fn setNative(self: *Page, row_index: usize, column_index: usize, value: std.json.Value) void {
+        const cells: *NativeCells = @ptrCast(@alignCast(@constCast(self.columns[column_index].values.encoded.ptr)));
+        cells.values[row_index] = value;
+    }
+    /// Consumes a lease even on allocation failure. No source reader, request
+    /// context, or artifact pin is retained: only authenticated decoded bytes.
+    pub fn adoptNativeLease(self: *Page, lease: rows.ColumnOwner) !void {
+        errdefer lease.release();
+        for (self.native_leases.items) |prior| if (prior.ptr == lease.ptr) {
+            lease.release();
+            return;
+        };
+        try self.native_leases.append(self.a, lease);
+    }
+    pub fn finishNative(self: *Page) !void {
+        const pa = self.arena.allocator();
+        for (@constCast(self.columns)) |*column| {
+            const cells: *const NativeCells = @ptrCast(@alignCast(column.values.encoded.ptr));
+            var tag: ?std.meta.Tag(std.json.Value) = null;
+            var uniform = true;
+            const nulls = try pa.alloc(u8, self.len);
+            for (cells.values, nulls) |value, *flag| {
+                flag.* = @intFromBool(value == .null);
+                if (value == .null) continue;
+                if (tag) |prior| {
+                    if (prior != std.meta.activeTag(value)) uniform = false;
+                } else tag = std.meta.activeTag(value);
+            }
+            column.nulls = .{ .bytes = nulls };
+            if (!uniform or tag == null) continue;
+            switch (tag.?) {
+                inline .integer, .float, .bool, .string => |kind| {
+                    const T = @FieldType(std.json.Value, @tagName(kind));
+                    const values = try pa.alloc(T, self.len);
+                    for (cells.values, values) |value, *out| out.* = if (value == .null) (if (kind == .string) "" else if (kind == .bool) false else 0) else @field(value, @tagName(kind));
+                    column.values = @unionInit(rows.ColumnValues, switch (kind) {
+                        .integer => "i64",
+                        .float => "f64",
+                        .string => "bytes",
+                        .bool => "bool",
+                        else => unreachable,
+                    }, values);
+                },
+                else => {},
+            }
+        }
     }
     /// Copy only selected vector slots before the provider advances. Dictionary
     /// entries are gathered once per page, preserving shared string storage.
@@ -227,7 +304,11 @@ pub const Page = struct {
             for (selection, nulls) |index, *flag| flag.* = @intFromBool(column.nulls.isNull(index));
             out.nulls = .{ .bytes = nulls };
             out.values = switch (column.values) {
-                .encoded => return error.UnsupportedSqlExecution,
+                .encoded => |values| blk: {
+                    const gathered = try pa.alloc([]const u8, selection.len);
+                    for (selection, gathered, nulls) |index, *value, flag| value.* = if (flag != 0) "null" else try std.json.Stringify.valueAlloc(pa, try values.at(index), .{});
+                    break :blk .{ .json = gathered };
+                },
                 .decimal128 => |values| blk: {
                     var result = values;
                     const gathered = try pa.alloc(i128, selection.len);

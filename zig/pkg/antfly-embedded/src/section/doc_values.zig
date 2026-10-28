@@ -436,6 +436,43 @@ pub const DocValuesReader = struct {
 /// the next get; no field payload is retained in the shared segment cache.
 pub const Cursor = struct {
     const Record = struct { doc: u32, offset: usize, len: u32 };
+    /// A cursor and result pages may share one immutable decoded chunk. Moving
+    /// the cursor drops its reference; outstanding rows keep payloads valid.
+    const Shared = struct {
+        a: Allocator,
+        refs: std.atomic.Value(usize) = .init(1),
+        bytes: []u8,
+        records: std.ArrayListUnmanaged(Record),
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const a = self.a;
+            a.free(self.bytes);
+            self.records.deinit(a);
+            a.destroy(self);
+        }
+    };
+    pub fn retainChunk(self: *Cursor) !@import("../storage/rowsource/types.zig").ColumnOwner {
+        if (self.chunk == null) return error.InvalidData;
+        const shared = self.shared orelse create: {
+            const value = try self.reader.alloc.create(Shared);
+            value.* = .{ .a = self.reader.alloc, .bytes = self.bytes, .records = self.records };
+            self.shared = value;
+            break :create value;
+        };
+        _ = shared.refs.fetchAdd(1, .monotonic);
+        return .{ .ptr = shared, .release_fn = Shared.release, .retained_bytes = @sizeOf(Shared) + shared.bytes.len + shared.records.capacity * @sizeOf(Record) };
+    }
+    fn retireChunk(self: *Cursor) void {
+        if (self.shared) |shared| {
+            Shared.release(shared);
+            self.records = .empty;
+            self.shared = null;
+        } else self.reader.alloc.free(self.bytes);
+        self.bytes = &.{};
+        self.chunk = null;
+        self.records.clearRetainingCapacity();
+    }
     reader: DocValuesReader,
     chunk: ?u32 = null,
     bytes: []u8 = &.{},
@@ -443,11 +480,12 @@ pub const Cursor = struct {
     first: u32 = 0,
     last: u32 = 0,
     decode_count: usize = 0,
+    shared: ?*Shared = null,
     pub fn init(reader: DocValuesReader) Cursor {
         return .{ .reader = reader };
     }
     pub fn deinit(self: *Cursor) void {
-        self.reader.alloc.free(self.bytes);
+        self.retireChunk();
         self.records.deinit(self.reader.alloc);
         self.reader.deinit();
     }
@@ -514,10 +552,7 @@ pub const Cursor = struct {
     }
     fn load(self: *Cursor, index: u32) !void {
         if (self.chunk == index) return;
-        self.reader.alloc.free(self.bytes);
-        self.bytes = &.{};
-        self.chunk = null;
-        self.records.clearRetainingCapacity();
+        self.retireChunk();
         self.bytes = try self.reader.decodeChunk(index);
         self.decode_count += 1;
         if (self.bytes.len < 4) return error.InvalidData;

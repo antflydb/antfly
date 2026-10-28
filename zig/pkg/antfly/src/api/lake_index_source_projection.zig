@@ -45,7 +45,7 @@ pub fn appendStored(a: A, snapshot: *const local.index.IndexSnapshot, doc: u32, 
 /// One scope per result batch, not per hit or server. Reuses decompression for
 /// nearby/interleaved ranked hits without retaining unbounded decoded bodies.
 pub const Hydrator = struct {
-    const Cursor = @import("antfly_local_sources").section_doc_values.Cursor;
+    const Cursor = @import("antfly_local_sources").section_source_column.Cursor;
     const Column = struct { reader: *const local.segment.SegmentReader, name: []u8, cursor: Cursor, used: u64 };
     blocks: local.index.IndexSnapshot.StoredDocBlockCache,
     columns: [4]?Column = @splat(null),
@@ -108,6 +108,9 @@ pub const Hydrator = struct {
         document: *const fn (*anyopaque, usize) u32,
         key: *const fn (*anyopaque, A, usize) anyerror![]const u8,
         checkpoint: ?*const fn (*anyopaque) anyerror!void = null,
+        fn checkToken(raw: *const anyopaque) !void {
+            try @as(*const Input, @ptrCast(@alignCast(raw))).check();
+        }
         fn check(self: Input) !void {
             if (self.checkpoint) |call| try call(self.ptr);
         }
@@ -152,8 +155,11 @@ pub const Hydrator = struct {
     pub const Visitor = struct {
         ptr: *anyopaque,
         accept: *const fn (*anyopaque, A, usize, []const u8, std.json.Value) anyerror!void,
+        text: ?*const fn (*anyopaque, A, usize, []const u8, local.section_source_column.Text) anyerror!bool = null,
+        retain: ?*const fn (*anyopaque, local.storage_rowsource_types.ColumnOwner) anyerror!void = null,
+        decode_allocator: ?A = null,
         fn stored(self: Visitor, a: A, i: usize, data: []const u8, fields: []const []const u8) !void {
-            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{});
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, self.decode_allocator orelse a, data, .{ .allocate = .alloc_always });
             if (parsed != .object) return error.InvalidNativeLakeTextCorpus;
             for (fields) |field| try self.accept(self.ptr, a, i, field, local.api_json_helpers.extractJsonPathValue(parsed, field) orelse return error.InvalidNativeLakeTextCorpus);
         }
@@ -209,13 +215,24 @@ pub const Hydrator = struct {
                 tail = field[dot + 1 ..];
                 cursor = try self.column(&segment.reader, field[0..dot]);
             };
+            if (cursor) |value| value.control = .{ .ptr = &input, .check_fn = Input.checkToken };
+            defer if (cursor) |value| {
+                value.control = .none;
+            };
+            if (tail == null) if (visitor.text) |consume| if (cursor) |value| if (try value.text(resolved.local_id)) |text| {
+                if (try consume(visitor.ptr, row.allocator(), i, field, text)) {
+                    self.column_values += 1;
+                    continue;
+                }
+            };
             const previous_chunk = if (cursor) |value| value.chunk else null;
             if (if (cursor) |value| try value.get(resolved.local_id) else null) |encoded| {
                 if (cursor) |value| if (value.chunk != previous_chunk) {
                     const base = entry.doc - resolved.local_id;
                     _ = value.prefetchSelected(sorted_docs[at + 1 ..], base, base + segment.reader.doc_count);
                 };
-                const root = try local.storage_typed_json.decodeBinary(row.allocator(), encoded);
+                if (visitor.retain) |retain| try retain(visitor.ptr, try cursor.?.directory.retainChunk());
+                const root = if (visitor.retain != null) try local.storage_typed_json.decodeBinaryBorrowed(visitor.decode_allocator orelse row.allocator(), encoded) else try local.storage_typed_json.decodeBinary(row.allocator(), encoded);
                 const value = if (tail) |suffix| local.api_json_helpers.extractJsonPathValue(root, suffix) orelse return error.InvalidNativeLakeTextCorpus else root;
                 try visitor.accept(visitor.ptr, row.allocator(), i, field, value);
                 self.column_values += 1;
@@ -225,6 +242,38 @@ pub const Hydrator = struct {
                 try visitor.stored(row.allocator(), i, stored.data, &.{field});
             }
         };
+    }
+    /// Result vectors retain decoded chunk leases. Large text pages decode
+    /// directly into the result page, avoiding AJV1 and JSON ownership copies.
+    pub fn columnRows(self: *Hydrator, a: A, snapshot: *const local.index.IndexSnapshot, input: Input, fields: []const []const u8) !*local.storage_db_column_source.Page {
+        const Page = local.storage_db_column_source.Page;
+        const page = try Page.native(a, fields, input.len);
+        errdefer page.release();
+        const Output = struct {
+            page: *Page,
+            input: Input,
+            fn index(output: *@This(), name: []const u8) !usize {
+                for (output.page.columns, 0..) |vector, i| if (std.mem.eql(u8, name, vector.name)) return i;
+                return error.InvalidNativeLakeTextCorpus;
+            }
+            fn accept(raw: *anyopaque, _: A, row: usize, name: []const u8, value: std.json.Value) !void {
+                const output: *@This() = @ptrCast(@alignCast(raw));
+                output.page.setNative(row, try output.index(name), value);
+            }
+            fn retain(raw: *anyopaque, lease: local.storage_rowsource_types.ColumnOwner) !void {
+                try @as(*@This(), @ptrCast(@alignCast(raw))).page.adoptNativeLease(lease);
+            }
+            fn text(raw: *anyopaque, _: A, row: usize, name: []const u8, value: local.section_source_column.Text) !bool {
+                const output: *@This() = @ptrCast(@alignCast(raw));
+                const bytes = try value.read(output.page.arena.allocator(), 0, value.length, .{ .ptr = &output.input, .check_fn = Input.checkToken });
+                output.page.setNative(row, try output.index(name), .{ .string = bytes });
+                return true;
+            }
+        };
+        var output: Output = .{ .page = page, .input = input };
+        try self.visitRows(a, snapshot, input, fields, .{ .ptr = &output, .accept = Output.accept, .text = Output.text, .retain = Output.retain, .decode_allocator = page.arena.allocator() });
+        try page.finishNative();
+        return page;
     }
     pub fn append(self: *Hydrator, a: A, snapshot: *const local.index.IndexSnapshot, doc: u32, expected_key: []const u8, fields: []const []const u8, target: *std.json.Value) !void {
         var targets = [_]?std.json.Value{target.*};
@@ -551,4 +600,70 @@ test "external lake bounded window profiles field-major returned rows reuse chun
     try std.testing.expectError(error.Timeout, Run.run(a, writer.snapshot(), &canceled, false));
     var wrong: Rows = .{ .docs = ordinals[0..3], .keys = keys[0..3], .wrong = true };
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, Run.run(a, writer.snapshot(), &wrong, false));
+}
+
+test "external lake bounded window profiles native result vectors outlive cursor eviction and own allocation failures" {
+    const a = std.testing.allocator;
+    var data = std.heap.ArenaAllocator.init(a);
+    defer data.deinit();
+    const da = data.allocator();
+    var value: std.json.ObjectMap = .empty;
+    for ([_][]const u8{ "one", "two", "three", "four", "five", "six" }) |name| try value.put(da, name, .{ .string = name });
+    try value.put(da, "integer", .{ .integer = 9007199254740993 });
+    try value.put(da, "float", .{ .float = 1.25 });
+    try value.put(da, "bool", .{ .bool = true });
+    var nested: std.json.ObjectMap = .empty;
+    try nested.put(da, "text", .{ .string = "borrowed nested string" });
+    try value.put(da, "nested", .{ .object = nested });
+    const large = try da.alloc(u8, 128 * 1024);
+    @memset(large, 'x');
+    try value.put(da, "large", .{ .string = large });
+    const root: std.json.Value = .{ .object = value };
+    const docs = [_]local.introducer.TextDocument{.{ .id = "row", .stored_data = try std.json.Stringify.valueAlloc(da, root, .{}), .stored_source = root, .text_fields = &.{} }};
+    const bytes = try local.introducer.buildSegmentFromTextWithAnalysisOptions(a, &docs, &local.search_analysis.default_analyzer, .{}, .{ .store_source_columns = true });
+    defer a.free(bytes);
+    var writer = try local.index.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithId(1, bytes);
+    const Run = struct {
+        fn doc(_: *anyopaque, _: usize) u32 {
+            return 0;
+        }
+        fn key(_: *anyopaque, _: A, _: usize) ![]const u8 {
+            return "row";
+        }
+        fn run(alloc: A, snapshot: *const local.index.IndexSnapshot, names: []const []const u8) !void {
+            var state: u8 = 0;
+            const page = block: {
+                var hydrator = Hydrator.init(alloc);
+                defer hydrator.deinit();
+                break :block try hydrator.columnRows(alloc, snapshot, .{ .ptr = &state, .len = 1, .document = doc, .key = key }, names);
+            };
+            defer page.release();
+            try std.testing.expectEqual(@as(usize, 10), page.native_leases.items.len);
+            try std.testing.expect(page.columns[6].values == .i64);
+            const row = page.row(0);
+            defer row.deinit();
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const parsed = try row.value(&scratch);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), parsed.object.get("integer").?.integer);
+            try std.testing.expectEqualStrings("one", parsed.object.get("one").?.string);
+            try std.testing.expectEqualStrings("borrowed nested string", parsed.object.get("nested").?.object.get("text").?.string);
+            try std.testing.expectEqual(@as(usize, 128 * 1024), parsed.object.get("large").?.string.len);
+            var clone_arena = std.heap.ArenaAllocator.init(alloc);
+            defer clone_arena.deinit();
+            const cloned = try row.cloneInto(clone_arena.allocator());
+            defer cloned.deinit();
+            const clone_bytes = try std.json.Stringify.valueAlloc(alloc, cloned, .{});
+            defer alloc.free(clone_bytes);
+            const encoded = try std.json.Stringify.valueAlloc(alloc, row, .{});
+            defer alloc.free(encoded);
+            try std.testing.expectEqualStrings(encoded, clone_bytes);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "9007199254740993") != null);
+        }
+    };
+    try Run.run(a, writer.snapshot(), value.keys());
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ writer.snapshot(), value.keys() });
 }

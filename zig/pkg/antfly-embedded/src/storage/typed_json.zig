@@ -180,11 +180,21 @@ pub fn decodeBinary(a: std.mem.Allocator, bytes: []const u8) !Json {
     if (reader.at != bytes.len) return error.InvalidTypedJson;
     return value;
 }
+/// Strings and object keys borrow the authenticated encoded chunk. The caller
+/// must retain its lease until every value/container allocated in `a` is retired.
+pub fn decodeBinaryBorrowed(a: std.mem.Allocator, bytes: []const u8) !Json {
+    if (!std.mem.startsWith(u8, bytes, "AJV1")) return error.InvalidTypedJson;
+    var reader: BinaryReader = .{ .a = a, .bytes = bytes, .at = 4, .borrow_text = true };
+    const value = try reader.value(0);
+    if (reader.at != bytes.len) return error.InvalidTypedJson;
+    return value;
+}
 const BinaryReader = struct {
     a: std.mem.Allocator,
     bytes: []const u8,
     at: usize,
     remaining_values: usize = 4 * 1024 * 1024,
+    borrow_text: bool = false,
     fn take(self: *@This(), n: usize) ![]const u8 {
         if (n > self.bytes.len - self.at) return error.InvalidTypedJson;
         defer self.at += n;
@@ -195,7 +205,8 @@ const BinaryReader = struct {
     }
     fn text(self: *@This()) ![]const u8 {
         const length = try self.int(u32);
-        return self.a.dupe(u8, try self.take(length));
+        const bytes = try self.take(length);
+        return if (self.borrow_text) bytes else self.a.dupe(u8, bytes);
     }
     fn integer(self: *@This()) !i64 {
         var bits: u64 = 0;

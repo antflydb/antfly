@@ -55,6 +55,11 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
         error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy, error.LakeSnapshotReadLeaseExpired, error.LakeSnapshotRetired, error.LakeOverlayCoverageUnavailable => error.StorageReadTemporarilyUnavailable,
         error.NativeLakeTextCorpusTooLarge, error.LakeOverlayTooLarge, error.ArtifactReadBudgetExceeded => error.QueryCandidateBudgetExceeded,
         error.IndexNotFound => error.InvalidQueryRequest,
+        error.Canceled => canceled: {
+            // Recover the request deadline after a provider-only boolean adapter.
+            try request.ensureActive();
+            break :canceled error.Canceled;
+        },
         else => err,
     };
 }
@@ -247,7 +252,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer pattern_programs.deinit();
     var effective = req;
     effective.text_pattern_programs = &pattern_programs;
-    effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
+    effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled, .check_fn = Execution.highlightCheckpoint };
     const has_vectors = build_recent or effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0;
     const has_text = for (owner.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment) break true;
@@ -981,7 +986,7 @@ const Execution = struct {
     fn highlightPlan(self: *Execution, name: ?[]const u8, text: types.TextQuery) !?HighlightPlan {
         const selected = (try self.textDeclaration(name)) orelse return null;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
-        const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+        const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, token, corpus.loadDirectory);
         defer metadata.release();
         const root = metadata.value.root;
@@ -1026,7 +1031,7 @@ const Execution = struct {
         }
         const selected = (try self.textDeclaration(name)) orelse return null;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics, .lazy_lineage = self.lazy_lineage };
-        const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+        const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
         const root = metadata.value.root;
@@ -1225,6 +1230,12 @@ const Execution = struct {
                 const value: *@This() = @ptrCast(@alignCast(raw));
                 try value.execution.context.ensureActive();
             }
+            fn text(raw: *anyopaque, scratch: A, i: usize, field: []const u8, source: local.section_source_column.Text) !bool {
+                const consumer: *@This() = @ptrCast(@alignCast(raw));
+                if (consumer.skip[i]) return true;
+                try consumer.execution.context.ensureActive();
+                return consumer.prepared.appendStoredSourceField(consumer.allocator, scratch, &consumer.output[i], consumer.types[i], field, source);
+            }
             fn accept(raw: *anyopaque, scratch: A, i: usize, field: []const u8, value: std.json.Value) !void {
                 const consumer: *@This() = @ptrCast(@alignCast(raw));
                 if (consumer.skip[i]) return;
@@ -1252,7 +1263,7 @@ const Execution = struct {
         var consumer: Consumer = .{ .execution = self, .prepared = prepared, .allocator = a, .metadata = metadata.allocator(), .hits = hits, .winners = winners, .types = types_, .skip = skip, .output = output };
         var hydrator = Hydrator.init(a);
         defer hydrator.deinit();
-        try hydrator.visitRows(a, snapshot, .{ .ptr = &consumer, .len = winners.len, .document = Consumer.doc, .key = Consumer.key, .checkpoint = Consumer.check }, fields, .{ .ptr = &consumer, .accept = Consumer.accept });
+        try hydrator.visitRows(a, snapshot, .{ .ptr = &consumer, .len = winners.len, .document = Consumer.doc, .key = Consumer.key, .checkpoint = Consumer.check }, fields, .{ .ptr = &consumer, .accept = Consumer.accept, .text = Consumer.text });
         for (winners, skip, output) |winner, skipped, *item| if (!skipped) {
             hits[winner.index].highlights = try item.finish(a);
             prepared.orderFields(&hits[winner.index]);
@@ -1349,7 +1360,7 @@ const Execution = struct {
         for (hits) |hit| if (!self.delivery_locations.contains(hit.id)) return false;
         const declaration = (try self.textDeclaration(name)) orelse return false;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics, .lazy_lineage = true };
-        const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+        const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), declaration.artifact, token, corpus.loadDirectory);
         defer metadata.release();
         const root = metadata.value.root;
@@ -1430,6 +1441,39 @@ const Execution = struct {
             fields = plan.parquet;
             stored_fields = plan.sidecar;
         };
+        if (self.overlay == null and stored_fields.len != 0 and fields.?.len == 0) {
+            const started = @import("antfly_platform").time.monotonicNs();
+            defer self.server.lake_query_metrics.record(.hydration_native, started);
+            const Rows = struct {
+                owner: *Execution,
+                hits: @import("lake_text_delivery.zig").Selection,
+                fn doc(raw: *anyopaque, i: usize) u32 {
+                    return @as(*@This(), @ptrCast(@alignCast(raw))).hits.at(i).native_text_doc_id.?;
+                }
+                fn key(raw: *anyopaque, alloc: A, i: usize) ![]const u8 {
+                    const value: *@This() = @ptrCast(@alignCast(raw));
+                    return nativeKey(value.owner, alloc, value.hits.at(i).id);
+                }
+                fn check(raw: *anyopaque) !void {
+                    try @as(*@This(), @ptrCast(@alignCast(raw))).owner.context.ensureActive();
+                }
+            };
+            var rows: Rows = .{ .owner = self, .hits = hits };
+            var hydrator = projection.Hydrator.init(a);
+            defer hydrator.deinit();
+            const page = try hydrator.columnRows(a, pin.?.snapshot, .{ .ptr = &rows, .len = hits.len(), .document = Rows.doc, .key = Rows.key, .checkpoint = Rows.check }, stored_fields);
+            defer page.release();
+            for (0..hits.len()) |i| {
+                const hit = hits.at(i);
+                if (hit.stored_data) |bytes| a.free(bytes);
+                hit.stored_data = null;
+                if (hit.source_value) |*value| types.deinitJsonValue(a, value);
+                hit.source_value = null;
+                std.debug.assert(hit.column_source == null);
+                hit.column_source = page.row(i);
+            }
+            return;
+        }
         const values = if (stored_fields.len != 0 and fields.?.len == 0) empty: {
             const rows = try a.alloc(?std.json.Value, hits.len());
             @memset(rows, std.json.Value{ .object = .empty });
@@ -1525,7 +1569,7 @@ const Execution = struct {
         const self = from(raw);
         try self.resolveOverlayPhysical();
         var request = self.request;
-        request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+        request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = &.{}, .primary_order = true, .after = options.primary_key_start_after, .before = options.primary_key_stop_before, .limit = 256 }, request, self.source);
         defer cursor.close(cursor.ptr);
         var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = scanCheckpoint };
@@ -2023,7 +2067,7 @@ const Execution = struct {
         } else return null;
         try self.bindIndex(selected.name);
         var cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
-        const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+        const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
         const root = metadata.value.root;
@@ -3635,7 +3679,7 @@ const Execution = struct {
                     break :all all_fields;
                 };
                 var request = self.request;
-                request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+                request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
                 const covered = @import("lake_index_sql_rows.zig").gatherCovering(a, self.server, self.table, self.source, request, .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context }, refs, fields) catch |err| switch (err) {
                     error.SqlMemoryLimitExceeded, error.ArtifactReadBudgetExceeded => null,
                     else => return err,

@@ -21862,9 +21862,14 @@ fn appendHighlightFragments(
     max_fragments: u32,
     fragment_size: u32,
     control: highlight_mod.Control,
+    program: *const highlight_mod.Program,
+    cache: *highlight_mod.AnalysisCache,
 ) !void {
-    const found = try highlight_mod.highlightMatchersWithScratch(alloc, scratch, text, matchers, analyzer, max_fragments, fragment_size, control);
+    const found = try highlight_mod.highlightPrepared(alloc, scratch, text, matchers, program, cache, analyzer, max_fragments, fragment_size, control);
     defer highlight_mod.freeFragments(alloc, found);
+    return appendFoundHighlightFragments(alloc, fragments, found, item, source_id);
+}
+fn appendFoundHighlightFragments(alloc: Allocator, fragments: *std.ArrayListUnmanaged(PendingHighlightFragment), found: []const highlight_mod.Fragment, item: ?u32, source_id: usize) !void {
     fragment_loop: for (found) |fragment| {
         for (fragments.items) |*existing| {
             if (existing.source_id != source_id or existing.offset != fragment.offset or existing.item != item or
@@ -22057,11 +22062,15 @@ pub const PreparedHighlights = struct {
         ordinary: []const highlight_mod.Matcher,
         keyword: []const highlight_mod.Matcher,
         substring: []const highlight_mod.Matcher,
+        programs: [3]highlight_mod.Program,
+        fn program(self: *const Group, analyzer: *const analysis_mod.Analyzer) *const highlight_mod.Program {
+            return &self.programs[if (analyzer == &analysis_mod.keyword_analyzer) @as(usize, 1) else if (analyzer == &analysis_mod.substring_analyzer) @as(usize, 2) else 0];
+        }
         fn matchers(self: Group, analyzer: *const analysis_mod.Analyzer) []const highlight_mod.Matcher {
             return if (analyzer == &analysis_mod.keyword_analyzer) self.keyword else if (analyzer == &analysis_mod.substring_analyzer) self.substring else self.ordinary;
         }
     };
-    const Binding = struct { group: usize, analyzer: *const analysis_mod.Analyzer };
+    const Binding = struct { group: usize, analyzer: *const analysis_mod.Analyzer, signature: [32]u8 };
     const FieldPlan = struct { name: []const u8, bindings: std.ArrayListUnmanaged(Binding) = .empty };
     const DocumentPlan = struct {
         fields: std.ArrayListUnmanaged(FieldPlan) = .empty,
@@ -22121,7 +22130,7 @@ pub const PreparedHighlights = struct {
                 kw.* = highlightMatcherForAnalyzer(matcher, &analysis_mod.keyword_analyzer);
                 sub.* = highlightMatcherForAnalyzer(matcher, &analysis_mod.substring_analyzer);
             }
-            try groups.append(arena, .{ .query = builder.query, .field = builder.field, .ordinary = builder.matchers.items, .keyword = keyword, .substring = substring });
+            try groups.append(arena, .{ .query = builder.query, .field = builder.field, .ordinary = builder.matchers.items, .keyword = keyword, .substring = substring, .programs = .{ try highlight_mod.Program.init(arena, builder.matchers.items), try highlight_mod.Program.init(arena, keyword), try highlight_mod.Program.init(arena, substring) } });
         }
         const routing = try arena.alloc(?[]const DocumentPlan, indexed_queries.len);
         @memset(routing, null);
@@ -22141,7 +22150,7 @@ pub const PreparedHighlights = struct {
                 const seen = for (field.bindings.items) |binding| {
                     if (binding.group == group_index and binding.analyzer == route.analyzer) break true;
                 } else false;
-                if (!seen) try field.bindings.append(arena, .{ .group = group_index, .analyzer = route.analyzer });
+                if (!seen) try field.bindings.append(arena, .{ .group = group_index, .analyzer = route.analyzer, .signature = try @import("../../../section/source_column.zig").fingerprint(arena, queryTextAnalyzer(route.analyzer)) });
             };
             routing[query_index] = plans;
         };
@@ -22221,8 +22230,74 @@ pub const PreparedHighlights = struct {
         };
         std.mem.sort(types.HighlightedField, hit.highlights, paths, Order.less);
     }
+    /// Original-offset vectors are optional evidence. Require complete static
+    /// routing and every analyzer fingerprint before publishing any field output.
+    /// Unsupported mappings/patterns use the controlled full-source analyzer.
+    pub fn appendStoredSourceField(self: *const PreparedHighlights, alloc: Allocator, scratch: Allocator, output: *Accumulator, row_type: ?std.json.Value, field: []const u8, source: @import("../../../section/source_column.zig").Text) !bool {
+        try self.control.check();
+        if (self.options.fields.len != 0) {
+            var wanted = false;
+            for (self.options.fields) |path| {
+                if (std.mem.eql(u8, field, path)) wanted = true;
+                if (path.len > field.len and std.mem.startsWith(u8, path, field) and path[field.len] == '.') return false;
+            }
+            if (!wanted) return true;
+        }
+        var context: std.json.ObjectMap = .empty;
+        if (row_type) |kind| try context.put(scratch, "_type", kind);
+        const Call = struct { binding: Binding, tokens: []const analysis_mod.Token };
+        var calls: std.ArrayListUnmanaged(Call) = .empty;
+        var vectors: std.AutoHashMapUnmanaged([32]u8, @import("../../../section/source_column.zig").Text.Vector) = .empty;
+        for (self.indexed_queries, 0..) |query, qi| {
+            const relevant = for (self.groups) |group| {
+                if (group.query == qi) break true;
+            } else false;
+            if (!relevant) continue;
+            const documents = self.routing[qi] orelse return false;
+            const schema = query.runtime_schema orelse return false;
+            const index = mapper_mod.highlightDocumentIndex(schema, context) orelse return false;
+            const plan = documents[index].field(field) orelse continue;
+            for (plan.bindings.items) |binding| {
+                const matchers = self.groups[binding.group].matchers(binding.analyzer);
+                for (matchers) |matcher| switch (matcher) {
+                    .term, .prefix, .wildcard, .regexp, .fuzzy => {},
+                    else => return false,
+                };
+                const tokens = vectors.get(binding.signature) orelse load: {
+                    const value = (try source.tokens(scratch, binding.signature, self.control)) orelse return false;
+                    try vectors.put(scratch, binding.signature, value);
+                    break :load value;
+                };
+                try calls.append(scratch, .{ .binding = binding, .tokens = tokens.items });
+            }
+        }
+        var fragments: std.ArrayListUnmanaged(PendingHighlightFragment) = .empty;
+        defer fragments.deinit(alloc);
+        var transferred = false;
+        defer if (!transferred) {
+            for (fragments.items) |*fragment| freePendingHighlightFragment(alloc, fragment);
+        };
+        for (calls.items) |call| {
+            const group = &self.groups[call.binding.group];
+            const found = (try highlight_mod.highlightStored(alloc, scratch, source, call.tokens, group.matchers(call.binding.analyzer), group.program(call.binding.analyzer), @max(self.options.max_fragments, 1), @max(self.options.fragment_size, 1), self.control)) orelse return false;
+            defer highlight_mod.freeFragments(alloc, found);
+            try appendFoundHighlightFragments(alloc, &fragments, found, null, 0);
+        }
+        if (fragments.items.len != 0) {
+            try finalizeHighlightFragments(alloc, &fragments, @max(self.options.max_fragments, 1));
+            const name = try alloc.dupe(u8, field);
+            errdefer alloc.free(name);
+            const found = try alloc.alloc(types.HighlightFragment, fragments.items.len);
+            errdefer alloc.free(found);
+            for (found, fragments.items) |*out, fragment| out.* = .{ .text = fragment.text, .offset = fragment.offset, .item = fragment.item, .spans = fragment.spans };
+            try output.fields.append(alloc, .{ .field = name, .fragments = found });
+            transferred = true;
+        }
+        return true;
+    }
     fn collectValue(self: *const PreparedHighlights, alloc: Allocator, hit_arena: Allocator, highlighted: *std.ArrayListUnmanaged(types.HighlightedField), parsed: std.json.Value, source_field: ?[]const u8) !void {
         if (self.entries.len == 0) return;
+        var analyzed: highlight_mod.AnalysisCache = .{ .a = hit_arena };
         const indexed_queries = self.indexed_queries;
         const options = self.options;
         const fragment_size = @max(options.fragment_size, 1);
@@ -22283,7 +22358,7 @@ pub const PreparedHighlights = struct {
                         if (source_value.literal_dotted and !highlightUsesSchemaLessText(indexed)) continue;
                         for (field_plan.bindings.items) |binding| {
                             try self.control.check();
-                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, self.groups[binding.group].matchers(binding.analyzer), queryTextAnalyzer(binding.analyzer), max_fragments, fragment_size, self.control);
+                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, self.groups[binding.group].matchers(binding.analyzer), queryTextAnalyzer(binding.analyzer), max_fragments, fragment_size, self.control, self.groups[binding.group].program(binding.analyzer), &analyzed);
                         }
                     }
                 } else for (self.groups) |group| {
@@ -22299,7 +22374,7 @@ pub const PreparedHighlights = struct {
                             if (seen) continue;
                             try processed_analyzers.append(hit_arena, contribution.analyzer);
                             try self.control.check();
-                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, group.matchers(contribution.analyzer), queryTextAnalyzer(contribution.analyzer), max_fragments, fragment_size, self.control);
+                            try appendHighlightFragments(alloc, &fragments, hit_arena, source_value.text, source_value.item, source_id, group.matchers(contribution.analyzer), queryTextAnalyzer(contribution.analyzer), max_fragments, fragment_size, self.control, group.program(contribution.analyzer), &analyzed);
                         }
                     }
                 }

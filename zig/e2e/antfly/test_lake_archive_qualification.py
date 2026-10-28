@@ -2015,7 +2015,10 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
     spec.loader.exec_module(bench)
     count = 32
     body = "needle " * 9362
-    rows = pa.table({"id": list(range(count)), "body": [body] * count})
+    sparse_body = "sparsecase needle " + "." * (8 * 1024 * 1024)
+    rows = pa.table(
+        {"id": list(range(count + 1)), "body": [body] * count + [sparse_body]}
+    )
     root = tmp_path / "fixture"
     if source_format == "parquet":
         archive = tmp_path / "archive.parquet"
@@ -2100,6 +2103,28 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                 for restarted in (False, True):
                     if restarted:
                         server.restart()
+                    # The token vector and one source page suffice for a tiny
+                    # snippet from an 8-MiB field, even after restart with the
+                    # original Parquet objects unavailable.
+                    sparse = client.query(
+                        {
+                            "request": {
+                                "full_text_search": {
+                                    "conjuncts": [
+                                        {"match": "sparsecase", "field": "body"},
+                                        {"match": "needle", "field": "body"},
+                                    ]
+                                },
+                                "fields": ["id"],
+                                "highlight": {"fields": ["body"], "fragment_size": 100},
+                                "limit": 1,
+                                "timeout_ms": 50,
+                            }
+                        }
+                    )["hits"]["hits"]
+                    assert len(sparse) == 1
+                    assert sparse[0]["_source"] == {"id": count}
+                    assert "needle" in sparse[0]["_highlights"]["body"][0]["text"]
                     base = {
                         "full_text_search": {"match": "needle", "field": "body"},
                         "highlight": {

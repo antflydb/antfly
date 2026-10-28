@@ -1891,3 +1891,46 @@ deadlines use the existing public HTTP 504 `query_timeout` envelope and
 Internal faults retain their existing error handling. Real Parquet and Iceberg E2Es compare projected/hidden snippets after
 restart with source data unavailable, check deadline responses, and verify a
 healthy request after a timeout.
+
+### Original-offset source pages and native result leases
+
+Native stored-source recipe v5 (reader protocol 91) encodes large UTF-8 string
+fields as independent 64-KiB Snappy pages, followed by an indexed document
+metadata stream. Small values and structured values retain typed AJV1 encoding.
+The metadata includes a compact UTF-8 continuation bitmap and original source
+byte offsets for each eligible analyzer pipeline. Vectors are independently
+compressed and fetched only for the requested fingerprint; ordinary projection
+reads page navigation without fetching token payloads. The fingerprint covers the
+character filters, tokenizer, token filters and an explicit interpretation
+version; request cancellation capabilities never enter persisted configuration.
+Source bytes and offset evidence share the same authenticated segment and
+publication identity. Compaction copies compressed source pages and rebases
+section-relative offsets while preserving analyzer evidence.
+
+A highlight consumer requires complete static document-type/source routing and
+an exact pipeline fingerprint for every contributing query binding. Compatible
+term, prefix, wildcard, regexp and fuzzy clauses match persisted vectors, select
+the same density-ranked fragments, and decode only source pages overlapping
+those fragments. Unsupported mappings, expanding analyzer pipelines, arrays,
+substring/literal clauses, or unavailable vectors retain controlled source
+analysis. Returned snippets own their text; borrowed metadata and hidden field
+bodies cannot escape their cursor callback. This adds publication storage and
+build work in exchange for avoiding repeated analysis and full-field decoding.
+Build allocations remain under the existing working-set admission owner.
+
+The shared source analyzer caches tokenization by source byte identity and
+analyzer for one field/value callback. Query-owned term and prefix lookup tables
+replace scanning every exact clause for every token; other pattern semantics and
+per-query fragment selection are preserved. Byte checkpoints cover Unicode and
+whitespace tokenization, character-filter scans, lowercase conversion, English
+stemmer region scans, regexp transitions and wildcard traversal. Scoped deadline
+checks remain authoritative when a transport exposes only boolean cancellation.
+
+Fully covered native result projections create typed column pages directly.
+Small typed values borrow immutable, reference-counted decoded chunks; large
+strings decode directly into the result page's arena. Containers borrow retained
+encoded strings and allocate their structure once. Cursor advancement, cache
+replacement and hydrator teardown release their references without invalidating
+results. The existing ColumnSource encoder handles these pages without an owned
+JSON source-object copy. Mixed Parquet/native projections retain the shared
+hydration fallback. Fragment and response-size limits continue to apply.

@@ -47,6 +47,7 @@ pub const Fragment = struct {
     text: []const u8,
     offset: u32,
     highlights: []const Span,
+    owned_text: bool = false,
 };
 
 /// One way a query clause can match analyzed text. `term`, `prefix`,
@@ -81,6 +82,64 @@ pub const Matcher = union(enum) {
         pattern: []const u8,
         compiled: *regex_mod.RegexAutomaton,
     };
+};
+
+/// Query-owned lookup tables. Exact terms and prefixes do not multiply token
+/// traversal by the number of clauses; other patterns retain their semantics.
+pub const Program = struct {
+    terms: std.StringHashMapUnmanaged(void) = .empty,
+    prefixes: std.StringHashMapUnmanaged(void) = .empty,
+    lengths: std.ArrayListUnmanaged(usize) = .empty,
+    patterns: std.ArrayListUnmanaged(Matcher) = .empty,
+    pub fn init(a: Allocator, matchers: []const Matcher) !Program {
+        var self: Program = .{};
+        errdefer self.deinit(a);
+        for (matchers) |m| switch (m) {
+            .term => |v| try self.terms.put(a, v, {}),
+            .prefix => |v| {
+                try self.prefixes.put(a, v, {});
+                if (std.mem.indexOfScalar(usize, self.lengths.items, v.len) == null) try self.lengths.append(a, v.len);
+            },
+            else => try self.patterns.append(a, m),
+        };
+        std.mem.sort(usize, self.lengths.items, {}, std.sort.asc(usize));
+        return self;
+    }
+    pub fn deinit(self: *Program, a: Allocator) void {
+        self.terms.deinit(a);
+        self.prefixes.deinit(a);
+        self.lengths.deinit(a);
+        self.patterns.deinit(a);
+    }
+    fn matches(self: *const Program, text: []const u8, poller: *Poller) !bool {
+        try poller.step();
+        if (self.terms.contains(text)) return true;
+        for (self.lengths.items) |n| {
+            if (n > text.len) break;
+            try poller.step();
+            if (self.prefixes.contains(text[0..n])) return true;
+        }
+        return false;
+    }
+};
+/// A value/field-scoped region, shared across query bindings but never retained
+/// across source callbacks. Cache keys include byte identity and analyzer.
+pub const AnalysisCache = struct {
+    const Key = struct { pointer: usize, len: usize, analyzer: *const analysis_mod.Analyzer };
+    a: Allocator,
+    values: std.AutoHashMapUnmanaged(Key, []analysis_mod.Token) = .empty,
+    analyses: usize = 0,
+    fn get(self: *AnalysisCache, text: []const u8, analyzer: *const analysis_mod.Analyzer, poller: *Poller) ![]analysis_mod.Token {
+        const key: Key = .{ .pointer = @intFromPtr(text.ptr), .len = text.len, .analyzer = analyzer };
+        if (self.values.get(key)) |tokens| return tokens;
+        var checked: CheckedAllocator = .{ .backing = self.a, .poller = poller };
+        const controlled = analyzer.withControl(poller.control);
+        const tokens = controlled.analyzeWithSourceOffsets(checked.allocator(), text) catch |err| return checked.failure orelse err;
+        if (checked.failure) |err| return err;
+        try self.values.put(self.a, key, tokens);
+        self.analyses += 1;
+        return tokens;
+    }
 };
 
 /// Highlight query terms in text, returning the best fragments.
@@ -123,6 +182,9 @@ pub fn highlightMatchersControlled(alloc: Allocator, text: []const u8, matchers:
 /// their spans use the result allocator; token/window state never becomes
 /// retained result memory when the result owner is monotonic.
 pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: []const u8, matchers: []const Matcher, analyzer: *const analysis_mod.Analyzer, max_fragments: u32, fragment_size: u32, control: Control) ![]Fragment {
+    return highlightPrepared(alloc, scratch, text, matchers, null, null, analyzer, max_fragments, fragment_size, control);
+}
+pub fn highlightPrepared(alloc: Allocator, scratch: Allocator, text: []const u8, matchers: []const Matcher, program: ?*const Program, cache: ?*AnalysisCache, analyzer: *const analysis_mod.Analyzer, max_fragments: u32, fragment_size: u32, control: Control) ![]Fragment {
     var workspace = std.heap.ArenaAllocator.init(scratch);
     defer workspace.deinit();
     const temporary = workspace.allocator();
@@ -137,12 +199,13 @@ pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: 
         defer analysis_arena.deinit();
         var checked: CheckedAllocator = .{ .backing = analysis_arena.allocator(), .poller = &poller };
         const token_allocator = checked.allocator();
-        const tokens = analyzer.analyzeWithSourceOffsets(token_allocator, text) catch |err| return checked.failure orelse err;
+        const controlled = analyzer.withControl(control);
+        const tokens = if (cache) |shared| try shared.get(text, analyzer, &poller) else controlled.analyzeWithSourceOffsets(token_allocator, text) catch |err| return checked.failure orelse err;
         if (checked.failure) |err| return err;
-        defer analysis_mod.Analyzer.freeTokens(token_allocator, tokens);
+        defer if (cache == null) analysis_mod.Analyzer.freeTokens(token_allocator, tokens);
         try control.check();
 
-        try collectMatchSpans(temporary, tokens, matchers, &spans, &poller);
+        try collectProgramSpans(temporary, tokens, matchers, program, &spans, &poller);
 
         for (matchers) |matcher| {
             switch (matcher) {
@@ -172,18 +235,63 @@ pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: 
                 matcher == .substring_fuzzy or matcher == .substring_regexp;
         }
         if (has_contains or has_substring_pattern) {
-            const words = analysis_mod.substring_query_analyzer.analyze(token_allocator, text) catch |err| return checked.failure orelse err;
+            const words = if (cache) |shared| try shared.get(text, &analysis_mod.substring_query_analyzer, &poller) else analysis_mod.substring_query_analyzer.withControl(control).analyze(token_allocator, text) catch |err| return checked.failure orelse err;
             if (checked.failure) |err| return err;
-            defer analysis_mod.Analyzer.freeTokens(token_allocator, words);
+            defer if (cache == null) analysis_mod.Analyzer.freeTokens(token_allocator, words);
             if (has_contains) try collectContainsSpans(temporary, text, words, matchers, &spans, &poller);
             if (has_substring_pattern) try collectSubstringPatternSpans(temporary, words, matchers, &spans, &poller);
         }
     }
+    return selectFragments(alloc, temporary, &spans, .{ .text = text }, max_fragments, fragment_size, &poller);
+}
+const TextSource = union(enum) {
+    text: []const u8,
+    stored: @import("../section/source_column.zig").Text,
+    fn length(self: TextSource) u32 {
+        return switch (self) {
+            .text => |s| @intCast(s.len),
+            .stored => |s| s.length,
+        };
+    }
+    fn floor(self: TextSource, at: u32) u32 {
+        return switch (self) {
+            .text => |s| utf8Floor(s, at),
+            .stored => |s| s.floor(at),
+        };
+    }
+    fn ceil(self: TextSource, at: u32) u32 {
+        return switch (self) {
+            .text => |s| utf8Ceil(s, at),
+            .stored => |s| s.ceil(at),
+        };
+    }
+    fn read(self: TextSource, a: Allocator, first: u32, end: u32, control: Control) ![]const u8 {
+        return switch (self) {
+            .text => |s| s[first..end],
+            .stored => |s| try s.read(a, first, end, control),
+        };
+    }
+};
+pub fn highlightStored(a: Allocator, scratch: Allocator, source: @import("../section/source_column.zig").Text, tokens: []const analysis_mod.Token, matchers: []const Matcher, program: ?*const Program, count: u32, size: u32, control: Control) !?[]Fragment {
+    for (matchers) |matcher| switch (matcher) {
+        .term, .prefix, .wildcard, .regexp, .fuzzy => {},
+        else => return null,
+    };
+    var arena = std.heap.ArenaAllocator.init(scratch);
+    defer arena.deinit();
+    var poller: Poller = .{ .control = control };
+    try control.check();
+    var spans: std.ArrayListUnmanaged(Span) = .empty;
+    if (source.length == 0 or count == 0 or matchers.len == 0) return &.{};
+    try collectProgramSpans(arena.allocator(), tokens, matchers, program, &spans, &poller);
+    return try selectFragments(a, arena.allocator(), &spans, .{ .stored = source }, count, size, &poller);
+}
+fn selectFragments(alloc: Allocator, temporary: Allocator, spans: *std.ArrayListUnmanaged(Span), source: TextSource, max_fragments: u32, fragment_size: u32, poller: *Poller) ![]Fragment {
     if (spans.items.len == 0) return &.{};
-    try normalizeSpans(temporary, &spans, &poller);
+    try normalizeSpans(temporary, spans, poller);
 
     // Score windows by match density and select the best non-overlapping ones.
-    const text_len: u32 = @intCast(text.len);
+    const text_len: u32 = source.length();
     const frag_size = @max(@min(fragment_size, text_len), 1);
 
     var windows = std.ArrayListUnmanaged(ScoredWindow).empty;
@@ -199,10 +307,10 @@ pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: 
         if (win_end - win_start < frag_size and win_start > 0) {
             win_start = if (win_end >= frag_size) win_end - frag_size else 0;
         }
-        win_start = utf8Floor(text, win_start);
-        win_end = utf8Ceil(text, win_end);
+        win_start = source.floor(win_start);
+        win_end = source.ceil(win_end);
 
-        const match_count = try sweep.count(spans.items, win_start, win_end, &poller);
+        const match_count = try sweep.count(spans.items, win_start, win_end, poller);
         // Clipping at either text boundary can produce identical windows.
         if (windows.items.len != 0 and windows.items[windows.items.len - 1].start == win_start and windows.items[windows.items.len - 1].end == win_end) continue;
         try windows.append(temporary, .{ .start = win_start, .end = win_end, .score = match_count });
@@ -214,7 +322,7 @@ pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: 
     var parent = heap_len / 2;
     while (parent > 0) {
         parent -= 1;
-        try siftWindows(windows.items, heap_len, parent, &poller);
+        try siftWindows(windows.items, heap_len, parent, poller);
     }
     var selected = std.ArrayListUnmanaged(ScoredWindow).empty;
     defer selected.deinit(temporary);
@@ -224,7 +332,7 @@ pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: 
         heap_len -= 1;
         if (heap_len != 0) {
             windows.items[0] = windows.items[heap_len];
-            try siftWindows(windows.items, heap_len, 0, &poller);
+            try siftWindows(windows.items, heap_len, 0, poller);
         }
         const overlaps = for (selected.items) |chosen| {
             try poller.step();
@@ -233,7 +341,7 @@ pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: 
         if (!overlaps) try selected.append(temporary, w);
     }
 
-    try controlledSort(ScoredWindow, temporary, selected.items, &poller, struct {
+    try controlledSort(ScoredWindow, temporary, selected.items, poller, struct {
         fn cmp(_: void, a: ScoredWindow, b: ScoredWindow) bool {
             return a.start < b.start;
         }
@@ -242,7 +350,10 @@ pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: 
     const fragments = try alloc.alloc(Fragment, selected.items.len);
     var initialized: usize = 0;
     errdefer {
-        for (fragments[0..initialized]) |fragment| alloc.free(fragment.highlights);
+        for (fragments[0..initialized]) |fragment| {
+            alloc.free(fragment.highlights);
+            if (fragment.owned_text) alloc.free(fragment.text);
+        }
         alloc.free(fragments);
     }
     var span_at: usize = 0;
@@ -261,14 +372,17 @@ pub fn highlightMatchersWithScratch(alloc: Allocator, scratch: Allocator, text: 
                 });
             }
         }
+        const fragment_text = try source.read(alloc, win.start, win.end, poller.control);
+        errdefer if (source == .stored) alloc.free(fragment_text);
         fragments[fi] = .{
-            .text = text[win.start..win.end],
+            .text = fragment_text,
+            .owned_text = source == .stored,
             .offset = win.start,
             .highlights = try alloc.dupe(Span, fragment_spans.items),
         };
         initialized += 1;
     }
-    try control.check();
+    try poller.control.check();
     return fragments;
 }
 
@@ -389,15 +503,19 @@ fn collectMatchSpans(
     spans: *std.ArrayListUnmanaged(Span),
     poller: *Poller,
 ) !void {
+    return collectProgramSpans(alloc, tokens, matchers, null, spans, poller);
+}
+fn collectProgramSpans(alloc: Allocator, tokens: []const analysis_mod.Token, matchers: []const Matcher, program: ?*const Program, spans: *std.ArrayListUnmanaged(Span), poller: *Poller) !void {
     for (tokens) |tok| {
         // Analyzers may emit several tokens for one surface span (shingles,
         // n-grams); the surface span is what gets highlighted.
-        for (matchers) |matcher| {
+        if (program) |compiled| if (try compiled.matches(tok.term, poller)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
+        for (if (program) |compiled| compiled.patterns.items else matchers) |matcher| {
             try poller.step();
             switch (matcher) {
                 .term => |term| if (std.mem.eql(u8, tok.term, term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .prefix => |prefix| if (std.mem.startsWith(u8, tok.term, prefix)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
-                .wildcard => |pattern| if (wildcard_mod.match(pattern, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
+                .wildcard => |pattern| if (try wildcard_mod.matchControlled(pattern, tok.term, poller.control)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .fuzzy => |fuzzy| {
                     const prefix_len: usize = fuzzy.prefix_len;
                     if (tok.term.len < prefix_len or fuzzy.term.len < prefix_len or
@@ -406,7 +524,7 @@ fn collectMatchSpans(
                         try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
                     }
                 },
-                .regexp => |regexp| if (regexpMatchesTerm(regexp, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
+                .regexp => |regexp| if (try regexpMatchesTerm(regexp, tok.term, poller)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .contains, .substring_term, .substring_wildcard, .substring_fuzzy, .substring_regexp => {},
                 .literal, .literal_prefix => {},
             }
@@ -416,10 +534,11 @@ fn collectMatchSpans(
 
 // Dictionary regexp queries feed the whole term to the automaton. The
 // regex library's text-search helper intentionally permits partial matches.
-fn regexpMatchesTerm(regexp: Matcher.Regexp, term: []const u8) bool {
+fn regexpMatchesTerm(regexp: Matcher.Regexp, term: []const u8, poller: *Poller) !bool {
     const aut = regexp.compiled.automaton();
     var state = aut.start();
     for (term) |byte| {
+        try poller.step();
         if (!aut.canMatch(state)) return false;
         state = aut.accept(state, byte);
     }
@@ -472,8 +591,8 @@ fn collectSubstringPatternTermSpans(
             try poller.step();
             const matches = switch (matcher) {
                 .substring_term => |needle| std.mem.eql(u8, needle, indexed_term),
-                .substring_wildcard => |pattern| wildcard_mod.match(pattern, indexed_term),
-                .substring_regexp => |regexp| regexpMatchesTerm(regexp, indexed_term),
+                .substring_wildcard => |pattern| try wildcard_mod.matchControlled(pattern, indexed_term, poller.control),
+                .substring_regexp => |regexp| try regexpMatchesTerm(regexp, indexed_term, poller),
                 .substring_fuzzy => |fuzzy| blk: {
                     const prefix_len: usize = fuzzy.prefix_len;
                     if (indexed_term.len < prefix_len or fuzzy.term.len < prefix_len or
@@ -522,7 +641,7 @@ fn collectContainsSpans(
             var search_at: usize = 0;
             while (search_at + needle.len <= surface.len) {
                 try poller.step();
-                const relative = indexOfIgnoreCase(surface[search_at..], needle) orelse break;
+                const relative = try indexOfIgnoreCase(surface[search_at..], needle, poller) orelse break;
                 const index = search_at + relative;
                 try spans.append(alloc, .{
                     .start = word.start_byte + @as(u32, @intCast(index)),
@@ -543,7 +662,7 @@ fn collectContainsSpans(
             search_at = 0;
             while (search_at + needle.len <= joined.len) {
                 try poller.step();
-                const relative = indexOfIgnoreCase(joined[search_at..], needle) orelse break;
+                const relative = try indexOfIgnoreCase(joined[search_at..], needle, poller) orelse break;
                 const joined_index = search_at + relative;
                 if (joined_index < surface.len and joined_index + needle.len > surface.len) {
                     try spans.append(alloc, .{
@@ -557,10 +676,11 @@ fn collectContainsSpans(
     }
 }
 
-fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8, poller: *Poller) !?usize {
     if (needle.len == 0 or needle.len > haystack.len) return null;
     var i: usize = 0;
     while (i + needle.len <= haystack.len) : (i += 1) {
+        try poller.step();
         if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return i;
     }
     return null;
@@ -634,6 +754,7 @@ fn boundedEditDistance(alloc: Allocator, a: []const u8, b: []const u8, limit: u8
 pub fn freeFragments(alloc: Allocator, fragments: []Fragment) void {
     for (fragments) |f| {
         alloc.free(f.highlights);
+        if (f.owned_text) alloc.free(f.text);
     }
     alloc.free(fragments);
 }
@@ -1211,4 +1332,112 @@ test "highlight dense windows advance density frontiers linearly and unwind canc
     };
     try std.testing.checkAllAllocationFailures(a, Faults.run, .{});
     std.debug.print("HIGHLIGHT_DENSITY spans={d} frontier_advances={d} cancellation_points={d}\n", .{ spans.len, sweep.first + sweep.end, calls });
+}
+
+test "highlight prepared programs share analysis and preserve per-query fragment selection" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const text = "needle cats running needles cat runner needle";
+    const first = [_]Matcher{ .{ .term = "needle" }, .{ .prefix = "run" }, .{ .prefix = "r" }, .{ .prefix = "runnz" } };
+    const second = [_]Matcher{ .{ .term = "cat" }, .{ .wildcard = "r*n" } };
+    var cache: AnalysisCache = .{ .a = arena.allocator() };
+    for ([_][]const Matcher{ &first, &second }) |matchers| {
+        var program = try Program.init(a, matchers);
+        defer program.deinit(a);
+        const expected = try highlightMatchers(a, text, matchers, &analysis_mod.default_analyzer, 2, 17);
+        defer freeFragments(a, expected);
+        const actual = try highlightPrepared(a, arena.allocator(), text, matchers, &program, &cache, &analysis_mod.default_analyzer, 2, 17, .none);
+        defer freeFragments(a, actual);
+        try std.testing.expectEqualDeep(expected, actual);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.analyses);
+}
+
+test "highlight byte scans cancel long punctuation tokens HTML and wildcard input with precise deadlines" {
+    const a = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 8) return error.DeadlineExceeded;
+        }
+    };
+    const text = try a.alloc(u8, 256 * 1024);
+    defer a.free(text);
+    const html: analysis_mod.Analyzer = .{ .char_filters = &.{.html_strip}, .tokenizer = .unicode_words, .filters = &.{.lowercase} };
+    for ([_]u8{ '.', 'x', 'X', '<' }) |byte| {
+        @memset(text, byte);
+        for ([_]*const analysis_mod.Analyzer{ &analysis_mod.default_analyzer, &html }) |analyzer| {
+            var state: State = .{};
+            try std.testing.expectError(error.DeadlineExceeded, highlightMatchersControlled(a, text, &.{.{ .term = "needle" }}, analyzer, 1, 32, .{ .ptr = &state, .check_fn = State.check }));
+            try std.testing.expectEqual(@as(usize, 8), state.calls);
+        }
+    }
+    @memset(text, 'x');
+    var state: State = .{};
+    try std.testing.expectError(error.DeadlineExceeded, wildcard_mod.matchControlled("*needle", text, .{ .ptr = &state, .check_fn = State.check }));
+}
+
+test "highlight stored original offsets read only winning string pages and preserve Unicode under allocation faults" {
+    const a = std.testing.allocator;
+    const column = @import("../section/source_column.zig");
+    const segment = @import("../segment.zig");
+    const source_mod = @import("../segment_source.zig");
+    const text = try a.alloc(u8, column.page_size * 4);
+    defer a.free(text);
+    @memset(text, '.');
+    const at = column.page_size - 4;
+    @memcpy(text[at..][0.."é needle 😀".len], "é needle 😀");
+    var memory = segment.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var writer = try column.Writer.init(a, &sink);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = text }, &.{&analysis_mod.simple_analyzer});
+    try std.testing.expect(try writer.finish());
+    const Reads = struct {
+        bytes: []const u8,
+        read_bytes: usize = 0,
+        fn close(_: *anyopaque) void {}
+        fn read(raw: *anyopaque, offset: u64, into: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.read_bytes += into.len;
+            @memcpy(into, self.bytes[@intCast(offset)..][0..into.len]);
+        }
+    };
+    var reads: Reads = .{ .bytes = memory.out.items };
+    const view = try source_mod.View.init(.{ .ranges = .{ .ptr = &reads, .length = reads.bytes.len, .read_into = Reads.read, .close = Reads.close } }, 0, reads.bytes.len);
+    const Run = struct {
+        fn run(alloc: Allocator, source: source_mod.View, original: []const u8) !void {
+            var reader = try column.Reader.init(alloc, source);
+            var cursor = column.Cursor.init(reader);
+            // Reader ownership transfers to cursor.
+            _ = &reader;
+            defer cursor.deinit();
+            const stored = (try cursor.text(0)).?;
+            const signature = try column.fingerprint(alloc, &analysis_mod.simple_analyzer);
+            const tokens = (try stored.tokens(alloc, signature, .none)).?;
+            defer tokens.deinit();
+            try std.testing.expect((try stored.tokens(alloc, @splat(0), .none)) == null);
+            const matchers = [_]Matcher{ .{ .term = "needle" }, .{ .prefix = "nee" }, .{ .wildcard = "n*dle" }, .{ .fuzzy = .{ .term = "needlf", .max_edits = 1 } } };
+            const expected = try highlightMatchers(alloc, original, &matchers, &analysis_mod.simple_analyzer, 1, 23);
+            defer freeFragments(alloc, expected);
+            const found = (try highlightStored(alloc, alloc, stored, tokens.items, &matchers, null, 1, 23, .none)).?;
+            defer freeFragments(alloc, found);
+            try std.testing.expectEqual(expected.len, found.len);
+            for (expected, found) |left, right| {
+                try std.testing.expectEqual(left.offset, right.offset);
+                try std.testing.expectEqualStrings(left.text, right.text);
+                try std.testing.expectEqualDeep(left.highlights, right.highlights);
+                try std.testing.expect(std.unicode.utf8ValidateSlice(right.text));
+            }
+        }
+    };
+    try Run.run(a, view, text);
+    std.debug.print("STORED_HIGHLIGHT source_bytes={d} compressed_bytes={d} read_bytes={d}\n", .{ text.len, memory.out.items.len, reads.read_bytes });
+    try std.testing.expect(reads.read_bytes < text.len / 4);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ view, text });
 }

@@ -51,6 +51,13 @@ const Job = struct {
     fn deinit(self: *Job) void {
         if (self.lease) |lease| lease.release() else if (self.result) |bytes| self.a.free(bytes);
     }
+    fn check(raw: *const anyopaque) !void {
+        const self: *const Job = @ptrCast(@alignCast(raw));
+        // Context is authoritative even when a transport-only adapter flattened
+        // the same deadline to Canceled.
+        if (self.cached) |cache| try cache.context.ensureActive();
+        try self.token.check();
+    }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Job = @ptrCast(@alignCast(raw));
         self.token.check() catch return true;
@@ -58,8 +65,11 @@ const Job = struct {
         return false;
     }
     fn read(self: *Job, alloc: A) ![]u8 {
-        const token: Token = .{ .ptr = self, .is_cancelled_fn = canceled };
-        const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(alloc, self.id, self.begin, self.length, token);
+        const token: Token = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = check };
+        const bytes = self.store.getRangeAllocWithCancellationUsingAllocator(alloc, self.id, self.begin, self.length, token) catch |err| {
+            try check(self);
+            return err;
+        };
         errdefer alloc.free(bytes);
         if (bytes.len != self.length) return error.ArtifactIntegrityMismatch;
         if (self.cached) |cache| cache.cache.recordPhysicalRead(bytes.len);
@@ -101,8 +111,7 @@ const Job = struct {
             context.checkpoint = null;
             context.cancellation = .fromCallback(self, canceled);
             const lease = cache.cache.physical.acquireCovered(hash.finalResult(), self.length * 2 + 64 * 1024, context, .{ .ptr = self, .load = fill }, .{ .domain = domain, .start = self.begin, .end = self.begin + self.length }) catch |err| fallback: {
-                try self.token.check();
-                try cache.context.ensureActive();
+                try check(self);
                 if (err != error.SqlMemoryLimitExceeded) return err;
                 break :fallback null;
             };

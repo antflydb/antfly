@@ -73,10 +73,10 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     }
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
-    // v4 adds authenticated chunk row ranges to independent typed source columns.
-    // Its producer attests direct projection and sequential merge navigation,
-    // including fields excluded from text indexing.
-    hash.update("native-lake-text-stored-source-v4");
+    // v5 adds independently compressed large text pages and original-offset
+    // vectors fenced by the complete analyzer pipeline fingerprint. Projection
+    // and merge preserve this evidence for fields excluded from text indexing.
+    hash.update("native-lake-text-stored-source-v5");
     hash.update(&original);
     var digest: [32]u8 = undefined;
     hash.final(&digest);

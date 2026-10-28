@@ -1290,7 +1290,7 @@ fn writeTextSegmentWithScratch(
             for (seg_writer.fields.items, 0..) |field, i| if (std.mem.eql(u8, field.name, name)) break :blk @as(u16, @intCast(i));
             break :blk try seg_writer.addField(name);
         };
-        producer.* = .{ .state = &build_state, .docs = docs, .order = if (index_sort.len > 0 and !attested) doc_order else &.{}, .field = name };
+        producer.* = .{ .state = &build_state, .docs = docs, .order = if (index_sort.len > 0 and !attested) doc_order else &.{}, .field = name, .analysis = text_analysis };
         try seg_writer.addSectionBuilder(field_idx, .columnar_stored, .{ .context = producer, .write = SourceColumnProducer.write });
     }
     noteBuildMemorySample(profile, profile_working_set, "rss_after_postings_build");
@@ -1946,19 +1946,27 @@ const SourceColumnProducer = struct {
     docs: []const TextDocument,
     order: []const TextIndexSortEntry,
     field: []const u8,
+    analysis: TextAnalysisConfig,
     fn write(a: Allocator, raw: *anyopaque, sink: *segment_mod.SegmentSink) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        var writer = @import("section/doc_values.zig").StreamingWriter.initIndexed(a, sink, 1024);
+        var writer = try @import("section/source_column.zig").Writer.init(a, sink);
         defer writer.deinit();
         for (0..self.docs.len) |i| {
             const doc = self.docs[if (self.order.len != 0) self.order[i].doc_index else i];
             const value = doc.stored_source.?.object.get(self.field) orelse continue;
             // Input rows remain leased; one encoded value and one raw/compressed
             // field chunk coexist. Reserve that scratch under the build owner.
-            try self.state.adjust(3 *| (@max(@as(u64, @intCast(doc.stored_data.len)), doc.stored_source_bytes) +| 64 * 1024));
-            const bytes = try @import("storage/typed_json.zig").encodeBinary(a, value);
-            defer a.free(bytes);
-            try writer.add(@intCast(i), bytes);
+            try self.state.adjust(writer.retained + 3 *| (@max(@as(u64, @intCast(doc.stored_data.len)), doc.stored_source_bytes) +| 64 * 1024));
+            var analyzers: std.ArrayList(*const analysis_mod.Analyzer) = .empty;
+            defer analyzers.deinit(a);
+            if (value == .string) for (doc.text_fields) |field| {
+                if (!std.mem.eql(u8, field.source_field orelse field.field_name, self.field) or !std.mem.eql(u8, field.text, value.string)) continue;
+                const analyzer = effectiveTextFieldAnalyzer(field, self.analysis);
+                if (!@import("section/source_column.zig").eligibleAnalyzer(analyzer)) continue;
+                if (std.mem.indexOfScalar(*const analysis_mod.Analyzer, analyzers.items, analyzer) == null) try analyzers.append(a, analyzer);
+            };
+            try writer.add(@intCast(i), value, analyzers.items);
+            try self.state.adjust(writer.retained + 3 *| (@max(@as(u64, @intCast(doc.stored_data.len)), doc.stored_source_bytes) +| 64 * 1024));
         }
         if (!try writer.finish()) return error.InvalidSegment;
         try self.state.adjust(0);

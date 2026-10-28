@@ -1544,9 +1544,9 @@ pub const SegmentReader = struct {
 
     /// Chunk payload borrows this reader/source; the returned reader owns its
     /// navigation directory and must be deinitialized before this reader.
-    pub fn storedColumnScoped(self: *const SegmentReader, alloc: Allocator, field: []const u8) !?@import("section/doc_values.zig").DocValuesReader {
+    pub fn storedColumnScoped(self: *const SegmentReader, alloc: Allocator, field: []const u8) !?@import("section/source_column.zig").Reader {
         const view = (try self.sectionView(field, .columnar_stored)) orelse return null;
-        return try @import("section/doc_values.zig").DocValuesReader.initRanges(alloc, view);
+        return try @import("section/source_column.zig").Reader.init(alloc, view);
     }
 
     pub fn invertedIndexScoped(self: *const SegmentReader, allocator: Allocator, field_name: []const u8) !?inverted.ScopedInvertedIndexReader {
@@ -4234,7 +4234,7 @@ fn appendStoredIdentitySpan(sink: *SegmentSink, source: @import("segment_source.
 }
 
 fn writeMergedSourceColumn(a: Allocator, sink: *SegmentSink, inputs: []const MergeInput, field: []const u8, order: ?SortedRecords) !bool {
-    const dv = @import("section/doc_values.zig");
+    const dv = @import("section/source_column.zig");
     const cursors = try a.alloc(?dv.Cursor, inputs.len);
     @memset(cursors, null);
     defer {
@@ -4247,19 +4247,19 @@ fn writeMergedSourceColumn(a: Allocator, sink: *SegmentSink, inputs: []const Mer
         any = true;
     };
     if (!any) return false;
-    var writer = dv.StreamingWriter.initIndexed(a, sink, 1024);
+    var writer = try dv.Writer.init(a, sink);
     defer writer.deinit();
     var ordinal: u32 = 0;
     if (order) |records| {
         var iterator = records.iterator();
         while (try iterator.next()) |record| {
-            if (cursors[record.ref.input_idx]) |*cursor| if (try cursor.get(record.ref.doc_id)) |value| try writer.add(ordinal, value);
+            if (cursors[record.ref.input_idx]) |*cursor| try writer.copy(ordinal, cursor, record.ref.doc_id);
             ordinal += 1;
         }
     } else for (inputs, cursors) |input, *cursor| {
         var live = LiveDocs.init(&input, 0, input.reader.doc_count);
         while (live.next()) |doc| {
-            if (cursor.*) |*value| if (try value.get(doc)) |bytes| try writer.add(ordinal, bytes);
+            if (cursor.*) |*value| try writer.copy(ordinal, value, doc);
             ordinal += 1;
         }
     }

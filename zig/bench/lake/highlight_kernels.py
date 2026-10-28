@@ -198,7 +198,8 @@ with bench.managed_server(
                     )
                     elapsed = time.perf_counter_ns() - started
                     if response.ok:
-                        hits = response.json()["hits"]["hits"]
+                        value = response.json()
+                        hits = value.get("responses", [value])[0]["hits"]["hits"]
                         assert [
                             {k: v for k, v in h.items() if k != "_source"} for h in hits
                         ] == [
