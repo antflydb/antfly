@@ -7275,6 +7275,10 @@ pub const HostedProvisionedTableReadSource = struct {
                 const owner: *@This() = @ptrCast(@alignCast(raw));
                 return owner.read.invoke(page_alloc, body);
             }
+            fn invokeTyped(raw: *anyopaque, page_alloc: std.mem.Allocator, request: @import("cypher").rpc.Request) !@import("cypher").rpc.Reply {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                return owner.read.invokeTyped(page_alloc, request);
+            }
             fn openSql(raw: *anyopaque, view_alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !table_read_source.RelationalReadView {
                 const owner: *@This() = @ptrCast(@alignCast(raw));
                 return owner.read.openSql(view_alloc, table, from, to, opts);
@@ -7292,7 +7296,7 @@ pub const HostedProvisionedTableReadSource = struct {
         owner.coordinator.io_impl = self.io_impl;
         _ = owner.coordinator.withDistributedRouting(self.router, self.executor, self.internal_service_secret, self.internal_service_issuer);
         owner.read = try ProvisionedTableReadSource.openCypherStatement(&owner.coordinator, alloc, input);
-        return .{ .ptr = owner, .vtable = &.{ .invoke = Owner.invoke, .release = Owner.close, .open_sql = Owner.openSql } };
+        return .{ .ptr = owner, .vtable = &.{ .invoke = Owner.invoke, .invoke_typed = Owner.invokeTyped, .release = Owner.close, .open_sql = Owner.openSql } };
     }
 
     fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !table_read_source.RelationalStatementRead {

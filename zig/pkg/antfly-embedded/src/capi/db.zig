@@ -792,6 +792,38 @@ pub const HandleGuard = struct {
     entry_sequence: u64 = 0,
     pinned_store_readonly: ?bool = null,
     suspended_query_root: ?*Handle = null,
+    suspended_immutable_query: bool = false,
+    immutable_readonly: ?struct { store: bool, file: bool } = null,
+
+    pub fn suspendImmutableQuery(self: *HandleGuard) void {
+        const connection = self.connection orelse return;
+        std.debug.assert(self.connection_gate_held and self.entry_error == null);
+        const root = connection.current.?;
+        std.debug.assert(root.immutable_query_borrows == 0);
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        self.immutable_readonly = .{ .store = store.read_only, .file = store.file.read_only };
+        // Read admission can inspect these flags. Freeze them before dropping
+        // the gate, rather than changing them concurrently during retirement.
+        store.read_only = true;
+        store.file.read_only = true;
+        root.immutable_query_borrows += 1;
+        self.suspended_immutable_query = true;
+        self.suspendQuery();
+    }
+
+    /// Caller holds the path gate and has finished all uses of the snapshot.
+    fn releaseImmutableQuery(self: *HandleGuard) void {
+        if (!self.suspended_immutable_query) return;
+        const root = self.suspended_query_root.?;
+        root.immutable_query_borrows -= 1;
+        if (self.connection.?.current == root) {
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            store.read_only = self.immutable_readonly.?.store;
+            store.file.read_only = self.immutable_readonly.?.file;
+        }
+        self.immutable_readonly = null;
+        self.suspended_immutable_query = false;
+    }
 
     /// Keep registry references and the provider snapshot alive, releasing both
     /// process and file locks while inference runs on an owned request plan.
@@ -820,9 +852,17 @@ pub const HandleGuard = struct {
     }
     pub fn resumeAccess(self: *HandleGuard, ptr: ?*anyopaque, access: HandleAccess) bool {
         if (self.suspended_query_root == null) return true;
+        const connection = self.connection.?;
+        if (self.suspended_immutable_query) {
+            // The caller has finished using the snapshot. Keep the lifetime
+            // borrow until reentry, but permit refresh to reuse this root when
+            // no overlapping query required a replacement.
+            connection.gate.mutex.lockUncancelable(handleLockIo());
+            self.releaseImmutableQuery();
+            connection.gate.mutex.unlock(handleLockIo());
+        }
         // Original registry references keep the connection/owner alive.
         const next = enterHandle(ptr, access) orelse return false;
-        const connection = self.connection.?;
         if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
         self.suspended_query_root.?.query_borrows -= 1;
         connection.collectRetired();
@@ -839,6 +879,8 @@ pub const HandleGuard = struct {
             const connection = self.connection.?;
             connection.gate.mutex.lockUncancelable(io);
             root.query_borrows -= 1;
+            var owned = self;
+            owned.releaseImmutableQuery();
             connection.collectRetired();
             connection.gate.mutex.unlock(io);
             if (self.parent_slot) |slot| HandleRegistry.leave(slot);

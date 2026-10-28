@@ -832,6 +832,15 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = error_consumer,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }));
+    const graph_reply_provider_mod = b.createModule(.{ .root_source_file = b.path("lib/runtime/src/runtime_graph_reply_roundtrip_test.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
+    graph_reply_provider_mod.addImport("cypher", antfly_test_mod.import_table.get("cypher").?);
+    const graph_reply_provider = b.addLibrary(.{ .name = "graph-reply-test-provider", .root_module = graph_reply_provider_mod });
+    const graph_reply_consumer = b.createModule(.{ .root_source_file = b.path("lib/runtime/src/runtime_graph_reply_roundtrip_test.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
+    graph_reply_consumer.addImport("cypher", antfly_test_mod.import_table.get("cypher").?);
+    graph_reply_consumer.linkLibrary(graph_reply_provider);
+    const graph_reply_test = b.addRunArtifact(b.addTest(.{ .root_module = graph_reply_consumer, .filters = &.{"typed graph callback preserves"} }));
+    b.step("cypher-callback-abi-test", "Verify typed graph callbacks across independent native runtimes").dependOn(&graph_reply_test.step);
+    error_identity_step.dependOn(&graph_reply_test.step);
     error_identity_step.dependOn(&error_roundtrip.step);
     model_chunk_step.dependOn(&error_roundtrip.step);
     const error_status_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{

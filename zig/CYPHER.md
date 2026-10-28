@@ -4073,3 +4073,140 @@ verifiers share the bounded admission retry guard: only an explicit 503
 admitted or unknown write outcomes remain observable. Its three contract tests
 pass. Qualification retains the production disk-admission floor; obsolete
 worktree build artifacts were reclaimed before the final campaign.
+
+## Read operation guards, detached Lite reads, and typed coordinator transport
+
+This integration merges `origin/main` through `7dabd028d6` before the read-path
+changes. Public Cypher read execution now shares one authority scope across its
+internal RPCs, with mandatory checks before execution, after execution, and after
+bounded response encoding. SQL extends the same scope around statement cursor
+construction, including eager GRAPH_TABLE execution when streaming cannot open.
+The periodic refresh remains bounded to ten milliseconds; cancellation and live
+role revisions are checked before considering a cached authority result. Write
+execution retains its existing precommit validation boundaries.
+
+Native Lite keeps short reads on the existing admission path. Once immutable
+graph cuts are prepared, a read that runs longer than one millisecond releases
+the connection mutex, path gate, and file writer lease at its next runtime or
+response-encoding checkpoint. Short queries such as RETURN 1 avoid detachment
+and its snapshot bookkeeping under contention. The store and file read-only flags are frozen before detachment, so retirement
+cannot race read admission by changing them. An immutable root borrow
+prevents refresh from reusing that root for a concurrent foreground request.
+Instead, the owner installs a replacement root and retains the old root until
+its last query, maintenance, or cursor borrower retires. This keeps old table
+objects and index contexts alive across concurrent DDL and data publication.
+The lifetime borrow is distinct from the immutability borrow: after execution
+releases all leases, watches, and cuts, resume permits root reuse when there was
+no overlap. Sequential reads therefore do not force a file reopen, and resume restores the
+serving root's original read-only flags before allowing further operations.
+
+Before delivering detached output, the C adapter reacquires current access and
+checks the graph incarnation/revision, every mapped physical table identity and
+schema version, and current raw-read authority for the root and all mappings.
+An invalidated result buffer is freed before returning an error. Mutation
+execution and directory-backed C handles keep their existing exclusive access.
+The native fixture explicitly exercises sequential root reuse and overlapping
+root retention across drop-and-recreate; public Python coverage races immutable
+Cypher reads with SQL updates through shared and independent connections.
+
+A graph RPC channel may now provide a typed in-process operation. The graph
+statement coordinator uses the same owner validation, work meter, projection,
+and read-field configuration for typed and serialized operations. Remote owner
+calls continue to use the version-one JSON transport. The optional storage-read
+callback goes through the existing checked runtime callback ABI; sources without
+it retain the serialized fallback. Authenticated search preparation is shared
+between both adapters. Projection and observation routing retain their dedicated
+owner semantics.
+
+Normalizers may return their input unchanged. Input nodes therefore use the
+reply arena, so a typed reply stays valid after the owner function returns.
+Owner replies decode directly into canonical transport values, avoiding a
+generic JSON DOM for the common type-first node, relationship, list, and property
+map envelopes. Structural discriminator keys can borrow the input during parsing;
+returned strings and entity data have owned lifetimes. The parser preserves
+signed integer precision, unsigned native timestamps, duplicate-field rejection,
+and the value-depth bound. Scalar text requires JSON strings, even though the
+generic Zig byte-slice parser also accepts JSON byte arrays. Reordered envelopes and path values retain the shared
+version-one decoder, including path adjacency validation. The coordinator no
+longer serializes and reparses an already-decoded distributed read reply.
+
+An equal-output owner transport probe uses 128 identities with 1 KiB properties
+and averages 100 repetitions per mode. One serialized owner hop takes 427 µs;
+two serialized hops take 882 µs; a typed coordinator over one serialized leaf
+takes 526 µs. All modes assert identical decoded properties and retain 172,176
+bytes in the result arena. This isolates codec/coordinator work, excluding
+network and storage latency; result-arena capacity does not measure transient
+peak allocation.
+
+Typed callback payloads use named request, ordering, filter, and budget-failure
+types so independently compiled runtimes agree on the checked ABI contract.
+A separate producer-library/consumer-test fixture verifies nested requests,
+canonical node replies, budget failures, and transported errors in both Debug
+and ReleaseFast builds with matching compilation profiles. Hosted read sources
+forward the typed capability through their existing routing wrapper. Wire
+serialization preserves nullable fields recursively: a terminal ordered cursor
+step carries `after: null`, which must survive coordinator/leaf round trips.
+
+An eligible immutable Lite read retries transient native WouldBlock/FileBusy
+failures at the individual read operation for at most 100 ms. Each retry keeps
+the same pinned cut and accumulated work/memory charges, and checks cancellation
+and authority before sleeping for one millisecond. Exhaustion reports snapshot
+unavailability. Mutation statements retain their existing failure behavior.
+
+A local native concurrency probe starts a roughly 18 ms read, waits 2 ms, then
+submits RETURN 1. Across 20 repetitions, median short-query latency falls from
+13.9 ms to 2.46 ms on the same connection and from 14.0 ms to 2.59 ms through a
+second connection to the same file. An independent file measures 0.21 ms.
+The cooperative threshold preserves the short-query fast path. A separate probe
+runs 1,000 calls per thread three times and measures median rates of about
+14,100 queries/second serially and 11,000 with eight contending threads.
+These are local microbenchmarks, not
+end-to-end service throughput guarantees.
+
+Statistic packet construction uses a reclaimed emission arena for integer bins,
+large-count division and reducer argument evaluation. Reducers and escaping
+cursor packets copy retained state into their own arenas. A 512-layer graph
+with 32 grouped quadratic averages fits a 32 MiB core budget in either encounter
+order, including an allocator that cannot grow allocations in place. The local
+probe drops from roughly 43–46 MiB to 20–24 MiB without changing results or
+work limits; allocation-failure campaigns cover cleanup and packet ownership.
+The existing native workload also passes in both storage modes: grouped AVG
+reports 22,618,302 bytes for Lite and 21,757,102 bytes for directory storage,
+versus the earlier 45,974,146 and 61,136,686 bytes. Both still scan one anchor,
+explore 4,088 edges and charge 144,840 intermediate states.
+
+Completed qualification includes 491 core Cypher tests, five native C-adapter
+fixtures, the independently compiled callback ABI fixture in Debug and
+ReleaseFast, 11 server transport tests, the checkpoint-pinning regression,
+and 13 authenticated-search/limit scenarios. The optimized library and CLI
+build successfully; the native export boundary retains 137 public functions
+without internal exports. The full optimized embedded run passes 1,513 cases
+with four skips. All 20 standalone/replicated-owner scenarios pass against the
+final optimized CLI, preserving the production disk-admission floor.
+
+Managed inline embedders implicitly consume an artifact with the index's name.
+Aggregate readiness retains that source's publication and producer-completion
+fences from every expected owner, including when the vector target is empty.
+Zero cardinality cannot erase pending source work. A serving snapshot may remain
+queryable while this completion work proceeds. Fault-injection setup retries
+only definite seed-batch prepare aborts; admitted or unknown mutations retain
+their original transaction identity and are never replayed as new writes.
+Standalone native owners retain their local producer and coverage protocol.
+Only Raft owners install the ordered-publication dispatcher: that dispatcher
+requires committed Data-Raft entries and cannot complete native publications.
+Empty-index end-to-end checks retain the implicit source and require its
+completion proof in both aggregate and per-owner readiness before seeding data.
+A fresh local store may lack its cardinality record until the first primary
+write. Local completion then uses one key-only seek in the same pinned source
+revision to prove emptiness. Any user key keeps a missing counter unknown;
+ordered owners continue to require the producer registry. Concurrent counter
+creation cannot change an older snapshot's proof.
+
+Native owner capture shares catalog admission with long-running searches. A
+separate file-pinning gate excludes completed dense checkpoint handoffs and
+shared vector-generation replacement while capture selects manifests and
+acquires hardlinks or stable WAL descriptors. Checkpoint builders still run
+outside this gate; completed publishers defer without blocking. Capture waits
+honor cancellation. A deterministic regression attempts publication between
+manifest selection and file pinning, then seals the old manifest after the
+new checkpoint has retired its live WAL path.

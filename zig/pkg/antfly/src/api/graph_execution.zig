@@ -105,7 +105,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
         }
         read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
         channel.read = &read.?;
-        client = .{ .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint }, .incarnation = graph.incarnation, .revision = graph.revision };
+        client = .{ .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .typed = AuthorityChannel.invokeTyped, .checkpoint = AuthorityChannel.checkpoint }, .incarnation = graph.incarnation, .revision = graph.revision };
         provider = client.backend();
     }
     var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = read_tables.items, .release_read = AuthorityChannel.releaseRead, .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint } };
@@ -119,7 +119,12 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     var overlay: cypher.transaction.Overlay = .{ .lazy = true, .retain_scan_preimages = true, .base = provider, .host = writer.host(), .max_entities = request.limits.intermediate_states, .max_anchors = request.limits.scanned_anchors, .max_edges = request.limits.explored_edges };
     writer.overlay = &overlay;
     if (writes and !compiled.query.explain) provider = overlay.backend();
-    var result = try cypher.runtime.execute(a, provider, graph, &compiled, request.parameters, request.limits);
+    var result = execution: {
+        if (!writes) try channel.validateAuthority(true);
+        channel.guarded_operation = !writes;
+        defer channel.guarded_operation = false;
+        break :execution try cypher.runtime.execute(a, provider, graph, &compiled, request.parameters, request.limits);
+    };
     defer result.deinit();
     // After a durable write decision, revocation must not turn a committed
     // response into an apparent rejection that invites statement replay.
@@ -145,7 +150,7 @@ pub const AuthorityChannel = struct {
     read_owner: ?*?port.GraphRead = null,
     last_authority_check: ?u64 = null,
     catalog_guard: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque, std.mem.Allocator) anyerror!void } = null,
-    /// SQL page operations have mandatory authoritative guards at both ends.
+    /// Read statements and SQL pages have authoritative guards at both ends.
     /// Internal RPCs share that boundary; long operations still refresh guards.
     guarded_operation: bool = false,
     role_revision: ?u64 = null,
@@ -200,6 +205,17 @@ pub const AuthorityChannel = struct {
         if (record.id != self.record_id) return error.CatalogGenerationChanged;
         self.last_authority_check = @import("antfly_platform").time.monotonicNs();
     }
+    pub fn invokeTyped(ptr: *anyopaque, a: std.mem.Allocator, request: cypher.rpc.Request) !cypher.rpc.Reply {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try self.validateAuthority(true);
+        var arena = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
+        defer arena.deinit();
+        var prepared = request;
+        if (prepared.operation == .search) try self.prepareSearch(arena.allocator(), &prepared);
+        const result = try (self.read orelse return error.CypherSnapshotRequired).invokeTyped(a, prepared);
+        try self.validateAuthority(true);
+        return result;
+    }
     pub fn invoke(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try self.validateAuthority(true);
@@ -211,35 +227,38 @@ pub const AuthorityChannel = struct {
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
             const owned = scratch.allocator();
-            const parameters = try cypher.wire.parameter(owned, request.value.search orelse return error.InvalidQueryRequest);
-            var json = try std.json.parseFromSliceLeaky(std.json.Value, owned, try std.json.Stringify.valueAlloc(owned, parameters, .{}), .{});
-            if (json != .object) return error.InvalidQueryRequest;
-            if (json.object.get("query")) |query| {
-                _ = json.object.swapRemove("query");
-                const mode = json.object.get("mode") orelse std.json.Value{ .string = "text" };
-                _ = json.object.swapRemove("mode");
-                if (mode != .string) return error.InvalidQueryRequest;
-                if (std.mem.eql(u8, mode.string, "text") or std.mem.eql(u8, mode.string, "hybrid")) {
-                    var text: std.json.ObjectMap = .empty;
-                    try text.put(owned, "query", query);
-                    try json.object.put(owned, "full_text_search", .{ .object = text });
-                }
-                if (std.mem.eql(u8, mode.string, "semantic") or std.mem.eql(u8, mode.string, "hybrid")) try json.object.put(owned, "semantic_search", query) else if (!std.mem.eql(u8, mode.string, "text")) return error.InvalidQueryRequest;
-            }
-            const scope = server_mod.ApiHttpServer.queryEmbeddingSecurityScope(self.identity.*);
-            var resolver = self.server.semanticStatusResolver(scope.domain, scope.value);
-            const normalized = try self.context.platformDeadline();
-            resolver.query_embedding_deadline_ns = normalized.deadline_ns;
-            resolver.query_cancellation = normalized.cancellation;
-            var parsed = try local.api_query.parsePublicQueryRequestWithDeadline(owned, resolver.iface(), request.value.table, try std.json.Stringify.valueAlloc(owned, json, .{}), normalized.deadline_ns);
-            defer parsed.deinit(owned);
-            request.value.prepared_search_json = try local.api_local_query_contract.encodeQueryRequest(owned, parsed.req);
+            try self.prepareSearch(owned, &request.value);
             prepared_body = try std.json.Stringify.valueAlloc(a, request.value, .{});
         }
         const result = try (self.read orelse return error.CypherSnapshotRequired).invoke(a, prepared_body orelse body);
         errdefer a.free(result);
         try self.validateAuthority(true);
         return result;
+    }
+    fn prepareSearch(self: *@This(), owned: std.mem.Allocator, request: *cypher.rpc.Request) !void {
+        const parameters = try cypher.wire.parameter(owned, request.search orelse return error.InvalidQueryRequest);
+        var json = try std.json.parseFromSliceLeaky(std.json.Value, owned, try std.json.Stringify.valueAlloc(owned, parameters, .{}), .{});
+        if (json != .object) return error.InvalidQueryRequest;
+        if (json.object.get("query")) |query| {
+            _ = json.object.swapRemove("query");
+            const mode = json.object.get("mode") orelse std.json.Value{ .string = "text" };
+            _ = json.object.swapRemove("mode");
+            if (mode != .string) return error.InvalidQueryRequest;
+            if (std.mem.eql(u8, mode.string, "text") or std.mem.eql(u8, mode.string, "hybrid")) {
+                var text: std.json.ObjectMap = .empty;
+                try text.put(owned, "query", query);
+                try json.object.put(owned, "full_text_search", .{ .object = text });
+            }
+            if (std.mem.eql(u8, mode.string, "semantic") or std.mem.eql(u8, mode.string, "hybrid")) try json.object.put(owned, "semantic_search", query) else if (!std.mem.eql(u8, mode.string, "text")) return error.InvalidQueryRequest;
+        }
+        const scope = server_mod.ApiHttpServer.queryEmbeddingSecurityScope(self.identity.*);
+        var resolver = self.server.semanticStatusResolver(scope.domain, scope.value);
+        const normalized = try self.context.platformDeadline();
+        resolver.query_embedding_deadline_ns = normalized.deadline_ns;
+        resolver.query_cancellation = normalized.cancellation;
+        var parsed = try local.api_query.parsePublicQueryRequestWithDeadline(owned, resolver.iface(), request.table, try std.json.Stringify.valueAlloc(owned, json, .{}), normalized.deadline_ns);
+        defer parsed.deinit(owned);
+        request.prepared_search_json = try local.api_local_query_contract.encodeQueryRequest(owned, parsed.req);
     }
 };
 const Metadata = struct {

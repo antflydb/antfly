@@ -21,6 +21,15 @@ pub const version = 1;
 pub const Value = struct {
     value: v.Value,
     include_native: bool = false,
+    /// Decode owner values directly into canonical values. The canonical
+    /// type-first envelope avoids a JSON DOM for nodes and their properties;
+    /// member-order-independent inputs retain the version-one contract.
+    pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Value {
+        return .{ .value = parseTyped(a, source, options, 0) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        }, .include_native = true };
+    }
     pub fn jsonStringify(self: Value, writer: anytype) !void {
         try writer.beginObject();
         try writer.objectField("type");
@@ -79,6 +88,129 @@ pub const Value = struct {
         try writer.endObject();
     }
 };
+
+fn expectToken(source: anytype, token: std.meta.Tag(std.json.Token)) !void {
+    if (std.meta.activeTag(try source.next()) != token) return error.InvalidCypherWireValue;
+}
+
+fn parseText(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) ![]const u8 {
+    // std.json also accepts a byte array for []u8. Wire text is a JSON string.
+    if (try source.peekNextTokenType() != .string) return error.InvalidCypherWireValue;
+    return std.json.innerParse([]const u8, a, source, options);
+}
+
+fn parseTyped(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions, depth: usize) anyerror!v.Value {
+    if (depth > 64) return error.CypherValueDepthExceeded;
+    var structural = options;
+    structural.allocate = .alloc_if_needed;
+    try expectToken(source, .object_begin);
+    const first = try parseText(a, source, structural);
+    if (std.mem.eql(u8, first, "value")) {
+        const payload = try std.json.innerParse(std.json.Value, a, source, options);
+        const second = try parseText(a, source, structural);
+        if (!std.mem.eql(u8, second, "type")) return error.InvalidCypherWireValue;
+        const kind = try parseText(a, source, structural);
+        try expectToken(source, .object_end);
+        return decodePayload(a, kind, payload, depth);
+    }
+    if (!std.mem.eql(u8, first, "type")) return error.InvalidCypherWireValue;
+    const kind = try parseText(a, source, structural);
+    const second = try parseText(a, source, structural);
+    if (!std.mem.eql(u8, second, "value")) return error.InvalidCypherWireValue;
+    const tag = std.meta.stringToEnum(std.meta.Tag(v.Value), kind) orelse return error.InvalidCypherWireValue;
+    const result: v.Value = switch (tag) {
+        .null => result: {
+            try expectToken(source, .null);
+            break :result .null;
+        },
+        .boolean => .{ .boolean = try std.json.innerParse(bool, a, source, options) },
+        .integer => .{ .integer = try std.fmt.parseInt(i64, try parseText(a, source, options), 10) },
+        .number => result: {
+            if (try source.peekNextTokenType() != .number) return error.InvalidCypherWireValue;
+            const number = try std.json.innerParse(f64, a, source, options);
+            if (!std.math.isFinite(number)) return error.InvalidCypherWireValue;
+            break :result .{ .number = number };
+        },
+        .string => .{ .string = try parseText(a, source, options) },
+        .list => result: {
+            try expectToken(source, .array_begin);
+            var items: std.ArrayList(v.Value) = .empty;
+            while (try source.peekNextTokenType() != .array_end) try items.append(a, try parseTyped(a, source, options, depth + 1));
+            try expectToken(source, .array_end);
+            break :result .{ .list = try items.toOwnedSlice(a) };
+        },
+        .map => result: {
+            try expectToken(source, .object_begin);
+            var entries: std.ArrayList(v.Entry) = .empty;
+            var names: std.StringHashMapUnmanaged(void) = .empty;
+            defer names.deinit(a);
+            while (try source.peekNextTokenType() != .object_end) {
+                const name = try parseText(a, source, options);
+                if ((try names.getOrPut(a, name)).found_existing) return error.InvalidCypherWireValue;
+                try entries.append(a, .{ .name = name, .value = try parseTyped(a, source, options, depth + 1) });
+            }
+            try expectToken(source, .object_end);
+            break :result .{ .map = try entries.toOwnedSlice(a) };
+        },
+        .node => result: {
+            const input = try parseEntity(struct { identity: v.Identity, labels: []const []const u8, properties: v.Value }, a, source, options, depth);
+            if (input.properties != .map or input.identity.table.len == 0 or input.identity.key.len == 0) return error.InvalidCypherWireValue;
+            const node = try a.create(v.Node);
+            node.* = .{ .identity = input.identity, .labels = input.labels, .properties = input.properties.map };
+            break :result .{ .node = node };
+        },
+        .relationship => result: {
+            const Native = struct { weight: f64, created_at: []const u8, updated_at: []const u8 };
+            const input = try parseEntity(struct { identity: v.Identity, index: []const u8, type: []const u8, source: v.Identity, target: v.Identity, ownership: @FieldType(v.Relationship, "ownership"), producer: ?v.Identity = null, properties: v.Value, native: ?Native = null }, a, source, options, depth);
+            if (input.properties != .map or input.identity.table.len == 0 or input.identity.key.len == 0 or input.index.len == 0 or input.type.len == 0) return error.InvalidCypherWireValue;
+            const relationship = try a.create(v.Relationship);
+            relationship.* = .{ .identity = input.identity, .index = input.index, .type = input.type, .source = input.source, .target = input.target, .ownership = input.ownership, .producer = input.producer, .properties = input.properties.map, .native = if (input.native) |native| .{ .weight = native.weight, .created_at = try std.fmt.parseUnsigned(u64, native.created_at, 10), .updated_at = try std.fmt.parseUnsigned(u64, native.updated_at, 10) } else .{} };
+            break :result .{ .relationship = relationship };
+        },
+        // Paths are uncommon on the owner data plane. Retain the shared strict
+        // adjacency validator instead of duplicating its contract here.
+        .path => try decodePayload(a, kind, try std.json.innerParse(std.json.Value, a, source, options), depth),
+    };
+    try expectToken(source, .object_end);
+    return result;
+}
+
+fn parseEntity(comptime T: type, a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions, depth: usize) !T {
+    var structural = options;
+    structural.allocate = .alloc_if_needed;
+    try expectToken(source, .object_begin);
+    var result: T = undefined;
+    const fields = @typeInfo(T).@"struct";
+    var seen: [fields.field_names.len]bool = @splat(false);
+    while (try source.peekNextTokenType() != .object_end) {
+        const name = try parseText(a, source, structural);
+        var matched = false;
+        inline for (fields.field_names, fields.field_types, 0..) |name_zig, Field, index| {
+            if (std.mem.eql(u8, name, name_zig)) {
+                if (seen[index]) return error.InvalidCypherWireValue;
+                seen[index] = true;
+                matched = true;
+                @field(result, name_zig) = if (comptime std.mem.eql(u8, name_zig, "properties")) try parseTyped(a, source, options, depth + 1) else try std.json.innerParse(Field, a, source, options);
+            }
+        }
+        if (!matched) return error.InvalidCypherWireValue;
+    }
+    try expectToken(source, .object_end);
+    inline for (fields.field_names, fields.field_types, fields.field_attrs, 0..) |name_zig, Field, attrs, index| {
+        if (!seen[index]) {
+            if (attrs.defaultValue(Field)) |default| @field(result, name_zig) = default else return error.InvalidCypherWireValue;
+        }
+    }
+    return result;
+}
+
+fn decodePayload(a: std.mem.Allocator, kind: []const u8, payload: std.json.Value, depth: usize) !v.Value {
+    var envelope: std.json.ObjectMap = .empty;
+    defer envelope.deinit(a);
+    try envelope.put(a, "type", .{ .string = kind });
+    try envelope.put(a, "value", payload);
+    return decode(a, .{ .object = envelope }, depth, true);
+}
 
 /// A native metadata key alone is never a wire discriminator. Recognize only
 /// the complete private envelope emitted by mutations.build; all other objects
@@ -248,4 +380,35 @@ test "private owner transport retains native attributes without exposing them in
             try std.testing.expectEqualDeep(r.native, cloned.native);
         }
     }
+}
+
+test "typed owner decoder matches version one values and rejects malformed envelopes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n: v.Node = .{ .identity = .{ .table = "docs", .key = "a" }, .labels = &.{"D"}, .properties = &.{.{ .name = "type", .value = .{ .list = &.{ .null, .{ .integer = std.math.minInt(i64) }, .{ .string = "escaped\nvalue" } } } }} };
+    const r: v.Relationship = .{ .identity = .{ .table = "docs", .key = "edge" }, .index = "links", .type = "LINK", .source = n.identity, .target = n.identity, .ownership = .document, .producer = n.identity, .native = .{ .weight = 3.5, .created_at = std.math.maxInt(u64), .updated_at = 9007199254740993 } };
+    for ([_]v.Value{ .null, .{ .boolean = true }, .{ .number = 1.5 }, .{ .node = &n }, .{ .relationship = &r }, .{ .path = .{ .nodes = &.{ &n, &n }, .relationships = &.{&r} } } }) |value| {
+        const encoded = try std.json.Stringify.valueAlloc(a, Value{ .value = value, .include_native = true }, .{});
+        const direct = try std.json.parseFromSliceLeaky(Value, a, encoded, .{ .allocate = .alloc_always });
+        const dom = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{});
+        const canonical = try transport(a, dom);
+        try std.testing.expect(v.Value.eql(canonical, direct.value));
+        if (value == .relationship) try std.testing.expectEqualDeep(value.relationship.native, direct.value.relationship.native);
+    }
+    const reversed = try std.json.parseFromSliceLeaky(Value, a, "{\"value\":\"9223372036854775807\",\"type\":\"integer\"}", .{});
+    try std.testing.expectEqual(std.math.maxInt(i64), reversed.value.integer);
+    for ([_][]const u8{
+        "{\"type\":\"number\",\"value\":\"1.0\"}",
+        "{\"type\":\"string\",\"value\":[97]}",
+        "{\"type\":\"integer\",\"value\":[49]}",
+        "{\"type\":[110,117,108,108],\"value\":null}",
+        "{\"type\":\"null\",\"value\":null,\"extra\":1}",
+        "{\"type\":\"map\",\"value\":{\"a\":{\"type\":\"null\",\"value\":null},\"a\":{\"type\":\"null\",\"value\":null}}}",
+        "{\"type\":\"node\",\"value\":{\"identity\":{\"table\":\"docs\",\"key\":\"\"},\"labels\":[],\"properties\":{\"type\":\"map\",\"value\":{}}}}",
+        "{\"type\":\"integer\",\"value\":\"9223372036854775808\"}",
+    }) |encoded| try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(Value, a, encoded, .{}));
+    var nested = try a.dupe(u8, "{\"type\":\"null\",\"value\":null}");
+    for (0..65) |_| nested = try std.fmt.allocPrint(a, "{{\"type\":\"list\",\"value\":[{s}]}}", .{nested});
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(Value, a, nested, .{}));
 }

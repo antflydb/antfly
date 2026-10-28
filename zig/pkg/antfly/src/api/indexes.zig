@@ -1160,7 +1160,7 @@ fn appendIndexStatusWithIdentity(
     const coverage_generation = if (runtime_identity) |identity| identity.incarnation else 0;
     const coverage_config_hash = if (runtime_identity) |identity| identity.config_hash else 0;
     var source_name_buffer: [64][]const u8 = undefined;
-    const configured_sources = configuredArtifactSourceNames(config, index_type, &source_name_buffer);
+    const configured_sources = configuredArtifactSourceNames(index_name, config, index_type, &source_name_buffer);
     try out.appendSlice(alloc, "{\"config\":");
     try appendIndexConfig(alloc, out, index_name, config);
     try out.appendSlice(alloc, ",\"status\":");
@@ -1170,7 +1170,7 @@ fn appendIndexStatusWithIdentity(
     try out.append(alloc, '}');
 }
 
-fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexType, buffer: *[64][]const u8) []const []const u8 {
+fn configuredArtifactSourceNames(index_name: []const u8, config: std.json.Value, index_type: ApiIndexType, buffer: *[64][]const u8) []const []const u8 {
     if (config != .object) return &.{};
     var count: usize = 0;
     if (config.object.get("sources")) |sources| if (sources == .array) {
@@ -1199,6 +1199,15 @@ fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexTyp
             buffer[0] = artifact.string;
             return buffer[0..1];
         }
+    }
+    // Inline embedders produce an implicit same-name artifact. Its replay and
+    // producer closure are real completion fences, including on empty tables.
+    // External/direct-field indexes have no such producer dependency.
+    if (index_type == .embeddings and embeddingsCoveragePolicy(config) != .external) {
+        if (config.object.get("embedder")) |embedder| if (embedder == .object) {
+            buffer[0] = index_name;
+            return buffer[0..1];
+        };
     }
     return &.{};
 }
@@ -7608,13 +7617,59 @@ fn consumerTests() type {
             );
             defer parsed.deinit();
             var names_buffer: [64][]const u8 = undefined;
-            const names = configuredArtifactSourceNames(parsed.value, .embeddings, &names_buffer);
+            const names = configuredArtifactSourceNames("vectors", parsed.value, .embeddings, &names_buffer);
             var out = std.ArrayListUnmanaged(u8).empty;
             defer out.deinit(std.testing.allocator);
             try appendMinimalIndexRuntimeStatus(std.testing.allocator, &out, .embeddings, names);
             try std.testing.expect(std.mem.indexOf(u8, out.items, "\"artifact\":\"document_vectors\",\"state\":\"pending\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, out.items, "\"artifact\":\"chunk_vectors\",\"state\":\"pending\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, out.items, "\"source_observation_incomplete\"") != null);
+        }
+
+        test "api index status preserves inline embedding source publication debt" {
+            const a = std.testing.allocator;
+            var config = try std.json.parseFromSlice(std.json.Value, a,
+                \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"test"}}
+            , .{});
+            defer config.deinit();
+            var sources = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "semantic_idx", .target_sequence = 1 }};
+            var indexes = [_]db_mod.types.DBIndexStats{.{
+                .name = "semantic_idx",
+                .kind = .dense_vector,
+                .serving_snapshot_ready = true,
+                .publication_target_ready = true,
+                .coverage_generation = 42,
+                .coverage_config_hash = 99,
+                .coverage_identity_ready = true,
+                .coverage_summary_ready = true,
+                .source_replay = &sources,
+            }};
+            var items = [_]runtime_status.LocalTableRuntimeStatus{
+                .{ .group_id = 1, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = &indexes } },
+                .{ .group_id = 2, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = &indexes } },
+            };
+            var statuses: runtime_status.LocalTableRuntimeStatuses = .{ .items = &items };
+            var lookup = try RuntimeStatusLookup.init(a, &.{ 1, 2 }, &statuses);
+            defer lookup.deinit();
+            // Empty cardinality must not erase either replay or producer debt.
+            for (0..3) |phase| {
+                sources[0].published_sequence = if (phase == 0) 0 else 1;
+                sources[0].producer_complete = phase != 1;
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                defer out.deinit(a);
+                try appendIndexStatusWithIdentity(a, &out, "semantic_idx", config.value, .{ .incarnation = 42, .config_hash = 99 }, &.{ 1, 2 }, &statuses, &lookup);
+                var parsed = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+                defer parsed.deinit();
+                const aggregate = parsed.value.object.get("status").?.object;
+                const readiness = aggregate.get("readiness").?.object;
+                try std.testing.expectEqual(phase == 2, readiness.get("complete").?.bool);
+                try std.testing.expectEqual(@as(usize, 1), readiness.get("sources").?.array.items.len);
+                try std.testing.expectEqual(phase == 2, aggregate.get("milestones").?.object.get("complete").?.object.get("reached").?.bool);
+                for ([_][]const u8{ "1", "2" }) |group| {
+                    const shard = parsed.value.object.get("shard_status").?.object.get(group).?.object;
+                    try std.testing.expectEqual(phase == 2, shard.get("readiness").?.object.get("complete").?.bool);
+                }
+            }
         }
 
         test "index encoders expose metadata-backed configs" {

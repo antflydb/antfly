@@ -1292,3 +1292,46 @@ def test_native_metadata_and_prefixed_edge_ids_survive_cypher_updates(require_na
         assert native_attributes(database) == [(4.5, 123, 456), (5.5, 124, 457)]
         database.cypher_json("g", {"query": "MATCH ()-[r:R]->() DELETE r"})
         assert database.cypher_json("g", {"query": "MATCH ()-[r:R]->() RETURN count(r)"})["rows"][0][0]["value"] == "0"
+
+
+@pytest.mark.parametrize("separate_connection", [False, True])
+def test_concurrent_cypher_reads_keep_one_cut_while_sql_publishes(require_native, aflite_path, separate_connection):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import nullcontext
+    from threading import Barrier
+
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (amount BIGINT)")
+        for index in range(16):
+            database.sql(f"INSERT INTO docs (_id,amount) VALUES ('{index}',0)")
+        database.graph_catalog_json(
+            {"action": "put", "name": "g", "definition": {"labels": [{"name": "D", "table": "docs"}]}}
+        )
+        with af.open_hosted(aflite_path) if separate_connection else nullcontext(database) as reader:
+            barrier = Barrier(3)
+
+            def read_snapshot():
+                barrier.wait(timeout=20)
+                return reader.cypher_json(
+                    "g",
+                    {
+                        "query": "MATCH (n:D) WITH collect(DISTINCT n.amount) AS amounts,count(n) AS total "
+                        "UNWIND range(1,5000) AS x RETURN amounts,total,max(toString(x))"
+                    },
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(read_snapshot) for _ in range(2)]
+                barrier.wait(timeout=20)
+                for amount in range(1, 5):
+                    database.sql(f"UPDATE docs SET amount={amount}")
+                for future in futures:
+                    row = future.result(timeout=30)["rows"][0]
+                    assert row[0]["type"] == "list"
+                    assert len(row[0]["value"]) == 1
+                    assert 0 <= int(row[0]["value"][0]["value"]) <= 4
+                    assert row[1] == {"type": "integer", "value": "16"}
+            assert database.cypher_json("g", {"query": "MATCH (n:D) RETURN sum(n.amount)"})["rows"][0][0] == {
+                "type": "integer",
+                "value": "64",
+            }

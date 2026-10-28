@@ -39,7 +39,7 @@ fn failureScope(out: *h.capi.Buffer, err: anyerror, diagnostic: cypher.compiler.
         error.CatalogGenerationChanged, error.CypherTransactionConflict, error.CypherWriteRequestAlreadyUsed, error.VersionConflict, error.SqlWriteConflict => .version_conflict,
         error.SqlMutationOutcomeUnknown => .outcome_unknown,
         error.OutOfMemory => .internal,
-        error.CypherMemoryBudgetExceeded, error.CypherSnapshotNotReady => .busy,
+        error.CypherMemoryBudgetExceeded, error.CypherSnapshotNotReady, error.WouldBlock, error.FileBusy => .busy,
         error.ReadOnly => .unsupported,
         else => .invalid_argument,
     };
@@ -64,15 +64,71 @@ pub fn antfly_db_graph_catalog_json(raw: ?*anyopaque, request: h.capi.Slice, out
 }
 pub fn antfly_db_cypher_json(raw: ?*anyopaque, name: h.capi.Slice, request: h.capi.Slice, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
     out.* = .{};
-    const guard = api.enterHandle(raw, .exclusive) orelse return .invalid_argument;
+    var guard = api.enterHandle(raw, .exclusive) orelse return .invalid_argument;
     defer guard.leave();
     if (guard.entry_error) |code| return code;
     if (!available(guard.handle)) return .unsupported;
     var diagnostic: cypher.compiler.Diagnostic = .{};
     var scope: @import("cypher_write.zig").Scope = .{};
-    execute(guard.handle, name.bytes(), request.bytes(), out, &diagnostic, &scope) catch |err| return failureScope(out, err, diagnostic, scope);
+    var finish_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer finish_arena.deinit();
+    var execution: DetachedRead = .{ .guard = &guard, .allocator = finish_arena.allocator() };
+    executeInternal(guard.handle, name.bytes(), request.bytes(), out, &diagnostic, &scope, &execution) catch |err| return failureScope(out, err, diagnostic, scope);
+    if (execution.graph != null) {
+        // All old-root leases, watches and pinned cuts have been released by
+        // executeInternal before resume can collect the retired root.
+        if (!guard.resumeAccess(raw, .exclusive)) {
+            api.antfly_buffer_free(out);
+            return .invalid_argument;
+        }
+        if (guard.entry_error) |code| {
+            api.antfly_buffer_free(out);
+            return code;
+        }
+        execution.validate(guard.handle) catch |err| {
+            api.antfly_buffer_free(out);
+            return failureScope(out, err, diagnostic, scope);
+        };
+    }
     return .ok;
 }
+
+const DetachedRead = struct {
+    guard: *api.HandleGuard,
+    allocator: A,
+    graph: ?cypher.catalog.Graph = null,
+    owners: []const struct { table_id: u64, schema_version: u32 } = &.{},
+
+    fn detach(self: *@This(), handle: *h.Handle, graph: cypher.catalog.Graph) !void {
+        if (self.guard.connection == null) return;
+        self.graph = try graph.clone(self.allocator);
+        const owners = try self.allocator.alloc(@typeInfo(@TypeOf(self.owners)).pointer.child, graph.labels.len);
+        for (graph.labels, owners) |label, *owner| {
+            const db = try @import("tables.zig").get(handle, label.table);
+            owner.* = .{ .table_id = db.core.identity_namespace.table_id, .schema_version = if (db.core.schema) |schema| schema.version else 0 };
+        }
+        self.owners = owners;
+        self.guard.suspendImmutableQuery();
+    }
+
+    fn validate(self: *@This(), handle: *h.Handle) !void {
+        const graph = self.graph.?;
+        const current = catalog.get(self.allocator, handle, graph.name) catch |err| switch (err) {
+            error.CatalogNotFound => return error.CatalogGenerationChanged,
+            else => return err,
+        };
+        if (current.incarnation != graph.incarnation or current.revision != graph.revision) return error.CatalogGenerationChanged;
+        try catalog.validateOwners(self.allocator, handle, graph);
+        var root = try handle.db.acquireCypherReadAuthority(self.allocator, "", "default");
+        defer root.release();
+        for (graph.labels, self.owners) |label, owner| {
+            const db = try @import("tables.zig").get(handle, label.table);
+            if (db.core.identity_namespace.table_id != owner.table_id or (if (db.core.schema) |schema| schema.version else 0) != owner.schema_version) return error.CatalogGenerationChanged;
+            var lease = try db.acquireCypherReadAuthority(self.allocator, "", "default");
+            defer lease.release();
+        }
+    }
+};
 
 pub fn antfly_db_graph_write_status_json(raw: ?*anyopaque, transaction_id: h.capi.Slice, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
     out.* = .{};
@@ -103,6 +159,8 @@ pub const Read = struct {
     watch_arena: ?std.heap.ArenaAllocator = null,
     expiry_seconds: ?i64 = null,
     deadline_ns: ?u64 = null,
+    detached: ?*DetachedRead = null,
+    detach_after_ns: ?u64 = null,
     partial_graph: bool = false,
     handle: *h.Handle,
     graph: cypher.catalog.Graph,
@@ -141,6 +199,8 @@ pub const Read = struct {
         if (self.watch_arena) |*arena| arena.deinit();
         self.watch_arena = null;
         self.checked_authority = null;
+        self.detached = null;
+        self.detach_after_ns = null;
     }
     pub fn pin(self: *Read, a: A, owners: []const *DB, fences: []const DB.StatementReadFence) !void {
         self.pin_arena = std.heap.ArenaAllocator.init(a);
@@ -189,9 +249,35 @@ pub const Read = struct {
     pub fn pinnedBackend(self: *Read) cypher.backend.Backend {
         return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .scan_ordered = pinnedScanOrdered, .estimate_where = pinnedEstimateWhere, .get = pinnedGet, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
     }
+    fn readCallResult(comptime Callback: type) type {
+        const Function = switch (@typeInfo(Callback)) {
+            .pointer => |pointer| pointer.child,
+            .@"fn" => Callback,
+            else => @compileError("expected a read callback"),
+        };
+        return @typeInfo(Function).@"fn".return_type.?;
+    }
+    /// A detached reader can meet a short native publication/rewrite window.
+    /// Retry only that operation on the same pinned cut, retaining its work and
+    /// memory charges. Mutation statements keep their original error behavior.
+    fn retryRead(self: *Read, callback: anytype, args: anytype) readCallResult(@TypeOf(callback)) {
+        var expires: ?u64 = null;
+        while (true) {
+            return @call(.auto, callback, args) catch |err| {
+                if (self.detached == null or (err != error.WouldBlock and err != error.FileBusy)) return err;
+                const now = @import("antfly_platform").time.monotonicNs();
+                if (expires == null) expires = now +| 100 * std.time.ns_per_ms;
+                if (now >= expires.?) return error.CypherSnapshotNotReady;
+                try checkpoint(self);
+                const io = self.handle.db.backend_runtime.io() orelse return err;
+                try io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            };
+        }
+    }
     fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
         const backend = cast(ptr).pinned_adapter.backend();
-        try backend.vtable.bind(backend.ptr, a, graph);
+        try cast(ptr).retryRead(backend.vtable.bind, .{ backend.ptr, a, graph });
     }
     fn pinnedReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         const backend = cast(ptr).pinned_adapter.backend();
@@ -203,31 +289,31 @@ pub const Read = struct {
     }
     fn pinnedScan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
         const backend = cast(ptr).pinned_adapter.backend();
-        return backend.vtable.scan(backend.ptr, a, table, after, limit);
+        return cast(ptr).retryRead(backend.vtable.scan, .{ backend.ptr, a, table, after, limit });
     }
     fn pinnedScanOrdered(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, order: []const cypher.backend.PropertyOrder, after: ?[]const u8, limit: usize, max_examined: usize) !?cypher.backend.Page(*const cypher.value.Node) {
         const backend = cast(ptr).pinned_adapter.backend();
-        return backend.vtable.scan_ordered.?(backend.ptr, a, table, filters, order, after, limit, max_examined);
+        return cast(ptr).retryRead(backend.vtable.scan_ordered.?, .{ backend.ptr, a, table, filters, order, after, limit, max_examined });
     }
     fn pinnedScanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
         const backend = cast(ptr).pinned_adapter.backend();
-        return backend.vtable.scan_where.?(backend.ptr, a, table, filters, after, limit);
+        return cast(ptr).retryRead(backend.vtable.scan_where.?, .{ backend.ptr, a, table, filters, after, limit });
     }
     fn pinnedEstimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, limit: usize) !?usize {
         const backend = cast(ptr).pinned_adapter.backend();
-        return if (backend.vtable.estimate_where) |estimate| try estimate(backend.ptr, a, table, filters, limit) else null;
+        return if (backend.vtable.estimate_where) |estimate| try cast(ptr).retryRead(estimate, .{ backend.ptr, a, table, filters, limit }) else null;
     }
     fn pinnedGet(ptr: *anyopaque, a: A, identity: cypher.value.Identity) !?*const cypher.value.Node {
         const backend = cast(ptr).pinned_adapter.backend();
-        return backend.vtable.get(backend.ptr, a, identity);
+        return cast(ptr).retryRead(backend.vtable.get, .{ backend.ptr, a, identity });
     }
     fn pinnedExpandBetween(ptr: *anyopaque, a: A, mapping: cypher.catalog.Relationship, identity: cypher.value.Identity, peer: cypher.value.Identity, direction: cypher.ast.Direction, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize, max_examined: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
         const backend = cast(ptr).pinned_adapter.backend();
-        return backend.vtable.expand_between.?(backend.ptr, a, mapping, identity, peer, direction, filters, after, limit, max_examined);
+        return cast(ptr).retryRead(backend.vtable.expand_between.?, .{ backend.ptr, a, mapping, identity, peer, direction, filters, after, limit, max_examined });
     }
     fn pinnedExpand(ptr: *anyopaque, a: A, mapping: cypher.catalog.Relationship, identity: cypher.value.Identity, direction: cypher.ast.Direction, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
         const backend = cast(ptr).pinned_adapter.backend();
-        return backend.vtable.expand(backend.ptr, a, mapping, identity, direction, after, limit);
+        return cast(ptr).retryRead(backend.vtable.expand, .{ backend.ptr, a, mapping, identity, direction, after, limit });
     }
     fn cast(ptr: *anyopaque) *Read {
         return @ptrCast(@alignCast(ptr));
@@ -243,6 +329,13 @@ pub const Read = struct {
         const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s;
         if (self.expiry_seconds) |expiry| if (now > expiry) return error.RowPolicyAuthenticationRequired;
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.RowPolicyAuthenticationRequired;
+        // Keep inexpensive reads on the admission fast path. Longer reads
+        // yield at an ordinary runtime/encoding checkpoint, after their data
+        // cuts are ready. This also runs before the cached authority return.
+        if (self.detach_after_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) {
+            self.detach_after_ns = null;
+            try self.detached.?.detach(self.handle, self.graph);
+        };
         const stamp = if (self.watch_arena != null) self.cohort.stable() else null;
         if (stamp != null and self.checked_authority == stamp) return;
         for (self.leases) |*lease| try lease.checkAt(@intCast(now));
@@ -279,6 +372,10 @@ pub const Read = struct {
 };
 
 pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.capi.Buffer, diagnostic: *cypher.compiler.Diagnostic, scope: *@import("cypher_write.zig").Scope) !void {
+    return executeInternal(handle, name, json, out, diagnostic, scope, null);
+}
+
+fn executeInternal(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.capi.Buffer, diagnostic: *cypher.compiler.Diagnostic, scope: *@import("cypher_write.zig").Scope, detached: ?*DetachedRead) !void {
     if (handle.sql_decision_uncertain) return error.SqlMutationOutcomeUnknown;
     var arena = std.heap.ArenaAllocator.init(handle.alloc);
     defer arena.deinit();
@@ -374,6 +471,10 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
     }
     for (fences[0..held]) |*fence| fence.release();
     held = 0;
+    if (!writes) if (detached) |execution| if (execution.guard.connection != null) {
+        read.detached = execution;
+        read.detach_after_ns = @import("antfly_platform").time.monotonicNs() +| std.time.ns_per_ms;
+    };
     var writer: @import("cypher_write.zig").Writer = .{ .read = &read, .guards = guards, .scope = scope, .request_id = request.write_request_id };
     var overlay: cypher.transaction.Overlay = .{ .lazy = true, .retain_scan_preimages = true, .base = read.pinnedBackend(), .host = writer.host(), .max_entities = request.limits.intermediate_states, .max_anchors = request.limits.scanned_anchors, .max_edges = request.limits.explored_edges };
     writer.overlay = &overlay;
@@ -527,4 +628,116 @@ test "capi embedded graph catalog and query retain table identities across reope
         api.antfly_buffer_free(&output);
         try std.testing.expectEqual(h.capi.ErrorCode.ok, antfly_db_graph_write_status_json(handle, .fromSlice(write_id), &output));
     }
+}
+
+test "capi embedded graph producer cardinality proves emptiness at the pinned cut" {
+    const a = std.testing.allocator;
+    var directory = try api.TestDirectory.init("empty-source-cut");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/empty.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var raw: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_create_hosted(path, &raw));
+    defer api.antfly_db_close(raw);
+    var guard = api.enterHandle(raw, .exclusive).?;
+    defer guard.leave();
+    const store = guard.handle.db.core.store;
+    const counts = @import("../storage/db/range_cardinality.zig");
+    var empty = try store.beginReadTxn();
+    defer empty.abort();
+    try std.testing.expectEqual(@as(?u64, 0), try counts.loadOrProveEmptyFromTxn(&empty));
+    // A legacy user row without a counter is unknown, never an empty proof.
+    try store.put("\x01legacy", "{}");
+    var legacy = try store.beginReadTxn();
+    defer legacy.abort();
+    try std.testing.expectEqual(@as(?u64, null), try counts.loadOrProveEmptyFromTxn(&legacy));
+    try std.testing.expectEqual(@as(?u64, 0), try counts.loadOrProveEmptyFromTxn(&empty));
+    var one: [8]u8 = undefined;
+    std.mem.writeInt(u64, &one, 1, .little);
+    try store.put(&@import("../storage/internal_keys.zig").range_document_count_key, &one);
+    var current = try store.beginReadTxn();
+    defer current.abort();
+    try std.testing.expectEqual(@as(?u64, 1), try counts.loadOrProveEmptyFromTxn(&current));
+    try std.testing.expectEqual(@as(?u64, null), try counts.loadOrProveEmptyFromTxn(&legacy));
+}
+
+test "capi embedded graph detached reads retain roots and revalidate replacement tables" {
+    const a = std.testing.allocator;
+    var directory = try api.TestDirectory.init("detached-graph");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/graph.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var raw: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_create_hosted(path, &raw));
+    defer api.antfly_db_close(raw);
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(raw, .fromSlice("{\"statement\":\"CREATE TABLE docs (id TEXT)\"}"), &output));
+    api.antfly_buffer_free(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, antfly_db_graph_catalog_json(raw, .fromSlice("{\"action\":\"put\",\"name\":\"g\",\"definition\":{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"relationships\":[]}}"), &output));
+    api.antfly_buffer_free(&output);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var guard = api.enterHandle(raw, .exclusive).?;
+    defer guard.leave();
+    const graph = try catalog.graph(arena.allocator(), try catalog.get(arena.allocator(), guard.handle, "g"));
+    const original = guard.handle;
+    var read: DetachedRead = .{ .guard = &guard, .allocator = arena.allocator() };
+    {
+        var root_lease = try guard.handle.db.acquireCypherReadAuthority(arena.allocator(), "", "default");
+        defer root_lease.release();
+        var checkpoints: Read = .{ .handle = guard.handle, .graph = graph, .owners = &.{}, .leases = &.{}, .tables = &.{}, .schemas = &.{}, .root_lease = &root_lease, .detached = &read, .detach_after_ns = std.math.maxInt(u64) };
+        try checkpoints.watch(arena.allocator());
+        defer checkpoints.unwatch();
+        try Read.checkpoint(&checkpoints);
+        try std.testing.expect(read.graph == null and guard.suspended_query_root == null);
+        const Contention = struct {
+            calls: usize = 0,
+            fn attempt(ptr: *@This()) anyerror!u32 {
+                ptr.calls += 1;
+                if (ptr.calls < 3) return error.WouldBlock;
+                return 42;
+            }
+        };
+        var contention: Contention = .{};
+        checkpoints.detached = null;
+        try std.testing.expectError(error.WouldBlock, checkpoints.retryRead(Contention.attempt, .{&contention}));
+        try std.testing.expectEqual(@as(usize, 1), contention.calls);
+        checkpoints.detached = &read;
+        contention.calls = 0;
+        try std.testing.expectEqual(@as(u32, 42), try checkpoints.retryRead(Contention.attempt, .{&contention}));
+        try std.testing.expectEqual(@as(usize, 3), contention.calls);
+        // Expiry is deterministic and must yield even with a certified cohort.
+        checkpoints.detach_after_ns = 0;
+        try Read.checkpoint(&checkpoints);
+        try std.testing.expect(read.graph != null and guard.suspended_query_root == original);
+    }
+    try std.testing.expect(original.owned_lite_backend.?.native_docstore.?.read_only);
+    try std.testing.expect(original.owned_lite_backend.?.native_docstore.?.file.read_only);
+    try std.testing.expect(guard.resumeAccess(raw, .exclusive));
+    try std.testing.expect(guard.entry_error == null);
+    // Sequential queries reuse the serving root rather than reopening the file.
+    try std.testing.expectEqual(original, guard.handle);
+    try std.testing.expect(!guard.handle.owned_lite_backend.?.native_docstore.?.read_only);
+    try std.testing.expect(!guard.handle.owned_lite_backend.?.native_docstore.?.file.read_only);
+    try read.validate(guard.handle);
+    try read.detach(guard.handle, graph);
+    {
+        var concurrent = api.enterHandle(raw, .exclusive).?;
+        defer concurrent.leave();
+        try std.testing.expect(concurrent.entry_error == null);
+        try std.testing.expect(concurrent.handle != original);
+        try std.testing.expectEqual(@as(usize, 1), original.immutable_query_borrows);
+        try std.testing.expectEqual(graph.labels.len, original.embedded_tables.count());
+    }
+    // DDL through the same public connection must not alter the borrowed root.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("tables.zig").antfly_db_drop_table(raw, .fromSlice("docs")));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(raw, .fromSlice("{\"statement\":\"CREATE TABLE docs (id TEXT)\"}"), &output));
+    const old_table = try @import("tables.zig").get(original, "docs");
+    try std.testing.expectEqual(read.owners[0].table_id, old_table.core.identity_namespace.table_id);
+    try std.testing.expect(guard.resumeAccess(raw, .exclusive));
+    try std.testing.expect(guard.entry_error == null);
+    try std.testing.expectError(error.CatalogGenerationChanged, read.validate(guard.handle));
 }

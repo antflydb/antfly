@@ -512,7 +512,14 @@ def test_cypher_receipt_recovers_owner_loss_during_index_visibility(
     transaction_id = uuid.uuid4().hex
     created_table = created_graph = crashed = False
 
-    def call(path, body=None, method="POST", accepted=(200, 201, 202, 204), timeout=30):
+    def call(
+        path,
+        body=None,
+        method="POST",
+        accepted=(200, 201, 202, 204),
+        timeout=30,
+        retry_aborted=False,
+    ):
         request = urllib.request.Request(
             base + "/db/v1" + path,
             data=None if body is None else json.dumps(body).encode(),
@@ -531,7 +538,14 @@ def test_cypher_receipt_recovers_owner_loss_during_index_visibility(
                 code, content = error.code, error.read()
             if (
                 code not in accepted
-                and retry_allowed(code, content, path=path, body=body)
+                and (
+                    retry_allowed(code, content, path=path, body=body)
+                    or (
+                        retry_aborted
+                        and code == 409
+                        and content == b"batch transaction conflicted"
+                    )
+                )
                 and time.monotonic() < deadline
             ):
                 time.sleep(0.2)
@@ -573,6 +587,9 @@ def test_cypher_receipt_recovers_owner_loss_during_index_visibility(
                 "sync_level": "full_index",
                 "inserts": {"a": {"id": "a", "body": "alpha concept"}},
             },
+            # Fixture seeding precedes fault injection. This response denotes
+            # a definite prepare abort, unlike an admitted/unknown CREATE.
+            retry_aborted=True,
         )
         call(
             f"/graphs/{graph}",

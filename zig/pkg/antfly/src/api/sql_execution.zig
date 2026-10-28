@@ -2050,7 +2050,7 @@ pub const Adapter = struct {
         owner.authority = .{ .server = self.server, .identity = self.identity, .context = self.context, .name = graph.graph.name, .record_id = graph.graph.incarnation, .tables = inputs, .writes = false, .read = &owner.read, .role_revision = role_revision };
         owner.authority.catalog_guard = .{ .ptr = owner, .call = GraphStatement.validateCatalog };
         const authority = &owner.authority;
-        var client: cypher.rpc.Client = .{ .channel = .{ .ptr = authority, .call = @import("graph_execution.zig").AuthorityChannel.invoke, .checkpoint = @import("graph_execution.zig").AuthorityChannel.checkpoint }, .incarnation = graph.graph.incarnation, .revision = graph.graph.revision };
+        var client: cypher.rpc.Client = .{ .channel = .{ .ptr = authority, .call = @import("graph_execution.zig").AuthorityChannel.invoke, .typed = @import("graph_execution.zig").AuthorityChannel.invokeTyped, .checkpoint = @import("graph_execution.zig").AuthorityChannel.checkpoint }, .incarnation = graph.graph.incarnation, .revision = graph.graph.revision };
         if (self.range_reads) |observed| {
             const body = try std.json.Stringify.valueAlloc(owned, cypher.rpc.Request{ .operation = .observe_ranges, .graph_incarnation = graph.graph.incarnation, .graph_revision = graph.graph.revision }, .{});
             const bytes = try client.channel.call(client.channel.ptr, owned, body);
@@ -2086,6 +2086,11 @@ pub const Adapter = struct {
             for (entry.batch.deletes) |key| try staged_rows.append(owned, .{ .identity = .{ .table = physical, .key = key }, .document_json = null });
             for (entry.batch.writes) |write| try staged_rows.append(owned, .{ .identity = .{ .table = physical, .key = write.key }, .document_json = write.value, .json_null_fields = write.json_null_fields });
         };
+        // Cursor construction can eagerly execute a non-streaming graph plan.
+        // Its internal RPCs share the same bounded guard as later page pulls.
+        try authority.validateAuthority(true);
+        authority.guarded_operation = true;
+        defer authority.guarded_operation = false;
         for (requests, owner.cursors) |request, *out| {
             try self.verify(owned, request.table);
             const child: catalog.Cursor = if (request.table.graph) |binding| blk: {
@@ -2145,6 +2150,8 @@ pub const Adapter = struct {
             out.* = .{ .order_satisfied = child.order_satisfied, .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null, .enable_weights = if (child.enable_weights != null) GraphStatementCursor.enableWeights else null, .enable_groups = if (child.enable_groups != null) GraphStatementCursor.enableGroups else null, .enable_aggregate_weights = if (child.enable_aggregate_weights != null) GraphStatementCursor.enableAggregateWeights else null };
             owner.opened += 1;
         }
+        authority.guarded_operation = false;
+        try authority.validateAuthority(true);
         // All allocations through the local arena must finish before its
         // final state moves into the statement owner.
         owner.arena = arena;

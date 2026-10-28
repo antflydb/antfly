@@ -7529,8 +7529,8 @@ test "transaction graph effects preserve clone merge and durable encoding" {
     var copy = try original.clone(a);
     defer copy.deinit(a);
     const tables = try copy.distributedTables(a);
-    defer a.free(tables);
-    try std.testing.expectEqual(@as(usize, 1), tables[0].graph_writes.len);
+    defer tables.deinit();
+    try std.testing.expectEqual(@as(usize, 1), tables.tables[0].graph_writes.len);
     const encoded = try encodeCommitRequest(a, copy);
     defer a.free(encoded);
     var restored = try parseCommitRequest(a, encoded);

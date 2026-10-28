@@ -44,9 +44,18 @@ def test_cypher_semantic_and_hybrid_owner_cut_search(
                 },
             },
         )
-        backup_api.wait_index_ready(
+        empty_status = backup_api.wait_index_ready(
             table, "semantic_idx", timeout_s=30, until="complete"
         )
+        # An empty vector target still needs a producer-completion proof.
+        # Check the aggregate and every owner so dropping an implicit source
+        # from the public contract cannot make this wait pass spuriously.
+        detail = backup_api.get_index(table, "semantic_idx")
+        for status in (empty_status, *detail["shard_status"].values()):
+            sources = status["readiness"]["sources"]
+            assert len(sources) == 1, status
+            assert sources[0]["artifact"] == "semantic_idx", status
+            assert sources[0]["complete"] is True, status
         backup_api.batch_write(
             table,
             inserts={

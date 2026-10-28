@@ -338,6 +338,10 @@ var test_before_dense_posting_coverage: ?struct {
     ctx: *anyopaque,
     call: *const fn (*anyopaque) anyerror!void,
 } = null;
+var test_before_native_backup_file_pins: ?struct {
+    ctx: *anyopaque,
+    call: *const fn (*anyopaque) anyerror!void,
+} = null;
 const sparse_backfill_batch_size: usize = 1024;
 const vector_backfill_page_items: usize = 1024;
 const vector_backfill_page_bytes: usize = 16 * 1024 * 1024;
@@ -1419,6 +1423,10 @@ pub const IndexManager = struct {
     primary_lsm_backend: ?*lsm_backend_mod.Backend = null,
     applied_sequence_checkpoint_path: ?[]const u8,
     vector_block_generation_mu: std.atomic.Mutex = .unlocked,
+    // Captures retain manifest-named files before checkpoint publication can
+    // retire them. This gate excludes only handoffs, never query readers or
+    // detached checkpoint construction.
+    native_backup_pin_mu: std.atomic.Mutex = .unlocked,
     vector_block_build_mu: std.atomic.Mutex = .unlocked,
     // A snapshot builder writes its reserved immutable generation without
     // holding vector_block_build_mu. WAL appends remain online, while this bit
@@ -4426,6 +4434,8 @@ pub const IndexManager = struct {
                 ) catch null;
             }
         };
+        self.lockAtomicWithBackoff(&self.native_backup_pin_mu);
+        defer self.native_backup_pin_mu.unlock();
         self.lockAtomicWithBackoff(&self.vector_block_generation_mu);
         const previous = self.vector_block_generation;
         self.vector_block_generation = generation;
@@ -4450,6 +4460,8 @@ pub const IndexManager = struct {
     }
 
     fn clearVectorBlockGeneration(self: *IndexManager) void {
+        self.lockAtomicWithBackoff(&self.native_backup_pin_mu);
+        defer self.native_backup_pin_mu.unlock();
         self.lockAtomicWithBackoff(&self.vector_block_generation_mu);
         const previous = self.vector_block_generation;
         self.vector_block_generation = null;
@@ -8810,6 +8822,11 @@ pub const IndexManager = struct {
         if (comptime builtin.os.tag == .freestanding) return error.Unsupported;
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        while (!self.native_backup_pin_mu.tryLock()) {
+            try cancellation.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        defer self.native_backup_pin_mu.unlock();
 
         var result = NativeBackupCheckpoints{ .alloc = self.alloc };
         errdefer result.deinit();
@@ -9093,6 +9110,7 @@ pub const IndexManager = struct {
             }
         }
         if (native_specs.items.len != 0) {
+            if (builtin.is_test) if (test_before_native_backup_file_pins) |hook| try hook.call(hook.ctx);
             result.native_files = try native_backup.pinExplicitArtifacts(
                 self.alloc,
                 io,
@@ -11104,6 +11122,8 @@ pub const IndexManager = struct {
     /// tree repair. A busy mutation owner keeps the notification pending.
     pub fn publishCompletedDensePostingCheckpoints(self: *IndexManager) !OnlineVectorBlockPublicationResult {
         var result: OnlineVectorBlockPublicationResult = .{};
+        if (!self.native_backup_pin_mu.tryLock()) return .{ .deferred = true };
+        defer self.native_backup_pin_mu.unlock();
         for (self.dense_indexes.items) |*entry| {
             if (!entry.apply_mutex.tryLock()) {
                 _ = entry.index.posting_publication_lock_deferrals.fetchAdd(1, .monotonic);
@@ -48569,6 +48589,34 @@ test "completed native publication defers to capture ownership without starting 
     try std.testing.expect(entry.index.experimentalPostingMutationCaptureActive());
     try std.testing.expectEqual(build, entry.index.experimental_posting_checkpoint_build.?);
     entry.index.cancelExperimentalPostingMutationCapture();
+
+    // A query capture shares catalog admission with already-running searches.
+    // At the exact gap between reading CURRENT and acquiring file leases, a
+    // completed checkpoint must defer instead of unlinking the selected WAL.
+    const Probe = struct {
+        manager: *IndexManager,
+        called: bool = false,
+        fn beforePins(ctx: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expect(self.manager.tryAcquireCatalogRead());
+            defer self.manager.releaseCatalogRead();
+            const result = try self.manager.publishCompletedDensePostingCheckpoints();
+            try std.testing.expect(result.deferred);
+            try std.testing.expectEqual(@as(usize, 0), result.published);
+            self.called = true;
+        }
+    };
+    var probe: Probe = .{ .manager = &manager };
+    const prior_hook = test_before_native_backup_file_pins;
+    test_before_native_backup_file_pins = .{ .ctx = &probe, .call = Probe.beforePins };
+    defer test_before_native_backup_file_pins = prior_hook;
+    const pin_root = try std.fmt.allocPrint(alloc, "{s}/capture-pins", .{path});
+    defer alloc.free(pin_root);
+    var generation = (try entry.index.nativeBackupGeneration(alloc, 1)).?;
+    defer generation.deinit();
+    var pinned = try manager.pinNativeBackupCheckpoints(runtime.io(), pin_root, 1, .none);
+    defer pinned.deinit();
+    try std.testing.expect(probe.called);
     const published = try manager.publishCompletedDensePostingCheckpoints();
     try std.testing.expectEqual(@as(usize, 1), published.published);
     try std.testing.expect(!published.deferred);
@@ -48577,6 +48625,14 @@ test "completed native publication defers to capture ownership without starting 
     try std.testing.expectEqual(@as(usize, 0), idle.published);
     try std.testing.expect(!idle.deferred);
     try std.testing.expect(entry.index.experimental_posting_checkpoint_build == null);
+    const sealed = try std.fmt.allocPrint(alloc, "{s}/captured", .{path});
+    defer alloc.free(sealed);
+    _ = try pinned.seal(runtime.io(), sealed, .none, std.math.maxInt(u64));
+    const current_path = try std.fmt.allocPrint(alloc, "{s}/indexes/completion/posting-segments/CURRENT", .{sealed});
+    defer alloc.free(current_path);
+    const captured_current = try native_backup.readFileAlloc(alloc, runtime.io(), current_path, 1024 * 1024);
+    defer alloc.free(captured_current);
+    try std.testing.expectEqualStrings(generation.current_bytes, captured_current);
 }
 
 test "read-only vector generation load preserves unpublished writer files" {

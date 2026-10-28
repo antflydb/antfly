@@ -12173,6 +12173,14 @@ const Engine = struct {
         return .{ .kernel = kernel, .calls = calls.items, .call_slots = call_slots.items, .global = !fold.has_keys and global };
     }
     fn emitStatistics(self: *Engine, initial: Row, value: Statistic.Value) !void {
+        // Bins and arbitrary-precision division intermediates belong to this
+        // synchronous emission. Reducers retain their own state; keeping the
+        // temporary arithmetic in the statement arena scales with every
+        // endpoint times every aggregate, even for a bounded group window.
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        const scope = EvalScope.enter(self, scratch.allocator());
+        defer scope.leave(self);
         var row = initial;
         for (self.statistic_targets) |target| row = try self.lengthRow(row, target.name, 0);
         const plan = self.statistic_plan.?;

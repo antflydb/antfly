@@ -723,12 +723,12 @@ pub const Owner = struct {
             defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const same_inode = (try probe.file.stat(probe.runtime())).inode == (try file.file.stat(file.runtime())).inode;
-            if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) {
+            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
             }
-            if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
+            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
                 try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
             {
                 // Lease bookkeeping and unpublished shadow files do not change
@@ -775,7 +775,7 @@ pub const Owner = struct {
             previous.lease_snapshot = true;
             // Cursor continuation can only read this generation. Make every
             // namespace's shared native store reject publication immediately.
-            if (previous.maintenance_references == 0) {
+            if (previous.maintenance_references == 0 and previous.immutable_query_borrows == 0) {
                 previous.owned_lite_backend.?.native_docstore.?.read_only = true;
                 previous.owned_lite_backend.?.native_docstore.?.file.read_only = true;
             }

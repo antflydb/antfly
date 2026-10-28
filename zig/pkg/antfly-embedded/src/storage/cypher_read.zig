@@ -13,8 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Leased owner graph reads cross compiled boundaries as private JSON only.
+//! Leased owner graph reads. Remote owners use the private JSON protocol;
+//! coordinators may also expose a typed in-process operation.
 const std = @import("std");
+const rpc = @import("cypher").rpc;
 const callbacks = @import("../runtime_callback_abi.zig");
 pub const Input = struct {
     /// Internal cohort capture: the first operation MUST be validate while
@@ -52,12 +54,23 @@ pub const Read = struct {
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
     pub const VTable = struct {
         invoke: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8,
+        invoke_typed: ?*const fn (*anyopaque, std.mem.Allocator, rpc.Request) anyerror!rpc.Reply = null,
         release: *const fn (*anyopaque) void,
         open_sql: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, @import("db/types.zig").ScanOptions) anyerror!@import("relational_read_view.zig").View = null,
     };
     const Abi = callbacks.Boundary(VTable);
     pub fn invoke(self: Read, a: std.mem.Allocator, request: []const u8) ![]u8 {
         return Abi.call("invoke", self.boundary_dispatch, self.vtable.invoke, .{ self.ptr, a, request });
+    }
+    pub fn invokeTyped(self: Read, a: std.mem.Allocator, request: rpc.Request) !rpc.Reply {
+        if (self.vtable.invoke_typed) |callback| return Abi.call("invoke_typed", self.boundary_dispatch, callback, .{ self.ptr, a, request });
+        const body = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(body);
+        if (body.len > 1 << 20) return error.CypherRequestTooLarge;
+        const response = try self.invoke(a, body);
+        defer a.free(response);
+        if (response.len > 32 << 20) return error.CypherResponseTooLarge;
+        return std.json.parseFromSliceLeaky(rpc.Reply, a, response, .{ .allocate = .alloc_always });
     }
     pub fn openSql(self: Read, a: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: @import("db/types.zig").ScanOptions) !@import("relational_read_view.zig").View {
         const callback = self.vtable.open_sql orelse return error.SqlStatementSnapshotRequired;

@@ -655,7 +655,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .dependOn(&run_maintenance_activity.step);
     const cypher_capi_tests = b.addTest(.{
         .root_module = capi_root_mod,
-        .filters = &.{ "capi embedded graph catalog and query", "capi Cypher authority" },
+        .filters = &.{ "capi embedded graph", "capi Cypher authority" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("capi-cypher-test", "Qualify local graph catalog and retained Cypher queries")

@@ -34620,10 +34620,10 @@ pub const DB = struct {
 
     pub fn publishCompletedDensePostingCheckpoints(self: *DB) !NativePublicationResult {
         if (comptime storage_engine.enabled) return storage_engine.call("publishCompletedDensePostingCheckpoints", .{self});
-        // Native backup closes and drains this same catalog barrier before
-        // selecting/pinning generated files. It excludes publication until
-        // hardlinks own the captured generation, without serializing ordinary
-        // primary commits behind the checkpoint handoff.
+        // Backups close this barrier; query cuts share catalog admission with
+        // searches. The index manager separately excludes checkpoint handoffs
+        // until hardlinks and WAL descriptors own the captured files, without
+        // draining query readers or serializing ordinary primary commits.
         var catalog_lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .busy = true };
         defer catalog_lease.release();
         const result = try self.core.index_manager.publishCompletedDensePostingCheckpoints();
@@ -36870,7 +36870,11 @@ pub const DB = struct {
             const legacy_complete = if (legacy) blk: {
                 const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse break :blk false;
                 const counts = try DerivedCoverageCounters.load(alloc, &producer_read, if (item.kind == .dense_vector or item.kind == .sparse_vector) index_name else local_scope, generation);
-                const total = counts.source_total orelse break :blk false;
+                // Fresh empty stores have no cardinality record until their
+                // first primary mutation. Prove that case at the SAME source
+                // cut; a missing counter in a populated legacy store stays
+                // unknown, and ordered producers still require their registry.
+                const total = counts.source_total orelse (try range_cardinality.loadOrProveEmptyFromTxn(&producer_read)) orelse break :blk false;
                 break :blk if (total == 0) true else counts.produced != null and counts.skipped != null and counts.terminal_failed == 0 and
                     counts.produced.? +| counts.skipped.? == total;
             } else false;

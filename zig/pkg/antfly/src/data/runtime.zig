@@ -6286,7 +6286,12 @@ pub const DataServer = struct {
         _ = owner_source.withRestoreDescriptorRecovery(.{ .ptr = self, .recover_fn = recoverRestoreDescriptor });
         _ = owner_source.withRemoteContent(self.api_server_cfg.remote_content);
         _ = owner_source.withCoordinatedTtl(.{ .ptr = self, .expire_fn = expireRelationalRows });
-        _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication });
+        // This dispatcher publishes through Data-Raft. Native standalone
+        // owners use their local producer/coverage protocol; installing the
+        // dispatcher there fences local production behind an unavailable
+        // replicated authority, even for an empty index.
+        if (owner_source.online_source_authority == .raft)
+            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication });
         _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
             if (self.storageKernelContextHandle()) |handle|

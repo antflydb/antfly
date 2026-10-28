@@ -8778,3 +8778,88 @@ test "ordered scalar group cursor seeks NULL phases and complete reducer domains
     try std.testing.expect((try groups.next(a)) == null);
     try std.testing.expect(cursor.engine.stats.scanned_anchors < 32);
 }
+
+const StatisticLifetimeFixture = struct {
+    reverse: bool = false,
+    nodes: []v.Node,
+    edges: []v.Relationship,
+    fn cast(p: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(p));
+    }
+    fn bind(_: *anyopaque, _: std.mem.Allocator, _: catalog.Graph) !void {}
+    fn check(_: *anyopaque) !void {}
+    fn get(p: *anyopaque, a: std.mem.Allocator, id: v.Identity) !?*const v.Node {
+        for (cast(p).nodes) |*n| if (n.identity.eql(id)) return (try (v.Value{ .node = n }).clone(a)).node;
+        return null;
+    }
+    fn scan(p: *anyopaque, a: std.mem.Allocator, _: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+        var out: std.ArrayList(*const v.Node) = .empty;
+        for (cast(p).nodes) |*n| {
+            if (after) |key| if (std.mem.order(u8, n.identity.key, key) != .gt) continue;
+            if (out.items.len == limit) break;
+            try out.append(a, (try (v.Value{ .node = n }).clone(a)).node);
+        }
+        return .{ .items = out.items, .next = if (out.items.len == limit) out.items[out.items.len - 1].identity.key else null, .unfiltered = true };
+    }
+    fn expand(p: *anyopaque, a: std.mem.Allocator, _: catalog.Relationship, id: v.Identity, direction: @import("ast.zig").Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+        var out: std.ArrayList(*const v.Relationship) = .empty;
+        for (0..cast(p).edges.len) |index| {
+            const e = &cast(p).edges[if (cast(p).reverse) cast(p).edges.len - 1 - index else index];
+            if ((direction != .in and e.source.eql(id)) or (direction != .out and e.target.eql(id))) {
+                try out.append(a, (try (v.Value{ .relationship = e }).clone(a)).relationship);
+            }
+        }
+        return .{ .items = out.items };
+    }
+};
+test "statistic emission scratch stays bounded across endpoint groups and aggregate cohorts" {
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source.deinit();
+    const a = source.allocator();
+    const layers = 512;
+    const nodes = try a.alloc(v.Node, 1 + 2 * layers);
+    for (nodes, 0..) |*n, i| {
+        const key = if (i == 0) "start" else try std.fmt.allocPrint(a, "v{d}_{d}", .{ (i - 1) / 2, (i - 1) % 2 });
+        const props = try a.alloc(v.Entry, 2);
+        props[0] = .{ .name = "id", .value = .{ .string = key } };
+        props[1] = .{ .name = "score", .value = .{ .integer = @intCast(if (i == 0) 0 else (i - 1) / 2 + 1) } };
+        n.* = .{ .identity = .{ .table = "docs", .key = key }, .labels = &.{"D"}, .properties = props };
+    }
+    var edges: std.ArrayList(v.Relationship) = .empty;
+    for (nodes, 0..) |n, i| {
+        const first_layer = if (i == 0) 0 else (i - 1) / 2 + 1;
+        for (first_layer..@min(first_layer + 2, layers)) |layer| for (0..2) |j| {
+            const peer = nodes[1 + 2 * layer + j].identity;
+            try edges.append(a, .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "{s}>{s}", .{ n.identity.key, peer.key }) }, .index = "links", .type = "R", .source = n.identity, .target = peer });
+        };
+    }
+    var fixture: StatisticLifetimeFixture = .{ .nodes = nodes, .edges = edges.items };
+    const source_backend: b.Backend = .{ .ptr = &fixture, .vtable = &.{ .bind = StatisticLifetimeFixture.bind, .checkpoint = StatisticLifetimeFixture.check, .scan = StatisticLifetimeFixture.scan, .get = StatisticLifetimeFixture.get, .expand = StatisticLifetimeFixture.expand } };
+    const source_graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{.{ .name = "R", .index = "links", .source_label = "D", .target_label = "D", .stored_type = "link" }} };
+    var query: std.Io.Writer.Allocating = .init(a);
+    try query.writer.writeAll("MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) RETURN b.score AS depth");
+    for (0..32) |k| try query.writer.print(",avg(length(p)*length(p)+{d}*length(p)) AS a{d}", .{ k, k });
+    try query.writer.writeAll(" ORDER BY depth LIMIT 10");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, query.written(), .{}, &diagnostic);
+    defer compiled.deinit();
+    // Disallow in-place arena growth so allocator placement cannot hide
+    // retained temporaries. Both encounter orders must fit the same budget.
+    var callbacks = std.testing.allocator.vtable.*;
+    callbacks.resize = std.mem.Allocator.noResize;
+    callbacks.remap = std.mem.Allocator.noRemap;
+    const backing: std.mem.Allocator = .{ .ptr = std.testing.allocator.ptr, .vtable = &callbacks };
+    for ([_]bool{ false, true }) |reverse| {
+        fixture.reverse = reverse;
+        var result = try runtime.execute(backing, source_backend, source_graph, &compiled, &.{}, .{ .memory_bytes = 32 << 20, .intermediate_states = 750000, .explored_edges = 5000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 10), result.rows.len);
+        for (result.rows, 1..) |row, depth| {
+            try std.testing.expectEqual(@as(i64, @intCast(depth)), row[0].integer);
+            try std.testing.expect(row[1].number > 0);
+            // All consumers share a physical traversal, but have distinct
+            // first moments. Temporary packet storage must not alias them.
+            for (1..32) |k| try std.testing.expect(row[k + 1].number > row[k].number);
+        }
+    }
+}

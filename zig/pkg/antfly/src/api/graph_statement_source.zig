@@ -95,7 +95,7 @@ pub const Statement = struct {
         const backend = self.set.backend();
         try backend.vtable.bind(backend.ptr, owned, self.graph);
         self.arena = arena;
-        return .{ .ptr = self, .vtable = &.{ .invoke = invoke, .release = close, .open_sql = openSql } };
+        return .{ .ptr = self, .vtable = &.{ .invoke = invoke, .invoke_typed = invokeTyped, .release = close, .open_sql = openSql } };
     }
     fn cast(ptr: *anyopaque) *Statement {
         return @ptrCast(@alignCast(ptr));
@@ -246,6 +246,29 @@ pub const Statement = struct {
         const backend = self.set.backend();
         try backend.vtable.bind(backend.ptr, arena.allocator(), graph);
         return (cypher.rpc.Owner{ .backend = backend, .graph = graph, .table = "" }).execute(a, body);
+    }
+    fn invokeTyped(ptr: *anyopaque, a: std.mem.Allocator, request: cypher.rpc.Request) !cypher.rpc.Reply {
+        const self = cast(ptr);
+        try checkpoint(ptr);
+        const graph = for (self.graphs) |entry| {
+            if (entry.incarnation == request.graph_incarnation and entry.revision == request.graph_revision) break entry;
+        } else return error.CatalogGenerationChanged;
+        switch (request.operation) {
+            // These operations have dedicated owner semantics and keep their
+            // existing wire routing. Observations have a different reply type.
+            .normalize, .project => {
+                const body = try std.json.Stringify.valueAlloc(a, request, .{});
+                defer a.free(body);
+                const response = try invoke(ptr, a, body);
+                defer a.free(response);
+                return std.json.parseFromSliceLeaky(cypher.rpc.Reply, a, response, .{ .allocate = .alloc_always });
+            },
+            .observe, .observe_ranges => return error.CypherObservationsUnavailable,
+            else => {},
+        }
+        const backend = self.set.backend();
+        try backend.vtable.bind(backend.ptr, a, graph);
+        return (cypher.rpc.Owner{ .backend = backend, .graph = graph, .table = "" }).executeTyped(a, request);
     }
     fn openSql(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: local.storage_db_types.ScanOptions) !reads.RelationalReadView {
         const self = cast(ptr);
