@@ -73,7 +73,7 @@ fn tokenSlice(tok: Token, start: usize, end: usize) Token {
 // Character Filters
 // ============================================================================
 
-fn byteCheckpoint(control: Control, offset: usize, next: *usize) !void {
+inline fn byteCheckpoint(control: Control, offset: usize, next: *usize) !void {
     if (offset < next.*) return;
     try control.check();
     next.* = offset +| 4096;
@@ -766,7 +766,7 @@ fn tokenizeEdgeNgram(alloc: Allocator, text: []const u8, cfg: EdgeNgramConfig) !
 
 /// Byte-bounded checkpoints, including runs which produce no allocations.
 /// The inner scan has the original branch/copy cost; control runs per 4 KiB.
-fn advanceRun(text: []const u8, start: u32, wanted: bool, whitespace: bool, control: Control, checkpoint: *usize) !u32 {
+inline fn advanceRun(text: []const u8, start: u32, wanted: bool, whitespace: bool, control: Control, checkpoint: *usize) !u32 {
     var pos = start;
     while (pos < text.len) {
         try byteCheckpoint(control, pos, checkpoint);
