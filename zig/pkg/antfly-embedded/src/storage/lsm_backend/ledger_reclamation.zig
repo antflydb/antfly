@@ -82,6 +82,12 @@ pub const Snapshot = struct {
 };
 
 pub fn reclaimSliceLocked(backend: anytype) void {
+    if (@import("retirement_execution.zig").deferred(backend)) return;
+    reclaimControlledSliceLocked(backend);
+}
+
+pub fn reclaimControlledSliceLocked(backend: anytype) void {
+    if (@import("antfly_platform").time.monotonicNs() < backend.retirement_execution_retry_at_ns) return;
     if (backend.ledger_reclaim_in_flight) return;
     if (backend.retired_ledger_snapshots == null) return;
     backend.ledger_reclaim_in_flight = true;
@@ -92,9 +98,10 @@ pub fn reclaimSliceLocked(backend: anytype) void {
         const pending = backend.retired_ledger_snapshots orelse break;
         if (units >= 2048 or runtime.workNowNs(backend) >= deadline) break;
         backend.mu.unlock();
-        const result = step(backend, &pending.reclaimer.?, 2048 - units, deadline);
+        const result = @import("retirement_execution.zig").step(backend, &pending.reclaimer.?, 2048 - units, deadline);
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
         note(backend, result);
+        if (result.refused) backend.retirement_execution_retry_at_ns = @import("antfly_platform").time.monotonicNs() +| 10 * std.time.ns_per_ms;
         units += result.units;
         if (!result.done) break;
         backend.retired_ledger_snapshots = pending.retired_next;
@@ -154,7 +161,7 @@ fn step(backend: anytype, reclaimer: *Ledger.Reclaimer, limit: usize, deadline: 
     return .{ .done = done, .units = limit - credits, .ns = elapsed };
 }
 
-fn note(backend: anytype, result: Slice) void {
+fn note(backend: anytype, result: anytype) void {
     backend.ledger_reclaim_slices +|= 1;
     backend.ledger_reclaim_units +|= result.units;
     backend.ledger_reclaim_max_slice_ns = @max(backend.ledger_reclaim_max_slice_ns, result.ns);

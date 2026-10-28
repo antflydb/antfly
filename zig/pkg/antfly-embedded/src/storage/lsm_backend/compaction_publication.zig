@@ -26,11 +26,13 @@ const Plan = @import("compaction.zig").CompactionPlan;
 const Certificate = @import("dependency_job.zig").Job;
 const runtime = @import("runtime.zig");
 const resources = @import("../resource_manager.zig");
+pub const retirement_execution = @import("retirement_execution.zig");
 const quantum_ns = 2 * std.time.ns_per_ms;
 
 /// Deterministic interleaving at the real off-lock preparation boundary.
 /// Erased from production; the test must join its backend before clearing it.
 pub var test_preparation_hook: ?*const fn (*@import("../lsm_backend.zig").Backend, *const Job) anyerror!void = null;
+pub var test_directory_hook: ?*const fn (@import("../../common/read_admission.zig").Port) anyerror!void = null;
 pub var test_controlled_hook: ?*const fn (*@import("../lsm_backend.zig").Backend, @import("../../common/read_admission.zig").Port) anyerror!void = null;
 
 pub const Job = struct {
@@ -71,6 +73,7 @@ pub const Job = struct {
     append_directory: ?Directory.Put = null,
     append_writer: ?Store.OutputInsertion = null,
     append_retired: ?*Directory = null,
+    append_ledger_retirement: [2]?*@import("ledger_reclamation.zig").Snapshot = @splat(null),
 
     const Rebase = struct {
         directory: *Directory,
@@ -113,6 +116,10 @@ pub const Job = struct {
         var self = try init(backend, .{ .source_level = 0, .source_start = 0, .source_len = 0, .target_start = 0, .target_len = 0, .output_level = 0 }, output_count);
         self.append_only = true;
         return self;
+    }
+
+    pub fn prepareAppendRetirementLocked(self: *Job, backend: anytype) !void {
+        for (&self.append_ledger_retirement) |*slot| slot.* = try @import("ledger_reclamation.zig").Snapshot.capture(backend, &Ledger.empty);
     }
 
     pub fn accountedMemoryBytes(self: *const Job, pass: u64) u64 {
@@ -277,6 +284,7 @@ pub const Job = struct {
             self.append_lease = null;
         }
         try self.append_directory.?.resumeWithAdmission(allocator, original);
+        if (comptime @import("builtin").is_test) if (test_directory_hook) |hook| try hook(original);
         var prepared = try self.append_directory.?.takePreparedWithAdmission(original);
         const old = self.directory;
         self.directory = prepared.directory;
@@ -503,7 +511,21 @@ pub const Job = struct {
     }
 
     pub fn finishLocked(self: *Job, backend: anytype, outputs: *std.ArrayListUnmanaged(Run)) void {
-        if (self.append_directory != null or self.append_writer != null or self.append_lease != null) {
+        if (self.controlled_append) {
+            // Unique run IDs make an append's partial paths wholly rooted in
+            // its candidate. Transfer variable retirement to the backend; only
+            // fixed registered-anchor/wrapper drops run in this guarded handoff.
+            if (self.append_directory) |*edit| {
+                var abandoned = edit.abandonAppend();
+                self.append_candidate = abandoned.directory;
+                abandoned.lease.deinit(backend.allocator);
+                self.append_directory = null;
+            }
+            if (self.append_writer) |*edit| edit.deinit(backend.allocator);
+            self.append_writer = null;
+            if (self.append_lease) |*lease| lease.deinit(backend.allocator);
+            self.append_lease = null;
+        } else if (self.append_directory != null or self.append_writer != null or self.append_lease != null) {
             // The failed admission has ended. Cleanup owns its rooted partial
             // trees and never invokes or retains the rejected original scope.
             runtime.unlockBackend(@TypeOf(backend.*), backend, true);
@@ -540,8 +562,15 @@ pub const Job = struct {
         // Clear inspected headers before reclaiming their account references.
         const base_obsolete = self.base_obsolete;
         self.base_obsolete = .empty;
-        self.drainLedger(backend, base_obsolete);
-        self.drainLedger(backend, self.obsolete);
+        const obsolete = self.obsolete;
+        self.obsolete = .empty;
+        for ([_]Ledger{ base_obsolete, obsolete }, 0..) |ledger, i| {
+            if (self.append_ledger_retirement[i]) |snapshot| {
+                snapshot.value = ledger;
+                snapshot.retire(backend);
+                self.append_ledger_retirement[i] = null;
+            } else self.drainLedger(backend, ledger);
+        }
         if (self.inputs) |inputs| {
             var i: usize = 0;
             while (i < self.prepared_inputs) {
@@ -807,6 +836,7 @@ fn checkAppendPublication(allocator: std.mem.Allocator, variant: usize) !void {
         try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
         return;
     }
+    if (variant >= 5) try job.prepareAppendRetirementLocked(&backend);
     while (!try job.advanceLocked(&backend, outputs.items)) {}
     if (variant == 1 or variant >= 5) {
         var added = try TestFixture.run(allocator, 3, 0, "c");

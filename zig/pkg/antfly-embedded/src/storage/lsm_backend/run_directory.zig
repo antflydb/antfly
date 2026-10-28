@@ -1138,6 +1138,17 @@ pub const Directory = struct {
             self.taken = true;
             return out;
         }
+        /// Abort a unique-ID append without destroying its partial tree. Every
+        /// insertion mutation is rooted in candidate; the registered lease
+        /// makes the remaining drop fixed. The caller owns queueing retirement.
+        pub fn abandonAppend(self: *@This()) Prepared {
+            std.debug.assert(!self.published and !self.taken and !self.retired and !self.retiring);
+            std.debug.assert(std.meta.activeTag(self.pending) != .remove and self.lease != null);
+            const out: Prepared = .{ .directory = self.candidate, .lease = self.lease.? };
+            self.lease = null;
+            self.taken = true;
+            return out;
+        }
         /// Transfer the remaining pin/metadata owner to a prearranged retire
         /// job. Aborting the candidate alone deliberately does not destroy it.
         pub fn takeEntryLeaseWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !EntryLease {
@@ -3205,6 +3216,22 @@ test "controlled physical sync private put replaces every index across ordering 
                     try std.testing.expect(live == base);
                 }
                 try std.testing.expectEqual(baseline_pins + 1, fixture.pins);
+                if (abort and (scenario == 0 or scenario == 9)) {
+                    // Flush append abort transfers every partial index at each
+                    // original rejection point. A separate owner retires it;
+                    // the rejected scope is never consulted again.
+                    var abandoned = job.abandonAppend();
+                    var retirement = Directory.Reclaimer.init(abandoned.directory);
+                    while (true) {
+                        var credits: usize = 1;
+                        if (retirement.step(a, &credits)) break;
+                    }
+                    retirement.finish(a);
+                    abandoned.lease.deinit(a);
+                    try std.testing.expectEqual(baseline_pins, fixture.pins);
+                    try std.testing.expectEqualDeep(roots, Directory.Removal.roots(base));
+                    continue;
+                }
                 if (abort) {
                     fault.at = fault.checks + target % 3;
                     try std.testing.expectError(fault.failure, job.retireWithAdmission(failing.allocator(), port));

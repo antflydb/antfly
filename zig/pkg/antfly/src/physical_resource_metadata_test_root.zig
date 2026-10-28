@@ -5933,7 +5933,7 @@ test "physical cache metadata bounded writer retirement refuses unknown producer
     try std.testing.expectEqual(@as(usize, 1), Callback.called);
 }
 
-fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry }) !void {
+fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry, retirement_retry, retirement_capacity, publication_directory_retry }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -5995,7 +5995,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         .compact_threshold_runs = 1000,
         .l0_soft_limit_runs = 1000,
         .l0_hard_limit_runs = 2000,
-    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = worker_owner }, .internal_flush_worker = mode == .waker });
+    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = worker_owner }, .internal_flush_worker = mode == .waker or mode == .retirement_capacity });
     var open = true;
     defer if (open) handle.close();
     const publication = local.storage_lsm_backend_compaction_publication;
@@ -6008,16 +6008,48 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         var refuse: std.atomic.Value(bool) = .init(false);
         var refuse_replay: bool = false;
         var replays: std.atomic.Value(usize) = .init(0);
+        var cleanup_calls: std.atomic.Value(usize) = .init(0);
+        var refuse_cleanup: std.atomic.Value(bool) = .init(false);
+        var refuse_directory: std.atomic.Value(bool) = .init(false);
+        var saturate_cleanup: bool = false;
+        fn directory(original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (refuse_directory.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+        }
+        fn cleanup(original: read_admission.Port) !void {
+            _ = cleanup_calls.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expect(execution.?.cleanup_in_use.load(.acquire));
+            if (refuse_cleanup.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+            if (saturate_cleanup) {
+                const io = std.testing.io;
+                const borrowed = runtime.native_abi.IoBorrow.init(&io);
+                const owner = execution.?.port();
+                var query: ?*anyopaque = null;
+                const occupied = owner.start(owner.context, &.{ .io = &borrowed, .class = @backingInt(runtime.runnable_abi.Class.query), .allow_wait = 0, .out_handle = &query });
+                defer if (query) |held| owner.finish(held);
+                // A peer may already own ordinary capacity. Either way the
+                // cleanup pass keeps its protected slot and health can enter.
+                if (!occupied.isOk()) try std.testing.expectEqual(@as(usize, 2), execution.?.owner.scheduler.stats().runnable_slots);
+                var health: ?*anyopaque = null;
+                const healthy = owner.start(owner.context, &.{ .io = &borrowed, .class = @backingInt(runtime.runnable_abi.Class.control), .allow_wait = 0, .out_handle = &health });
+                defer if (health) |held| owner.finish(held);
+                try std.testing.expect(healthy.isOk());
+                try original.checkpoint();
+            }
+        }
         fn controlled(_: *lsm.Backend, original: read_admission.Port) !void {
             const call = controlled_calls.fetchAdd(1, .monotonic);
             try original.checkpoint();
-            try std.testing.expectEqual(@as(usize, 1), execution.?.owner.scheduler.stats().runnable_slots);
+            const stats = execution.?.owner.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots - stats.control_slots);
             if (refuse.swap(false, .acq_rel) or (refuse_replay and call == 1)) return error.ResourceBudgetExceeded;
         }
         fn hook(_: *lsm.Backend, job: *const publication.Job) !void {
             _ = replays.fetchMax(job.rebases, .monotonic);
             if (!job.append_only or claimed.swap(true, .acq_rel)) return;
-            try std.testing.expectEqual(@as(usize, 0), execution.?.owner.scheduler.stats().runnable_slots);
+            const stats = execution.?.owner.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 0), stats.runnable_slots - stats.control_slots);
             ready.set(std.testing.io);
             go.waitUncancelable(std.testing.io);
         }
@@ -6027,6 +6059,12 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     Interleave.refuse.store(mode == .publication_retry, .release);
     Interleave.refuse_replay = mode == .publication_rebase_retry;
     Interleave.replays.store(0, .release);
+    Interleave.cleanup_calls.store(0, .release);
+    Interleave.refuse_cleanup.store(mode == .retirement_retry, .release);
+    Interleave.refuse_directory.store(mode == .publication_directory_retry, .release);
+    Interleave.saturate_cleanup = mode == .retirement_capacity;
+    publication.retirement_execution.test_hook = Interleave.cleanup;
+    publication.test_directory_hook = Interleave.directory;
     publication.test_controlled_hook = Interleave.controlled;
     if (mode == .publication_interleave or rebase_publication) {
         Interleave.claimed.store(false, .release);
@@ -6042,6 +6080,8 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         }
         publication.test_preparation_hook = null;
         publication.test_controlled_hook = null;
+        publication.test_directory_hook = null;
+        publication.retirement_execution.test_hook = null;
         Interleave.execution = null;
     }
     const io = std.testing.io;
@@ -6178,7 +6218,12 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         }
         while (true) {
             while (!handle.ptr().mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
-            const done = handle.ptr().activeImmutableMemtableCount() == 0 and !handle.ptr().immutable_flush_job_in_flight;
+            const backend = handle.ptr();
+            const cleanup_done = backend.retired_run_directories == null and backend.directory_reclaimer == null and
+                backend.retired_run_stores == null and backend.store_reclaimer == null and backend.retired_ledger_snapshots == null and
+                !backend.directory_reclaim_in_flight and !backend.store_reclaim_in_flight and !backend.ledger_reclaim_in_flight and !backend.maintenance_job_in_flight;
+            const done = backend.activeImmutableMemtableCount() == 0 and !backend.immutable_flush_job_in_flight and
+                (if (mode == .retirement_retry or mode == .retirement_capacity or mode == .publication_directory_retry) cleanup_done else true);
             handle.ptr().mu.unlock();
             if (done) break;
             if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
@@ -6196,7 +6241,10 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
                 try std.testing.expectEqual(completed.immutable_flushes, completed.flushes);
             }
         }
-        if (mode == .publication_retry or mode == .publication_rebase_retry) {
+        if (mode == .retirement_retry or mode == .retirement_capacity or mode == .publication_directory_retry) {
+            try std.testing.expect(Interleave.cleanup_calls.load(.acquire) >= (if (mode == .retirement_retry) @as(usize, 2) else 1));
+        }
+        if (mode == .publication_retry or mode == .publication_rebase_retry or mode == .publication_directory_retry) {
             const completed = handle.ptr().snapshotWriteStats();
             try std.testing.expectEqual(@as(u64, if (rebase_publication) 2 else 1), completed.immutable_flushes);
             try std.testing.expect(completed.flushes > completed.immutable_flushes);
@@ -6286,6 +6334,18 @@ test "physical cache metadata registered flush publication normal worker replays
 
 test "physical cache metadata registered flush publication replay refusal preserves immutable debt for retry" {
     try normalAdmittedFlushWorker(.publication_rebase_retry);
+}
+
+test "physical cache metadata registered flush publication queued retirement retries independent cleanup refusal" {
+    try normalAdmittedFlushWorker(.retirement_retry);
+}
+
+test "physical cache metadata registered flush publication cleanup preserves ordinary saturation and health progress" {
+    try normalAdmittedFlushWorker(.retirement_capacity);
+}
+
+test "physical cache metadata registered flush publication failed directory candidate transfers to controlled retirement" {
+    try normalAdmittedFlushWorker(.publication_directory_retry);
 }
 
 test "physical cache metadata registered flush publication controlled writer insertion preserves ownership at allocation and original refusal" {

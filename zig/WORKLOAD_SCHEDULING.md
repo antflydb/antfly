@@ -1839,6 +1839,10 @@ final guarded handoff swaps coupled roots. Concurrent metadata changes cause a
 fresh capture of the current roots and admitted replay of only the flush's new
 outputs, preserving the original deadline and the four-rebase limit. Old roots
 transfer to backend-owned retirement queues. Failed candidates preserve immutable
-and WAL debt before retry. Queued legacy root retirement and partial-candidate
-cleanup still need controlled execution before publication as a whole can be
-considered admitted; broader compaction integration remains unfinished.
+and WAL debt before retry. Queued directory, writer and obsolete-ledger roots
+now retire through short protected cleanup admissions on the detached backend
+worker. Foreground unlocks queue this work, preserving outer DB/catalog guards;
+refusal retains cursors and backs off outside service guards. Failed
+append candidates use the same rooted retirement handoff. Output-vector
+retirement and remaining flush durability/immutable cleanup still need execution
+integration; broader compaction integration remains unfinished.

@@ -29910,8 +29910,29 @@ worker tests cover a concurrent ledger change, no SST rebuild on successful
 replay, refusal during replay, stable pinned reads, retry and reopen. Allocation
 fixtures separately cover root capture, partial abort and the rebase limit.
 
-The bounded-publication milestone remains open: queued legacy root retirement
-and partial-candidate cleanup still require controlled execution integration. Existing compaction publication benefits from
+Normal directory, writer and queued obsolete-ledger retirement now executes in
+bounded slices under independent nonblocking cleanup admissions. Foreground and
+selected DB maintenance unlocks only enqueue these roots when a runnable owner
+is installed; the detached backend maintenance callback acquires cleanup CPU
+without outer DB/catalog guards. The protected cleanup slot leaves ordinary and
+health capacity available. Refusal keeps the exact cursor/accounting owner,
+advertises a retry delay, and backs off on the durable worker rather than blocking
+foreground unlocks. A maintenance waker does not suppress this cleanup handoff.
+
+Flush publication prepays its ledger retirement headers. Failed unique-ID
+append candidates transfer their rooted partial directory to backend retirement;
+registered entry leases and cache-free writer wrappers need only fixed final
+drops. No rejected original scope survives this handoff. Native worker coverage
+includes cleanup refusal/retry, ordinary saturation with health progress, and
+refusal after directory preparation followed by immutable retry and reopen.
+Allocation fixtures cover the prearranged ledger handoff; append-abort fixtures
+transfer partial indexes at every original checkpoint. Exclusive close joins
+queued teardown after background work and readers stop. Private ABI versions
+are native154/storage-owner214; no durable/public wire format changes.
+
+The bounded-publication milestone remains open: output-vector retirement and
+the remaining flush durability/immutable cleanup path still need execution
+integration. Existing compaction publication benefits from
 the corrected owned-output reference transfer, but compaction construction and
 remaining metadata operations have not been enabled under shared CPU admission.
 The same publication/compaction milestone and the full design remain open.

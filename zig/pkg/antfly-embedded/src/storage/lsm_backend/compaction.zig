@@ -5120,7 +5120,6 @@ pub fn publishFlushRuns(backend: anytype, outputs: *std.ArrayListUnmanaged(Run))
     backend.retainReaderKind(.compaction);
     defer backend.releaseReaderKind(.compaction);
     var job = try Publication.initAppend(backend, outputs.items.len);
-    job.controlled_append = true;
     job.next = backend.active_compaction_publications;
     backend.active_compaction_publications = &job;
     defer {
@@ -5129,6 +5128,8 @@ pub fn publishFlushRuns(backend: anytype, outputs: *std.ArrayListUnmanaged(Run))
         while (link.*.? != &job) link = &link.*.?.next;
         link.* = job.next;
     }
+    try job.prepareAppendRetirementLocked(backend);
+    job.controlled_append = true;
     while (true) {
         const ready = try job.advanceLocked(backend, outputs.items);
         backend.directory_planning_slices +|= 1;

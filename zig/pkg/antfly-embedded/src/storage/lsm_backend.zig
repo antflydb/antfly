@@ -1802,6 +1802,7 @@ pub const Backend = struct {
     closure_reclaim_in_flight: bool = false,
     store_reclaimer: ?RunStore.Reclaimer = null,
     store_reclaim_in_flight: bool = false,
+    retirement_execution_retry_at_ns: u64 = 0,
     directory_reclaimer: ?RunDirectory.Reclaimer = null,
     directory_reclaim_in_flight: bool = false,
     retired_read_versions: ?*runtime_mod.ReadVersion = null,
@@ -4122,7 +4123,21 @@ pub const Backend = struct {
 
     pub fn drainRetiredLedgers(self: *Backend) void {
         _ = runtime_mod.lockBackend(Backend, self);
-        while (self.retired_ledger_snapshots != null) @import("lsm_backend/ledger_reclamation.zig").reclaimSliceLocked(self);
+        while (self.retired_ledger_snapshots != null) {
+            if (self.closing.load(.acquire) and self.active_readers == 0) {
+                // Exclusive joined teardown cannot delegate to a stopped worker.
+                var credits: usize = 2048;
+                _ = @import("lsm_backend/ledger_reclamation.zig").reclaimQuiescedStep(self, &credits);
+            } else {
+                @import("lsm_backend/ledger_reclamation.zig").reclaimControlledSliceLocked(self);
+                if (self.retired_ledger_snapshots != null) {
+                    const io = self.manifestCoordinationIo();
+                    self.mu.unlock();
+                    if (io) |lane| lane.sleep(.fromMilliseconds(1), .awake) catch {} else platform.time.yieldBriefly();
+                    _ = runtime_mod.lockBackend(Backend, self);
+                }
+            }
+        }
         std.debug.assert(self.ledger_snapshots == null);
         self.mu.unlock();
     }
@@ -4244,6 +4259,7 @@ pub const Backend = struct {
         if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return true;
         if (@import("lsm_backend/read_metadata_reclamation.zig").pending(self)) return true;
         if (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null)) return true;
+        if (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) return true;
         if (self.manifest_recovery_required) return false;
         const reclaim_visits_before = self.obsolete_reclaim_visits;
         const planning_slices_before = self.directory_planning_slices;
@@ -4866,9 +4882,9 @@ pub const Backend = struct {
         self.reclaimClosurePlanningSliceLocked();
         self.reclaimGcPlanningSliceLocked();
         self.reclaimBulkPlanningSliceLocked();
-        self.reclaimStoreSliceLocked();
+        self.reclaimStoreSliceLocked(false);
         @import("lsm_backend/read_metadata_reclamation.zig").reclaimSliceLocked(self);
-        self.reclaimDirectorySliceLocked();
+        self.reclaimDirectorySliceLocked(false);
         var turns: usize = 0;
         while (self.retired_read_versions != null and turns < 8) : (turns += 1) {
             var batch = ReclaimingMemory{ .next = self.reclaiming_memory, .versions = self.retired_read_versions };
@@ -4908,11 +4924,14 @@ pub const Backend = struct {
         if ((self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
             @import("lsm_backend/memtable_reclamation.zig").pending(self) or
             @import("lsm_backend/read_metadata_reclamation.zig").pending(self) or
+            (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) or
             (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null))) self.scheduleMaintenanceJobLocked(true);
         self.mu.unlock();
     }
 
-    fn reclaimDirectorySliceLocked(self: *Backend) void {
+    fn reclaimDirectorySliceLocked(self: *Backend, controlled: bool) void {
+        if (!controlled and @import("lsm_backend/retirement_execution.zig").deferred(self)) return;
+        if (platform_time.monotonicNs() < self.retirement_execution_retry_at_ns) return;
         if (self.directory_reclaim_in_flight) return;
         if (self.directory_reclaimer == null and self.retired_run_directories == null) return;
         self.directory_reclaim_in_flight = true;
@@ -4927,16 +4946,16 @@ pub const Backend = struct {
             }
             self.retainReaderKind(.other);
             self.mu.unlock();
-            var quantum: usize = @min(credits, 64);
-            const before = quantum;
-            const done = self.directory_reclaimer.?.step(self.allocator, &quantum);
+            const result = @import("lsm_backend/retirement_execution.zig").step(self, &self.directory_reclaimer.?, credits, deadline);
             _ = runtime_mod.lockBackend(Backend, self);
-            credits -= before - quantum;
-            if (done) {
+            credits -= result.units;
+            if (result.refused) self.retirement_execution_retry_at_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_ms;
+            if (result.done) {
                 self.directory_reclaimer.?.finish(self.allocator);
                 self.directory_reclaimer = null;
             }
             self.releaseReaderKind(.other);
+            if (!result.done) break;
         }
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
@@ -4944,9 +4963,12 @@ pub const Backend = struct {
     pub fn retireRunStore(self: *Backend, store: *RunStore) void {
         store.retired_next = self.retired_run_stores;
         self.retired_run_stores = store;
+        self.cached_maintenance_hint.store(1, .release);
     }
 
-    fn reclaimStoreSliceLocked(self: *Backend) void {
+    fn reclaimStoreSliceLocked(self: *Backend, controlled: bool) void {
+        if (!controlled and @import("lsm_backend/retirement_execution.zig").deferred(self)) return;
+        if (platform_time.monotonicNs() < self.retirement_execution_retry_at_ns) return;
         if (self.store_reclaim_in_flight) return;
         if (self.store_reclaimer == null and self.retired_run_stores == null) return;
         self.store_reclaim_in_flight = true;
@@ -4961,16 +4983,16 @@ pub const Backend = struct {
             }
             self.retainReaderKind(.other);
             self.mu.unlock();
-            var quantum: usize = @min(credits, 64);
-            const before = quantum;
-            const done = self.store_reclaimer.?.step(self.allocator, &quantum);
+            const result = @import("lsm_backend/retirement_execution.zig").step(self, &self.store_reclaimer.?, credits, deadline);
             _ = runtime_mod.lockBackend(Backend, self);
-            credits -= before - quantum;
-            if (done) {
+            credits -= result.units;
+            if (result.refused) self.retirement_execution_retry_at_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_ms;
+            if (result.done) {
                 self.store_reclaimer.?.finish(self.allocator);
                 self.store_reclaimer = null;
             }
             self.releaseReaderKind(.other);
+            if (!result.done) break;
         }
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
@@ -6067,11 +6089,12 @@ pub const Backend = struct {
         const pending_memory = @import("lsm_backend/memtable_reclamation.zig").pending(self);
         const pending_metadata = @import("lsm_backend/read_metadata_reclamation.zig").pending(self);
         const pending_directory = !self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null);
-        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory or pending_metadata or pending_directory);
+        const pending_store = !self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null);
+        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory or pending_metadata or pending_directory or pending_store);
         if (self.options.backend.read_only and !ledger_cleanup) return;
         if (self.bulkIngestActive() and !ledger_cleanup and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
         const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation) - @intFromBool(pending_memory and !after_reclamation) - @intFromBool(pending_metadata and !after_reclamation);
-        if (self.options.maintenance_waker != null) {
+        if (self.options.maintenance_waker != null and !ledger_cleanup) {
             if (score != 0) self.wakeMaintenanceWorker();
             return;
         }
@@ -6094,6 +6117,13 @@ pub const Backend = struct {
     fn runMaintenanceJob(ptr: *anyopaque) !void {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         errdefer self.clearMaintenanceJobInFlight(false);
+        // A refused cleanup slice keeps its roots queued. Back off only on the
+        // durable worker; foreground unlocks neither wait nor retry in a loop.
+        _ = runtime_mod.lockBackend(Backend, self);
+        const retry_ns = self.retirement_execution_retry_at_ns -| platform_time.monotonicNs();
+        const retry_io = self.manifestCoordinationIo();
+        self.mu.unlock();
+        if (retry_ns != 0) if (retry_io) |io| try io.sleep(.fromNanoseconds(@min(retry_ns, 10 * std.time.ns_per_ms)), .awake);
 
         const max_steps = @min(max_background_maintenance_steps, @max(@as(usize, 1), self.options.background_maintenance_max_steps));
         const deadline = work_budget.after(self.manifestCoordinationIo(), background_maintenance_burst_ns);
@@ -6104,6 +6134,16 @@ pub const Backend = struct {
         while (steps < max_steps and !self.closing.load(.acquire) and
             (steps == 0 or work_budget.before(deadline))) : (steps += 1)
         {
+            // This callback owns Backend lifetime and holds no DB/catalog
+            // guards. Foreground unlocks only enqueue controlled retirement.
+            _ = runtime_mod.lockBackend(Backend, self);
+            @import("lsm_backend/ledger_reclamation.zig").reclaimControlledSliceLocked(self);
+            self.reclaimStoreSliceLocked(true);
+            self.reclaimDirectorySliceLocked(true);
+            self.mu.unlock();
+            // A selected maintenance owner retains normal planning authority.
+            // Our independent callback only discharges physical cleanup debt.
+            if (self.options.maintenance_waker != null) break;
             const progressed = try self.runMaintenanceStep();
             if (!progressed) break;
             made_progress = true;
@@ -10735,7 +10775,10 @@ pub const Backend = struct {
     pub fn nextMaintenanceWakeDelayNsBestEffort(self: *Backend) ?u64 {
         if (!self.mu.tryLock()) return null;
         defer self.mu.unlock();
-        if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return 0;
+        if ((self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
+            (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) or
+            (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null)))
+            return self.retirement_execution_retry_at_ns -| platform_time.monotonicNs();
         if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return 0;
         if (self.manifest_recovery_required) return null;
 

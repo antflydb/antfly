@@ -39,6 +39,7 @@ pub const Pass = struct {
     pub const Options = struct {
         allow_wait: bool = true,
         retained_bytes: u64 = 0,
+        cleanup: bool = false,
     };
 
     /// Independent producers may refuse queuing so one durable worker can
@@ -52,7 +53,8 @@ pub const Pass = struct {
         var handle: ?*anyopaque = null;
         const status = port.start(port.context, &.{
             .io = &io_borrow,
-            .class = @backingInt(abi.Class.background),
+            .class = @backingInt(if (options.cleanup) abi.Class.control else abi.Class.background),
+            .cleanup = @intFromBool(options.cleanup),
             .slots = 1,
             .has_deadline = 1,
             .native_deadline = 1,
@@ -66,7 +68,7 @@ pub const Pass = struct {
         self.owner = port;
         self.handle = handle orelse return error.InvalidRunnableTransition;
         errdefer self.deinit();
-        self.borrow = try abi.Borrowed.fromOwner(port, self.handle.?, 1, .background);
+        self.borrow = try abi.Borrowed.fromOwner(port, self.handle.?, 1, if (options.cleanup) .control else .background);
         try self.check();
         return self;
     }
