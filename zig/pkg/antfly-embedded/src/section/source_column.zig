@@ -55,6 +55,34 @@ pub fn eligibleAnalyzer(analyzer: *const analysis.Analyzer) bool {
     };
     return true;
 }
+fn encodeVector(a: A, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try u32add(a, &out, (raw.len + page_size - 1) / page_size);
+    var at: usize = 0;
+    while (at < raw.len) {
+        const end = @min(raw.len, at + page_size);
+        const encoded = try snappy.encode(a, raw[at..end]);
+        defer a.free(encoded);
+        try u32add(a, &out, encoded.len);
+        try out.appendSlice(a, encoded);
+        at = end;
+    }
+    return out.toOwnedSlice(a);
+}
+fn decodeVector(encoded: []const u8, raw: []u8, control: Token) !void {
+    var p: Parser = .{ .bytes = encoded };
+    const count = try p.int(u32);
+    if (count != (raw.len + page_size - 1) / page_size) return error.InvalidData;
+    var at: usize = 0;
+    while (at < raw.len) {
+        try control.check();
+        const end = @min(raw.len, at + page_size);
+        try snappy.decodeInto(try p.take(try p.int(u32)), raw[at..end]);
+        at = end;
+    }
+    if (p.at != encoded.len) return error.InvalidData;
+}
 /// Writes pages now; the caller stores the small returned descriptor in its
 /// ordinary indexed doc-value stream. All offsets are section-relative.
 pub fn writeText(a: A, sink: *Sink, start: usize, text: []const u8, analyzers: []const *const analysis.Analyzer) ![]u8 {
@@ -114,7 +142,7 @@ pub fn writeText(a: A, sink: *Sink, start: usize, text: []const u8, analyzers: [
             try u32add(sa, &vector, token.end_byte);
             try u32add(sa, &vector, token.position);
         }
-        const encoded = try snappy.encode(sa, vector.items);
+        const encoded = try encodeVector(sa, vector.items);
         try u64add(a, &out, sink.len() - start);
         try u32add(a, &out, encoded.len);
         try u32add(a, &out, vector.items.len);
@@ -226,7 +254,7 @@ pub const Text = struct {
         try self.view.readInto(std.mem.readInt(u64, entry[32..40], .little), encoded);
         const bytes = try a.alloc(u8, std.mem.readInt(u32, entry[44..48], .little));
         errdefer a.free(bytes);
-        try snappy.decodeInto(encoded, bytes);
+        try decodeVector(encoded, bytes, control);
         var vector: Parser = .{ .bytes = bytes };
         const items = try a.alloc(analysis.Token, std.mem.readInt(u32, entry[48..52], .little));
         errdefer a.free(items);
@@ -478,4 +506,32 @@ test "highlight native source compaction preserves analyzer vectors and section-
     try Run.run(a, source, text);
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ source, text });
+}
+
+test "highlight analyzer vectors check deadlines between bounded decoded blocks" {
+    const a = std.testing.allocator;
+    const raw = try a.alloc(u8, page_size * 4);
+    defer a.free(raw);
+    @memset(raw, 'x');
+    const encoded = try encodeVector(a, raw);
+    defer a.free(encoded);
+    const decoded = try a.alloc(u8, raw.len);
+    defer a.free(decoded);
+    const Stop = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            if (self.calls == 2) return error.DeadlineExceeded;
+        }
+    };
+    var stop: Stop = .{};
+    @memset(decoded, 0);
+    try std.testing.expectError(error.DeadlineExceeded, decodeVector(encoded, decoded, .{ .ptr = &stop, .check_fn = Stop.check }));
+    try std.testing.expectEqual(@as(usize, 2), stop.calls);
+    try std.testing.expectEqualSlices(u8, raw[0..page_size], decoded[0..page_size]);
+    try std.testing.expectEqual(@as(u8, 0), decoded[page_size]);
+    try decodeVector(encoded, decoded, .none);
+    try std.testing.expectEqualSlices(u8, raw, decoded);
+    try std.testing.expectError(error.InvalidData, decodeVector(encoded[0 .. encoded.len - 1], decoded, .none));
 }
