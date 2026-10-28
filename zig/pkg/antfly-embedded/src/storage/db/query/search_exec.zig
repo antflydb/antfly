@@ -12445,7 +12445,9 @@ const SortedPrimaryCandidates = struct {
         }
         while (true) {
             if (self.tie_stream) |stream| {
-                const item = stream.next(stream.ptr, budget -| self.scanned) catch |err| {
+                // The remaining budget cannot exceed the caller's usize
+                // allowance, even when the cumulative counter is wider.
+                const item = stream.next(stream.ptr, @intCast(budget -| self.scanned)) catch |err| {
                     const count_ = stream.scanned_count.?(stream.ptr);
                     self.scanned +|= count_ - self.tie_count;
                     self.tie_count = count_;
