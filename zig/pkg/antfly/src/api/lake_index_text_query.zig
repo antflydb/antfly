@@ -1140,18 +1140,10 @@ const Execution = struct {
             var all_covered = true;
             for (result.hits) |*hit| {
                 try self.context.ensureActive();
-                const value = hit.source_value orelse {
+                const value = (try projectedHighlightSource(&scratch, hit, fields)) orelse {
                     all_covered = false;
                     continue;
                 };
-                const covered = for (fields) |field| {
-                    if (local.api_json_helpers.extractJsonPathValue(value, field) == null) break false;
-                } else true;
-                if (!covered) {
-                    all_covered = false;
-                    continue;
-                }
-                _ = scratch.reset(.retain_capacity);
                 try prepared.attachValue(a, scratch.allocator(), hit, value);
             }
             if (!all_covered) {
@@ -3843,6 +3835,19 @@ fn requiresEncodedSource(req: types.SearchRequest) bool {
 
 /// Compile public include patterns to physical dependencies once per hydration
 /// call. Exclusion-only projections still mean the complete source document.
+/// Borrow already returned small columns for one row. Large scalar fields
+/// keep the persisted-offset path; hidden dependencies retain field-major I/O.
+fn projectedHighlightSource(scratch: *std.heap.ArenaAllocator, hit: *const types.SearchHit, fields: []const []const u8) !?std.json.Value {
+    _ = scratch.reset(.retain_capacity);
+    const from_columns = hit.source_value == null;
+    const value = hit.source_value orelse if (hit.column_source) |source| try source.value(scratch) else return null;
+    for (fields) |field| {
+        const found = local.api_json_helpers.extractJsonPathValue(value, field) orelse return null;
+        if (from_columns and std.mem.indexOfScalar(u8, field, '.') == null and found == .string and found.string.len > 4096) return null;
+    }
+    return value;
+}
+
 fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequest) !?[]const []const u8 {
     // Deferred wire projection does not require unrelated physical columns.
     // Consumers without an explicit dependency contract retain full source.
@@ -5746,4 +5751,26 @@ test "external lake bounded window profiles final locators survive result retire
     try Run.run(std.testing.allocator);
     var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
+}
+
+test "external lake highlight projection reuses small column leases and keeps large fields on offset vectors" {
+    const a = std.testing.allocator;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for ([_]usize{ 32, 8192 }) |size| {
+        const page = try local.storage_db_column_source.Page.native(a, &.{"body"}, 1);
+        defer page.release();
+        const text = try page.arena.allocator().alloc(u8, size);
+        @memset(text, 'x');
+        page.setNative(0, 0, .{ .string = text });
+        try page.finishNative();
+        var hit: types.SearchHit = .{ .id = try a.dupe(u8, "row"), .column_source = page.row(0) };
+        defer hit.deinit(a);
+        const found = try projectedHighlightSource(&scratch, &hit, &.{"body"});
+        if (size <= 4096) {
+            try std.testing.expectEqual(size, found.?.object.get("body").?.string.len);
+            try std.testing.expectEqual(@intFromPtr(text.ptr), @intFromPtr(found.?.object.get("body").?.string.ptr));
+        } else try std.testing.expect(found == null);
+        try std.testing.expect((try projectedHighlightSource(&scratch, &hit, &.{"missing"})) == null);
+    }
 }
