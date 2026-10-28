@@ -1,0 +1,469 @@
+{
+  "status": "passed",
+  "backend": "cuda",
+  "batch_sizes": [
+    2,
+    4,
+    8
+  ],
+  "performance_release_qualified": false,
+  "binary_sha256": "0881ae137d42f069410a799b95bacc56eebfd89e7a9df33e36afa0ca87e4a883",
+  "models": {
+    "base": {
+      "checks": [
+        {
+          "items": 2,
+          "reverse": false,
+          "parity": true,
+          "ms": 15.364757
+        },
+        {
+          "items": 2,
+          "reverse": true,
+          "parity": true,
+          "ms": 15.982773
+        },
+        {
+          "items": 4,
+          "reverse": false,
+          "parity": true,
+          "ms": 19.55349
+        },
+        {
+          "items": 4,
+          "reverse": true,
+          "parity": true,
+          "ms": 17.384867
+        },
+        {
+          "items": 8,
+          "reverse": false,
+          "parity": true,
+          "ms": 34.696855
+        },
+        {
+          "items": 8,
+          "reverse": true,
+          "parity": true,
+          "ms": 34.967687
+        }
+      ],
+      "timings": {
+        "2": {
+          "samples": 5,
+          "serial_total_median_ms": 25.912765,
+          "batch_median_ms": 16.496356,
+          "throughput_speedup": 1.5708175187295912
+        },
+        "4": {
+          "samples": 5,
+          "serial_total_median_ms": 49.768892,
+          "batch_median_ms": 15.568276,
+          "throughput_speedup": 3.1968145991245276
+        },
+        "8": {
+          "samples": 5,
+          "serial_total_median_ms": 96.75913100000001,
+          "batch_median_ms": 30.808762,
+          "throughput_speedup": 3.1406367772908244
+        }
+      },
+      "overflow_status": 413,
+      "invalid_last_row_status": 413,
+      "retry_after_rejection_equal": true
+    },
+    "multi": {
+      "checks": [
+        {
+          "items": 2,
+          "reverse": false,
+          "parity": true,
+          "ms": 15.200517
+        },
+        {
+          "items": 2,
+          "reverse": true,
+          "parity": true,
+          "ms": 13.831782
+        },
+        {
+          "items": 4,
+          "reverse": false,
+          "parity": true,
+          "ms": 19.00269
+        },
+        {
+          "items": 4,
+          "reverse": true,
+          "parity": true,
+          "ms": 19.499394
+        },
+        {
+          "items": 8,
+          "reverse": false,
+          "parity": true,
+          "ms": 26.692924
+        },
+        {
+          "items": 8,
+          "reverse": true,
+          "parity": true,
+          "ms": 27.367964
+        }
+      ],
+      "timings": {
+        "2": {
+          "samples": 5,
+          "serial_total_median_ms": 26.234316,
+          "batch_median_ms": 13.668806,
+          "throughput_speedup": 1.9192836594505767
+        },
+        "4": {
+          "samples": 5,
+          "serial_total_median_ms": 54.339432,
+          "batch_median_ms": 18.675619,
+          "throughput_speedup": 2.909645565161722
+        },
+        "8": {
+          "samples": 5,
+          "serial_total_median_ms": 108.537697,
+          "batch_median_ms": 26.441693,
+          "throughput_speedup": 4.104793781547952
+        }
+      },
+      "overflow_status": 413,
+      "invalid_last_row_status": 413,
+      "retry_after_rejection_equal": true
+    },
+    "decide-fp32": {
+      "checks": [
+        {
+          "items": 2,
+          "reverse": false,
+          "parity": true,
+          "ms": 47.390397
+        },
+        {
+          "items": 2,
+          "reverse": true,
+          "parity": true,
+          "ms": 47.516445
+        },
+        {
+          "items": 4,
+          "reverse": false,
+          "parity": true,
+          "ms": 118.374184
+        },
+        {
+          "items": 4,
+          "reverse": true,
+          "parity": true,
+          "ms": 117.581432
+        },
+        {
+          "items": 8,
+          "reverse": false,
+          "parity": true,
+          "ms": 215.027728
+        },
+        {
+          "items": 8,
+          "reverse": true,
+          "parity": true,
+          "ms": 215.450094
+        }
+      ],
+      "timings": {
+        "2": {
+          "samples": 5,
+          "serial_total_median_ms": 92.588011,
+          "batch_median_ms": 47.522909,
+          "throughput_speedup": 1.9482816382305215
+        },
+        "4": {
+          "samples": 5,
+          "serial_total_median_ms": 204.627432,
+          "batch_median_ms": 117.954681,
+          "throughput_speedup": 1.7347970446378471
+        },
+        "8": {
+          "samples": 5,
+          "serial_total_median_ms": 395.984341,
+          "batch_median_ms": 213.949518,
+          "throughput_speedup": 1.8508307226006462
+        }
+      },
+      "overflow_status": 413,
+      "invalid_last_row_status": 413,
+      "retry_after_rejection_equal": true
+    },
+    "decide-q8": {
+      "checks": [
+        {
+          "items": 2,
+          "reverse": false,
+          "parity": true,
+          "ms": 51.421928
+        },
+        {
+          "items": 2,
+          "reverse": true,
+          "parity": true,
+          "ms": 50.655274
+        },
+        {
+          "items": 4,
+          "reverse": false,
+          "parity": true,
+          "ms": 98.258612
+        },
+        {
+          "items": 4,
+          "reverse": true,
+          "parity": true,
+          "ms": 97.885445
+        },
+        {
+          "items": 8,
+          "reverse": false,
+          "parity": true,
+          "ms": 172.443179
+        },
+        {
+          "items": 8,
+          "reverse": true,
+          "parity": true,
+          "ms": 170.588492
+        }
+      ],
+      "timings": {
+        "2": {
+          "samples": 5,
+          "serial_total_median_ms": 76.851973,
+          "batch_median_ms": 50.486009,
+          "throughput_speedup": 1.5222429841899365
+        },
+        "4": {
+          "samples": 5,
+          "serial_total_median_ms": 158.24602199999998,
+          "batch_median_ms": 98.59682,
+          "throughput_speedup": 1.6049809922875808
+        },
+        "8": {
+          "samples": 5,
+          "serial_total_median_ms": 302.243669,
+          "batch_median_ms": 172.145242,
+          "throughput_speedup": 1.755748027006172
+        }
+      },
+      "overflow_status": 413,
+      "invalid_last_row_status": 413,
+      "retry_after_rejection_equal": true
+    }
+  },
+  "concurrent_batches": [
+    {
+      "requests": 4,
+      "inputs_per_request": 8,
+      "total_inputs": 32,
+      "all_equal": true,
+      "results": [
+        {
+          "model": "base",
+          "items": 8,
+          "ms": 339.699317
+        },
+        {
+          "model": "multi",
+          "items": 8,
+          "ms": 253.599913
+        },
+        {
+          "model": "decide-fp32",
+          "items": 8,
+          "ms": 397.40612
+        },
+        {
+          "model": "decide-q8",
+          "items": 8,
+          "ms": 400.148005
+        }
+      ]
+    },
+    {
+      "requests": 16,
+      "inputs_per_request": 8,
+      "total_inputs": 128,
+      "all_equal": true,
+      "results": [
+        {
+          "model": "base",
+          "items": 8,
+          "ms": 313.923384
+        },
+        {
+          "model": "multi",
+          "items": 8,
+          "ms": 247.182508
+        },
+        {
+          "model": "decide-fp32",
+          "items": 8,
+          "ms": 416.03263
+        },
+        {
+          "model": "decide-q8",
+          "items": 8,
+          "ms": 415.434087
+        },
+        {
+          "model": "base",
+          "items": 8,
+          "ms": 946.946897
+        },
+        {
+          "model": "multi",
+          "items": 8,
+          "ms": 484.271776
+        },
+        {
+          "model": "decide-fp32",
+          "items": 8,
+          "ms": 1215.293467
+        },
+        {
+          "model": "decide-q8",
+          "items": 8,
+          "ms": 1586.182676
+        },
+        {
+          "model": "base",
+          "items": 8,
+          "ms": 624.787312
+        },
+        {
+          "model": "multi",
+          "items": 8,
+          "ms": 737.14316
+        },
+        {
+          "model": "decide-fp32",
+          "items": 8,
+          "ms": 1563.220118
+        },
+        {
+          "model": "decide-q8",
+          "items": 8,
+          "ms": 1216.111435
+        },
+        {
+          "model": "base",
+          "items": 8,
+          "ms": 1225.788275
+        },
+        {
+          "model": "multi",
+          "items": 8,
+          "ms": 978.13708
+        },
+        {
+          "model": "decide-fp32",
+          "items": 8,
+          "ms": 820.504245
+        },
+        {
+          "model": "decide-q8",
+          "items": 8,
+          "ms": 819.170742
+        }
+      ]
+    }
+  ],
+  "date": "2026-10-28",
+  "target": "NVIDIA GB10 / SM121",
+  "driver": "580.178.04",
+  "build": {
+    "zig": "0.17.0",
+    "optimize": "ReleaseFast",
+    "cpu": "baseline+sha2",
+    "cuda": true,
+    "metal": false,
+    "cuda_artifacts": "fatbin",
+    "strip": true
+  },
+  "budgets_mib": {
+    "process": 40960,
+    "host": 20480,
+    "backend": 24576,
+    "combined": 32768,
+    "scratch": 16384
+  },
+  "model_revisions": {
+    "base": "fastino/gliner2.5-base-v1@72ac19b486cd4557424c8d61114e7530c243e9b0",
+    "base_transformers_config": "fastino/gliner2.5-base-v1@54785d51df8d86a0d8f2eb212fec15871aad2c4d",
+    "multi": "fastino/gliner2.5-multi-v1@aaecfe45db1d828c963717054ccb868e8ad1f1d5",
+    "decide_fp32": "fastino/GLiNER2.5-Decide@5a7adf72a23b4d311abae6ce050d7f0012bb3416",
+    "decide_q8": "antflydb/GLiNER2.5-Decide@358ae4b1263cedb79faf9e8b7984c3b4e5586874"
+  },
+  "regression": {
+    "selected": 24,
+    "passed": 24,
+    "skipped": 0,
+    "exit_code": 0,
+    "test_binary_sha256": "5112a4dec9dbb9be591a5fbc19b320d3fcf90be23ed52020dc957dcbbfd7f8ec",
+    "batch_checks": 132,
+    "batch_sizes": [
+      2,
+      4,
+      8
+    ],
+    "both_input_orders": true,
+    "multi_profile_capture_files": [
+      "family/multi_v1_general_classification_capture.json",
+      "family/multi_v1_endpoint_capture.json",
+      "family/multi_v1_clean_entity_short_capture.json",
+      "family/multi_v1_classification_floor_capture.json",
+      "family/multi_v1_general_entity_capture.json",
+      "family/multi_v1_source_word_floor_capture.json"
+    ],
+    "queued_eight_input_cancellation": "no GPU launches; leases restored; retry equal",
+    "native_fp32_max_classifier_logit_error": 7.62939453125e-06,
+    "cuda_fp32_singleton_max_classifier_logit_error": 8.106231689453125e-06,
+    "cuda_q8_singleton_max_classifier_logit_error": 0.03154325485229492,
+    "wrapper_artifact_batch_test": {
+      "selected": 1,
+      "passed": 1,
+      "skipped": 0,
+      "batch_checks": 12
+    }
+  },
+  "disabled_cuda_gate": {
+    "cuda": false,
+    "exit_code": 1,
+    "message": "production CUDA qualification requires -Dcuda=true; skipped GPU tests cannot qualify serving"
+  },
+  "out_of_scope_native_q8_diagnostic": {
+    "status": "failed",
+    "maximum_raw_classifier_logit_error": 0.06692218780517578,
+    "existing_raw_logit_tolerance": 0.05,
+    "production_qualified": false,
+    "note": "Q8 qualification is CUDA only. Native Q8 was an additional diagnostic, not a mandatory CUDA release row."
+  },
+  "single_input_http_regression": {
+    "status": "passed",
+    "typed_decisions": true,
+    "concurrency": 16,
+    "tokens_512": true,
+    "tokens_513_status": 413,
+    "reload_and_eviction": true
+  },
+  "scope_notes": [
+    "Explicit schema_version:2 /ai/v1/extract input batches only; independent requests are not automatically coalesced.",
+    "Existing independent per-item task and padded-token geometry profiles are retained.",
+    "Base long-document extraction remains one input; multi long documents are unqualified.",
+    "Decide <=8 items, one prepared sequence per item, <=512 tokens each. Typed /ai/v1/decisions retains its single-input wire format.",
+    "Boundary capability discovery retains its conservative one-input advertisement because long-document batching is unqualified.",
+    "Five-sample local HTTP timings compare the same inputs sent individually with a single batch; these are not a comparative Python or fleet performance qualification."
+  ]
+}

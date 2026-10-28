@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Exact-artifact Metal parity for the published multilingual GLiNER2.5
+//! Exact-artifact GPU parity for the published multilingual GLiNER2.5
 //! boundary family. This stays separate from the generic device scorer tests:
 //! every run binds the full checkpoint and all four sidecars to the immutable
 //! upstream capture before executing the resident encoder, head and scorer.
@@ -157,8 +157,14 @@ fn expectReference(checkpoint: pipeline.FamilyCheckpoint, reference: pipeline.Fa
 }
 
 fn parity(comptime checkpoint: pipeline.FamilyCheckpoint) !void {
-    if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    if (!@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    try deviceParity(checkpoint, .metal);
+}
+
+fn deviceParity(comptime checkpoint: pipeline.FamilyCheckpoint, comptime device: enum { metal, cuda }) !void {
+    if (device == .metal) {
+        if (comptime !build_options.enable_metal) return error.SkipZigTest;
+        if (!@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    } else if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const model_environment = checkpoint.environment_prefix ++ "_MODEL_DIR";
     const capture_environment = (checkpoint.capture_environment_prefix orelse checkpoint.environment_prefix) ++ "_CAPTURE";
     const directory = platform.env.getenv(model_environment) orelse return error.SkipZigTest;
@@ -178,6 +184,8 @@ fn parity(comptime checkpoint: pipeline.FamilyCheckpoint) !void {
     defer a.free(weight_path);
     var weights = fixtures.TensorFixture{ .allocator = a, .reader = try safetensors.MMapReader.openFileAbsolute(a, weight_path) };
     defer weights.deinit();
+    c_file.MmapRegion.adviseBytesSequential(weights.reader.file_bytes);
+    defer c_file.MmapRegion.adviseBytesRandom(weights.reader.file_bytes);
     try expectPin(checkpoint.model, weights.reader.file_bytes);
     const tokenizer_bytes = try readPinned(a, directory, "tokenizer.json", checkpoint.sidecars.@"tokenizer.json");
     defer a.free(tokenizer_bytes);
@@ -191,16 +199,21 @@ fn parity(comptime checkpoint: pipeline.FamilyCheckpoint) !void {
     defer a.free(tokenizer_config);
     const config = try model.parseConfig(a, config_bytes, encoder_bytes);
 
-    var store = try head_tests.loadMetalWeights(a, &weights);
-    defer store.lazy_weights.deinit(a);
-    metal.initPrefetchQueue(&store, a);
-    defer metal.deinitPrefetchQueue(&store);
-    defer metal.deinitSharedNativeProvider(&store);
-    var backend = try metal.MetalCompute.init(a, &store, null);
-    defer backend.deinit();
-    const cb = backend.computeBackend();
+    var store: @import("../../ops/gpu_hosted_store.zig").WeightStore = if (device == .metal) try head_tests.loadMetalWeights(a, &weights) else undefined;
+    defer if (device == .metal) store.lazy_weights.deinit(a);
+    if (device == .metal) metal.initPrefetchQueue(&store, a);
+    defer if (device == .metal) metal.deinitPrefetchQueue(&store);
+    defer if (device == .metal) metal.deinitSharedNativeProvider(&store);
+    var backend: metal.MetalCompute = if (device == .metal) try metal.MetalCompute.init(a, &store, null) else undefined;
+    defer if (device == .metal) backend.deinit();
+    const session: ?@import("../../backends/session.zig").Session = if (device == .cuda) try factory.createGlinerCudaSessionWithPrecision(a, directory, .fp32) else null;
+    defer if (session) |value| value.close();
+    if (session) |value| try std.testing.expectEqual(.cuda, value.backend());
+    var cb = if (device == .metal) backend.computeBackend() else try factory.getComputeBackend(session.?, a);
+    defer if (device == .cuda) cb.deinit();
 
     for (capture.value.requests) |request| {
+        const cuda_before = if (comptime device == .cuda and build_options.enable_cuda) factory.getCudaRuntimeStats(session.?).? else {};
         errdefer std.debug.print("{s} resident family device case: {s}\n", .{ checkpoint.profile, request.id });
         var schema = try schema_mod.compile(a, request.native_schema_json, .{});
         defer schema.deinit();
@@ -248,6 +261,12 @@ fn parity(comptime checkpoint: pipeline.FamilyCheckpoint) !void {
         }
         const stats = try scorer.stats();
         try std.testing.expect(stats.result_download_bytes <= scorer.limits.max_result_download_bytes);
+        if (comptime device == .cuda and build_options.enable_cuda) {
+            const after = factory.getCudaRuntimeStats(session.?).?;
+            try std.testing.expect(after.kernel_launches > cuda_before.kernel_launches);
+            try std.testing.expectEqual(cuda_before.to_float32_calls, after.to_float32_calls);
+            std.debug.print("gliner_family_cuda case={s} launches={d} host_tensor_fallbacks=0\n", .{ request.id, after.kernel_launches - cuda_before.kernel_launches });
+        }
     }
 }
 
@@ -407,6 +426,8 @@ fn optimizedFfnReleasedArtifactParity(comptime checkpoint: pipeline.FamilyCheckp
     defer a.free(weight_path);
     var weights = fixtures.TensorFixture{ .allocator = a, .reader = try safetensors.MMapReader.openFileAbsolute(a, weight_path) };
     defer weights.deinit();
+    c_file.MmapRegion.adviseBytesSequential(weights.reader.file_bytes);
+    defer c_file.MmapRegion.adviseBytesRandom(weights.reader.file_bytes);
     try expectPin(checkpoint.model, weights.reader.file_bytes);
 
     var controller = admission_memory.AdmissionController{};
@@ -532,6 +553,8 @@ test "GLiNER2.5 multilingual Decide public wire capture Metal resident parity" {
     defer a.free(weight_path);
     var weights = fixtures.TensorFixture{ .allocator = a, .reader = try safetensors.MMapReader.openFileAbsolute(a, weight_path) };
     defer weights.deinit();
+    c_file.MmapRegion.adviseBytesSequential(weights.reader.file_bytes);
+    defer c_file.MmapRegion.adviseBytesRandom(weights.reader.file_bytes);
     try expectPin(checkpoint.model, weights.reader.file_bytes);
     const tokenizer_bytes = try readPinned(a, directory, "tokenizer.json", checkpoint.sidecars.@"tokenizer.json");
     defer a.free(tokenizer_bytes);
@@ -630,4 +653,16 @@ test "GLiNER2.5 multilingual Decide public wire capture Metal resident parity" {
         const stats = try scorer.stats();
         try std.testing.expect(stats.result_download_bytes <= scorer.limits.max_result_download_bytes);
     }
+}
+
+// Each capture keeps its own artifact, token, logit and decoded-output pins.
+// These offline checks gather CUDA evidence without relaxing serving policy.
+test "GLiNER2.5 multilingual v1 frozen CUDA family profiles" {
+    try deviceParity(pipeline.multilingual_family_checkpoints[0], .cuda);
+    try deviceParity(pipeline.multilingual_endpoint_checkpoints[0], .cuda);
+    try deviceParity(pipeline.multilingual_classification_floor_checkpoints[0], .cuda);
+    try deviceParity(pipeline.multilingual_general_classification_checkpoints[0], .cuda);
+    try deviceParity(pipeline.multilingual_general_entity_checkpoints[0], .cuda);
+    try deviceParity(pipeline.multilingual_clean_entity_short_checkpoints[0], .cuda);
+    try deviceParity(pipeline.multilingual_source_word_floor_checkpoints[0], .cuda);
 }
