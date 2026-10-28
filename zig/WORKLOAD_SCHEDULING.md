@@ -19,8 +19,11 @@ WAL retirement preserves the dedicated replay stream and adopts its measured
 retention state only if no peer mutation advanced the WAL generation.
 Accepted publication I/O retains its grant
 through independent cleanup and joins before releasing journal ownership.
-Periodic checkpoint rotation, foreground WAL append/sync, remaining metadata planning and broader
-compaction execution still need integration;
+Periodic checkpoint maintenance now admits journal rotation, concurrent streaming
+construction, retirement-ledger preparation/rebase and descriptor publication.
+Cold/replacement retirement-path preparation also runs outside the metadata mutex.
+Foreground WAL append/sync, remaining metadata operations and broader compaction
+execution still need integration;
 this does not establish full engine or mixed-protocol overload qualification.
 
 Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
@@ -31,7 +34,7 @@ implementation evidence are recorded in the implementation ledger.
 The branch integrates main through `a507489e93` (#1330). The October 27 merge
 retains the bounded maintenance worker and main's newer document/resolver paths.
 
-Private native ABI 160 and kernel-owner ABI 220 fence the current manager,
+Private native ABI 161 and kernel-owner ABI 221 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
 retirement, allocator-host acquisition, publication-resource and registered source-ancestry and yieldable physical output retirement and registered writer-root contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;

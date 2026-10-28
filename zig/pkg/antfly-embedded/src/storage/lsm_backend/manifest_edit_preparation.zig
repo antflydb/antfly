@@ -30,8 +30,11 @@ const platform = @import("antfly_platform");
 const Run = repository.Run;
 const storage_io = @import("storage_io.zig");
 pub const wal_retirement = @import("normal_wal_retirement.zig");
+pub const checkpoint_rotation = @import("normal_checkpoint_rotation.zig");
 pub const checkpoint_publication = @import("normal_checkpoint_publication.zig");
 pub var test_hook: ?*const fn (admission.Port) anyerror!void = null;
+pub var test_plan_edit_hook: ?*const fn (admission.Port) anyerror!void = null;
+pub var test_plan_hook: ?*const fn (admission.Port) anyerror!void = null;
 pub var test_append_hook: ?*const fn (*Frame, admission.Port) anyerror!void = null;
 pub var test_append_join_hook: ?*const fn (admission.Port) anyerror!void = null;
 pub var test_retirement_hook: ?*const fn (admission.Port) anyerror!void = null;
@@ -47,6 +50,8 @@ pub const Frame = struct {
     deadline_ns: u64 = 0,
     wal_owner: ?*wal_retirement.Owner = null,
     wal_retirement_offset: usize = 0,
+    rotation_owner: ?*checkpoint_rotation.Owner = null,
+    rotation_retirement_offset: usize = 0,
     checkpoint_owner: ?*checkpoint_publication.Owner = null,
     checkpoint_retirement_offset: usize = 0,
     next: ?*Frame = null,
@@ -54,6 +59,11 @@ pub const Frame = struct {
     previous: ?*Directory = null,
     obsolete: ?*Snapshot = null,
     previous_obsolete: ?*Snapshot = null,
+    planning_source: ?*Snapshot = null,
+    planned_obsolete: ?Ledger = null,
+    planned_previous: ?Ledger = null,
+    plan_reclaimer: ?Ledger.Reclaimer = null,
+    previous_plan_reclaimer: ?Ledger.Reclaimer = null,
     added: []manifest.RunMeta = &.{},
     removed: []u64 = &.{},
     added_paths: []manifest.ObsoletePathMeta = &.{},
@@ -65,7 +75,7 @@ pub const Frame = struct {
     retirement_offset: usize = 0,
 
     pub fn create(backend: anytype) !*Frame {
-        var credit = try backend.options.resource_manager.?.reserve(.lsm_table_builder_working_set, @sizeOf(Frame) + 2 * @sizeOf(Directory) + 2 * @sizeOf(Snapshot));
+        var credit = try backend.options.resource_manager.?.reserve(.lsm_table_builder_working_set, @sizeOf(Frame) + 2 * @sizeOf(Directory) + 3 * @sizeOf(Snapshot));
         errdefer credit.release();
         const self = try backend.allocator.create(Frame);
         self.* = .{ .credit = credit };
@@ -236,9 +246,96 @@ pub const Frame = struct {
             return cause;
         };
     }
-    pub fn prepareCheckpoint(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, root: []const u8, id: u64, next_id: u64) !void {
+    pub fn rotateWithExecution(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, previous: u64, id: u64, sequence: u64) !void {
         const io = owner.io() orelse return error.ExecutionWaitUnsupported;
-        const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+        if (self.deadline_ns == 0) self.deadline_ns = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+        try self.credit.growBoundedOversized(try std.math.add(u64, @sizeOf(checkpoint_rotation.Owner), try backend.storage.?.appendResourceBytes(0)), 1);
+        const result = blk: {
+            var pass = execution.Pass.init(owner.runnableOwner(), &io, self.deadline_ns, .{ .context = backend, .is_cancelled = cancelled }) catch |cause| break :blk @as(anyerror!void, cause);
+            defer pass.deinit();
+            var scope = pass.admissionScope(io) catch |cause| break :blk @as(anyerror!void, cause);
+            const payload = scope.payload();
+            const original = admission.Port.init(&payload);
+            self.rotation_owner = &(try allocate(checkpoint_rotation.Owner, backend.allocator, 1, original))[0];
+            self.rotation_owner.?.* = .{};
+            break :blk self.rotation_owner.?.prepare(backend.storage.?, backend.options.unpublished_outputs.?, backend.root_dir.?, previous, id, sequence, original);
+        };
+        result catch |cause| {
+            if (self.rotation_owner) |rotation| {
+                errdefer rotation.join();
+                while (true) {
+                    const joined = blk: {
+                        var pass = execution.Pass.initWithOptions(owner.runnableOwner(), &io, platform.time.monotonicNs() +| 100 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true }) catch |failure| break :blk @as(anyerror!void, failure);
+                        defer pass.deinit();
+                        var scope = pass.admissionScope(io) catch |failure| break :blk @as(anyerror!void, failure);
+                        const payload = scope.payload();
+                        break :blk rotation.joinWithAdmission(.init(&payload));
+                    };
+                    joined catch |failure| {
+                        switch (failure) {
+                            error.Timeout, error.DeadlineExceeded, error.ResourceBudgetExceeded, error.ParentMemoryBusy, error.CapacityUnavailable, error.OutOfMemory, error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable => {
+                                try io.sleep(.fromMilliseconds(1), .awake);
+                                continue;
+                            },
+                            else => rotation.join(),
+                        }
+                    };
+                    break;
+                }
+            }
+            return cause;
+        };
+    }
+    /// Seeds are immutable registered snapshots. Only the private fork is
+    /// mutated off-lock; accounting observes shared atomic accounts and the
+    /// retained construction credit, never a growing spare vector.
+    pub fn planRetirement(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, fence: *const repository.ManifestJournal.CheckpointFence, first: *const Ledger, second: ?*const Ledger, deadline: u64) !void {
+        const io = owner.io() orelse return error.ExecutionWaitUnsupported;
+        if (self.deadline_ns == 0) self.deadline_ns = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+        const count = fence.retiredPathCount();
+        var plan_bound = try std.math.add(u64, try first.prepareMemoryBound(count), try std.math.mul(u64, count, backend.root_dir.?.len + 128));
+        if (second) |seed| plan_bound = try std.math.add(u64, plan_bound, try std.math.add(u64, try seed.prepareMemoryBound(count), try std.math.mul(u64, count, backend.root_dir.?.len + 128)));
+        try self.credit.growBoundedOversized(plan_bound, 1);
+        var pass = try execution.Pass.init(owner.runnableOwner(), &io, self.deadline_ns, .{ .context = backend, .is_cancelled = cancelled });
+        defer pass.deinit();
+        var scope = try pass.admissionScope(io);
+        const payload = scope.payload();
+        const original = admission.Port.init(&payload);
+        if (comptime @import("builtin").is_test) if (test_plan_hook) |hook| try hook(original);
+        self.planned_obsolete = first.fork();
+        try fillRetired(&self.planned_obsolete.?, backend.allocator, backend.root_dir.?, fence, deadline, original);
+        if (second) |seed| {
+            self.planned_previous = seed.fork();
+            try fillRetired(&self.planned_previous.?, backend.allocator, backend.root_dir.?, fence, deadline, original);
+        }
+    }
+    fn fillRetired(ledger: *Ledger, a: std.mem.Allocator, root: []const u8, fence: *const repository.ManifestJournal.CheckpointFence, deadline: u64, original: admission.Port) !void {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        for (0..fence.retiredPathCount()) |index| {
+            try original.checkpoint();
+            const path = try fence.retiredPathAt(root, index, &buffer);
+            if (ledger.get(path)) |existing| {
+                if (existing.delete_after_ns != std.math.maxInt(u64)) continue;
+                try ledger.prepareWithAdmission(a, original);
+                ledger.setDeadlinePrepared(path, deadline);
+                if (comptime @import("builtin").is_test) if (test_plan_edit_hook) |hook| try hook(original);
+                continue;
+            }
+            try ledger.prepareWithAdmission(a, original);
+            // A filesystem path is bounded by max_path_bytes. No metadata
+            // vector or large-key copy is hidden in this fixed-size edit.
+            const copied = try a.dupe(u8, path);
+            ledger.appendAssumeCapacity(.{ .path = copied, .delete_after_ns = deadline });
+            if (comptime @import("builtin").is_test) if (test_plan_edit_hook) |hook| try hook(original);
+        }
+    }
+    pub fn prepareCheckpoint(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, root: []const u8, id: u64, next_id: u64) !void {
+        return self.prepareCheckpointAtSequence(backend, owner, root, id, next_id, 0, false);
+    }
+    pub fn prepareCheckpointAtSequence(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, root: []const u8, id: u64, next_id: u64, sequence: u64, preserve_journal: bool) !void {
+        const io = owner.io() orelse return error.ExecutionWaitUnsupported;
+        const deadline = if (self.deadline_ns != 0) self.deadline_ns else platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+        self.deadline_ns = deadline;
         // Fixed streaming scratch plus one retained provider grant, independent
         // of metadata/key count. Funding occurs off-lock before CPU admission.
         try self.credit.growBoundedOversized(try std.math.add(u64, @sizeOf(checkpoint_publication.Owner), try backend.storage.?.appendResourceBytes(0)), 1);
@@ -256,7 +353,7 @@ pub const Frame = struct {
         self.checkpoint_owner = &(try allocate(checkpoint_publication.Owner, backend.allocator, 1, original))[0];
         const checkpoint = self.checkpoint_owner.?;
         checkpoint.* = .{ .deadline = deadline };
-        try checkpoint.prepare(backend.storage.?, backend.options.unpublished_outputs.?, root, id, next_id, .{
+        try checkpoint.prepareAtSequence(backend.storage.?, backend.options.unpublished_outputs.?, root, id, next_id, sequence, preserve_journal, .{
             .cursor = self.current.?.readCursor(),
             .ledger = self.obsolete.?.value.iterator(),
             .count = self.obsolete.?.value.count(),
@@ -355,9 +452,21 @@ pub const Frame = struct {
         self.obsolete = null;
         if (self.previous_obsolete) |snapshot| snapshot.retire(backend);
         self.previous_obsolete = null;
+        if (self.planning_source) |snapshot| snapshot.retire(backend);
+        self.planning_source = null;
     }
     pub fn stepWithAdmission(self: *Frame, a: std.mem.Allocator, credits: *usize, original: ?admission.Port) !bool {
         if (comptime @import("builtin").is_test) if (self.wal_owner == null) if (original) |port| if (test_retirement_hook) |hook| try hook(port);
+        inline for (.{ .{ "planned_obsolete", "plan_reclaimer" }, .{ "planned_previous", "previous_plan_reclaimer" } }) |fields| {
+            if (@field(self, fields[0])) |ledger| {
+                @field(self, fields[1]) = .init(ledger);
+                @field(self, fields[0]) = null;
+            }
+            if (@field(self, fields[1])) |*reclaimer| {
+                if (!try reclaimer.stepWithAdmission(a, credits, original)) return false;
+                @field(self, fields[1]) = null;
+            }
+        }
         if (self.wal_owner) |wal_owner| {
             if (credits.* == 0) return false;
             credits.* -= 1;
@@ -385,6 +494,22 @@ pub const Frame = struct {
         if (self.append_grant) |*grant| {
             if (original) |port| try grant.retireWithAdmission(port) else grant.deinit();
             self.append_grant = null;
+        }
+        if (self.rotation_owner) |rotation| {
+            if (credits.* == 0) return false;
+            credits.* -= 1;
+            if (self.rotation_retirement_offset == 0 and !try rotation.retireStep(original)) return false;
+            const bytes = std.mem.asBytes(rotation);
+            while (self.rotation_retirement_offset < bytes.len) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                const end = @min(bytes.len, self.rotation_retirement_offset + 16 * 1024);
+                @memset(bytes[self.rotation_retirement_offset..end], undefined);
+                self.rotation_retirement_offset = end;
+            }
+            a.rawFree(bytes, .of(checkpoint_rotation.Owner), @returnAddress());
+            self.rotation_owner = null;
         }
         if (self.checkpoint_owner) |checkpoint| {
             if (credits.* == 0) return false;

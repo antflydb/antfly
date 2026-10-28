@@ -1686,6 +1686,7 @@ pub const Backend = struct {
     immutable_flush_completion: ImmutableFlushCompletion = .{},
     maintenance_job_in_flight: bool = false,
     manifest_checkpoint_build_in_flight: bool = false,
+    manifest_checkpoint_retry_at_ns: u64 = 0,
     manifest_checkpoint_build_id: ?u64 = null,
     manifest_checkpoint_directory: ?*RunDirectory = null,
     planner_seed: usize = 0,
@@ -4332,6 +4333,10 @@ pub const Backend = struct {
         const bulk_retired = self.retireUnneededBulkPlanLocked();
         compaction_mod.retireObsoleteAdmissions(self);
         if (!self.manifest_checkpoint_build_in_flight and self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue()) {
+            if (self.admittedImmutableFlushRuntime() != null) {
+                self.scheduleMaintenanceJobLocked(true);
+                return false;
+            }
             return try self.manifest_journal.runCheckpoint(self);
         }
         if (self.wal_checkpoint_pending and self.walCheckpointRetryDueLocked()) {
@@ -6325,12 +6330,14 @@ pub const Backend = struct {
         if (self.options.backend.read_only and !ledger_cleanup) return;
         if (self.bulkIngestActive() and !ledger_cleanup and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
         const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation) - @intFromBool(pending_memory and !after_reclamation) - @intFromBool(pending_metadata and !after_reclamation);
-        if (self.options.maintenance_waker != null and !ledger_cleanup) {
+        const owned_checkpoint = self.admittedImmutableFlushRuntime() != null and !self.manifest_recovery_required and
+            self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue();
+        if (self.options.maintenance_waker != null and !ledger_cleanup and !owned_checkpoint) {
             if (score != 0) self.wakeMaintenanceWorker();
             return;
         }
         if (self.maintenance_job_in_flight) return;
-        if (!self.bulkIngestActive() and !ledger_cleanup) {
+        if (!self.bulkIngestActive() and !ledger_cleanup and !owned_checkpoint) {
             if (self.immutable_flush_job_in_flight or self.immutable_flush_build_in_flight) return;
             if (self.activeImmutableMemtableCount() > 0) return;
         }
@@ -6356,7 +6363,7 @@ pub const Backend = struct {
         // A refused cleanup slice keeps its roots queued. Back off only on the
         // durable worker; foreground unlocks neither wait nor retry in a loop.
         _ = runtime_mod.lockBackend(Backend, self);
-        const retry_ns = self.retirement_execution_retry_at_ns -| platform_time.monotonicNs();
+        const retry_ns = @max(self.retirement_execution_retry_at_ns, self.manifest_checkpoint_retry_at_ns) -| platform_time.monotonicNs();
         const retry_io = self.manifestCoordinationIo();
         self.mu.unlock();
         if (retry_ns != 0) if (retry_io) |io| try io.sleep(.fromNanoseconds(@min(retry_ns, 10 * std.time.ns_per_ms)), .awake);
@@ -6396,6 +6403,19 @@ pub const Backend = struct {
                 self.mu.unlock();
                 if (pause != 0) if (io) |lane| lane.sleep(.fromNanoseconds(@min(pause, maintenance_admission_retry_ns)), .awake) catch {};
                 break; // At most one durable completion attempt per dispatch.
+            }
+            if (!self.manifest_recovery_required and self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue()) {
+                if (self.admittedImmutableFlushRuntime()) |execution_runtime| {
+                    if (platform_time.monotonicNs() >= self.manifest_checkpoint_retry_at_ns) {
+                        const progressed = self.manifest_journal.runCheckpointWithExecution(self, execution_runtime) catch false;
+                        // A busy publication lane is retained work, not progress.
+                        // Back off outside CPU before selecting the next attempt.
+                        self.manifest_checkpoint_retry_at_ns = if (progressed) 0 else platform_time.monotonicNs() +| maintenance_admission_retry_ns;
+                    }
+                    made_progress = !self.manifest_recovery_required;
+                    self.mu.unlock();
+                    break; // One periodic checkpoint attempt per detached dispatch.
+                }
             }
             self.mu.unlock();
             // A selected maintenance owner retains normal planning authority.

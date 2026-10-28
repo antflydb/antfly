@@ -85,7 +85,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Normal journal owners carry accepted IO and bounded grant retirement.
 // Normal primary WAL retirement owns a funded physical continuation and
 // generation-stamped retention state independently of dedicated replay.
-pub const abi_version: u32 = 220;
+// Periodic checkpoints retain admitted rotation and private retirement plans.
+pub const abi_version: u32 = 221;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

@@ -22,8 +22,8 @@ const File = @import("owned_atomic_file.zig").File;
 const admission = @import("../../common/read_admission.zig");
 
 /// The caller prepays memoryBound(), fences unrelated publication and pins the
-/// source through retirement. This publishes a replacement set, never a live
-/// journal rotation. Existing parent directories and valid output metadata are
+/// source through retirement. A caller that already rotated the live journal
+/// sets preserve_journal before driving; that suffix must never be overwritten. Existing parent directories and valid output metadata are
 /// required. No original execution or allocator callback is retained.
 ///
 /// Keep this owner address stable while physical IO borrows its command. A
@@ -42,6 +42,7 @@ pub fn Publication(comptime Source: type) type {
         descriptor: [36]u8,
         phase: Phase = .checkpoint,
         fixed_written: bool = false,
+        preserve_journal: bool = false,
         attempted: [3]bool = @splat(false),
         published: [3]bool = @splat(false),
         aborting: bool = false,
@@ -106,7 +107,7 @@ pub fn Publication(comptime Source: type) type {
                         if (!self.encoder.retiring and !self.encoder.retired) while (try self.encoder.writeNextWithAdmission(&self.file, original)) {};
                         try self.encoder.retireWithAdmission(original);
                         try self.finishCurrent(original);
-                        self.advanceFile(.segment);
+                        self.advanceFile(if (self.preserve_journal) .descriptor else .segment);
                     },
                     .segment, .descriptor => {
                         if (!self.fixed_written) {

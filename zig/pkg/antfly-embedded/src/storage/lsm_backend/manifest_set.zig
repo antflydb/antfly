@@ -126,6 +126,10 @@ pub fn createSegment(allocator: Allocator, storage: Storage, root: []const u8, i
     try replace(allocator, storage, path, &segmentHeader(id, first_sequence));
 }
 
+pub fn linkHeader(previous: u64, next: u64) [header_len]u8 {
+    return header(link_magic, previous, next);
+}
+
 /// The caller serializes this handoff with appends. A failed or ambiguous
 /// handoff must fence further appends until recovery or a new set publication.
 pub fn rotate(allocator: Allocator, storage: Storage, root: []const u8, previous: u64, next: u64, first_sequence: u64) !void {

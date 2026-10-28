@@ -818,6 +818,8 @@ pub var publication_test_hook: ?struct { context: *anyopaque, run: *const fn (*a
 /// Benchmark control: identical durable format and planner, serialized fsync.
 pub var publication_test_keep_backend_locked = false;
 
+pub var checkpoint_due_test_hook: ?*const fn (*const ManifestJournal) bool = null;
+
 const LedgerSnapshot = @import("ledger_reclamation.zig").Snapshot;
 
 pub const ManifestJournal = struct {
@@ -1025,6 +1027,7 @@ pub const ManifestJournal = struct {
     }
 
     pub fn checkpointDue(self: *const @This()) bool {
+        if (comptime @import("builtin").is_test) if (checkpoint_due_test_hook) |hook| if (hook(self)) return true;
         const edit_budget = @min(8 * 1024 * 1024, (max_manifest_read_bytes -| (self.bytes -| self.edit_bytes)) / 2);
         return self.sequence == null or self.sequence.? -| self.checkpoint_sequence >= 256 or self.edit_bytes >= edit_budget;
     }
@@ -1256,6 +1259,136 @@ pub const ManifestJournal = struct {
         return true;
     }
 
+    /// Detached normal owner: rotate under the publication lane, then let
+    /// journals advance while the captured checkpoint streams. Never rewrite
+    /// the rotated journal when publishing its new checkpoint descriptor.
+    pub fn runCheckpointWithExecution(self: *@This(), backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime) !bool {
+        if (backend.manifest_recovery_required) return error.RecoveryRequired;
+        if (backend.registered_publication.seal != null or backend.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
+        if (backend.manifest_publish_in_flight or backend.manifest_checkpoint_build_in_flight or self.sequence == null or self.descriptor == null or backend.manifest_directory == null) return false;
+        if (self.segment_count == manifest_set.max_segments) {
+            self.sequence = null;
+            backend.markManifestDirty();
+            backend.flush_completion_pending = true;
+            return true;
+        }
+        const Frame = @import("manifest_edit_preparation.zig").Frame;
+        const runtime = @import("runtime.zig");
+        const Backend = @TypeOf(backend.*);
+        const frame = try Frame.create(backend);
+        defer backend.retireManifestPreparation(frame);
+        backend.manifest_checkpoint_build_in_flight = true;
+        defer backend.manifest_checkpoint_build_in_flight = false;
+        backend.retainReaderKind(.other);
+        defer backend.releaseReaderKind(.other);
+        var handoff = try backend.beginManifestTurn();
+        var handoff_held = true;
+        defer if (handoff_held) handoff.deinit();
+        const fence = CheckpointFence.capture(backend);
+        const sequence = self.sequence.?;
+        const old_bytes = self.bytes;
+        const old_edits = self.edit_bytes;
+        const deadline = backend.nowNs() +| backend.options.obsolete_retention_ns;
+        frame.current = try backend.manifest_directory.?.fork(backend.allocator);
+        backend.manifest_checkpoint_directory = frame.current;
+        defer backend.manifest_checkpoint_directory = null;
+        frame.obsolete = try LedgerSnapshot.capture(backend, &self.obsolete);
+        runtime.unlockBackend(Backend, backend, true);
+        const planned = frame.planRetirement(backend, owner, &fence, &frame.obsolete.?.value, null, deadline);
+        _ = runtime.lockBackend(Backend, backend);
+        try planned;
+        if (!fence.matches(backend)) return error.ResourceBudgetExceeded;
+        std.mem.swap(ObsoleteLedger, &frame.obsolete.?.value, &frame.planned_obsolete.?);
+        const id = backend.next_run_id;
+        backend.next_run_id = try std.math.add(u64, id, 1);
+        const next_id = backend.next_run_id;
+        backend.manifest_checkpoint_build_id = id;
+        defer backend.manifest_checkpoint_build_id = null;
+        const previous = self.active_segment;
+        // Conservatively retain attempted output identities even on refusal.
+        // A failed link cannot authorize deleting a possibly live journal.
+        self.segments[self.segment_count] = id;
+        self.segment_count += 1;
+        const rotate_started = backend.writeStatsNowNs();
+        runtime.unlockBackend(Backend, backend, true);
+        const rotated = frame.rotateWithExecution(backend, owner, previous, id, sequence);
+        _ = runtime.lockBackend(Backend, backend);
+        backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(rotate_started);
+        rotated catch |cause| {
+            if (frame.rotation_owner != null and frame.rotation_owner.?.linkMayHavePublished()) {
+                self.sequence = null;
+                backend.markManifestDirty();
+                backend.flush_completion_pending = true;
+            }
+            return cause;
+        };
+        self.active_segment = id;
+        backend.write_stats.manifest_bytes +|= 2 * manifest_set.header_len;
+        handoff.deinit();
+        handoff_held = false;
+        const build_started = backend.writeStatsNowNs();
+        runtime.unlockBackend(Backend, backend, true);
+        const built = frame.prepareCheckpointAtSequence(backend, owner, backend.root_dir.?, id, next_id, sequence, true);
+        _ = runtime.lockBackend(Backend, backend);
+        backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(build_started);
+        try built;
+        const checkpoint_bytes = frame.checkpoint_owner.?.physical.encoder.total;
+        var publication = try backend.beginManifestTurn();
+        defer publication.deinit();
+        if (self.sequence == null or self.descriptor == null or !std.meta.eql(self.descriptor, fence.journal.descriptor) or self.active_segment != id) return false;
+        if (!self.checkpointFits(checkpoint_bytes, old_bytes)) return error.ManifestJournalBacklogExceeded;
+        // Rebase retirement intent on both publication-time ledgers. The
+        // publication lane fences journals; a live-root CAS detects foreground
+        // ledger changes while CPU admission runs without Backend.mu.
+        const final = try Frame.create(backend);
+        defer backend.retireManifestPreparation(final);
+        final.deadline_ns = frame.deadline_ns;
+        final.obsolete = try LedgerSnapshot.capture(backend, &self.obsolete);
+        final.previous_obsolete = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+        const final_fence = CheckpointFence.capture(backend);
+        runtime.unlockBackend(Backend, backend, true);
+        const rebased = final.planRetirement(backend, owner, &fence, &final.obsolete.?.value, &final.previous_obsolete.?.value, deadline);
+        _ = runtime.lockBackend(Backend, backend);
+        try rebased;
+        if (!final_fence.matches(backend) or backend.obsolete_paths.tree.root != final.previous_obsolete.?.value.tree.root) return error.ResourceBudgetExceeded;
+        std.mem.swap(ObsoleteLedger, &backend.obsolete_paths, &final.planned_previous.?);
+        std.mem.swap(ObsoleteLedger, &final.previous_obsolete.?.value, &final.planned_previous.?);
+        backend.obsolete_manifest_dirty = true;
+        const publish_started = backend.writeStatsNowNs();
+        runtime.unlockBackend(Backend, backend, true);
+        const published = frame.finishCheckpoint(backend, owner);
+        _ = runtime.lockBackend(Backend, backend);
+        backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(publish_started);
+        _ = published catch |cause| {
+            if (frame.checkpoint_owner.?.descriptorMayHavePublished()) {
+                backend.manifest_recovery_required = true;
+                self.sequence = null;
+                backend.markManifestDirty();
+            }
+            return cause;
+        };
+        if (!final_fence.matches(backend)) {
+            backend.manifest_recovery_required = true;
+            self.sequence = null;
+            backend.markManifestDirty();
+            return error.RecoveryRequired;
+        }
+        std.mem.swap(ObsoleteLedger, &self.obsolete, &final.planned_obsolete.?);
+        std.mem.swap(ObsoleteLedger, &final.obsolete.?.value, &final.planned_obsolete.?);
+        self.descriptor = .{ .checkpoint = id, .first_segment = id, .sequence = sequence };
+        self.checkpoint_sequence = sequence;
+        self.next_run_id = @max(self.next_run_id, next_id);
+        self.edit_bytes -= old_edits;
+        self.bytes = checkpoint_bytes + (self.bytes - old_bytes);
+        self.segments[0] = id;
+        self.segment_count = 1;
+        backend.current_manifest_bytes = self.bytes;
+        backend.write_stats.manifest_checkpoints +|= 1;
+        backend.write_stats.manifest_writes +|= 1;
+        backend.write_stats.manifest_bytes +|= checkpoint_bytes + 36;
+        return true;
+    }
+
     /// Caller holds the publication lock. The last durable directory owns SST
     /// pins until its successor is durable, independently of reader lifetimes.
     pub fn persist(self: *@This(), backend: anytype, root_dir: []const u8, runs: []const Run) !Result {
@@ -1360,29 +1493,45 @@ pub const ManifestJournal = struct {
             backend.syncTrackedInMemoryStateUsageCurrentLocked();
             if (reservation) |*lease| lease.release();
         }
-        const retired_count = self.retiredFileCount();
-        const prepared_paths = try std.math.add(usize, backend.obsolete_paths.spare.items.len, retired_count);
-        if (backend.options.resource_manager) |manager| {
-            const bound = try std.math.add(u64, 64 * 1024 + retired_count * (root.len + 128) * 2, try backend.obsolete_paths.prepareMemoryBound(prepared_paths));
-            reservation = try manager.reserve(.lsm_table_builder_working_set, bound);
-        }
         const directory = try current.fork(allocator);
         if (frame) |owned| owned.current = directory;
         errdefer if (frame == null) directory.destroy(allocator);
-        const retired = try allocator.alloc(lsm_manifest.ObsoletePathMeta, retired_count);
-        defer allocator.free(retired);
-        var initialized: usize = 0;
-        var transferred = false;
-        defer if (!transferred) for (retired[0..initialized]) |path| allocator.free(path.path);
-        try self.retiredFiles(allocator, root, backend.nowNs() +| backend.options.obsolete_retention_ns, retired, &initialized);
-        try backend.obsolete_paths.ensureUnusedCapacity(allocator, prepared_paths);
-        for (retired) |path| {
-            if (backend.obsolete_paths.contains(path.path)) {
-                allocator.free(path.path);
-            } else backend.obsolete_paths.appendAssumeCapacity(.{ .path = @constCast(path.path), .delete_after_ns = path.delete_after_ns });
-        }
-        transferred = true;
-        const ledger_owner = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+        const ledger_owner = if (frame) |owned| blk: {
+            owned.planning_source = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+            const fence = CheckpointFence.capture(backend);
+            const deadline = backend.nowNs() +| backend.options.obsolete_retention_ns;
+            const runtime = @import("runtime.zig");
+            runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+            const planned = owned.planRetirement(backend, execution_runtime.?, &fence, &owned.planning_source.?.value, null, deadline);
+            _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+            try planned;
+            if (!fence.matches(backend) or backend.obsolete_paths.tree.root != owned.planning_source.?.value.tree.root) return error.ResourceBudgetExceeded;
+            std.mem.swap(ObsoleteLedger, &backend.obsolete_paths, &owned.planned_obsolete.?);
+            // Register the old live spare-vector ownership before observers run.
+            std.mem.swap(ObsoleteLedger, &owned.planning_source.?.value, &owned.planned_obsolete.?);
+            break :blk try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+        } else blk: {
+            const retired_count = self.retiredFileCount();
+            const prepared_paths = try std.math.add(usize, backend.obsolete_paths.spare.items.len, retired_count);
+            if (backend.options.resource_manager) |manager| {
+                const bound = try std.math.add(u64, 64 * 1024 + retired_count * (root.len + 128) * 2, try backend.obsolete_paths.prepareMemoryBound(prepared_paths));
+                reservation = try manager.reserve(.lsm_table_builder_working_set, bound);
+            }
+            const retired = try allocator.alloc(lsm_manifest.ObsoletePathMeta, retired_count);
+            defer allocator.free(retired);
+            var initialized: usize = 0;
+            var transferred = false;
+            defer if (!transferred) for (retired[0..initialized]) |path| allocator.free(path.path);
+            try self.retiredFiles(allocator, root, backend.nowNs() +| backend.options.obsolete_retention_ns, retired, &initialized);
+            try backend.obsolete_paths.ensureUnusedCapacity(allocator, prepared_paths);
+            for (retired) |path| {
+                if (backend.obsolete_paths.contains(path.path)) {
+                    allocator.free(path.path);
+                } else backend.obsolete_paths.appendAssumeCapacity(.{ .path = @constCast(path.path), .delete_after_ns = path.delete_after_ns });
+            }
+            transferred = true;
+            break :blk try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+        };
         if (frame) |owned| owned.obsolete = ledger_owner;
         defer if (frame == null) ledger_owner.retire(backend);
         const ledger = &ledger_owner.value;

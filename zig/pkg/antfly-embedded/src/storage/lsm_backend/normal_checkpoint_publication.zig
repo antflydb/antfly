@@ -62,16 +62,21 @@ pub const Owner = struct {
     deadline: u64 = 0,
 
     pub fn prepare(self: *@This(), storage: io.Storage, queue: *Cleanup.Queue, root: []const u8, id: u64, next_id: u64, source: Source, original: admission.Port) !void {
+        return self.prepareAtSequence(storage, queue, root, id, next_id, 0, false, source, original);
+    }
+    pub fn prepareAtSequence(self: *@This(), storage: io.Storage, queue: *Cleanup.Queue, root: []const u8, id: u64, next_id: u64, sequence: u64, preserve_journal: bool, source: Source, original: admission.Port) !void {
         if (comptime @import("builtin").is_test) if (repository.publication_test_hook) |hook| try hook.run(hook.context);
         if (comptime @import("builtin").is_test) if (test_hook) |hook| try hook(original);
         self.grant = (try storage.tryPrepareDurabilityWithAdmission(original)) orelse return error.ResourceBudgetExceeded;
-        try self.physical.initInPlace(self.grant.?, root, id, 0, next_id, source, repository.maxManifestReadBytes());
+        try self.physical.initInPlace(self.grant.?, root, id, sequence, next_id, source, repository.maxManifestReadBytes());
+        self.physical.preserve_journal = preserve_journal;
         self.live = true;
         self.grant = null;
         try queue.retainProducerWithAdmission(original);
         self.queue = queue;
-        for (&self.creations, 0..) |*creation, i| creation.* = Cleanup.Creation.init(queue, self.physical.paths[i][0..self.physical.path_lens[i]]);
-        while (self.ticket_index < 2) {
+        const count: usize = if (preserve_journal) 1 else 2;
+        for (self.creations[0..count], 0..) |*creation, i| creation.* = Cleanup.Creation.init(queue, self.physical.paths[i][0..self.physical.path_lens[i]]);
+        while (self.ticket_index < count) {
             const i = self.ticket_index;
             try self.creations[i].?.resumeWithAdmission(original);
             self.tickets[i] = try self.creations[i].?.take();

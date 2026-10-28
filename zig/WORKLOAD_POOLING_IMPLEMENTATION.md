@@ -30104,10 +30104,53 @@ Raft/outbox or mixed-engine overload evidence. Existing admitted-retirement,
 prepared-append, metadata-retirement, maintenance-dispatch and C API/provider
 semantic checks accompany them; full archive/GNU qualification remains waived.
 
-The bounded-publication milestone remains open for checkpoint retirement-path
-planning under the metadata mutex, periodic checkpoint rotation, foreground WAL
-append/sync and other legacy WAL callers, and compaction construction/remaining
-metadata operations. Nonempty legacy `wal.log` or mixed embedded replay layouts
+Normal detached periodic checkpoint maintenance now lends the same shared
+execution owner to rotation, construction, retirement-ledger planning/rebase and
+descriptor publication. The normal maintenance facade dispatches an independent
+durable job even when a selected maintenance waker owns ordinary planning; CPU
+admission runs after releasing Backend.mu and outside DB/catalog guards. Busy
+publication or admission refusal backs off outside CPU and retains periodic debt.
+One attempt runs per detached dispatch. Existing 256-edit/byte cadence remains.
+
+Rotation uses an owned atomic-file grant for the new journal and predecessor
+link. Rejected waits retain accepted commands; independent protected cleanup joins
+before releasing the manifest publication lane. A possibly published link fences
+journal sequencing and selects autonomous replacement through normal completion.
+The checkpoint writer skips journal creation for rotated sets, allowing peers to
+append and sync their suffix while the pinned prefix streams. Publication checks
+lineage and recovery headroom, rebases retirement intent on current durable/live
+ledgers, and installs captured checkpoint counters while retaining newer journal
+bytes, run directories and sequence. Descriptor uncertainty fences recovery and
+preserves both lineages and referenced SSTs.
+
+Cold/replacement and periodic retirement planning now build private COW ledgers
+from registered immutable snapshots under shared execution outside Backend.mu.
+They reserve construction capacity before path-copy edits, check original
+execution between bounded filename edits, retain partial plans through independent
+credited reclamation, and validate live-root identity before adoption. Accounting
+never reads a growing private spare vector. Fixed root/header swaps under the
+metadata mutex install completed plans; sources remain pinned through physical
+retirement. Private native/owner ABI versions 161/221 fence these retained layouts.
+Durable formats are unchanged.
+
+[`periodic-checkpoint-production-v4-debug.json`](qualification/workload-pooling/receipts/2026-10-10/child-outbox-capture-retirement-cumulative-integration/periodic-checkpoint-production-v4-debug.json)
+records focused Debug qualification including ten new native normal-path cases.
+One runs the actual 256-edit threshold through ordinary commits and reopens every
+row. Fault fixtures deterministically select the same normal dispatcher without
+forging durable sequence/counter state. They cover pre-edit and partial-plan
+refusal, rotation refusal, actual uncertain link publication and autonomous
+replacement, streaming retry from rotated lineage, descriptor recovery fencing,
+peer publication into the rotated suffix while builder CPU is parked,
+cancellation with accepted rotation IO followed by controlled close, and selected
+maintenance dispatch. Retry cases require no new write/sync or SST rebuild;
+crash/reopen and zero remaining construction/execution charges are checked. These
+are native backend integration fixtures and C API/provider semantic compilation,
+not full server/Raft, archive/GNU or cross-engine overload qualification.
+
+The bounded-publication milestone remains open for foreground WAL append/sync
+and other legacy WAL callers, and compaction construction/remaining metadata
+operations. Synchronous and ineligible checkpoint callers retain legacy paths.
+Nonempty legacy `wal.log` or mixed embedded replay layouts
 are refused before destructive normal retirement and still need migration or a
 compatible admitted driver. Callers without the
 eligible detached runtime retain their legacy publication path. This is not full

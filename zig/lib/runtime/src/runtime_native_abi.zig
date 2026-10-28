@@ -144,7 +144,8 @@ const builtin = @import("builtin");
 // Prepared append owners retain accepted IO and bounded buffer retirement.
 // Normal primary WAL retirement owns a funded physical continuation and
 // generation-stamped retention state independently of dedicated replay.
-pub const abi_version: u32 = 160;
+// Periodic checkpoints retain admitted rotation and private retirement plans.
+pub const abi_version: u32 = 161;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

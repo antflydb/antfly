@@ -7532,3 +7532,289 @@ test "physical cache metadata registered flush publication normal WAL prefix ret
 test "physical cache metadata registered flush publication normal WAL canceled accepted IO joins before controlled close" {
     try normalAdmittedWal(.cancel_close);
 }
+
+fn normalAdmittedPeriodicCheckpoint(mode: enum { cadence, plan_retry, plan_partial, rotation_retry, link_failure, build_retry, descriptor_uncertain, interleave, cancel_close, selected_owner }) !void {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const io_mod = local.storage_lsm_backend_storage_io;
+    const repository = local.storage_lsm_backend_repository;
+    const preparation = local.storage_lsm_backend_compaction_publication.manifest_edit_preparation;
+    const rotation = preparation.checkpoint_rotation;
+    const checkpoint = preparation.checkpoint_publication;
+    const owners = @import("api/runnable_owner_execution.zig");
+    const platform = @import("antfly_platform");
+    const scheduler = local.common_request_admission.runnable_scheduler;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
+    defer state.owner.deinit();
+    var resources = try Resources.initWithBudgets(a, budgets_mod.smartResourceBudgetsForTotal(128 << 20));
+    defer resources.deinit();
+    resources.attachResourceManager();
+    defer RegisteredOutputFixture.drain(&resources.resource_manager);
+    var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 12);
+    defer pool.deinit();
+    var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/normal-periodic", .{tmp.sub_path});
+    defer a.free(root);
+    var handle = try lsm.BackendHandle.openWithConfig(a, root, .{
+        .storage = native.storage(),
+        .resource_manager = &resources.resource_manager,
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 128,
+        .immutable_flush_window_max_memtables = 1,
+        .compact_threshold_runs = 10000,
+        .l0_soft_limit_runs = 10000,
+        .l0_hard_limit_runs = 20000,
+    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = state.port() } });
+    var open = true;
+    const H = struct {
+        var selected: @TypeOf(mode) = .cadence;
+        var backend: *lsm.Backend = undefined;
+        var execution: *owners.State = undefined;
+        var old_checkpoint: u64 = 0;
+        var plans: std.atomic.Value(usize) = .init(0);
+        var rotations: std.atomic.Value(usize) = .init(0);
+        var builds: std.atomic.Value(usize) = .init(0);
+        var injected: std.atomic.Value(bool) = .init(false);
+        var ready: std.Io.Event = .unset;
+        var go: std.Io.Event = .unset;
+        var hold_cleanup: bool = false;
+        fn due(journal: *const repository.ManifestJournal) bool {
+            return journal.descriptor != null and journal.descriptor.?.checkpoint == old_checkpoint;
+        }
+        fn unlocked(original: read_admission.Port) !void {
+            try original.checkpoint();
+            const cpu = execution.owner.scheduler.stats();
+            try std.testing.expect(cpu.runnable_slots > cpu.control_slots);
+            const until = platform.time.monotonicNs() +| 5 * std.time.ns_per_s;
+            while (!backend.mu.tryLock()) {
+                if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            backend.mu.unlock();
+        }
+        fn plan(original: read_admission.Port) !void {
+            try unlocked(original);
+            const call = plans.fetchAdd(1, .monotonic);
+            if (selected == .plan_retry and call == 0) return error.ResourceBudgetExceeded;
+        }
+        fn edit(original: read_admission.Port) !void {
+            try unlocked(original);
+            if (selected == .plan_partial and !injected.swap(true, .acq_rel)) return error.ResourceBudgetExceeded;
+        }
+        fn rotate(owner: *rotation.Owner, original: read_admission.Port) !void {
+            try unlocked(original);
+            if (owner.stage == 0) {
+                _ = rotations.fetchAdd(1, .monotonic);
+                if (selected == .rotation_retry and !injected.swap(true, .acq_rel)) return error.ResourceBudgetExceeded;
+            } else if (owner.stage == 1) {
+                if (selected == .link_failure and !injected.swap(true, .acq_rel)) io_mod.NativeSyncTestControl.control_failure_after_rename.store(true, .release);
+                if (selected == .cancel_close and !injected.swap(true, .acq_rel)) {
+                    io_mod.NativeSyncTestControl.started.store(false, .release);
+                    io_mod.NativeSyncTestControl.release.store(false, .release);
+                    io_mod.NativeSyncTestControl.pause.store(true, .release);
+                }
+            }
+        }
+        fn build(original: read_admission.Port) !void {
+            try unlocked(original);
+            const call = builds.fetchAdd(1, .monotonic);
+            if (selected == .build_retry and call == 0) return error.ResourceBudgetExceeded;
+            if (selected == .interleave and call == 0) {
+                const boundary = (try original.executionWait()).?;
+                try boundary.beginWait();
+                ready.set(std.testing.io);
+                const waited = go.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+                try boundary.endWait();
+                try waited;
+            }
+        }
+        fn descriptor(original: read_admission.Port) !void {
+            try unlocked(original);
+            if (selected == .descriptor_uncertain and !injected.swap(true, .acq_rel)) io_mod.NativeSyncTestControl.control_failure_after_rename.store(true, .release);
+        }
+        fn retire(original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (hold_cleanup) return error.ResourceBudgetExceeded;
+            io_mod.NativeSyncTestControl.control_failure_after_rename.store(false, .release);
+        }
+        fn wake(_: *anyopaque) void {}
+        fn quiet(b: *lsm.Backend, peer_only: bool) bool {
+            const flushed = b.activeImmutableMemtableCount() == 0 and !b.immutable_flush_job_in_flight and !b.immutable_flush_build_in_flight and !b.flush_completion_pending;
+            return flushed and !b.manifest_publish_in_flight and (peer_only or (!b.manifest_checkpoint_build_in_flight and !b.maintenance_job_in_flight and b.active_manifest_preparation == null and b.retired_manifest_preparations == null and !b.manifest_preparation_reclaim_in_flight));
+        }
+        fn wait(b: *lsm.Backend, until: u64, peer_only: bool) !void {
+            while (true) {
+                while (!b.mu.tryLock()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                const done = quiet(b, peer_only);
+                b.mu.unlock();
+                if (done) return;
+                if (platform.time.monotonicNs() >= until) {
+                    std.debug.print("periodic timeout {t}: plans={d} rotations={d} builds={d} seq={any} cpseq={d} build={} maintenance={} completion={} recovery={} frames={}\n", .{ selected, plans.load(.acquire), rotations.load(.acquire), builds.load(.acquire), b.manifest_journal.sequence, b.manifest_journal.checkpoint_sequence, b.manifest_checkpoint_build_in_flight, b.maintenance_job_in_flight, b.flush_completion_pending, b.manifest_recovery_required, b.retired_manifest_preparations != null });
+                    return error.TestUnexpectedResult;
+                }
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+        fn put(b: *lsm.Backend, key: []const u8) !void {
+            var write = try b.beginWrite();
+            defer write.abort();
+            try write.put(.{}, key, "durable");
+            try write.commit();
+        }
+    };
+    defer {
+        H.go.set(io);
+        H.hold_cleanup = false;
+        repository.checkpoint_due_test_hook = null;
+        io_mod.NativeSyncTestControl.release.store(true, .release);
+        io_mod.NativeSyncTestControl.pause.store(false, .release);
+        io_mod.NativeSyncTestControl.control_failure_after_rename.store(false, .release);
+        if (open) handle.close();
+        preparation.test_plan_hook = null;
+        preparation.test_plan_edit_hook = null;
+        preparation.test_retirement_hook = null;
+        rotation.test_hook = null;
+        checkpoint.test_hook = null;
+        checkpoint.test_descriptor_hook = null;
+    }
+    const until = platform.time.monotonicNs() +| 120 * std.time.ns_per_s;
+    try H.put(handle.ptr(), "first");
+    try H.wait(handle.ptr(), until, false);
+    try H.put(handle.ptr(), "second");
+    try H.wait(handle.ptr(), until, false);
+    H.selected = mode;
+    H.backend = handle.ptr();
+    H.execution = &state;
+    H.old_checkpoint = handle.ptr().manifest_journal.descriptor.?.checkpoint;
+    H.plans.store(0, .release);
+    H.rotations.store(0, .release);
+    H.builds.store(0, .release);
+    H.injected.store(false, .release);
+    H.ready = .unset;
+    H.go = .unset;
+    H.hold_cleanup = mode == .cancel_close;
+    preparation.test_plan_hook = H.plan;
+    preparation.test_plan_edit_hook = H.edit;
+    preparation.test_retirement_hook = H.retire;
+    rotation.test_hook = H.rotate;
+    checkpoint.test_hook = H.build;
+    checkpoint.test_descriptor_hook = H.descriptor;
+    const before = handle.ptr().snapshotWriteStats();
+    if (mode == .cadence) {
+        // Exercise the actual 256-edit production threshold without altering
+        // sequencing or cadence. Other fault cases select the same dispatcher
+        // deterministically, retaining valid journal contents and counters.
+        for (0..255) |i| {
+            var key: [24]u8 = undefined;
+            try H.put(handle.ptr(), try std.fmt.bufPrint(&key, "row-{d}", .{i}));
+            try H.wait(handle.ptr(), until, false);
+        }
+    } else {
+        repository.checkpoint_due_test_hook = H.due;
+        if (mode == .selected_owner) handle.ptr().options.maintenance_waker = .{ .ptr = handle.ptr(), .wake_fn = H.wake };
+        _ = try handle.ptr().runMaintenanceStep();
+    }
+    if (mode == .interleave) {
+        try H.ready.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+        const parked = state.owner.scheduler.stats();
+        try std.testing.expectEqual(parked.control_slots, parked.runnable_slots);
+        const captured = handle.ptr().manifest_journal.sequence.?;
+        try H.put(handle.ptr(), "peer");
+        try H.wait(handle.ptr(), until, true);
+        try std.testing.expect(handle.ptr().manifest_journal.sequence.? > captured);
+        H.go.set(io);
+    }
+    if (mode == .cancel_close) {
+        while (!io_mod.NativeSyncTestControl.started.load(.acquire) or !H.injected.load(.acquire)) {
+            if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        const backend = handle.ptr();
+        backend.closing.store(true, .release);
+        io_mod.NativeSyncTestControl.release.store(true, .release);
+        io_mod.NativeSyncTestControl.pause.store(false, .release);
+        backend.background_executor.drain();
+        try std.testing.expectEqual(@as(u64, 0), backend.active_readers);
+        try std.testing.expect(!backend.manifest_publish_in_flight and !backend.manifest_checkpoint_build_in_flight);
+        var frame = backend.retired_manifest_preparations;
+        while (frame != null and frame.?.rotation_owner == null) frame = frame.?.next;
+        const retained = (frame orelse return error.TestUnexpectedResult).rotation_owner.?;
+        try std.testing.expect(!retained.live or retained.file.pending == null);
+        H.hold_cleanup = false;
+        var pass = try local.common_background_execution.Pass.initWithOptions(state.port(), &io, platform.time.monotonicNs() +| 200 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true });
+        defer pass.deinit();
+        var scope = try pass.admissionScope(io);
+        const payload = scope.payload();
+        var close: lsm.Backend.QuiescedClosePreparation = .{};
+        try close.resumeWithAdmission(backend, io, .init(&payload));
+    } else {
+        try H.wait(handle.ptr(), until, false);
+        const backend = handle.ptr();
+        if (mode == .descriptor_uncertain) {
+            try std.testing.expect(backend.manifest_recovery_required and backend.manifest_journal.sequence == null);
+        } else {
+            try std.testing.expect(!backend.manifest_recovery_required);
+            try std.testing.expect(backend.manifest_journal.descriptor.?.checkpoint != H.old_checkpoint);
+            try std.testing.expect(H.builds.load(.acquire) >= 1);
+            if (mode == .cadence) try std.testing.expect(backend.manifest_journal.checkpoint_sequence >= 256);
+            if (mode == .plan_retry or mode == .plan_partial or mode == .build_retry or mode == .rotation_retry) try std.testing.expect(H.plans.load(.acquire) >= 3);
+        }
+        try std.testing.expectEqual(before.immutable_flushes + @as(u64, if (mode == .cadence) 255 else @intFromBool(mode == .interleave)), backend.snapshotWriteStats().immutable_flushes);
+    }
+    repository.checkpoint_due_test_hook = null;
+    io_mod.NativeSyncTestControl.control_failure_after_rename.store(false, .release);
+    handle.abandonAfterCrash();
+    open = false;
+    RegisteredOutputFixture.drain(&resources.resource_manager);
+    try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("durable", try read.get(.{}, "first"));
+    try std.testing.expectEqualStrings("durable", try read.get(.{}, "second"));
+    if (mode == .interleave) try std.testing.expectEqualStrings("durable", try read.get(.{}, "peer"));
+    if (mode == .cadence) for (0..255) |i| {
+        var key: [24]u8 = undefined;
+        try std.testing.expectEqualStrings("durable", try read.get(.{}, try std.fmt.bufPrint(&key, "row-{d}", .{i})));
+    };
+}
+
+test "physical cache metadata registered flush publication periodic checkpoint follows actual edit cadence and reopens all rows" {
+    try normalAdmittedPeriodicCheckpoint(.cadence);
+}
+test "physical cache metadata registered flush publication periodic checkpoint retries retirement planning without fresh write" {
+    try normalAdmittedPeriodicCheckpoint(.plan_retry);
+}
+test "physical cache metadata registered flush publication periodic checkpoint retries rotation refusal without SST rebuild" {
+    try normalAdmittedPeriodicCheckpoint(.rotation_retry);
+}
+test "physical cache metadata registered flush publication periodic checkpoint uncertain link selects autonomous replacement" {
+    try normalAdmittedPeriodicCheckpoint(.link_failure);
+}
+test "physical cache metadata registered flush publication periodic checkpoint retries failed streaming build from rotated lineage" {
+    try normalAdmittedPeriodicCheckpoint(.build_retry);
+}
+test "physical cache metadata registered flush publication periodic checkpoint descriptor uncertainty fences recovery and retains inputs" {
+    try normalAdmittedPeriodicCheckpoint(.descriptor_uncertain);
+}
+test "physical cache metadata registered flush publication periodic checkpoint preserves concurrent journal suffix and peer roots" {
+    try normalAdmittedPeriodicCheckpoint(.interleave);
+}
+test "physical cache metadata registered flush publication periodic checkpoint cancellation joins rotation before controlled close" {
+    try normalAdmittedPeriodicCheckpoint(.cancel_close);
+}
+test "physical cache metadata registered flush publication periodic checkpoint selected maintenance dispatches detached execution" {
+    try normalAdmittedPeriodicCheckpoint(.selected_owner);
+}
+
+test "physical cache metadata registered flush publication periodic checkpoint partial retirement plan retains funded cleanup" {
+    try normalAdmittedPeriodicCheckpoint(.plan_partial);
+}
