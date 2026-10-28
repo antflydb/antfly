@@ -49,7 +49,7 @@ shared = base / "input"
 shared.mkdir(parents=True, exist_ok=True)
 out = base / label
 out.mkdir(exist_ok=True)
-archive = shared / "archive.parquet"
+archive = shared / "archive-row-groups.parquet"
 names = ("sparsehead", "sparsetail")
 if not archive.exists():
     punctuation = "." * (8 * 1024 * 1024)
@@ -65,6 +65,7 @@ if not archive.exists():
         ),
         archive,
         use_dictionary=False,
+        row_group_size=1,
     )
 fixture = bench.import_fixture(shared / "fixture", [archive], "source-pages")
 definition = {
