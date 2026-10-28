@@ -1,5 +1,6 @@
 # Publish packages to npm when tagged
 # - ts/antfly/sdk/v* tags publish @antfly/sdk
+# - ts/antfly/better-auth/v* tags publish @antfly/better-auth
 # - ts/antfly/components/v* tags publish @antfly/components
 # - ts/antfly/design-system/v* tags publish @antfly/design-system
 # - ts/antfly/web/v* tags publish @antfly/web
@@ -15,6 +16,7 @@ on:
   push:
     tags:
       - 'ts/antfly/sdk/v*'
+      - 'ts/antfly/better-auth/v*'
       - 'ts/antfly/components/v*'
       - 'ts/antfly/design-system/v*'
       - 'ts/antfly/web/v*'
@@ -26,7 +28,13 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  auth-checks:
+    if: startsWith(github.ref, 'refs/tags/ts/antfly/better-auth/v')
+    uses: ./.github/workflows/better-auth-compatibility.yml
+
   publish:
+    needs: auth-checks
+    if: ${{ !cancelled() && (needs.auth-checks.result == 'success' || needs.auth-checks.result == 'skipped') }}
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -93,3 +101,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/ts/antfly/web/v')
         working-directory: ts
         run: pnpm --filter @antfly/web publish --access public --no-git-checks --provenance
+
+      - name: Publish Better Auth integration
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/better-auth/v')
+        working-directory: ts
+        run: pnpm --filter @antfly/better-auth publish --access public --no-git-checks --provenance
