@@ -215,6 +215,7 @@ fn cursorFor(value: Snapshot, bytes: u64, records: u32, checksum: [32]u8) DiskCu
 pub const Store = struct {
     pub const max_records = 64;
     pub const max_file_bytes = max_encoded_bytes * 8;
+    retention: @import("media_checkpoint_quota.zig").Manager = .{},
     full_reads: std.atomic.Value(u64) = .init(0),
     mutexes: [256]std.Io.Mutex = @splat(.init),
     pub const Context = struct { store: *Store, io: std.Io, models_dir: []const u8 };
@@ -306,7 +307,7 @@ pub const Store = struct {
         @memcpy(bytes[bytes.len - 8 ..], "AFSC0001");
         return bytes;
     }
-    fn append(context: Context, a: std.mem.Allocator, identity: [32]u8, value: Snapshot, cursor: DiskCursor) !?DiskCursor {
+    fn append(context: Context, a: std.mem.Allocator, identity: [32]u8, value: Snapshot, cursor: DiskCursor, quota: *@import("media_checkpoint_quota.zig").Gate) !?DiskCursor {
         if (cursor.records == 0 or cursor.records >= max_records or value.next_window <= cursor.window or cursor.complete or value.sample_rate != cursor.rate or value.registry.count < cursor.registry_count or value.spanCount() < cursor.span_count) return null;
         if (cursor.total) |total| if (value.total_samples == null or value.total_samples.? != total) return null;
         if (!std.mem.eql(u8, &cursor.prefix_hash, &value.prefixDigest(cursor.span_count -| 1))) return null;
@@ -315,7 +316,10 @@ pub const Store = struct {
             if (current.start_ns != tail.start_ns or current.speaker_index != tail.speaker_index or current.end_ns < tail.end_ns) return null;
         }
         var name: [std.fs.max_path_bytes]u8 = undefined;
-        const file = std.Io.Dir.cwd().openFile(context.io, try path(&name, context.models_dir, identity, false), .{ .mode = .read_write }) catch return null;
+        const filename = try path(&name, context.models_dir, identity, false);
+        const entry_stat = std.Io.Dir.cwd().statFile(context.io, filename, .{ .follow_symlinks = false }) catch return null;
+        if (entry_stat.kind != .file) return null;
+        const file = std.Io.Dir.cwd().openFile(context.io, filename, .{ .mode = .read_write }) catch return null;
         defer file.close(context.io);
         const stat = try file.stat(context.io);
         if (stat.kind != .file or stat.size != cursor.bytes or stat.size > max_file_bytes or stat.size < 80) return null;
@@ -326,8 +330,10 @@ pub const Store = struct {
         const bytes = try frame(a, identity, value, cursor);
         defer a.free(bytes);
         if (bytes.len > max_file_bytes - stat.size) return null;
+        try quota.reserve(bytes.len, 0);
         try file.writePositionalAll(context.io, bytes, stat.size);
         try file.sync(context.io);
+        try quota.commit(0, bytes.len, false);
         var checksum: [32]u8 = undefined;
         @memcpy(&checksum, bytes[bytes.len - 40 ..][0..32]);
         return cursorFor(value, stat.size + bytes.len, cursor.records + 1, checksum);
@@ -341,17 +347,19 @@ pub const Store = struct {
         const mutex = &context.store.mutexes[identity[0]];
         try mutex.lock(context.io);
         defer mutex.unlock(context.io);
+        var quota = try context.store.retention.open(context.io, context.models_dir, identity);
+        defer quota.deinit();
         var dir: [std.fs.max_path_bytes]u8 = undefined;
         try std.Io.Dir.cwd().createDirPath(context.io, try std.fmt.bufPrint(&dir, "{s}/.antfly-speaker-plans", .{context.models_dir}));
         var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
         const lock = try std.Io.Dir.cwd().createFile(context.io, try std.fmt.bufPrint(&lock_buf, "{s}/.antfly-speaker-plans/{x:0>2}.lock", .{ context.models_dir, identity[0] }), .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true });
         defer lock.close(context.io);
-        if (hint) |cursor| if (try append(context, a, identity, value, cursor)) |saved| return saved;
+        if (hint) |cursor| if (try append(context, a, identity, value, cursor, &quota)) |saved| return saved;
         if (loadWithCursor(context, a, identity)) |old| {
             defer old.snapshot.deinit(a);
             if (old.snapshot.extends(value)) return old.cursor;
             if (!value.extends(old.snapshot)) return error.InvalidSpeakerCheckpoint;
-            if (try append(context, a, identity, value, old.cursor)) |saved| return saved;
+            if (try append(context, a, identity, value, old.cursor, &quota)) |saved| return saved;
         } else |err| {
             if (err == error.OutOfMemory) return err;
         }
@@ -362,6 +370,8 @@ pub const Store = struct {
         const target = try path(&target_buf, context.models_dir, identity, false);
         const pending = try path(&pending_buf, context.models_dir, identity, true);
         defer std.Io.Dir.cwd().deleteFile(context.io, pending) catch {};
+        const old_size = if (std.Io.Dir.cwd().statFile(context.io, target, .{ .follow_symlinks = false })) |stat| (if (stat.kind == .file) @as(?u64, stat.size) else null) else |_| null;
+        try quota.reserve(40 + bytes.len, @intFromBool(old_size == null));
         {
             const file = try std.Io.Dir.cwd().createFile(context.io, pending, .{});
             defer file.close(context.io);
@@ -373,6 +383,7 @@ pub const Store = struct {
             try file.sync(context.io);
         }
         try std.Io.Dir.cwd().rename(pending, .cwd(), target, context.io);
+        try quota.commit(old_size orelse 0, 40 + bytes.len, old_size == null);
         var checksum: [32]u8 = undefined;
         @memcpy(&checksum, bytes[bytes.len - 40 ..][0..32]);
         return cursorFor(value, 40 + bytes.len, 1, checksum);

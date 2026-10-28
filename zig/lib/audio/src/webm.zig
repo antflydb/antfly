@@ -653,7 +653,16 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
         samples: usize,
         sample_rate: u32,
         channels: u8,
+        retained_owner: ?OpusIndex = null,
         pub fn init(a: std.mem.Allocator, bytes: []const u8, max_packets: usize) !Self {
+            const Builder = struct {
+                fn build(_: @This(), alloc: std.mem.Allocator, demuxed: opus.Demuxed, max: usize) !OpusIndex {
+                    return OpusIndex.build(alloc, demuxed, max);
+                }
+            };
+            return initWithBuilder(a, bytes, max_packets, Builder{});
+        }
+        pub fn initWithBuilder(a: std.mem.Allocator, bytes: []const u8, max_packets: usize, builder: anytype) !Self {
             var demuxed = try demux(a, bytes);
             defer demuxed.deinit();
             if (demuxed.access_units.len == 0 or demuxed.access_units.len > max_packets) return error.UnsupportedStreamingAudioProfile;
@@ -693,7 +702,7 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
                         total = try std.math.add(usize, total, count.*);
                     }
                     const owned = opus.Demuxed{ .header = head, .packets = packets, .packet_tocs = tocs, .packet_sample_counts = raw_counts, .total_decoded_frames = raw_total, .playable_frames = total, .discard_padding_frames = 0, .allocator = a };
-                    codec = .{ .opus = try OpusIndex.build(a, owned, max_packets) };
+                    codec = .{ .opus = try builder.build(a, owned, max_packets) };
                 },
                 .vorbis => {
                     const packets = try buildOggPackets(a, try splitXiphLacedTriple(demuxed.codec_private), demuxed.access_units);
@@ -743,10 +752,14 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
             return .{ .allocator = a, .codec = codec, .spans = try spans.toOwnedSlice(a), .samples = if (trim < cursor) cursor - trim else cursor, .sample_rate = rate, .channels = channels };
         }
         pub fn deinit(self: *Self) void {
+            const a = self.allocator;
+            const spans = self.spans;
+            var retained = self.retained_owner;
+            a.free(spans);
             switch (self.codec) {
                 inline else => |*index| index.deinit(),
             }
-            self.allocator.free(self.spans);
+            if (retained) |*owner| owner.deinit();
         }
         pub fn copy(self: Self, a: std.mem.Allocator) !Self {
             const spans = try a.dupe(Span, self.spans);

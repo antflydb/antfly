@@ -46,7 +46,7 @@ pub const Index = struct {
         try finish(owner, max_packets);
         return .{ .owner = owner };
     }
-    fn create(admission: ?Admission) !*Owner {
+    pub fn create(admission: ?Admission) !*Owner {
         const backing = @import("antfly_platform").allocator.concurrentFallback();
         var lease: ?memory.AdmissionLease = if (admission) |quota| try quota.acquire(quota.context, @sizeOf(Owner)) else null;
         errdefer if (lease) |*owned| owned.release();
@@ -65,28 +65,23 @@ pub const Index = struct {
         _ = try opus.initialFrameState(owner.demuxed.header.channels);
         owner.capacity = @intCast(@min(max_checkpoints, @max(2, (owner.demuxed.playable_frames + interval - 1) / interval + 2)));
         if (owner.admission) |quota| owner.checkpoint_lease = try quota.acquire(quota.context, (owner.capacity + 4) * @sizeOf(Checkpoint));
-        owner.retained_bytes = @sizeOf(Owner) + (owner.capacity + 4) * @sizeOf(Checkpoint) + @max(owner.arena.queryCapacity(), owner.allocation.reserved_bytes + owner.allocation.metadata_bytes);
+        owner.state_bytes = (owner.capacity + 4) * @sizeOf(Checkpoint);
+        refreshBytes(owner);
     }
-    pub fn build(_: std.mem.Allocator, demuxed: opus.Demuxed, max_packets: usize) !Index {
-        const owner = try create(null);
-        errdefer owner.destroy();
-        const a = owner.arena.allocator();
-        owner.demuxed = demuxed;
-        owner.demuxed.allocator = a;
-        owner.demuxed.packets = try a.alloc([]u8, demuxed.packets.len);
-        for (owner.demuxed.packets, demuxed.packets) |*out, packet| out.* = try a.dupe(u8, packet);
-        owner.demuxed.packet_tocs = try a.dupe(opus.Toc, demuxed.packet_tocs);
-        owner.demuxed.packet_sample_counts = try a.dupe(u16, demuxed.packet_sample_counts);
-        try finish(owner, max_packets);
-        var old = demuxed;
-        old.deinit();
-        return .{ .owner = owner };
+    pub fn refreshBytes(owner: *Owner) void {
+        owner.retained_bytes = @sizeOf(Owner) + owner.state_bytes + @max(owner.arena.queryCapacity(), owner.allocation.reserved_bytes + owner.allocation.metadata_bytes);
     }
-    pub fn admit(self: Index, admission: ?Admission) !void {
-        if (self.owner.lease == null) {
-            if (admission) |quota| self.owner.lease = try quota.acquire(quota.context, self.owner.retained_bytes);
+    pub const Builder = struct {
+        owner: *Owner,
+        pub fn build(self: Builder, _: std.mem.Allocator, demuxed: opus.Demuxed, max_packets: usize) !Index {
+            self.owner.demuxed = demuxed;
+            try finish(self.owner, max_packets);
+            _ = self.owner.refs.fetchAdd(1, .monotonic);
+            // Packet ownership is already in this owner's admitted arena.
+            // A second payload copy or a later admission step is unnecessary.
+            return .{ .owner = self.owner };
         }
-    }
+    };
     pub fn copy(self: Index, _: std.mem.Allocator) !Index {
         _ = self.owner.refs.fetchAdd(1, .monotonic);
         return self;
@@ -124,8 +119,9 @@ pub const Owner = struct {
     frontiers: [4]?*Checkpoint = @splat(null),
     clock: u64 = 0,
     retained_bytes: usize = 0,
+    state_bytes: usize = 0,
     decoded_packets: std.atomic.Value(u64) = .init(0),
-    fn destroy(self: *Owner) void {
+    pub fn destroy(self: *Owner) void {
         for (self.checkpoints) |point| if (point) |owned| @import("antfly_platform").allocator.concurrentFallback().destroy(owned);
         for (self.frontiers) |point| if (point) |owned| @import("antfly_platform").allocator.concurrentFallback().destroy(owned);
         self.arena.deinit();
@@ -243,7 +239,17 @@ test "model aware media progressive Opus indexes decode requested prefixes and r
     }
     repeated.total_decoded_frames = total;
     repeated.playable_frames = total - repeated.header.pre_skip;
-    var index = try Index.build(a, repeated, 1000000);
+    const owner = try Index.create(null);
+    const meta = owner.arena.allocator();
+    var transferred = repeated;
+    transferred.allocator = meta;
+    transferred.packets = try meta.alloc([]u8, repeated.packets.len);
+    for (transferred.packets, repeated.packets) |*out, packet| out.* = try meta.dupe(u8, packet);
+    transferred.packet_tocs = try meta.dupe(opus.Toc, repeated.packet_tocs);
+    transferred.packet_sample_counts = try meta.dupe(u16, repeated.packet_sample_counts);
+    var index = try (Index.Builder{ .owner = owner }).build(meta, transferred, 1000000);
+    var initial = Index{ .owner = owner };
+    initial.deinit();
     defer index.deinit();
     try std.testing.expectEqual(@as(u64, 0), index.owner.decoded_packets.load(.monotonic));
     var reference = try audio.decodeInterleaved(a, bytes, .{});

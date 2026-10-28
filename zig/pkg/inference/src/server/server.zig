@@ -10687,11 +10687,15 @@ pub const Node = struct {
         defer a.free(key);
         if (!std.mem.eql(u8, &revision, &try self.chunkSpeakerRevision(path, io, control))) return error.ModelConfigurationChanged;
         const lease = try self.speaker_models.acquire(self.allocator, path, key, control);
-        errdefer {
+        errdefer lease.deinit();
+        const after = self.chunkSpeakerRevision(path, io, control) catch |err| {
+            lease.verificationFailed(err);
+            return err;
+        };
+        if (!std.mem.eql(u8, &revision, &after)) {
             lease.retire();
-            lease.deinit();
+            return error.ModelConfigurationChanged;
         }
-        if (!std.mem.eql(u8, &revision, &try self.chunkSpeakerRevision(path, io, control))) return error.ModelConfigurationChanged;
         return lease;
     }
     fn speakerEmbedder(self: *Node, control: InferenceExecutionControl) !@import("../pipelines/speaker_model_cache.zig").Cache.Lease {

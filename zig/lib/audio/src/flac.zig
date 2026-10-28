@@ -41,7 +41,7 @@ pub const StreamInfo = struct {
     md5: [16]u8,
 };
 
-const ParsedStream = struct {
+pub const ParsedStream = struct {
     stream_info: StreamInfo,
     data_offset: usize,
 };
@@ -175,7 +175,7 @@ pub fn parseStreamInfo(bytes: []const u8) !StreamInfo {
     return (try parseStream(bytes)).stream_info;
 }
 
-fn parseStream(bytes: []const u8) !ParsedStream {
+pub fn parseStream(bytes: []const u8) !ParsedStream {
     if (bytes.len < 4) return error.UnsupportedAudioFormat;
     if (!std.mem.eql(u8, bytes[0..4], "fLaC")) return parseRawFrameStream(bytes);
 
@@ -269,7 +269,7 @@ fn parseStreamInfoBlock(payload: []const u8) !StreamInfo {
     };
 }
 
-fn decodeFrameAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, bytes: []const u8) !FrameDecoded {
+pub fn decodeFrameAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, bytes: []const u8) !FrameDecoded {
     var reader = BitReader.init(bytes);
     const header = try parseFrameHeader(&reader, stream_info);
 

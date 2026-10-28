@@ -50,6 +50,12 @@ pub const Cache = struct {
         pub fn model(self: Lease) *Embedder {
             return &self.entry.model;
         }
+        pub fn verificationFailed(self: Lease, err: anyerror) void {
+            switch (err) {
+                error.ModelConfigurationChanged, error.ChecksumMismatch, error.InvalidManagedDownload => self.retire(),
+                else => {},
+            }
+        }
         pub fn retire(self: Lease) void {
             self.cache.lock();
             defer self.cache.mutex.unlock();
@@ -266,4 +272,24 @@ test "model aware media speaker cache allocation failures retire every imported 
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "model aware media cancelled verification preserves healthy cached speaker models" {
+    const a = std.testing.allocator;
+    var loader: TestLoader = .{};
+    var cache = Cache{ .loader_context = &loader, .loader = TestLoader.create };
+    defer cache.deinit(a);
+    for ([_]anyerror{ error.Cancelled, error.Timeout, error.OutOfMemory, error.ResourceTemporarilyUnavailable }) |err| {
+        const lease = try cache.acquire(a, "same.onnx", "same:r1", .{});
+        lease.verificationFailed(err);
+        lease.deinit();
+        try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 0), loader.closes.load(.monotonic));
+    }
+    try std.testing.expectEqual(@as(u64, 1), cache.imports.load(.monotonic));
+    const invalid = try cache.acquire(a, "same.onnx", "same:r1", .{});
+    invalid.verificationFailed(error.ModelConfigurationChanged);
+    invalid.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loader.closes.load(.monotonic));
 }
