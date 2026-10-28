@@ -1134,6 +1134,7 @@ const LocalStandaloneMetadata = struct {
                 .supports_sql_views = durable,
                 .supports_sql_sequences = durable,
                 .supports_sql_routines = durable,
+                .supports_sql_casts = durable,
                 .supports_resolver_catalog_read = true,
                 .supports_resolver_authority = true,
                 .supports_object_tables = true,
@@ -3712,6 +3713,36 @@ const LocalStandaloneMetadata = struct {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                 return std.json.Stringify.valueAlloc(alloc, try store.sqlSequenceAdmissionHead(group_ids.main_metadata_group_id), .{});
+            },
+            .sql_cast_snapshot => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlCastSnapshot(alloc, group_ids.main_metadata_group_id, request, context);
+            },
+            .sql_cast_outcome => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlCastOutcome(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .sql_cast_mutate => |request| {
+                const casts = @import("../system_catalog/casts.zig");
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const command = try casts.command(alloc, request);
+                if (store.prepareSystemCatalogResult(alloc, group_ids.main_metadata_group_id, command)) |preview| {
+                    alloc.free(preview);
+                } else |err| {
+                    if (casts.Outcome.fromError(err) == null) return err;
+                }
+                const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_system_catalog = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+                self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                return store.sqlCastOutcome(alloc, group_ids.main_metadata_group_id, try casts.observation(alloc, request)) catch error.MetadataMutationOutcomeUnknown;
             },
             .sql_routine_snapshot => |request| {
                 if (!context.setting_admin) return error.Forbidden;

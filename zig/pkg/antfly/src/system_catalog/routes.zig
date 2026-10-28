@@ -83,6 +83,7 @@ fn tableNameAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
 pub fn resourceNameAlloc(alloc: std.mem.Allocator, route: Route) ![]u8 {
     const name = route.name orelse "*";
     return switch (route.kind) {
+        .cast => alloc.dupe(u8, route.database),
         .database, .tablespace, .query_source => alloc.dupe(u8, name),
         .namespace => std.fmt.allocPrint(alloc, "{s}.{s}", .{ route.database, name }),
         .table, .view, .sequence, .routine => (domain.TableScope{ .database = route.database, .namespace = route.namespace, .table = route.name }).keyAlloc(alloc),

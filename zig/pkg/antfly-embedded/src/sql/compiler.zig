@@ -3330,6 +3330,53 @@ const Parser = struct {
         self.pos += 1;
         return .{ .namespace = namespace, .table = try self.alloc.dupe(u8, symbol_token.text) };
     }
+    fn castDdl(self: *Parser, creating: bool) Error!ast.CatalogDdl {
+        const conditional = !creating and self.keyword(.@"if");
+        if (conditional) try self.expectKeyword(.exists);
+        try self.expect(.lparen);
+        const source = try self.castType();
+        try self.expectKeyword(.as);
+        const target = try self.castType();
+        try self.expect(.rparen);
+        if (source.numeric_modifier != null or target.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "cast identities require unmodified type domains");
+        var result: ast.CatalogDdl = .{ .kind = .cast, .action = if (creating) .create else .drop, .name = .{ .table = "$cast" }, .conditional = conditional, .cast_definition = .{
+            .source = .{ .kind = source.type, .element_type = source.element_type, .temporal_kind = source.temporal_kind },
+            .target = .{ .kind = target.type, .element_type = target.element_type, .temporal_kind = target.temporal_kind },
+        } };
+        if (!creating) {
+            result.cascade = self.ddlWord("CASCADE");
+            if (!result.cascade) _ = self.ddlWord("RESTRICT");
+            return result;
+        }
+        if (self.ddlWord("WITHOUT")) {
+            if (!self.ddlWord("FUNCTION")) return self.fail(error.InvalidSqlSyntax, "expected FUNCTION");
+            result.cast_definition.?.method = .binary;
+        } else {
+            try self.expectKeyword(.with);
+            if (self.ddlWord("INOUT")) {
+                result.cast_definition.?.method = .inout;
+            } else {
+                if (!self.ddlWord("FUNCTION")) return self.fail(error.InvalidSqlSyntax, "expected FUNCTION or INOUT");
+                result.cast_definition.?.function = try self.name();
+                if (self.take(.lparen)) {
+                    var signature: std.ArrayList(ast.RoutineDefinition.Type) = .empty;
+                    if (!self.take(.rparen)) while (true) {
+                        if (signature.items.len >= 3) return self.fail(error.InvalidSqlSyntax, "cast functions take at most three arguments");
+                        const argument = try self.castType();
+                        if (argument.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "cast function signature requires unmodified types");
+                        try signature.append(self.alloc, .{ .kind = argument.type, .element_type = argument.element_type, .temporal_kind = argument.temporal_kind });
+                        if (self.take(.rparen)) break;
+                        try self.expect(.comma);
+                    };
+                    result.routine_signature = try signature.toOwnedSlice(self.alloc);
+                }
+            }
+        }
+        if (self.keyword(.as)) {
+            result.cast_definition.?.context = if (self.ddlWord("ASSIGNMENT")) .assignment else if (self.ddlWord("IMPLICIT")) .implicit else return self.fail(error.InvalidSqlSyntax, "expected ASSIGNMENT or IMPLICIT");
+        }
+        return result;
+    }
     fn aggregateDdl(self: *Parser, creating: bool, replace: bool) Error!ast.CatalogDdl {
         const conditional = !creating and self.keyword(.@"if");
         if (conditional) try self.expectKeyword(.exists);
@@ -4140,6 +4187,7 @@ const Parser = struct {
             return .{ .catalog_ddl = .{ .kind = kind, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column } };
         }
         if (self.keyword(.create)) {
+            if (self.ddlWord("CAST")) return .{ .catalog_ddl = try self.castDdl(true) };
             if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(true, false) };
             if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(true) };
             if (self.keyword(.@"or")) {
@@ -4179,6 +4227,7 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("CAST")) return .{ .catalog_ddl = try self.castDdl(false) };
             if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(false, false) };
             if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(false) };
             if (self.ddlWord("FUNCTION")) return .{ .catalog_ddl = try self.routineDrop(false) };
@@ -5782,5 +5831,24 @@ test "compiler SQL original aggregate declarations retain typed transition state
             try std.testing.expectEqual(ast.ColumnType.string, declared.aggregate_definition.?.state.kind);
             try std.testing.expectEqualStrings("first_sfunc", declared.aggregate_definition.?.transition.table);
         } else try std.testing.expectEqual(ordinal == 2, declared.conditional);
+    }
+}
+
+test "compiler SQL original casts retain database type pairs and conversion contexts" {
+    const cases = [_][]const u8{
+        "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT",
+        "DROP CAST (jsonb AS text)",
+        "DROP CAST IF EXISTS (jsonb AS text)",
+        "CREATE CAST (jsonb AS text) WITH FUNCTION public.convert(jsonb,integer,boolean) AS IMPLICIT",
+        "CREATE CAST (jsonb AS text) WITH INOUT",
+    };
+    for (cases, 0..) |sql, i| {
+        var compiled = try compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.cast, ddl.kind);
+        try std.testing.expectEqual(ast.ColumnType.json, ddl.cast_definition.?.source.kind);
+        try std.testing.expectEqual(ast.ColumnType.string, ddl.cast_definition.?.target.kind);
+        try std.testing.expectEqual(i == 2, ddl.conditional);
     }
 }

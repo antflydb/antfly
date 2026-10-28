@@ -123,6 +123,7 @@ pub const Resolver = struct {
     checkpoint: *const fn (*anyopaque) anyerror!void,
 };
 pub const Options = struct {
+    routines: ?@import("routine_bindings.zig").Resolver = null,
     owner: Owner,
     security: Security = .owner,
     security_barrier: bool = false,
@@ -303,7 +304,7 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
         break :blk compiled.?.statement.select;
     };
     var preparation: Preparation = .{ .resolver = resolver };
-    const backend: catalog.Backend = .{ .ptr = &preparation, .settings_view = options.settings, .vtable = &.{ .resolve = Preparation.resolve, .scan = Preparation.scan, .mutate = Preparation.mutate, .checkpoint = Preparation.checkpoint } };
+    const backend: catalog.Backend = .{ .ptr = &preparation, .routine_resolver = options.routines, .settings_view = options.settings, .vtable = &.{ .resolve = Preparation.resolve, .scan = Preparation.scan, .mutate = Preparation.mutate, .checkpoint = Preparation.checkpoint } };
     const relations = @import("relation_binding.zig");
     const relation = try relations.bindDefinition(a, backend, statement);
     var adapter: relations.ResolveAdapter = .{ .backend = backend, .table = relation.table };

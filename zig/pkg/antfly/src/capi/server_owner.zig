@@ -1990,6 +1990,19 @@ pub fn metadataApplyStoreProjection(
                     const bytes = state.value.encode(a) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, bytes);
                 },
+                .sql_cast_snapshot => |input| {
+                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+                    const value = handle.store.sqlCastSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_cast_outcome => |input| {
+                    const value = handle.store.sqlCastOutcome(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
+                        error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => error.MetadataMutationOutcomeUnknown,
+                        else => err,
+                    });
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .sql_routine_snapshot => |input| {
                     if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };

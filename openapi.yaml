@@ -23047,6 +23047,7 @@ components:
         - procedure
         - operator
         - aggregate
+        - cast
       description: Native catalog resource kind; never a synthetic physical table.
     SQLCatalogOperationKind:
       type: string

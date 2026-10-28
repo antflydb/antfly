@@ -3723,6 +3723,46 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-cast-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-cast-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-cast-kernel-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL database cast",
+        "-Dtest-filter=SQL original casts",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-cast-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_cast_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_cast_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -5560,18 +5600,84 @@
     },
     {
       "id": "sql-0139",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original publishes a database-scoped source/target cast through the native atomic catalog and bounded outcome journal. PostgreSQL and authenticated public native owners agree on assignment/explicit conversions, SQL NULL versus JSON null, support arity and flags, duplicate and invalid declarations, numeric modifiers, and stable support identities after namespace rename. Prepared resources retain positive and absent-cast witnesses; function replacement invalidates its own witness. Cold rows and committed lost-ACK recovery are qualified. Stored definitions requiring custom casts, AS IMPLICIT, INOUT, binary and named-type casts remain guarded; this case does not qualify those shapes.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_cast_lifecycle_integration_test.zig",
+          "test": "mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement",
+          "gate": "sql-cast-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog database casts retain typed dependencies and exact cold retirement",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL original casts retain database type pairs and conversion contexts",
+          "gate": "sql-cast-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_cast_lifecycle_integration_test.zig",
+          "test": "mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement",
+          "gate": "sql-cast-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0140",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original retires the database-owned type pair through identity/generation-fenced native catalog publication. PostgreSQL and native public owners agree on DROP tags, complete postimages and restored builtin conversion. Supporting-function RESTRICT/CASCADE, cold dependency rebuilding, exact rejected replay and cold retained creation replay are qualified without resurrecting a retired cast. Native outcome observation follows the database ID through rename and old-name reuse. Builtin-cast deletion and durable custom-cast dependencies in stored definitions remain unsupported.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_cast_lifecycle_integration_test.zig",
+          "test": "mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement",
+          "gate": "sql-cast-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog database casts retain typed dependencies and exact cold retirement",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL original casts retain database type pairs and conversion contexts",
+          "gate": "sql-cast-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_cast_lifecycle_integration_test.zig",
+          "test": "mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement",
+          "gate": "sql-cast-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0141",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original DROP CAST IF EXISTS succeeds with the exact PostgreSQL missing-cast notice after native cold retirement. Authenticated public owners preserve complete rows and ordinary conversion behavior; read-only deletion is denied. The same strict lifecycle campaign verifies the real create/drop path, prepared invalidation and read-only recovery of a committed mutation whose acknowledgement was lost. This is not a claim that every PostgreSQL cast method or type family is supported.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_cast_lifecycle_integration_test.zig",
+          "test": "mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement",
+          "gate": "sql-cast-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog database casts retain typed dependencies and exact cold retirement",
+          "gate": "sql-routine-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL original casts retain database type pairs and conversion contexts",
+          "gate": "sql-cast-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_cast_lifecycle_integration_test.zig",
+          "test": "mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement",
+          "gate": "sql-cast-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0142",

@@ -26,7 +26,7 @@ pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
 pub const RoutineHeader = @import("routines.zig").Header;
 pub const ServiceOwner = @import("../common/service_ownership.zig").Owner;
-pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence, routine };
+pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence, routine, cast };
 
 pub fn namespaceRelation(kind: Kind) bool {
     return kind == .table or kind == .view or kind == .sequence;
@@ -375,6 +375,14 @@ pub const StateIndex = struct {
                 defer alloc.free(signature);
                 if (record.value.id != r.id or !std.mem.eql(u8, signature, r.signature.?)) return error.InvalidCatalogRecord;
             }
+            if (r.kind == .cast) {
+                if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
+                var record = try @import("casts.zig").Record.decode(alloc, r.source_json);
+                defer record.deinit();
+                const key = try record.value.definition.pair.keyAlloc(alloc);
+                defer alloc.free(key);
+                if (record.value.id != r.id or record.value.database_id != r.parent_id or !std.mem.eql(u8, key, r.name)) return error.InvalidCatalogRecord;
+            }
             try validateDescription(r.description);
             if (r.description) |value| if (value.len == 0) return error.InvalidCatalogRecord;
             if (namespaceRelation(r.kind)) inline for (.{ Kind.table, Kind.view, Kind.sequence }) |kind| {
@@ -403,6 +411,9 @@ pub const StateIndex = struct {
                 count.value_ptr.* += 1;
             }
         }
+        for (state.resources) |r| if (r.kind == .cast) {
+            if (self.byId(.database, r.parent_id) == null) return error.InvalidCatalogRecord;
+        };
         for (state.resources) |r| if (r.kind == .sequence or r.kind == .routine) {
             if (self.byId(.namespace, r.parent_id) == null) return error.InvalidCatalogRecord;
         };
@@ -411,23 +422,21 @@ pub const StateIndex = struct {
         // Whole-state adoption/restore verifies references after every ID is
         // indexed, independent of physical resource ordering. Ordinary point
         // publication validates the same identity in its native transaction.
-        for (state.resources) |resource| if (resource.kind == .routine) {
-            var record = try @import("routines.zig").Record.decode(alloc, resource.source_json);
-            defer record.deinit();
-            const uses = try record.value.functionUsesAlloc(alloc);
-            defer @import("routines.zig").Record.freeFunctionUses(alloc, uses);
-            for (uses) |use| {
+        for (state.resources) |resource| if (resource.kind == .routine or resource.kind == .cast) {
+            var dependencies = try @import("callable_dependencies.zig").Set.init(alloc, resource);
+            defer dependencies.deinit(alloc);
+            for (dependencies.uses) |use| {
                 const reference = use.reference;
                 const target = self.ids.get(.{ .kind = .routine, .id = reference.id }) orelse return error.InvalidCatalogRecord;
                 if (target.parent_id != reference.namespace_id) return error.InvalidCatalogRecord;
-                const owner_namespace = self.ids.get(.{ .kind = .namespace, .id = resource.parent_id }) orelse if (resource.parent_id == default_namespace_id) default_namespace else return error.InvalidCatalogRecord;
+                const owner_database = if (resource.kind == .cast) resource.parent_id else (self.ids.get(.{ .kind = .namespace, .id = resource.parent_id }) orelse if (resource.parent_id == default_namespace_id) default_namespace else return error.InvalidCatalogRecord).parent_id;
                 const function_namespace = self.ids.get(.{ .kind = .namespace, .id = reference.namespace_id }) orelse if (reference.namespace_id == default_namespace_id) default_namespace else return error.InvalidCatalogRecord;
-                if (owner_namespace.parent_id != function_namespace.parent_id) return error.InvalidCatalogRecord;
+                if (owner_database != function_namespace.parent_id) return error.InvalidCatalogRecord;
                 var function = try @import("routines.zig").Record.decode(alloc, target.source_json);
                 defer function.deinit();
                 if (function.value.kind != .function or function.value.definition.arguments.len != use.arguments.len or function.value.definition.result == null or !std.meta.eql(function.value.definition.result.?, use.result)) return error.InvalidCatalogRecord;
                 for (function.value.definition.arguments, use.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared)) return error.InvalidCatalogRecord;
-                if (record.value.kind == .aggregate and reference.id == record.value.definition.function_reference.?.id and function.value.definition.strict and record.value.definition.aggregate.?.initial == null and !std.meta.eql(record.value.definition.aggregate.?.state, record.value.definition.arguments[0].type)) return error.InvalidCatalogRecord;
+                if (dependencies.routine) |record| if (record.value.kind == .aggregate and reference.id == record.value.definition.function_reference.?.id and function.value.definition.strict and record.value.definition.aggregate.?.initial == null and !std.meta.eql(record.value.definition.aggregate.?.state, record.value.definition.arguments[0].type)) return error.InvalidCatalogRecord;
             }
         };
         return self;
@@ -786,7 +795,7 @@ pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, requ
 pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool) !Delta {
     // View definitions require attribute/dependency admission. Generic resource
     // mutation must never publish an opaque caller-provided view payload.
-    if (request.kind == .routine) return error.CatalogRoutineAdmissionRequired;
+    if (request.kind == .routine or request.kind == .cast) return error.CatalogRoutineAdmissionRequired;
     if (request.kind == .view) return error.CatalogViewAdmissionRequired;
     if (request.kind == .sequence) return error.CatalogSequenceAdmissionRequired;
     if (request.action == .alter) return error.InvalidCatalogMutation;
@@ -813,6 +822,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     const parent_id: u64 = switch (request.kind) {
         .database, .tablespace, .query_source => 0,
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
+        .cast => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
         .table, .view, .sequence, .routine => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
     var found = try reader.lookup(request.kind, parent_id, request.name);
@@ -882,6 +892,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 } else {
                     switch (existing.kind) {
                         .database => {
+                            if ((try reader.children(.cast, existing.id, 1)).len != 0) return error.DatabaseNotEmpty;
                             const namespaces = try reader.children(.namespace, existing.id, 0);
                             for (namespaces) |namespace| {
                                 if ((try reader.children(.table, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
@@ -899,7 +910,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                         },
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
                         .query_source => {},
-                        .view, .sequence, .routine => unreachable,
+                        .view, .sequence, .routine, .cast => unreachable,
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
@@ -1655,7 +1666,7 @@ pub fn validateTableName(name: []const u8) !void {
 }
 
 pub fn validateResourceName(kind: Kind, name: []const u8) !void {
-    if (namespaceRelation(kind) or kind == .routine) return validateTableName(name);
+    if (namespaceRelation(kind) or kind == .routine or kind == .cast) return validateTableName(name);
     return validateName(name);
 }
 

@@ -4091,3 +4091,44 @@ test "SQL user aggregate derived CTE joins retain live reduction outputs" {
         }
     }
 }
+
+test "SQL database cast view boundaries retain builtin programs and restore caller resolution" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const bindings = @import("routine_bindings.zig");
+    const function = try @import("routine_definition.zig").prepare(arena.allocator(), .{ .id = 77, .generation = 1, .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .jsonb } }}, .result = .{ .scalar = .text }, .body = "SELECT 'custom'", .owner = .auth_disabled } }, null, null);
+    var view = try @import("compiler.zig").compile(a, "SELECT payload,payload::text AS converted FROM (VALUES('{}'::jsonb)) t(payload)", .{});
+    defer view.deinit();
+    const Fixture = struct {
+        query: *const @import("ast.zig").Select,
+        function: *const bindings.Resolved,
+        calls: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedPhysicalLookup;
+        }
+        fn read(raw: *anyopaque, _: Allocator, _: @import("ast.zig").Name) !catalog.ReadRelation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .view = .{ .id = 7, .generation = 1, .query = self.query, .columns = &.{ .{ .name = "payload", .path = "payload", .type = .json, .element_type = .jsonb }, .{ .name = "converted", .path = "converted", .type = .string, .element_type = .text } }, .backend = .{ .ptr = self, .binding_scope = 42, .vtable = &.{ .resolve = resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = checkpoint } }, .security_barrier = false } };
+        }
+        fn routine(_: *anyopaque, _: Allocator, _: []const u8, _: []const bindings.Argument) anyerror!*const bindings.Resolved {
+            return error.UnexpectedFunctionLookup;
+        }
+        fn cast(raw: *anyopaque, _: Allocator, source: scalar.Type, target: scalar.Type, _: @import("../system_catalog/casts.zig").Context) anyerror!?*const bindings.Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return if (source.kind == .json and target.kind == .string) self.function else null;
+        }
+    };
+    for ([_][]const u8{ "SELECT converted FROM v", "SELECT payload::text AS converted FROM v" }, 0..) |sql, index| {
+        var fixture: Fixture = .{ .query = &view.statement.select, .function = function };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .routine_resolver = .{ .ptr = &fixture, .resolve = Fixture.routine, .resolve_cast = Fixture.cast }, .vtable = &.{ .resolve = Fixture.resolve, .resolve_read = Fixture.read, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        try std.testing.expectEqualStrings(if (index == 0) "{}" else "custom", result.output.native_rows.?[0][0].value.string);
+        try std.testing.expect(if (index == 0) fixture.calls == 0 else fixture.calls != 0);
+    }
+}

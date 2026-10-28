@@ -511,7 +511,7 @@ const Builder = struct {
                     }
                     if (call.aggregate) |aggregate| break :blk .{ .cast = .{ .operand = try self.scalarNode(.{ .literal = .null }), .type = aggregate.output.kind.?, .element_type = aggregate.output.element_type, .temporal_kind = aggregate.output.temporal_kind } };
                     const argument = try self.inferenceExpression(call.args[0], columns);
-                    if (std.mem.eql(u8, name, "string_agg")) break :blk .{ .cast = .{ .operand = argument, .type = .string, .element_type = .text, .coercion = .function } };
+                    if (std.mem.eql(u8, name, "string_agg")) break :blk .{ .cast = .{ .operand = argument, .type = .string, .element_type = .text, .coercion = .function, .context = .implicit } };
                     if (std.mem.eql(u8, name, "array_agg")) break :blk .{ .call = .{ .name = "$array", .args = try self.alloc.dupe(*const ast.Scalar, &.{argument}) } };
                     var stripped = call;
                     stripped.args = call.args[0..arity];
@@ -1120,7 +1120,7 @@ const Builder = struct {
                         aggregate = try lookup(provider.ptr, self.alloc, part.name, inputs);
                         if (aggregate) |bound| {
                             if (bound.arguments.len != inputs.len) return error.InvalidSqlProgram;
-                            for (args[0..inputs.len], bound.arguments) |*argument, target| argument.* = try self.scalarNode(.{ .cast = .{ .operand = argument.*, .type = target.kind.?, .element_type = target.element_type, .temporal_kind = target.temporal_kind, .coercion = .function } });
+                            for (args[0..inputs.len], bound.arguments) |*argument, target| argument.* = try self.scalarNode(.{ .cast = .{ .operand = argument.*, .type = target.kind.?, .element_type = target.element_type, .temporal_kind = target.temporal_kind, .coercion = .function, .context = .implicit } });
                         }
                     };
                 }
@@ -1802,6 +1802,8 @@ const Builder = struct {
                     if (view.id == 0 or view.generation == 0 or view.backend.binding_scope == 0 or self.view_depth >= self.view_path.len) return error.InvalidSqlBackendResponse;
                     for (self.view_path[0..self.view_depth]) |id| if (id == view.id) return error.SqlViewCycle;
                     const previous_backend = self.backend;
+                    const invocation = self.backend.parameter_invocation;
+                    const previous_routines = if (invocation) |owner| owner.routine_resolver else null;
                     const previous_outer = self.outer_scope;
                     self.view_path[self.view_depth] = view.id;
                     self.view_depth += 1;
@@ -1811,10 +1813,16 @@ const Builder = struct {
                     self.backend.ptr = view.backend.ptr;
                     self.backend.vtable = view.backend.vtable;
                     self.backend.binding_scope = view.backend.binding_scope;
+                    // Stored definitions retain builtin-only callable binding.
+                    // Share invocation values, not the caller's newer cast
+                    // catalog. The completed programs retain resolved opcodes.
+                    self.backend.routine_resolver = view.backend.routine_resolver;
+                    if (invocation) |owner| owner.routine_resolver = view.backend.routine_resolver;
                     self.backend.settings_view = previous_backend.settings_view orelse view.backend.settings_view;
                     self.backend.prepared_read = null;
                     self.outer_scope = null;
                     defer {
+                        if (invocation) |owner| owner.routine_resolver = previous_routines;
                         self.backend = previous_backend;
                         self.outer_scope = previous_outer;
                         self.view_depth -= 1;

@@ -7290,6 +7290,7 @@ pub const AntflyApiHandler = struct {
                 const kind: usermgr.ResourceType = switch (target.kind) {
                     .query_source, .view, .sequence => .table,
                     .routine => .namespace,
+                    .cast => .database,
                     .database => .database,
                     .namespace => .namespace,
                     .table => .table,

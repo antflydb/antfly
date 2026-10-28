@@ -148,8 +148,10 @@ const std = @import("std");
 /// Version 107 decodes identity-fenced callable annotations on the retained
 /// catalog outcome lane without advancing executable generations.
 /// Version 108 decodes identity-bound operators and their derived dependency directory.
-pub const current_version: u16 = 109;
-pub const sql_routine_version: u16 = 109;
+/// Version 110 publishes database-owned casts and tags callable dependency owners.
+pub const current_version: u16 = 110;
+pub const sql_cast_version: u16 = 110;
+pub const sql_routine_version: u16 = 110;
 pub const sql_materialized_refresh_version: u16 = 103;
 pub const sql_materialized_view_version: u16 = 102;
 pub const sql_population_version: u16 = 101;

@@ -1,14 +1,35 @@
 # SQL catalog lifecycle and original-case qualification
 
-Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `3f8eeafaaf` (verified 2026-10-24). Earlier implementation and
-qualification checkpoints are retained below with their exact scope.
-This is an implementation and qualification backlog, not
-a completion claim. PostgreSQL is the SQL standard and independent test oracle.
+Status: ongoing SQL catalog lifecycle qualification, merged with `origin/main`
+at `1bb04dd0b9` (2026-10-27). This is an implementation and qualification
+backlog, not a completion claim. PostgreSQL is the SQL standard and independent
+oracle.
 
-## Current original-case qualification (2026-10-24)
+## Current original-case qualification (2026-10-27)
 
-The ledger now records **788 implemented / 137 rejected / 433 superseded /
+The ledger records **861 implemented / 138 rejected / 449 superseded /
+138 unresolved**, including **111 unresolved DDL/catalog cases**. The immutable
+inventory still contains the same 1,586 originals. The ledger is authoritative;
+counts in earlier checkpoints below describe their recorded historical state.
+
+The database-cast cohort closes `sql-0139`–`sql-0141`: CREATE CAST, DROP CAST, and
+DROP CAST IF EXISTS. See [the cast architecture](sql-casts.md) for atomic
+publication, stable database/function identities, typed execution, prepared
+absence witnesses, cold replay, recovery and the explicit remaining limits.
+The final native Debug gate passes the public campaign and seven metadata tests
+with no skips, failures or leaks. Six focused kernel tests pass, and the full
+SQL Debug gate passes 1,709 tests with four skips and no failures or leaks.
+The PostgreSQL fixture and builtin-cast identity checks pass. Native function,
+procedure, operator, aggregate, interval and table-contract regressions pass.
+`make generate`, `make fmt` and changed-file license checks pass.
+
+This reduces unresolved cases from 141 to 138. It does not activate enum/domain
+identities, AS IMPLICIT, INOUT/binary casts, or durable custom-cast dependencies
+in stored definitions. Those remaining contracts retain their guards.
+
+## Earlier next-100 checkpoint (2026-10-24)
+
+At this checkpoint the ledger recorded **788 implemented / 137 rejected / 433 superseded /
 228 unresolved**. The requested next-100 batch has closed **62 original cases**:
 `sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
 `sql-0593`–`sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,

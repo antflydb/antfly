@@ -121,7 +121,7 @@ test "SQL temporal cast binding rejects nonexistent PostgreSQL epoch casts befor
         try std.testing.expectError(error.SqlCannotCoerce, bind(a, parsed.expression, &.{}, &.{}, .{}));
     }
     const operand: ast.Scalar = .{ .column = "v" };
-    const function: ast.Scalar = .{ .cast = .{ .operand = &operand, .type = .number, .element_type = .float64, .coercion = .function } };
+    const function: ast.Scalar = .{ .cast = .{ .operand = &operand, .type = .number, .element_type = .float64, .coercion = .function, .context = .implicit } };
     try std.testing.expectError(error.SqlUndefinedFunction, bind(a, &function, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{}));
 }
 
@@ -1336,7 +1336,7 @@ pub fn inferTypedParametersExpected(alloc: Allocator, expression: *const ast.Sca
     if (expected) |descriptor| if (descriptor.kind != .array or descriptor.element_type != null) try validateParameterType(descriptor);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .allow_unresolved = true, .typed_parameters = true };
+    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .allow_unresolved = true, .typed_parameters = true, .assignment_target = expected };
     try binder.registerColumns();
     for (parameters) |descriptor| try validateParameterType(descriptor);
     for (parameters, binder.parameters[0..parameters.len]) |descriptor, *output| output.* = try normalizeParameterType(descriptor);
@@ -1583,7 +1583,7 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     errdefer alloc.destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .settings = settings, .typed_parameters = typed_parameters };
+    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .settings = settings, .typed_parameters = typed_parameters, .assignment_target = expected };
     try binder.registerColumns();
     @memcpy(binder.parameters[0..parameter_hints.len], parameter_hints);
     if (typed_parameters) for (binder.parameters[0..parameter_hints.len]) |*descriptor| {
@@ -3047,6 +3047,8 @@ const Binder = struct {
     limits: BindLimits,
     names: std.StringHashMapUnmanaged(u32) = .empty,
     inferred: std.AutoHashMapUnmanaged(*const ast.Scalar, Type) = .empty,
+    assignment_target: ?Type = null,
+    cast_functions: std.AutoHashMapUnmanaged(*const ast.Scalar, ?*const @import("routine_bindings.zig").Resolved) = .empty,
     explicit_arrays: std.AutoHashMapUnmanaged(*const ast.Scalar, arrays.ElementType) = .empty,
     instructions: std.ArrayList(Instruction) = .empty,
     uses_sequences: bool = false,
@@ -3151,6 +3153,13 @@ const Binder = struct {
                 }
                 if (cast.type == .array) try self.typeArrayConstructors(cast.operand, cast.element_type.?, depth + 1);
                 const source = try self.infer(cast.operand, depth + 1);
+                const target: Type = .{ .kind = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .temporal_kind = cast.temporal_kind };
+                const unknown_input = cast.operand.* == .literal and (cast.operand.literal == .string or cast.operand.literal == .null);
+                if (!unknown_input) if (try self.catalogCast(expression, source, target, cast.context)) |function| {
+                    var output = function.output;
+                    output.numeric_modifier = cast.numeric_modifier;
+                    break :blk output;
+                };
                 const range = @import("range_value.zig");
                 if (range.kindFromType(cast.type) != null and source.kind != null and source.kind != .string and source.kind != cast.type) return error.SqlCannotCoerce;
                 if (source.kind != null and range.kindFromType(source.kind.?) != null and cast.type != source.kind and cast.type != .string) return error.SqlCannotCoerce;
@@ -3751,6 +3760,40 @@ const Binder = struct {
         return bound;
     }
 
+    fn catalogCast(self: *Binder, key: *const ast.Scalar, source: Type, target: Type, context: @import("../system_catalog/casts.zig").Context) !?*const @import("routine_bindings.zig").Resolved {
+        if (source.kind == null or target.kind == null) return null;
+        const resolver = self.limits.routines orelse (if (self.limits.invocation) |invocation| invocation.routine_resolver else null) orelse return null;
+        const lookup = resolver.resolve_cast orelse return null;
+        const canonical_source = try normalizeParameterType(source);
+        const canonical_target = try normalizeParameterType(target);
+        if (target.numeric_modifier == null and canonical_source.kind == canonical_target.kind and canonical_source.element_type == canonical_target.element_type and canonical_source.temporal_kind == canonical_target.temporal_kind) return null;
+        const cache = key.* == .cast and key.cast.context == context and key.cast.type == target.kind and key.cast.element_type == target.element_type and key.cast.temporal_kind == target.temporal_kind;
+        if (cache) if (self.cast_functions.get(key)) |entry| return entry;
+        const function = try lookup(resolver.ptr, self.alloc, canonical_source, canonical_target, context);
+        if (function) |bound| {
+            if (bound.arguments.len == 0 or bound.arguments.len > 3 or bound.output.kind != canonical_target.kind or bound.output.element_type != canonical_target.element_type or bound.output.temporal_kind != canonical_target.temporal_kind) return error.InvalidSqlProgram;
+        }
+        if (cache) try self.cast_functions.put(self.alloc, key, function);
+        return function;
+    }
+    fn emitCastCall(self: *Binder, function: *const @import("routine_bindings.zig").Resolved, operand: u32, context: @import("../system_catalog/casts.zig").Context, modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier) !u32 {
+        if (function.arguments.len == 0 or function.arguments.len > 3 or self.instructions.items.len + function.arguments.len > self.limits.nodes) return error.SqlProgramLimitExceeded;
+        const args = try self.alloc.alloc(u32, function.arguments.len);
+        args[0] = operand;
+        if (args.len >= 2) {
+            args[1] = @intCast(self.instructions.items.len);
+            const typmod: i64 = if (modifier) |value| try value.postgres() else -1;
+            try self.instructions.append(self.alloc, .{ .type = .{ .kind = .integer, .element_type = .int32, .nullable = false }, .operation = .{ .literal = .{ .integer = typmod } } });
+        }
+        if (args.len >= 3) {
+            args[2] = @intCast(self.instructions.items.len);
+            try self.instructions.append(self.alloc, .{ .type = .{ .kind = .boolean, .element_type = .boolean, .nullable = false }, .operation = .{ .literal = .{ .bool = context == .explicit } } });
+        }
+        const result: u32 = @intCast(self.instructions.items.len);
+        try self.instructions.append(self.alloc, .{ .type = function.output, .operation = .{ .call = .{ .function = .@"$routine", .args = args, .routine = function } } });
+        return result;
+    }
+
     fn arrayChildren(self: *const Binder, args: []const *const ast.Scalar) bool {
         for (args) |arg| if (self.inferred.get(arg)) |kind| {
             if (kind.kind == .array) return true;
@@ -3864,6 +3907,16 @@ const Binder = struct {
                 break :blk .{ .column = ordinal };
             },
             .cast => |cast| blk: {
+                if (self.cast_functions.get(expression)) |optional| if (optional) |function| {
+                    const source = try self.infer(cast.operand, depth + 1);
+                    const operand = try self.compileTypedContext(cast.operand, source.kind, source.element_type, source.temporal_kind, depth + 1);
+                    const index = try self.emitCastCall(function, operand, cast.context, cast.numeric_modifier);
+                    if (cast.numeric_modifier != null and function.arguments.len == 1) break :blk .{ .cast = .{ .operand = index, .type = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .temporal_kind = cast.temporal_kind } };
+                    // Keep argument instructions, then publish the call through
+                    // the ordinary boundary so outer assignments still apply.
+                    const call = self.instructions.pop().?;
+                    break :blk call.operation;
+                };
                 // A default datetime cast already denotes timestamptz. When
                 // its consumer requires the exact native domain, retain that
                 // context through nested casts instead of detouring through
@@ -3941,7 +3994,7 @@ const Binder = struct {
                     const args = try self.alloc.alloc(u32, call.args.len);
                     for (call.args, args, routine.arguments) |arg, *out, target| {
                         const cast = try self.alloc.create(ast.Scalar);
-                        cast.* = .{ .cast = .{ .operand = arg, .type = target.kind orelse return error.InvalidSqlProgram, .element_type = target.element_type, .temporal_kind = target.temporal_kind, .coercion = .function } };
+                        cast.* = .{ .cast = .{ .operand = arg, .type = target.kind orelse return error.InvalidSqlProgram, .element_type = target.element_type, .temporal_kind = target.temporal_kind, .coercion = .function, .context = .implicit } };
                         out.* = try self.compileTypedContext(cast, target.kind, target.element_type, target.temporal_kind, depth + 1);
                     }
                     break :blk .{ .call = .{ .function = .@"$routine", .args = args, .routine = routine } };
@@ -3952,7 +4005,7 @@ const Binder = struct {
                     for (call.args, args, 0..) |arg, *out, ordinal| {
                         const expected_kind: ast.ColumnType = if (ordinal == 0) .string else if (ordinal == 1) .integer else .boolean;
                         const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = expected_kind, .element_type = if (ordinal == 0) .text else if (ordinal == 1) .int64 else .boolean, .coercion = .function } };
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = expected_kind, .element_type = if (ordinal == 0) .text else if (ordinal == 1) .int64 else .boolean, .coercion = .function, .context = .implicit } };
                         out.* = try self.compileTypedContext(coercion, expected_kind, coercion.cast.element_type, null, depth + 1);
                     }
                     break :blk .{ .call = .{ .function = function, .args = args } };
@@ -3980,7 +4033,7 @@ const Binder = struct {
                             continue;
                         }
                         const cast = try self.alloc.create(ast.Scalar);
-                        cast.* = .{ .cast = .{ .operand = arg, .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function } };
+                        cast.* = .{ .cast = .{ .operand = arg, .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function, .context = .implicit } };
                         out.* = try self.compileTypedContext(cast, endpoint.kind, endpoint.element_type, endpoint.temporal_kind, depth + 1);
                     }
                     break :blk .{ .call = .{ .function = function, .args = args } };
@@ -4003,7 +4056,7 @@ const Binder = struct {
                             } else {
                                 const endpoint = rangeEndpointType(range_kind);
                                 const cast = try self.alloc.create(ast.Scalar);
-                                cast.* = .{ .cast = .{ .operand = call.args[1], .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function } };
+                                cast.* = .{ .cast = .{ .operand = call.args[1], .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function, .context = .implicit } };
                                 args[1] = try self.compileTypedContext(cast, endpoint.kind, endpoint.element_type, endpoint.temporal_kind, depth + 1);
                             }
                         }
@@ -4062,7 +4115,7 @@ const Binder = struct {
                     const target = try parameterElementType(kind);
                     for (call.args, args) |arg, *out| {
                         const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = kind.kind.?, .element_type = target, .coercion = .function } };
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = kind.kind.?, .element_type = target, .coercion = .function, .context = .implicit } };
                         out.* = try self.compileArrayContext(coercion, kind.kind, target, depth + 1);
                     }
                     break :blk .{ .call = .{ .function = function, .args = args } };
@@ -4111,14 +4164,14 @@ const Binder = struct {
                         const identity = if (i == 0) @import("temporal_value.zig").Kind.interval else kind.temporal_kind.?;
                         if (actual.kind == null or (arg.* == .literal and arg.literal == .string)) {
                             const coercion = try self.alloc.create(ast.Scalar);
-                            coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = identity, .coercion = .function } };
+                            coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = identity, .coercion = .function, .context = .implicit } };
                             out.* = try self.compileTypedContext(coercion, .datetime, null, identity, depth + 1);
                         } else out.* = try self.compileTypedContext(arg, .datetime, null, actual.temporal_kind, depth + 1);
                         continue;
                     }
                     if (function == .uuidv7) {
                         const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = .interval, .coercion = .function } };
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = .interval, .coercion = .function, .context = .implicit } };
                         out.* = try self.compileArrayContext(coercion, .datetime, null, depth + 1);
                         continue;
                     }
@@ -4248,6 +4301,18 @@ const Binder = struct {
                 .operation = .{ .cast = .{ .operand = index, .type = .number, .element_type = array_element } },
             });
             return promoted;
+        }
+        if (depth == 0 and self.limits.assignment and expected != null and kind.kind != null) {
+            const target = self.assignment_target orelse Type{ .kind = expected, .element_type = array_element orelse if (expected == .string) .text else null, .temporal_kind = temporal_kind };
+            if (try self.catalogCast(expression, kind, target, .assignment)) |function| {
+                const converted = try self.emitCastCall(function, index, .assignment, target.numeric_modifier);
+                self.instructions.items[converted].type.numeric_modifier = target.numeric_modifier;
+                if (target.numeric_modifier == null or function.arguments.len > 1) return converted;
+                if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+                const constrained: u32 = @intCast(self.instructions.items.len);
+                try self.instructions.append(self.alloc, .{ .type = self.instructions.items[converted].type, .operation = .{ .cast = .{ .operand = converted, .type = target.kind.?, .element_type = target.element_type, .numeric_modifier = target.numeric_modifier, .temporal_kind = target.temporal_kind } } });
+                return constrained;
+            }
         }
         // PostgreSQL assignment to a string-category target uses the source's
         // output function. This is an assignment boundary only: retain the
@@ -9415,4 +9480,90 @@ test "SQL routine bound calls evaluate arguments once share work budgets and avo
     try std.testing.expectEqual(prepared_lookups, owner.lookups);
     try std.testing.expectError(error.SqlProgramLimitExceeded, caller.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = std.testing.io, .steps = 1 }));
     try std.testing.expectError(error.SqlProgramLimitExceeded, caller.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = std.testing.io, .depth = 1 }));
+}
+
+test "SQL database casts bind typed VM calls once and preserve explicit assignment and NULL contexts" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const definitions = @import("routine_definition.zig");
+    const bindings = @import("routine_bindings.zig");
+    const CastContext = @import("../system_catalog/casts.zig").Context;
+    const function = try definitions.prepare(arena.allocator(), .{ .id = 72, .generation = 1, .definition = .{ .arguments = &.{ .{ .type = .{ .scalar = .jsonb } }, .{ .type = .{ .scalar = .int32 } }, .{ .type = .{ .scalar = .boolean } } }, .result = .{ .scalar = .text }, .body = "SELECT concat($2::text,':',$3::text)", .owner = .auth_disabled } }, null, null);
+    const Fixture = struct {
+        function: *const bindings.Resolved,
+        context: CastContext = .assignment,
+        calls: usize = 0,
+        fn lookup(_: *anyopaque, _: Allocator, _: []const u8, _: []const bindings.Argument) anyerror!*const bindings.Resolved {
+            return error.UnexpectedFunctionLookup;
+        }
+        fn cast(raw: *anyopaque, _: Allocator, source: Type, target: Type, context: CastContext) anyerror!?*const bindings.Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (source.kind != .json or target.kind != .string) return null;
+            if (!self.context.allows(context)) return error.SqlAssignmentTypeMismatch;
+            return self.function;
+        }
+    };
+    var fixture: Fixture = .{ .function = function };
+    const resolver: bindings.Resolver = .{ .ptr = &fixture, .resolve = Fixture.lookup, .resolve_cast = Fixture.cast };
+    var expression = try @import("compiler.zig").compileScalar(a, "payload::text", .{});
+    defer expression.deinit();
+    var explicit = try bind(a, expression.expression, &.{.{ .name = "payload", .type = .json, .element_type = .jsonb }}, &.{}, .{ .routines = resolver });
+    defer explicit.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (0..10000) |index| {
+        _ = scratch.reset(.retain_capacity);
+        const result = try explicit.evaluate(scratch.allocator(), &.{if (index % 2 == 0) Datum.json(.null) else Datum{}}, &.{}, .{});
+        try std.testing.expect(!result.sql_null);
+        try std.testing.expectEqualStrings("-1:true", result.value.string);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    var assignment_expression = try @import("compiler.zig").compileScalar(a, "payload", .{});
+    defer assignment_expression.deinit();
+    var assignment = try bindTypedExpectedWithSettings(a, assignment_expression.expression, &.{.{ .name = "payload", .type = .json, .element_type = .jsonb }}, &.{}, .{ .kind = .string, .element_type = .text }, .{ .routines = resolver, .assignment = true }, null);
+    defer assignment.deinit();
+    const assigned = try assignment.evaluate(scratch.allocator(), &.{Datum{}}, &.{}, .{});
+    try std.testing.expectEqualStrings("-1:false", assigned.value.string);
+    fixture.context = .explicit;
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, bindTypedExpectedWithSettings(a, assignment_expression.expression, &.{.{ .name = "payload", .type = .json, .element_type = .jsonb }}, &.{}, .{ .kind = .string, .element_type = .text }, .{ .routines = resolver, .assignment = true }, null));
+}
+
+test "SQL database cast assignment carries numeric typmods through inference and execution" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const definitions = @import("routine_definition.zig");
+    const bindings = @import("routine_bindings.zig");
+    const CastContext = @import("../system_catalog/casts.zig").Context;
+    const function = try definitions.prepare(arena.allocator(), .{ .id = 74, .generation = 1, .definition = .{ .arguments = &.{ .{ .type = .{ .scalar = .uuid } }, .{ .type = .{ .scalar = .int32 } }, .{ .type = .{ .scalar = .boolean } } }, .result = .{ .scalar = .numeric }, .body = "SELECT $2::numeric", .owner = .auth_disabled } }, null, null);
+    const Fixture = struct {
+        function: *const bindings.Resolved,
+        fn lookup(_: *anyopaque, _: Allocator, _: []const u8, _: []const bindings.Argument) anyerror!*const bindings.Resolved {
+            return error.UnexpectedFunctionLookup;
+        }
+        fn cast(raw: *anyopaque, _: Allocator, source: Type, target: Type, _: CastContext) anyerror!?*const bindings.Resolved {
+            if (source.kind != .uuid or target.element_type != .numeric) return null;
+            return (@as(*@This(), @ptrCast(@alignCast(raw)))).function;
+        }
+    };
+    var fixture: Fixture = .{ .function = function };
+    const resolver: bindings.Resolver = .{ .ptr = &fixture, .resolve = Fixture.lookup, .resolve_cast = Fixture.cast };
+    var expression = try @import("compiler.zig").compileScalar(a, "payload", .{});
+    defer expression.deinit();
+    const modifier: @import("../common/sql_builtin_type.zig").NumericModifier = .{ .precision = 8, .scale = 2 };
+    var program = try bindTypedExpectedWithSettings(a, expression.expression, &.{.{ .name = "payload", .type = .uuid, .element_type = .uuid }}, &.{}, .{ .kind = .number, .element_type = .numeric, .numeric_modifier = modifier }, .{ .routines = resolver, .assignment = true }, null);
+    defer program.deinit();
+    try std.testing.expectEqualDeep(modifier, program.output_type.numeric_modifier.?);
+    const result = try program.evaluate(arena.allocator(), &.{Datum.fromJson(.{ .string = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" })}, &.{}, .{});
+    var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+    const encoded = try @import("numeric_value.zig").format(&context, result.numeric.?.*);
+    try std.testing.expectEqualStrings("524294", encoded);
+    fixture.function = try definitions.prepare(arena.allocator(), .{ .id = 75, .generation = 1, .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .uuid } }}, .result = .{ .scalar = .numeric }, .body = "SELECT 123.456::numeric", .owner = .auth_disabled } }, null, null);
+    var constrained = try bindTypedExpectedWithSettings(a, expression.expression, &.{.{ .name = "payload", .type = .uuid, .element_type = .uuid }}, &.{}, .{ .kind = .number, .element_type = .numeric, .numeric_modifier = modifier }, .{ .routines = resolver, .assignment = true }, null);
+    defer constrained.deinit();
+    const rounded = try constrained.evaluate(arena.allocator(), &.{Datum{}}, &.{}, .{});
+    try std.testing.expectEqualStrings("123.46", try @import("numeric_value.zig").format(&context, rounded.numeric.?.*));
 }

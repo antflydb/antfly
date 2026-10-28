@@ -184,3 +184,5 @@ pub const procedure_reference = @embedFile("fixtures/sql_procedure_reference.jso
 pub const operator_reference = @embedFile("fixtures/sql_operator_reference.json");
 
 pub const aggregate_lifecycle_reference = @embedFile("fixtures/sql_aggregate_lifecycle_reference.json");
+
+pub const cast_reference = @embedFile("fixtures/sql_cast_reference.json");

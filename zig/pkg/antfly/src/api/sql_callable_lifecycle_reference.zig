@@ -31,9 +31,10 @@ pub fn observe(ctx: *fixture.Context, step: Step, reader: bool) !void {
     return compareResponse(ctx, step, response);
 }
 pub fn compareResponse(ctx: *fixture.Context, step: Step, response: anytype) !void {
-    if (response.status != (if (step.sqlstate != null) @as(u16, 400) else @as(u16, 200))) std.debug.print("callable status={d} sql={s} body={s}\n", .{ response.status, step.sql, response.body });
+    const expected_status: u16 = if (step.sqlstate) |code| (if (std.mem.eql(u8, code, "0A000")) 501 else 400) else 200;
+    if (response.status != expected_status) std.debug.print("callable status={d} sql={s} body={s}\n", .{ response.status, step.sql, response.body });
     const notices: []const wire.SQLNotice = if (step.sqlstate) |code| rejected: {
-        try std.testing.expectEqual(@as(u16, 400), response.status);
+        try std.testing.expectEqual(expected_status, response.status);
         var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
         defer diagnostic.deinit();
         try std.testing.expectEqualStrings(code, diagnostic.value.code);
@@ -86,3 +87,56 @@ pub fn compareResponse(ctx: *fixture.Context, step: Step, response: anytype) !vo
     };
     _ = notices;
 }
+
+/// Public prepared resources own both positive and negative catalog witnesses.
+/// Tests close successful resources explicitly and unwind failures safely.
+pub const PreparedResource = struct {
+    context: *fixture.Context,
+    id: []u8,
+    closed: bool = false,
+    pub fn create(ctx: *fixture.Context, statement: []const u8) !PreparedResource {
+        const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement }, .{});
+        defer ctx.alloc.free(body);
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/sql/prepared", .POST, body, 15_000);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) std.debug.print("callable prepare status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(struct { prepared_id: []const u8 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return .{ .context = ctx, .id = try ctx.alloc.dupe(u8, parsed.value.prepared_id) };
+    }
+    pub fn expectResult(self: *PreparedResource, step: Step) !void {
+        const ctx = self.context;
+        const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/prepared/{s}/execute", .{self.id});
+        defer ctx.alloc.free(path);
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, path, .POST, "{}", 15_000);
+        defer response.deinit(ctx.alloc);
+        try compareResponse(ctx, step, response);
+    }
+    pub fn expectStale(self: *PreparedResource) !void {
+        const ctx = self.context;
+        const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/prepared/{s}/execute", .{self.id});
+        defer ctx.alloc.free(path);
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, path, .POST, "{}", 15_000);
+        defer response.deinit(ctx.alloc);
+        if (response.status == 200) std.debug.print("stale prepared callable executed body={s}\n", .{response.body});
+        try std.testing.expect(response.status != 200);
+        var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("40001", diagnostic.value.code);
+    }
+    pub fn close(self: *PreparedResource) !void {
+        if (self.closed) return;
+        const ctx = self.context;
+        const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/prepared/{s}", .{self.id});
+        defer ctx.alloc.free(path);
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, path, .DELETE, null, 15_000);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expect(response.status == 200 or response.status == 204);
+        self.closed = true;
+    }
+    pub fn deinit(self: *PreparedResource) void {
+        if (!self.closed) self.close() catch {};
+        self.context.alloc.free(self.id);
+    }
+};

@@ -17,6 +17,10 @@
 //! FK and restore envelopes. Schema/row strings are validated but never copied.
 const std = @import("std");
 
+pub fn requiresSqlCast(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_cast");
+}
+
 pub fn requiresSqlRoutine(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_routine");
 }
@@ -309,4 +313,9 @@ test "relational integrity restore staging refresh decoder marker ignores source
 test "SQL routine catalog decoder marker ignores quoted bodies and requires explicit callable publication" {
     for ([_][]const u8{ "{}", "{\"source_json\":\"sql_routine\"}", "{\"sql_routine\":null}" }) |bytes| try std.testing.expect(!requiresSqlRoutine(bytes));
     for ([_][]const u8{ "{\"sql_routine\":{}}", "{\"sql_rout\\u0069ne\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlRoutine(bytes));
+}
+
+test "SQL routine catalog database cast decoder marker cannot hide publication in source text" {
+    for ([_][]const u8{ "{}", "{\"source_json\":\"sql_cast\"}", "{\"sql_cast\":null}" }) |bytes| try std.testing.expect(!requiresSqlCast(bytes));
+    for ([_][]const u8{ "{\"sql_cast\":{}}", "{\"sql_ca\\u0073t\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlCast(bytes));
 }

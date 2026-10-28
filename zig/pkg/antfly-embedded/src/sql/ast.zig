@@ -44,6 +44,7 @@ pub const Scalar = union(enum) {
         numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
         /// Coercion origin controls binding diagnostics, not execution identity.
         coercion: enum { explicit, function } = .explicit,
+        context: @import("../system_catalog/casts.zig").Context = .explicit,
         pub fn withOperand(self: @This(), operand: *const Scalar) @This() {
             var result = self;
             result.operand = operand;
@@ -407,7 +408,7 @@ pub const RelationPopulation = struct {
 };
 
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate },
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -433,6 +434,13 @@ pub const CatalogDdl = struct {
     routine: ?RoutineDefinition = null,
     routine_signature: ?[]const RoutineDefinition.Type = null,
     operator_function: ?Name = null,
+    cast_definition: ?struct {
+        source: RoutineDefinition.Type,
+        target: RoutineDefinition.Type,
+        function: ?Name = null,
+        context: @import("../system_catalog/casts.zig").Context = .explicit,
+        method: enum { function, inout, binary } = .function,
+    } = null,
     aggregate_definition: ?struct {
         state: RoutineDefinition.Type,
         transition: Name,

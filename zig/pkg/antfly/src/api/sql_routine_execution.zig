@@ -68,6 +68,8 @@ pub const Owner = struct {
     bodies: std.AutoHashMapUnmanaged(Identity, *const native.bindings.Resolved) = .empty,
     procedure_names: std.StringHashMapUnmanaged(*native.procedures.Resolved) = .empty,
     aggregate_names: std.StringHashMapUnmanaged(?*const native.bindings.Aggregate) = .empty,
+    cast_cuts: std.StringHashMapUnmanaged(@import("../system_catalog/casts.zig").Snapshot) = .empty,
+    cast_functions: std.StringHashMapUnmanaged(*const native.bindings.Resolved) = .empty,
     declaration_cuts: std.StringHashMapUnmanaged(routines.Snapshot) = .empty,
     settings: ?local.sql_setting_catalog.View = null,
     depth: usize = 0,
@@ -102,7 +104,60 @@ pub const Owner = struct {
         return self.resolverFor(false);
     }
     fn resolverFor(self: *Owner, dynamic: bool) native.bindings.Resolver {
-        return .{ .ptr = self, .resolve = if (dynamic) dynamicResolve else resolve, .resolve_operator = if (dynamic) resolveDynamicOperator else resolveOperator, .resolve_aggregate = resolveAggregate, .resolve_reference = if (dynamic) resolveDynamicReference else resolveReference };
+        return .{ .ptr = self, .resolve = if (dynamic) dynamicResolve else resolve, .resolve_operator = if (dynamic) resolveDynamicOperator else resolveOperator, .resolve_aggregate = resolveAggregate, .resolve_cast = if (dynamic) resolveDynamicCast else resolveCast, .resolve_reference = if (dynamic) resolveDynamicReference else resolveReference };
+    }
+    fn resolveCast(raw: *anyopaque, _: A, source: local.sql_scalar.Type, target: local.sql_scalar.Type, context: catalog.casts.Context) anyerror!?*const native.bindings.Resolved {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        return self.lookupCast(source, target, context, false, true);
+    }
+    fn resolveDynamicCast(raw: *anyopaque, _: A, source: local.sql_scalar.Type, target: local.sql_scalar.Type, context: catalog.casts.Context) anyerror!?*const native.bindings.Resolved {
+        return (@as(*Owner, @ptrCast(@alignCast(raw)))).lookupCast(source, target, context, true, true);
+    }
+    fn lookupCast(self: *Owner, source: local.sql_scalar.Type, target: local.sql_scalar.Type, context: catalog.casts.Context, dynamic: bool, execute: bool) !?*const native.bindings.Resolved {
+        if (!self.root.server.source.vtable.supports_sql_casts) return null;
+        const casts = @import("../system_catalog/casts.zig");
+        const Binding = @import("sql_prepared.zig").Binding;
+        try self.root.context.ensureActive();
+        if (self.root.server.cfg.auth_enabled and self.root.identity.* == null) return error.Forbidden;
+        const pair: catalog.casts.Pair = .{
+            .source = try native.storageType(.{ .kind = source.kind orelse return null, .element_type = source.element_type, .temporal_kind = source.temporal_kind }),
+            .target = try native.storageType(.{ .kind = target.kind orelse return null, .element_type = target.element_type, .temporal_kind = target.temporal_kind }),
+        };
+        // Immutable builtin objects cannot be overridden by CREATE CAST.
+        // Their ordinary conversions need neither metadata nor a manifest.
+        if (catalog.builtin_casts.exists(pair)) return null;
+        const a = self.arena.allocator();
+        const key = try std.fmt.allocPrint(a, "{d}:{s}", .{ @intFromBool(dynamic), try pair.keyAlloc(a) });
+        const cut = self.cast_cuts.get(key) orelse captured: {
+            if (self.cast_cuts.count() >= 128) return error.SqlProgramLimitExceeded;
+            const request: casts.SnapshotRequest = .{ .database = self.root.database, .pair = pair, .expected_revision = self.root.revision };
+            var private = self.root.context;
+            private.setting_admin = true;
+            const bytes = try self.root.server.source.systemCatalog(a, private, .{ .sql_cast_snapshot = request });
+            defer a.free(bytes);
+            const snapshot_ = try std.json.parseFromSliceLeaky(casts.Snapshot, a, bytes, .{ .allocate = .alloc_always });
+            try snapshot_.validate(request);
+            self.root.revision = snapshot_.revision;
+            const manifest = try Binding.fromCast(a, self.root.database, snapshot_, pair);
+            if (!dynamic) if (self.root.prepared_bindings) |bindings| try Binding.verifyCast(bindings, manifest);
+            if (!dynamic) if (self.root.collect_prepared_bindings) |bindings| {
+                if (bindings.items.len >= 64) return error.SqlProgramLimitExceeded;
+                try bindings.append(a, manifest);
+            };
+            try self.cast_cuts.put(a, key, snapshot_);
+            break :captured snapshot_;
+        };
+        const record = cut.record orelse return null;
+        if (!execute) return error.UnsupportedSqlShape;
+        if (!record.definition.context.allows(context)) return if (context == .assignment) error.SqlAssignmentTypeMismatch else error.SqlCannotCoerce;
+        if (self.cast_functions.get(key)) |ready| return ready;
+        var scratch: [3]catalog.casts.Type = undefined;
+        const use = record.definition.functionUse(&scratch);
+        const arguments = try a.alloc(native.bindings.Argument, use.arguments.len);
+        for (use.arguments, arguments) |kind, *argument| argument.* = .{ .type = native.runtimeType(kind) };
+        const ready = try self.lookupReference(use.reference, arguments, dynamic);
+        try self.cast_functions.put(a, key, ready);
+        return ready;
     }
     fn resolveAggregate(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.bindings.Argument) anyerror!?*const native.bindings.Aggregate {
         const self: *Owner = @ptrCast(@alignCast(raw));
@@ -316,4 +371,24 @@ pub fn bindAggregate(raw: *anyopaque, _: A, name: []const u8, arguments: []const
     const root: *execution.Adapter = @ptrCast(@alignCast(raw));
     if (root.routine_owner == null) root.routine_owner = try Owner.create(root);
     return Owner.resolveAggregate(root.routine_owner.?, undefined, name, arguments);
+}
+
+pub fn bindCast(raw: *anyopaque, _: A, source: local.sql_scalar.Type, target: local.sql_scalar.Type, context: catalog.casts.Context) !?*const native.bindings.Resolved {
+    const root: *execution.Adapter = @ptrCast(@alignCast(raw));
+    if (root.routine_owner == null) root.routine_owner = try Owner.create(root);
+    return Owner.resolveCast(root.routine_owner.?, undefined, source, target, context);
+}
+
+pub fn persistedResolver(root: *execution.Adapter) native.bindings.Resolver {
+    return .{ .ptr = root, .resolve = struct {
+        fn reject(_: *anyopaque, _: A, _: []const u8, _: []const native.bindings.Argument) anyerror!*const native.bindings.Resolved {
+            return error.UnsupportedSqlShape;
+        }
+    }.reject, .resolve_cast = struct {
+        fn reject(raw: *anyopaque, _: A, source: local.sql_scalar.Type, target: local.sql_scalar.Type, context: catalog.casts.Context) anyerror!?*const native.bindings.Resolved {
+            const adapter: *execution.Adapter = @ptrCast(@alignCast(raw));
+            if (adapter.routine_owner == null) adapter.routine_owner = try Owner.create(adapter);
+            return adapter.routine_owner.?.lookupCast(source, target, context, false, false);
+        }
+    }.reject };
 }

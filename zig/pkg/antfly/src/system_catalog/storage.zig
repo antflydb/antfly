@@ -843,18 +843,16 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
     defer index.deinit(alloc);
     for (state.value.resources) |resource| {
         var found = (if (resource.kind == .routine) try findFunction(alloc, txn, group_id, resource.parent_id, resource.name, resource.signature orelse return error.InvalidCatalogRecord) else try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
-        if (resource.kind == .routine) {
-            var record = try routines.Record.decode(alloc, resource.source_json);
-            defer record.deinit();
-            try validateCallableReference(alloc, txn, group_id, record.value);
-            const uses = try record.value.functionUsesAlloc(alloc);
-            defer routines.Record.freeFunctionUses(alloc, uses);
-            for (uses) |use| {
+        if (resource.kind == .routine or resource.kind == .cast) {
+            var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, resource);
+            defer dependencies.deinit(alloc);
+            try validateFunctionUses(alloc, txn, group_id, dependencies.uses);
+            for (dependencies.uses) |use| {
                 const reference = use.reference;
                 const key = try functionDependencyKey(alloc, group_id, reference.id, resource.id);
                 defer alloc.free(key);
                 const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
-                if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
+                if (bytes.len != 9 or bytes[0] != (if (resource.kind == .cast) @as(u8, 'c') else 'r') or std.mem.readInt(u64, bytes[1..9], .little) != resource.id) return error.InvalidCatalogRecord;
             }
         }
         defer found.deinit();
@@ -914,14 +912,18 @@ pub fn functionDependents(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, gro
     while (row) |item| : (row = try cursor.next()) {
         if (!std.mem.startsWith(u8, item.key, prefix)) break;
         if (result.items.len >= limit) return error.SqlProgramLimitExceeded;
-        if (item.value.len != 8) return error.InvalidCatalogRecord;
-        const id = std.mem.readInt(u64, item.value[0..8], .little);
-        const resource = (try getById(a, txn, group, .routine, id)) orelse return error.InvalidCatalogRecord;
-        const record = (try routines.Record.decode(a, resource.value.source_json)).value;
-        if (record.id != id) return error.InvalidCatalogRecord;
-        const uses = try record.functionUsesAlloc(a);
-        defer routines.Record.freeFunctionUses(a, uses);
-        const found = for (uses) |use| {
+        if (item.value.len != 9) return error.InvalidCatalogRecord;
+        const kind: domain.Kind = switch (item.value[0]) {
+            'r' => .routine,
+            'c' => .cast,
+            else => return error.InvalidCatalogRecord,
+        };
+        const id = std.mem.readInt(u64, item.value[1..9], .little);
+        const resource = (try getById(a, txn, group, kind, id)) orelse return error.InvalidCatalogRecord;
+        var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(a, resource.value);
+        defer dependencies.deinit(a);
+        if (dependencies.id() != id) return error.InvalidCatalogRecord;
+        const found = for (dependencies.uses) |use| {
             if (use.reference.id == function) break true;
         } else false;
         if (!found) return error.InvalidCatalogRecord;
@@ -929,9 +931,7 @@ pub fn functionDependents(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, gro
     }
     return result.toOwnedSlice(a);
 }
-fn validateCallableReference(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: routines.Record) !void {
-    const uses = try record.functionUsesAlloc(a);
-    defer routines.Record.freeFunctionUses(a, uses);
+pub fn validateFunctionUses(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, uses: []const routines.FunctionUse) !void {
     for (uses) |use| {
         const reference = use.reference;
         var resource = (try getById(a, txn, group, .routine, reference.id)) orelse return error.InvalidCatalogRecord;
@@ -951,17 +951,16 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
     defer alloc.free(child_json);
     try txn.put(child_key, child_json);
-    if (r.kind == .routine) {
-        var parsed = try routines.Record.decode(alloc, r.source_json);
-        defer parsed.deinit();
-        const uses = try parsed.value.functionUsesAlloc(alloc);
-        defer routines.Record.freeFunctionUses(alloc, uses);
-        for (uses) |use| {
+    if (r.kind == .routine or r.kind == .cast) {
+        var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, r);
+        defer dependencies.deinit(alloc);
+        for (dependencies.uses) |use| {
             const reference = use.reference;
             const key = try functionDependencyKey(alloc, group_id, reference.id, r.id);
             defer alloc.free(key);
-            var id: [8]u8 = undefined;
-            std.mem.writeInt(u64, &id, r.id, .little);
+            var id: [9]u8 = undefined;
+            id[0] = if (r.kind == .cast) 'c' else 'r';
+            std.mem.writeInt(u64, id[1..9], r.id, .little);
             try txn.put(key, &id);
         }
     }
@@ -990,12 +989,10 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         error.NotFound => {},
         else => return err,
     };
-    if (r.kind == .routine) {
-        var parsed = try routines.Record.decode(alloc, r.source_json);
-        defer parsed.deinit();
-        const uses = try parsed.value.functionUsesAlloc(alloc);
-        defer routines.Record.freeFunctionUses(alloc, uses);
-        for (uses) |use| {
+    if (r.kind == .routine or r.kind == .cast) {
+        var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, r);
+        defer dependencies.deinit(alloc);
+        for (dependencies.uses) |use| {
             const reference = use.reference;
             const key = try functionDependencyKey(alloc, group_id, reference.id, r.id);
             defer alloc.free(key);

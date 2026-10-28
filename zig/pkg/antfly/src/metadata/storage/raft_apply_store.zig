@@ -17,6 +17,7 @@ const hot_standby_write_gate_adapter = @import("../../storage/hot_standby/write_
 const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
 const std = @import("std");
 const sql_views = @import("../../system_catalog/views.zig");
+const sql_casts = @import("../../system_catalog/casts.zig");
 const sql_routines = @import("../../system_catalog/routines.zig");
 const sql_sequences = @import("../../system_catalog/sequence_catalog.zig");
 const store_report_baseline = @import("../store_report_baseline.zig");
@@ -24365,7 +24366,7 @@ pub const RaftApplyStore = struct {
         const sources = @import("antfly_local_sources");
         if (command.version != 3 or command.column_sequences.len == 0 or command.column_sequences.len > 256 or
             command.mutation.kind != .table or command.mutation.action != .create or command.sql_sequence != null or
-            command.sql_view != null or command.sql_routine != null or command.placement_update != null) return error.InvalidCatalogMutation;
+            command.sql_view != null or command.sql_routine != null or command.sql_cast != null or command.placement_update != null) return error.InvalidCatalogMutation;
         const topology = command.topology orelse return error.InvalidCatalogMutation;
         if (topology != .create or topology.create.table.table_id != command.mutation.table_id) return error.InvalidCatalogMutation;
         _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_column_sequences_version);
@@ -24470,7 +24471,12 @@ pub const RaftApplyStore = struct {
     pub fn prepareSystemCatalogResult(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: SystemCatalogCommand) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
-        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null or command.sql_routine != null)) return error.InvalidCatalogMutation;
+        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null or command.sql_routine != null or command.sql_cast != null)) return error.InvalidCatalogMutation;
+        if (command.sql_cast != null) {
+            var region = std.heap.ArenaAllocator.init(alloc);
+            defer region.deinit();
+            return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlCastCatalogTxn(region.allocator(), &txn, group_id, command), .{});
+        }
         if (command.sql_routine != null) {
             var region: std.heap.ArenaAllocator = .init(alloc);
             defer region.deinit();
@@ -24900,6 +24906,13 @@ pub const RaftApplyStore = struct {
         var parsed = try std.json.parseFromSlice(SystemCatalogCommand, self.alloc, bytes, .{});
         defer parsed.deinit();
         const command = parsed.value;
+        if (command.sql_cast != null) {
+            self.applySqlCastOutcomeTxn(txn, group_id, command) catch |err| switch (err) {
+                error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.SequenceAdmissionExpired, error.SequenceAdmissionConflict, error.CatalogRevisionExhausted => return,
+                else => return err,
+            };
+            return;
+        }
         if (command.sql_routine != null) {
             self.applySqlRoutineOutcomeTxn(txn, group_id, command) catch |err| switch (err) {
                 error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.SequenceAdmissionExpired, error.SequenceAdmissionConflict, error.CatalogRevisionExhausted => return,
@@ -24915,7 +24928,7 @@ pub const RaftApplyStore = struct {
             return;
         }
         if (command.version != 1 and command.version != 2 and command.version != 3) return error.InvalidCatalogMutation;
-        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null or command.sql_routine != null)) return error.InvalidCatalogMutation;
+        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null or command.sql_routine != null or command.sql_cast != null)) return error.InvalidCatalogMutation;
         if (command.mutation.action == .comment) {
             _ = self.requireTopologyActivationTxn(txn, group_id, topology_protocol.sql_resource_comments_version) catch |err| switch (err) {
                 error.TableTopologyProtocolUpgradeRequired => return,
@@ -36978,6 +36991,129 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(alloc, result, .{});
     }
 
+    pub fn sqlCastSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: sql_casts.SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try request.validate();
+        try context.ensureActive();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        if (request.expected_revision) |revision| if (revision != meta.revision) return error.CatalogGenerationChanged;
+        const incarnation = try catalogIncarnationTxn(&txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        const database = if (request.database_id) |id| try view.byId(.database, id) else try view.lookup(.database, 0, request.database);
+        const resource = if (database) |parent| try system_catalog_storage.find(a, &txn, group, .cast, parent.id, try request.pair.keyAlloc(a)) else null;
+        const record = if (resource) |found| (try sql_casts.records.Record.decode(a, found.value.source_json)).value else null;
+        const outcomes: sql_casts.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        const snapshot: sql_casts.Snapshot = .{ .revision = meta.revision, .next_id = meta.next_id, .head = try outcomes.head(a), .incarnation = incarnation, .database_id = if (database) |parent| parent.id else null, .database = if (database) |parent| parent.name else null, .record = record };
+        try snapshot.validate(request);
+        return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+    }
+    fn validateSqlCastCommandTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
+        const request = command.sql_cast orelse return error.InvalidCatalogMutation;
+        try request.validate();
+        if (command.version != 5 or command.expected_revision != 0 or command.sql_routine != null or command.sql_sequence != null or command.sql_view != null or command.topology != null or command.placement_update != null or command.constraint_name_admission != null or command.column_sequences.len != 0 or command.mutation.kind != .cast or command.mutation.action != (if (request.operation == .create) system_catalog.Action.create else .drop) or !std.mem.eql(u8, command.mutation.database, request.database) or !std.mem.eql(u8, command.mutation.name, try request.pair().keyAlloc(a))) return error.InvalidCatalogMutation;
+        const incarnation = try catalogIncarnationTxn(txn, group);
+        if (!std.mem.eql(u8, &incarnation, &request.incarnation)) return error.CatalogGenerationChanged;
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_cast_version);
+    }
+    fn applySqlCastCatalogTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: sql_casts.Mutation, apply: bool) !sql_casts.Result {
+        _ = self;
+        const meta = try system_catalog_storage.readMeta(a, txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
+        const database = (try view.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound;
+        if (database.id != request.database_id) return error.CatalogGenerationChanged;
+        const key = try request.pair().keyAlloc(a);
+        const previous = try system_catalog_storage.find(a, txn, group, .cast, database.id, key);
+        const prior = if (previous) |resource| (try sql_casts.records.Record.decode(a, resource.value.source_json)).value else null;
+        var next: ?sql_casts.records.Record = null;
+        var next_id = meta.next_id;
+        switch (request.operation) {
+            .create => |definition| {
+                var scratch: [3]sql_casts.records.Type = undefined;
+                const use = definition.functionUse(&scratch);
+                var support = (try system_catalog_storage.getById(a, txn, group, .routine, use.reference.id)) orelse return error.CatalogGenerationChanged;
+                defer support.deinit();
+                if (support.value.parent_id != use.reference.namespace_id) return error.CatalogGenerationChanged;
+                var function = try sql_routines.records.Record.decode(a, support.value.source_json);
+                defer function.deinit();
+                if (function.value.kind != .function or function.value.definition.result == null or !std.meta.eql(function.value.definition.result.?, use.result) or function.value.definition.arguments.len != use.arguments.len) return error.SqlInvalidCastDefinition;
+                for (function.value.definition.arguments, use.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared)) return error.SqlInvalidCastDefinition;
+                const namespace = (try system_catalog_storage.getById(a, txn, group, .namespace, use.reference.namespace_id)) orelse return error.CatalogGenerationChanged;
+                if (namespace.value.parent_id != database.id) return error.SqlInvalidCastDefinition;
+                if (@import("antfly_local_sources").sql_catalog.builtin_casts.exists(definition.pair) or prior != null) return error.SqlDuplicateCast;
+                next = .{ .id = next_id, .generation = 1, .database_id = database.id, .definition = definition };
+                try next.?.validate();
+                next_id = std.math.add(u64, next_id, 1) catch return error.CatalogRevisionExhausted;
+            },
+            .drop => |drop| {
+                if (prior) |old| {
+                    const expected = drop.expected orelse return error.CatalogGenerationChanged;
+                    if (expected.id != old.id or expected.generation != old.generation) return error.CatalogGenerationChanged;
+                } else {
+                    if (!drop.if_exists) return error.SqlCastNotFound;
+                    return .{ .revision = meta.revision, .identity = null, .removed = 0 };
+                }
+            },
+        }
+        const result: sql_casts.Result = .{ .revision = std.math.add(u64, meta.revision, 1) catch return error.CatalogRevisionExhausted, .identity = if (next) |record| .{ .id = record.id, .generation = record.generation } else null, .removed = @intFromBool(next == null) };
+        if (!apply) return result;
+        var upserts: [1]system_catalog.Resource = undefined;
+        if (next) |record| upserts[0] = .{ .kind = .cast, .id = record.id, .parent_id = database.id, .name = key, .source_json = try record.encode(a) };
+        var removes: [1]system_catalog.Resource = undefined;
+        if (next == null) removes[0] = previous.?.value;
+        const delta: system_catalog.Delta = .{ .upserts = if (next != null) &upserts else &.{}, .removes = if (next == null) &removes else &.{}, .next_id = next_id };
+        const bytes = try std.json.Stringify.valueAlloc(a, try sql_casts.command(a, request), .{});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        try system_catalog_storage.applyDelta(a, txn, group, delta, meta, digest);
+        return result;
+    }
+    fn prepareSqlCastCatalogTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !sql_casts.Outcome {
+        try self.validateSqlCastCommandTxn(a, txn, group, command);
+        const request = command.sql_cast.?;
+        const outcomes: sql_casts.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group = group, .incarnation = request.incarnation };
+        return switch (try outcomes.prepare(a, request.admission, try sql_casts.boundDigest(a, try sql_casts.observation(a, request)))) {
+            .replay => |outcome| outcome,
+            .append => prepared: {
+                const result = self.applySqlCastCatalogTxn(a, txn, group, request, false);
+                break :prepared if (result) |value| .{ .success = value } else |err| sql_casts.Outcome.fromError(err) orelse return err;
+            },
+        };
+    }
+    fn applySqlCastOutcomeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try self.validateSqlCastCommandTxn(a, txn, group, command);
+        const request = command.sql_cast.?;
+        const outcomes: sql_casts.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group = group, .incarnation = request.incarnation };
+        const digest = try sql_casts.boundDigest(a, try sql_casts.observation(a, request));
+        switch (try outcomes.prepare(a, request.admission, digest)) {
+            .replay => return,
+            .append => |ordinal| {
+                const result = self.applySqlCastCatalogTxn(a, txn, group, request, true);
+                const outcome: sql_casts.Outcome = if (result) |value| .{ .success = value } else |err| sql_casts.Outcome.fromError(err) orelse return err;
+                try outcomes.append(a, ordinal, request.admission, digest, outcome);
+            },
+        }
+    }
+    pub fn sqlCastOutcome(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: sql_casts.OutcomeRequest) ![]u8 {
+        try request.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const incarnation = try catalogIncarnationTxn(&txn, group);
+        if (!std.mem.eql(u8, &incarnation, &request.incarnation)) return a.dupe(u8, "null");
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        const database = (try view.byId(.database, request.database_id)) orelse return a.dupe(u8, "null");
+        if (database.id != request.database_id) return a.dupe(u8, "null");
+        const outcomes: sql_casts.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        return std.json.Stringify.valueAlloc(a, try outcomes.lookup(a, request.admission, try sql_casts.boundDigest(a, request)), .{});
+    }
+
     pub fn sqlRoutineSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: sql_routines.SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         var region: std.heap.ArenaAllocator = .init(alloc);
         defer region.deinit();
@@ -37052,7 +37188,7 @@ pub const RaftApplyStore = struct {
     fn validateSqlRoutineCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
         const request = command.sql_routine orelse return error.InvalidCatalogMutation;
         try request.validate();
-        if (command.version != 4 or command.expected_revision != 0 or command.sql_view != null or command.sql_sequence != null or command.column_sequences.len != 0 or
+        if (command.sql_cast != null or command.version != 4 or command.expected_revision != 0 or command.sql_view != null or command.sql_sequence != null or command.column_sequences.len != 0 or
             command.topology != null or command.placement_update != null or command.constraint_name_admission != null or command.mutation.kind != .routine or
             command.mutation.action != sql_routines.commandAction(request) or
             !std.mem.eql(u8, command.mutation.database, request.target.database) or !std.mem.eql(u8, command.mutation.namespace, request.target.namespace) or !std.mem.eql(u8, command.mutation.name, request.target.table) or
@@ -37155,6 +37291,10 @@ pub const RaftApplyStore = struct {
         const revision = std.math.add(u64, meta.revision, 1) catch return error.CatalogRevisionExhausted;
         const cascade_notice = if (dependents.len == 1) single: {
             const dependent = dependents[0];
+            if (dependent.kind == .cast) {
+                const record = (try sql_casts.records.Record.decode(a, dependent.source_json)).value;
+                break :single try std.fmt.allocPrint(a, "drop cascades to cast from {s} to {s}", .{ record.definition.pair.source.sqlName(), record.definition.pair.target.sqlName() });
+            }
             const record = (try sql_routines.records.Record.decode(a, dependent.source_json)).value;
             const parent = (try system_catalog_storage.getById(a, txn, group, .namespace, dependent.parent_id)) orelse return error.InvalidCatalogRecord;
             const qualified_name = if (std.mem.eql(u8, parent.value.name, request.target.namespace)) dependent.name else try std.fmt.allocPrint(a, "{s}.{s}", .{ parent.value.name, dependent.name });
@@ -59576,6 +59716,103 @@ test "SQL routine catalog aggregate dependency rebuild and retained retirement s
             defer txn.abort();
             try std.testing.expectEqual(@as(usize, 0), (try system_catalog_storage.functionDependents(a, &txn, group, transition.id, 1024)).len);
             try std.testing.expectEqual(@as(usize, 0), (try system_catalog_storage.functionDependents(a, &txn, group, final.id, 1024)).len);
+        }
+    }
+}
+
+test "SQL routine catalog database casts retain typed dependencies and exact cold retirement" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cast-catalog", .{tmp.sub_path});
+    defer alloc.free(root);
+    const group = group_ids.main_metadata_group_id;
+    const seed = "03030303030303030303030303030303".*;
+    const pair: sql_casts.records.Pair = .{ .source = .{ .scalar = .jsonb }, .target = .{ .scalar = .text } };
+    const T = struct {
+        fn cut(store: *RaftApplyStore, a: std.mem.Allocator) !sql_casts.Snapshot {
+            const bytes = try store.sqlCastSnapshot(a, group, .{ .database = "cast_database", .pair = pair }, .{});
+            return std.json.parseFromSliceLeaky(sql_casts.Snapshot, a, bytes, .{});
+        }
+        fn apply(store: *RaftApplyStore, a: std.mem.Allocator, request: sql_casts.Mutation) !sql_casts.Outcome {
+            const command = try sql_casts.command(a, request);
+            const preview = try store.prepareSystemCatalogResult(a, group, command);
+            _ = preview;
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(a, command, .{}) });
+            return (try std.json.parseFromSliceLeaky(?sql_casts.Outcome, a, try store.sqlCastOutcome(a, group, try sql_casts.observation(a, request)), .{})).?;
+        }
+        fn routine(store: *RaftApplyStore, a: std.mem.Allocator, request: sql_routines.Mutation) !sql_routines.Outcome {
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(a, sql_routines.command(request), .{}) });
+            return (try std.json.parseFromSliceLeaky(?sql_routines.Outcome, a, try store.sqlRoutineOutcome(a, group, try sql_routines.observation(a, request)), .{})).?;
+        }
+    };
+    var function: sql_routines.Identity = undefined;
+    var created: sql_casts.Identity = undefined;
+    var creation: sql_casts.Mutation = undefined;
+    var retirement: sql_routines.Mutation = undefined;
+    var retired_revision: u64 = 0;
+    for (0..3) |pass| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        if (pass == 0) {
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = seed });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            const catalog_command: SystemCatalogCommand = .{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .database, .name = "cast_database" } };
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(a, catalog_command, .{}) });
+            var cut = try T.cut(&store, a);
+            function = (try T.routine(&store, a, .{ .admission = .{ .nonce = @splat(10), .head = cut.head }, .target = .{ .database = "cast_database", .table = "cast_support" }, .namespace_id = 4, .incarnation = cut.incarnation, .operation = .{ .publish = .{ .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .jsonb } }}, .result = .{ .scalar = .text }, .body = "SELECT 'custom'", .owner = .auth_disabled } } } })).success.identity.?;
+            cut = try T.cut(&store, a);
+            const request: sql_casts.Mutation = .{ .admission = .{ .nonce = @splat(11), .head = cut.head }, .database = "cast_database", .database_id = cut.database_id.?, .incarnation = cut.incarnation, .operation = .{ .create = .{ .pair = pair, .context = .assignment, .function = .{ .database = "cast_database", .namespace = "public", .name = "cast_support", .namespace_id = 4, .id = function.id }, .owner = .auth_disabled } } };
+            creation = request;
+            created = (try T.apply(&store, a, request)).success.identity.?;
+            try std.testing.expectEqual(created.id, (try T.apply(&store, a, request)).success.identity.?.id);
+            // A malformed support signature wins over duplicate-cast detection,
+            // as PostgreSQL does, and its rejection is retained exactly.
+            var invalid = request;
+            invalid.admission = .{ .nonce = @splat(14), .head = (try T.cut(&store, a)).head };
+            invalid.operation.create.arguments = 2;
+            try std.testing.expectEqual(.SqlInvalidCastDefinition, (try T.apply(&store, a, invalid)).rejected);
+            try std.testing.expectEqual(.SqlInvalidCastDefinition, (try T.apply(&store, a, invalid)).rejected);
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try system_catalog_storage.rebuildNameIndex(a, &txn, group);
+            try system_catalog_storage.validateNameIndex(a, &txn, group);
+            const dependencies = try system_catalog_storage.functionDependents(a, &txn, group, function.id, 1024);
+            try std.testing.expectEqual(@as(usize, 1), dependencies.len);
+            try std.testing.expectEqual(system_catalog.Kind.cast, dependencies[0].kind);
+            try std.testing.expectEqual(@as(u64, 3), dependencies[0].parent_id);
+            try txn.commit();
+        } else if (pass == 1) {
+            const cut = try T.cut(&store, a);
+            try std.testing.expectEqual(created.id, cut.record.?.id);
+            retirement = .{ .admission = .{ .nonce = @splat(12), .head = cut.head }, .target = .{ .database = "cast_database", .table = "cast_support" }, .namespace_id = 4, .incarnation = cut.incarnation, .operation = .{ .drop = .{ .signature = "jsonb", .expected = function } } };
+            const rejected = try T.routine(&store, a, retirement);
+            try std.testing.expectEqual(.SqlDependentCallable, rejected.rejected);
+            try std.testing.expectEqualDeep(rejected, try T.routine(&store, a, retirement));
+            retirement.admission = .{ .nonce = @splat(13), .head = (try T.cut(&store, a)).head };
+            retirement.operation.drop.cascade = true;
+            const removed = (try T.routine(&store, a, retirement)).success;
+            retired_revision = removed.revision;
+            try std.testing.expectEqualStrings("drop cascades to cast from jsonb to text", removed.cascade_notice.?);
+        } else {
+            try std.testing.expectEqual(retired_revision, (try T.routine(&store, a, retirement)).success.revision);
+            const before = try T.cut(&store, a);
+            const rename: SystemCatalogCommand = .{ .expected_revision = before.revision, .mutation = .{ .action = .rename, .kind = .database, .name = "cast_database", .new_name = "renamed_cast_database" } };
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(a, rename, .{}) });
+            const reuse: SystemCatalogCommand = .{ .expected_revision = before.revision + 1, .mutation = .{ .action = .create, .kind = .database, .name = "cast_database" } };
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(a, reuse, .{}) });
+            const live_request: sql_casts.SnapshotRequest = .{ .database = "cast_database", .database_id = creation.database_id, .pair = pair };
+            const live = try std.json.parseFromSliceLeaky(sql_casts.Snapshot, a, try store.sqlCastSnapshot(a, group, live_request, .{}), .{});
+            try live.validate(live_request);
+            try std.testing.expectEqualStrings("renamed_cast_database", live.database.?);
+            try std.testing.expect((try T.cut(&store, a)).database_id != live.database_id);
+            try std.testing.expect(live.record == null);
+            try std.testing.expect((try T.cut(&store, a)).record == null);
+            try std.testing.expectEqual(created.id, (try T.apply(&store, a, creation)).success.identity.?.id);
+            try std.testing.expect((try T.cut(&store, a)).record == null);
         }
     }
 }

@@ -102,6 +102,48 @@ pub fn mutateSqlRoutine(svc: anytype, alloc: std.mem.Allocator, context: operati
     return outcome;
 }
 
+pub fn mutateSqlCast(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("casts.zig").Mutation) ![]u8 {
+    const casts = @import("casts.zig");
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try @import("../metadata/service.zig").ensureSqlCastCapabilityWithContext(svc, context);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_cast_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const command = try casts.command(alloc, request);
+    if (store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command)) |preview| {
+        alloc.free(preview);
+    } else |err| {
+        // Accepted semantic failures need the same retained nonce outcome as
+        // success. Only invalid envelopes/capability/IO failures stop admission.
+        if (casts.Outcome.fromError(err) == null) return err;
+    }
+    const observation = try casts.observation(alloc, request);
+    const previous = try store.sqlCastOutcome(alloc, svc.metadata_group_id, observation);
+    defer alloc.free(previous);
+    if (!std.mem.eql(u8, previous, "null")) return alloc.dupe(u8, previous);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const outcome = store.sqlCastOutcome(alloc, svc.metadata_group_id, observation) catch return error.MetadataMutationOutcomeUnknown;
+    if (std.mem.eql(u8, outcome, "null")) {
+        alloc.free(outcome);
+        return error.MetadataMutationOutcomeUnknown;
+    }
+    return outcome;
+}
+
 pub fn mutateSqlSequenceCounter(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("sequence_catalog.zig").CounterRequest) ![]u8 {
     const sequence = @import("sequence_catalog.zig");
     if (!context.setting_admin) return error.Forbidden;
@@ -2231,6 +2273,23 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
         },
         .sql_view_mutate => |request| mutateSqlView(svc, alloc, context, request),
+        .sql_cast_mutate => |request| mutateSqlCast(svc, alloc, context, request),
+        .sql_cast_snapshot => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlCastSnapshot(alloc, svc.metadata_group_id, request, context);
+        },
+        .sql_cast_outcome => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlCastOutcome(alloc, svc.metadata_group_id, request);
+        },
         .sql_routine_mutate => |request| mutateSqlRoutine(svc, alloc, context, request),
         .sql_routine_snapshot => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;

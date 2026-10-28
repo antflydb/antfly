@@ -118,7 +118,8 @@ const Loader = struct {
 pub fn preparePopulation(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, a: A, intent: ast.RelationPopulation, revision: u64, path: ?*const Path) !definitions.Owned {
     var loader: Loader = .{ .server = server, .identity = identity, .context = context, .database = database, .namespace = namespace, .revision = revision, .path = path };
     var admitted = identity;
-    var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &admitted, .context = context, .database = database, .namespace = namespace };
+    var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &admitted, .context = context, .database = database, .namespace = namespace, .revision = revision };
+    defer adapter.releaseExecutionOwners();
     var settings: ?sources.sql_setting_catalog.View = null;
     defer if (settings) |*value| value.deinit();
     if (identity != null) {
@@ -126,7 +127,7 @@ pub fn preparePopulation(server: *http.ApiHttpServer, identity: ?http.Authentica
         settings = try sources.sql_setting_catalog.View.capture(a, capture.owner, capture.scope, capture.overlay);
         try settings.?.pinSqlUser(capture.sql_user);
     }
-    return definitions.preparePopulation(a, .{ .ptr = &loader, .resolve = Loader.resolve, .checkpoint = Loader.checkpoint }, intent, .{ .owner = try currentOwner(identity, server.cfg.auth_enabled), .settings = if (settings) |*value| value else null });
+    return definitions.preparePopulation(a, .{ .ptr = &loader, .resolve = Loader.resolve, .checkpoint = Loader.checkpoint }, intent, .{ .routines = if (intent.materialized()) @import("sql_routine_execution.zig").persistedResolver(&adapter) else null, .owner = try currentOwner(identity, server.cfg.auth_enabled), .settings = if (settings) |*value| value else null });
 }
 
 pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: ast.CatalogDdl, path: ?*const Path) !catalog.DdlOutcome {
@@ -170,7 +171,8 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
             var loader: Loader = .{ .server = server, .identity = identity, .context = context, .database = database, .namespace = namespace, .revision = snapshot.revision, .path = path };
             const Adapter = @import("sql_execution.zig").Adapter;
             var admitted = identity;
-            var adapter: Adapter = .{ .server = server, .identity = &admitted, .context = context, .database = database, .namespace = namespace };
+            var adapter: Adapter = .{ .server = server, .identity = &admitted, .context = context, .database = database, .namespace = namespace, .revision = snapshot.revision };
+            defer adapter.releaseExecutionOwners();
             var settings: ?sources.sql_setting_catalog.View = null;
             defer if (settings) |*value| value.deinit();
             if (identity != null) {
@@ -178,7 +180,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
                 settings = try sources.sql_setting_catalog.View.capture(a, capture.owner, capture.scope, capture.overlay);
                 try settings.?.pinSqlUser(capture.sql_user);
             }
-            var definition = try definitions.prepareDdl(a, .{ .ptr = &loader, .resolve = Loader.resolve, .checkpoint = Loader.checkpoint }, ddl, .{ .owner = try currentOwner(identity, server.cfg.auth_enabled), .settings = if (settings) |*value| value else null });
+            var definition = try definitions.prepareDdl(a, .{ .ptr = &loader, .resolve = Loader.resolve, .checkpoint = Loader.checkpoint }, ddl, .{ .routines = @import("sql_routine_execution.zig").persistedResolver(&adapter), .owner = try currentOwner(identity, server.cfg.auth_enabled), .settings = if (settings) |*value| value else null });
             defer definition.deinit();
             // The command owner borrows definition until serialization below.
             // Its owned JSON survives the preparation's arena teardown.

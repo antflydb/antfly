@@ -47,6 +47,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
     if (statement == .catalog_ddl and (statement.catalog_ddl.action == .populate or (statement.catalog_ddl.materialized and statement.catalog_ddl.action != .drop))) return error.UnsupportedSqlExecution;
     const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
     try backend.vtable.checkpoint(backend.ptr);
+    if (backend.validate_persisted_expressions) |validate| try validate(backend.ptr, alloc, statement);
     const preparation: @import("immutable_plan.zig").Limits = if (backend.scalar_control) |control| .{ .checkpoint = control.checkpoint, .checkpoint_context = control.ptr } else .{};
     const generated_names = if (statement == .create_table) try generatedConstraintNamesAlloc(alloc, statement.create_table) else &.{};
     defer alloc.free(generated_names);
@@ -102,6 +103,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .procedure => "CREATE PROCEDURE",
                 .operator => "CREATE OPERATOR",
                 .aggregate => "CREATE AGGREGATE",
+                .cast => "CREATE CAST",
                 .table => unreachable,
             },
             .drop => switch (ddl.kind) {
@@ -116,6 +118,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .procedure => "DROP PROCEDURE",
                 .operator => "DROP OPERATOR",
                 .aggregate => "DROP AGGREGATE",
+                .cast => "DROP CAST",
                 .table => unreachable,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
@@ -131,6 +134,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .procedure => "ALTER PROCEDURE",
                 .operator => "ALTER OPERATOR",
                 .aggregate => "ALTER AGGREGATE",
+                .cast => "ALTER CAST",
             },
         },
     }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt, .catalog_receipt = outcome.catalog_receipt };

@@ -1777,7 +1777,8 @@ fn viewBindings(a: std.mem.Allocator, guard: ?[]const u8) !?[]const @import("sql
     };
     if (bindings.len == 0 or bindings.len > 64 or !hasViewBindings(bindings)) return error.CatalogGenerationChanged;
     for (bindings) |binding| {
-        if (binding.id == 0 or binding.database.len == 0 or binding.namespace.len == 0 or binding.name.len == 0) return error.CatalogGenerationChanged;
+        if ((binding.id == 0 and binding.kind != .cast) or binding.database.len == 0 or (binding.namespace.len == 0 and binding.kind != .cast) or binding.name.len == 0) return error.CatalogGenerationChanged;
+        if (binding.kind == .cast) try @import("sql_prepared.zig").Binding.verifyCast(&.{binding}, binding);
         if (binding.kind == .view and (binding.schema_version == 0 or binding.definition_digest == null)) return error.CatalogGenerationChanged;
         if ((binding.kind == .function or binding.kind == .procedure or binding.kind == .operator or binding.kind == .aggregate) and (binding.schema_version == 0 or binding.routine_incarnation == null or std.mem.allEqual(u8, &binding.routine_incarnation.?, 0) or binding.routine_signature == null or binding.routine_namespace_id == null or binding.routine_namespace_id == 0)) return error.CatalogGenerationChanged;
         if (binding.kind == .sequence) {

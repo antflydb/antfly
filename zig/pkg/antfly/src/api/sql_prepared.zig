@@ -32,7 +32,9 @@ const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
-    kind: enum { table, view, sequence, function, procedure, operator, aggregate } = .table,
+    kind: enum { table, view, sequence, function, procedure, operator, aggregate, cast } = .table,
+    cast_database_id: ?u64 = null,
+    cast_pair: ?@import("antfly_local_sources").sql_catalog.casts.Pair = null,
     sequence_incarnation: ?[16]u8 = null,
     routine_incarnation: ?[16]u8 = null,
     routine_signature: ?[]const u8 = null,
@@ -60,6 +62,21 @@ pub const Binding = struct {
             if (entry.kind != .table) continue;
             if (!std.mem.eql(u8, entry.database, current.database) or !std.mem.eql(u8, entry.namespace, current.namespace) or !std.mem.eql(u8, entry.name, current.name)) continue;
             if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
+
+    pub fn fromCast(a: std.mem.Allocator, database: []const u8, snapshot: @import("../system_catalog/casts.zig").Snapshot, pair: @import("antfly_local_sources").sql_catalog.casts.Pair) !Binding {
+        return .{ .kind = .cast, .database = database, .namespace = "", .name = try pair.keyAlloc(a), .physical_name = "", .id = if (snapshot.record) |record| record.id else 0, .schema_version = if (snapshot.record) |record| record.generation else 0, .revision = snapshot.revision, .routine_incarnation = snapshot.incarnation, .cast_database_id = snapshot.database_id orelse return error.DatabaseNotFound, .cast_pair = pair };
+    }
+    pub fn verifyCast(bindings: []const Binding, current: Binding) !void {
+        if (current.kind != .cast or current.cast_pair == null or current.cast_database_id == null or current.cast_database_id == 0 or current.routine_incarnation == null or ((current.id == 0) != (current.schema_version == 0))) return error.InvalidSqlBackendResponse;
+        if (std.mem.allEqual(u8, &current.routine_incarnation.?, 0)) return error.InvalidSqlBackendResponse;
+        current.cast_pair.?.validate() catch return error.InvalidSqlBackendResponse;
+        for (bindings) |entry| {
+            if (entry.kind != .cast or !std.meta.eql(entry.cast_pair, current.cast_pair) or entry.cast_database_id != current.cast_database_id) continue;
+            if (entry.id != current.id or entry.schema_version != current.schema_version or !std.meta.eql(entry.routine_incarnation, current.routine_incarnation)) return error.CatalogGenerationChanged;
             return;
         }
         return error.CatalogGenerationChanged;

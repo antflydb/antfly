@@ -1325,6 +1325,9 @@ pub const PopulationPreparation = struct {
 };
 
 pub const routines = @import("routine_definition.zig");
+pub const builtin_casts = @import("../system_catalog/builtin_casts.zig");
+pub const casts = @import("../system_catalog/casts.zig");
+pub const callable_dependencies = @import("../system_catalog/callable_dependencies.zig");
 pub const notices = @import("notices.zig");
 
 pub const Ddl = union(enum) {
@@ -1374,7 +1377,7 @@ pub const DdlReceipt = struct {
 /// Native catalog operations have no physical table/schema receipt. Identity
 /// integers stay native here and stringify as exact decimal strings on wire.
 pub const CatalogOperationReceipt = struct {
-    pub const Kind = enum { sequence, function, procedure, operator, aggregate };
+    pub const Kind = enum { sequence, function, procedure, operator, aggregate, cast };
     pub const Operation = enum { create, alter, rename, drop };
     pub const State = enum { committed, rejected, unknown };
     pub const Diagnostic = struct { code: []const u8, message: []const u8, retryable: bool };
@@ -1531,6 +1534,7 @@ pub const CopyFilter = struct {
 
 pub const Backend = struct {
     pub const PreparedRead = struct { name: ast.Name, relation: ReadRelation };
+    validate_persisted_expressions: ?*const fn (*anyopaque, std.mem.Allocator, ast.Statement) anyerror!void = null,
     /// Private resolver namespace. Distinct delegated view contexts must not
     /// share name bindings even when their SQL references have the same text.
     copy_filter: ?CopyFilter = null,

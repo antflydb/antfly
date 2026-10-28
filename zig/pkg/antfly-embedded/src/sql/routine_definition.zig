@@ -116,7 +116,7 @@ pub fn prepare(a: A, record: records.Record, resolver: ?@import("routine_binding
     // arg1/arg2 identifier: PostgreSQL exposes only $n for unnamed SQL inputs.
     const expression = body.columns[0].expression orelse &ast.Scalar{ .column = body.columns[0].field };
     const result = runtimeType(record.definition.result orelse return error.SqlWrongObjectType);
-    const cast: ast.Scalar = .{ .cast = .{ .operand = expression, .type = result.kind.?, .element_type = result.element_type, .temporal_kind = result.temporal_kind, .coercion = .function } };
+    const cast: ast.Scalar = .{ .cast = .{ .operand = expression, .type = result.kind.?, .element_type = result.element_type, .temporal_kind = result.temporal_kind, .coercion = .function, .context = .assignment } };
     const program = try a.create(scalar.Program);
     program.* = try scalar.bindTypedExpectedWithSettings(a, &cast, columns, descriptors, result, .{ .routines = resolver }, settings);
     // Suspending external effects need their own retained invocation directory;
