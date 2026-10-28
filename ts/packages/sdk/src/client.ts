@@ -1940,7 +1940,7 @@ export class AntflyClient {
       const { data, error, response } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
-      if (error)
+      if (!response.ok)
         throw new AntflyHTTPError(
           `Failed to get table: ${apiErrorMessage(error)}`,
           response?.status ?? 0,
@@ -2249,7 +2249,7 @@ export class AntflyClient {
           },
         }
       );
-      if (error)
+      if (!response.ok)
         throw new AntflyHTTPError(
           `Key lookup failed: ${apiErrorMessage(error)}`,
           response?.status ?? 0,
@@ -3558,7 +3558,7 @@ export class AntflyClient {
           params: { path: { tableName, indexName } },
         }
       );
-      if (error)
+      if (!response.ok)
         throw new AntflyHTTPError(
           `Failed to get index: ${apiErrorMessage(error)}`,
           response?.status ?? 0,

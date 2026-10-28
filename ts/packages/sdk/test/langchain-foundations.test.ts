@@ -33,6 +33,30 @@ it.each([404, 401, 500])("preserves lookup HTTP status %i", async (status) => {
   await expect(client.tables.get("t")).rejects.toBeInstanceOf(AntflyHTTPError);
   await expect(client.indexes.get("t", "v")).rejects.toMatchObject({ status });
 });
+it.each(
+  [401, 404, 500].flatMap((status) =>
+    [true, false].map((hasContentLength) => ({ status, hasContentLength }))
+  )
+)("preserves empty lookup HTTP status $status with Content-Length: $hasContentLength", async ({
+  status,
+  hasContentLength,
+}) => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(null, {
+          status,
+          headers: hasContentLength ? { "Content-Length": "0" } : undefined,
+        })
+    )
+  );
+  const client = new AntflyClient({ baseUrl: "http://localhost" });
+  const expected = { name: "AntflyHTTPError", status };
+  await expect(client.tables.get("t")).rejects.toMatchObject(expected);
+  await expect(client.tables.lookup("t", "a")).rejects.toMatchObject(expected);
+  await expect(client.indexes.get("t", "v")).rejects.toMatchObject(expected);
+});
 it("preserves batch statuses", async () => {
   vi.stubGlobal(
     "fetch",
