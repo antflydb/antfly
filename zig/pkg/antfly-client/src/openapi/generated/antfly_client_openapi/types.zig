@@ -13808,7 +13808,7 @@ pub const EntityCurationResult = struct {
     applied: ?bool = null,
     /// Native HTTP mutations return this progress resource relative to the request URI. Follow its bounded pages for individual consumer proofs.
     progress_url: ?[]const u8 = null,
-    /// Native mutation outcomes, stored once per namespace. Consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries.
+    /// Mutation outcomes, stored once per namespace. Read absorbed keys and dispositions here; consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries.
     namespaces: ?[]const EntityNamespaceOutcome = null,
     results: []const std.json.Value,
 

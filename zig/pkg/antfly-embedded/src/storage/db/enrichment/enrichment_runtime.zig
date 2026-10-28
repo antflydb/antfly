@@ -14549,6 +14549,7 @@ fn indexDocumentProducerRequired(a: Allocator, item: AssetProducerBatchItem) !bo
     return provider == .string and std.mem.eql(u8, provider.string, "antfly");
 }
 fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer_mod.Producer, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     const Task = struct {
         runtime: *EnrichmentRuntime,
         producer: asset_producer_mod.Producer,
@@ -15412,6 +15413,7 @@ const IndexDocumentCheckpoint = struct {
     }
 };
 fn retireIndexDocumentCheckpoint(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, authority: ?*const @import("../artifact_producer_context.zig").Token) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     var arena = std.heap.ArenaAllocator.init(runtime.alloc);
     defer arena.deinit();
     const a = arena.allocator();

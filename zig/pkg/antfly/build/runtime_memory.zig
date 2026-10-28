@@ -263,6 +263,11 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     // Round each peak + 10% to whole GiB rather than applying a blanket bump
     // that would suppress unrelated compilation parallelism. See COMPILATION.md.
     const floors = [_]struct { name: []const u8, gib: usize }{
+        // Run 40624165216: native Nix glibc Zig 0.17.0 GNU Debug CAPI
+        // consumer object peaked at 17,141,358,592 bytes. Peak + 10%,
+        // rounded to whole GiB, fits the 20 GiB scheduler with room for
+        // small compilers instead of forcing a failed-claim recompilation.
+        .{ .name = test_owner_names.capi_contract, .gib = 18 },
         .{ .name = "public-api-parity", .gib = 20 },
         .{ .name = "data-runtime-tests", .gib = 14 },
         .{ .name = "standalone-runtime-owner-tests", .gib = 16 },
@@ -676,4 +681,13 @@ test "qualified local claims are independent of consumers and preserve three com
     // 28.75 GiB fits this host's 28.8 GiB compiler budget. Rounding each
     // claim to a whole GiB, or inheriting the consumer claim, prevents it.
     try std.testing.expect(consumer + root_local + data_local <= 36 * gib * 4 / 5);
+}
+
+test "native Linux CAPI test reservation covers the measured compiler without consuming the whole budget" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const peak: usize = 17_141_358_592;
+    const claim = testCompileMaxRss(test_owner_names.capi_contract, linux, linux, .debug, 7 * 1024 * 1024 * 1024);
+    try std.testing.expect(claim >= peak + peak / 10);
+    try std.testing.expect(claim + 2 * 1024 * 1024 * 1024 <= 20 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 7 * 1024 * 1024 * 1024), testCompileMaxRss(test_owner_names.capi_contract, linux, linux, .fast, 7 * 1024 * 1024 * 1024));
 }

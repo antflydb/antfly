@@ -93,11 +93,18 @@ const std = @import("std");
 /// Version 60 backfills and maintains root-scoped resolver pin projections.
 /// Version 61 resumes bounded pin paths and backfills static root membership.
 /// Version 62 incrementally repairs graph-fenced pin membership from edit journals.
-pub const current_version: u16 = 63;
+/// Version 63 adds dependency-scoped pin repair and indexed invalidation proofs.
+/// Version 64 adds deletable dependency summaries and forward-only pin repair.
+/// Version 65 scopes native paths and adds paged fingerprint dependency summaries.
+/// Version 66 indexes routing sources for dependency-validated canonical proofs.
+/// Version 67 qualifies legacy resolver content before native cache admission.
+/// Version 68 tracks bounded edits during resumable resolver qualification.
+/// Version 69 adds graph definitions and transaction sessions.
+pub const current_version: u16 = 69;
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 62;
+pub const resolver_namespaces_version: u16 = 68;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {
@@ -107,10 +114,10 @@ pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 
-/// Version 63 adds graph definitions and transaction sessions alongside main's
+/// Version 69 adds graph definitions and transaction sessions alongside main's
 /// resolver namespace and document job formats, preserving command tags 0..80.
-pub const transaction_sessions_version: u16 = 63;
-pub const graph_definition_version: u16 = 63;
+pub const transaction_sessions_version: u16 = 69;
+pub const graph_definition_version: u16 = 69;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
