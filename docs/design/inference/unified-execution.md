@@ -3303,3 +3303,9 @@ source/performance accounting.
 [The AG outcome register](unified-execution-ag-outcomes.md) records one native
 arithmetic owner across ordinary panels and packed QKV, fixed-extent pointer
 views, removal of packed-specific helpers and shared projection traversal.
+
+### AH native Q3 four-column row ownership
+
+[The AH outcome register](unified-execution-ah-outcomes.md) records shared
+Q3 subblock traversal across one, two and four rows, preserving two-row dot
+tiles, arithmetic order and the existing private result contracts.

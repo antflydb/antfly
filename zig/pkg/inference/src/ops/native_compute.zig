@@ -25145,128 +25145,55 @@ inline fn q3KNoDmnPanelValues(panel_block: []const u8, sub: usize) []const u8 {
     return panel_block[prepared_q3_k_panel_values_offset + sub * prepared_q3_k_panel_nr * 16 ..][0 .. prepared_q3_k_panel_nr * 16];
 }
 
-inline fn dotQ3KNoDmnPanel4(
-    q8_block: []const u8,
-    panel_block: []const u8,
-) struct { f32, f32, f32, f32 } {
-    std.debug.assert(q8_block.len == 292);
-    const qx = q8_block[4..260];
-    const x_scale: F32x4 = @splat(readF32Le(q8_block[0..4]));
-    var acc: F32x4 = @splat(0.0);
+/// Compile-time rows retain sixteen unrolled subblocks and two MR2 tiles for MR4.
+inline fn q3KNoDmnPanel4Rows(comptime mr: usize, inputs: [mr][]const u8, panel: []const u8) [mr]F32x4 {
+    comptime std.debug.assert(mr == 1 or mr == 2 or mr == 4);
+    inline for (inputs) |input| std.debug.assert(input.len == 292);
+    var scales: [mr]F32x4 = undefined;
+    inline for (0..mr) |row| scales[row] = @splat(readF32Le(inputs[row][0..4]));
+    var acc: [mr]F32x4 = @splat(@splat(0.0));
+    const tile_rows = @min(mr, 2);
+    const Dot = if (mr == 1) struct { i32, i32, i32, i32 } else struct { i32, i32, i32, i32, i32, i32, i32, i32 };
     inline for (0..16) |sub| {
-        const q_off = sub * 16;
-        const values = q3KNoDmnPanelValues(panel_block, sub);
-        const dots = dotI8I8Block4_16(
-            qx[q_off..][0..16],
-            values[0..][0..16],
-            values[16..][0..16],
-            values[2 * 16 ..][0..16],
-            values[3 * 16 ..][0..16],
-        );
-        const dots_vec: F32x4 = @floatFromInt(@as(I32x4, .{ dots[0], dots[1], dots[2], dots[3] }));
-        acc += q3KNoDmnPanelDsc(panel_block, sub) * dots_vec;
+        const off = 4 + sub * 16;
+        const values = q3KNoDmnPanelValues(panel, sub);
+        var dots: [mr / tile_rows]Dot = undefined;
+        inline for (0..mr / tile_rows) |tile| {
+            dots[tile] = if (mr == 1)
+                dotI8I8Block4_16(inputs[0][off..][0..16], values[0..][0..16], values[16..][0..16], values[32..][0..16], values[48..][0..16])
+            else
+                dotI8I8Block4MR2_16(inputs[tile * 2][off..][0..16], inputs[tile * 2 + 1][off..][0..16], values[0..][0..16], values[16..][0..16], values[32..][0..16], values[48..][0..16]);
+        }
+        const dsc = q3KNoDmnPanelDsc(panel, sub);
+        var converted: [mr]F32x4 = undefined;
+        inline for (0..mr) |row| {
+            const d = dots[row / tile_rows];
+            const lane = (row % tile_rows) * 4;
+            converted[row] = @floatFromInt(@as(I32x4, .{ d[lane], d[lane + 1], d[lane + 2], d[lane + 3] }));
+        }
+        inline for (0..mr) |row| acc[row] += dsc * converted[row];
     }
-    const scaled = x_scale * acc;
-    return .{ scaled[0], scaled[1], scaled[2], scaled[3] };
+    inline for (0..mr) |row| acc[row] = scales[row] * acc[row];
+    return acc;
 }
 
-inline fn dotQ3KNoDmnPanel4MR2(
-    q8_block_r0: []const u8,
-    q8_block_r1: []const u8,
-    panel_block: []const u8,
-) struct { f32, f32, f32, f32, f32, f32, f32, f32 } {
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const x_scale0: F32x4 = @splat(readF32Le(q8_block_r0[0..4]));
-    const x_scale1: F32x4 = @splat(readF32Le(q8_block_r1[0..4]));
-    var acc0: F32x4 = @splat(0.0);
-    var acc1: F32x4 = @splat(0.0);
-    inline for (0..16) |sub| {
-        const q_off = sub * 16;
-        const values = q3KNoDmnPanelValues(panel_block, sub);
-        const dots = dotI8I8Block4MR2_16(
-            qx0[q_off..][0..16],
-            qx1[q_off..][0..16],
-            values[0..][0..16],
-            values[16..][0..16],
-            values[2 * 16 ..][0..16],
-            values[3 * 16 ..][0..16],
-        );
-        const dsc = q3KNoDmnPanelDsc(panel_block, sub);
-        const dots0: F32x4 = @floatFromInt(@as(I32x4, .{ dots[0], dots[1], dots[2], dots[3] }));
-        const dots1: F32x4 = @floatFromInt(@as(I32x4, .{ dots[4], dots[5], dots[6], dots[7] }));
-        acc0 += dsc * dots0;
-        acc1 += dsc * dots1;
-    }
-    const r0 = x_scale0 * acc0;
-    const r1 = x_scale1 * acc1;
-    return .{ r0[0], r0[1], r0[2], r0[3], r1[0], r1[1], r1[2], r1[3] };
+inline fn dotQ3KNoDmnPanel4(q8_block: []const u8, panel_block: []const u8) struct { f32, f32, f32, f32 } {
+    const rows = q3KNoDmnPanel4Rows(1, .{q8_block}, panel_block);
+    return .{ rows[0][0], rows[0][1], rows[0][2], rows[0][3] };
 }
 
-inline fn dotQ3KNoDmnPanel4MR4(
-    q8_block_r0: []const u8,
-    q8_block_r1: []const u8,
-    q8_block_r2: []const u8,
-    q8_block_r3: []const u8,
-    panel_block: []const u8,
-) [16]f32 {
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(q8_block_r2.len == 292);
-    std.debug.assert(q8_block_r3.len == 292);
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const qx2 = q8_block_r2[4..260];
-    const qx3 = q8_block_r3[4..260];
-    const x_scale0: F32x4 = @splat(readF32Le(q8_block_r0[0..4]));
-    const x_scale1: F32x4 = @splat(readF32Le(q8_block_r1[0..4]));
-    const x_scale2: F32x4 = @splat(readF32Le(q8_block_r2[0..4]));
-    const x_scale3: F32x4 = @splat(readF32Le(q8_block_r3[0..4]));
-    var acc0: F32x4 = @splat(0.0);
-    var acc1: F32x4 = @splat(0.0);
-    var acc2: F32x4 = @splat(0.0);
-    var acc3: F32x4 = @splat(0.0);
-    inline for (0..16) |sub| {
-        const q_off = sub * 16;
-        const values = q3KNoDmnPanelValues(panel_block, sub);
-        const dots01 = dotI8I8Block4MR2_16(
-            qx0[q_off..][0..16],
-            qx1[q_off..][0..16],
-            values[0..][0..16],
-            values[16..][0..16],
-            values[2 * 16 ..][0..16],
-            values[3 * 16 ..][0..16],
-        );
-        const dots23 = dotI8I8Block4MR2_16(
-            qx2[q_off..][0..16],
-            qx3[q_off..][0..16],
-            values[0..][0..16],
-            values[16..][0..16],
-            values[2 * 16 ..][0..16],
-            values[3 * 16 ..][0..16],
-        );
-        const dsc = q3KNoDmnPanelDsc(panel_block, sub);
-        const dots0: F32x4 = @floatFromInt(@as(I32x4, .{ dots01[0], dots01[1], dots01[2], dots01[3] }));
-        const dots1: F32x4 = @floatFromInt(@as(I32x4, .{ dots01[4], dots01[5], dots01[6], dots01[7] }));
-        const dots2: F32x4 = @floatFromInt(@as(I32x4, .{ dots23[0], dots23[1], dots23[2], dots23[3] }));
-        const dots3: F32x4 = @floatFromInt(@as(I32x4, .{ dots23[4], dots23[5], dots23[6], dots23[7] }));
-        acc0 += dsc * dots0;
-        acc1 += dsc * dots1;
-        acc2 += dsc * dots2;
-        acc3 += dsc * dots3;
-    }
-    const r0 = x_scale0 * acc0;
-    const r1 = x_scale1 * acc1;
-    const r2 = x_scale2 * acc2;
-    const r3 = x_scale3 * acc3;
-    return .{
-        r0[0], r0[1], r0[2], r0[3],
-        r1[0], r1[1], r1[2], r1[3],
-        r2[0], r2[1], r2[2], r2[3],
-        r3[0], r3[1], r3[2], r3[3],
+inline fn dotQ3KNoDmnPanel4MR2(q8_block_r0: []const u8, q8_block_r1: []const u8, panel_block: []const u8) struct { f32, f32, f32, f32, f32, f32, f32, f32 } {
+    const rows = q3KNoDmnPanel4Rows(2, .{ q8_block_r0, q8_block_r1 }, panel_block);
+    return .{ rows[0][0], rows[0][1], rows[0][2], rows[0][3], rows[1][0], rows[1][1], rows[1][2], rows[1][3] };
+}
+
+inline fn dotQ3KNoDmnPanel4MR4(q8_block_r0: []const u8, q8_block_r1: []const u8, q8_block_r2: []const u8, q8_block_r3: []const u8, panel_block: []const u8) [16]f32 {
+    const rows = q3KNoDmnPanel4Rows(4, .{ q8_block_r0, q8_block_r1, q8_block_r2, q8_block_r3 }, panel_block);
+    var output: [16]f32 = undefined;
+    inline for (0..4) |row| inline for (0..4) |col| {
+        output[row * 4 + col] = rows[row][col];
     };
+    return output;
 }
 
 inline fn k16Panel8Dsc(panel_block: []const u8, sub: usize) F32x8 {
@@ -51381,4 +51308,74 @@ test "packed QKV row families independent oracle and benchmark" {
             std.debug.print("packed_qkv profile={d} mr={d} mode={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=1001\n", .{ profile, profiles[profile].mr, profiles[profile].mode, @as(f64, @floatFromInt(samples[10])) / 1001.0, @as(f64, @floatFromInt(samples[19])) / 1001.0, samples[10], samples[19] });
         }
     }
+}
+
+test "Q3 four column rows independent oracle and benchmark" {
+    @setEvalBranchQuota(500_000);
+    const State = struct {
+        inputs: [4][292]u8 align(64) = @splat(@splat(0)),
+        panel: [prepared_q3_k_panel_block_bytes]u8 align(64) = @splat(0),
+        fn initialize(self: *@This(), seed: usize) void {
+            for (&self.inputs, 0..) |*input, row| {
+                const scale: f32 = if (row % 2 == 0) 0.125 else -0.25;
+                std.mem.writeInt(u32, input[0..4], @bitCast(scale), .little);
+                for (0..256) |i| {
+                    const value: i8 = if (seed == 0) 0 else if (seed == 1) (if ((i + row) % 2 == 0) -128 else 127) else @intCast(@as(i32, @intCast((i * 17 + row * 31 + seed) % 256)) - 128);
+                    input[4 + i] = @bitCast(value);
+                }
+            }
+            for (0..16) |sub| for (0..4) |col| {
+                const scale: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((sub + col * 3) % 11)) - 5)) * 0.125;
+                // Literal panel offsets give the oracle independent physical addressing.
+                std.mem.writeInt(u32, self.panel[(sub * 4 + col) * 4 ..][0..4], @bitCast(scale), .little);
+                for (0..16) |i| {
+                    const value: i8 = if (seed == 0) 0 else if (seed == 1) (if ((sub + col + i) % 2 == 0) -4 else 3) else @intCast(@as(i32, @intCast((sub * 7 + col * 3 + i * 5 + seed) % 8)) - 4);
+                    self.panel[256 + (sub * 4 + col) * 16 + i] = @bitCast(value);
+                }
+            };
+        }
+        noinline fn run(self: *@This(), comptime mr: usize) [mr * 4]f32 {
+            const result = if (mr == 1) dotQ3KNoDmnPanel4(&self.inputs[0], &self.panel) else if (mr == 2) dotQ3KNoDmnPanel4MR2(&self.inputs[0], &self.inputs[1], &self.panel) else dotQ3KNoDmnPanel4MR4(&self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], &self.panel);
+            var out: [mr * 4]f32 = undefined;
+            inline for (0..mr * 4) |i| out[i] = result[i];
+            return out;
+        }
+        noinline fn measure(self: *@This(), comptime mr: usize) u64 {
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..2001) |_| {
+                self.inputs[0][4] +%= 1;
+                std.mem.doNotOptimizeAway(self.run(mr));
+            }
+            return @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - start);
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 1280), prepared_q3_k_panel_block_bytes);
+    try std.testing.expectEqual(@as(usize, 0), prepared_q3_k_panel_dsc_offset);
+    try std.testing.expectEqual(@as(usize, 256), prepared_q3_k_panel_values_offset);
+    var state: State = .{};
+    for (0..4) |seed| {
+        state.initialize(seed);
+        inline for (.{ 1, 2, 4 }) |mr| {
+            const result = state.run(mr);
+            for (0..mr) |row| for (0..4) |col| {
+                var expected: f64 = 0;
+                for (0..16) |sub| {
+                    var dot: i64 = 0;
+                    for (0..16) |i| dot += @as(i64, @as(i8, @bitCast(state.inputs[row][4 + sub * 16 + i]))) * @as(i64, @as(i8, @bitCast(state.panel[256 + (sub * 4 + col) * 16 + i])));
+                    const scale = @as(f32, @bitCast(std.mem.readInt(u32, state.panel[(sub * 4 + col) * 4 ..][0..4], .little)));
+                    expected += @as(f64, scale) * @as(f64, @floatFromInt(dot));
+                }
+                const scale = @as(f32, @bitCast(std.mem.readInt(u32, state.inputs[row][0..4], .little)));
+                try std.testing.expectEqual(@as(f32, @floatCast(expected * @as(f64, scale))), result[row * 4 + col]);
+            };
+        }
+    }
+    if (platform.env.getenvBool("ANTFLY_Q3_FOUR_BENCH")) inline for (.{ 1, 2, 4 }) |mr| {
+        const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        while (std.Io.Clock.awake.now(std.testing.io).nanoseconds - start < 25_000_000) _ = state.measure(mr);
+        var times: [21]u64 = undefined;
+        for (&times) |*sample| sample.* = state.measure(mr);
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        std.debug.print("q3_four mr={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=2001\n", .{ mr, @as(f64, @floatFromInt(times[10])) / 2001.0, @as(f64, @floatFromInt(times[19])) / 2001.0, times[10], times[19] });
+    };
 }
