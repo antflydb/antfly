@@ -173,6 +173,47 @@ adapter forwards the flag and includes it in observer identity. Final comparison
 assert native fused calls inside the measured app. Local injected binding delay
 is an experimental model; zero injected delay still includes emulator R2 I/O.
 
+## Local latency evidence
+
+The final actual-workerd comparison uses 512 documents per tenant, four tenants,
+192 reads and 64 concurrent writes, with 20 ms injected binding delay and every
+fourth offered round at 100 ms. Each side verifies bodies, visibility and final
+counts. The baseline uses the preserved `9c6e075608` modules. Final candidates use
+full native module SHA-256
+`feb007cc25315a419a5c9203973808772c2008a76ac8c312578c7b7b2e595de0`.
+
+| Active controls | Forward read/write p95 (ms) | Reverse read/write p95 (ms) |
+| --- | ---: | ---: |
+| Baseline | 945 / 1,227 | 969 / 1,297 |
+| Fused admission, overlay state, foreground cache, opportunistic preparation | 674 / 1,240 | 669 / 1,220 |
+| Same controls plus WAL document index | 937 / 1,346 | 847 / 1,287 |
+
+The forward run overlaps final tests and repository cache cleanup; treat it as
+exploratory. The reverse run starts after both finish. It reduces read p95 by
+about 31% with overlay reuse and about 13% with indexing also enabled. This small
+tail workload favors overlay reuse: adding the index increases durable write and
+retention cost and obtains fewer cache hits/extensions. Point indexing remains
+independently controlled for workloads where avoiding large-tail replay pays for
+its maintenance. These results do not justify enabling every control together.
+
+Reports `lifecycle-latency-1793212179617.json` and
+`lifecycle-latency-1793212607620.json` preserve native fusion activation counts
+(196 observed read traces per optimized case), modules, role bundles, bindings,
+physical I/O and sampled spans under
+`examples/cloudflare-serverless/dist/qualification/read-state-lab/`.
+A final uniform/no-injected-delay check uses 64 documents per tenant, 96 reads
+and 32 writes. Baseline read/write p95 is 942/913 ms, overlay reuse is
+1,006/912 ms, and the indexed combination is 793/793 ms (report
+`lifecycle-latency-1793213047726.json`, 100 observed fused read traces per
+optimized case). Overlay reuse regresses read p95 by about 7% here. Emulator I/O,
+queueing and cold kernel effects remain; no universal latency improvement or
+cloud SLO follows from these local populations. Roll out controls independently
+against the application's read/write mix and delay distribution.
+
+The frozen cloud control `c44896ac8c` and its gate thresholds are unchanged.
+All 1,173 older sealed artifacts remain hash-valid. No Cloudflare resources were
+created. Local results do not pass the cloud acceptance gate.
+
 ## Research informing the design
 
 [SlateDB readers](https://slatedb.io/docs/design/readers/) use pinned manifests
