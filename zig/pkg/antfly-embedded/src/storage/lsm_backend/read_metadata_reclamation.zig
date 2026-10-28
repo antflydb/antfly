@@ -23,6 +23,7 @@ const admission = @import("../../common/read_admission.zig");
 pub const quantum_bytes: usize = 16 * 1024;
 
 pub const Job = struct {
+    pub var test_admission_hook: ?*const fn (admission.Port) anyerror!void = null;
     value: union(enum) { domain: *DomainIndex, projection: *runtime.ReadVersion },
     field: usize = 0,
     group: usize = 0,
@@ -74,6 +75,22 @@ pub const Job = struct {
         }
         return false;
     }
+    pub fn stepWithAdmission(self: *Job, allocator: std.mem.Allocator, credits: *usize, original: ?admission.Port) !bool {
+        if (comptime @import("builtin").is_test) if (original) |port| if (test_admission_hook) |hook| try hook(port);
+        const backing = switch (self.value) {
+            .domain => allocator,
+            .projection => |version| version.allocator,
+        };
+        while (credits.* != 0) {
+            if (original) |port| try port.checkpoint();
+            var unit: usize = 1;
+            const done = self.step(backing, &unit);
+            credits.* -= 1 - unit;
+            if (done) return true;
+        }
+        return false;
+    }
+
     pub fn memoryBytes(self: *const Job, pass: u64) u64 {
         return switch (self.value) {
             .domain => |index| index.memoryBytes(),
@@ -126,7 +143,12 @@ fn next(backend: anytype) bool {
 }
 
 pub fn reclaimSliceLocked(backend: anytype) void {
-    if (!pending(backend)) return;
+    if (@import("retirement_execution.zig").deferred(backend)) return;
+    reclaimControlledSliceLocked(backend);
+}
+
+pub fn reclaimControlledSliceLocked(backend: anytype) void {
+    if (@import("antfly_platform").time.monotonicNs() < backend.retirement_execution_retry_at_ns or !pending(backend)) return;
     backend.read_metadata_reclaim_in_flight = true;
     defer backend.read_metadata_reclaim_in_flight = false;
     backend.retainReaderKind(.other);
@@ -135,16 +157,16 @@ pub fn reclaimSliceLocked(backend: anytype) void {
     var credits: usize = 128;
     while (credits != 0 and runtime.workNowNs(backend) < until and next(backend)) {
         const job = &backend.read_metadata_reclaimer.?;
-        const backing = job.backingAllocator(backend);
         backend.mu.unlock();
-        var unit: usize = 1;
-        const done = job.step(backing, &unit);
+        const result = @import("retirement_execution.zig").step(backend, job, credits, until);
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
-        credits -= 1;
-        if (done) {
+        credits -= result.units;
+        if (result.refused) backend.retirement_execution_retry_at_ns = @import("antfly_platform").time.monotonicNs() +| 10 * std.time.ns_per_ms;
+        if (result.done) {
             job.finish(backend);
             backend.read_metadata_reclaimer = null;
         }
+        if (!result.done) break;
     }
     backend.syncTrackedInMemoryStateUsageCurrentLocked();
 }

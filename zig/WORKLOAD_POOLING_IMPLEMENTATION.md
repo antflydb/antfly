@@ -29928,7 +29928,7 @@ refusal after directory preparation followed by immutable retry and reopen.
 Allocation fixtures cover the prearranged ledger handoff; append-abort fixtures
 transfer partial indexes at every original checkpoint. Exclusive close joins
 queued teardown after background work and readers stop. Private ABI versions
-are native155/storage-owner215; no durable/public wire format changes.
+are native156/storage-owner216; no durable/public wire format changes.
 
 Normal publication now loans its output vector from the existing registered
 flush batch. That owner keeps the exact vector credit and allocator host until
@@ -29951,8 +29951,29 @@ pending vectors/states, pinned reads and reopen. Deterministic coverage exercise
 loan ownership through allocation/original refusal and independent, allocation-free
 state cleanup for tree, flat and arena representations.
 
-The bounded-publication milestone remains open: manifest/WAL durability completion
-and remaining read-metadata/coordination work still need execution integration. Existing compaction publication benefits from
+Accepted normal flushes now retain a separate manifest/WAL completion obligation
+after their immutable input is retired. The detached maintenance owner retries
+that obligation even when the immutable queue is empty, including with an
+internal maintenance waker. Each dispatch makes at most one completion attempt;
+failures retain debt and back off without service guards or CPU ownership. A
+successful covered manifest/WAL completion clears the obligation and cached
+maintenance hint. Recovery-fenced backends keep their WAL and suppress retries.
+Native tests inject pre-IO budget and IO failures at the real journal publication
+boundary, verify one SST construction and autonomous completion without another
+write/sync, and exercise a recovery fence followed by crash/reopen recovery.
+
+Projection/domain metadata buffers now use independent protected cleanup passes
+on the detached worker, with checkpoints between 16 KiB chunks and the original
+allocator preserved for projected generations. Foreground unlocks queue these
+owners. A native peer commit exercises cached-generation invalidation and
+retirement through admission refusal; existing ownership/accounting fixtures
+still cover every physical buffer.
+
+The bounded-publication milestone remains open: manifest validation, delta
+construction/encoding and physical journal/WAL operations still use their legacy
+implementations and require controlled execution integration. This retry wiring
+establishes durable completion ownership; it does not claim those operators are
+admitted. Existing compaction publication benefits from
 the corrected owned-output reference transfer, but compaction construction and
 remaining metadata operations have not been enabled under shared CPU admission.
 The same publication/compaction milestone and the full design remain open.

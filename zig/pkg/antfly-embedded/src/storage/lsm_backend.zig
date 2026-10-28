@@ -1796,6 +1796,8 @@ pub const Backend = struct {
     retired_run_stores: ?*RunStore = null,
     retired_flush_outputs: ?*@import("lsm_backend/registered_flush_outputs.zig").Owner = null,
     flush_outputs_reclaim_in_flight: bool = false,
+    flush_completion_pending: bool = false,
+    flush_completion_retry_at_ns: u64 = 0,
     active_compaction_publications: ?*compaction_mod.Publication = null,
     output_cleanup_retry_at_ns: u64 = 0,
     output_cleanup_admission_failures: u64 = 0,
@@ -3887,6 +3889,7 @@ pub const Backend = struct {
         if (self.pending_gc != null or self.retired_gc != null or self.directory_reclaimer != null or self.retired_run_directories != null) score +|= 1;
         if (self.retired_run_stores != null or self.store_reclaimer != null) score +|= 1;
         if (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) score +|= 1;
+        if (self.flush_completion_pending and !self.manifest_recovery_required) score +|= 1;
         if (self.obsolete_run_count != 0 and (self.obsolete_run_drain_remaining != 0 or self.obsolete_run_pin_epoch != file_pin_release_epoch.load(.acquire))) score +|= 1;
         if (self.manifest_journal.checkpointDue() and self.manifest_journal.sequence != null) score += 1;
         const directory = if (!self.run_directory_dirty) self.run_directory else null;
@@ -4930,7 +4933,7 @@ pub const Backend = struct {
         // Small snapshot retirements normally finish in this unlock. Only
         // residual debt warrants a worker; pre-unlock scheduling would submit
         // an otherwise empty background job on each ordinary manifest edit.
-        if ((self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
+        if (self.flushCompletionPending() or (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
             @import("lsm_backend/memtable_reclamation.zig").pending(self) or
             @import("lsm_backend/read_metadata_reclamation.zig").pending(self) or
             (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) or
@@ -6145,7 +6148,7 @@ pub const Backend = struct {
         const pending_directory = !self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null);
         const pending_store = !self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null);
         const pending_outputs = self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight;
-        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory or pending_metadata or pending_directory or pending_store or pending_outputs);
+        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory or pending_metadata or pending_directory or pending_store or pending_outputs or self.flushCompletionPending());
         if (self.options.backend.read_only and !ledger_cleanup) return;
         if (self.bulkIngestActive() and !ledger_cleanup and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
         const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation) - @intFromBool(pending_memory and !after_reclamation) - @intFromBool(pending_metadata and !after_reclamation);
@@ -6167,6 +6170,11 @@ pub const Backend = struct {
             if (err == error.BackgroundOwnerClosing or err == error.BackgroundOwnerClosed) return;
             std.log.warn("lsm maintenance background scheduling failed root={?s} err={}", .{ self.root_dir, err });
         };
+    }
+
+    fn flushCompletionPending(self: *const Backend) bool {
+        return self.flush_completion_pending and !self.manifest_recovery_required and
+            !self.immutable_flush_job_in_flight and !self.immutable_flush_build_in_flight and !self.options.backend.read_only;
     }
 
     fn runMaintenanceJob(ptr: *anyopaque) !void {
@@ -6194,10 +6202,27 @@ pub const Backend = struct {
             _ = runtime_mod.lockBackend(Backend, self);
             @import("lsm_backend/ledger_reclamation.zig").reclaimControlledSliceLocked(self);
             self.reclaimFlushOutputsSliceLocked(true);
-            if (@import("lsm_backend/retirement_execution.zig").deferred(self))
+            if (@import("lsm_backend/retirement_execution.zig").deferred(self)) {
                 @import("lsm_backend/memtable_reclamation.zig").reclaimControlledSliceLocked(self);
+                @import("lsm_backend/read_metadata_reclamation.zig").reclaimControlledSliceLocked(self);
+            }
             self.reclaimStoreSliceLocked(true);
             self.reclaimDirectorySliceLocked(true);
+            if (self.flushCompletionPending()) {
+                const delay = self.flush_completion_retry_at_ns -| platform_time.monotonicNs();
+                if (delay == 0) self.persistManifestLocked() catch {
+                    // Keep installed SSTs/WAL debt owned. Failed completion is
+                    // retried by this durable lane, never by rebuilding an empty
+                    // immutable window or requiring another foreground write.
+                    self.flush_completion_retry_at_ns = platform_time.monotonicNs() +| maintenance_admission_retry_ns;
+                };
+                _ = self.refreshCachedMaintenanceHintLocked();
+                const pause = self.flush_completion_retry_at_ns -| platform_time.monotonicNs();
+                const io = self.manifestCoordinationIo();
+                self.mu.unlock();
+                if (pause != 0) if (io) |lane| lane.sleep(.fromNanoseconds(@min(pause, maintenance_admission_retry_ns)), .awake) catch {};
+                break; // At most one durable completion attempt per dispatch.
+            }
             self.mu.unlock();
             // A selected maintenance owner retains normal planning authority.
             // Our independent callback only discharges physical cleanup debt.
@@ -6426,6 +6451,9 @@ pub const Backend = struct {
         if (admitted_runtime != null) {
             try compaction_mod.publishFlushRuns(self, &build_result);
             build_published = true;
+            // The immutable input can retire before manifest/WAL completion.
+            // Its accepted durability obligation must outlive the empty queue.
+            if (!self.bulkIngestActive()) self.flush_completion_pending = true;
         } else {
             var directory = try self.prepareRunDirectoryChange(null, build_result.items);
             errdefer if (directory) |owned| owned.destroy(self.allocator);
@@ -6847,6 +6875,10 @@ pub const Backend = struct {
             try self.reconcileObsoletePathsForManifest();
             const removed_or_retried = self.obsolete_manifest_dirty;
             if (removed_or_retried) try self.writeManifestSnapshotLocked(root_dir, start_ns);
+        }
+        if (self.flush_completion_pending and self.manifestCoversCurrentRuns()) {
+            self.flush_completion_pending = false;
+            self.flush_completion_retry_at_ns = 0;
         }
     }
 
@@ -10850,6 +10882,8 @@ pub const Backend = struct {
             (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null)))
             return self.retirement_execution_retry_at_ns -| platform_time.monotonicNs();
         if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return self.retirement_execution_retry_at_ns -| platform_time.monotonicNs();
+        if (@import("lsm_backend/read_metadata_reclamation.zig").pending(self)) return self.retirement_execution_retry_at_ns -| platform_time.monotonicNs();
+        if (self.flushCompletionPending()) return self.flush_completion_retry_at_ns -| platform_time.monotonicNs();
         if (self.manifest_recovery_required) return null;
 
         // Keep the advertised deadline consistent with runMaintenanceStepLocked:

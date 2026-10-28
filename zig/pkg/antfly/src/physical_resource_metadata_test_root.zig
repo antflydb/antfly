@@ -5954,7 +5954,7 @@ test "physical cache metadata bounded writer retirement refuses unknown producer
     try std.testing.expectEqual(@as(usize, 1), Callback.called);
 }
 
-fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry, retirement_retry, retirement_capacity, publication_directory_retry, output_retirement_retry, output_retirement_close, immutable_retirement_retry, immutable_retirement_close, output_retirement_preflight }) !void {
+fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry, retirement_retry, retirement_capacity, publication_directory_retry, output_retirement_retry, output_retirement_close, immutable_retirement_retry, immutable_retirement_close, output_retirement_preflight, manifest_completion_retry, manifest_completion_io_retry, manifest_completion_waker, read_metadata_retry, manifest_completion_fence }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -5965,6 +5965,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     const a = std.testing.allocator;
     const maintenance_origin = mode == .maintenance or mode == .maintenance_retry or mode == .maintenance_close or mode == .waker or mode == .maintenance_budget or mode == .maintenance_unsupported;
     const rebase_publication = mode == .publication_rebase or mode == .publication_rebase_retry;
+    const completion_retry = mode == .manifest_completion_retry or mode == .manifest_completion_io_retry or mode == .manifest_completion_waker;
     const retry_refusal = mode == .retry or mode == .maintenance_retry;
     var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
     defer state.owner.deinit();
@@ -6016,7 +6017,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         .compact_threshold_runs = 1000,
         .l0_soft_limit_runs = 1000,
         .l0_hard_limit_runs = 2000,
-    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = worker_owner }, .internal_flush_worker = mode == .waker or mode == .retirement_capacity });
+    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = worker_owner }, .internal_flush_worker = mode == .waker or mode == .retirement_capacity or mode == .manifest_completion_waker });
     var open = true;
     defer if (open) handle.close();
     const publication = local.storage_lsm_backend_compaction_publication;
@@ -6036,6 +6037,38 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         var vector_calls: std.atomic.Value(usize) = .init(0);
         var refuse_vector: std.atomic.Value(bool) = .init(false);
         var keep_vector_queued: bool = false;
+        var manifest_calls: std.atomic.Value(usize) = .init(0);
+        var manifest_failure: anyerror = error.ResourceBudgetExceeded;
+        var fence_manifest: bool = false;
+        var metadata_calls: std.atomic.Value(usize) = .init(0);
+        var refuse_metadata: std.atomic.Value(bool) = .init(false);
+        fn manifest(raw: *anyopaque) !void {
+            const backend: *lsm.Backend = @ptrCast(@alignCast(raw));
+            const call = manifest_calls.fetchAdd(1, .monotonic);
+            while (!backend.mu.tryLock()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            defer backend.mu.unlock();
+            if (fence_manifest) {
+                try std.testing.expectEqual(@as(usize, 0), call);
+                backend.manifest_recovery_required = true;
+                return error.RecoveryRequired;
+            }
+            if (call < 3) {
+                // The normal builder has already retired its sole input. The
+                // retry must complete this accepted publication without a new
+                // write, sync, or another SST construction.
+                try std.testing.expect(backend.flush_completion_pending);
+                try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+                try std.testing.expectEqual(@as(u64, 1), backend.write_stats.immutable_flushes);
+                try std.testing.expectEqual(call == 0, backend.immutable_flush_job_in_flight);
+                return manifest_failure;
+            }
+        }
+        fn metadata(original: read_admission.Port) !void {
+            _ = metadata_calls.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.?.owner.scheduler.stats().cleanup_runnable_slots);
+            if (refuse_metadata.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+        }
         var immutable_calls: std.atomic.Value(usize) = .init(0);
         var refuse_immutable: std.atomic.Value(bool) = .init(false);
         var keep_immutable_queued: bool = false;
@@ -6110,6 +6143,13 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     Interleave.refuse_immutable.store(mode == .immutable_retirement_retry, .release);
     Interleave.keep_immutable_queued = mode == .immutable_retirement_close;
     publication.memtable_reclamation.Job.test_admission_hook = Interleave.immutable;
+    Interleave.manifest_calls.store(0, .release);
+    Interleave.manifest_failure = if (mode == .manifest_completion_io_retry) error.InputOutput else error.ResourceBudgetExceeded;
+    Interleave.fence_manifest = mode == .manifest_completion_fence;
+    if (completion_retry or mode == .manifest_completion_fence) lsm.repository.publication_test_hook = .{ .context = handle.ptr(), .run = Interleave.manifest };
+    Interleave.metadata_calls.store(0, .release);
+    Interleave.refuse_metadata.store(mode == .read_metadata_retry, .release);
+    publication.read_metadata_reclamation.Job.test_admission_hook = Interleave.metadata;
     publication.retirement_execution.test_hook = Interleave.cleanup;
     publication.test_directory_hook = Interleave.directory;
     publication.test_controlled_hook = Interleave.controlled;
@@ -6131,6 +6171,8 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         publication.retirement_execution.test_hook = null;
         FlushPublicationFixture.Batch.test_vector_retirement_hook = null;
         publication.memtable_reclamation.Job.test_admission_hook = null;
+        lsm.repository.publication_test_hook = null;
+        publication.read_metadata_reclamation.Job.test_admission_hook = null;
         Interleave.execution = null;
     }
     const io = std.testing.io;
@@ -6272,9 +6314,14 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
                 backend.retired_run_stores == null and backend.store_reclaimer == null and backend.retired_ledger_snapshots == null and
                 backend.retired_flush_outputs == null and !backend.flush_outputs_reclaim_in_flight and
                 backend.retired_memory_head == null and backend.memtable_reclaimer == null and !backend.memtable_reclaim_in_flight and
+                backend.read_metadata_reclaimer == null and backend.retired_projection_versions == null and backend.retired_domain_indexes == null and !backend.read_metadata_reclaim_in_flight and
                 !backend.directory_reclaim_in_flight and !backend.store_reclaim_in_flight and !backend.ledger_reclaim_in_flight and !backend.maintenance_job_in_flight;
             const done = backend.activeImmutableMemtableCount() == 0 and !backend.immutable_flush_job_in_flight and
-                (if (mode == .retirement_retry or mode == .retirement_capacity or mode == .publication_directory_retry or mode == .output_retirement_retry or mode == .immutable_retirement_retry)
+                (if (mode == .manifest_completion_fence)
+                    cleanup_done and backend.flush_completion_pending and backend.manifest_recovery_required
+                else if (completion_retry)
+                    cleanup_done and !backend.flush_completion_pending
+                else if (mode == .retirement_retry or mode == .retirement_capacity or mode == .publication_directory_retry or mode == .output_retirement_retry or mode == .immutable_retirement_retry)
                     cleanup_done
                 else if (mode == .output_retirement_close or mode == .output_retirement_preflight)
                     backend.retired_flush_outputs != null and Interleave.vector_calls.load(.acquire) != 0
@@ -6286,6 +6333,37 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             if (done) break;
             if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
             try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        if (completion_retry) {
+            try std.testing.expect(Interleave.manifest_calls.load(.acquire) >= 4);
+            const completed = handle.ptr().snapshotWriteStats();
+            try std.testing.expectEqual(@as(u64, 1), completed.immutable_flushes);
+            try std.testing.expectEqual(@as(u64, 1), completed.flushes);
+            try std.testing.expect(completed.wal_resets >= 1);
+            try std.testing.expect(handle.ptr().wal_retention.reset_proven);
+        }
+        if (mode == .read_metadata_retry) {
+            var cached = try handle.ptr().beginRead();
+            try std.testing.expectEqualStrings("durable", try cached.get(.{}, "admitted"));
+            cached.abort();
+            // A normal peer commit invalidates the cached read generation.
+            var peer = try handle.ptr().beginWrite();
+            defer peer.abort();
+            try peer.put(.{}, "second", "metadata");
+            try peer.commit();
+            while (true) {
+                const backend = handle.ptr();
+                while (!backend.mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+                const done = backend.activeImmutableMemtableCount() == 0 and !backend.immutable_flush_job_in_flight and
+                    !backend.maintenance_job_in_flight and !backend.flush_completion_pending and
+                    backend.retired_projection_versions == null and backend.retired_domain_indexes == null and
+                    backend.read_metadata_reclaimer == null and !backend.read_metadata_reclaim_in_flight and
+                    Interleave.metadata_calls.load(.acquire) >= 2;
+                backend.mu.unlock();
+                if (done) break;
+                if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
         }
         try std.testing.expect(state.owner.scheduler.stats().grants[@backingInt(scheduler.Class.background)] > 0);
         try std.testing.expect(Interleave.controlled_calls.load(.acquire) >= (if (mode == .publication_retry) @as(usize, 2) else 1));
@@ -6343,7 +6421,13 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             try preparation.resumeWithAdmission(backend, io, .init(&payload));
             try std.testing.expect(backend.retired_flush_outputs == null);
         }
-        handle.close();
+        if (mode == .manifest_completion_fence) {
+            try std.testing.expectEqual(@as(usize, 1), Interleave.manifest_calls.load(.acquire));
+            try std.testing.expect(!handle.ptr().wal_retention.reset_proven);
+            // Recovery authority excludes publication retries. Simulate a crash
+            // rather than invoking explicit close-time durability repair.
+            handle.abandonAfterCrash();
+        } else handle.close();
         open = false;
     }
     if (foreground) |held| owner.finish(held);
@@ -6447,6 +6531,26 @@ test "physical cache metadata registered flush publication close joins refused i
 
 test "physical cache metadata registered flush publication controlled close preparation drains pending output vector before durability" {
     try normalAdmittedFlushWorker(.output_retirement_preflight);
+}
+
+test "physical cache metadata registered flush publication completes manifest after admission refusal with an empty immutable queue" {
+    try normalAdmittedFlushWorker(.manifest_completion_retry);
+}
+
+test "physical cache metadata registered flush publication completes manifest after IO failure without another write" {
+    try normalAdmittedFlushWorker(.manifest_completion_io_retry);
+}
+
+test "physical cache metadata registered flush publication internal waker retains independent manifest completion debt" {
+    try normalAdmittedFlushWorker(.manifest_completion_waker);
+}
+
+test "physical cache metadata registered flush publication peer commit retires cached projection under protected cleanup with retry" {
+    try normalAdmittedFlushWorker(.read_metadata_retry);
+}
+
+test "physical cache metadata registered flush publication recovery fence retains WAL and suppresses completion retries" {
+    try normalAdmittedFlushWorker(.manifest_completion_fence);
 }
 
 test "physical cache metadata registered flush publication controlled writer insertion preserves ownership at allocation and original refusal" {

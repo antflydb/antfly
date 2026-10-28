@@ -1849,5 +1849,9 @@ CPU, keeping vector credit until the final chunk is freed. Immutable state
 retirement uses the same worker with checkpoints between physical chunks across
 tree, flat and arena representations. Both retain debt through refusal and
 joined close; controlled close preparation returns vector credit before final
-persistence. Manifest/WAL completion and remaining read-metadata/coordination
-work still need execution integration; broader compaction remains unfinished.
+persistence. Projection/domain buffer retirement also uses the protected worker.
+Normal flushes retain separate manifest/WAL completion debt after their immutable
+input retires, so transient publication failures retry without another write,
+including under a maintenance waker. Recovery fences retain the WAL and stop
+these retries. Manifest validation, delta encoding and journal/WAL physical
+operators still need controlled execution; broader compaction remains unfinished.

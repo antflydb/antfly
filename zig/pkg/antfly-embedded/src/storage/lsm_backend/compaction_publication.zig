@@ -26,6 +26,7 @@ const Plan = @import("compaction.zig").CompactionPlan;
 const Certificate = @import("dependency_job.zig").Job;
 const runtime = @import("runtime.zig");
 const resources = @import("../resource_manager.zig");
+pub const read_metadata_reclamation = @import("read_metadata_reclamation.zig");
 pub const memtable_reclamation = @import("memtable_reclamation.zig");
 pub const retirement_execution = @import("retirement_execution.zig");
 const quantum_ns = 2 * std.time.ns_per_ms;
