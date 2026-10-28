@@ -4131,6 +4131,9 @@ pub const CudaCompute = struct {
     lighton_shared_recurrent_weights_enabled: bool = false,
     lighton_state_pool_hits: usize = 0,
     lighton_state_pool_misses: usize = 0,
+    lighton_deferred_buffer_reuses: usize = 0,
+    lighton_deferred_buffer_reused_bytes: usize = 0,
+    lighton_deferred_state_reuses: usize = 0,
     lighton_packed_state_calls: usize = 0,
     lighton_state_pool_releases: std.atomic.Value(usize) = .init(0),
     lighton_shared_recurrent_weight_borrows: usize = 0,
@@ -5322,6 +5325,7 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_prefix_shared_qk_calls={d}\n", .{self.lighton_recurrent.prefix_shared_qk_calls});
             std.debug.print("LIGHTONOCR3 cuda_ragged_batch_calls={d} cuda_ragged_query_rows={d}\n", .{ self.lighton_recurrent.ragged_batch_calls, self.lighton_recurrent.ragged_query_rows });
             std.debug.print("LIGHTONOCR3 cuda_state_pool_hits={d} cuda_state_pool_misses={d} cuda_state_pool_releases={d} cuda_shared_recurrent_weight_borrows={d}\n", .{ self.lighton_state_pool_hits, self.lighton_state_pool_misses, self.lighton_state_pool_releases.load(.monotonic), self.lighton_shared_recurrent_weight_borrows });
+            std.debug.print("LIGHTONOCR3 cuda_deferred_buffer_reuses={d} cuda_deferred_buffer_reused_bytes={d} cuda_deferred_state_reuses={d}\n", .{ self.lighton_deferred_buffer_reuses, self.lighton_deferred_buffer_reused_bytes, self.lighton_deferred_state_reuses });
         }
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_packed_state_calls={d} cuda_rms_norm_bf16_mirror_hits={d} activation_mirror_hits={d}\n", .{ self.lighton_packed_state_calls, self.stats.rms_norm_bf16_mirror_hits, self.stats.bf16_cublaslt_activation_mirror_hits });
@@ -13105,6 +13109,11 @@ fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceB
         std.log.warn("cuda_graph_capture_probe: unsafe_temp_alloc seq={d} bytes={d} disabled=1", .{ seq, len });
         return error.CudaGraphCaptureUnsafeTempAlloc;
     }
+    if (takeLightOnDeferredBufferUnlocked(self, len, stable_reuse)) |buffer| {
+        self.stats.temp_buffer_hits += 1;
+        traceCudaTempAlloc(self, seq, "alloc_hit", len, buffer);
+        return buffer;
+    }
     self.stats.temp_buffer_misses += 1;
     const buffer = buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |err| {
         if (err == error.CudaMemoryLimitExceeded) {
@@ -13157,6 +13166,45 @@ fn lightOnStatePoolEnabled(self: *const CudaCompute) bool {
         (self.ctx.video_cache_budget.admission == null or self.ocr_retained_cache_lease != null);
 }
 
+/// The caller holds temp_buffer_mutex. These owned allocations are still
+/// charged to the original retained reservation and physical owner. As with
+/// ordinary-cache hits, their old and new GPU users share ctx.stream, so FIFO
+/// ordering permits reuse without a host wait or an intervening cuMemFree.
+fn takeLightOnDeferredBufferUnlocked(self: *CudaCompute, len: usize, exact: bool) ?buffer_mod.DeviceBuffer {
+    if (len == 0 or self.deferred_device_frees.items.len == 0 or self.capability_profile != .lightonocr3 or self.lazy_host_store != null or self.resident_training_cache or self.execution_scope != null or
+        self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        !cudaDeferredFreeEnabled()) return null;
+    const deferred_budget = cudaDeferredFreeBudgetBytes(self);
+    // A queue still at its drain threshold may have failed synchronization;
+    // it must retain the original conservative allocation/free behavior.
+    if (deferred_budget == 0 or self.deferred_device_free_bytes >= deferred_budget or
+        cudaTempCacheBudgetBytes(self) == 0 or cudaTempCacheMaxBuffers(self) == 0 or
+        (self.ctx.video_cache_budget.admission != null and self.ocr_retained_cache_lease == null)) return null;
+    var best_index: ?usize = null;
+    var best_len: usize = std.math.maxInt(usize);
+    for (self.deferred_device_frees.items, 0..) |buffer, i| {
+        // Borrowed views, partial extents and untracked allocations cannot
+        // become independently owned tensors or per-page recurrent state.
+        if (buffer.ptr == 0 or buffer.borrowed or buffer.allocation_bytes == 0 or buffer.allocation_bytes != buffer.len or
+            buffer.len < len or (exact and buffer.len != len)) continue;
+        if (buffer.len < best_len) {
+            best_index = i;
+            best_len = buffer.len;
+            if (buffer.len == len) break;
+        }
+    }
+    if (best_index) |i| {
+        const buffer = self.deferred_device_frees.swapRemove(i);
+        std.debug.assert(buffer.len <= self.deferred_device_free_bytes);
+        self.deferred_device_free_bytes -= buffer.len;
+        self.lighton_deferred_buffer_reuses += 1;
+        self.lighton_deferred_buffer_reused_bytes +|= buffer.len;
+        return buffer;
+    }
+    return null;
+}
+
 fn allocLightOnStateBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (!lightOnStatePoolEnabled(self)) return buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
     {
@@ -13167,6 +13215,12 @@ fn allocLightOnStateBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuf
 
             const reused = self.temp_buffers.swapRemove(i);
             self.lighton_state_pool_hits += 1;
+            self.stats.temp_buffer_hits += 1;
+            return reused;
+        }
+        if (takeLightOnDeferredBufferUnlocked(self, len, true)) |reused| {
+            self.lighton_state_pool_hits += 1;
+            self.lighton_deferred_state_reuses += 1;
             self.stats.temp_buffer_hits += 1;
             return reused;
         }
@@ -34454,11 +34508,113 @@ test "LightOnOCR3 CUDA Florence BART FFN fusion preserves exact GELU residual an
     try std.testing.expectEqual(@as(usize, 5), compute.florence_bart_ffn_calls);
 }
 
-test "LightOnOCR3 CUDA recurrent state recycling keeps independent cache admission and immutable resident weights" {
-    try checkLightOnStateRecycling();
+test "LightOnOCR3 CUDA deferred buffer reuse preserves queued bytes physical quota and operator rollback" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    compute.capability_profile = .lightonocr3;
+    compute.runtime_policy.temp_cache_mb = 1;
+    compute.runtime_policy.max_temp_buffers = 1;
+    compute.runtime_policy.stable_temp_reuse = false;
+    try compute.configureEmbeddingGemma2Admission(.{ .controller = &controller, .limits = .{ .backend_limit_bytes = 32 * 1024 * 1024, .scratch_limit_bytes = 32 * 1024 * 1024 }, .check_live_memory = false });
+    const retained = controller.snapshot().backend_scratch_bytes;
+    try std.testing.expect(retained != 0);
+    // Fill the single ordinary-cache slot. Reusing the deferred allocation
+    // must neither add a slot nor expand either admitted retention budget.
+    var idle = try allocDeviceBufferOrdinary(&compute, 1024);
+    releaseDeviceBuffer(&compute, &idle);
+    try std.testing.expectEqual(@as(usize, 1), compute.temp_buffers.buffers.items.len);
+    var before = try buffer_mod.HostBuffer.alloc(&compute.ctx, 4096);
+    defer before.free(&compute.ctx);
+    var after = try buffer_mod.HostBuffer.alloc(&compute.ctx, 4096);
+    defer after.free(&compute.ctx);
+    defer compute.ctx.synchronize() catch {};
+    var original = try allocDeviceBufferOrdinary(&compute, 4096);
+    defer releaseDeviceBuffer(&compute, &original);
+    const pointer = original.ptr;
+    const physical = compute.ctx.device_allocations.snapshot();
+    try compute.kernels.launchFillF32(&compute.ctx, original, 1024, 1.25);
+    // Pinned copies preserve the asynchronous stream ordering being tested.
+    try original.copyToHost(&compute.ctx, before.bytes());
+    releaseDeviceBuffer(&compute, &original);
+    if (!cudaDeferredFreeEnabled() or cudaDeferredFreeBudgetBytes(&compute) == 0) {
+        try std.testing.expectEqual(@as(usize, 0), compute.deferred_device_frees.items.len);
+        try std.testing.expectEqual(@as(usize, 0), compute.lighton_deferred_buffer_reuses);
+        try std.testing.expectEqual(physical.live - 4096, compute.ctx.device_allocations.snapshot().live);
+        for (std.mem.bytesAsSlice(f32, before.constBytes())) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+        return;
+    }
+    try std.testing.expectEqual(@as(usize, 4096), compute.deferred_device_free_bytes);
+    const allocations = compute.stats.device_alloc_calls;
+    const drains = compute.stats.deferred_free_drains;
+    const forced = compute.stats.deferred_free_forced_drains;
+    try compute.ctx.device_allocations.setLimit(physical.live);
+    defer compute.ctx.device_allocations.setLimit(physical.limit) catch {};
+    var reused = try allocDeviceBufferOrdinary(&compute, 2048);
+    defer releaseDeviceBuffer(&compute, &reused);
+    try std.testing.expectEqual(pointer, reused.ptr);
+    try std.testing.expectEqual(@as(usize, 4096), reused.allocation_bytes);
+    try std.testing.expectEqual(@as(usize, 0), compute.deferred_device_frees.items.len);
+    try std.testing.expectEqual(@as(usize, 0), compute.deferred_device_free_bytes);
+    try std.testing.expectEqual(@as(usize, 1), compute.lighton_deferred_buffer_reuses);
+    try std.testing.expectEqual(@as(usize, 4096), compute.lighton_deferred_buffer_reused_bytes);
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+    try std.testing.expectEqual(drains, compute.stats.deferred_free_drains);
+    try std.testing.expectEqual(forced, compute.stats.deferred_free_forced_drains);
+    try std.testing.expectEqual(physical.live, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1), compute.temp_buffers.buffers.items.len);
+    try compute.kernels.launchFillF32(&compute.ctx, reused, 512, -0.25);
+    try reused.copyToHost(&compute.ctx, after.bytes());
+    try compute.ctx.synchronize();
+    for (std.mem.bytesAsSlice(f32, before.constBytes())) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+    const result = std.mem.bytesAsSlice(f32, after.constBytes());
+    for (result[0..512]) |value| try std.testing.expectEqual(@as(f32, -0.25), value);
+    for (result[512..]) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+    releaseDeviceBuffer(&compute, &reused);
+    try compute.ctx.device_allocations.setLimit(physical.limit);
+    // Stable reuse retains exact extents rather than taking an oversized
+    // allocation, even when it remains available in the deferred queue.
+    compute.runtime_policy.stable_temp_reuse = true;
+    var exact = try allocDeviceBufferOrdinary(&compute, 2048);
+    defer releaseDeviceBuffer(&compute, &exact);
+    try std.testing.expect(exact.ptr != pointer);
+    try std.testing.expectEqual(@as(usize, 2048), exact.len);
+    try std.testing.expectEqual(@as(usize, 4096), compute.deferred_device_free_bytes);
+    try std.testing.expectEqual(@as(usize, 1), compute.lighton_deferred_buffer_reuses);
+    {
+        while (!compute.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer compute.temp_buffer_mutex.unlock();
+        compute.runtime_policy.max_temp_buffers = 0;
+        try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+        compute.runtime_policy.max_temp_buffers = 1;
+        compute.runtime_policy.temp_cache_mb = 0;
+        try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+        compute.runtime_policy.temp_cache_mb = 1;
+        const ceiling = compute.ocr_deferred_free_budget_bytes;
+        compute.ocr_deferred_free_budget_bytes = 4096;
+        try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+        compute.ocr_deferred_free_budget_bytes = 4095;
+        try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+        compute.ocr_deferred_free_budget_bytes = ceiling;
+    }
+    try std.testing.expectEqual(@as(usize, 4096), compute.deferred_device_free_bytes);
+    try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
 }
 
-fn checkLightOnStateRecycling() !void {
+test "LightOnOCR3 CUDA recurrent state recycling keeps independent cache admission and immutable resident weights" {
+    try checkLightOnStateRecycling(false);
+}
+
+test "LightOnOCR3 CUDA deferred state reuse preserves exact owners and independent admission" {
+    if (!cudaDeferredFreeEnabled() or cudaDeferredFreeConfiguredBytes() == 0) return error.SkipZigTest;
+    try checkLightOnStateRecycling(true);
+}
+
+fn checkLightOnStateRecycling(deferred_only: bool) !void {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     const recurrent = @import("lighton_recurrent.zig");
@@ -34468,8 +34624,13 @@ fn checkLightOnStateRecycling() !void {
         var compute = try CudaCompute.init(a);
         var owned = true;
         defer if (owned) compute.deinit();
+        if (deferred_only and (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1)) return error.SkipZigTest;
         compute.capability_profile = .lightonocr3;
         compute.lighton_state_pool_enabled = true;
+        if (deferred_only) {
+            compute.runtime_policy.temp_cache_mb = 1;
+            compute.runtime_policy.max_temp_buffers = 1;
+        }
 
         compute.lighton_shared_recurrent_weights_enabled = true;
         const cb = compute.computeBackend();
@@ -34544,11 +34705,26 @@ fn checkLightOnStateRecycling() !void {
         }
         for (first_buffers) |buffer| try compute.kernels.launchFillF32(&compute.ctx, buffer, buffer.len / 4, std.math.nan(f32));
         try compute.ctx.synchronize();
+        if (deferred_only) {
+            try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
+            var idle = try allocDeviceBufferOrdinary(&compute, 64);
+            releaseDeviceBuffer(&compute, &idle);
+            try std.testing.expectEqual(@as(usize, 1), compute.temp_buffers.buffers.items.len);
+            try std.testing.expect(cudaDeferredFreeBudgetBytes(&compute) > first_owner.len);
+        }
         const first_live = compute.ctx.device_allocations.snapshot().live;
         const cached_before = compute.temp_buffers.buffers.items.len;
         const releases_before = compute.lighton_state_pool_releases.load(.monotonic);
         first.deinit();
-        try std.testing.expectEqual(cached_before + 1, compute.temp_buffers.buffers.items.len);
+        if (deferred_only) {
+            try std.testing.expectEqual(cached_before, compute.temp_buffers.buffers.items.len);
+            try std.testing.expectEqual(@as(usize, 1), compute.deferred_device_frees.items.len);
+            try std.testing.expectEqual(first_owner.len, compute.deferred_device_free_bytes);
+            for (compute.deferred_device_frees.items) |entry| {
+                try std.testing.expect(!entry.borrowed);
+                try std.testing.expectEqual(entry.len, entry.allocation_bytes);
+            }
+        } else try std.testing.expectEqual(cached_before + 1, compute.temp_buffers.buffers.items.len);
         try std.testing.expectEqual(releases_before + 1, compute.lighton_state_pool_releases.load(.monotonic));
         for (compute.temp_buffers.buffers.items) |entry| try std.testing.expect(!entry.borrowed);
         // The independent cache owner funds retired storage after the page's
@@ -34572,6 +34748,7 @@ fn checkLightOnStateRecycling() !void {
             for (reused[0..i]) |prior| try std.testing.expect(prior.ptr != buffer.ptr);
         }
         try std.testing.expect(compute.lighton_state_pool_hits >= 1);
+        if (deferred_only) try std.testing.expectEqual(@as(usize, 1), compute.lighton_deferred_state_reuses);
         // Compare fresh execution from poisoned recycled storage with the
         // original independently allocated/cloned state, without changing math.
         compute.lighton_state_pool_enabled = false;

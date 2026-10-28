@@ -1,6 +1,6 @@
 {
   "schema_version": 4,
-  "scope": "Selected CUDA head/vision kernels and correctness-qualified execution update 838. Latest isolated whole-model measurements remain build 767: 0.8B faster; 4B 1.24% behind. Timing confirmation of 838 is pending because competing GPU jobs invalidate the new comparisons. Three synthetic pages; no representative OCR accuracy or complete BF16 decoder claim.",
+  "scope": "Selected CUDA head/vision kernels and correctness-qualified execution update 879. Latest isolated whole-model measurements remain build 767: 0.8B faster; 4B 1.24% behind. Timing confirmation of 879 is queued while the GPU is shared; earlier contended screens are excluded. Three synthetic pages; no representative OCR accuracy or complete BF16 decoder claim.",
   "hardware": {
     "gpu": "NVIDIA GB10, DGX Spark, SM12.1",
     "driver": "580.178.04",
@@ -50,7 +50,7 @@
     ],
     "native_client_concurrency": 256,
     "vllm_queue": "All256requests queued up front; max_num_seqs128",
-    "runtime_source_build": "767 (historical clean measurements; current source is 838)"
+    "runtime_source_build": "767 (historical clean measurements; current source is 879)"
   },
   "selected_changes": [
     "BF16 vision-block performance profile for both models; F32 conservative fallback remains available. Decoder projections/residuals and recurrent state stay F32; existing optional BF16 prefill stays unchanged.",
@@ -60,7 +60,8 @@
     "Ordinary cache reuse with O(1)byte ledger; selected0.8B cold-qualified projection descriptors.",
     "Mixed prefix/decode choices reuse the cancellation-safe pinned token-bank readback and release the execution lane while waiting. Original multi-token counters remain separate; no inactive compute or state rows.",
     "SM12.1 4B output-head heuristic queries M16, then validates actual layouts and launches only real rows, preserving the 1,024-plan bound and workspace policy.",
-    "Separately admitted 32 MiB host metadata arena uses copy-completion events rather than draining later GPU producers on reuse; existing upload-disable controls and admission-denied fallbacks remain."
+    "Separately admitted 32 MiB host metadata arena uses copy-completion events rather than draining later GPU producers on reuse; existing upload-disable controls and admission-denied fallbacks remain.",
+    "Same-stream reuse of owned deferred allocations on SM12.1 LightOn ordinary-cache misses and exact recurrent-state misses. Existing physical/admission charges and cache/free controls remain; no kernel math, precision, capacity or environment controls change."
   ],
   "results": [
     {
@@ -142,13 +143,13 @@
       "shape"
     ],
     "default_F32_regression": {
-      "selected": 283,
-      "passed": 269,
+      "selected": 285,
+      "passed": 271,
       "skipped": 14
     },
     "wide_regression": {
-      "selected": 109,
-      "passed": 108,
+      "selected": 111,
+      "passed": 110,
       "skipped": 1
     },
     "real_default_F32_models": [
@@ -200,15 +201,15 @@
       "enabled_build": true,
       "CPU_ownership_and_bounds_tests": 13,
       "new_GPU_performance_claim": false,
-      "binary_sha256": "eea6f6a1af5f4a5fc22440c3cbec1439c2cb2d2acb2409ed6a158a74f352e28a"
+      "binary_sha256": "5cf017b780269b587dafc6166a946b87c66e3e194a6c874089e9748b47c8c4cb"
     },
     "maximum_shape_memory_preflight": {
       "minimum_free_bytes": 64424509440,
       "cleanup": "Release unused Torch cache and both immutable input checkpoint file-cache pages before same guard; cases, oracle and limits unchanged",
       "proof_sha256": "f28407434943b586e23114ad337555477d3b6527ec1da03196c6681425769758"
     },
-    "runtime_source_build": "838",
-    "unchanged_vision_kernel_independent_evidence": "767/780, retained in performance_evidence; vision PTX/generators unchanged.838also passes both real-model F32vision batch checks and BF16invoice transcription.",
+    "runtime_source_build": "879",
+    "unchanged_vision_kernel_independent_evidence": "767/780, retained in performance_evidence; vision PTX/generators unchanged.879also passes both real-model F32vision batch checks and BF16invoice transcription.",
     "head_4B_descriptor": {
       "cases": 256,
       "suppression_variants": 2,
@@ -252,11 +253,17 @@
         8
       ],
       "CPU_event_wrap_and_failed_retirement_checks": true
+    },
+    "deferred_buffer_reuse": {
+      "physical_quota": "Pinned before/after copies preserve original bytes; reuse succeeds with no new allocation headroom, allocation calls, drain or admission-charge change.",
+      "ownership": "Recurrent state reuses only exact tracked owners; poisoned retired storage matches independent fresh state for both head counts and weight formats.",
+      "controls": "Stable extents, zero cache-byte/slot limits, disabled deferred freeing and queue-at/over-drain-threshold fallbacks checked.",
+      "source_scope": "Host allocator only; every CUDA/PTX input is unchanged from build838."
     }
   },
   "reproduction": {
     "runtime_build_base_commit": "3ac0bed9e17630332af2682ff80cebf8de2334a1",
-    "runtime_binary_sha256": "db6fa80c40660246eede2aeb86d86446f2254509a1c6154ff49c2d096cbb2893",
+    "runtime_binary_sha256": "996d273e287aaae909b12a9cbb0abd08977bda01acfbdff965713a1790079a0c",
     "runtime_build_command": [
       "/Users/ajroetker/bin/zig-0.17.0/zig",
       "build",
@@ -279,7 +286,7 @@
       "zig/pkg/inference/src/architectures/session_factory.zig": "a343a52332aa523c52aeee6d41b83236e8bf310fa60d512a87be77f7fcbb56eb",
       "zig/pkg/inference/src/models/gpt.zig": "648f016723da1b985f83ae134e555afd00009ad7c92fda1d7ccb118d5d3cecd4",
       "zig/pkg/inference/src/ops/cuda/cublaslt.zig": "2312ef8b8057950155129f1be44318ee6a3a7e730d59066611546e1ac16569f3",
-      "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "e212ce4e8ca19366d4ab7bc3bf52cb24db1f4e3501a54cb86ef72021105ddd38",
+      "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "d5bc7f6985438c8249702a41d3d8057b1d2f515147825fc2958fe0e6491f32a9",
       "zig/pkg/inference/src/ops/cuda/cudnn_conv.zig": "98902ea34fd935aaffde6f52be43937f8997c03b9d14f3015705949b5294c765",
       "zig/pkg/inference/src/ops/cuda/cudnn_sdpa.zig": "d732dd69e38f67325707e8f53862de0f50c5786a3053c89bc0d959cf7135e29f",
       "zig/pkg/inference/src/ops/cuda/florence_fused.ptx": "d4f91e70390ffb1e571526c14370582584cc5c657d316245106ab576d0a0a5f8",
@@ -351,8 +358,8 @@
       "zig/pkg/inference/src/ops/cuda/lighton_vision_down_1024_f32.ptx": "3a9053d17735bf5bac01fda744ba903f608bb1fc5e3661e2245912c5c94109f0",
       "zig/pkg/inference/src/ops/cuda/lighton_vision_down_1024_bf16.ptx": "53b1860ce091b00757095b94a2e79f09a3efff77ba14931d0e0356131d658a46"
     },
-    "source_archive_sha256": "47416275ebe7311c76a990b0566466fd3bd36faad172eec25ad6bd192d3b05e4",
-    "source_identity": "All79current published source inputs match the838CUDA and850Metal builds. Before porting, all4787tracked Zig/C/C++/header/Metal/PTX sources matched012dc814e2except the three qualified execution-update files. Historical767performance has its own evidence bundle.",
+    "source_archive_sha256": "6edd13850fe171137766524f8daea187ba4564e33af3c8eb3b9d4a9fe60e827a",
+    "source_identity": "All 79 current published source inputs match CUDA 879 and Metal 885. All 4,787 tracked Zig/C/C++/header/Metal/PTX files match the published working tree after porting only cuda_compute.zig. CUDA/PTX/math/precision remain unchanged from 838. Historical build 767 performance has separate evidence.",
     "zig_version": "0.17.0",
     "checker_sha256": {
       "check_cuda_lighton_head.py": "4be3db2eb1de35301c8ab106a7344afefb571949ab72d5be8591ff93b520fb12",
@@ -440,14 +447,14 @@
       "source_sha256": "fb71916d4960fbb580f183dc282d6a6f19eda94ce81e2336b005745cd03f5e1e"
     },
     "evidence": {
-      "sha256": "499319851c67808865e3e06ea9fcfc9c5c777cb17ce9a30336d55d04ed2a41e4",
-      "bytes": 26482492,
-      "remote_path": "/home/ajroetker/antfly/.worktrees/perf-lightonocr3-vllm-followup/.cache/evidence/ocr-838/499319851c67808865e3e06ea9fcfc9c5c777cb17ce9a30336d55d04ed2a41e4.tar.gz",
-      "uri": "ssh://glowworm/home/ajroetker/antfly/.worktrees/perf-lightonocr3-vllm-followup/.cache/evidence/ocr-838/499319851c67808865e3e06ea9fcfc9c5c777cb17ce9a30336d55d04ed2a41e4.tar.gz",
-      "inventory_files": 78
+      "sha256": "281e76bd6221ac945a4837a0873dc0e6769bb9d365bdcf3f8e6932033c72002a",
+      "bytes": 26490798,
+      "remote_path": "/home/ajroetker/antfly/.worktrees/perf-lightonocr3-vllm-followup/.cache/evidence/ocr-879/281e76bd6221ac945a4837a0873dc0e6769bb9d365bdcf3f8e6932033c72002a.tar.gz",
+      "uri": "ssh://glowworm/home/ajroetker/antfly/.worktrees/perf-lightonocr3-vllm-followup/.cache/evidence/ocr-879/281e76bd6221ac945a4837a0873dc0e6769bb9d365bdcf3f8e6932033c72002a.tar.gz",
+      "inventory_files": 83
     },
-    "published_source_base_commit": "012dc814e2dc37c0b3806893e9753c34f6be08fa",
-    "published_source_proof_sha256": "52c6f4c714e31774e79d9cddc399c6930b2aeb2025dff4f36d8330741bba5152",
+    "published_source_base_commit": "d90b8a298c72cf44ed7e9d57c74571610d965ce3",
+    "published_source_proof_sha256": "77e45d1b1378ea5159a7f7caa4324d02029cd1ce5d7d8d1b97c858f0b73e5361",
     "performance_evidence": {
       "sha256": "eb0462cf69acb145ccc150776593fa5da38deccb918ee55eb8780de0d171f98b",
       "bytes": 27708554,

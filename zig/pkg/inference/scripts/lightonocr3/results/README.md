@@ -51,10 +51,10 @@ They avoid cuBLASLt BF16 bias-epilogue cliffs observed against vLLM's actual Tor
 linear path. All raw measurements and settings are retained outside Git.
 
 The current source also adds asynchronous mixed-prefix/decode token readback,
-actual-row 4B head algorithm selection, and independently admitted event-based
-metadata staging. These changes are correctness-qualified. The table below still
-identifies the earlier frozen767 build; fresh comparisons of the current838 build
-were affected by competing GPU jobs and are excluded. No new throughput gain is
+actual-row 4B head algorithm selection, independently admitted event-based
+metadata staging, and same-stream reuse of owned deferred allocations. These changes are correctness-qualified. The table below still
+identifies the earlier frozen767 build; fresh comparisons of the current879 build
+are queued for a quiet GPU window. Earlier contended screens are excluded. No new throughput gain is
 claimed for the execution update yet.
 
 | Model | Native pages/s | Actual vLLM pages/s | Native versus reference mean |
@@ -79,7 +79,7 @@ cache (`ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB=19456` and
 `ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE=1`), within unchanged memory limits.
 The 4B run retains a 16 GiB cache and disables that norm-weight cache.
 
-Current qualification includes 269 default and 108 wide CUDA tests, both models' F32 vision
+Current qualification includes 271 default and 110 wide CUDA tests, both models' F32 vision
 checks at batches 1,1,2,3,8,16, and all 118 independent BF16 vision-block cases
 bit-for-bit, including 65,536 rows and batch 16. The head also matches independent
 IEEE F32 PyTorch logits in 12 real-checkpoint cases with exact token choices and
@@ -91,7 +91,11 @@ and 13 CPU ownership/bounds/readback checks pass; no new Metal GPU qualification
 128 actual batch sizes with and without suppression: 256 independent full-logit
 checks, exact tokens, readonly inputs and canaries, with maximum error 5.61e-6
 against the unchanged 2e-4 limit. All four existing upload rollback combinations,
-denied host admission, event reuse and synchronous-download rollback pass.
+denied host admission, event reuse and synchronous-download rollback pass. Deferred
+reuse also preserves pinned before/after byte copies at an exact physical quota,
+unchanged admission charges, exact recurrent-state ownership and poisoned-state
+reset. Existing cache/free rollback controls remain; CUDA math and precision are
+unchanged.
 
 The [compact manifest](followup-1331.json) records the 79 frozen runtime inputs,
 binary, checkpoint/fixture/report hashes, generator versions and content-addressed
@@ -102,8 +106,8 @@ measurements and exact controls shown above.
 It remains on Glowworm and can be retrieved through the already authorized host:
 
 ```sh
-tailscale ssh glowworm 'cat ARTIFACT_PATH' > qualification838.tar.gz
-shasum -a 256 qualification838.tar.gz
+tailscale ssh glowworm 'cat ARTIFACT_PATH' > qualification879.tar.gz
+shasum -a 256 qualification879.tar.gz
 ```
 
 Replace `ARTIFACT_PATH` with `reproduction.evidence.remote_path` from the manifest
