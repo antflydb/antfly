@@ -1046,6 +1046,9 @@ pub const Session = struct {
 pub const DurableSessionStore = struct {
     alloc: std.mem.Allocator,
     backend: Backend,
+    // Connection mutations update a shared directory using read/modify/write.
+    // Runtime write batches are atomic but do not serialize those snapshots.
+    sql_connection_mutex: std.atomic.Mutex = .unlocked,
     fail_writes_for_test: bool = false,
     fail_lease_transition_after_session_write_for_test: bool = false,
 
@@ -1250,6 +1253,8 @@ pub const DurableSessionStore = struct {
     /// unexecuted transaction and detach its exact connection in the same
     /// native transaction. Neither side may become visible alone.
     pub fn deleteAndDetachConnection(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool) !void {
+        platform_sync.lockYielding(&self.sql_connection_mutex);
+        defer self.sql_connection_mutex.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         const key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(key);

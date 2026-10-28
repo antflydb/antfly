@@ -6288,7 +6288,7 @@ pub const AntflyApiHandler = struct {
             var buffer: [256]u8 = undefined;
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
         };
-        return ctx.status(200).json(.{});
+        return ctx.status(200).json(struct {}{});
     }
 
     fn executeSQLMode(self: *AntflyApiHandler, ctx: *httpx.Context, mode: SQLPreparedMode, resource_id: ?[]const u8) !httpx.Response {
@@ -14073,6 +14073,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var closed = try Route.call(alloc, &handler, alice_auth, .close, connection_id, null);
     defer closed.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), closed.status);
+    try std.testing.expectEqualStrings("{}", closed.body);
     var after_close = try Route.statement(alloc, &handler, alice_auth, connection_id, "SHOW app.limit");
     defer after_close.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), after_close.status);

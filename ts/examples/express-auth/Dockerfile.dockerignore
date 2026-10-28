@@ -1,0 +1,9 @@
+.git
+.worktrees
+**/node_modules
+**/.next
+**/.zig-cache
+**/zig-out
+**/dist
+**/data
+**/.env*
