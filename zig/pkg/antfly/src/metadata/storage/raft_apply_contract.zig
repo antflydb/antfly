@@ -248,11 +248,13 @@ pub const SystemCatalogCommand = struct {
     constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
     sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
     sql_routine: ?@import("../../system_catalog/routines.zig").Mutation = null,
+    sql_type: ?@import("../../system_catalog/named_types.zig").Mutation = null,
     sql_cast: ?@import("../../system_catalog/casts.zig").Mutation = null,
     sql_sequence: ?@import("../../system_catalog/sequence_catalog.zig").Mutation = null,
     column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation = &.{},
 
     pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.sql_type != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_type = self.sql_type });
         if (self.sql_cast != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_cast = self.sql_cast });
         if (self.sql_routine != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_routine = self.sql_routine });
         if (self.column_sequences.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence, .column_sequences = self.column_sequences });
@@ -316,6 +318,8 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_sequence_admission_head: void,
     sql_column_identities: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
     sql_sequence_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
+    sql_type_snapshot: @import("../../system_catalog/named_types.zig").SnapshotRequest,
+    sql_type_outcome: @import("../../system_catalog/named_types.zig").OutcomeRequest,
     sql_cast_snapshot: @import("../../system_catalog/casts.zig").SnapshotRequest,
     sql_cast_outcome: @import("../../system_catalog/casts.zig").OutcomeRequest,
     sql_routine_snapshot: @import("../../system_catalog/routines.zig").SnapshotRequest,

@@ -442,6 +442,31 @@ pub const RaftApplyStore = struct {
         defer alloc.free(bytes);
         return @import("antfly_local_sources").system_catalog_column_identities.State.decode(alloc, bytes);
     }
+    pub fn sqlTypeSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/named_types.zig").SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate();
+        const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .sql_type_snapshot = request }, .{});
+        defer alloc.free(bytes);
+        const result = try self.projectionWithAllocator([]u8, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(bytes), .control = .{
+            .execution_deadline_ns = deadline orelse 0,
+            .has_execution_deadline = @intFromBool(deadline != null),
+            .cancellation_ctx = @ptrCast(@constCast(&context.cancellation)),
+            .cancellation_fn = Callback.cancelled,
+        } });
+        errdefer alloc.free(result);
+        try context.ensureActive();
+        return result;
+    }
+    pub fn sqlTypeOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/named_types.zig").OutcomeRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_type_outcome = request });
+    }
     pub fn sqlCastSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/casts.zig").SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.validate();

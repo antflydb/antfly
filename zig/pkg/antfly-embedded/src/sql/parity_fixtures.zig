@@ -186,3 +186,5 @@ pub const operator_reference = @embedFile("fixtures/sql_operator_reference.json"
 pub const aggregate_lifecycle_reference = @embedFile("fixtures/sql_aggregate_lifecycle_reference.json");
 
 pub const cast_reference = @embedFile("fixtures/sql_cast_reference.json");
+
+pub const enum_catalog_reference = @embedFile("fixtures/sql_enum_catalog_reference.json");

@@ -86,7 +86,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
             .role_default => "ALTER ROLE",
             .alter_sequence => "ALTER SEQUENCE",
             .truncate => "TRUNCATE TABLE",
-            .alter_schema => switch (ddl.schema_change orelse return error.InvalidSqlSyntax) {
+            .alter_schema => if (ddl.kind == .named_type) "ALTER TYPE" else switch (ddl.schema_change orelse return error.InvalidSqlSyntax) {
                 .create_index => "CREATE INDEX",
                 .drop_index => "DROP INDEX",
                 else => "ALTER TABLE",
@@ -104,6 +104,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .operator => "CREATE OPERATOR",
                 .aggregate => "CREATE AGGREGATE",
                 .cast => "CREATE CAST",
+                .named_type => "CREATE TYPE",
                 .table => unreachable,
             },
             .drop => switch (ddl.kind) {
@@ -119,6 +120,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .operator => "DROP OPERATOR",
                 .aggregate => "DROP AGGREGATE",
                 .cast => "DROP CAST",
+                .named_type => "DROP TYPE",
                 .table => unreachable,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
@@ -135,6 +137,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .operator => "ALTER OPERATOR",
                 .aggregate => "ALTER AGGREGATE",
                 .cast => "ALTER CAST",
+                .named_type => "ALTER TYPE",
             },
         },
     }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt, .catalog_receipt = outcome.catalog_receipt };

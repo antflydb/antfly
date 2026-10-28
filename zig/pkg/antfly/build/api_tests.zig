@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [30]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [31]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2317,6 +2317,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "pgwire procedure notices",
             "mounted SQL original operators preserve typed overloads stable function identities and cold dependency retirement",
             "mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement",
+            "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
             "mounted SQL original aggregates preserve typed transitions bounded states and cold dependency retirement",
             "mounted SQL ordinary aggregates preserve PostgreSQL ordering distinct filters and cold rows",
             "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
@@ -2367,6 +2368,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // release/Linux bounds retain their independently measured profiles.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
     });
+    const sql_enum_catalog_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes"});
+    sql_enum_catalog_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-enum-catalog-test", "Verify enum catalog scope, original DDL and cold outcome transport").dependOn(&sql_enum_catalog_run.step);
     const sql_cast_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement"});
     sql_cast_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-cast-test", "Run native database cast execution, prepared witnesses and cold retirement").dependOn(&sql_cast_run.step);
@@ -2993,7 +2997,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_cast_run, sql_procedure_run, sql_aggregate_run, sql_operator_run, sql_routine_run, sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, copy_input_run, characteristics_run, tablespace_run, drop_retirement_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_enum_catalog_run, sql_cast_run, sql_procedure_run, sql_aggregate_run, sql_operator_run, sql_routine_run, sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, copy_input_run, characteristics_run, tablespace_run, drop_retirement_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

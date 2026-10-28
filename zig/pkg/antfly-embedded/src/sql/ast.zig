@@ -408,7 +408,7 @@ pub const RelationPopulation = struct {
 };
 
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast },
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast, named_type },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -434,6 +434,10 @@ pub const CatalogDdl = struct {
     routine: ?RoutineDefinition = null,
     routine_signature: ?[]const RoutineDefinition.Type = null,
     operator_function: ?Name = null,
+    enum_definition: ?union(enum) {
+        create: []const []const u8,
+        add: struct { label: []const u8, placement: @import("../system_catalog/named_types.zig").Placement = .end, if_not_exists: bool = false },
+    } = null,
     cast_definition: ?struct {
         source: RoutineDefinition.Type,
         target: RoutineDefinition.Type,

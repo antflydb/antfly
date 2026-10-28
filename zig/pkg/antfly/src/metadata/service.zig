@@ -3647,6 +3647,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlType(command.apply_system_catalog)) return metadata_topology_protocol.sql_type_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlCast(command.apply_system_catalog)) return metadata_topology_protocol.sql_cast_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlRoutine(command.apply_system_catalog)) return metadata_topology_protocol.sql_routine_version;
     const refresh = switch (command) {
@@ -4162,6 +4163,10 @@ pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const 
         try ensureMaterializedViewCapabilityWithContext(service, context)
     else if (@import("schema_reader_wire.zig").requiresPopulation(bytes))
         try ensureQueryPopulationCapabilityWithContext(service, context);
+}
+
+pub fn ensureSqlTypeCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_type_version);
 }
 
 pub fn ensureSqlCastCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {

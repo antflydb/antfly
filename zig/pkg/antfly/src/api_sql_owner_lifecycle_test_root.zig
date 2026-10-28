@@ -57,6 +57,7 @@ test {
     _ = @import("api/sql_operator_lifecycle_integration_test.zig");
     _ = @import("api/sql_aggregate_lifecycle_integration_test.zig");
     _ = @import("api/sql_cast_lifecycle_integration_test.zig");
+    _ = @import("api/sql_enum_catalog_integration_test.zig");
     _ = @import("pgwire/protocol_test.zig");
     _ = @import("api/sql_collection_integration_test.zig");
     _ = @import("system_catalog/views.zig");

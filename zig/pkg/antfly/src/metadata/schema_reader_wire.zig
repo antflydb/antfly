@@ -17,6 +17,9 @@
 //! FK and restore envelopes. Schema/row strings are validated but never copied.
 const std = @import("std");
 
+pub fn requiresSqlType(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_type");
+}
 pub fn requiresSqlCast(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_cast");
 }
@@ -318,4 +321,9 @@ test "SQL routine catalog decoder marker ignores quoted bodies and requires expl
 test "SQL routine catalog database cast decoder marker cannot hide publication in source text" {
     for ([_][]const u8{ "{}", "{\"source_json\":\"sql_cast\"}", "{\"sql_cast\":null}" }) |bytes| try std.testing.expect(!requiresSqlCast(bytes));
     for ([_][]const u8{ "{\"sql_cast\":{}}", "{\"sql_ca\\u0073t\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlCast(bytes));
+}
+
+test "SQL routine catalog named type decoder marker ignores strings and recognizes escaped fields" {
+    for ([_][]const u8{ "{}", "{\"source_json\":\"sql_type\"}", "{\"sql_type\":null}" }) |bytes| try std.testing.expect(!requiresSqlType(bytes));
+    for ([_][]const u8{ "{\"sql_type\":{}}", "{\"sql_t\\u0079pe\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlType(bytes));
 }

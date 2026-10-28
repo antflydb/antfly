@@ -28428,6 +28428,7 @@ const RemoteMetadataSource = struct {
                 .supports_sql_sequences = true,
                 .supports_sql_routines = true,
                 .supports_sql_casts = true,
+                .supports_sql_types = true,
                 .supports_resolver_catalog_read = true,
                 .supports_resolver_authority = true,
                 .status = remoteStatus,

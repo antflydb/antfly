@@ -33,7 +33,15 @@ pub const Result = struct {
     identity: ?Identity,
     removed: usize,
     cascade_notice: ?[]const u8 = null,
+    no_op: bool = false,
+    pub fn jsonStringify(self: Result, writer: anytype) !void {
+        if (self.no_op) return writer.write(.{ .revision = self.revision, .identity = self.identity, .removed = self.removed, .cascade_notice = self.cascade_notice, .no_op = true });
+        // New type-only no-op results are protected by decoder capability 111.
+        // Existing callable/sequence frames keep their exact field shape.
+        try writer.write(.{ .revision = self.revision, .identity = self.identity, .removed = self.removed, .cascade_notice = self.cascade_notice });
+    }
     pub fn validate(self: Result) !void {
+        if (self.no_op and (self.removed != 0 or self.cascade_notice != null)) return error.InvalidSequenceOutcome;
         if (self.cascade_notice) |notice| if (notice.len == 0 or notice.len > 1024 or self.removed != 1 or !std.unicode.utf8ValidateSlice(notice) or std.mem.indexOfScalar(u8, notice, 0) != null) return error.InvalidSequenceOutcome;
         if (self.identity) |value| try value.validate();
         if (self.removed > 1 or (self.removed != 0 and self.identity != null) or
@@ -73,6 +81,17 @@ pub const Rejection = enum {
     SqlInvalidCastDefinition,
     SqlDuplicateCast,
     SqlCastNotFound,
+    SqlNamedTypeNotFound,
+    SqlDuplicateType,
+    SqlDuplicateTypeOrigin,
+    SqlDuplicateEnumLabel,
+    SqlInvalidEnumLabel,
+    SqlEnumLabelNotFound,
+    InvalidSqlNamedType,
+    InvalidSqlEnumSymbol,
+    InvalidSqlEnumOrder,
+    SqlTypeActivationRequired,
+
     InvalidSqlCastRecord,
     SqlInvalidTextRepresentation,
     SqlNumericOutOfRange,

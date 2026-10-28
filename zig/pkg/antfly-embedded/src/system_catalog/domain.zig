@@ -26,7 +26,7 @@ pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
 pub const RoutineHeader = @import("routines.zig").Header;
 pub const ServiceOwner = @import("../common/service_ownership.zig").Owner;
-pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence, routine, cast };
+pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence, routine, cast, named_type };
 
 pub fn namespaceRelation(kind: Kind) bool {
     return kind == .table or kind == .view or kind == .sequence;
@@ -365,6 +365,8 @@ pub const StateIndex = struct {
         errdefer self.deinit(alloc);
         try self.names.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         try self.ids.ensureTotalCapacity(alloc, @intCast(state.resources.len));
+        var type_origins: std.AutoHashMapUnmanaged([16]u8, void) = .empty;
+        defer type_origins.deinit(alloc);
         for (state.resources) |r| {
             if ((r.kind == .routine) != (r.signature != null)) return error.InvalidCatalogRecord;
             if (r.kind == .routine) {
@@ -374,6 +376,14 @@ pub const StateIndex = struct {
                 const signature = try record.value.catalogSignatureAlloc(alloc);
                 defer alloc.free(signature);
                 if (record.value.id != r.id or !std.mem.eql(u8, signature, r.signature.?)) return error.InvalidCatalogRecord;
+            }
+            if (r.kind == .named_type) {
+                if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
+                var record = try @import("named_types.zig").Record.decode(alloc, r.source_json);
+                defer record.deinit();
+                if (record.value.identity.id != r.id or record.value.identity.namespace_id != r.parent_id) return error.InvalidCatalogRecord;
+                const origin = try type_origins.getOrPut(alloc, record.value.identity.origin_id);
+                if (origin.found_existing) return error.InvalidCatalogRecord;
             }
             if (r.kind == .cast) {
                 if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
@@ -414,8 +424,11 @@ pub const StateIndex = struct {
         for (state.resources) |r| if (r.kind == .cast) {
             if (self.byId(.database, r.parent_id) == null) return error.InvalidCatalogRecord;
         };
-        for (state.resources) |r| if (r.kind == .sequence or r.kind == .routine) {
+        for (state.resources) |r| if (r.kind == .sequence or r.kind == .routine or r.kind == .named_type) {
             if (self.byId(.namespace, r.parent_id) == null) return error.InvalidCatalogRecord;
+        };
+        for (state.resources) |r| if (r.kind == .named_type) {
+            if (self.names.contains(.{ .kind = .table, .parent = r.parent_id, .name = r.name }) or self.names.contains(.{ .kind = .view, .parent = r.parent_id, .name = r.name })) return error.InvalidCatalogRecord;
         };
         if (!self.ids.contains(.{ .kind = .database, .id = default_database_id })) try self.appendChild(alloc, default_database);
         if (!self.ids.contains(.{ .kind = .namespace, .id = default_namespace_id })) try self.appendChild(alloc, default_namespace);
@@ -795,7 +808,7 @@ pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, requ
 pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool) !Delta {
     // View definitions require attribute/dependency admission. Generic resource
     // mutation must never publish an opaque caller-provided view payload.
-    if (request.kind == .routine or request.kind == .cast) return error.CatalogRoutineAdmissionRequired;
+    if (request.kind == .routine or request.kind == .cast or request.kind == .named_type) return error.CatalogRoutineAdmissionRequired;
     if (request.kind == .view) return error.CatalogViewAdmissionRequired;
     if (request.kind == .sequence) return error.CatalogSequenceAdmissionRequired;
     if (request.action == .alter) return error.InvalidCatalogMutation;
@@ -823,8 +836,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
         .database, .tablespace, .query_source => 0,
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
         .cast => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
-        .table, .view, .sequence, .routine => (try reader.namespaceFor(request.database, request.namespace)).id,
+        .table, .view, .sequence, .routine, .named_type => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
+    if (request.action == .create and (request.kind == .table or request.kind == .view)) {
+        if (try reader.lookup(.named_type, parent_id, request.name) != null) return error.SqlDuplicateType;
+    }
     var found = try reader.lookup(request.kind, parent_id, request.name);
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
         if (try reader.physicalByName(request.name)) |table| if (try reader.byId(.table, table.id) == null) {
@@ -898,7 +914,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                                 if ((try reader.children(.table, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 if ((try reader.children(.view, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 if ((try reader.children(.sequence, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
-                                if ((try reader.children(.routine, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
+                                if ((try reader.children(.routine, namespace.id, 1)).len != 0 or (try reader.children(.named_type, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 try removes.append(alloc, namespace);
                             }
                         },
@@ -906,11 +922,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                             if ((try reader.children(.table, existing.id, 1)).len != 0 or
                                 (try reader.children(.view, existing.id, 1)).len != 0 or
                                 (try reader.children(.sequence, existing.id, 1)).len != 0 or
-                                (try reader.children(.routine, existing.id, 1)).len != 0) return error.NamespaceNotEmpty;
+                                (try reader.children(.routine, existing.id, 1)).len != 0 or (try reader.children(.named_type, existing.id, 1)).len != 0) return error.NamespaceNotEmpty;
                         },
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
                         .query_source => {},
-                        .view, .sequence, .routine, .cast => unreachable,
+                        .view, .sequence, .routine, .cast, .named_type => unreachable,
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
@@ -1666,7 +1682,7 @@ pub fn validateTableName(name: []const u8) !void {
 }
 
 pub fn validateResourceName(kind: Kind, name: []const u8) !void {
-    if (namespaceRelation(kind) or kind == .routine or kind == .cast) return validateTableName(name);
+    if (namespaceRelation(kind) or kind == .routine or kind == .cast or kind == .named_type) return validateTableName(name);
     return validateName(name);
 }
 

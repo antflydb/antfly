@@ -8,6 +8,7 @@ class SQLCatalogObjectKind(StrEnum):
     OPERATOR = "operator"
     PROCEDURE = "procedure"
     SEQUENCE = "sequence"
+    TYPE = "type"
 
     def __str__(self) -> str:
         return str(self.value)

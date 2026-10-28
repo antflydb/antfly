@@ -874,6 +874,7 @@ pub const Adapter = struct {
         // Catalog jobs are not transaction participants yet. Never commit
         // their namespace change independently of an explicit SQL transaction.
         if (input == .populate and self.active_transaction != null) return error.UnsupportedSqlExecution;
+        if (input == .catalog_ddl and input.catalog_ddl.kind == .named_type) return @import("sql_type_ddl.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and input.catalog_ddl.kind == .cast) return @import("sql_cast_ddl.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and (input.catalog_ddl.kind == .function or input.catalog_ddl.kind == .procedure or input.catalog_ddl.kind == .operator or input.catalog_ddl.kind == .aggregate))
             return @import("sql_routine_ddl.zig").execute(self, allocators, input.catalog_ddl);

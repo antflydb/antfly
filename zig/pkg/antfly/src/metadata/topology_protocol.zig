@@ -149,7 +149,9 @@ const std = @import("std");
 /// catalog outcome lane without advancing executable generations.
 /// Version 108 decodes identity-bound operators and their derived dependency directory.
 /// Version 110 publishes database-owned casts and tags callable dependency owners.
-pub const current_version: u16 = 110;
+/// Version 111 decodes immutable namespace-owned named types.
+pub const current_version: u16 = 111;
+pub const sql_type_version: u16 = 111;
 pub const sql_cast_version: u16 = 110;
 pub const sql_routine_version: u16 = 110;
 pub const sql_materialized_refresh_version: u16 = 103;

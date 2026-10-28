@@ -137,6 +137,7 @@ pub fn observe(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
 pub fn recover(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, a: A, encoded: []const u8) !Receipt {
     try context.ensureActive();
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
+    if (try @import("sql_type_recovery.zig").recoverIfType(server, identity, context, a, encoded)) |receipt| return receipt;
     if (try @import("sql_cast_recovery.zig").recoverIfCast(server, identity, context, a, encoded)) |receipt| return receipt;
     if (try @import("sql_routine_recovery.zig").recoverIfCallable(server, identity, context, a, encoded)) |receipt| return receipt;
     var scratch = std.heap.ArenaAllocator.init(a);

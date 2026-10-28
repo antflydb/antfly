@@ -7289,7 +7289,7 @@ pub const AntflyApiHandler = struct {
                 defer ctx.allocator.free(resource);
                 const kind: usermgr.ResourceType = switch (target.kind) {
                     .query_source, .view, .sequence => .table,
-                    .routine => .namespace,
+                    .routine, .named_type => .namespace,
                     .cast => .database,
                     .database => .database,
                     .namespace => .namespace,

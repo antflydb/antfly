@@ -843,6 +843,7 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
     defer index.deinit(alloc);
     for (state.value.resources) |resource| {
         var found = (if (resource.kind == .routine) try findFunction(alloc, txn, group_id, resource.parent_id, resource.name, resource.signature orelse return error.InvalidCatalogRecord) else try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
+        defer found.deinit();
         if (resource.kind == .routine or resource.kind == .cast) {
             var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, resource);
             defer dependencies.deinit(alloc);
@@ -855,7 +856,11 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
                 if (bytes.len != 9 or bytes[0] != (if (resource.kind == .cast) @as(u8, 'c') else 'r') or std.mem.readInt(u64, bytes[1..9], .little) != resource.id) return error.InvalidCatalogRecord;
             }
         }
-        defer found.deinit();
+        if (resource.kind == .named_type) {
+            var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(alloc, resource.source_json);
+            defer record.deinit();
+            if (try namedTypeByOrigin(alloc, txn, group_id, record.value.identity.origin_id) != resource.id) return error.InvalidCatalogRecord;
+        }
         if (found.value.id != resource.id) return error.InvalidCatalogRecord;
         const child_key = try childKey(alloc, group_id, resource);
         defer alloc.free(child_key);
@@ -890,6 +895,33 @@ fn childKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource) ![]u8 {
     if (r.kind != .routine) return base;
     defer alloc.free(base);
     return std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ base, r.signature orelse return error.InvalidCatalogRecord });
+}
+fn namedTypeOriginKey(a: std.mem.Allocator, group: u64, origin: [16]u8) ![]u8 {
+    const prefix = try namePrefixAlloc(a, group);
+    defer a.free(prefix);
+    const key = try a.alloc(u8, prefix.len + "type_origin:".len + origin.len);
+    @memcpy(key[0..prefix.len], prefix);
+    @memcpy(key[prefix.len..][0.."type_origin:".len], "type_origin:");
+    @memcpy(key[prefix.len + "type_origin:".len ..], &origin);
+    return key;
+}
+/// A covering immutable-origin directory allows restore adoption and duplicate
+/// rejection without scanning namespace/name inventories.
+pub fn namedTypeByOrigin(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, origin: [16]u8) !?u64 {
+    const key = try namedTypeOriginKey(a, group, origin);
+    defer a.free(key);
+    const value = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (value.len != 8) return error.InvalidCatalogRecord;
+    const id = std.mem.readInt(u64, value[0..8], .little);
+    var resource = (try getById(a, txn, group, .named_type, id)) orelse return error.InvalidCatalogRecord;
+    defer resource.deinit();
+    var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(a, resource.value.source_json);
+    defer record.deinit();
+    if (record.value.identity.id != id or !std.mem.eql(u8, &record.value.identity.origin_id, &origin)) return error.InvalidCatalogRecord;
+    return id;
 }
 fn functionDependencyPrefix(a: std.mem.Allocator, group: u64, function: u64) ![]u8 {
     return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:routine_dependency:{d}:", .{ group, function });
@@ -951,6 +983,20 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
     defer alloc.free(child_json);
     try txn.put(child_key, child_json);
+    if (r.kind == .named_type) {
+        var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(alloc, r.source_json);
+        defer record.deinit();
+        const key = try namedTypeOriginKey(alloc, group_id, record.value.identity.origin_id);
+        defer alloc.free(key);
+        const previous = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, r.id, .little);
+        if (previous) |value| if (!std.mem.eql(u8, value, &encoded)) return error.InvalidCatalogRecord;
+        try txn.put(key, &encoded);
+    }
     if (r.kind == .routine or r.kind == .cast) {
         var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, r);
         defer dependencies.deinit(alloc);
@@ -989,6 +1035,16 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         error.NotFound => {},
         else => return err,
     };
+    if (r.kind == .named_type) {
+        var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(alloc, r.source_json);
+        defer record.deinit();
+        const key = try namedTypeOriginKey(alloc, group_id, record.value.identity.origin_id);
+        defer alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
     if (r.kind == .routine or r.kind == .cast) {
         var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, r);
         defer dependencies.deinit(alloc);

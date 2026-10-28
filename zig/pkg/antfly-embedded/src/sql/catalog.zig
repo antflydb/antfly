@@ -19,6 +19,14 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 
+pub const enum_values = @import("../common/sql_enum_value.zig");
+pub const named_types = @import("../system_catalog/named_types.zig");
+
+test {
+    _ = named_types;
+    _ = enum_values;
+}
+
 pub const cloneDocumentPath = @import("document_path.zig").clone;
 
 pub const Column = struct {
@@ -1377,7 +1385,7 @@ pub const DdlReceipt = struct {
 /// Native catalog operations have no physical table/schema receipt. Identity
 /// integers stay native here and stringify as exact decimal strings on wire.
 pub const CatalogOperationReceipt = struct {
-    pub const Kind = enum { sequence, function, procedure, operator, aggregate, cast };
+    pub const Kind = enum { sequence, function, procedure, operator, aggregate, cast, type };
     pub const Operation = enum { create, alter, rename, drop };
     pub const State = enum { committed, rejected, unknown };
     pub const Diagnostic = struct { code: []const u8, message: []const u8, retryable: bool };

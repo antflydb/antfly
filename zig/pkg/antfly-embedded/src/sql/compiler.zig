@@ -3330,6 +3330,51 @@ const Parser = struct {
         self.pos += 1;
         return .{ .namespace = namespace, .table = try self.alloc.dupe(u8, symbol_token.text) };
     }
+    fn enumLabel(self: *Parser) Error![]const u8 {
+        if (!self.peek(.string)) return self.fail(error.InvalidSqlSyntax, "enum labels require string literals");
+        return (try self.value()).string;
+    }
+    fn enumDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
+        var conditional = false;
+        if (action == .drop and self.keyword(.@"if")) {
+            try self.expectKeyword(.exists);
+            conditional = true;
+        }
+        var ddl: ast.CatalogDdl = .{ .kind = .named_type, .action = action, .name = try self.name(), .conditional = conditional };
+        switch (action) {
+            .create => {
+                try self.expectKeyword(.as);
+                if (!self.ddlWord("ENUM")) return self.fail(error.UnsupportedSqlShape, "this named type definition is not supported");
+                try self.expect(.lparen);
+                var labels: std.ArrayList([]const u8) = .empty;
+                if (!self.take(.rparen)) while (true) {
+                    if (labels.items.len >= @import("../system_catalog/named_types.zig").max_labels) return self.fail(error.SqlLimitExceeded, "enum label count limit exceeded");
+                    try labels.append(self.alloc, try self.enumLabel());
+                    if (self.take(.rparen)) break;
+                    try self.expect(.comma);
+                };
+                ddl.enum_definition = .{ .create = try labels.toOwnedSlice(self.alloc) };
+            },
+            .alter_schema => {
+                try self.expectKeyword(.add);
+                if (!self.ddlWord("VALUE")) return self.fail(error.InvalidSqlSyntax, "expected VALUE");
+                const if_not_exists = self.keyword(.@"if");
+                if (if_not_exists) {
+                    try self.expectKeyword(.not);
+                    try self.expectKeyword(.exists);
+                }
+                const label = try self.enumLabel();
+                const placement: @import("../system_catalog/named_types.zig").Placement = if (self.ddlWord("BEFORE")) .{ .before = try self.enumLabel() } else if (self.ddlWord("AFTER")) .{ .after = try self.enumLabel() } else .end;
+                ddl.enum_definition = .{ .add = .{ .label = label, .placement = placement, .if_not_exists = if_not_exists } };
+            },
+            .drop => {
+                ddl.cascade = self.ddlWord("CASCADE");
+                if (!ddl.cascade) _ = self.ddlWord("RESTRICT");
+            },
+            else => unreachable,
+        }
+        return ddl;
+    }
     fn castDdl(self: *Parser, creating: bool) Error!ast.CatalogDdl {
         const conditional = !creating and self.keyword(.@"if");
         if (conditional) try self.expectKeyword(.exists);
@@ -4187,6 +4232,7 @@ const Parser = struct {
             return .{ .catalog_ddl = .{ .kind = kind, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column } };
         }
         if (self.keyword(.create)) {
+            if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.create) };
             if (self.ddlWord("CAST")) return .{ .catalog_ddl = try self.castDdl(true) };
             if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(true, false) };
             if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(true) };
@@ -4227,6 +4273,7 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.drop) };
             if (self.ddlWord("CAST")) return .{ .catalog_ddl = try self.castDdl(false) };
             if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(false, false) };
             if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(false) };
@@ -4248,6 +4295,7 @@ const Parser = struct {
             return .{ .drop_table = .{ .table = try self.name(), .if_exists = if_exists } };
         }
         if (self.keyword(.alter)) {
+            if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.alter_schema) };
             if (self.ddlWord("SEQUENCE")) return .{ .catalog_ddl = try self.sequenceDdl(.alter_sequence) };
             if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDefaultDdl() };
             if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.rename, false) };
@@ -5851,4 +5899,37 @@ test "compiler SQL original casts retain database type pairs and conversion cont
         try std.testing.expectEqual(ast.ColumnType.string, ddl.cast_definition.?.target.kind);
         try std.testing.expectEqual(i == 2, ddl.conditional);
     }
+}
+
+test "compiler SQL named enum original declarations retain exact labels placement and retirement intent" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0096", "sql-0097", "sql-0098", "sql-0099", "sql-0100" }, 0..) |id, i| {
+        const original = try corpus.get(id);
+        var compiled = try compile(a, original.sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.named_type, ddl.kind);
+        try std.testing.expectEqualStrings("usage_status", ddl.name.table);
+        if (i == 0) {
+            try std.testing.expectEqual(@as(usize, 3), ddl.enum_definition.?.create.len);
+            try std.testing.expectEqualStrings("queued", ddl.enum_definition.?.create[0]);
+        } else if (i < 3) {
+            try std.testing.expectEqualStrings("archived", ddl.enum_definition.?.add.label);
+            try std.testing.expectEqual(i == 2, ddl.enum_definition.?.add.if_not_exists);
+            if (i == 2) try std.testing.expectEqualStrings("done", ddl.enum_definition.?.add.placement.after);
+        } else {
+            try std.testing.expectEqual(.drop, ddl.action);
+            try std.testing.expectEqual(i == 4, ddl.conditional);
+            try std.testing.expectEqual(i == 4, ddl.cascade);
+        }
+    }
+    var empty = try compile(a, "CREATE TYPE empty_enum AS ENUM ()", .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.statement.catalog_ddl.enum_definition.?.create.len);
+    var quoted = try compile(a, "CREATE TYPE public.\"Status\" AS ENUM ('','é','a''b')", .{});
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("Status", quoted.statement.catalog_ddl.name.table);
+    try std.testing.expectEqualStrings("a'b", quoted.statement.catalog_ddl.enum_definition.?.create[2]);
 }

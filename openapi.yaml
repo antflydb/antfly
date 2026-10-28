@@ -23048,6 +23048,7 @@ components:
         - operator
         - aggregate
         - cast
+        - type
       description: Native catalog resource kind; never a synthetic physical table.
     SQLCatalogOperationKind:
       type: string
