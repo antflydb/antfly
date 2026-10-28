@@ -527,8 +527,8 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
     const unsupported_native_empty = unavailable_authority;
     // Exercise the durable failure/reopen matrix without unwinding DWARF on
     // every allocation. Keep SafeAllocator checks and fail on leaked owners.
-    var fixture_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer if (fixture_allocator.deinit() != 0) @panic("restore fixture leaked allocations");
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
     const alloc = fixture_allocator.allocator();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -895,8 +895,8 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     // These fixtures measure restore correctness and durability, rather than
     // allocator stack capture. Retain safety checks and explicit leak failure
     // for every corpus size, including ReleaseFast qualification.
-    var fixture_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer if (fixture_allocator.deinit() != 0) @panic("restore fixture leaked allocations");
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
     const alloc = fixture_allocator.allocator();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
