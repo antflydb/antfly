@@ -1,10 +1,10 @@
 name: LangChain.js integration
 on:
   pull_request:
-    paths: ['ts/packages/langchain/**', 'ts/packages/sdk/**', 'ts/pnpm-lock.yaml', 'ts/pnpm-workspace.yaml', '.github/workflows/langchain-js.yml']
+    paths: ['ts/packages/langchain/**', 'ts/packages/langgraph-store/**', 'ts/packages/sdk/**', 'ts/pnpm-lock.yaml', 'ts/pnpm-workspace.yaml', '.github/workflows/langchain-js.yml']
   push:
     branches: [main]
-    paths: ['ts/packages/langchain/**', 'ts/packages/sdk/**', 'ts/pnpm-lock.yaml', '.github/workflows/langchain-js.yml']
+    paths: ['ts/packages/langchain/**', 'ts/packages/langgraph-store/**', 'ts/packages/sdk/**', 'ts/pnpm-lock.yaml', '.github/workflows/langchain-js.yml']
   workflow_dispatch:
   schedule:
     - cron: '23 8 * * 1'
@@ -30,14 +30,17 @@ jobs:
       - name: Update compatible dependencies
         if: matrix.dependencies == 'latest-compatible'
         working-directory: ts
-        run: pnpm --filter @antfly/langchain add --save-dev '@langchain/core@^1.3.0' '@langchain/classic@^1.0.56' '@langchain/openai@^1.7.1' --ignore-scripts
+        run: |
+          pnpm --filter @antfly/langchain add --save-dev '@langchain/core@^1.3.0' '@langchain/classic@^1.0.56' '@langchain/openai@^1.7.1' --ignore-scripts
+          pnpm --filter @antfly/langgraph-store add --save-dev '@langchain/core@^1.3.0' '@langchain/langgraph@^1.5.3' --ignore-scripts
       - name: Build, typecheck, lint and test
         working-directory: ts
         run: |
-          pnpm --filter @antfly/langchain... build
-          pnpm --filter @antfly/langchain... typecheck
+          pnpm --filter @antfly/langgraph-store... build
+          pnpm --filter @antfly/langgraph-store... typecheck
           pnpm --filter @antfly/langchain lint
-          pnpm --filter @antfly/langchain... test
+          pnpm --filter @antfly/langgraph-store lint
+          pnpm --filter @antfly/langgraph-store... test
       - name: Verify independent npm consumer
         working-directory: ts
         run: pnpm --filter @antfly/langchain test:package

@@ -21,7 +21,7 @@ function run(command, args, cwd = consumer) {
     throw new Error(`${command} ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`);
   return result.stdout;
 }
-for (const name of ["sdk", "langchain"])
+for (const name of ["sdk", "langchain", "langgraph-store"])
   run(
     "pnpm",
     ["pack", "--out", resolve(artifacts, `${name}.tgz`)],
@@ -38,6 +38,8 @@ run("npm", [
   "--no-fund",
   resolve(artifacts, "sdk.tgz"),
   resolve(artifacts, "langchain.tgz"),
+  resolve(artifacts, "langgraph-store.tgz"),
+  "@langchain/langgraph@1.5.3",
   `@langchain/core@${core}`,
   "typescript@5.9.3",
   "@types/node@25.9.3",
@@ -48,11 +50,21 @@ for (const [extension, statement] of [
 ]) {
   writeFileSync(
     resolve(consumer, `exports.${extension}`),
-    `${statement}\nfor (const key of ['AntflyVectorStore','AntflyEmbeddings','AntflyRetriever','AntflyReranker','WriteOutcomeError']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
+    `${statement}\nfor (const key of ['AntflyVectorStore','AntflyEmbeddings','AntflyRetriever','AntflyReranker','WriteOutcomeError','AntflyJSONStore','AntflyDocumentStore','AntflyByteStore','AntflyGraphStore','AntflyMultimodalCorpus','createAntflyGraphTools']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
   );
   run("node", [`exports.${extension}`]);
 }
-const contract = `import { AntflyClient, InferenceClient } from '@antfly/sdk';
+for (const extension of ["mjs", "cjs"]) {
+  writeFileSync(
+    resolve(consumer, `memory.${extension}`),
+    extension === "mjs"
+      ? "import { AntflyStore } from '@antfly/langgraph-store'; if (typeof AntflyStore !== 'function') throw new Error('memory export');"
+      : "const { AntflyStore } = require('@antfly/langgraph-store'); if (typeof AntflyStore !== 'function') throw new Error('memory export');"
+  );
+  run("node", [`memory.${extension}`]);
+}
+const contract = `import { AntflyStore } from '@antfly/langgraph-store';
+import { AntflyClient, InferenceClient } from '@antfly/sdk';
 import { AntflyEmbeddings, AntflyVectorStore, AntflyRetriever, AntflyReranker } from '@antfly/langchain';
 const client = new AntflyClient({baseUrl:'http://localhost:8080'});
 const embeddings = new AntflyEmbeddings({client:new InferenceClient({baseUrl:'http://localhost:8080'}),model:'test'});
@@ -61,6 +73,8 @@ const retriever = new AntflyRetriever({vectorStore:store});
 void retriever.invoke('question',{signal:new AbortController().signal});
 void store.asRetriever({searchType:'mmr',k:2});
 void new AntflyReranker({client:new InferenceClient({baseUrl:'http://localhost:8080'}),model:'test'}).asRunnable();
+const memory = new AntflyStore({client,table:'memory'});
+void memory.put(['users','alice'],'key',{text:'hello'});
 // @ts-expect-error invalid mode must fail the public consumer contract
 new AntflyRetriever({client,table:'test',mode:'invented'});
 `;
@@ -94,6 +108,14 @@ try {
 const store=await AntflyVectorStore.fromDocuments([{id:'owner',pageContent:'Mira Chen owns operations.',metadata:{source:'package'}}],embeddings,{client,table});
 const found=await new AntflyRetriever({vectorStore:store,k:1}).invoke('Who owns operations?');
 if(found[0]?.id!=='owner') throw new Error('Installed-package retrieval failed');
+const { AntflyStore } = await import('@antfly/langgraph-store');
+const { AntflyJSONStore } = await import('@antfly/langchain');
+const memory = new AntflyStore({client,table});
+await memory.put(['users','alice'],'preference',{food:'apples'});
+if ((await new AntflyStore({client,table}).get(['users','alice'],'preference'))?.value.food !== 'apples') throw new Error('Installed memory persistence failed');
+const jsonStore = new AntflyJSONStore({client,table,namespace:'package'});
+await jsonStore.mset([['record',{ok:true}]]);
+if (!(await jsonStore.mget(['record']))[0]?.ok) throw new Error('Installed JSON store failed');
 await store.delete({ids:['owner']});
 if((await store.getByIds(['owner'])).length) throw new Error('Installed-package deletion failed');
 } finally {await client.tables.drop(table);}
@@ -110,7 +132,7 @@ const receipt = {
   types: "passed",
   live: process.env.ANTFLY_URL ? "passed" : "not requested",
   artifacts: Object.fromEntries(
-    ["sdk", "langchain"].map((name) => [
+    ["sdk", "langchain", "langgraph-store"].map((name) => [
       name,
       createHash("sha256")
         .update(readFileSync(resolve(artifacts, `${name}.tgz`)))

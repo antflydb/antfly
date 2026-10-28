@@ -1,4 +1,4 @@
-import type { InferenceClient } from "@antfly/sdk";
+import type { ContentPart, InferenceClient } from "@antfly/sdk";
 import { Embeddings } from "@langchain/core/embeddings";
 import { count, type OperationOptions, vectors } from "./utils.js";
 
@@ -48,6 +48,24 @@ export class AntflyEmbeddings extends Embeddings {
       result.push(...vectors(value, batch.length, this.options.dimensions ?? result[0]?.length));
     }
     return result;
+  }
+  /** Each input is one multimodal item; parts within an item share one embedding. */
+  async embedMultimodal(inputs: ContentPart[][], options?: OperationOptions): Promise<number[][]> {
+    const results: number[][] = [];
+    for (const parts of inputs) {
+      if (!parts.length) throw new TypeError("Multimodal input must contain parts");
+      options?.signal?.throwIfAborted();
+      const result = await this.caller.call(() =>
+        this.options.client.embedDense(this.options.model, parts, {
+          dimensions: this.options.dimensions,
+          task_type: "RETRIEVAL_DOCUMENT",
+          error_policy: "fail_fast",
+          signal: options?.signal,
+        })
+      );
+      results.push(...vectors(result, 1, this.options.dimensions ?? results[0]?.length));
+    }
+    return results;
   }
   embedDocuments(texts: string[], options?: OperationOptions): Promise<number[][]> {
     return this.embed(texts, "RETRIEVAL_DOCUMENT", options);

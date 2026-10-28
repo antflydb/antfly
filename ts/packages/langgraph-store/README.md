@@ -1,0 +1,49 @@
+# @antfly/langgraph-store
+
+Persistent long-term memory for LangGraph.js, backed by Antfly. Requires Node 24+,
+`@langchain/core >=1.3 <2` and `@langchain/langgraph >=1.5.3 <2`.
+
+```ts
+import { AntflyClient } from "@antfly/sdk";
+import { AntflyStore } from "@antfly/langgraph-store";
+
+const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+const store = await AntflyStore.create({ client, table: "agent_memory" });
+await store.put(["users", "alice"], "preference", { food: "apples" });
+const memory = await store.get(["users", "alice"], "preference");
+// Pass store to graph.compile({ store }); nodes/tools use runtime/config.store.
+```
+
+Constructors attach without creating resources. A new instance using the same
+table and namespace reads persisted memory across processes and conversations.
+Supply user identity from trusted application context, not model tool arguments.
+See `examples/agent-memory.ts` for an actual compiled StateGraph; run with
+`ANTFLY_URL`, `ANTFLY_TABLE`, `USER_ID` and optional `REMEMBER`. Pass `--create`
+only for the initial run.
+
+The adapter supports component-safe namespaces, ordered mixed batches, get/put/
+delete, search filters, pagination, namespace prefix/suffix wildcards, timestamps
+and index controls. A mixed batch is sequential, not an atomic transaction. Later
+reads see completed earlier writes. Concurrent writes to the same item are last
+writer wins; serialize them if preserving the original creation timestamp is
+essential. No per-item TTL or execution checkpointing is implemented.
+
+Configure `index: { embeddings, dims, fields: ["$"] }` for semantic search using
+any LangChain embeddings implementation. Paths support nested properties,
+wildcard array elements and negative array indices. Per-put `false` disables
+indexing; a path list overrides default fields. Multiple fields produce separate
+vectors; the best cosine similarity ranks each item. Filters apply before
+pagination. Supported operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`.
+
+Semantic search currently scans scoped persisted items and computes exact cosine
+similarity in Node. It is intended for bounded agent memories, not large vector
+corpora; use `AntflyVectorStore` for server-indexed retrieval. Namespace listing
+also scans matching storage. Vectors are validated against configured dimensions.
+Changing the embedding model requires reindexing memory values.
+
+Build/test from `ts`: `pnpm --filter @antfly/langgraph-store... build`, then
+`pnpm --filter @antfly/langgraph-store test`. Set `ANTFLY_LIVE=1` and `ANTFLY_URL`
+to run the two-user runtime integration test. Tests create/drop unique tables.
+The independent package verifier is shared with `@antfly/langchain` and verifies
+all three SDK/integration tarballs. Publish SDK, LangChain, then this package via
+the `ts/antfly/langgraph-store/v*` tag workflow after registry configuration.

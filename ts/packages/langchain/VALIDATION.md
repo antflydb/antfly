@@ -1,4 +1,50 @@
-# LangChain.js first-release validation
+# LangChain.js suite validation
+
+## Persistence, memory, graph and multimodal extension — 2026-10-27
+
+The extension implements the previously deferred milestones. Current executed
+results: **57 LangChain tests and 6 LangGraph-store tests passed, zero skips**
+with the live profile enabled. Builds and TypeScript checks passed for both
+packages; Biome checks passed with warnings about dynamic graph types/non-null
+assertions. The SDK foundation is unchanged from the checks below.
+
+Evidence: [suite tests](validation/suite-tests.txt),
+[memory tests](validation/memory-tests.txt),
+[multimodal restart](validation/multimodal-after-restart.json), and
+[two-user memory restart](validation/memory-after-restart.txt).
+
+Real-server checks include cursor-paged key enumeration, all three codecs,
+fresh attachments, graph source ownership/deletion, namespace enforcement,
+MATCH bindings/exact counts, shortest/k-shortest paths, graph expansion and
+actual LangChain tool invocation. The memory test executes a compiled LangGraph
+StateGraph with two trusted user contexts; it checks ordering, timestamps,
+semantic ranking, index suppression, filters and namespace listing.
+
+The synthetic multimodal corpus retrieves the expected text page, chart and
+diagram. Original image hashes are checked before message construction. The
+server was stopped and restarted with the same data directory; fresh processes
+recalled Alice's apples and Bob's pears, and verified all three corpus sources
+without re-ingestion or reading fixture files. Live tests cover replacement,
+deletion and missing media. Deterministic chat-model tests verify original bytes
+reach generation, citation checks and refusal before generation when references
+are stale, missing or corrupt.
+
+All three tarballs are checked by the independent consumer verifier for ESM,
+CommonJS and TypeScript. Its live profile checks retrieval, deletion, JSON-store
+roundtrips and fresh-instance LangGraph memory. Receipts and artifacts are under
+`.state/langchain/consumer-*` in this worktree.
+
+Limits: memory semantic search uses exact Node-side scoring over persisted
+scoped vectors; this is appropriate for bounded memories, not large corpora.
+Multimodal writes span several stores and require serializing same-source writes;
+interrupted ingestion can leave orphan records. Native multimodal embedding
+transport is contract-tested, but no native vision embedding model or paid vision
+generation was run. The example's generation path is implemented and tested with
+a standard deterministic LangChain chat model; this is not evidence of visual
+answer quality. CI/release workflows are wired but have not run on GitHub, and
+neither npm package has been published.
+
+## Historical first-release retrieval validation
 
 Executed locally on 2026-10-27, macOS ARM64, Node 24.19.0, pnpm 11.10.0,
 TypeScript 5.9.3, LangChain core 1.3.0, classic 1.0.56, and OpenAI integration
@@ -100,4 +146,5 @@ defaults to the two named models above. An isolated configured server is require
 - Published-package ownership/Trusted Publishing and the initial npm bootstrap
   are external release setup. No existing release tag was changed.
 - JSON/document/byte stores, LangGraph memory, graph adapters, and multimodal
-  workflows remain the later milestones in the agreed scope.
+  workflows were deferred at this historical checkpoint; they are implemented
+  and validated by the extension described above.

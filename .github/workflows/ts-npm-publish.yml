@@ -21,6 +21,7 @@ on:
       - 'ts/antfly/design-system/v*'
       - 'ts/antfly/web/v*'
       - 'ts/antfly/langchain/v*'
+      - 'ts/antfly/langgraph-store/v*'
 
 permissions:
   contents: read
@@ -119,7 +120,7 @@ jobs:
           pnpm --filter @antfly/better-auth publish --access public --no-git-checks --provenance --tag "$channel"
 
       - name: Verify LangChain package consumer
-        if: startsWith(github.ref, 'refs/tags/ts/antfly/langchain/v')
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/langchain/v') || startsWith(github.ref, 'refs/tags/ts/antfly/langgraph-store/v')
         working-directory: ts
         run: pnpm --filter @antfly/langchain test:package
 
@@ -127,3 +128,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/ts/antfly/langchain/v')
         working-directory: ts
         run: pnpm --filter @antfly/langchain publish --access public --no-git-checks --provenance
+
+      - name: Publish LangGraph memory integration
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/langgraph-store/v')
+        working-directory: ts
+        run: pnpm --filter @antfly/langgraph-store publish --access public --no-git-checks --provenance

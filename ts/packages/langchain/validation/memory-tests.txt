@@ -1,0 +1,13 @@
+packages/cli-linux-arm64                 | [WARN] Unsupported platform: wanted: {"cpu":["arm64"],"os":["linux"],"libc":["glibc"]} (current: {"os":"darwin","cpu":"arm64","libc":"unknown"})
+packages/cli-linux-x64                   | [WARN] Unsupported platform: wanted: {"cpu":["x64"],"os":["linux"],"libc":["glibc"]} (current: {"os":"darwin","cpu":"arm64","libc":"unknown"})
+packages/embedded-linux-arm64            | [WARN] Unsupported platform: wanted: {"cpu":["arm64"],"os":["linux"],"libc":["glibc"]} (current: {"os":"darwin","cpu":"arm64","libc":"unknown"})
+packages/embedded-linux-x64              | [WARN] Unsupported platform: wanted: {"cpu":["x64"],"os":["linux"],"libc":["glibc"]} (current: {"os":"darwin","cpu":"arm64","libc":"unknown"})
+$ vitest run --maxWorkers=2
+
+ RUN  v4.1.9 /Users/drewlanenga/Code/github.com/antflydb/antfly/.worktrees/feat-langchain-js/ts/packages/langgraph-store
+
+
+ Test Files  2 passed (2)
+      Tests  6 passed (6)
+   Start at  17:04:53
+   Duration  664ms (transform 115ms, setup 0ms, import 549ms, tests 311ms, environment 0ms)

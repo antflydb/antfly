@@ -183,9 +183,71 @@ configured. Initial publication may require registry-owner bootstrap. Release
 and verify the SDK foundation first. Upstream discovery is a separate
 [integration submission](https://docs.langchain.com/oss/javascript/contributing/publish-langchain).
 
-## Later milestones
+## Persistent stores, graph and multimodal retrieval
 
-Persistent JSON/document/byte stores, parent-child/multimodal retrieval,
-`@antfly/langgraph-store`, and graph ingestion/query/tools remain later milestones.
+`AntflyJSONStore`, `AntflyDocumentStore`, and `AntflyByteStore` implement LangChain's
+`BaseStore<string, V>`. Constructors attach; inherited `create(options)` explicitly
+creates a table and returns the selected store class. Use a separate namespace for
+each codec. `mget` preserves order and returns `undefined` for missing keys; missing
+tables remain errors. Writes validate all inputs, use bounded batches and wait for
+index visibility. `yieldKeys(prefix)` uses cursor pagination. JSON codecs reject
+lossy values; document codecs preserve IDs; byte codecs validate base64 and default
+to an 8 MiB value limit. Write errors include physical keys and earlier committed
+keys. A batch is not a transaction across its network requests.
+
+```ts
+const parents = new AntflyDocumentStore({ client, table, namespace: "parents" });
+const media = new AntflyByteStore({ client, table, namespace: "original-media" });
+await parents.mset([["page-1", new Document({ id: "page-1", pageContent: "Original text" })]]);
+```
+
+Pass `parents` as `docstore` to upstream `MultiVectorRetriever`. Its `byteStore`
+option stores serialized **documents**, so use a distinct byte-store namespace
+for that option and keep original images in `media`.
+
+`AntflyGraphStore` accepts structurally compatible `GraphDocument` objects. It
+uses source-owned contributions and optimistic transactions to preserve shared
+nodes on replacement/deletion. Graph queries accept Antfly JSON, with `$param`
+objects for bound values. Supported operations are MATCH, traversal, shortest
+paths, k-shortest paths and exact counts. Every alias/path is constrained to the
+configured table and namespace; optional MATCH, arbitrary WHERE expressions and
+multi-hop MATCH edges are rejected. Explicit one-hop aliases remain available.
+`expandDocuments` preserves seed evidence and adds bounded graph neighbors.
+`createAntflyGraphTools` and `createAntflySearchTool` expose validated LangChain tools.
+The caller is responsible for choosing trusted tenant scopes.
+
+`AntflyMultimodalCorpus` persists summary vectors, original parent documents and
+image bytes. It uses deterministic revision IDs, checks image hashes before
+generation, rejects missing/stale references, and supports replacement/deletion.
+Multi-store ingestion is not atomic: after interruption rerun the same source;
+concurrent writes to one source must be serialized by the application. Orphaned
+records from an interrupted revision can require application cleanup.
+`AntflyEmbeddings.embedMultimodal` additionally supports native multimodal models;
+select and install a capable model explicitly.
+
+From this package directory, after building:
+
+```sh
+pnpm exec tsx examples/graph.ts create
+pnpm exec tsx examples/graph.ts query
+pnpm exec tsx examples/multimodal.ts ingest
+# Can run after restarting Antfly; verify reads no local fixture files:
+pnpm exec tsx examples/multimodal.ts verify
+pnpm exec tsx examples/multimodal.ts ask 'What is the chart audit marker?'
+# Explicit opt-in using OPENAI_MODEL and OPENAI_API_KEY:
+pnpm exec tsx examples/multimodal.ts ask 'What is the chart audit marker?' --generate
+pnpm exec tsx examples/multimodal.ts delete
+```
+
+Set `ANTFLY_URL` and `ANTFLY_EMBEDDING_MODEL` as in the quickstart. The bundled
+synthetic PDF, two original PNG figures, extracted text and declared summaries
+come from the Apache-2.0 Python-suite fixture. This example uses pre-extracted
+fixture text; it is not a general PDF parser. Verification measures retrieval and
+media integrity; it does not claim vision-answer quality. Generation accepts a
+standard LangChain chat model and validates citation IDs.
+
+Long-term memory lives in the separate [@antfly/langgraph-store](../langgraph-store/README.md)
+package because LangGraph's BaseStore has a different contract.
+
 Chat-model adapters, execution checkpointing, per-item TTL, arbitrary PDF parsing,
 and embedded-runtime support are outside this release.

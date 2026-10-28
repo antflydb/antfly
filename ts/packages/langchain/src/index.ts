@@ -1,10 +1,15 @@
 export { AntflyEmbeddings, type AntflyEmbeddingsOptions } from "./embeddings.js";
+export * from "./graphs.js";
+export * from "./multimodal.js";
 export { AntflyReranker, type AntflyRerankerOptions } from "./reranker.js";
 export {
   AntflyRetriever,
   type AntflyRetrieverCallOptions,
   type AntflyRetrieverOptions,
 } from "./retriever.js";
+
+export * from "./stores.js";
+export * from "./tools.js";
 export {
   type AntflyFilter,
   type DistanceMetric,
