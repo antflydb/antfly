@@ -2,8 +2,9 @@
 
 Baseline: `d89b8ad34fec1e79cea082ad4fb5faddbbb44dca`.
 
-The six work packages are implemented. CPU and Metal qualification is complete;
-fresh CUDA runtime qualification remains queued behind existing Glowworm work.
+The six work packages are implemented and qualified. CPU, Metal and the fresh
+CUDA runtime matrix pass their recorded numerical, resource and performance
+checks.
 
 ## Source result
 
@@ -111,7 +112,7 @@ All **384 retained outputs are finite and byte-identical** per case across arms.
 Route checks and the independent decoder reference pass at the existing 0.002
 tolerance; the decoder's worst sampled absolute error is below 0.000668.
 
-## CUDA evidence and pending device work
+## CUDA static and runtime qualification
 
 CUDA 13.2 compiles portable PTX, SM89, SM121a and the seven-target fatbin.
 Every supported target retains **454 exports**, identical register, stack,
@@ -121,12 +122,29 @@ change only RMSNorm's input VJP, with unchanged instruction count/resources.
 The **SM121a cubin is byte-identical to baseline**. Checked-in PTX, fatbin and
 SM89 images are regenerated from the final pinned inputs; source policy passes.
 
-A final source-pinned runtime controller waits behind existing Glowworm jobs.
-It contains 49 independent normalization forward/gradient, pooling, masked
-contrastive, layout/repeated-head and GELU cases with fixed AA/AB/BA comparisons.
-The earlier superseded controller was stopped while waiting, before GPU work.
-No unrelated job is stopped. Static/identity evidence is separate from this
-pending fresh CUDA runtime receipt.
+The source-pinned runtime matrix completed on Glowworm's DGX Spark after the
+existing jobs cleared. All **49 cases pass AA/AB/BA** (147 cohort/case checks):
+normalization forward/input gradients, mean/L2 pooling, masked contrastive
+probabilities and losses, layout conversion, repeated heads and GELU products.
+Independent references, exact baseline/candidate outputs, replay outputs and
+guards pass. Register counts and active blocks per SM match for every case.
+
+| Cohort | Worst median ratio | Worst p95 ratio |
+| --- | ---: | ---: |
+| AA calibration | 1.000976 | 1.013444 |
+| AB | 1.001679 | 1.011386 |
+| BA | 1.002881 | 1.012689 |
+
+The original 5% median / 10% p95 limits, fixed 32 balanced arms and 20,000
+captured launches per arm remain unchanged. The pinned stable harness retains
+its 500 ms wall-clock warmup; CUDA event intervals are archived separately.
+No automatic failure retry or interruption of unrelated work occurred. The
+superseded controller was stopped while still waiting, before GPU work.
+
+All CUDA source/header and runtime input hashes were reverified after the run.
+The raw receipts, logs, harness, fixtures, binary and independently recomputed
+summary are retained in `cuda-device-final/`. The standalone SM121a run is fresh
+device evidence; the seven-architecture checks above remain static evidence.
 
 ## Retained findings and provenance
 
