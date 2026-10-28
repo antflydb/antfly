@@ -6912,6 +6912,7 @@ pub const MetadataAdminVoprSource = struct {
             .sql_view_mutate,
             .sql_type_mutate,
             .sql_type_snapshot,
+            .sql_type_bindings,
             .sql_type_outcome,
             .sql_cast_mutate,
             .sql_cast_snapshot,

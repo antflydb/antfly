@@ -91,6 +91,7 @@ pub const Rejection = enum {
     InvalidSqlEnumSymbol,
     InvalidSqlEnumOrder,
     SqlTypeActivationRequired,
+    SqlDependentType,
 
     InvalidSqlCastRecord,
     SqlInvalidTextRepresentation,

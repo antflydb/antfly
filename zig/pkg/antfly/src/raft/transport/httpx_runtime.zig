@@ -144,6 +144,7 @@ const Handler = struct {
                 .POST => .POST,
                 .PUT => .PUT,
                 .DELETE => .DELETE,
+                .PATCH => .PATCH,
                 else => return ctx.status(405).text("method not allowed"),
             },
             .uri = ctx.request.uri.path,

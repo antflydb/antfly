@@ -1903,6 +1903,69 @@ pub const SQLBuiltinType = enum {
     }
 };
 
+/// A schema-bound enum column. JSON values are exact labels; SQL NULL is distinct from every label, including the empty string.
+pub const SQLNamedEnumColumnSchema = struct {
+    type: []const u8,
+    /// Resolved catalog type ID. The table's named_types directory supplies its immutable executable definition.
+    x_antfly_sql_type_id: u64,
+    nullable: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "x-antfly-sql-type-id", "x_antfly_sql_type_id", false },
+        .{ "nullable", "nullable", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("x-antfly-sql-type-id");
+        try jw.write(self.x_antfly_sql_type_id);
+        if (self.nullable) |value| {
+            try jw.objectField("nullable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Immutable enum symbol. Symbol IDs are append-only; order keys are opaque stable ordering metadata.
+pub const SQLNamedEnumLabel = struct {
+    id: u32,
+    /// Exact UTF-8 label; PostgreSQL limits its encoded length to 63 bytes.
+    text: []const u8,
+    /// Server-managed immutable ordering key encoded as lowercase hexadecimal.
+    order_key: []const u8,
+};
+
+/// Server-resolved immutable SQL type identity. Origin survives restore remapping of local IDs and wire OIDs.
+pub const SQLNamedTypeIdentity = struct {
+    id: u64,
+    namespace_id: u64,
+    generation: u32,
+    /// Opaque durable 128-bit origin, encoded as lowercase hexadecimal.
+    origin_id: []const u8,
+    oid: u32,
+    array_oid: u32,
+};
+
+/// Server-resolved executable type layout retained by a table schema epoch. Catalog ownership is separate from value representation.
+pub const SQLNamedTypeLayout = struct {
+    kind: []const u8,
+    identity: SQLNamedTypeIdentity,
+    labels: []const SQLNamedEnumLabel,
+};
+
 /// PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC.
 pub const SQLNumericModifier = struct {
     precision: i64,
@@ -1948,6 +2011,8 @@ pub const SQLRangeColumnSchema = struct {
 
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
+    /// Server-resolved immutable SQL type layouts, sorted by catalog ID. Clients reference types through x-antfly-sql-type-id; catalog admission verifies every layout against its active definition. Retained by backups and schema epochs for deterministic cold decoding.
+    named_types: ?[]const SQLNamedTypeLayout = null,
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?u32 = null,
     storage_mode: ?TableStorageMode = null,
@@ -1982,6 +2047,7 @@ pub const TableSchema = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "named_types", "named_types", true },
         .{ "version", "version", true },
         .{ "storage_mode", "storage_mode", true },
         .{ "base_source", "base_source", true },
@@ -2010,6 +2076,10 @@ pub const TableSchema = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.named_types) |value| {
+            try jw.objectField("named_types");
+            try jw.write(value);
+        }
         if (self.version) |value| {
             try jw.objectField("version");
             try jw.write(value);

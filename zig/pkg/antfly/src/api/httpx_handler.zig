@@ -385,6 +385,10 @@ fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []cons
 fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     const jsonErrorResponse = AntflyApiHandler.jsonErrorResponse;
     return switch (err) {
+        error.Forbidden => jsonErrorResponse(ctx, 403, "schema declaration requires access to its referenced catalog objects"),
+        error.SqlNamedTypeNotFound => jsonErrorResponse(ctx, 400, "referenced SQL type does not exist"),
+        error.CatalogGenerationChanged => jsonErrorResponse(ctx, 409, "referenced catalog definitions changed; refresh and retry"),
+        error.MetadataCapabilityUnavailable => jsonErrorResponse(ctx, 503, "referenced schema capabilities are not active on this deployment"),
         error.UnsupportedExternalLakeSchemaType => jsonErrorResponse(ctx, 400, "automatic lake schema detection requires supported flat scalar columns; unsupported nested or binary types need a compatible source"),
         error.ExternalLakeSchemaMismatch => jsonErrorResponse(ctx, 409, "lake files have incompatible column types or the supplied schema fingerprint does not match the detected schema"),
         error.ExternalLakeSchemaUnavailable => jsonErrorResponse(ctx, 400, "lake schema metadata is unavailable; Parquet inference requires at least one file with a schema"),
@@ -7876,7 +7880,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(413);
             return ctx.text("create table request too large");
         }
-        var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
+        const bound_body = @import("sql_type_schema.zig").bindCreateBodyAlloc(self.api_server, alloc, authenticated_identity, operationContext(ctx, authenticated_identity), body_data) catch |err| return witnessDDLError(ctx, err);
+        defer if (bound_body) |bytes| alloc.free(bytes);
+        var create_req = table_contract.parseCreateTableRequest(alloc, bound_body orelse body_data) catch |err| {
             if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
                 std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
                 return err;
@@ -7889,7 +7895,7 @@ pub const AntflyApiHandler = struct {
         const create_route = try system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path));
         defer if (create_route) |value| value.deinit(alloc);
         const create_scope = if (create_route) |value| try value.target() else try system_catalog.Target.literal(logical_table_name);
-        const bound_schema = self.api_server.bindForeignKeySchema(alloc, create_scope, decoded_table_name, tables_api.effectiveSchemaJson(create_req.schema_json), "", authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| {
+        const bound_schema = self.api_server.bindResolvedForeignKeySchema(alloc, create_scope, decoded_table_name, tables_api.effectiveSchemaJson(create_req.schema_json), "", authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| {
             if (err == error.Forbidden) return jsonErrorResponse(ctx, 403, "foreign key declarations require admin permission on every referenced parent table");
             return witnessDDLError(ctx, err);
         };
@@ -8661,10 +8667,8 @@ pub const AntflyApiHandler = struct {
                 current_record.lake_index_catalog_json = definition.lake_index_catalog_json;
             }
             const current = &current_record;
-            const proposed = (if (mode == .merge_patch)
-                table_contract.mergeSchemaPatchRequest(alloc, current.schema_json, body_data)
-            else
-                table_contract.parseSchemaUpdateRequest(alloc, body_data)) catch |err| {
+            const proposed = @import("sql_type_schema.zig").bindUpdateAlloc(self.api_server, alloc, authenticated_identity, operationContext(ctx, authenticated_identity), current.schema_json, body_data, mode) catch |err| {
+                if (err == error.Forbidden or err == error.MetadataCapabilityUnavailable or err == error.SqlNamedTypeNotFound or err == error.CatalogGenerationChanged) return witnessDDLError(ctx, err);
                 if (err == error.OutOfMemory) return err;
                 _ = ctx.status(400);
                 return ctx.text(table_contract.schemaUpdateRequestErrorMessage(err, body_data));
@@ -8686,7 +8690,7 @@ pub const AntflyApiHandler = struct {
             const logical_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return jsonErrorResponse(ctx, 400, "invalid table name");
             defer alloc.free(logical_name);
             const schema_scope = if (schema_route) |value| try value.target() else try system_catalog.Target.literal(logical_name);
-            const bound = self.api_server.bindForeignKeySchema(alloc, schema_scope, decoded_table_name, proposed, current.schema_json, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| {
+            const bound = self.api_server.bindResolvedForeignKeySchema(alloc, schema_scope, decoded_table_name, proposed, current.schema_json, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| {
                 if (err == error.Forbidden) return jsonErrorResponse(ctx, 403, "foreign key declarations require admin permission on every referenced parent table");
                 return witnessDDLError(ctx, err);
             };
@@ -8791,11 +8795,7 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(405);
                     return ctx.text("schema patch is unavailable on this deployment");
                 }
-                const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch |parse_err| {
-                    invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(parse_err, body_data);
-                    _ = ctx.status(400);
-                    return ctx.text(invalid_schema_message);
-                };
+                const schema_json = try alloc.dupe(u8, supported_schema orelse return error.InvalidSchemaUpdateRequest);
                 defer alloc.free(schema_json);
                 const table_writes_source = self.api_server.table_writes orelse {
                     _ = ctx.status(405);

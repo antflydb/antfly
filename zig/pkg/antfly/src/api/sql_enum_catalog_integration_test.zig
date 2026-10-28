@@ -156,3 +156,126 @@ fn lostAck(ctx: *fixture.Context) !void {
     try std.testing.expect(recovered.object_id != null);
     try std.testing.expectEqual(@as(usize, 1), probe.mutations);
 }
+
+const IngressCampaign = struct {
+    pub const native_auth = true;
+    pub const cold_catalog = true;
+    credentials: client.ApiKeyHeaders = .{},
+    type_id: u64 = 0,
+    schema_version: u32 = 0,
+    pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+        try Campaign.configureAuth(manager);
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.credentials.activateWithCatalog(ctx, true);
+        ctx.headers = ctx.admin_headers;
+        var created_type = try client.execute(ctx, "CREATE TYPE ingress_state AS ENUM ('z','a','')", .write_admission);
+        defer created_type.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), created_type.status);
+        const server = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
+        var region = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const request: types.SnapshotRequest = .{ .targets = &.{.{ .table = "ingress_state" }} };
+        const bytes = try server.source.systemCatalog(a, .{ .setting_admin = true }, .{ .sql_type_snapshot = request });
+        const cut = try std.json.parseFromSliceLeaky(types.Snapshot, a, bytes, .{});
+        try cut.validate(a, request);
+        self.type_id = cut.found.?.record.identity.id;
+        const body = try std.json.Stringify.valueAlloc(a, .{
+            .indexes = std.json.Value{ .object = .empty },
+            .schema = .{
+                .storage_mode = "relational",
+                .default_type = "row",
+                // A readonly assertion has no authority, even if malformed.
+                .named_types = .{ .forged = "not a catalog definition" },
+                .document_schemas = .{ .row = .{ .schema = .{
+                    .type = "object",
+                    .additionalProperties = false,
+                    .properties = .{ .state = .{ .type = "sql_enum", .@"x-antfly-sql-type-id" = self.type_id, .nullable = true } },
+                } } },
+            },
+        }, .{});
+        var created = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/enum_rows", .POST, body, 15_000);
+        defer created.deinit(ctx.alloc);
+        errdefer std.debug.print("enum table create status={d} body={s}\n", .{ created.status, created.body });
+        try std.testing.expect(created.status == 200 or created.status == 201);
+        const serving = try fixture.waitServingSchema(ctx, "enum_rows", 0);
+        self.schema_version = serving.version;
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+        try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "enum_rows");
+        const mutations = try std.json.Stringify.valueAlloc(a, .{ .schema_version = self.schema_version, .mutations = .{
+            .{ .key = "first", .expected_version = "0", .row = .{ .state = "z" } },
+            .{ .key = "empty", .expected_version = "0", .row = .{ .state = "" } },
+            .{ .key = "null", .expected_version = "0", .row = .{ .state = @as(?[]const u8, null) } },
+        } }, .{});
+        var written = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/enum_rows/rows/mutate", .POST, mutations, 15_000);
+        defer written.deinit(ctx.alloc);
+        errdefer std.debug.print("enum typed writes status={d} body={s}\n", .{ written.status, written.body });
+        try std.testing.expectEqual(@as(u16, 201), written.status);
+        const invalid = try std.json.Stringify.valueAlloc(a, .{ .schema_version = self.schema_version, .mutations = .{.{ .key = "invalid", .expected_version = "0", .row = .{ .state = "Z" } }} }, .{});
+        var rejected = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/enum_rows/rows/mutate", .POST, invalid, 15_000);
+        defer rejected.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 400), rejected.status);
+        // PATCH binds the full postimage, replaces readonly assertions, and
+        // preserves historical rows under a newly published immutable epoch.
+        var patched = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/enum_rows/schema", .PATCH, "{\"named_types\":{\"forged\":true}}", 15_000);
+        defer patched.deinit(ctx.alloc);
+        errdefer std.debug.print("enum schema patch status={d} body={s}\n", .{ patched.status, patched.body });
+        try std.testing.expectEqual(@as(u16, 200), patched.status);
+        var updated = try std.json.parseFromSlice(struct { schema: struct { version: u32 } }, ctx.alloc, patched.body, .{ .ignore_unknown_fields = true });
+        defer updated.deinit();
+        self.schema_version = updated.value.schema.version;
+        try self.observe(ctx);
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        ctx.headers = ctx.admin_headers;
+        try self.observe(ctx);
+    }
+    fn observe(self: *@This(), ctx: *fixture.Context) !void {
+        const serving = try fixture.waitServingSchema(ctx, "enum_rows", self.schema_version);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+        var table = try fixture.table(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "enum_rows");
+        defer table.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), table.status);
+        // Public reads retain the server-resolved executable snapshot.
+        var parsed = try std.json.parseFromSlice(std.json.Value, ctx.alloc, table.body, .{});
+        defer parsed.deinit();
+        const registry = parsed.value.object.get("schema").?.object.get("named_types").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), registry.len);
+        try std.testing.expectEqual(self.type_id, @as(u64, @intCast(registry[0].object.get("identity").?.object.get("id").?.integer)));
+        const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .schema_version = self.schema_version, .fields = &[_][]const u8{"state"}, .limit = 4 }, .{});
+        defer ctx.alloc.free(body);
+        var rows = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/enum_rows/rows/query", .POST, body, 15_000);
+        defer rows.deinit(ctx.alloc);
+        errdefer std.debug.print("enum projected rows status={d} body={s}\n", .{ rows.status, rows.body });
+        try std.testing.expectEqual(@as(u16, 200), rows.status);
+        const Row = struct { _id: []const u8, row: struct { state: ?[]const u8 } };
+        var lines = std.mem.tokenizeScalar(u8, rows.body, '\n');
+        const expected_keys = [_][]const u8{ "empty", "first", "null" };
+        const expected_labels = [_]?[]const u8{ "", "z", null };
+        for (expected_keys, expected_labels) |key, label| {
+            const line = lines.next() orelse return error.MissingEnumRow;
+            var row = try std.json.parseFromSlice(Row, ctx.alloc, line, .{ .ignore_unknown_fields = true });
+            defer row.deinit();
+            try std.testing.expectEqualStrings(key, row.value._id);
+            if (label) |text| try std.testing.expectEqualStrings(text, row.value.row.state.?) else try std.testing.expect(row.value.row.state == null);
+        }
+        try std.testing.expect(lines.next() == null);
+        const filtered_body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .schema_version = self.schema_version, .fields = &[_][]const u8{"state"}, .conditions = .{.{ .column = "state", .op = "lt", .value = "a" }} }, .{});
+        defer ctx.alloc.free(filtered_body);
+        var filtered = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/enum_rows/rows/query", .POST, filtered_body, 15_000);
+        defer filtered.deinit(ctx.alloc);
+        errdefer std.debug.print("enum filtered rows status={d} body={s}\n", .{ filtered.status, filtered.body });
+        try std.testing.expectEqual(@as(u16, 200), filtered.status);
+        var matches = std.mem.tokenizeScalar(u8, filtered.body, '\n');
+        var match = try std.json.parseFromSlice(Row, ctx.alloc, matches.next() orelse return error.MissingEnumRow, .{ .ignore_unknown_fields = true });
+        defer match.deinit();
+        try std.testing.expectEqualStrings("first", match.value._id);
+        try std.testing.expectEqualStrings("z", match.value.row.state.?);
+        try std.testing.expect(matches.next() == null);
+    }
+};
+
+test "mounted SQL named enum schema binding prepares public typed writes and retains cold projections" {
+    try fixture.runWithState(IngressCampaign, .{});
+}

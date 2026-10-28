@@ -248,22 +248,28 @@ pub const TuplePlan = struct {
         self.* = undefined;
     }
 
+    /// Physical value-domain compatibility, independent of column spelling.
+    /// FK planners bind their own ordered child and parent columns, so sharing
+    /// an integer carrier is never enough to equate two named enum types.
+    pub fn sameValueDomain(self: TuplePlan, left_index: usize, other: TuplePlan, right_index: usize) bool {
+        const left = self.keys[left_index];
+        const right = other.keys[right_index];
+        if (left.column_type != right.column_type or self.columns[left.ordinal].sql_element_type != other.columns[right.ordinal].sql_element_type) return false;
+        if (left.enum_record) |record| return if (right.enum_record) |rhs| record.sameValueDomain(rhs.*) else false;
+        return right.enum_record == null;
+    }
+
     /// Uniqueness inference ignores presentation order and sort direction,
     /// while retaining the exact typed expression/collation identity.
     pub fn sameEqualityKey(self: TuplePlan, left_index: usize, other: TuplePlan, right_index: usize) bool {
         const left = self.keys[left_index];
         const right = other.keys[right_index];
         if (left.column_type != right.column_type or left.fold_ascii != right.fold_ascii) return false;
-        if (left.enum_record) |record| {
-            const rhs = right.enum_record orelse return false;
-            if (record.identity.id != rhs.identity.id or !std.mem.eql(u8, &record.identity.origin_id, &rhs.identity.origin_id)) return false;
-        } else if (right.enum_record != null) return false;
         if (left.expression) |expression| {
             const rhs = right.expression orelse return false;
             return std.mem.eql(u8, &expression.fingerprint, &rhs.fingerprint);
         }
-        if (right.expression != null) return false;
-        if (self.columns[left.ordinal].sql_element_type != other.columns[right.ordinal].sql_element_type) return false;
+        if (right.expression != null or !self.sameValueDomain(left_index, other, right_index)) return false;
         return std.mem.eql(u8, self.columns[left.ordinal].name, other.columns[right.ordinal].name);
     }
 
@@ -303,12 +309,7 @@ pub const TuplePlan = struct {
                 return error.RelationalIndexColumnTypeMismatch;
             if (original.enum_record) |record| {
                 const candidate = &(layout.enumView(ordinal) orelse return error.RelationalIndexColumnTypeMismatch).record;
-                if (record.identity.id != candidate.identity.id or !std.mem.eql(u8, &record.identity.origin_id, &candidate.identity.origin_id)) return error.RelationalIndexColumnTypeMismatch;
-                // Stable symbols/ranks must be identical in historical epochs.
-                const common = @min(record.definition.labels.len, candidate.definition.labels.len);
-                for (record.definition.labels[0..common], candidate.definition.labels[0..common]) |left, right| {
-                    if (left.id != right.id or !std.mem.eql(u8, left.text, right.text) or !std.mem.eql(u8, left.order_key, right.order_key)) return error.RelationalIndexColumnTypeMismatch;
-                }
+                if (!record.sameValueDomain(candidate.*)) return error.RelationalIndexColumnTypeMismatch;
                 key.enum_record = candidate;
             }
             key.ordinal = @intCast(ordinal);
@@ -330,6 +331,26 @@ pub const TuplePlan = struct {
     /// composite constraint claims and FK probes.
     pub fn appendValues(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), values: []const Value) !bool {
         return self.appendValuesWithContext(alloc, out, values, null);
+    }
+
+    /// Public JSON bounds/predicates use an enum's label representation.
+    /// Resolve it once through the pinned epoch, retaining the cached atom.
+    /// The ordinary typed encoder stays strict: SQL TEXT is not an enum.
+    pub fn resolveLiteral(self: TuplePlan, index: usize, value: Value) !Value {
+        if (index >= self.keys.len) return error.InvalidRelationalIndexBound;
+        const key = self.keys[index];
+        if (key.column_type != .enumeration or value != .string) return value;
+        const view = self.layout.enumView(key.ordinal) orelse return error.InvalidRelationalIndexBound;
+        return .{ .enumeration = view.input(value.string) catch return error.InvalidRelationalIndexBound };
+    }
+
+    /// Preparation-only JSON boundary. Conversion borrows the shared symbol
+    /// directory and uses fixed stack storage, independent of result count.
+    pub fn appendLiteralValues(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), values: []const Value) !bool {
+        if (values.len > self.keys.len or values.len > 32) return error.InvalidRelationalIndexBound;
+        var resolved: [32]Value = undefined;
+        for (values, resolved[0..values.len], 0..) |value, *target, i| target.* = try self.resolveLiteral(i, value);
+        return self.appendValues(alloc, out, resolved[0..values.len]);
     }
 
     /// Preserve per-key size limits while charging aggregate work to the row.

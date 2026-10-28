@@ -860,6 +860,9 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
             var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(alloc, resource.source_json);
             defer record.deinit();
             if (try namedTypeByOrigin(alloc, txn, group_id, record.value.identity.origin_id) != resource.id) return error.InvalidCatalogRecord;
+            const expected = try @import("antfly_local_sources").sql_catalog.named_layouts.digest(alloc, record.value);
+            const actual = (try namedTypeLayoutDigest(alloc, txn, group_id, resource.id)) orelse return error.InvalidCatalogRecord;
+            if (!std.mem.eql(u8, &expected, &actual)) return error.InvalidCatalogRecord;
         }
         if (found.value.id != resource.id) return error.InvalidCatalogRecord;
         const child_key = try childKey(alloc, group_id, resource);
@@ -895,6 +898,19 @@ fn childKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource) ![]u8 {
     if (r.kind != .routine) return base;
     defer alloc.free(base);
     return std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ base, r.signature orelse return error.InvalidCatalogRecord });
+}
+fn namedTypeLayoutKey(a: std.mem.Allocator, group: u64, id: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:type_layout:{d}", .{ group, id });
+}
+pub fn namedTypeLayoutDigest(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, id: u64) !?[32]u8 {
+    const key = try namedTypeLayoutKey(a, group, id);
+    defer a.free(key);
+    const bytes = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (bytes.len != 32) return error.InvalidCatalogRecord;
+    return bytes[0..32].*;
 }
 fn namedTypeOriginKey(a: std.mem.Allocator, group: u64, origin: [16]u8) ![]u8 {
     const prefix = try namePrefixAlloc(a, group);
@@ -996,6 +1012,10 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         std.mem.writeInt(u64, &encoded, r.id, .little);
         if (previous) |value| if (!std.mem.eql(u8, value, &encoded)) return error.InvalidCatalogRecord;
         try txn.put(key, &encoded);
+        const layout_key = try namedTypeLayoutKey(alloc, group_id, r.id);
+        defer alloc.free(layout_key);
+        const digest = try @import("antfly_local_sources").sql_catalog.named_layouts.digest(alloc, record.value);
+        try txn.put(layout_key, &digest);
     }
     if (r.kind == .routine or r.kind == .cast) {
         var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, r);
@@ -1041,6 +1061,12 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         const key = try namedTypeOriginKey(alloc, group_id, record.value.identity.origin_id);
         defer alloc.free(key);
         txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        const layout_key = try namedTypeLayoutKey(alloc, group_id, r.id);
+        defer alloc.free(layout_key);
+        txn.delete(layout_key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
         };

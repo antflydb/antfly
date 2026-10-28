@@ -235,6 +235,19 @@ pub const Record = struct {
     definition: Definition,
     owner: @import("owners.zig").Owner,
 
+    /// Equality and ordered-key compatibility across independently pinned
+    /// epochs. ADD VALUE may append symbols; the shared history must preserve
+    /// every label and rank. Local IDs and durable origins both define type
+    /// identity, independently of column names and catalog ownership.
+    pub fn sameValueDomain(self: Record, other: Record) bool {
+        if (self.identity.id != other.identity.id or !std.mem.eql(u8, &self.identity.origin_id, &other.identity.origin_id)) return false;
+        const common = @min(self.definition.labels.len, other.definition.labels.len);
+        for (self.definition.labels[0..common], other.definition.labels[0..common]) |left, right| {
+            if (left.id != right.id or !std.mem.eql(u8, left.text, right.text) or !std.mem.eql(u8, left.order_key, right.order_key)) return false;
+        }
+        return true;
+    }
+
     /// Deep ownership for native schema epochs. No JSON arena or catalog
     /// cursor is retained by an installed schema.
     pub fn cloneOwned(self: Record, a: A) !Record {

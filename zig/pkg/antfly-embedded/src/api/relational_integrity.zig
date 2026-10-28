@@ -157,8 +157,8 @@ pub const Plan = struct {
             var parent_tuple = try bindTuple(owned, binding.parent, def.parent_columns);
             defer parent_tuple.deinit();
             const child_tuple = try bindTuple(owned, view, def.child_columns);
-            for (child_tuple.keys, parent_tuple.keys) |child, parent| {
-                if (child.column_type != parent.column_type) return error.ForeignKeyTypeMismatch;
+            for (0..child_tuple.keys.len) |i| {
+                if (!child_tuple.sameValueDomain(i, parent_tuple, i)) return error.ForeignKeyTypeMismatch;
             }
             var copied = def;
             copied.name = try owned.dupe(u8, def.name);

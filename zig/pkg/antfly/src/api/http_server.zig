@@ -17611,6 +17611,15 @@ pub const ApiHttpServer = struct {
     /// Stored constraints use immutable identities, so rename never retargets
     /// an FK and drop/recreate cannot silently attach it to a different table.
     pub fn bindForeignKeySchema(self: *ApiHttpServer, alloc: std.mem.Allocator, scope: system_catalog.Target, child: []const u8, proposed_json: []const u8, before: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) ![]u8 {
+        const bound_types = try @import("sql_type_schema.zig").bindSchemaAlloc(self, alloc, identity, context, proposed_json);
+        defer if (bound_types) |bytes| alloc.free(bytes);
+        return self.bindResolvedForeignKeySchema(alloc, scope, child, bound_types orelse proposed_json, before, identity, context);
+    }
+
+    /// Public ingress has already captured named layouts before contract
+    /// parsing. Reuse that cut rather than doing a second metadata round trip;
+    /// the metadata transaction independently verifies its catalog witnesses.
+    pub fn bindResolvedForeignKeySchema(self: *ApiHttpServer, alloc: std.mem.Allocator, scope: system_catalog.Target, child: []const u8, proposed_json: []const u8, before: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) ![]u8 {
         const normalized = try context.platformDeadline();
         const bound_identity = try @import("lake_schema_detection.zig").bindIdentity(alloc, proposed_json, before);
         defer if (bound_identity) |bytes| alloc.free(bytes);
@@ -22351,10 +22360,13 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(table_name);
         if (body.len > tables_api.max_table_create_body_bytes)
             return try contextual_operations.textAlloc(self.alloc, 413, "create table request too large");
-        var request = table_contract.parseCreateTableRequest(self.alloc, body) catch |err|
+        const bound_body = @import("sql_type_schema.zig").bindCreateBodyAlloc(self, self.alloc, authenticated_identity, .{}, body) catch |err|
+            return try contextual_operations.textAlloc(self.alloc, system_catalog.httpStatus(err), @errorName(err));
+        defer if (bound_body) |bytes| self.alloc.free(bytes);
+        var request = table_contract.parseCreateTableRequest(self.alloc, bound_body orelse body) catch |err|
             return try contextual_operations.textAlloc(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, body));
         defer request.deinit(self.alloc);
-        const bound_schema = self.bindForeignKeySchema(self.alloc, try system_catalog.Target.parse(logical_name), table_name, tables_api.effectiveSchemaJson(request.schema_json), "", authenticated_identity, .{}) catch |err| {
+        const bound_schema = self.bindResolvedForeignKeySchema(self.alloc, try system_catalog.Target.parse(logical_name), table_name, tables_api.effectiveSchemaJson(request.schema_json), "", authenticated_identity, .{}) catch |err| {
             if (err == error.Forbidden) return contextualJsonErrorResponse(self.alloc, 403, "foreign key declarations require admin permission on every referenced parent table");
             return contextualWitnessDDLError(self.alloc, err);
         };

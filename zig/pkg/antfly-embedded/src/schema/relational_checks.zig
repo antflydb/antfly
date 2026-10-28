@@ -52,7 +52,9 @@ pub fn validateSchemaUpdate(alloc: Allocator, previous_json: []const u8, next_js
 pub fn valueFromJson(alloc: Allocator, kind: schema.RelationalColumnType, value: std.json.Value, literal: bool) !tuples.Value {
     if (value == .null) return .null;
     return switch (kind) {
-        .string => if (value == .string) .{ .string = value.string } else error.InvalidBatchRequest,
+        // Enum labels remain unbound only until predicate/bound preparation
+        // resolves their physical column's immutable symbol directory.
+        .string, .enumeration => if (value == .string) .{ .string = value.string } else error.InvalidBatchRequest,
         .integer => .{ .integer = if (literal and value == .string)
             std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidBatchRequest
         else

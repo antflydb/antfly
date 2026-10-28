@@ -76,8 +76,14 @@ pub fn validate(alloc: std.mem.Allocator, child_json: []const u8, parent_name: [
         if (fk.child_columns.len == 0 or fk.child_columns.len != fk.parent_columns.len)
             return error.ForeignKeyTypeMismatch;
         for (fk.child_columns, fk.parent_columns) |child_column, parent_column| {
-            if (try columnType(child_layout, child_column) != try columnType(parent_layout, parent_column))
-                return error.ForeignKeyTypeMismatch;
+            const left = try columnType(child_layout, child_column);
+            const right = try columnType(parent_layout, parent_column);
+            if (left.column_type != right.column_type) return error.ForeignKeyTypeMismatch;
+            if (left.column_type == .enumeration) {
+                const child_type = native.namedType(child_layout, left.named_type_id orelse return error.ForeignKeyTypeMismatch) orelse return error.ForeignKeyTypeMismatch;
+                const parent_type = native.namedType(parent_layout, right.named_type_id orelse return error.ForeignKeyTypeMismatch) orelse return error.ForeignKeyTypeMismatch;
+                if (!child_type.sameValueDomain(parent_type.*)) return error.ForeignKeyTypeMismatch;
+            }
         }
     }
 }
@@ -88,12 +94,12 @@ fn sameColumns(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
-fn columnType(layout: native.TableSchema, name: []const u8) !native.RelationalColumnType {
+fn columnType(layout: native.TableSchema, name: []const u8) !native.RelationalColumn {
     const column = for (layout.relational_columns) |candidate| {
         if (std.mem.eql(u8, candidate.name, name)) break candidate;
     } else return error.ForeignKeyTypeMismatch;
     return switch (column.column_type) {
-        .string, .blob, .boolean, .datetime, .integer, .number => column.column_type,
+        .string, .blob, .boolean, .datetime, .integer, .number, .enumeration => column,
         else => error.ForeignKeyTypeMismatch,
     };
 }

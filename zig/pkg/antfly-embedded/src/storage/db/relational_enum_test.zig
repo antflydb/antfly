@@ -332,3 +332,162 @@ test "SQL named enum schema pins retain atom directories after producer and init
     try std.testing.expectEqual(@as(u32, 39), pinned.readerRequirements().semantic_version);
     try std.testing.expectEqual(@as(u32, 39), pinned.readerRequirements().encoding_version);
 }
+
+test "SQL named enum FK planners retain exact domains across column names and additive epochs" {
+    const a = std.testing.allocator;
+    const registry = @import("schema_registry.zig");
+    const integrity = @import("../../api/relational_integrity.zig");
+    var labels = try types.Owned.create(a, &.{ "z", "a" });
+    defer labels.deinit();
+    var evolved = try types.Owned.add(a, labels.definition, "middle", .{ .before = "a" });
+    defer evolved.deinit();
+    const base: types.Record = .{ .identity = try types.Identity.init(7, 2, 1, @splat(3)), .definition = labels.definition, .owner = .auth_disabled };
+    const child_schema: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .named_types = &.{base}, .relational_columns = &.{.{ .name = "state", .path = "state", .column_type = .enumeration, .named_type_id = 7 }} };
+    var child: registry.SchemaView = .{ .epoch = try registry.Epoch.createCloned(a, child_schema) };
+    defer child.release();
+    const parent_unique: @import("../relational_index.zig").UniqueConstraint = .{ .name = "pk", .columns = &.{"parent_state"} };
+    const Cases = enum { same, additive, another_type, another_origin, forged_rank, forged_label };
+    for (std.enums.values(Cases)) |case| {
+        var record = base;
+        var forged = [_]types.Label{ labels.definition.labels[0], labels.definition.labels[1] };
+        switch (case) {
+            .same => {},
+            .additive => {
+                record.identity.generation = 2;
+                record.definition = evolved.definition;
+            },
+            .another_type => record.identity = try record.identity.remap(8, 2),
+            .another_origin => record.identity.origin_id = @splat(8),
+            .forged_rank => {
+                forged[0].order_key = "\x01";
+                record.definition.labels = &forged;
+            },
+            .forged_label => {
+                forged[0].text = "other";
+                record.definition.labels = &forged;
+            },
+        }
+        const parent_schema: schema.TableSchema = .{ .version = 2, .storage_mode = .relational, .requires_public_schema = true, .named_types = &.{record}, .relational_columns = &.{.{ .name = "parent_state", .path = "parent_state", .column_type = .enumeration, .named_type_id = record.identity.id }} };
+        var parent: registry.SchemaView = .{ .epoch = try registry.Epoch.createCloned(a, parent_schema) };
+        defer parent.release();
+        const binding: integrity.ForeignBinding = .{
+            .generation = @splat(1),
+            .parent_generation = @splat(2),
+            .definition = .{ .name = "fk", .child_columns = &.{"state"}, .parent_table = "parent", .parent_columns = &.{"parent_state"} },
+            .parent = parent,
+            .parent_unique = parent_unique,
+        };
+        if (case != .same and case != .additive) {
+            try std.testing.expectError(error.ForeignKeyTypeMismatch, integrity.Plan.init(a, "child", child, &.{}, &.{binding}));
+            continue;
+        }
+        var plan = try integrity.Plan.init(a, "child", child, &.{}, &.{binding});
+        defer plan.deinit();
+        const child_bytes = try encode(a, child_schema, "{\"state\":\"a\"}");
+        defer a.free(child_bytes);
+        const parent_bytes = try encode(a, parent_schema, "{\"parent_state\":\"a\"}");
+        defer a.free(parent_bytes);
+        var child_tuple = try keys.TuplePlan.init(a, child.tableSchema().*, child.physicalLayout(), &.{.{ .column = "state" }});
+        defer child_tuple.deinit();
+        var parent_tuple = try keys.TuplePlan.init(a, parent.tableSchema().*, parent.physicalLayout(), &.{.{ .column = "parent_state" }});
+        defer parent_tuple.deinit();
+        try std.testing.expect(child_tuple.sameValueDomain(0, parent_tuple, 0));
+        const left = try child_tuple.encodeAlloc(a, try codec.ordinalRowView(child_bytes, child.tableSchema().*, child.physicalLayout()));
+        defer a.free(left.bytes);
+        const right = try parent_tuple.encodeAlloc(a, try codec.ordinalRowView(parent_bytes, parent.tableSchema().*, parent.physicalLayout()));
+        defer a.free(right.bytes);
+        try std.testing.expectEqualSlices(u8, left.bytes, right.bytes);
+    }
+}
+
+test "SQL named enum JSON predicates and bounds prepare borrowed atoms and preserve declaration order" {
+    const a = std.testing.allocator;
+    const predicates = @import("relational_predicate.zig");
+    const partial = @import("relational_index_predicate.zig");
+    var labels = try types.Owned.create(a, &.{ "z", "a", "" });
+    defer labels.deinit();
+    const record: types.Record = .{ .identity = try types.Identity.init(7, 2, 1, @splat(3)), .definition = labels.definition, .owner = .auth_disabled };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .named_types = &.{record}, .relational_columns = &.{.{ .name = "state", .path = "state", .column_type = .enumeration, .named_type_id = 7, .allows_null = true }} };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var tuple = try keys.TuplePlan.init(a, table, &layout, &.{.{ .column = "state" }});
+    defer tuple.deinit();
+    const literal = try tuple.resolveLiteral(0, .{ .string = "a" });
+    try std.testing.expectEqual(try layout.enumView(0).?.input("a"), literal.enumeration);
+    var typed = std.ArrayList(u8).empty;
+    defer typed.deinit(a);
+    _ = try tuple.appendValues(a, &typed, &.{literal});
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(a);
+    _ = try tuple.appendLiteralValues(a, &wire, &.{.{ .string = "a" }});
+    try std.testing.expectEqualSlices(u8, typed.items, wire.items);
+    const prefix = wire.items.len;
+    // The typed encoder remains strict; only the explicit JSON boundary may
+    // turn a label into an enum. Failed conversions preserve existing bytes.
+    try std.testing.expectError(error.InvalidRelationalIndexBound, tuple.appendValues(a, &wire, &.{.{ .string = "a" }}));
+    try std.testing.expectEqual(prefix, wire.items.len);
+    try std.testing.expectError(error.InvalidRelationalIndexBound, tuple.appendLiteralValues(a, &wire, &.{.{ .string = "A" }}));
+    try std.testing.expectEqual(prefix, wire.items.len);
+    var condition = try predicates.Plan.init(a, table, &layout, .{ .column = "state", .op = .lt, .value = .{ .string = "a" } });
+    defer condition.deinit();
+    var source = try condition.projectSource(a, table, &layout);
+    defer source.deinit();
+    var member = try partial.Plan.init(a, table, &layout, &.{.{ .field = "state", .op = .lt, .value_json = "\"a\"" }});
+    defer member.deinit();
+    var partial_source = try member.projectSource(a, table, &layout);
+    defer partial_source.deinit();
+    var scratch = std.ArrayList(u8).empty;
+    defer scratch.deinit(a);
+    const inputs = [_][]const u8{ "{\"state\":\"z\"}", "{\"state\":\"a\"}", "{\"state\":\"\"}", "{\"state\":null}", "{}" };
+    const truths = [_]predicates.Truth{ .yes, .no, .no, .unknown, .unknown };
+    for (inputs, truths) |input, truth| {
+        const row_bytes = try encode(a, table, input);
+        defer a.free(row_bytes);
+        const row = try codec.ordinalRowView(row_bytes, table, &layout);
+        try std.testing.expectEqual(truth, try source.evaluate(a, &scratch, row));
+        try std.testing.expectEqual(truth == .yes, try partial_source.matches(a, &scratch, row));
+    }
+    try wire.ensureTotalCapacity(a, 128);
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const execution_alloc = denied.allocator();
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..100_000) |_| {
+        const atom = try tuple.resolveLiteral(0, .{ .string = "a" });
+        wire.clearRetainingCapacity();
+        _ = try tuple.appendLiteralValues(execution_alloc, &wire, &.{.{ .enumeration = atom.enumeration }});
+    }
+    try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+    std.debug.print("SQL enum JSON bound preparation: iterations=100000 elapsed_ns={} allocations={}\n", .{ std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started, denied.alloc_index });
+}
+
+test "SQL named enum text projection excludes row registries and remains stable across additive type epochs" {
+    const a = std.testing.allocator;
+    var labels = try types.Owned.create(a, &.{ "z", "a" });
+    defer labels.deinit();
+    const record: types.Record = .{ .identity = try types.Identity.init(7, 2, 1, @splat(3)), .definition = labels.definition, .owner = .auth_disabled };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .named_types = &.{record}, .relational_columns = &.{.{ .name = "state", .path = "state", .column_type = .enumeration, .named_type_id = 7 }} };
+    const projected = try schema.serializeTextProjectionSchema(a, table);
+    defer a.free(projected);
+    const decoded = try schema.deserializeSchema(a, projected);
+    defer schema.freeSchema(a, decoded);
+    try std.testing.expectEqual(schema.StorageMode.document, decoded.storage_mode);
+    try std.testing.expect(!decoded.requires_public_schema);
+    try std.testing.expectEqual(@as(usize, 0), decoded.named_types.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded.relational_columns.len);
+    var plain = table;
+    plain.named_types = &.{};
+    plain.relational_columns = &.{};
+    const ordinary = try schema.serializeTextProjectionSchema(a, plain);
+    defer a.free(ordinary);
+    try std.testing.expectEqualSlices(u8, ordinary, projected);
+    var next = try types.Owned.add(a, labels.definition, "middle", .{ .before = "a" });
+    defer next.deinit();
+    var evolved_record = record;
+    evolved_record.identity.generation += 1;
+    evolved_record.definition = next.definition;
+    var evolved = table;
+    evolved.named_types = &.{evolved_record};
+    const after = try schema.serializeTextProjectionSchema(a, evolved);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(u8, projected, after);
+}

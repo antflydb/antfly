@@ -17,6 +17,7 @@ const std = @import("std");
 const schema_regex = @import("antfly_regex");
 const geo_mod = @import("../search/geo.zig");
 const storage_schema = @import("../storage/schema.zig");
+const named_layouts = @import("../common/sql_named_type_layout.zig");
 
 // The public vocabulary belongs to OpenAPI. storage/schema.zig separately
 // owns the explicitly tagged durable representation.
@@ -63,6 +64,7 @@ pub const TableSchema = struct {
     foreign_keys: ?std.json.Parsed([]const relational_wire.RelationalForeignKeyConstraint) = null,
     column_defaults: ?std.json.Parsed(std.json.Value) = null,
     generated_columns: ?std.json.Parsed(std.json.Value) = null,
+    named_types: ?named_layouts.Registry = null,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
         if (self.external_base_source) |*source| source.deinit(alloc);
@@ -72,6 +74,7 @@ pub const TableSchema = struct {
         if (self.foreign_keys) |*constraints| constraints.deinit();
         if (self.column_defaults) |*expressions| expressions.deinit();
         if (self.generated_columns) |*expressions| expressions.deinit();
+        if (self.named_types) |*registry| registry.deinit();
         alloc.free(self.default_type);
         alloc.free(self.ttl_field);
         for (self.document_schemas) |*document_schema| document_schema.deinit(alloc);
@@ -226,6 +229,7 @@ pub const IndexSortField = struct {
 
 pub const DocumentSchema = struct {
     name: []const u8,
+    has_named_type_fields: bool = false,
     min_properties: ?u64 = null,
     max_properties: ?u64 = null,
     required_fields: [][]const u8 = &.{},
@@ -332,6 +336,8 @@ pub const DocumentProperty = struct {
     integer_only: bool = false,
     format: ?[]const u8 = null,
     sql_column_name: ?[]const u8 = null,
+    named_type_id: ?u64 = null,
+    enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
     sql_type: ?@import("../common/sql_builtin_type.zig").Type = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     allows_null: bool = false,
@@ -548,6 +554,7 @@ const ParsedTypeSpec = struct {
 
 const SchemaContext = struct {
     document_root: std.json.ObjectMap,
+    named_type_seen: ?*bool = null,
     scope_schema: std.json.ObjectMap,
     numeric_domain: bool = false,
     strict_native_keywords: bool = false,
@@ -555,6 +562,7 @@ const SchemaContext = struct {
     fn child(self: SchemaContext, object: std.json.ObjectMap) SchemaContext {
         return .{
             .document_root = self.document_root,
+            .named_type_seen = self.named_type_seen,
             .scope_schema = if (object.get("$defs") != null) object else self.scope_schema,
             .strict_native_keywords = self.strict_native_keywords,
             .numeric_domain = self.numeric_domain or blk: {
@@ -828,6 +836,35 @@ const RootRefGuard = struct {
     }
 };
 
+/// Collect physical column type identities before catalog resolution. Readonly
+/// layout assertions are intentionally ignored here; the authority replaces
+/// them from one pinned catalog cut before compiling the complete schema.
+/// Constants, defaults, and JSON payload objects are never searched for refs.
+pub fn namedTypeReferencesAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u64 {
+    try validateSchemaValue(value, true);
+    var schema = try parseTableSchemaValueMode(alloc, value, true);
+    defer schema.deinit(alloc);
+    try validateParsedStorageModeSchema(schema);
+    var ids = std.ArrayList(u64).empty;
+    defer ids.deinit(alloc);
+    for (schema.document_schemas) |document| {
+        for (document.properties) |property| if (property.named_type_id) |id| {
+            if (ids.items.len >= named_layouts.max_types) return error.InvalidSchemaUpdateRequest;
+            try ids.append(alloc, id);
+        };
+    }
+    std.mem.sort(u64, ids.items, {}, std.sort.asc(u64));
+    var count: usize = 0;
+    for (ids.items) |id| {
+        if (count == 0 or ids.items[count - 1] != id) {
+            ids.items[count] = id;
+            count += 1;
+        }
+    }
+    ids.items.len = count;
+    return ids.toOwnedSlice(alloc);
+}
+
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     return parseSchemaRequest(alloc, body, false, true);
 }
@@ -859,6 +896,7 @@ fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inferenc
         try validateParsedRelationalSchema(schema);
         try validateRelationalExpressions(alloc, schema);
     }
+    if (schema.named_types) |registry| try named_layouts.canonicalizeSchemaLeaky(parsed.arena.allocator(), &parsed.value, registry.records);
     return try stringifyJsonValue(alloc, parsed.value);
 }
 
@@ -1180,7 +1218,7 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
         std.mem.eql(u8, kind, "html") or std.mem.eql(u8, kind, "search_as_you_type") or
         std.mem.eql(u8, kind, "substring") or
         std.mem.eql(u8, kind, "boolean") or std.mem.eql(u8, kind, "integer") or
-        std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "numeric") or sql_array;
+        std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "numeric") or std.mem.eql(u8, kind, "sql_enum") or sql_array;
     if (!physical_scalar) return false;
     if (property.integer_only and !std.mem.eql(u8, kind, "integer")) return false;
     const defaults = DocumentProperty{ .name = "" };
@@ -1192,6 +1230,8 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
             !std.mem.eql(u8, reflected_name, "sql_column_name") and
             !std.mem.eql(u8, reflected_name, "sql_type") and
             !std.mem.eql(u8, reflected_name, "numeric_modifier") and
+            !std.mem.eql(u8, reflected_name, "named_type_id") and
+            !std.mem.eql(u8, reflected_name, "enum_view") and
             !std.mem.eql(u8, reflected_name, "integer_only") and
             !std.mem.eql(u8, reflected_name, "allows_null"))
         {
@@ -1790,7 +1830,7 @@ fn validateNativeSchemaKeywordPlacement(object: std.json.ObjectMap) !void {
         .{ "x-antfly-field", {} },       .{ "x-antfly-include-in-all", {} },
         .{ "x-antfly-index", {} },       .{ "x-antfly-sql-numeric-modifier", {} },
         .{ "x-antfly-sql-type", {} },    .{ "x-antfly-types", {} },
-        .{ "x-antfly-column-name", {} },
+        .{ "x-antfly-column-name", {} }, .{ "x-antfly-sql-type-id", {} },
     });
     const table_only = comptime std.StaticStringMap(void).initComptime(.{
         .{ "storage_mode", {} },      .{ "default_type", {} },       .{ "enforce_types", {} },
@@ -1798,7 +1838,7 @@ fn validateNativeSchemaKeywordPlacement(object: std.json.ObjectMap) !void {
         .{ "ttl", {} },               .{ "ttl_field", {} },          .{ "ttl_duration", {} },
         .{ "ttl_duration_ns", {} },   .{ "relational_indexes", {} }, .{ "unique_constraints", {} },
         .{ "foreign_keys", {} },      .{ "checks", {} },             .{ "column_defaults", {} },
-        .{ "generated_columns", {} },
+        .{ "generated_columns", {} }, .{ "named_types", {} },
     });
     for (object.keys()) |key| {
         if (table_only.has(key) or (std.mem.startsWith(u8, key, "x-antfly-") and !native.has(key)))
@@ -1809,7 +1849,7 @@ fn validateNativeSchemaKeywordPlacement(object: std.json.ObjectMap) !void {
 fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
     if (context.strict_native_keywords) try validateNativeSchemaKeywordPlacement(object);
     // SQL identities belong to root column properties, never the row object.
-    if (object.contains("x-antfly-column-name") or object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")) return error.InvalidSchemaUpdateRequest;
+    if (object.contains("x-antfly-column-name") or object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier") or object.contains("x-antfly-sql-type-id")) return error.InvalidSchemaUpdateRequest;
     if (object.get("type")) |schema_type| {
         if (schema_type != .null) _ = try validateTypeSpecDefinition(schema_type, true);
     }
@@ -2376,6 +2416,7 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "embedding") or
         std.mem.eql(u8, schema_type_name, "json") or
         std.mem.eql(u8, schema_type_name, "sql_array") or
+        std.mem.eql(u8, schema_type_name, "sql_enum") or
         std.mem.eql(u8, schema_type_name, "object") or
         std.mem.eql(u8, schema_type_name, "array"))
     {
@@ -2886,6 +2927,10 @@ pub fn parseTtlDurationNs(raw: []const u8) !u64 {
 }
 
 fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !TableSchema {
+    return parseTableSchemaValueMode(alloc, value, false);
+}
+
+fn parseTableSchemaValueMode(alloc: std.mem.Allocator, value: std.json.Value, unresolved: bool) !TableSchema {
     const root = value.object;
 
     var parsed: TableSchema = .{
@@ -2955,6 +3000,9 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("enforce_types")) |enforce_types| {
         if (enforce_types != .null) parsed.enforce_types = enforce_types.bool;
     }
+    if (!unresolved) if (root.get("named_types")) |layouts| {
+        parsed.named_types = try named_layouts.Registry.parseValue(alloc, layouts);
+    };
     if (root.get("document_schemas")) |document_schemas| {
         if (document_schemas != .null) parsed.document_schemas = try parseDocumentSchemas(alloc, document_schemas);
     }
@@ -3052,6 +3100,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (parsed.external_base_source) |source| {
         if (source.binding.format == .lance or parsed.ttl_duration_ns != 0 or parsed.checks != null or parsed.unique_constraints != null or parsed.foreign_keys != null or parsed.column_defaults != null or parsed.generated_columns != null) return error.InvalidSchemaUpdateRequest;
     }
+    try bindNamedTypesMode(&parsed, unresolved);
     return parsed;
 }
 
@@ -3180,6 +3229,41 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
     }
 }
 
+fn bindNamedProperty(property: *DocumentProperty, registry: ?named_layouts.Registry, root: bool, unresolved: bool) anyerror!void {
+    if (property.named_type_id) |id| {
+        if (!root) return error.InvalidSchemaUpdateRequest;
+        if (!unresolved) {
+            const types = registry orelse return error.InvalidSchemaUpdateRequest;
+            property.enum_view = types.byId(id) orelse return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    const info = @typeInfo(DocumentProperty).@"struct";
+    inline for (info.field_names, info.field_types) |name, Field| {
+        const child = @field(property, name);
+        if (Field == []DocumentProperty) {
+            for (child) |*entry| try bindNamedProperty(entry, registry, false, unresolved);
+        } else if (Field == ?*DocumentProperty) {
+            if (child) |entry| try bindNamedProperty(entry, registry, false, unresolved);
+        } else if (Field == []const PatternProperty) {
+            for (child) |entry| try bindNamedProperty(entry.property, registry, false, unresolved);
+        } else if (Field == []const DependentSchema) {
+            for (child) |entry| try bindNamedProperty(entry.schema, registry, false, unresolved);
+        }
+    }
+}
+fn bindNamedTypesMode(schema: *TableSchema, unresolved: bool) !void {
+    if (schema.storage_mode != .relational and schema.named_types != null and schema.named_types.?.records.len != 0) return error.InvalidSchemaUpdateRequest;
+    for (schema.document_schemas) |document| {
+        if (!document.has_named_type_fields) continue;
+        var root = makeRootDocumentProperty(document);
+        // Only this root's named properties are physical columns. All other
+        // root predicates and nested shapes remain ordinary JSON contracts.
+        root.properties = &.{};
+        try bindNamedProperty(&root, schema.named_types, false, unresolved);
+        for (document.properties) |*property| try bindNamedProperty(property, schema.named_types, schema.storage_mode == .relational, unresolved);
+    }
+}
+
 fn validateParsedStorageModeSchema(schema: TableSchema) !void {
     if (schema.storage_mode == .relational) return;
     for (schema.document_schemas) |document_schema| {
@@ -3189,6 +3273,7 @@ fn validateParsedStorageModeSchema(schema: TableSchema) !void {
 }
 
 fn propertyContainsRelationalOnlySchemaType(property: *const DocumentProperty) bool {
+    if (property.named_type_id != null) return true;
     if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return true;
     if (property.sql_type != null) return true;
     if (property.field_type) |field_type| {
@@ -3780,6 +3865,7 @@ fn isRelationalStorageProperty(property: DocumentProperty) bool {
             std.mem.eql(u8, field_type, "embedding") or
             std.mem.eql(u8, field_type, "json") or
             std.mem.eql(u8, field_type, "sql_array") or
+            std.mem.eql(u8, field_type, "sql_enum") or
             std.mem.eql(u8, field_type, "object") or
             std.mem.eql(u8, field_type, "array");
     }
@@ -3826,7 +3912,9 @@ fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]Docu
     var it = object.iterator();
     while (it.next()) |entry| {
         const schema_value = entry.value_ptr.object.get("schema").?;
+        var named_type_seen = false;
         const context: SchemaContext = .{
+            .named_type_seen = &named_type_seen,
             .document_root = schema_value.object,
             .scope_schema = schema_value.object,
         };
@@ -3834,6 +3922,7 @@ fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]Docu
         defer alloc.destroy(property);
         errdefer property.deinit(alloc);
         document_schemas[initialized] = try parseDocumentSchemaFromProperty(alloc, entry.key_ptr.*, property);
+        document_schemas[initialized].has_named_type_fields = named_type_seen;
         initialized += 1;
     }
     return document_schemas;
@@ -3999,6 +4088,9 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     // Scalar parsing owns large Debug temporaries. Finish that work before
     // descending so nested schemas retain only the child traversal frame.
     try @call(.never_inline, parseScalarPropertyKeywords, .{ alloc, context.numeric_domain, object, property });
+    if (property.named_type_id != null) if (context.named_type_seen) |seen| {
+        seen.* = true;
+    };
     property.properties = if (object.get("properties")) |properties_value|
         if (properties_value == .object) try parseDocumentProperties(alloc, context, properties_value.object) else &[_]DocumentProperty{}
     else
@@ -4020,6 +4112,13 @@ fn parseScalarPropertyKeywords(alloc: std.mem.Allocator, numeric_domain: bool, o
             std.mem.eql(u8, name.string, "_id") or std.mem.eql(u8, name.string, "_doc") or std.mem.eql(u8, name.string, "_version")) return error.InvalidSchemaUpdateRequest;
         property.sql_column_name = try alloc.dupe(u8, name.string);
     }
+    property.named_type_id = if (object.get("x-antfly-sql-type-id")) |value| id: {
+        const number = exactU64JsonNumber(value) orelse return error.InvalidSchemaUpdateRequest;
+        if (number == 0) return error.InvalidSchemaUpdateRequest;
+        break :id number;
+    } else null;
+    const enum_family = if (property.field_type) |physical| std.mem.eql(u8, physical, "sql_enum") else false;
+    if (enum_family != (property.named_type_id != null) or (enum_family and (object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")))) return error.InvalidSchemaUpdateRequest;
     property.sql_type = if (object.get("x-antfly-sql-type")) |value| blk: {
         if (value != .string) return error.InvalidSchemaUpdateRequest;
         const physical = property.field_type orelse return error.InvalidSchemaUpdateRequest;
@@ -5413,6 +5512,20 @@ fn validateDocumentFieldValueWithContext(
             return;
         }
         return error.InvalidBatchRequest;
+    }
+
+    if (property.named_type_id != null) {
+        if (value.* != .string) return error.InvalidBatchRequest;
+        const view = property.enum_view orelse return error.InvalidBatchRequest;
+        if (value.string.len > @import("../system_catalog/named_types.zig").max_label_bytes) return error.InvalidBatchRequest;
+        if (context.preparation_execution) |execution| {
+            var count = view.record.definition.labels.len;
+            var branches: usize = 1;
+            while (count != 0) : (count >>= 1) branches += 1;
+            try execution.charge(branches * (1 + value.string.len));
+        }
+        _ = view.input(value.string) catch return error.InvalidBatchRequest;
+        return;
     }
 
     if (propertyIsSqlArray(property)) {

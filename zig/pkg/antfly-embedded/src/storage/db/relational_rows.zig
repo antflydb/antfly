@@ -621,7 +621,7 @@ pub const Reader = struct {
         var key = std.ArrayList(u8).empty;
         // The caller's arena owns this scratch and its result.
         try key.appendSlice(alloc, &(try records.forwardPrefix(index.id())));
-        _ = try index.tuple.appendValues(alloc, &key, bound.values);
+        _ = try index.tuple.appendLiteralValues(alloc, &key, bound.values);
         if (upper == bound.inclusive) return (try internal.nextPrefixAlloc(alloc, key.items)) orelse error.InvalidRelationalIndexBound;
         return key.items;
     }

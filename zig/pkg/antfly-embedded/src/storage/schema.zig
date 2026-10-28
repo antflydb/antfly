@@ -749,6 +749,10 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_public_schema = false;
     projection_schema.external_base_source = null;
     projection_schema.relational_columns = &.{};
+    // Text postings are over logical labels. Row-only executable registries
+    // cannot survive after their columns and public-schema contract are
+    // removed, or alter the retained v11/v12 text projection identity.
+    projection_schema.named_types = &.{};
     projection_schema.requires_typed_expressions = false;
     projection_schema.requires_predicate_expressions = false;
     projection_schema.requires_exact_numeric_expressions = false;

@@ -18,6 +18,8 @@ const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_comm
 const std = @import("std");
 const sql_views = @import("../../system_catalog/views.zig");
 const sql_types = @import("../../system_catalog/named_types.zig");
+const sql_type_uses = @import("../../system_catalog/named_type_dependencies.zig");
+const sql_type_layouts = @import("antfly_local_sources").sql_catalog.named_layouts;
 const sql_casts = @import("../../system_catalog/casts.zig");
 const sql_routines = @import("../../system_catalog/routines.zig");
 const sql_sequences = @import("../../system_catalog/sequence_catalog.zig");
@@ -20903,7 +20905,11 @@ pub const RaftApplyStore = struct {
             child.schema_json = try a.dupe(u8, names.schema_json);
             name_admission = try names.admission.dupe(a);
         }
-        if (purpose == .query_population) child.schema_reader_requirements = try @import("antfly_local_sources").schema_mod.readerRequirementsForDefinitions(a, child.schema_json, child.read_schema_json);
+        if (purpose == .query_population) {
+            child.schema_reader_requirements = try @import("antfly_local_sources").schema_mod.readerRequirementsForDefinitions(a, child.schema_json, child.read_schema_json);
+        } else if (try @import("antfly_local_sources").schema_mod.namedTypeReaderRequirementsForDefinitions(a, child.schema_json, child.read_schema_json)) |requirements| {
+            child.schema_reader_requirements = requirements;
+        }
         child.name = physical_name;
         const derived_id = std.hash.Wyhash.hash(0x54424c45, physical_name);
         child.table_id = if (derived_id == 0) 1 else derived_id;
@@ -24501,6 +24507,13 @@ pub const RaftApplyStore = struct {
         try self.validateGeneratedConstraintNamesTxn(a, &txn, group_id, command, meta);
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = meta } };
         try validateCatalogTopology(command);
+        if (command.topology) |topology| switch (topology) {
+            .create => |create| {
+                const guards = try sql_type_layouts.guardsForDefinitionsAlloc(a, create.table.schema_json, create.table.read_schema_json);
+                try self.validateNamedTypeGuardsTxn(a, &txn, group_id, create.table, guards);
+            },
+            else => {},
+        };
         var delta = try system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop);
         defer delta.deinit(a);
         if (command.column_sequences.len != 0) {
@@ -32203,6 +32216,7 @@ pub const RaftApplyStore = struct {
         }
         const existing_table_name = try self.lookupTableNameTxn(txn, group_id, table_id);
         defer if (existing_table_name) |name| self.alloc.free(name);
+        try sql_type_uses.synchronize(self.alloc, txn, group_id, table_id, &.{});
         try self.removeSystemCatalogTableTxn(txn, group_id, table_id);
         if (try index_publication.deleteTerminal(txn, group_id, table_id)) try relation_reconciliation.advanceTrackedSource(txn, group_id);
         if (try stagingGet(txn, key) != null) try relation_reconciliation.advanceTrackedSource(txn, group_id);
@@ -36687,8 +36701,10 @@ pub const RaftApplyStore = struct {
         column_identity_value: ?[]u8,
         source_changed: bool,
         fingerprint: [32]u8,
+        named_type_guards: []sql_type_layouts.Guard = &.{},
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.named_type_guards);
             alloc.free(self.value);
             if (self.previous_name) |name| alloc.free(name);
             if (self.lake_value) |bytes| alloc.free(bytes);
@@ -36696,6 +36712,17 @@ pub const RaftApplyStore = struct {
             self.* = undefined;
         }
     };
+
+    fn validateNamedTypeGuardsTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: metadata.TableRecord, guards: []const sql_type_layouts.Guard) !void {
+        if (guards.len == 0) return;
+        const requirement = record.schema_reader_requirements orelse return error.InvalidSchemaUpdateRequest;
+        if (requirement.semantic_version < 39 or requirement.encoding_version < 39) return error.InvalidSchemaUpdateRequest;
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_type_version);
+        for (guards) |guard| {
+            const actual = (try system_catalog_storage.namedTypeLayoutDigest(a, txn, group, guard.id)) orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &guard.digest, &actual)) return error.CatalogGenerationChanged;
+        }
+    }
 
     fn prepareTableRecordTxnMode(
         self: *RaftApplyStore,
@@ -36708,6 +36735,16 @@ pub const RaftApplyStore = struct {
         var resolver_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer resolver_arena.deinit();
         const record = (try self.admittedResolverProjectionTxn(resolver_arena.allocator(), txn, group_id, input_record)) orelse return null;
+        const type_guards = sql_type_layouts.guardsForDefinitionsAlloc(self.alloc, record.schema_json, record.read_schema_json) catch |err| switch (err) {
+            error.InvalidSchemaUpdateRequest => return null,
+            else => return err,
+        };
+        var guards_transferred = false;
+        defer if (!guards_transferred) self.alloc.free(type_guards);
+        self.validateNamedTypeGuardsTxn(resolver_arena.allocator(), txn, group_id, record, type_guards) catch |err| switch (err) {
+            error.InvalidSchemaUpdateRequest, error.CatalogGenerationChanged => return null,
+            else => return err,
+        };
         const encoded_existing = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -36719,6 +36756,17 @@ pub const RaftApplyStore = struct {
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
             defer metadata_table_manager.freeTable(self.alloc, existing);
+            if (!published_fk_generation) {
+                const previous_guards = try sql_type_layouts.guardsForDefinitionsAlloc(resolver_arena.allocator(), existing.schema_json, existing.read_schema_json);
+                var changed = previous_guards.len != type_guards.len;
+                if (!changed) for (previous_guards, type_guards) |old, next| {
+                    if (old.id != next.id or !std.mem.eql(u8, &old.digest, &next.digest)) {
+                        changed = true;
+                        break;
+                    }
+                };
+                if (changed) return null;
+            }
             if (existing.sql_materialized_view_id != record.sql_materialized_view_id) return error.SqlWrongObjectType;
             if (source_tracked) previous_digest = relationTableSourceDigest(existing.table_id, existing.name, existing.schema_json);
             if (!std.mem.eql(u8, existing.schema_json, record.schema_json))
@@ -36770,7 +36818,9 @@ pub const RaftApplyStore = struct {
             const digest = relationTableSourceDigest(record.table_id, record.name, record.schema_json);
             break :changed previous_digest == null or !std.mem.eql(u8, &previous_digest.?, &digest);
         } else false;
+        guards_transferred = true;
         return .{
+            .named_type_guards = type_guards,
             .identity = .{ .table_id = record.table_id, .name = record.name },
             .value = value,
             .previous_name = previous_name,
@@ -36787,6 +36837,9 @@ pub const RaftApplyStore = struct {
         var resolver_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer resolver_arena.deinit();
         const definition = try decodeTableRecord(resolver_arena.allocator(), prepared.value);
+        const type_ids = try resolver_arena.allocator().alloc(u64, prepared.named_type_guards.len);
+        for (type_ids, prepared.named_type_guards) |*id, guard| id.* = guard.id;
+        try sql_type_uses.synchronize(resolver_arena.allocator(), txn, group_id, prepared.identity.table_id, type_ids);
         // Attribute retirement owns its sequences just as whole-table DROP
         // does. Publish dependency cleanup and the new layout in one native
         // transaction, after admission and before replacing stable identities.
@@ -37042,6 +37095,34 @@ pub const RaftApplyStore = struct {
         try snapshot.validate(a, request);
         return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
     }
+    pub fn sqlTypeBindings(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: sql_types.BindingsRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        if (request.expected_revision) |revision| if (revision != meta.revision) return error.CatalogGenerationChanged;
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        const bindings = try a.alloc(sql_types.BindingsSnapshot.Entry, request.ids.len);
+        var total: usize = 0;
+        for (request.ids, bindings) |id, *binding| {
+            try context.ensureActive();
+            const resource = (try view.byId(.named_type, id)) orelse return error.SqlNamedTypeNotFound;
+            total +|= resource.source_json.len;
+            if (total > sql_type_layouts.max_registry_bytes) return error.SqlProgramLimitExceeded;
+            const namespace = (try view.byId(.namespace, resource.parent_id)) orelse return error.InvalidCatalogRecord;
+            const database = (try view.byId(.database, namespace.parent_id)) orelse return error.InvalidCatalogRecord;
+            const record = (try sql_types.records.Record.decode(a, resource.source_json)).value;
+            binding.* = .{ .target = .{ .database = database.name, .namespace = namespace.name, .table = resource.name }, .namespace_id = namespace.id, .record = record };
+        }
+        const snapshot: sql_types.BindingsSnapshot = .{ .revision = meta.revision, .next_id = meta.next_id, .incarnation = try catalogIncarnationTxn(&txn, group), .bindings = bindings };
+        try snapshot.validate(a, request);
+        try context.ensureActive();
+        return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+    }
     fn validateSqlTypeCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
         const request = command.sql_type orelse return error.InvalidCatalogMutation;
         try request.validate();
@@ -37082,6 +37163,7 @@ pub const RaftApplyStore = struct {
                     return .{ .revision = meta.revision, .identity = .{ .id = prior.identity.id, .generation = prior.identity.generation }, .removed = 0, .no_op = true };
                 }
                 owned = try sql_types.records.Owned.add(a, prior.definition, add.label, add.placement);
+                if (try sql_type_uses.firstDependent(txn, group, prior.identity.id) != null) return error.SqlTypeActivationRequired;
                 next = prior;
                 next.?.identity.generation = std.math.add(u32, prior.identity.generation, 1) catch return error.CatalogRevisionExhausted;
                 next.?.definition = owned.?.definition;
@@ -37090,6 +37172,7 @@ pub const RaftApplyStore = struct {
                 if (old) |prior| {
                     const expected = drop.expected orelse return error.CatalogGenerationChanged;
                     if (prior.identity.id != expected.id or prior.identity.generation != expected.generation) return error.CatalogGenerationChanged;
+                    if (try sql_type_uses.firstDependent(txn, group, prior.identity.id) != null) return if (drop.cascade) error.SqlTypeActivationRequired else error.SqlDependentType;
                 } else {
                     if (!drop.if_exists) return error.SqlNamedTypeNotFound;
                     return .{ .revision = meta.revision, .identity = null, .removed = 0, .no_op = true };
@@ -60092,6 +60175,150 @@ test "SQL routine catalog named enum publication retains cold order identity and
             try std.testing.expectError(error.CatalogGenerationChanged, store.sqlTypeSnapshot(a, group, request, .{}));
             const recovered = (try std.json.parseFromSliceLeaky(?sql_types.Outcome, a, try store.sqlTypeOutcome(a, group, try sql_types.observation(a, drop)), .{})).?;
             try std.testing.expectEqual(@as(usize, 1), recovered.success.removed);
+        }
+    }
+}
+
+test "SQL routine catalog named type bindings reject forgery and retain atomic cold table dependencies" {
+    const a = std.testing.allocator;
+    const group = group_ids.main_metadata_group_id;
+    const seed = "05050505050505050505050505050505".*;
+    const target: system_catalog.Target = .{ .namespace = "type_bindings", .table = "usage_state" };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/type-bindings", .{tmp.sub_path});
+    defer a.free(root);
+    const T = struct {
+        fn cut(store: *RaftApplyStore, alloc: std.mem.Allocator) !sql_types.Snapshot {
+            const request: sql_types.SnapshotRequest = .{ .targets = &.{target} };
+            const bytes = try store.sqlTypeSnapshot(alloc, group, request, .{});
+            const snapshot = try std.json.parseFromSliceLeaky(sql_types.Snapshot, alloc, bytes, .{});
+            try snapshot.validate(alloc, request);
+            return snapshot;
+        }
+        fn apply(store: *RaftApplyStore, alloc: std.mem.Allocator, request: sql_types.Mutation) !sql_types.Outcome {
+            const command = sql_types.command(request);
+            _ = try store.prepareSystemCatalogResult(alloc, group, command);
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(alloc, command, .{}) });
+            return (try std.json.parseFromSliceLeaky(?sql_types.Outcome, alloc, try store.sqlTypeOutcome(alloc, group, try sql_types.observation(alloc, request)), .{})).?;
+        }
+        fn tableSchema(alloc: std.mem.Allocator, record: sql_types.records.Record) ![]u8 {
+            const layout = try sql_type_layouts.toWireLeaky(alloc, record);
+            const layouts = [_]@TypeOf(layout){layout};
+            return std.json.Stringify.valueAlloc(alloc, .{
+                .version = @as(u32, 1),
+                .storage_mode = "relational",
+                .default_type = "row",
+                .enforce_types = true,
+                .named_types = &layouts,
+                .document_schemas = .{ .row = .{ .schema = .{ .type = "object", .additionalProperties = false, .properties = .{
+                    .state = .{ .type = "sql_enum", .@"x-antfly-sql-type-id" = record.identity.id, .nullable = true },
+                } } } },
+            }, .{});
+        }
+        fn table(store: *RaftApplyStore, alloc: std.mem.Allocator) !metadata.TableRecord {
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            var buffer: [160]u8 = undefined;
+            return decodeTableRecord(alloc, try txn.get(try tableKeyForGroup(&buffer, group, 900)));
+        }
+    };
+    var rejected_drop: sql_types.Mutation = undefined;
+    for (0..2) |pass| {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const arena = region.allocator();
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        if (pass == 0) {
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = seed });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(arena, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(arena, SystemCatalogCommand{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .namespace, .name = "type_bindings" } }, .{}) });
+            var cut = try T.cut(&store, arena);
+            var mutation: sql_types.Mutation = .{ .admission = .{ .nonce = @splat(71), .head = cut.head }, .target = target, .namespace_id = cut.scopes[0].namespace_id.?, .incarnation = cut.incarnation, .operation = .{ .create_enum = .{ .labels = &.{ "z", "a", "" }, .owner = .auth_disabled } } };
+            _ = (try T.apply(&store, arena, mutation)).success;
+            cut = try T.cut(&store, arena);
+            const wanted = [_]u64{cut.found.?.record.identity.id};
+            const request: sql_types.BindingsRequest = .{ .ids = &wanted, .expected_revision = cut.revision };
+            const resolved = try std.json.parseFromSliceLeaky(sql_types.BindingsSnapshot, arena, try store.sqlTypeBindings(arena, group, request, .{}), .{});
+            try resolved.validate(arena, request);
+            try std.testing.expectEqualStrings("type_bindings", resolved.bindings[0].target.namespace);
+            try std.testing.expectEqualStrings("usage_state", resolved.bindings[0].target.table);
+            try std.testing.expectError(error.CatalogGenerationChanged, store.sqlTypeBindings(arena, group, .{ .ids = &wanted, .expected_revision = cut.revision + 1 }, .{}));
+            try std.testing.expectError(error.InvalidCatalogMutation, store.sqlTypeBindings(arena, group, .{ .ids = &.{ wanted[0], wanted[0] } }, .{}));
+            const schema_json = try T.tableSchema(arena, cut.found.?.record);
+            const table: metadata.TableRecord = .{ .table_id = 900, .name = "enum_rows", .schema_json = schema_json, .schema_reader_requirements = .{ .semantic_version = 39, .encoding_version = 39 } };
+            {
+                var txn = try store.store.beginReadTxn();
+                defer txn.abort();
+                const guards = try sql_type_layouts.guardsForDefinitionsAlloc(arena, table.schema_json, table.read_schema_json);
+                try store.validateNamedTypeGuardsTxn(arena, &txn, group, table, guards);
+                var unmarked = table;
+                unmarked.schema_reader_requirements = null;
+                try std.testing.expectError(error.InvalidSchemaUpdateRequest, store.validateNamedTypeGuardsTxn(arena, &txn, group, unmarked, guards));
+            }
+            try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+            // A retained decoder keeps the type alive after the write layout
+            // no longer references it. These edges survive a cold reopen.
+            var historical = table;
+            historical.table_id = 901;
+            historical.name = "historical_enum_rows";
+            historical.read_schema_json = schema_json;
+            historical.schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"payload\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}}}";
+            try store.applyStandaloneCommand(group, .{ .upsert_table = historical });
+            try std.testing.expectEqualStrings(schema_json, (try T.table(&store, arena)).schema_json);
+            {
+                var txn = try store.store.beginReadTxn();
+                defer txn.abort();
+                try std.testing.expectEqual(@as(?u64, 900), try sql_type_uses.firstDependent(&txn, group, cut.found.?.record.identity.id));
+                const actual = (try system_catalog_storage.namedTypeLayoutDigest(arena, &txn, group, cut.found.?.record.identity.id)).?;
+                try std.testing.expectEqualDeep(try sql_type_layouts.digest(arena, cut.found.?.record), actual);
+            }
+            var fake = try std.json.parseFromSliceLeaky(std.json.Value, arena, schema_json, .{});
+            const first = &fake.object.getPtr("named_types").?.array.items[0];
+            try first.object.getPtr("labels").?.array.items[0].object.put(arena, "text", .{ .string = "forged" });
+            var replacement = table;
+            replacement.schema_json = try std.json.Stringify.valueAlloc(arena, fake, .{});
+            try store.applyStandaloneCommand(group, .{ .upsert_table = replacement });
+            try std.testing.expectEqualStrings(schema_json, (try T.table(&store, arena)).schema_json);
+            mutation.admission = .{ .nonce = @splat(72), .head = (try T.cut(&store, arena)).head };
+            mutation.operation = .{ .add_enum = .{ .expected = .{ .id = cut.found.?.record.identity.id, .generation = cut.found.?.record.identity.generation }, .label = "z", .if_not_exists = true } };
+            try std.testing.expect((try T.apply(&store, arena, mutation)).success.no_op);
+            mutation.admission = .{ .nonce = @splat(73), .head = (try T.cut(&store, arena)).head };
+            mutation.operation.add_enum.label = "new";
+            try std.testing.expectEqual(.SqlTypeActivationRequired, (try T.apply(&store, arena, mutation)).rejected);
+            rejected_drop = mutation;
+            rejected_drop.admission = .{ .nonce = @splat(74), .head = (try T.cut(&store, arena)).head };
+            rejected_drop.operation = .{ .drop = .{ .expected = .{ .id = cut.found.?.record.identity.id, .generation = cut.found.?.record.identity.generation } } };
+            try std.testing.expectEqual(.SqlDependentType, (try T.apply(&store, arena, rejected_drop)).rejected);
+        } else {
+            const cut = try T.cut(&store, arena);
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                try system_catalog_storage.rebuildNameIndex(arena, &txn, group);
+                try system_catalog_storage.validateNameIndex(arena, &txn, group);
+                try std.testing.expectEqual(@as(?u64, 900), try sql_type_uses.firstDependent(&txn, group, cut.found.?.record.identity.id));
+                try txn.commit();
+            }
+            try std.testing.expectEqual(.SqlDependentType, (try T.apply(&store, arena, rejected_drop)).rejected);
+            try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = 900, .expected_transition_generation = 0 } });
+            {
+                var txn = try store.store.beginReadTxn();
+                defer txn.abort();
+                try std.testing.expectEqual(@as(?u64, 901), try sql_type_uses.firstDependent(&txn, group, cut.found.?.record.identity.id));
+            }
+            try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = 901, .expected_transition_generation = 0 } });
+            {
+                var txn = try store.store.beginReadTxn();
+                defer txn.abort();
+                try std.testing.expectEqual(@as(?u64, null), try sql_type_uses.firstDependent(&txn, group, cut.found.?.record.identity.id));
+            }
+            // An admitted rejection remains a rejection even after dependencies retire.
+            try std.testing.expectEqual(.SqlDependentType, (try T.apply(&store, arena, rejected_drop)).rejected);
+            var fresh = rejected_drop;
+            fresh.admission = .{ .nonce = @splat(75), .head = (try T.cut(&store, arena)).head };
+            try std.testing.expectEqual(@as(u32, 1), (try T.apply(&store, arena, fresh)).success.removed);
         }
     }
 }

@@ -62,7 +62,7 @@ pub const Plan = struct {
         tuple.encoded_bytes_limit = @import("relational_row_transform.zig").max_row_bytes * 2 + 3;
         var operand = std.ArrayList(u8).empty;
         defer operand.deinit(alloc);
-        const operand_null = try tuple.appendValues(alloc, &operand, &.{condition.value});
+        const operand_null = try tuple.appendValues(alloc, &operand, &.{try tuple.resolveLiteral(0, condition.value)});
         return .{ .tuple = tuple, .operand = try operand.toOwnedSlice(alloc), .op = condition.op, .operand_null = operand_null };
     }
 

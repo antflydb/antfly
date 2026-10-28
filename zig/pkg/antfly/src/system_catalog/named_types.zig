@@ -80,6 +80,41 @@ pub const Snapshot = struct {
         } else if (request.reference != null) return error.CatalogGenerationChanged;
     }
 };
+pub const BindingsRequest = struct {
+    ids: []const u64,
+    expected_revision: ?u64 = null,
+    pub fn validate(self: @This()) !void {
+        if (self.ids.len > local.sql_catalog.named_layouts.max_types) return error.InvalidCatalogMutation;
+        var previous: u64 = 0;
+        for (self.ids) |id| {
+            if (id <= previous) return error.InvalidCatalogMutation;
+            previous = id;
+        }
+    }
+};
+/// All entries come from one immutable metadata read cut. Scope names are
+/// resolved by namespace ID so rename/reuse cannot redirect authorization.
+pub const BindingsSnapshot = struct {
+    pub const Entry = struct { target: domain.Target, namespace_id: u64, record: records.Record };
+    revision: u64,
+    next_id: u64,
+    incarnation: [16]u8,
+    bindings: []const Entry,
+    pub fn validate(self: @This(), a: A, request: BindingsRequest) !void {
+        try request.validate();
+        if (self.next_id < 3 or self.bindings.len != request.ids.len or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidSqlBackendResponse;
+        if (request.expected_revision) |revision| if (revision != self.revision) return error.CatalogGenerationChanged;
+        var origins = std.AutoHashMapUnmanaged([16]u8, void).empty;
+        defer origins.deinit(a);
+        for (request.ids, self.bindings) |id, entry| {
+            try entry.target.validate();
+            try entry.record.validate(a);
+            if (entry.record.identity.id != id or id >= self.next_id or entry.namespace_id != entry.record.identity.namespace_id) return error.InvalidSqlBackendResponse;
+            if ((try origins.getOrPut(a, entry.record.identity.origin_id)).found_existing) return error.InvalidSqlBackendResponse;
+        }
+    }
+};
+
 pub const Mutation = struct {
     admission: outcomes.Admission,
     target: domain.Target,

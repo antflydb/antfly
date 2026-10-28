@@ -37,6 +37,7 @@ pub const patternPropertyMatches = impl.patternPropertyMatches;
 pub const shouldIgnoreSchemaValidationField = impl.shouldIgnoreSchemaValidationField;
 pub const pathContainsSchemaIgnoredField = impl.pathContainsSchemaIgnoredField;
 pub const parseTtlDurationNs = impl.parseTtlDurationNs;
+pub const namedTypeReferencesAlloc = impl.namedTypeReferencesAlloc;
 
 fn relationalUuidColumns(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
@@ -53,6 +54,16 @@ fn relationalUuidColumns(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     return try impl.parseSchemaUpdateRequest(alloc, body);
+}
+
+/// Ordinary table creation retains its existing admission policy. Named
+/// executable layouts require an explicit compiler-derived reader contract,
+/// including historical layouts retained by an online schema migration.
+pub fn namedTypeReaderRequirementsForDefinitions(alloc: std.mem.Allocator, write: []const u8, read: []const u8) !?storage_schema.ReaderRequirements {
+    const guards = try @import("../common/sql_named_type_layout.zig").guardsForDefinitionsAlloc(alloc, write, read);
+    defer alloc.free(guards);
+    if (guards.len == 0) return null;
+    return try readerRequirementsForDefinitions(alloc, write, read);
 }
 
 pub fn parseValidatedTableSchema(alloc: std.mem.Allocator, schema_json: []const u8) !ParsedTableSchema {
@@ -1887,6 +1898,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
     var expression_schema = expressionCapabilitySchema(schema);
     expression_schema.relational_columns = relational_columns;
+    expression_schema.named_types = if (schema.named_types) |registry| try registry.cloneRecords(alloc) else &.{};
+    errdefer @import("../common/sql_named_type_layout.zig").freeRecords(alloc, expression_schema.named_types);
     if (schema.unique_constraints != null or schema.foreign_keys != null) {
         const definitions = try @import("relational_declarations.zig").definitionFingerprints(alloc, schema, expression_schema);
         @import("relational_declarations.zig").freeDefinitions(alloc, definitions);
@@ -1969,6 +1982,8 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .relational => .relational,
     } else .relational;
     result.requires_public_schema = true;
+    result.named_types = if (schema.named_types) |registry| try registry.cloneRecords(alloc) else &.{};
+    errdefer @import("../common/sql_named_type_layout.zig").freeRecords(alloc, result.named_types);
     result.relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
     return result;
 }
@@ -2005,6 +2020,7 @@ fn expressionCapabilitySchema(schema: ParsedTableSchema) storage_schema.TableSch
         .requires_range_expressions = requiresRangeExpressions(schema),
         .requires_temporal_keys = requiresTemporalKeys(schema),
         .requires_sequence_defaults = requiresSequenceDefaults(schema),
+        .named_types = if (schema.named_types) |registry| registry.records else &.{},
     };
 }
 
@@ -2141,6 +2157,7 @@ fn deriveRuntimeRelationalColumns(
                 .json_kind = runtimeRelationalJsonKind(property),
                 .sql_element_type = if (property.sql_type) |kind| @import("../common/sql_builtin_type.zig").Type.fromWire(kind) else null,
                 .numeric_modifier = property.numeric_modifier,
+                .named_type_id = property.named_type_id,
             });
             name = null;
             path = null;
@@ -2171,6 +2188,7 @@ pub fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_sch
     if (documentPropertyUsesJsonEncoding(property)) return .json;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "sql_array")) return .sql_array;
+        if (std.mem.eql(u8, field_type, "sql_enum")) return .enumeration;
         if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, field_type)) |kind| return @import("../sql/range_value.zig").typeFromKind(storage_schema.RelationalColumnType, kind);
         if (property.sql_type == .numeric) return .numeric;
         if (std.mem.eql(u8, field_type, "embedding")) return .dense_vector;

@@ -1129,6 +1129,7 @@ pub const StdHttpListener = struct {
             .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
+            .PATCH => .PATCH,
             else => null,
         };
     }

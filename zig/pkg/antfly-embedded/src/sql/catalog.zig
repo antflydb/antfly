@@ -21,9 +21,11 @@ const ast = @import("ast.zig");
 
 pub const enum_values = @import("../common/sql_enum_value.zig");
 pub const named_types = @import("../system_catalog/named_types.zig");
+pub const named_layouts = @import("../common/sql_named_type_layout.zig");
 
 test {
     _ = named_types;
+    _ = named_layouts;
     _ = enum_values;
     _ = @import("../storage/db/relational_enum_test.zig");
 }

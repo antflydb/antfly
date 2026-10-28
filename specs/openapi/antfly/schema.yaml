@@ -79,6 +79,92 @@ components:
         rejects the write. Restore verifies stored values without rounding.
       enum: [text, int16, int32, int64, float32, float64, boolean, uuid, jsonb, numeric]
 
+    SQLNamedTypeIdentity:
+      type: object
+      additionalProperties: false
+      required: [id, namespace_id, generation, origin_id, oid, array_oid]
+      description: Server-resolved immutable SQL type identity. Origin survives restore remapping of local IDs and wire OIDs.
+      properties:
+        id:
+          type: integer
+          format: uint64
+          minimum: 1
+        namespace_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        generation:
+          type: integer
+          format: uint32
+          minimum: 1
+        origin_id:
+          type: string
+          minLength: 32
+          maxLength: 32
+          pattern: '^[0-9a-f]{32}$'
+          description: Opaque durable 128-bit origin, encoded as lowercase hexadecimal.
+        oid:
+          type: integer
+          format: uint32
+        array_oid:
+          type: integer
+          format: uint32
+
+    SQLNamedEnumLabel:
+      type: object
+      additionalProperties: false
+      required: [id, text, order_key]
+      description: Immutable enum symbol. Symbol IDs are append-only; order keys are opaque stable ordering metadata.
+      properties:
+        id:
+          type: integer
+          format: uint32
+          minimum: 1
+        text:
+          type: string
+          description: Exact UTF-8 label; PostgreSQL limits its encoded length to 63 bytes.
+        order_key:
+          type: string
+          minLength: 2
+          maxLength: 16384
+          pattern: '^(?:[0-9a-f]{2})+$'
+          description: Server-managed immutable ordering key encoded as lowercase hexadecimal.
+
+    SQLNamedTypeLayout:
+      type: object
+      additionalProperties: false
+      required: [kind, identity, labels]
+      description: Server-resolved executable type layout retained by a table schema epoch. Catalog ownership is separate from value representation.
+      properties:
+        kind:
+          type: string
+          enum: [enum]
+        identity:
+          $ref: "#/components/schemas/SQLNamedTypeIdentity"
+        labels:
+          type: array
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/SQLNamedEnumLabel"
+
+    SQLNamedEnumColumnSchema:
+      type: object
+      additionalProperties: true
+      required: [type, x-antfly-sql-type-id]
+      description: A schema-bound enum column. JSON values are exact labels; SQL NULL is distinct from every label, including the empty string.
+      properties:
+        type:
+          type: string
+          enum: [sql_enum]
+        x-antfly-sql-type-id:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Resolved catalog type ID. The table's named_types directory supplies its immutable executable definition.
+        nullable:
+          type: boolean
+          default: false
+
     SQLNumericModifier:
       type: object
       additionalProperties: false
@@ -196,6 +282,8 @@ components:
             $ref: "#/components/schemas/SQLArrayColumnSchema"
           x-antfly-sql-range-column-schema:
             $ref: "#/components/schemas/SQLRangeColumnSchema"
+          x-antfly-sql-enum-column-schema:
+            $ref: "#/components/schemas/SQLNamedEnumColumnSchema"
 
     TtlConfig:
       type: object
@@ -893,6 +981,13 @@ components:
       type: object
       description: Schema definition for a table with multiple document types
       properties:
+        named_types:
+          type: array
+          readOnly: true
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/SQLNamedTypeLayout"
+          description: Server-resolved immutable SQL type layouts, sorted by catalog ID. Clients reference types through x-antfly-sql-type-id; catalog admission verifies every layout against its active definition. Retained by backups and schema epochs for deterministic cold decoding.
         version:
           type: integer
           format: uint32

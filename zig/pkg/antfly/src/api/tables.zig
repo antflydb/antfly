@@ -1590,6 +1590,18 @@ pub fn mergeSchemaPatchRequest(
     current_schema_json: []const u8,
     patch_json: []const u8,
 ) ![]u8 {
+    const merged = try mergeSchemaPatchDocumentAlloc(alloc, current_schema_json, patch_json);
+    defer alloc.free(merged);
+    return parseSchemaUpdateRequest(alloc, merged);
+}
+
+/// Internal admission stage: merge exact JSON tokens before catalog type
+/// binding. This result must be fully compiled before any metadata mutation.
+pub fn mergeSchemaPatchDocumentAlloc(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    patch_json: []const u8,
+) ![]u8 {
     if (patch_json.len == 0) return error.InvalidSchemaUpdateRequest;
 
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -1606,11 +1618,7 @@ pub fn mergeSchemaPatchRequest(
 
     try applyJsonMergePatch(arena, &current, patch);
     _ = current.object.orderedRemove("version");
-    const merged = try std.json.Stringify.valueAlloc(alloc, current, .{});
-    errdefer alloc.free(merged);
-    const validated = try parseSchemaUpdateRequest(alloc, merged);
-    alloc.free(merged);
-    return validated;
+    return std.json.Stringify.valueAlloc(alloc, current, .{});
 }
 
 fn applyJsonMergePatch(alloc: std.mem.Allocator, target: *std.json.Value, patch: std.json.Value) !void {

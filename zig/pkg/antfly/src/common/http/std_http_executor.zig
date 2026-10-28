@@ -305,6 +305,7 @@ pub const StdHttpExecutor = struct {
             .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
+            .PATCH => .PATCH,
         };
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         var response = try client.requestToWriter(method, req.uri, .{
@@ -347,6 +348,7 @@ pub const StdHttpExecutor = struct {
             .POST => std.http.Method.POST,
             .PUT => std.http.Method.PUT,
             .DELETE => std.http.Method.DELETE,
+            .PATCH => std.http.Method.PATCH,
         };
         var extra_headers = std.ArrayListUnmanaged(std.http.Header).empty;
         defer extra_headers.deinit(alloc);
@@ -456,6 +458,7 @@ pub const StdHttpExecutor = struct {
             .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
+            .PATCH => .PATCH,
         };
         // The resolved client owns URI parsing, connection establishment,
         // transmission, and response receipt behind one opaque call. Local
@@ -716,6 +719,7 @@ pub const StdHttpExecutor = struct {
             .POST => std.http.Method.POST,
             .PUT => std.http.Method.PUT,
             .DELETE => std.http.Method.DELETE,
+            .PATCH => std.http.Method.PATCH,
         };
 
         var extra_headers = std.ArrayListUnmanaged(std.http.Header).empty;

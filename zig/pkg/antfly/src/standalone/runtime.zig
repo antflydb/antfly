@@ -3715,6 +3715,11 @@ const LocalStandaloneMetadata = struct {
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                 return std.json.Stringify.valueAlloc(alloc, try store.sqlSequenceAdmissionHead(group_ids.main_metadata_group_id), .{});
             },
+            .sql_type_bindings => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlTypeBindings(alloc, group_ids.main_metadata_group_id, request, context);
+            },
             .sql_type_snapshot => |request| {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;

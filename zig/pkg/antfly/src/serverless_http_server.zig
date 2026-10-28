@@ -102,6 +102,7 @@ pub const ServerlessHttpServer = struct {
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
+            .PATCH => return .{ .status = 405, .body = try self.alloc.dupe(u8, "method not allowed") },
         };
 
         const path = if (std.mem.indexOfScalar(u8, req.uri, '?')) |query_index| req.uri[0..query_index] else req.uri;

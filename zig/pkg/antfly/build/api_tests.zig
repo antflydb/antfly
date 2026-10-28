@@ -2318,6 +2318,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original operators preserve typed overloads stable function identities and cold dependency retirement",
             "mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement",
             "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+            "mounted SQL named enum schema binding prepares public typed writes and retains cold projections",
+            "SQL named enum schema ingress authorizes one catalog cut and preserves ordinary escaped schemas",
             "mounted SQL original aggregates preserve typed transitions bounded states and cold dependency retirement",
             "mounted SQL ordinary aggregates preserve PostgreSQL ordering distinct filters and cold rows",
             "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
@@ -2368,7 +2370,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // release/Linux bounds retain their independently measured profiles.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
     });
-    const sql_enum_catalog_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes"});
+    const sql_enum_catalog_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes", "mounted SQL named enum schema binding prepares public typed writes and retains cold projections", "SQL named enum schema ingress authorizes one catalog cut and preserves ordinary escaped schemas" });
     sql_enum_catalog_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-enum-catalog-test", "Verify enum catalog scope, original DDL and cold outcome transport").dependOn(&sql_enum_catalog_run.step);
     const sql_cast_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement"});

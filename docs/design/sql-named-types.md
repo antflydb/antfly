@@ -137,9 +137,10 @@ compiled directories, tuple plans and covering-plan construction.
 These native storage tests do not qualify the public SQL feature. Still required
 before the original cases receive implementation credit:
 
-1. Bind SQL enum columns to schema-owned definitions through the public schema
-   compiler and immutable catalog dependencies. Current SQL scalar paths reject
-   enum columns rather than treating symbols as integers or labels as TEXT.
+1. Bind SQL type-name intents and scalar descriptors to the schema-owned
+   definitions. Public JSON schema binding, catalog dependencies and typed-row
+   APIs are implemented; SQL scalar paths still reject enum columns rather
+   than treating symbols as integers or labels as TEXT.
 2. Complete enum expression operations, uniqueness/FK type compatibility and
    distributed integrity qualification over those public schemas.
 3. Bind named type intents in SQL columns, scalar casts and parameter/result
@@ -153,3 +154,63 @@ before the original cases receive implementation credit:
 
 The disposition ledger has not been changed for the enum/domain work. Passing
 catalog/model tests alone does not establish these remaining contracts.
+
+## Public schema and integrity binding
+
+The public TableSchema now exposes generated readonly named-type layouts and
+physical `sql_enum` columns referencing an immutable catalog type ID. The
+ordinary schema compiler owns a deduplicated registry of executable views;
+validators, row preparation, native schemas and cold projection retain that
+same identity. Embedded use remains self-contained. Server ingress resolves
+references from one bounded metadata read cut, checks existing namespace usage
+authority against current scope names, replaces readonly client assertions,
+and drops unused snapshots. Constants and JSON payloads do not create type
+dependencies. Ordinary schemas retain an allocation-free negative fast path.
+
+REST creation, full replacement, RFC 7396 PATCH postimages, MCP creation, and
+the internal SQL schema producer share this binding stage. Public requests
+resolve layouts before pure schema parsing and reuse that read cut for FK
+admission. Metadata repeats fixed-size executable-layout witnesses using point
+lookups, then updates reverse type/table dependencies in the table transaction.
+Name-directory reconstruction retains durable reverse edges. Rejected catalog
+outcomes remain rejected after their blocking dependency disappears.
+
+FK admission and distributed claim preparation compare named type identity and
+stable common symbol history independently of child/parent column names.
+Additive epochs preserve existing equality tuples; unrelated enums and forged
+rank histories cannot share claims merely because both use four-byte symbols.
+This uses the existing native integrity planner and transaction machinery.
+
+Dependent ADD VALUE and DROP CASCADE still require coordinated owner/schema
+activation. Their explicit activation barrier remains in place, while DROP
+RESTRICT reports dependent objects. SQL scalar/array descriptors, named casts,
+expressions and domain activation remain unfinished. These changes do not
+qualify the original enum/domain cases or change the disposition ledger.
+
+Creation now captures compiler-derived reader contracts before the catalog
+barrier and carries them through normal and FK-initial admission. Read-only
+preflight and serialized apply share executable-layout verification. Active
+and retained read schemas contribute to the same reverse dependency set, so
+historical rows cannot lose their type while a migration is unfinished.
+
+JSON predicates and ordered bounds resolve labels once to borrowed cached
+atoms. Typed tuple encoding remains strict. Text projections discard the row
+registry along with relational columns and retain their existing v11/v12
+representation; additive type definitions do not alter projection bytes at a
+fixed logical schema version.
+
+The final Debug affected gate passes 25 storage/model tests, 10 native metadata
+tests, and three public/admission campaigns with no skips, failures or leaks.
+The public campaign creates a table through REST using only catalog type IDs,
+verifies readonly assertions cannot replace definitions, writes typed values,
+rejects invalid labels, applies PATCH, filters by declaration order, and checks
+complete projections after an independent cold reopen. Admission tests include
+current-scope authorization, deduplicated bulk lookup and allocation-failure
+cleanup. Native tests preserve dependencies that exist only in retained read
+schemas through name-directory rebuilding and cold metadata recovery.
+
+On the development machine, Debug loops of 100,000 sparse projected row/key
+operations and 100,000 JSON-bound preparations took roughly 89 ms and 32 ms,
+respectively, with zero allocations after preparation. These microbenchmarks
+are separate from end-to-end request throughput and do not qualify SQL scalar
+execution or coordinated type activation.

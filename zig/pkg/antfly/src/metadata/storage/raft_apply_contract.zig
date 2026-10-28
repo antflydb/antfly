@@ -319,6 +319,7 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_column_identities: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
     sql_sequence_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
     sql_type_snapshot: @import("../../system_catalog/named_types.zig").SnapshotRequest,
+    sql_type_bindings: @import("../../system_catalog/named_types.zig").BindingsRequest,
     sql_type_outcome: @import("../../system_catalog/named_types.zig").OutcomeRequest,
     sql_cast_snapshot: @import("../../system_catalog/casts.zig").SnapshotRequest,
     sql_cast_outcome: @import("../../system_catalog/casts.zig").OutcomeRequest,

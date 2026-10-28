@@ -588,6 +588,10 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     defer arena.deinit();
     const a = arena.allocator();
     const create_req = try prepareCreateRequest(a, request);
+    const named_type_readers = if (create_req) |req|
+        try @import("antfly_local_sources").schema_mod.namedTypeReaderRequirementsForDefinitions(a, req.schema_json orelse "", "")
+    else
+        null;
     const object_create = if (create_req) |req| (req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{}).engine == .object else false;
     const ordinary_version = if (request.mutation.action == .comment) protocol.sql_resource_comments_version else if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
     var resolver_create = false;
@@ -597,10 +601,12 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
             .table_id = 0,
             .name = request.physical_name orelse "",
             .indexes_json = req.indexes_json orelse tables_api.default_indexes_json,
+            .schema_json = if (named_type_readers != null) req.schema_json orelse "" else "",
+            .schema_reader_requirements = named_type_readers,
         });
     }
     const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @max(required_version, if (request.column_sequences.len != 0) protocol.sql_column_sequences_version else 0));
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @max(if (named_type_readers != null) protocol.sql_type_version else 0, @max(required_version, if (request.column_sequences.len != 0) protocol.sql_column_sequences_version else 0)));
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -625,6 +631,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, req.indexes_json.?);
         try managed_embedder.validateEmbeddingProducerOwnershipJson(a, req.indexes_json.?);
         var table = tables_api.deriveTableRecord(storage_name, req);
+        if (named_type_readers) |requirements| table.schema_reader_requirements = requirements;
         if (!try store.resolverProjectionValid(a, svc.metadata_group_id, table)) return error.ResolverCurationConflict;
         if (try fk_publication.schemaHasForeignKeys(a, table.schema_json)) return error.ForeignKeyGenerationPublicationRequired;
         const policy = admission.placement_policy;
@@ -2323,6 +2330,14 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.sqlTypeSnapshot(alloc, svc.metadata_group_id, request, context);
+        },
+        .sql_type_bindings => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlTypeBindings(alloc, svc.metadata_group_id, request, context);
         },
         .sql_type_outcome => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;

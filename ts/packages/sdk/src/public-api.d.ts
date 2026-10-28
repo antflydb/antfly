@@ -18090,6 +18090,37 @@ export interface components {
         };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
         CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"] | components["schemas"]["CreateRelationalIndexRequest"];
+        /** @description Server-resolved immutable SQL type identity. Origin survives restore remapping of local IDs and wire OIDs. */
+        SQLNamedTypeIdentity: {
+            /** Format: uint64 */
+            id: number;
+            /** Format: uint64 */
+            namespace_id: number;
+            /** Format: uint32 */
+            generation: number;
+            /** @description Opaque durable 128-bit origin, encoded as lowercase hexadecimal. */
+            origin_id: string;
+            /** Format: uint32 */
+            oid: number;
+            /** Format: uint32 */
+            array_oid: number;
+        };
+        /** @description Immutable enum symbol. Symbol IDs are append-only; order keys are opaque stable ordering metadata. */
+        SQLNamedEnumLabel: {
+            /** Format: uint32 */
+            id: number;
+            /** @description Exact UTF-8 label; PostgreSQL limits its encoded length to 63 bytes. */
+            text: string;
+            /** @description Server-managed immutable ordering key encoded as lowercase hexadecimal. */
+            order_key: string;
+        };
+        /** @description Server-resolved executable type layout retained by a table schema epoch. Catalog ownership is separate from value representation. */
+        SQLNamedTypeLayout: {
+            /** @enum {string} */
+            kind: "enum";
+            identity: components["schemas"]["SQLNamedTypeIdentity"];
+            labels: components["schemas"]["SQLNamedEnumLabel"][];
+        };
         /**
          * @description Storage representation for the table. Omission selects "document".
          *     "relational" stores schema-bound typed rows and requires exactly one
@@ -18443,6 +18474,20 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description A schema-bound enum column. JSON values are exact labels; SQL NULL is distinct from every label, including the empty string. */
+        SQLNamedEnumColumnSchema: {
+            /** @enum {string} */
+            type: "sql_enum";
+            /**
+             * Format: uint64
+             * @description Resolved catalog type ID. The table's named_types directory supplies its immutable executable definition.
+             */
+            "x-antfly-sql-type-id": number;
+            /** @default false */
+            nullable?: boolean;
+        } & {
+            [key: string]: unknown;
+        };
         /** @description Defines the structure of a document type */
         DocumentSchema: {
             /** @description A description of the document type. */
@@ -18545,6 +18590,8 @@ export interface components {
         };
         /** @description Schema definition for a table with multiple document types */
         TableSchema: {
+            /** @description Server-resolved immutable SQL type layouts, sorted by catalog ID. Clients reference types through x-antfly-sql-type-id; catalog admission verifies every layout against its active definition. Retained by backups and schema epochs for deterministic cold decoding. */
+            readonly named_types?: components["schemas"]["SQLNamedTypeLayout"][];
             /**
              * Format: uint32
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.

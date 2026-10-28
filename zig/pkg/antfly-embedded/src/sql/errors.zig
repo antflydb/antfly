@@ -258,6 +258,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlInvalidEnumLabel => .{ .code = "42602", .message = "Enum labels must contain at most 63 bytes." },
         error.SqlEnumLabelNotFound => .{ .code = "22023", .message = "The enum placement label does not exist." },
         error.SqlDuplicateTypeOrigin => .{ .code = "40001", .message = "This logical type origin is already registered.", .retryable = true },
+        error.SqlDependentType => .{ .code = "2BP01", .message = "One or more columns depend on this type.", .hint = "Remove dependent columns or request CASCADE." },
         error.SqlTypeActivationRequired => .{ .code = "0A000", .message = "This type change requires coordinated dependent-schema activation." },
         error.SqlCastNotFound => .{ .code = "42704", .message = "The requested cast does not exist." },
         error.SqlDuplicateCast => .{ .code = "42710", .message = "A cast already exists for this source and target type." },
