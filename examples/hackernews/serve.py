@@ -68,6 +68,10 @@ def search_request(value):
         "view",
         "cursor",
         "recent_since",
+        "type",
+        "sort",
+        "date_from",
+        "date_to",
     }:
         raise ValueError("Expected q, view and optional cursor")
     term = value.get("q")
@@ -77,6 +81,21 @@ def search_request(value):
     view = value.get("view", "all")
     if not isinstance(view, str) or view not in ("all", *tables):
         raise ValueError("Unknown search view")
+    item_type = value.get("type", "all")
+    sort = value.get("sort", "relevance")
+    if not isinstance(item_type, str) or item_type not in ("all", "story", "comment"):
+        raise ValueError("Unknown item type")
+    if not isinstance(sort, str) or sort not in ("relevance", "date"):
+        raise ValueError("Unknown sort order")
+    bounds = {}
+    for name, operator in (("date_from", "gte"), ("date_to", "lt")):
+        if name in value:
+            bound = value[name]
+            if type(bound) is not int or not 0 <= bound <= 253402300800:
+                raise ValueError("Invalid date boundary")
+            bounds[operator] = bound
+    if "gte" in bounds and "lt" in bounds and bounds["gte"] >= bounds["lt"]:
+        raise ValueError("Date range must start before it ends")
     query = {
         "full_text_search": {"match": term.strip(), "field": "body"},
         "full_text_index": "body_text",
@@ -93,10 +112,18 @@ def search_request(value):
         "order_by": [{"field": "_score", "desc": True}],
         "limit": 20,
     }
+    if sort == "date":
+        query["order_by"] = [
+            {"field": "created_at", "desc": True},
+            {"field": "hn_id", "desc": True},
+        ]
     if view == "all":
-        query.update(source={"saved": "hackernews"}, source_ranking="rrf")
+        query["source"] = {"saved": "hackernews"}
+        if sort == "relevance":
+            query["source_ranking"] = "rrf"
     else:
         query["table"] = tables[view]
+    predicates = []
     cursor = value.get("cursor")
     if view == "recent":
         since = value.get("recent_since")
@@ -106,9 +133,17 @@ def search_request(value):
             since = max(0, int(time.time()) - 365 * 86400)
         if type(since) is not int or not 0 <= since <= int(time.time()):
             raise ValueError("Invalid recent cutoff")
-        query["filter_query"] = {"range": {"path": "/created_at", "gte": since}}
+        predicates.append({"range": {"path": "/created_at", "gte": since}})
     elif "recent_since" in value:
         raise ValueError("Recent cutoff is only valid for the recent view")
+    if bounds:
+        predicates.append({"range": {"path": "/created_at", **bounds}})
+    if item_type != "all":
+        predicates.append({"term": {"path": "/item_type", "value": item_type}})
+    if predicates:
+        query["filter_query"] = (
+            predicates[0] if len(predicates) == 1 else {"conjuncts": predicates}
+        )
     if cursor is not None:
         if not isinstance(cursor, str) or not 1 <= len(cursor) <= 65536:
             raise ValueError("Invalid cursor")
@@ -207,21 +242,24 @@ class Gateway(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
+        # Search state lives in the browser's query string, not the asset route.
+        path = self.path.partition("?")[0]
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+            "/search-state.mjs": ("search-state.mjs", "text/javascript; charset=utf-8"),
             "/app.css": ("app.css", "text/css; charset=utf-8"),
         }
-        if self.path in assets:
-            filename, content_type = assets[self.path]
+        if path in assets:
+            filename, content_type = assets[path]
             return self.respond(
                 200,
                 (Path(__file__).parent / "web" / filename).read_bytes(),
                 content_type,
             )
-        if self.path == "/healthz":
+        if path == "/healthz":
             return self.respond(200, {"ok": True})
-        if self.path == "/readyz":
+        if path == "/readyz":
             lock = getattr(self.server, "ready_lock", None)
             if lock is None:
                 ready = self.check_readiness()
@@ -284,8 +322,10 @@ class Gateway(BaseHTTPRequestHandler):
                 "hits": result["hits"],
                 "cursor": next_cursor(query, result),
             }
-            if "filter_query" in query:
-                output["recent_since"] = query["filter_query"]["range"]["gte"]
+            if query.get("table") == "hn_current":
+                predicate = query["filter_query"]
+                dates = predicate.get("range") or predicate["conjuncts"][0]["range"]
+                output["recent_since"] = dates["gte"]
             return self.respond(200, output)
         except HTTPError as error:
             error.close()

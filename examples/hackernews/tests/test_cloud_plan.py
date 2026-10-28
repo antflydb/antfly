@@ -30,6 +30,10 @@ def test_separate_object_tables_and_scoped_cloud_keys():
         assert tables[name]["storage"] == {"engine": "object"}
         assert "num_shards" not in tables[name]
         assert tables[name]["indexes"]["body_text"]["field"] == "body"
+        props = tables[name]["schema"]["document_schemas"]["row"]["schema"][
+            "properties"
+        ]
+        assert props["item_type"]["x-antfly-field"]["type"] == "keyword"
     base = tables["archive-table.json"]["schema"]["base_source"]
     assert base["format"] == "parquet" and "write_policy" not in base
     assert base["credentials"]["ref"] == "cloud-gcs-cred_" + archive.replace("-", "")

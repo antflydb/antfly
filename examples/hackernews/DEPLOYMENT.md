@@ -152,11 +152,36 @@ returned by the provider through the existing DNS owner, then verify TLS and eve
 view at `hn.antfly.io`. The prior $150 ceiling covers incremental qualification;
 review remaining spend before archive jobs and agree on an ongoing serving budget.
 
-Local validation on October 27: 41 HN tests passed against the checksum-verified
-RC.5 draft embedded library; the standalone-binary test was skipped. Both amd64
+Local validation on October 27: 56 relevant HN tests passed against the checksum-verified
+RC.5 draft native server and embedded library, including real filtered/date-sorted
+gateway and saved-overlay pagination. Two JavaScript URL/date-state tests passed;
+fixture browser checks covered desktop/mobile layout, filters, pagination, shared
+URL reloads, copy-link sanitization and Back/Forward restoration. Both amd64
 images built, gateway health/auth isolation passed, and the producer performed a
 native Lite write/read inside its container. Images have not been pushed and no
 Cloud instance, infrastructure apply or archive qualification was performed.
+
+## Search controls and shared links
+
+The UI supports Everything / Stories / Comments, relevance or newest-first date
+ordering, preset date windows and a custom inclusive UTC date range. Date sorting
+runs in Antfly before pagination, including across the saved overlay. Item type
+is an exact keyword predicate; generated schemas map `item_type` and `author` as
+keywords and keep numeric date/ID sort fields. Existing object tables with older
+immutable schemas need an explicit migration and index publication before these
+filters can be used; the gateway does not silently recreate them.
+
+The URL records the search term, type, sort, date selection and data view. Opening
+a shared link or using Back/Forward restores those controls and starts a fresh
+search. Opaque result cursors and backend credentials never enter generated share
+links. Preset windows resolve once per search; pagination retains those bounds
+and Recent's original cutoff. A custom Through date includes the whole UTC day.
+
+Run the pure URL/date-state tests with
+`node --test examples/hackernews/tests/test_search_state.mjs`. The gateway tests
+also cover shared-link reloads, fixed backend predicates and cursor binding.
+Set `ANTFLY_NATIVE_BINARY` to exercise actual filtered/date-ordered native and
+saved-overlay pagination rather than skipping that integration test.
 
 ## Gateway behavior
 

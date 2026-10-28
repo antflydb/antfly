@@ -61,6 +61,8 @@ def table_definition(args):
     }
     for column in ("hn_id", "created_at", "points"):
         properties[column]["x-antfly-field"] = {"type": "numeric", "sortable": True}
+    for column in ("item_type", "author"):
+        properties[column]["x-antfly-field"] = {"type": "keyword", "sortable": True}
     return {
         "schema": {
             "storage_mode": "relational",
