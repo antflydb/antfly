@@ -287,12 +287,17 @@ def create_current_table(call, current):
                                     },
                                     **{
                                         name: {"type": "string"}
-                                        for name in (
-                                            "body",
-                                            "title",
-                                            "author",
-                                            "item_type",
-                                        )
+                                        for name in ("body", "title")
+                                    },
+                                    **{
+                                        name: {
+                                            "type": "string",
+                                            "x-antfly-field": {
+                                                "type": "keyword",
+                                                "sortable": True,
+                                            },
+                                        }
+                                        for name in ("author", "item_type")
                                     },
                                 },
                             }
