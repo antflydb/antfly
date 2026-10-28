@@ -70,8 +70,15 @@ constants, layout and resource use independently of timing noise.
 All 24 fresh rotary profiles pass the independent CPU oracle on Glowworm,
 with exact baseline/candidate outputs and intact guards.
 
-PENDING: the fixed runtime AA/AB/BA matrix. Its controller waits for other GPU work, rechecks source/image
-pins, and retires only its own process if unrelated GPU work resumes.
+The fresh runtime AA/AB/BA matrix also passes all 24 profiles in each cohort,
+including independently reset graph replay, guards and register/occupancy
+checks. No failed measurement was retried.
+
+| Cohort | Worst candidate/baseline median | Worst p95 |
+| --- | ---: | ---: |
+| AA | 1.002701 | 1.008127 |
+| AB | 1.001935 | 1.034606 |
+| BA | 1.001252 | 1.008869 |
 
 The rotary fixture matrix contains 24 profiles across all four exports,
 HD2/30/256/512, unequal Q/KV head counts, batch and sequence tails, official
@@ -106,3 +113,8 @@ oracle checks through the CUDA Driver API without Torch/NumPy. The CUDA
 family harness adds an opt-in `--inplace-stable` protocol; its existing timing
 mode remains the default. The Metal harness honors explicit language versions
 and production floating-point-function policies, and reports/gates p95.
+
+The completed runtime archive has SHA256
+`0e344361214c02d2cce2031fdb2b254d129563d1fbece84ceb2376f27ebe6f3c`. Independent verification
+checks every recorded input hash and recomputes median/p95 gates from raw
+arms. The CPU oracle maximum absolute error is `1.1920928955078125e-07`.
