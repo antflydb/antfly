@@ -1,0 +1,4 @@
+# Changes to CI/release trust require one of the two founders to review.
+/.github/ @ajroetker @bpopadiuk
+/RELEASE.md @ajroetker @bpopadiuk
+/scripts/release/ @ajroetker @bpopadiuk
