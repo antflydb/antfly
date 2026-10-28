@@ -375,4 +375,8 @@ shares one output-token budget across the audio item's windows and temperature
 retries; generated timestamp and EOS tokens count, while forced prompt tokens do
 not. Exhaustion returns `OUTPUT_TOKEN_LIMIT_EXCEEDED` rather than a successful
 partial transcript. Session append calls each receive a request budget; a single
-streaming upload shares its budget for the lifetime of that request.
+streaming upload shares its budget for the lifetime of that request. A failed
+session processing pass preserves its buffered audio, conditioning, sequence
+numbers, and previously delivered events. Retry with a fresh request budget by
+committing the buffered audio; do not re-upload audio already appended. Completed
+processing passes from earlier streaming chunks remain committed.
