@@ -2224,6 +2224,8 @@ from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
 from .runtime_config import RuntimeConfig
+from .runtime_config_generation_batching import RuntimeConfigGenerationBatching
+from .runtime_config_generation_batching_mode import RuntimeConfigGenerationBatchingMode
 from .runtime_config_model_strategies import RuntimeConfigModelStrategies
 from .runtime_config_model_strategies_additional_property import RuntimeConfigModelStrategiesAdditionalProperty
 from .runtime_config_status import RuntimeConfigStatus
@@ -4487,6 +4489,8 @@ __all__ = (
     "RowFilterEntry",
     "RowFilterEntryFilter",
     "RuntimeConfig",
+    "RuntimeConfigGenerationBatching",
+    "RuntimeConfigGenerationBatchingMode",
     "RuntimeConfigModelStrategies",
     "RuntimeConfigModelStrategiesAdditionalProperty",
     "RuntimeConfigStatus",

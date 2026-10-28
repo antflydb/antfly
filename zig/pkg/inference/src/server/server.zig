@@ -1323,11 +1323,7 @@ test "standalone inference bind is loopback-only unless explicitly overridden" {
     try validateStandaloneBind("0.0.0.0", true);
 }
 
-pub const GenerationBatchingMode = enum {
-    off,
-    auto,
-    on,
-};
+pub const GenerationBatchingMode = @FieldType(platform.inference_settings.GenerationBatching, "mode");
 
 fn cudaDecodeGraphReplayRequested(raw_opt: ?[]const u8) bool {
     const raw = raw_opt orelse return false;
@@ -1347,6 +1343,14 @@ pub const GenerationBatchingConfig = struct {
     max_step_query_tokens: usize = 512,
     max_decode_wait_us: u32 = 1_000,
     max_idle_prefill_chunk_size: usize = 2048,
+
+    pub fn fromSettings(settings: platform.inference_settings.GenerationBatching) @This() {
+        var out: @This() = .{};
+        inline for (comptime std.meta.fieldNames(platform.inference_settings.GenerationBatching)) |field| {
+            @field(out, field) = @field(settings, field);
+        }
+        return out;
+    }
 
     pub fn enabledForBackend(self: @This(), backend: backends_mod.BackendType) bool {
         if (backend != .cuda) return false;
@@ -10292,10 +10296,7 @@ pub const Node = struct {
             );
         defer reader.deinit();
         try control.check();
-        max_tokens = if (try reader.defaultMaxTokens()) |model_default|
-            boundedReadOutputTokens(requested_max_tokens, model_default, executor_contract.batch.max_output_tokens_per_item)
-        else
-            requested_max_tokens;
+        max_tokens = try reader.resolveMaxTokens(requested_max_tokens, executor_contract.batch.max_output_tokens_per_item);
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
@@ -10430,10 +10431,7 @@ pub const Node = struct {
             );
         defer reader.deinit();
         try control.check();
-        max_tokens = if (try reader.defaultMaxTokens()) |model_default|
-            boundedReadOutputTokens(requested_max_tokens, model_default, executor_contract.batch.max_output_tokens_per_item)
-        else
-            requested_max_tokens;
+        max_tokens = try reader.resolveMaxTokens(requested_max_tokens, executor_contract.batch.max_output_tokens_per_item);
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
@@ -17297,6 +17295,8 @@ pub const Node = struct {
         if (body.requests.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'requests' must not be empty" });
         }
+        self.config.request_limits.validateItemCount(body.requests.len) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
         if (body.requests.len > max_generate_batch_items) {
             return ctx.status(413).json(.{
                 .@"error" = "BATCH_TOO_LARGE",
@@ -20720,7 +20720,7 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "every framed attachment must be referenced exactly once",
             });
-        const max_tokens = validateReadMaxTokens(body.max_tokens) catch
+        var max_tokens = validateReadMaxTokens(body.max_tokens) catch
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "'max_tokens' must be between 1 and 1024",
@@ -20984,6 +20984,8 @@ pub const Node = struct {
         };
         defer reader.deinit();
 
+        max_tokens = reader.resolveMaxTokens(max_tokens, executor_contract.batch.max_output_tokens_per_item) catch |err|
+            return inferenceFailureResponse(ctx, err);
         const exact_prompt_tokens = reader.inputTokenCount(.{
             .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
@@ -46355,4 +46357,24 @@ test "LightOn measured prompt policy rejects expanded input before page executio
     try validateMeasuredReadPrompt(contract, 32, 64);
     try std.testing.expectError(error.InferenceInputTokensExceeded, validateMeasuredReadPrompt(contract, 33, 64));
     try std.testing.expectError(error.InferenceOutputTokensExceeded, validateMeasuredReadPrompt(contract, 32, 65));
+}
+
+test "generate batch HTTP enforces public cardinality before dispatch" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_items_per_request = 1 } });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/generate/batch");
+    defer request.deinit();
+    try request.setJson(
+        \\{"requests":[{"custom_id":"one","body":{"model":"missing","messages":[]}},{"custom_id":"two","body":{"model":"missing","messages":[]}}]}
+    );
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.generateBatchContent(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "BATCH_TOO_LARGE") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }

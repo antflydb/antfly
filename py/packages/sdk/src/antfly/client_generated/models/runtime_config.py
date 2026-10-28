@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from ..models.kernel_jit_config import KernelJitConfig
     from ..models.model_ref import ModelRef
     from ..models.prompt_cache_config import PromptCacheConfig
+    from ..models.runtime_config_generation_batching import RuntimeConfigGenerationBatching
     from ..models.runtime_config_model_strategies import RuntimeConfigModelStrategies
 
 
@@ -61,6 +62,8 @@ class RuntimeConfig:
             HTTP(S), file, and S3 content until explicit allowlists are configured.
             Do not assume omission has identical policy semantics across consumers.
         s3_credentials (Credentials | Unset):
+        generation_batching (RuntimeConfigGenerationBatching | Unset): Experimental execution batching; mode on
+            explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply.
         keep_alive (str | Unset): How long to keep models loaded in memory after last use (Ollama-compatible).
             Models are automatically unloaded after this duration of inactivity.
             Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
@@ -129,6 +132,7 @@ class RuntimeConfig:
     ml_dir: str | Unset = UNSET
     content_security: ContentSecurityConfig | Unset = UNSET
     s3_credentials: Credentials | Unset = UNSET
+    generation_batching: RuntimeConfigGenerationBatching | Unset = UNSET
     keep_alive: str | Unset = "5m"
     max_loaded_models: int | Unset = 10
     pool_size: int | Unset = UNSET
@@ -162,6 +166,10 @@ class RuntimeConfig:
         s3_credentials: dict[str, Any] | Unset = UNSET
         if not isinstance(self.s3_credentials, Unset):
             s3_credentials = self.s3_credentials.to_dict()
+
+        generation_batching: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.generation_batching, Unset):
+            generation_batching = self.generation_batching.to_dict()
 
         keep_alive = self.keep_alive
 
@@ -221,6 +229,8 @@ class RuntimeConfig:
             field_dict["content_security"] = content_security
         if s3_credentials is not UNSET:
             field_dict["s3_credentials"] = s3_credentials
+        if generation_batching is not UNSET:
+            field_dict["generation_batching"] = generation_batching
         if keep_alive is not UNSET:
             field_dict["keep_alive"] = keep_alive
         if max_loaded_models is not UNSET:
@@ -258,6 +268,7 @@ class RuntimeConfig:
         from ..models.kernel_jit_config import KernelJitConfig
         from ..models.model_ref import ModelRef
         from ..models.prompt_cache_config import PromptCacheConfig
+        from ..models.runtime_config_generation_batching import RuntimeConfigGenerationBatching
         from ..models.runtime_config_model_strategies import RuntimeConfigModelStrategies
 
         d = dict(src_dict)
@@ -284,6 +295,13 @@ class RuntimeConfig:
             s3_credentials = UNSET
         else:
             s3_credentials = Credentials.from_dict(_s3_credentials)
+
+        _generation_batching = d.pop("generation_batching", UNSET)
+        generation_batching: RuntimeConfigGenerationBatching | Unset
+        if isinstance(_generation_batching, Unset):
+            generation_batching = UNSET
+        else:
+            generation_batching = RuntimeConfigGenerationBatching.from_dict(_generation_batching)
 
         keep_alive = d.pop("keep_alive", UNSET)
 
@@ -346,6 +364,7 @@ class RuntimeConfig:
             ml_dir=ml_dir,
             content_security=content_security,
             s3_credentials=s3_credentials,
+            generation_batching=generation_batching,
             keep_alive=keep_alive,
             max_loaded_models=max_loaded_models,
             pool_size=pool_size,

@@ -476,6 +476,14 @@ pub const LoadedReader = union(enum) {
         };
     }
 
+    /// Resolve once and pass the same effective options to validation and execution.
+    /// Explicit values remain unchanged so callers can reject values over policy.
+    pub fn resolveMaxTokens(self: *LoadedReader, requested: ?usize, ceiling: ?usize) !?usize {
+        if (requested) |value| return value;
+        const model_default = try self.defaultMaxTokens() orelse return null;
+        return if (ceiling) |limit| @min(model_default, limit) else model_default;
+    }
+
     /// Return the exact per-item textual input length produced by this loaded
     /// reader. Multi-stage OCR has no text input; every generative reader uses
     /// the same prompt builder and tokenizer as execution.
@@ -1222,4 +1230,11 @@ test "Moondream readers route natively only with native checkpoint artifacts" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/tokenizer.json", .data = "{}" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/model.safetensors", .data = "" });
     try std.testing.expectEqual(ReaderKind.moondream, (try probeManifest(allocator, model_dir, man)).supported);
+}
+
+test "reader effective output options bound omitted defaults and preserve explicit values" {
+    var reader: LoadedReader = .{ .moondream = undefined };
+    try std.testing.expectEqual(@as(?usize, 64), try reader.resolveMaxTokens(null, 64));
+    try std.testing.expectEqual(@as(?usize, 256), try reader.resolveMaxTokens(null, null));
+    try std.testing.expectEqual(@as(?usize, 65), try reader.resolveMaxTokens(65, 64));
 }

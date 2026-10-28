@@ -645,14 +645,7 @@ fn readTextsWithReader(
     controlled_options.execution_control = ctx.execution_control;
     // Composed image extraction must use the same bounded effective reader
     // options as /read, including when the caller omits max_tokens.
-    if (controlled_options.max_tokens == null) {
-        if (try reader.defaultMaxTokens()) |model_default| {
-            controlled_options.max_tokens = if (ctx.reader_request_limits.max_output_tokens_per_item) |limit|
-                @min(model_default, limit)
-            else
-                model_default;
-        }
-    }
+    controlled_options.max_tokens = try reader.resolveMaxTokens(controlled_options.max_tokens, ctx.reader_request_limits.max_output_tokens_per_item);
     if (ctx.reader_admission) |admission|
         _ = try admission.resolve_limits(admission.ptr, model_path, image_datas, controlled_options);
     if (ctx.reader_request_limits.max_input_tokens_per_item) |limit| {

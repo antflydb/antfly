@@ -64,6 +64,15 @@ class ResourcePolicyContractTests(unittest.TestCase):
         self.assertIn("style", logging)
         self.assertNotIn("resources", logging)
 
+    def test_execution_settings_use_canonical_lifetime_and_batching(self):
+        config = self.resolve(self.schemas["InferenceConfig"])["properties"]
+        runtime = self.resolve(config["inference"])["properties"]
+        self.assertIn("keep_alive", runtime)
+        self.assertNotIn("keep_alive_ms", runtime)
+        batching = self.resolve(runtime["generation_batching"])["properties"]
+        self.assertEqual(batching["mode"]["enum"], ["off", "auto", "on"])
+        self.assertIn("max_step_query_tokens", batching)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -234,6 +234,7 @@ const InferenceRuntimeConfigWire = struct {
     embedded_enabled: bool = true,
     worker_environment: []const struct { name: []const u8, value: []const u8 } = &.{},
     resources: platform.resource_policy.Resources = .{},
+    generation_batching: platform.inference_settings.GenerationBatching = .{},
     kernel_jit: KernelJit = .{},
     prompt_cache: PromptCache = .{},
 };
@@ -5179,6 +5180,7 @@ pub fn runFromIterator(
         .embedded_enabled = embedded_inference_enabled,
         .worker_environment = worker_environment.items,
         .resources = inference_resource_policy,
+        .generation_batching = configured_inference.generation_batching,
         .kernel_jit = .{
             .mode = effective_kernel_jit_mode,
             .cache_dir = configured_inference.kernel_jit.cache_dir,

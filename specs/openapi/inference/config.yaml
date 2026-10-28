@@ -1496,6 +1496,32 @@ components:
         s3_credentials:
           $ref: "../shared/s3.yaml#/components/schemas/Credentials"
           description: "S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail."
+        generation_batching:
+          type: object
+          additionalProperties: false
+          description: Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply.
+          properties:
+            mode:
+              type: string
+              enum: ["off", "auto", "on"]
+              default: "off"
+            max_step_items:
+              type: integer
+              minimum: 0
+              default: 2
+            max_step_query_tokens:
+              type: integer
+              minimum: 0
+              default: 512
+            max_decode_wait_us:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              default: 1000
+            max_idle_prefill_chunk_size:
+              type: integer
+              minimum: 0
+              default: 2048
         keep_alive:
           type: string
           description: |

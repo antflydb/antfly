@@ -53,7 +53,7 @@ const InferenceSettings = struct {
     };
 
     const PromptCacheConfig = struct {
-        enabled: bool = true,
+        enabled: bool = false,
         mode: inference.runtime.kv.prompt_cache.Mode = .block_hash,
         max_bytes_mb: usize = 512,
         min_tokens: usize = 64,
@@ -65,11 +65,11 @@ const InferenceSettings = struct {
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
     preload: []const WarmModelConfig = &.{},
-    keep_alive_ms: ?u64 = null,
+    keep_alive: ?[]const u8 = null,
     max_loaded_models: ?usize = null,
     http_max_body_mb: ?usize = null,
     pool_size: ?usize = null,
-    generation_batching: ?inference.server.GenerationBatchingConfig = null,
+    generation_batching: ?platform.inference_settings.GenerationBatching = null,
     kernel_jit: ?inference.graph.kernel_jit.Config = null,
     prompt_cache: ?PromptCacheConfig = null,
 };
@@ -94,7 +94,10 @@ fn mergedMemoryBudgets(config: platform.resource_policy.InferenceMemory, cli: in
 fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(RunConfig) {
     const raw = try inference.util.c_file.readFileMax(allocator, path, std.math.maxInt(usize));
     defer allocator.free(raw);
-    return try parseRunConfig(allocator, raw);
+    return parseRunConfig(allocator, raw) catch |err| {
+        platform.inference_settings.diagnoseInvalidConfig(allocator, raw);
+        return err;
+    };
 }
 
 fn validateKnownObjectFields(comptime T: type, object: std.json.ObjectMap) !void {
@@ -115,9 +118,7 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
         .object => |object| object,
         else => return error.InvalidInferenceConfig,
     };
-    for ([_][]const u8{ "admission", "graph_execution", "memory", "request_limits", "max_concurrent_requests", "process_memory_budget_mb", "preload", "models_dir", "ml_dir", "prompt_cache", "kernel_jit", "max_loaded_models", "content_security", "s3_credentials", "pool_size", "generation_batching", "http_max_body_mb", "keep_alive_ms" }) |old| {
-        if (root.contains(old)) return error.InvalidInferenceConfig;
-    }
+    try platform.inference_settings.validateCanonicalLocations(root);
     if (root.get("resources")) |value| {
         _ = platform.resource_policy.Resources.parse(allocator, value) catch return error.InvalidInferenceConfig;
     }
@@ -147,6 +148,7 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
         }).validate();
     }
     if (parsed.value.inference.kernel_jit) |value| try value.validate();
+    if (parsed.value.inference.keep_alive) |value| _ = try platform.inference_settings.parseKeepAliveMs(value);
     try parsed.value.resources.validate();
     return parsed;
 }
@@ -632,11 +634,11 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
             config_preload_models = try preloadModelsFromConfig(allocator, cfg.inference.preload);
             node_cfg.preload = config_preload_models;
         }
-        if (cfg.inference.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
+        if (cfg.inference.keep_alive) |value| node_cfg.keep_alive_ms = try platform.inference_settings.parseKeepAliveMs(value);
         if (cfg.inference.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.inference.pool_size) |value| node_cfg.pool_size = value;
         if (cfg.inference.http_max_body_mb) |value| node_cfg.http_max_body_bytes = try inference.server.httpBodyLimitBytesFromMib(value);
-        if (cfg.inference.generation_batching) |value| node_cfg.generation_batching = value;
+        if (cfg.inference.generation_batching) |value| node_cfg.generation_batching = inference.server.GenerationBatchingConfig.fromSettings(value);
         if (cfg.inference.prompt_cache) |value| node_cfg.prompt_cache = .{
             .enabled = value.enabled,
             .mode = value.mode,
@@ -935,7 +937,7 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("q4_k", parsed.value.inference.preload[0].quantization.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.inference.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.inference.pool_size);
-    try std.testing.expectEqual(inference.server.GenerationBatchingMode.on, parsed.value.inference.generation_batching.?.mode);
+    try std.testing.expectEqual(.on, parsed.value.inference.generation_batching.?.mode);
     try std.testing.expectEqual(@as(usize, 8), parsed.value.inference.generation_batching.?.max_step_items);
     try std.testing.expectEqual(@as(usize, 256), parsed.value.inference.generation_batching.?.max_step_query_tokens);
     try std.testing.expectEqual(@as(u32, 750), parsed.value.inference.generation_batching.?.max_decode_wait_us);
@@ -1144,4 +1146,19 @@ test "standalone resources use shared byte policy and preserve explicit CLI auto
     try std.testing.expectEqual(@as(u32, 1), policy.inference.admission.max_concurrent_requests);
     try std.testing.expectEqual(@as(?u32, 8), policy.inference.admission.max_work_units);
     try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator, "{\"resources\":{\"inference\":{\"request_limits\":{\"max_items_per_request\":0}}}}"));
+}
+
+test "standalone canonical execution settings share lifetime and batching" {
+    const parsed = try parseRunConfig(std.testing.allocator,
+        \\{"inference":{"keep_alive":"90s","generation_batching":{"mode":"on","max_step_query_tokens":123}}}
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 90000), try platform.inference_settings.parseKeepAliveMs(parsed.value.inference.keep_alive.?));
+    const settings = inference.server.GenerationBatchingConfig.fromSettings(parsed.value.inference.generation_batching.?);
+    try std.testing.expectEqual(.on, settings.mode);
+    try std.testing.expectEqual(@as(usize, 123), settings.max_step_query_tokens);
+    const zero = try parseRunConfig(std.testing.allocator, "{\"inference\":{\"keep_alive\":\"0\"}}");
+    defer zero.deinit();
+    try std.testing.expectEqual(@as(u64, 0), try platform.inference_settings.parseKeepAliveMs(zero.value.inference.keep_alive.?));
+    try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator, "{\"inference\":{\"keep_alive_ms\":5000}}"));
 }

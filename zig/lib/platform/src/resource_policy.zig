@@ -58,6 +58,10 @@ pub const InferenceRequestLimits = struct {
     max_output_tokens_per_item: ?usize = null,
     max_decoded_pixels_per_batch: ?u64 = null,
 
+    pub fn validateItemCount(self: @This(), count: usize) !void {
+        if (self.max_items_per_request) |limit| if (count > limit) return error.InferenceBatchTooLarge;
+    }
+
     pub fn validate(self: @This()) !void {
         inline for (comptime std.meta.fieldNames(@This())) |field| {
             if (@field(self, field)) |value| if (value == 0) return error.InvalidInferenceConfig;

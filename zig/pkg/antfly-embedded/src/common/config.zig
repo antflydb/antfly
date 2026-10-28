@@ -138,6 +138,14 @@ pub const Config = struct {
         operation_timeout_ms: u64 = default_backup_operation_timeout_ms,
     };
 
+    fn parseGenerationBatching(alloc: std.mem.Allocator, raw: ?std.json.Value) !platform.inference_settings.GenerationBatching {
+        const object = raw orelse return .{};
+        const value = object.object.get("generation_batching") orelse return .{};
+        const parsed = try std.json.parseFromValue(platform.inference_settings.GenerationBatching, alloc, value, .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub const MetadataConfig = struct {
         pub const NodeUrl = struct {
             node_id: u64,
@@ -417,22 +425,15 @@ pub const Config = struct {
         kernel_jit: KernelJitConfig = .{},
         prompt_cache: PromptCacheConfig = .{},
         keep_alive: ?[]u8 = null,
-        // `keep_alive_ms` is not part of the shared openapi inference schema
-        // (only the `keep_alive` duration string is); it exists solely so
-        // `antfly inference run`'s config loader (parseRunConfig in
-        // inference_runtime/runtime.zig) can accept the operator's flat
-        // integer-millisecond spelling. Never populated by the generic
-        // `Config.parseFromSlice` openapi path.
-        keep_alive_ms: ?u64 = null,
         // True only when `antfly inference run`'s merged config (nested
-        // `inference.prompt_cache` or the operator's flat top-level
-        // `prompt_cache`) explicitly set a `prompt_cache` object.
+        // `inference.prompt_cache`) explicitly set a `prompt_cache` object.
         // `PromptCacheConfig.enabled` defaults to false once that object is
         // present, but the run server's own built-in default is enabled=true;
         // this flag lets callers keep that default when the key is absent
         // entirely. Never populated by the generic `Config.parseFromSlice`
         // openapi path.
         prompt_cache_configured: bool = false,
+        generation_batching: platform.inference_settings.GenerationBatching = .{},
         max_loaded_models: ?i64 = null,
         http_max_body_mb: usize = 10,
         pool_size: usize = 2,
@@ -814,15 +815,7 @@ pub const Config = struct {
             .max_timeout_ms = try optionalU32Field(policy.object, "max_timeout_ms") orelse 3_600_000,
         } else .{};
         try public_inference.validate();
-        for ([_][]const u8{ "admission", "graph_execution", "memory", "request_limits", "process_memory_budget_mb" }) |old| {
-            if (root.contains(old)) return error.InvalidConfig;
-        }
-        if (root.get("inference")) |value| {
-            if (value != .object) return error.InvalidConfig;
-            for ([_][]const u8{ "admission", "max_concurrent_requests", "memory", "request_limits" }) |old| {
-                if (value.object.contains(old)) return error.InvalidConfig;
-            }
-        }
+        platform.inference_settings.validateCanonicalLocations(root) catch return error.InvalidConfig;
         const resources = if (root.get("resources")) |value|
             platform.resource_policy.Resources.parse(alloc, value) catch return error.InvalidConfig
         else
@@ -1002,6 +995,7 @@ pub const Config = struct {
                 .kernel_jit = kernel_jit,
                 .prompt_cache = prompt_cache,
                 .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
+                .generation_batching = try parseGenerationBatching(alloc, raw_root.get("inference")),
                 .max_loaded_models = inference.max_loaded_models,
                 .http_max_body_mb = if (inference.http_max_body_mb) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 10,
                 .pool_size = if (inference.pool_size) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 2,
@@ -1276,7 +1270,10 @@ pub fn loadFromPathWithSecretsWithIo(
 ) !Config {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
-    return try Config.parseFromSliceWithSecrets(alloc, raw, secret_store);
+    return Config.parseFromSliceWithSecrets(alloc, raw, secret_store) catch |err| {
+        platform.inference_settings.diagnoseInvalidConfig(alloc, raw);
+        return err;
+    };
 }
 
 pub fn loadFromPathWithSecretsForDeployment(
@@ -1297,7 +1294,10 @@ pub fn loadFromPathWithSecretsForDeploymentWithIo(
 ) !Config {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
-    return try Config.parseFromSliceWithSecretsForDeployment(alloc, raw, secret_store, deployment_mode);
+    return Config.parseFromSliceWithSecretsForDeployment(alloc, raw, secret_store, deployment_mode) catch |err| {
+        platform.inference_settings.diagnoseInvalidConfig(alloc, raw);
+        return err;
+    };
 }
 
 pub fn resolveLocalRoleBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config, role: []const u8) ![]u8 {

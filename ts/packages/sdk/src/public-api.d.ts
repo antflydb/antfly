@@ -30051,6 +30051,22 @@ export interface components {
             content_security?: components["schemas"]["ContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["Credentials"];
+            /** @description Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply. */
+            generation_batching?: {
+                /**
+                 * @default off
+                 * @enum {string}
+                 */
+                mode?: "off" | "auto" | "on";
+                /** @default 2 */
+                max_step_items?: number;
+                /** @default 512 */
+                max_step_query_tokens?: number;
+                /** @default 1000 */
+                max_decode_wait_us?: number;
+                /** @default 2048 */
+                max_idle_prefill_chunk_size?: number;
+            };
             /**
              * @description How long to keep models loaded in memory after last use (Ollama-compatible).
              *     Models are automatically unloaded after this duration of inactivity.
