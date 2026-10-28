@@ -4114,6 +4114,35 @@ pub fn CurrentStateRetirement(comptime Publication: type) type {
             if (self.publication) |*publication| publication.release();
             self.publication = null;
         }
+        /// Abandon further logical work while joining the exact accepted read
+        /// or write under independent execution. Publication remains owned until
+        /// that join; the retained grant retires separately.
+        pub fn abortWithAdmission(self: *Self, original: admission.Port) !void {
+            try original.checkpoint();
+            var trace: admission.RejectionTrace = .{};
+            switch (self.pending) {
+                .read => |*value| {
+                    _ = value.waitWithAdmission(trace.bind(original).?) catch {
+                        if (trace.failure) |rejected| return rejected;
+                        self.joinAndRelease();
+                        return;
+                    };
+                },
+                .physical => |*value| value.waitWithAdmission(trace.bind(original).?) catch {
+                    if (trace.failure) |rejected| return rejected;
+                },
+                .none => {},
+            }
+            self.joinAndRelease();
+        }
+        /// Exclusive mandatory fallback when controlled join is unsupported.
+        /// Keep the grant owned for later retirement instead of destroying it.
+        pub fn joinAndRelease(self: *Self) void {
+            self.retirePending();
+            self.releasePublication();
+            self.failure = error.Canceled;
+            self.stage = .failed;
+        }
         pub fn retireWithAdmission(self: *Self, original: admission.Port) !void {
             try original.checkpoint();
             if (self.stage != .published and self.stage != .failed) return error.ResourceBudgetExceeded;

@@ -29,6 +29,7 @@ const Comparison = @import("run_comparison.zig").Cursor;
 const platform = @import("antfly_platform");
 const Run = repository.Run;
 const storage_io = @import("storage_io.zig");
+pub const wal_retirement = @import("normal_wal_retirement.zig");
 pub const checkpoint_publication = @import("normal_checkpoint_publication.zig");
 pub var test_hook: ?*const fn (admission.Port) anyerror!void = null;
 pub var test_append_hook: ?*const fn (*Frame, admission.Port) anyerror!void = null;
@@ -44,6 +45,8 @@ pub const Frame = struct {
     append_path: [std.fs.max_path_bytes]u8 = undefined,
     append_path_len: usize = 0,
     deadline_ns: u64 = 0,
+    wal_owner: ?*wal_retirement.Owner = null,
+    wal_retirement_offset: usize = 0,
     checkpoint_owner: ?*checkpoint_publication.Owner = null,
     checkpoint_retirement_offset: usize = 0,
     next: ?*Frame = null,
@@ -184,6 +187,55 @@ pub const Frame = struct {
             return cause;
         };
     }
+    pub fn prepareWal(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime) !void {
+        const io = owner.io() orelse return error.ExecutionWaitUnsupported;
+        self.deadline_ns = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+        try self.credit.growBoundedOversized(try std.math.add(u64, @sizeOf(wal_retirement.Owner), try backend.storage.?.appendResourceBytes(0)), 1);
+        var pass = try execution.Pass.init(owner.runnableOwner(), &io, self.deadline_ns, .{ .context = backend, .is_cancelled = cancelled });
+        defer pass.deinit();
+        var scope = try pass.admissionScope(io);
+        const payload = scope.payload();
+        const original = admission.Port.init(&payload);
+        self.wal_owner = &(try allocate(wal_retirement.Owner, backend.allocator, 1, original))[0];
+        self.wal_owner.?.* = .{ .root = backend.root_dir.?, .deadline = self.deadline_ns };
+        self.wal_owner.?.grant = (try backend.storage.?.tryPrepareDurabilityWithAdmission(original)) orelse return error.ResourceBudgetExceeded;
+        if (comptime @import("builtin").is_test) if (wal_retirement.test_prepare_hook) |hook| try hook(original);
+    }
+    pub fn driveWal(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime) !void {
+        // Even a failure in cleanup backoff must join accepted IO and release
+        // the WAL gate before the caller reacquires Backend.mu.
+        errdefer self.wal_owner.?.joinAndRelease();
+        const io = owner.io() orelse return error.ExecutionWaitUnsupported;
+        const result = blk: {
+            var pass = execution.Pass.init(owner.runnableOwner(), &io, self.deadline_ns, .{ .context = backend, .is_cancelled = cancelled }) catch |cause| break :blk @as(anyerror!void, cause);
+            defer pass.deinit();
+            var scope = pass.admissionScope(io) catch |cause| break :blk @as(anyerror!void, cause);
+            const payload = scope.payload();
+            break :blk self.wal_owner.?.drive(.init(&payload));
+        };
+        result catch |cause| {
+            while (true) {
+                const cleanup = blk: {
+                    var pass = execution.Pass.initWithOptions(owner.runnableOwner(), &io, platform.time.monotonicNs() +| 100 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true }) catch |failure| break :blk @as(anyerror!void, failure);
+                    defer pass.deinit();
+                    var scope = pass.admissionScope(io) catch |failure| break :blk @as(anyerror!void, failure);
+                    const payload = scope.payload();
+                    break :blk self.wal_owner.?.abortWithAdmission(.init(&payload));
+                };
+                cleanup catch |failure| {
+                    switch (failure) {
+                        error.Timeout, error.DeadlineExceeded, error.ResourceBudgetExceeded, error.ParentMemoryBusy, error.CapacityUnavailable, error.OutOfMemory, error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable => {
+                            try io.sleep(.fromMilliseconds(1), .awake);
+                            continue;
+                        },
+                        else => self.wal_owner.?.joinAndRelease(),
+                    }
+                };
+                break;
+            }
+            return cause;
+        };
+    }
     pub fn prepareCheckpoint(self: *Frame, backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime, root: []const u8, id: u64, next_id: u64) !void {
         const io = owner.io() orelse return error.ExecutionWaitUnsupported;
         const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
@@ -305,7 +357,23 @@ pub const Frame = struct {
         self.previous_obsolete = null;
     }
     pub fn stepWithAdmission(self: *Frame, a: std.mem.Allocator, credits: *usize, original: ?admission.Port) !bool {
-        if (comptime @import("builtin").is_test) if (original) |port| if (test_retirement_hook) |hook| try hook(port);
+        if (comptime @import("builtin").is_test) if (self.wal_owner == null) if (original) |port| if (test_retirement_hook) |hook| try hook(port);
+        if (self.wal_owner) |wal_owner| {
+            if (credits.* == 0) return false;
+            credits.* -= 1;
+            if (self.wal_retirement_offset == 0) try wal_owner.retireWithAdmission(original);
+            const bytes = std.mem.asBytes(wal_owner);
+            while (self.wal_retirement_offset < bytes.len) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                const end = @min(bytes.len, self.wal_retirement_offset + 16 * 1024);
+                @memset(bytes[self.wal_retirement_offset..end], undefined);
+                self.wal_retirement_offset = end;
+            }
+            a.rawFree(bytes, .of(wal_retirement.Owner), @returnAddress());
+            self.wal_owner = null;
+        }
         if (self.append_pending != null) {
             if (original) |port| self.observeAppend(port) catch |cause| {
                 if (self.append_pending != null) return cause;

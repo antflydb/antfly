@@ -142,7 +142,9 @@ const builtin = @import("builtin");
 // Detached flush executors retain runtime access; writer records own legacy output tickets.
 // Normal flush publication retains controlled edit cursors and pass deadlines.
 // Prepared append owners retain accepted IO and bounded buffer retirement.
-pub const abi_version: u32 = 159;
+// Normal primary WAL retirement owns a funded physical continuation and
+// generation-stamped retention state independently of dedicated replay.
+pub const abi_version: u32 = 160;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

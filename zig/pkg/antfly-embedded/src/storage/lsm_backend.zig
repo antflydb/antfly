@@ -1452,6 +1452,8 @@ pub const Backend = struct {
         // Proof from our own completed destructive reset, not a sampled byte
         // count. No append, recovery, or invalidation may preserve this proof.
         reset_proven: bool = false,
+        primary_empty_proven: bool = false,
+        generation: u64 = 0,
         primary: ?wal_mod.RetentionStats = null,
         primary_ns: u64 = 0,
         replay: ?wal_mod.RetentionStats = null,
@@ -1468,6 +1470,7 @@ pub const Backend = struct {
             now_ns: u64,
         ) !wal_mod.AppendResult {
             self.reset_proven = false;
+            self.primary_empty_proven = false;
             errdefer self.invalidatePrimary();
             const result = try wal_mod.appendStateWithOptionsResult(
                 storage,
@@ -1511,6 +1514,9 @@ pub const Backend = struct {
 
         fn noteAppend(self: *@This(), result: wal_mod.AppendResult, now_ns: u64) void {
             if (result.bytes == 0 or result.segment == 0) return;
+            self.generation +|= 1;
+            self.reset_proven = false;
+            self.primary_empty_proven = false;
             if (self.primary) |*stats| {
                 if (stats.current_segment == 0) {
                     stats.oldest_retained_segment = 1;
@@ -1527,17 +1533,20 @@ pub const Backend = struct {
         }
 
         fn invalidatePrimary(self: *@This()) void {
+            self.generation +|= 1;
+            self.primary_empty_proven = false;
             self.reset_proven = false;
             self.primary = null;
             self.primary_ns = 0;
         }
 
         fn invalidateAll(self: *@This()) void {
-            self.* = .{};
+            self.* = .{ .generation = self.generation +| 1 };
         }
 
         fn installReset(self: *@This(), now_ns: u64) void {
             self.reset_proven = true;
+            self.primary_empty_proven = true;
             self.primary = .{
                 .oldest_retained_segment = 1,
                 .current_segment = 1,
@@ -1789,6 +1798,7 @@ pub const Backend = struct {
     manifest_directory: ?*RunDirectory = null,
     registered_manifest_checkpoint: ?*@import("lsm_backend/registered_manifest_checkpoint.zig").Owner = null,
     wal_retirement_recovery: ?WalRetirementRecovery = null,
+    normal_wal_retirement_in_flight: bool = false,
     manifest_journal: repository_mod.ManifestJournal = .{},
     run_directory_dirty: bool = true,
     run_directory_generation: u64 = 0,
@@ -2266,7 +2276,7 @@ pub const Backend = struct {
         }
     }
 
-    const WalOperationLock = struct {
+    pub const WalOperationLock = struct {
         backend: *Backend,
         process_lock_mode: ?storage_io.NativePathLockMode = null,
         native_locked: bool = false,
@@ -2380,6 +2390,20 @@ pub const Backend = struct {
             self.* = .{};
         }
     };
+
+    pub const NormalWalRetirementPublication = struct {
+        lock: WalOperationLock,
+        // Coverage was captured under Backend.mu and this exclusive WAL gate.
+        // Physical callbacks never reenter Backend.mu while a peer may own it.
+        pub fn noteMutation(_: *@This()) !void {}
+        pub fn publishWithAdmission(_: *@This(), _: anytype, original: read_admission.Port) !void {
+            try original.checkpoint();
+        }
+        pub fn release(self: *@This()) void {
+            self.lock.release();
+        }
+    };
+    pub const NormalWalRetirement = wal_mod.CurrentStateRetirement(NormalWalRetirementPublication);
 
     const WalRetirementRecovery = struct {
         generation: u64,
@@ -5382,6 +5406,10 @@ pub const Backend = struct {
     }
 
     fn maybeCheckpointWalAfterManifestPublish(self: *Backend) !void {
+        return self.maybeCheckpointWalAfterManifestPublishWithExecution(null);
+    }
+
+    fn maybeCheckpointWalAfterManifestPublishWithExecution(self: *Backend, execution_runtime: ?*background_runtime_mod.BackendRuntime) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         if (self.registered_publication.seal != null or self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
@@ -5389,6 +5417,10 @@ pub const Backend = struct {
         // A newer flush can finish while an older manifest is syncing. Empty
         // memtables alone no longer prove that the WAL is covered durably.
         if (!self.manifestCoversCurrentRuns()) return;
+        if (execution_runtime) |owner| {
+            if (self.root_writer_lock != null and self.wal_operation_lock_file != null and self.root_lock_state != null)
+                return self.retireNormalWalWithExecutionLocked(owner);
+        }
         if (self.mutable.entryCount() == 0 and self.activeImmutableMemtableCount() == 0) {
             try self.resetWalAfterManifestCheckpoint();
             return;
@@ -5404,6 +5436,76 @@ pub const Backend = struct {
             oldest_active - 1,
         );
         self.syncTrackedWalRetentionUsageCurrentLocked();
+    }
+
+    fn retireNormalWalWithExecutionLocked(self: *Backend, owner: *background_runtime_mod.BackendRuntime) !void {
+        if (self.normal_wal_retirement_in_flight) return error.ResourceBudgetExceeded;
+        if (self.mutable.entryCount() == 0 and self.activeImmutableMemtableCount() == 0 and self.wal_retention.primary_empty_proven) {
+            self.clearPublishedWalLogicalDebtLocked();
+            return;
+        }
+        if (self.mutable.entryCount() != 0 or self.activeImmutableMemtableCount() != 0) {
+            if ((self.oldestActiveWalSegment() orelse return) <= 1) return;
+        }
+        const Frame = @import("lsm_backend/manifest_edit_preparation.zig").Frame;
+        const frame = try Frame.create(self);
+        defer self.retireManifestPreparation(frame);
+        self.normal_wal_retirement_in_flight = true;
+        defer self.normal_wal_retirement_in_flight = false;
+        self.retainReaderKind(.other);
+        defer self.releaseReaderKind(.other);
+        self.mu.unlock();
+        const prepared = frame.prepareWal(self, owner);
+        _ = runtime_mod.lockBackend(Backend, self);
+        try prepared;
+        var lock = (try self.tryAcquireWalOperationLockImpl(.exclusive, false)) orelse return error.ResourceBudgetExceeded;
+        if (self.manifest_recovery_required or !self.manifestCoversCurrentRuns()) {
+            lock.release();
+            return error.ResourceBudgetExceeded;
+        }
+        const work = frame.wal_owner.?;
+        if (self.mutable.entryCount() != 0 or self.activeImmutableMemtableCount() != 0) {
+            if (self.mutable.entryCount() != 0 and !self.mutable_wal_range.isSet()) {
+                lock.release();
+                return error.ExecutionWaitUnsupported;
+            }
+            for (self.immutable_memtables.items[self.immutable_head..], self.immutable_wal_ranges.items[self.immutable_head..]) |state, range| {
+                if (state.entryCount() != 0 and !range.isSet()) {
+                    lock.release();
+                    return error.ExecutionWaitUnsupported;
+                }
+            }
+            const oldest = self.oldestActiveWalSegment() orelse {
+                lock.release();
+                return error.ExecutionWaitUnsupported;
+            };
+            if (oldest <= 1) {
+                lock.release();
+                return;
+            }
+            work.covered = oldest - 1;
+        }
+        work.lock = lock;
+        self.wal_retention.invalidatePrimary();
+        work.generation = self.wal_retention.generation;
+        const started = self.writeStatsNowNs();
+        self.mu.unlock();
+        const completed = frame.driveWal(self, owner);
+        _ = runtime_mod.lockBackend(Backend, self);
+        // The physical owner releases the WAL gate before this reentry. A
+        // peer append or reset may already have advanced the retention view.
+        try completed;
+        if (self.wal_retention.generation == work.generation) {
+            self.wal_retention.primary = work.stats;
+            self.wal_retention.primary_ns = self.writeStatsNowNs();
+            self.wal_retention.primary_empty_proven = work.covered == null and work.stats.bytes == 0;
+            if (self.wal_retention.primary_empty_proven and self.mutable.entryCount() == 0 and self.activeImmutableMemtableCount() == 0 and self.manifestCoversCurrentRuns()) self.clearPublishedWalLogicalDebtLocked();
+            if (self.wal_retention.replay) |replay| self.syncTrackedWalRetentionUsageLocked(work.stats.bytes +| replay.bytes);
+        }
+        if (work.covered == null) {
+            self.write_stats.wal_resets +|= 1;
+            self.write_stats.wal_reset_ns +|= self.writeStatsElapsedNs(started);
+        }
     }
 
     fn estimateStateBytes(state: anytype) u64 {
@@ -7001,7 +7103,7 @@ pub const Backend = struct {
             defer turn.deinit();
             _ = try self.writeRunSetManifestSnapshotInTurnWithExecutionLocked(root_dir, &.{}, start_ns, true, turn.waited, execution_runtime);
         }
-        try self.maybeCheckpointWalAfterManifestPublish();
+        try self.maybeCheckpointWalAfterManifestPublishWithExecution(execution_runtime);
         self.manifest_dirty = !self.manifestCoversCurrentRuns();
         self.obsolete_manifest_dirty = self.obsolete_paths.tree.root != self.manifest_journal.obsolete.tree.root;
     }
@@ -7650,7 +7752,7 @@ pub const Backend = struct {
         // every observation amplifies Lite publication work and retirement.
         // Only our completed-reset proof permits this shortcut; fresh opens,
         // partial failures and every append still take the durable I/O path.
-        if (self.wal_retention.reset_proven) {
+        if (self.wal_retention.reset_proven or self.wal_retention.primary_empty_proven) {
             self.clearPublishedWalLogicalDebtLocked();
             return;
         }

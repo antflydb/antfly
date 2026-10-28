@@ -14,9 +14,12 @@ scan continuation through the write facade and background worker. See
 
 Eligible normal file flushes now admit SST construction, metadata append
 preparation, incremental journal encoding/append/sync, and cold/replacement
-streaming checkpoint publication. Accepted publication I/O retains its grant
+streaming checkpoint publication, and post-manifest primary WAL retirement.
+WAL retirement preserves the dedicated replay stream and adopts its measured
+retention state only if no peer mutation advanced the WAL generation.
+Accepted publication I/O retains its grant
 through independent cleanup and joins before releasing journal ownership.
-Periodic checkpoint rotation, WAL I/O, remaining metadata planning and broader
+Periodic checkpoint rotation, foreground WAL append/sync, remaining metadata planning and broader
 compaction execution still need integration;
 this does not establish full engine or mixed-protocol overload qualification.
 
@@ -28,7 +31,7 @@ implementation evidence are recorded in the implementation ledger.
 The branch integrates main through `a507489e93` (#1330). The October 27 merge
 retains the bounded maintenance worker and main's newer document/resolver paths.
 
-Private native ABI 159 and kernel-owner ABI 219 fence the current manager,
+Private native ABI 160 and kernel-owner ABI 220 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
 retirement, allocator-host acquisition, publication-resource and registered source-ancestry and yieldable physical output retirement and registered writer-root contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;

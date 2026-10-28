@@ -30068,8 +30068,47 @@ rebuilt. The separate provider cases cover copied-byte ownership and constructor
 capacity, accepted-write and partial-tail failures; `antfly-prepared-append-test`
 selects those existing checks without running the full physical-sync suite.
 
+Normal detached post-manifest primary WAL retirement now uses the owned streaming
+retirement operation under shared background execution outside `Backend.mu`.
+The backend captures the covered primary segment prefix under its metadata mutex
+and an exclusive WAL gate; physical callbacks never reenter the metadata mutex.
+The gate is released before the driver reacquires that mutex, allowing a peer
+append already waiting under it to finish. A retention generation prevents that
+peer's newer WAL state from being overwritten by an older empty-retirement
+receipt. An active mutable or immutable tail bounds the retired prefix. Full
+primary retirement records a separate empty-primary proof, preserving dedicated
+replay bytes and preventing later no-op legacy close cleanup from resetting them.
+
+The funded owner retains tentative resources, accepted reads/deletes/index
+writes, copied paths and the WAL gate through original-scope rejection. Fresh
+protected cleanup joins accepted I/O before releasing the gate, including
+cancellation and cleanup admission refusal. An error during cleanup backoff also
+joins before mutex reentry. Physical grants retire independently through the
+existing funded FIFO. Failures invalidate retention knowledge; autonomous flush
+completion retries from the actual durable floor without another write, sync or
+SST build. Private native/owner ABI versions 160/220 fence the enlarged backend
+retention state and owned retirement frame. Durable formats are unchanged.
+
+[`wal-retirement-production-v7-debug.json`](qualification/workload-pooling/receipts/2026-10-10/child-outbox-capture-retirement-cumulative-integration/wal-retirement-production-v7-debug.json)
+records the focused Debug qualification. Seven new normal-path native cases
+exercise pre-mutation refusal, rejected accepted-read wait with refused independent
+cleanup, actual deletion failure and retry, dedicated replay retention through
+normal cleanup and later close, a peer commit blocked on the WAL gate, finite
+prefix retirement with a mutable segment, and cancellation followed by controlled
+close. They use ordinary BackendHandle commits and the real native storage pool,
+shared execution owner and detached completion worker. Successful retry and
+concurrency cases abandon/reopen without close repairing publication; resource
+and execution charges return to zero. The replay stream is seeded explicitly by
+the WAL provider API: these are native backend integration fixtures, not server,
+Raft/outbox or mixed-engine overload evidence. Existing admitted-retirement,
+prepared-append, metadata-retirement, maintenance-dispatch and C API/provider
+semantic checks accompany them; full archive/GNU qualification remains waived.
+
 The bounded-publication milestone remains open for checkpoint retirement-path
-planning under the metadata mutex, periodic checkpoint rotation, WAL operations,
-and compaction construction/remaining metadata operations. Callers without the
+planning under the metadata mutex, periodic checkpoint rotation, foreground WAL
+append/sync and other legacy WAL callers, and compaction construction/remaining
+metadata operations. Nonempty legacy `wal.log` or mixed embedded replay layouts
+are refused before destructive normal retirement and still need migration or a
+compatible admitted driver. Callers without the
 eligible detached runtime retain their legacy publication path. This is not full
 DB/server or cross-engine overload qualification. The full design remains open.

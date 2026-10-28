@@ -6451,7 +6451,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             try std.testing.expectEqual(@as(u64, 1), completed.immutable_flushes);
             try std.testing.expectEqual(@as(u64, 1), completed.flushes);
             try std.testing.expect(completed.wal_resets >= 1);
-            try std.testing.expect(handle.ptr().wal_retention.reset_proven);
+            try std.testing.expect(handle.ptr().wal_retention.primary_empty_proven);
         }
         if (mode == .read_metadata_retry or preparing_manifest or mode == .checkpoint_replacement) {
             const before = handle.ptr().snapshotWriteStats();
@@ -7241,4 +7241,294 @@ test "physical cache metadata registered flush publication journal IO parks shar
 }
 test "physical cache metadata registered flush publication canceled journal waiter joins accepted IO before controlled close" {
     try normalAdmittedJournal(.cancel_close);
+}
+
+fn normalAdmittedWal(mode: enum { prepare_retry, accepted_retry, delete_retry, replay, interleave, finite, cancel_close }) !void {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const io_mod = local.storage_lsm_backend_storage_io;
+    const wal = local.storage_lsm_backend_wal;
+    const retirement = local.storage_lsm_backend_compaction_publication.manifest_edit_preparation.wal_retirement;
+    const owners = @import("api/runnable_owner_execution.zig");
+    const platform = @import("antfly_platform");
+    const scheduler = local.common_request_admission.runnable_scheduler;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
+    defer state.owner.deinit();
+    var resources = try Resources.initWithBudgets(a, budgets_mod.smartResourceBudgetsForTotal(128 << 20));
+    defer resources.deinit();
+    resources.attachResourceManager();
+    defer RegisteredOutputFixture.drain(&resources.resource_manager);
+    var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
+    defer pool.deinit();
+    var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/normal-wal", .{tmp.sub_path});
+    defer a.free(root);
+    var handle = try lsm.BackendHandle.openWithConfig(a, root, .{
+        .storage = native.storage(),
+        .resource_manager = &resources.resource_manager,
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 128,
+        .immutable_flush_window_max_memtables = 1,
+        .compact_threshold_runs = 1000,
+        .l0_soft_limit_runs = 1000,
+        .l0_hard_limit_runs = 2000,
+        .wal_segment_bytes = if (mode == .finite) 1 else 1 << 20,
+    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = state.port() } });
+    var open = true;
+    const H = struct {
+        var selected: @TypeOf(mode) = .prepare_retry;
+        var backend: *lsm.Backend = undefined;
+        var execution: *owners.State = undefined;
+        var calls: std.atomic.Value(usize) = .init(0);
+        var accepted: std.atomic.Value(usize) = .init(0);
+        var joined: std.atomic.Value(usize) = .init(0);
+        var injected: std.atomic.Value(bool) = .init(false);
+        var ready: std.Io.Event = .unset;
+        var go: std.Io.Event = .unset;
+        var hold_cleanup: bool = false;
+        fn prepare(original: read_admission.Port) !void {
+            if (selected != .finite or injected.swap(true, .acq_rel)) return;
+            const wait = (try original.executionWait()).?;
+            try wait.beginWait();
+            ready.set(std.testing.io);
+            const waited = go.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            try wait.endWait();
+            try waited;
+        }
+        fn drive(owner: *retirement.Owner, original: read_admission.Port) !void {
+            try original.checkpoint();
+            try std.testing.expect(execution.owner.scheduler.stats().runnable_slots > 0);
+            if (owner.operation == null) {
+                _ = calls.fetchAdd(1, .monotonic);
+                // Probe only before a peer can hold Backend.mu waiting on WAL.
+                while (!backend.mu.tryLock()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                backend.mu.unlock();
+                if (selected == .prepare_retry and !injected.swap(true, .acq_rel)) return error.ResourceBudgetExceeded;
+                if ((selected == .interleave or selected == .cancel_close) and !injected.swap(true, .acq_rel)) {
+                    io_mod.NativeSyncTestControl.started.store(false, .release);
+                    io_mod.NativeSyncTestControl.release.store(false, .release);
+                    io_mod.NativeSyncTestControl.pause.store(true, .release);
+                }
+                if (selected == .delete_retry) io_mod.NativeSyncTestControl.delete_failure.store(true, .release);
+            } else if (owner.operation.?.stage != .ready) {
+                _ = accepted.fetchAdd(1, .monotonic);
+                if (selected == .accepted_retry and !injected.swap(true, .acq_rel)) return error.ResourceBudgetExceeded;
+            }
+        }
+        fn abort(original: read_admission.Port) !void {
+            const call = joined.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().cleanup_runnable_slots);
+            if (selected == .accepted_retry and call == 0) return error.ResourceBudgetExceeded;
+        }
+        fn retire(owner: *retirement.Owner, original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (hold_cleanup) return error.ResourceBudgetExceeded;
+            if (selected == .delete_retry and !owner.completed and owner.operation != null and owner.operation.?.stage == .failed) {
+                io_mod.NativeSyncTestControl.delete_failure.store(false, .release);
+                selected = .replay; // Restore only after the failed physical attempt was joined.
+            }
+        }
+        fn quiet(b: *lsm.Backend) bool {
+            return b.activeImmutableMemtableCount() == 0 and !b.immutable_flush_job_in_flight and !b.immutable_flush_build_in_flight and
+                !b.flush_completion_pending and !b.maintenance_job_in_flight and !b.normal_wal_retirement_in_flight and
+                b.active_manifest_preparation == null and b.retired_manifest_preparations == null and !b.manifest_preparation_reclaim_in_flight;
+        }
+        fn waitQuiet(b: *lsm.Backend, deadline: u64) !void {
+            while (true) {
+                while (!b.mu.tryLock()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                const done = quiet(b);
+                b.mu.unlock();
+                if (done) return;
+                if (platform.time.monotonicNs() >= deadline) {
+                    std.debug.print("WAL quiet timeout mode={t} completion={} immutable={d} maintenance={} normal={} frames={} calls={d}\n", .{ selected, b.flush_completion_pending, b.activeImmutableMemtableCount(), b.maintenance_job_in_flight, b.normal_wal_retirement_in_flight, b.retired_manifest_preparations != null, calls.load(.acquire) });
+                    return error.TestUnexpectedResult;
+                }
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    H.selected = mode;
+    H.backend = handle.ptr();
+    H.execution = &state;
+    H.calls.store(0, .release);
+    H.accepted.store(0, .release);
+    H.joined.store(0, .release);
+    H.injected.store(false, .release);
+    H.ready = .unset;
+    H.go = .unset;
+    H.hold_cleanup = mode == .cancel_close;
+    retirement.test_prepare_hook = H.prepare;
+    retirement.test_hook = H.drive;
+    retirement.test_abort_hook = H.abort;
+    retirement.test_retirement_hook = H.retire;
+    defer {
+        H.go.set(io);
+        io_mod.NativeSyncTestControl.release.store(true, .release);
+        io_mod.NativeSyncTestControl.pause.store(false, .release);
+        io_mod.NativeSyncTestControl.delete_failure.store(false, .release);
+        H.hold_cleanup = false;
+        if (open) handle.close();
+        retirement.test_prepare_hook = null;
+        retirement.test_hook = null;
+        retirement.test_abort_hook = null;
+        retirement.test_retirement_hook = null;
+    }
+    // Seed the dedicated durable replay stream before any background job runs.
+    _ = try wal.appendReplay(native.storage(), a, root, 1, "retained-replay", true, .{});
+    const replay_before = try wal.snapshotReplayRetention(native.storage(), a, root);
+    var write = try handle.ptr().beginWrite();
+    defer write.abort();
+    try write.put(.{}, "first", "manifested");
+    try write.commit();
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    if (mode == .cancel_close) {
+        while (H.calls.load(.acquire) == 0 or !io_mod.NativeSyncTestControl.started.load(.acquire)) {
+            if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        const backend = handle.ptr();
+        backend.closing.store(true, .release);
+        io_mod.NativeSyncTestControl.release.store(true, .release);
+        io_mod.NativeSyncTestControl.pause.store(false, .release);
+        backend.background_executor.drain();
+        try std.testing.expectEqual(@as(u64, 0), backend.active_readers);
+        try std.testing.expect(!backend.normal_wal_retirement_in_flight and !backend.wal_retention.primary_empty_proven);
+        var frame = backend.retired_manifest_preparations;
+        while (frame != null and frame.?.wal_owner == null) frame = frame.?.next;
+        const owner = (frame orelse return error.TestUnexpectedResult).wal_owner.?;
+        try std.testing.expect(owner.lock == null and owner.pending == null);
+        if (owner.operation) |op| try std.testing.expect(op.publication == null);
+        try std.testing.expect(backend.flush_completion_pending);
+        H.hold_cleanup = false;
+        var pass = try local.common_background_execution.Pass.initWithOptions(state.port(), &io, platform.time.monotonicNs() +| 200 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true });
+        defer pass.deinit();
+        var scope = try pass.admissionScope(io);
+        const payload = scope.payload();
+        var close: lsm.Backend.QuiescedClosePreparation = .{};
+        try close.resumeWithAdmission(backend, io, .init(&payload));
+        try std.testing.expect(backend.retired_manifest_preparations == null);
+    }
+    if (mode == .finite or mode == .interleave) {
+        if (mode == .finite) {
+            try H.ready.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        } else {
+            while (H.calls.load(.acquire) == 0 or !io_mod.NativeSyncTestControl.started.load(.acquire)) {
+                if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+        const backend = handle.ptr();
+        while (!backend.mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+        backend.options.flush_threshold = 1 << 20;
+        backend.options.mutable_idle_flush_after_ns = 0;
+        backend.mu.unlock();
+        var read = try backend.beginRead();
+        try std.testing.expectEqualStrings("manifested", try read.get(.{}, "first"));
+        read.abort();
+        var peer = try backend.beginWrite();
+        defer peer.abort();
+        try peer.put(.{}, "second", "wal-only");
+        if (mode == .finite) {
+            try peer.commit();
+            H.go.set(io);
+        } else {
+            const Peer = struct {
+                txn: *@TypeOf(peer),
+                started: std.Io.Event = .unset,
+                failure: ?anyerror = null,
+                fn run(self: *@This()) void {
+                    self.started.set(std.testing.io);
+                    self.txn.commit() catch |cause| {
+                        self.failure = cause;
+                    };
+                }
+            };
+            var concurrent: Peer = .{ .txn = &peer };
+            const thread = try std.Thread.spawn(.{}, Peer.run, .{&concurrent});
+            var joined = false;
+            defer if (!joined) {
+                io_mod.NativeSyncTestControl.release.store(true, .release);
+                thread.join();
+            };
+            try concurrent.started.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            // Ensure the peer entered the backend mutex before releasing IO.
+            while (backend.mu.tryLock()) {
+                backend.mu.unlock();
+                if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            io_mod.NativeSyncTestControl.release.store(true, .release);
+            io_mod.NativeSyncTestControl.pause.store(false, .release);
+            thread.join();
+            joined = true;
+            if (concurrent.failure) |cause| return cause;
+        }
+    }
+    if (mode != .cancel_close) try H.waitQuiet(handle.ptr(), deadline);
+    const backend = handle.ptr();
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expect(!backend.wal_retention.reset_proven);
+    if (mode == .interleave or mode == .finite) {
+        try std.testing.expect(!backend.wal_retention.primary_empty_proven);
+        // This peer is mutable, so its debt lives in the mutable generation,
+        // rather than the counter for flushed-but-unmanifested batches.
+        try std.testing.expect(backend.mutable.logical_bytes > 0);
+        try std.testing.expect(backend.mutable_wal_range.first != 0 and backend.mutable_wal_range.last != 0);
+        try std.testing.expect(backend.wal_retention.primary.?.bytes > 0);
+        if (mode == .finite) {
+            try std.testing.expectEqual(@as(u64, 0), stats.wal_resets);
+            try std.testing.expectEqual(@as(u64, 2), backend.wal_retention.primary.?.current_segment);
+            try std.testing.expectEqual(@as(u64, 2), backend.wal_retention.primary.?.oldest_retained_segment);
+        }
+    } else if (mode != .cancel_close) {
+        try std.testing.expect(backend.wal_retention.primary_empty_proven);
+        try std.testing.expectEqual(@as(u64, 0), backend.unpublished_wal_logical_bytes);
+        try std.testing.expect(stats.wal_resets >= 1);
+    }
+    if (mode == .prepare_retry or mode == .accepted_retry or mode == .delete_retry) try std.testing.expect(H.calls.load(.acquire) >= 2);
+    if (mode == .accepted_retry) try std.testing.expect(H.joined.load(.acquire) >= 2);
+    try std.testing.expectEqualDeep(replay_before, try wal.snapshotReplayRetention(native.storage(), a, root));
+    if (mode == .replay) handle.close() else handle.abandonAfterCrash();
+    open = false;
+    RegisteredOutputFixture.drain(&resources.resource_manager);
+    try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    try std.testing.expectEqualDeep(replay_before, try wal.snapshotReplayRetention(native.storage(), a, root));
+    var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("manifested", try read.get(.{}, "first"));
+    if (mode == .interleave or mode == .finite) try std.testing.expectEqualStrings("wal-only", try read.get(.{}, "second"));
+}
+
+test "physical cache metadata registered flush publication normal WAL refusal retries without fresh write or SST rebuild" {
+    try normalAdmittedWal(.prepare_retry);
+}
+test "physical cache metadata registered flush publication normal WAL accepted read joins under independent refused cleanup" {
+    try normalAdmittedWal(.accepted_retry);
+}
+test "physical cache metadata registered flush publication normal WAL deletion failure retries from actual durable floor" {
+    try normalAdmittedWal(.delete_retry);
+}
+test "physical cache metadata registered flush publication normal WAL cleanup and later close preserve dedicated replay" {
+    try normalAdmittedWal(.replay);
+}
+test "physical cache metadata registered flush publication normal WAL gate releases before mutex reentry and peer debt survives" {
+    try normalAdmittedWal(.interleave);
+}
+test "physical cache metadata registered flush publication normal WAL prefix retirement preserves an active mutable segment" {
+    try normalAdmittedWal(.finite);
+}
+
+test "physical cache metadata registered flush publication normal WAL canceled accepted IO joins before controlled close" {
+    try normalAdmittedWal(.cancel_close);
 }

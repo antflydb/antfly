@@ -83,7 +83,9 @@ const failure_abi = @import("runtime_failure_abi");
 // Detached flush executors retain runtime access; writer records own legacy output tickets.
 // Normal flush publication retains controlled edit cursors and pass deadlines.
 // Normal journal owners carry accepted IO and bounded grant retirement.
-pub const abi_version: u32 = 219;
+// Normal primary WAL retirement owns a funded physical continuation and
+// generation-stamped retention state independently of dedicated replay.
+pub const abi_version: u32 = 220;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
