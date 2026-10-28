@@ -275,10 +275,34 @@ pub const Group = struct {
     ids: std.ArrayList([]const u8) = .empty,
     fields: std.ArrayList([]const u8) = .empty,
     images: std.ArrayList([]const u8) = .empty,
+    identity_images: std.ArrayList([]const u8) = .empty,
 };
+fn contains(values: []const []const u8, value: []const u8) bool {
+    for (values) |item| if (std.mem.eql(u8, item, value)) return true;
+    return false;
+}
+fn fits(group: Group, reference: Reference) bool {
+    var added: [3][]const u8 = undefined;
+    var count: usize = 0;
+    const paths = [_]?[]const u8{ reference.field, reference.revision_field, reference.permissions_field };
+    for (paths) |maybe| if (maybe) |path| {
+        if (!contains(group.fields.items, path) and !contains(added[0..count], path)) {
+            added[count] = path;
+            count += 1;
+        }
+    };
+    return group.fields.items.len + count + group.images.items.len + @intFromBool(!contains(group.images.items, reference.field)) + group.identity_images.items.len + @intFromBool(reference.identity != null and !contains(group.identity_images.items, reference.field)) <= 64;
+}
 fn add(a: A, list: *std.ArrayList([]const u8), field: []const u8) !void {
     for (list.items) |existing| if (std.mem.eql(u8, existing, field)) return;
     try list.append(a, field);
+}
+fn identityUnionCount(left: []const []const u8, right: []const []const u8) usize {
+    var count = left.len;
+    for (right) |field| if (!contains(left, field)) {
+        count += 1;
+    };
+    return count;
 }
 fn equalFields(left: []const []const u8, right: []const []const u8) bool {
     if (left.len != right.len) return false;
@@ -321,7 +345,7 @@ pub fn groups(a: A, references: []const Reference) ![]Group {
         const slot = found: {
             for (parents.items, 0..) |parent, j| {
                 const first = references[parent.references.items[0]];
-                if (parent.references.items.len < 32 and std.mem.eql(u8, first.document_id, reference.document_id) and std.mem.eql(u8, first.table, reference.table) and filters[parent.references.items[0]].ptr == filters[i].ptr) break :found j;
+                if (parent.references.items.len < 32 and fits(parent, reference) and std.mem.eql(u8, first.document_id, reference.document_id) and std.mem.eql(u8, first.table, reference.table) and filters[parent.references.items[0]].ptr == filters[i].ptr) break :found j;
             }
             try parents.append(a, .{});
             break :found parents.items.len - 1;
@@ -333,6 +357,7 @@ pub fn groups(a: A, references: []const Reference) ![]Group {
         try add(a, &parent.fields, reference.revision_field);
         if (reference.permissions_field) |field| try add(a, &parent.fields, field);
         try add(a, &parent.images, reference.field);
+        if (reference.identity != null) try add(a, &parent.identity_images, reference.field);
     }
     var output: std.ArrayList(Group) = .empty;
     for (parents.items) |parent| {
@@ -340,6 +365,7 @@ pub fn groups(a: A, references: []const Reference) ![]Group {
             for (output.items, 0..) |other, i| {
                 if (other.references.items.len + parent.references.items.len <= 32 and
                     equalFields(other.fields.items, parent.fields.items) and equalFields(other.images.items, parent.images.items) and
+                    identityUnionCount(other.identity_images.items, parent.identity_images.items) + other.fields.items.len + other.images.items.len <= 64 and
                     std.mem.eql(u8, references[other.references.items[0]].table, references[parent.references.items[0]].table) and filters[other.references.items[0]].ptr == filters[parent.references.items[0]].ptr) break :found i;
             }
             try output.append(a, .{});
@@ -350,6 +376,7 @@ pub fn groups(a: A, references: []const Reference) ![]Group {
             group.fields = parent.fields;
             group.images = parent.images;
         }
+        for (parent.identity_images.items) |field| try add(a, &group.identity_images, field);
         try group.references.appendSlice(a, parent.references.items);
         for (parent.ids.items) |id| try add(a, &group.ids, id);
     }
@@ -409,4 +436,35 @@ test "httpx inference gateway grouping large distinct filters retains linear bou
     const grouped = try groups(bounded.allocator(), &references);
     try std.testing.expectEqual(references.len, grouped.len);
     try std.testing.expect(!budget.exhausted);
+}
+
+test "httpx inference gateway groups respect scalar binding limits and retain every reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var references: [32]Reference = undefined;
+    for (&references, 0..) |*reference, i| reference.* = .{
+        .table = "docs",
+        .document_id = "a",
+        .field = try std.fmt.allocPrint(a, "images.{d}", .{i}),
+        .revision_field = try std.fmt.allocPrint(a, "revisions.{d}", .{i}),
+        .revision = "r1",
+        .permissions_field = try std.fmt.allocPrint(a, "permissions.{d}", .{i}),
+        .identity = "sv1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .mime_type = "image/png",
+        .byte_length = 68,
+    };
+    const grouped = try groups(a, &references);
+    var seen: u32 = 0;
+    try std.testing.expect(grouped.len > 1);
+    for (grouped) |group| {
+        try std.testing.expect(group.fields.items.len + group.identity_images.items.len + group.images.items.len <= 64);
+        for (group.references.items) |slot| {
+            const bit = @as(u32, 1) << @intCast(slot);
+            try std.testing.expect(seen & bit == 0);
+            seen |= bit;
+        }
+    }
+    try std.testing.expectEqual(std.math.maxInt(u32), seen);
 }

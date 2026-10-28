@@ -969,3 +969,24 @@ borrowed object view during serialization without another payload-sized object.
 Other worker layouts keep the strict general fallback. Explicit immutable object
 receipts cannot disable validation for ordinary caller-constructed or parsed raw
 values; generic RawValue remains slice-sized.
+
+
+### Provenance, normalization and in-process consumers
+
+Pure column/CASE forwarding may retain row-scoped normalized bytes and the
+selected source path through references. Logical-node counts, height, output
+limits and cancellation checks remain charged when a normalized value is reused.
+Strict immutable native scalar extents can supply a one-node normalization proof;
+numeric/composite or unqualified input retains ordinary normalization. Identity
+and missing checks on such aliases do not require a payload DOM. Derived values
+and typed consumers keep the shared VM semantics.
+
+Public source fields and unconditional direct operands may share a bounded
+selected-row read, while CASE-only operands stay lazy. Byte windows are bounded
+independently of metadata windows and cannot outlive the pinned read transaction.
+Public array masks apply after scalar resolution against original positions.
+A synchronous internal typed-result consumer borrows the same authorized public
+query result before encoding; it cannot bypass admission, policy, read-cut,
+revision or lifecycle checks. It must copy retained data before returning and
+preserve query cancellation and failure semantics. No public API or persistent
+format is introduced by this delivery optimization.

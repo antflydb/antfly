@@ -254,8 +254,8 @@ test "api query contract raw JSON budgets match VM for escaped strings and wide 
             const limits: sql.EvalLimits = .{ .steps = steps, .output_bytes = 1024 * 1024, .output_column_loader = .{ .context = &self, .read = read }, .checkpoint = poll, .checkpoint_context = &self };
             const result = try p.evaluateOutput(alloc, &.{}, &.{}, limits);
             try std.testing.expect(result == .raw);
-            try std.testing.expect(result.raw.ptr == raw.ptr);
-            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, result.raw, .{});
+            try std.testing.expect(result.raw.value.bytes.ptr == raw.ptr);
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, result.raw.value.bytes, .{});
             try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(alloc, normal.value, .{}), try std.json.Stringify.valueAlloc(alloc, parsed, .{}));
             try std.testing.expect(self.polls > 4);
             self.polls = 0;

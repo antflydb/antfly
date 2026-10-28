@@ -1234,3 +1234,75 @@ computed elapsed 2.03 → 1.98 ms, CPU 1.54 → 1.48 ms and sampled RSS
 both runs are retained rather than selecting a favorable sample. Metadata-update
 CPU was about 4–5% higher in both small runs. These results support reduced read
 work, not a universally better latency, memory or write-cost claim.
+
+
+### Alias-preserving values and bounded result consumers
+
+The follow-up keeps the public `fields` / `select` / `params` contract, ASCH25
+primary documents and the value-identity ABI unchanged. Internal normalized
+values now retain immutable bytes, their original extent, logical-node count
+and height. Reuse charges the consuming VM's work, depth and output limits and
+polls cancellation; a receipt cannot turn off resource accounting. Strict native
+views can certify string/bool/null scalar extents immediately. Strings have no
+numeric descendants and retain their admitted escape spelling, so this avoids a
+second string scan. Unqualified sources still use the scanner; numbers and
+composites still normalize with the typed JSON parser/formatter. Duplicate or
+malformed native nodes cannot issue a receipt.
+
+Raw outputs retain the selected column's provenance through aliases and CASE.
+Only executed pure forwarding paths carry it: computed/coerced values keep the
+ordinary typed VM. `value_identity(ref(alias))` can use the same pinned source
+identity as the selected field, with row-local memoization. A present raw value,
+including JSON null, proves `is_missing(ref(alias))` false without a DOM. Ordinary
+consuming operators still materialize typed values when required. These facts
+are scoped to immutable row bytes; they are neither wire metadata nor access
+capabilities, and no request-global/user-global value cache is added.
+
+The request prepares the union of public source fields and unconditional direct
+operands. Native storage fetches selected rows in owned byte windows, at most
+1 MiB of proven original bytes and 64 keys per batch, inside the existing pinned
+transaction. Unknown proofs or individually large rows keep lazy per-row reads.
+Metadata windows remain bounded independently. Public source output can reuse
+that row view, applying its mask once; array operand positions remain original.
+CASE-only operands are not included unless explicitly requested as public source.
+The distributed hydration path uses the same mechanism and read-cut ownership.
+
+Gateway lookups select flat value, image-presence and optional identity bindings
+through ordinary scalar projection. Array indexes are resolved before public
+mask compaction. Group planning accounts for every binding, splitting below the
+64-output ceiling while retaining the 32-reference ceiling. Values, revisions
+and permissions keep independent checks, and missing images remain distinct
+from present null/invalid values.
+
+A synchronous typed consumer receives the same canonical result that ordinary
+query execution would encode. Query permits, catalog binding, table permission,
+row policy, snapshot/revision checks, cancellation and result lifecycle fences
+run through the existing public query service. The consumer copies only values
+it retains before the producer retires; it does not manufacture a second HTTP
+response and then parse it. Providers without typed delivery retain the wire
+path. A producer omitting computed output may trigger one fresh authorized query
+for complete root fields when no reference pins an identity. That conservative
+fallback preserves original array positions. Identity-pinned references never
+downgrade, and fallback queries retain the original deadline and recheck policy.
+Consumer failures cross the generic delivery boundary as `QueryDeliveryFailed`
+while the gateway retains their original classification (for example, revision
+mismatch, absence or permission failure).
+
+Media work now uses a rolling pool of at most four groups. Completed slots are
+joined, copied and retired before being refilled; one slow group cannot force a
+barrier between cohorts. An 8 MiB active estimate and the shared SQL I/O scheduler
+bound concurrent admission across requests. Estimates never replace actual
+request quotas or the verified expanded-input limit. Oversized required groups
+run inline; tiny requests below 64 KiB estimated encoded payload also run inline
+to avoid task/stack overhead. The latter is a cost policy with a possible remote
+latency tradeoff, not a universal storage claim. Parent copies and child scratch
+share a synchronizing allocator lock during overlap. Every task is joined or
+canceled before its descriptor or arena retires, including failure paths.
+
+`e2e/antfly/bench_projection_aliases.py` compares equivalent direct-field and alias
+identity/missing expressions, including three-copy chains, with exact output
+hashes across both modes and binaries. The media driver also covers eight groups
+and skewed image sizes. Shared deterministic PNG generation lives in
+`e2e/antfly/media_fixture.py`. No model/provider call is needed for these checks.
+Qualification results and the source/host limitations follow below; raw reports
+remain ignored under `output/projection-followup/`.

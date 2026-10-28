@@ -3133,8 +3133,10 @@ def test_select_numeric_outputs_are_independent_of_materialization_order(
 
 @pytest.mark.fresh_antfly_process
 @pytest.mark.parametrize("num_shards", [1, 2])
+@pytest.mark.parametrize("array_paths", [False, True])
+@pytest.mark.parametrize("large_images", [False, True])
 def test_gateway_materializes_distinct_masks_before_model_execution(
-    tmp_path, num_shards
+    tmp_path, num_shards, array_paths, large_images
 ):
     import copy
     import hashlib
@@ -3149,6 +3151,10 @@ def test_gateway_materializes_distinct_masks_before_model_execution(
         binary, "127.0.0.1", find_free_port(), config_path=config
     )
     encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII="
+    if large_images:
+        from media_fixture import png
+
+        encoded = base64.b64encode(png(256, 100)).decode("ascii")
     digest = hashlib.sha256(base64.b64decode(encoded)).hexdigest()
     try:
         table = server.api_url + "/tables/media_groups"
@@ -3166,6 +3172,14 @@ def test_gateway_materializes_distinct_masks_before_model_execution(
             }
             for i in range(4)
         }
+
+        if array_paths:
+            for i, document in enumerate(documents.values()):
+                document["images"] = ["unused"] * (i + 1) + [
+                    "data:image/png;base64," + encoded
+                ]
+                document["versions"] = ["unused", document.pop("revision")]
+                document["policies"] = [{"public": False}, document.pop("permissions")]
 
         def write_document(doc_id):
             result = requests.post(
@@ -3186,14 +3200,14 @@ def test_gateway_materializes_distinct_masks_before_model_execution(
                 "source": {
                     "table": "media_groups",
                     "document_id": f"doc-{i}",
-                    "field": f"images.image{i}",
-                    "revision_field": "revision",
+                    "field": f"images.{i + 1}" if array_paths else f"images.image{i}",
+                    "revision_field": "versions.1" if array_paths else "revision",
                     "revision": "r1",
-                    "permissions_field": "permissions",
+                    "permissions_field": "policies.1" if array_paths else "permissions",
                     "sha256": digest,
                     "mime_type": "image/png",
                     "byte_length": len(base64.b64decode(encoded)),
-                    "max_pixels": 1,
+                    "max_pixels": 256 * 256 if large_images else 1,
                 },
             }
             for i in range(4)
@@ -3208,19 +3222,109 @@ def test_gateway_materializes_distinct_masks_before_model_execution(
         ready = invoke(payload)
         assert ready.status_code == 400, ready.text
         assert ready.json()["error"]["code"] == "ModelRequired", ready.text
+        absent = copy.deepcopy(payload)
+        absent["input"][0]["content"][0]["source"]["field"] = (
+            "images.99" if array_paths else "images.absent"
+        )
+        missing = invoke(absent)
+        assert missing.status_code == 404, missing.text
+        assert missing.json()["error"]["code"] == "InferenceSourceUnavailable", (
+            missing.text
+        )
         mismatched = copy.deepcopy(payload)
         mismatched["input"][0]["content"][1]["source"]["sha256"] = "0" * 64
         bad_digest = invoke(mismatched)
         assert bad_digest.status_code == 409, bad_digest.text
-        documents["doc-3"]["permissions"]["public"] = False
+        permissions = (
+            documents["doc-3"]["policies"][1]
+            if array_paths
+            else documents["doc-3"]["permissions"]
+        )
+        permissions["public"] = False
         write_document("doc-3")
         denied = invoke(payload)
         assert denied.status_code == 403, denied.text
-        documents["doc-3"]["permissions"]["public"] = True
+        permissions["public"] = True
         write_document("doc-3")
-        documents["doc-2"]["revision"] = "r2"
+        if array_paths:
+            documents["doc-2"]["versions"][1] = "r2"
+        else:
+            documents["doc-2"]["revision"] = "r2"
         write_document("doc-2")
         stale = invoke(payload)
         assert stale.status_code == 409, stale.text
+        if not large_images:
+            url = "data:image/png;base64," + encoded
+            documents["doc-0"]["images"] = (
+                [url] * 128 if array_paths else {f"image{i}": url for i in range(128)}
+            )
+            write_document("doc-0")
+            logical_identity = (
+                "sv1-"
+                + hashlib.sha256(
+                    b"antfly.source.value.v1\0" + json.dumps(url).encode()
+                ).hexdigest()
+            )
+            many = []
+            for i in range(128):
+                item = copy.deepcopy(references[0])
+                item["source"]["field"] = (
+                    f"images.{i}" if array_paths else f"images.image{i}"
+                )
+                item["source"]["identity"] = logical_identity
+                many.append(item)
+            split = invoke({"input": [{"role": "user", "content": many}]})
+            assert split.status_code == 400, split.text
+            assert split.json()["error"]["code"] == "ModelRequired", split.text
     finally:
         server.stop()
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_batches_preserve_array_positions_across_byte_and_row_windows(
+    stateful_api, num_shards
+):
+    table = "select_byte_windows_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    documents = {
+        f"doc-{i:03}": {
+            "metadata": {"revision": "r1", "ordinal": i},
+            "items": [{"n": i * 3 + j} for j in range(3)],
+            "padding": "x" * 20000,
+        }
+        for i in range(130)
+    }
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/batch",
+        json={"inserts": documents, "sync_level": "full_index"},
+        timeout=60,
+    )
+    assert response.status_code == 201, response.text
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query",
+        json={
+            "query": {"match_all": {}},
+            "limit": 130,
+            "fields": ["metadata.revision", "items.1.n"],
+            "select": {
+                "ordinal": {"field": "metadata.ordinal"},
+                "original_second": {"field": "items.1.n"},
+                "copy": {"ref": "original_second"},
+            },
+        },
+        timeout=60,
+    )
+    assert response.status_code == 200, response.text
+    hits = response.json()["responses"][0]["hits"]["hits"]
+    assert {hit["_id"] for hit in hits} == set(documents)
+    for hit in hits:
+        i = documents[hit["_id"]]["metadata"]["ordinal"]
+        assert hit["_source"] == {
+            "metadata": {"revision": "r1"},
+            "items": [{"n": i * 3 + 1}],
+        }
+        assert hit["_computed"] == {
+            "ordinal": i,
+            "original_second": i * 3 + 1,
+            "copy": i * 3 + 1,
+        }

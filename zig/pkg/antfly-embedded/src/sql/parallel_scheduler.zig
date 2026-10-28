@@ -23,6 +23,7 @@ const A = std.mem.Allocator;
 pub const LockedAllocator = struct {
     backing: A,
     mutex: std.atomic.Mutex = .unlocked,
+    shared_mutex: ?*std.atomic.Mutex = null,
     /// Immutable parent identity for admission through this synchronizing wrapper.
     pub fn parentAllocator(a: std.mem.Allocator) ?std.mem.Allocator {
         if (a.vtable.alloc != allocate) return null;
@@ -32,30 +33,33 @@ pub const LockedAllocator = struct {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
     }
     fn lock(self: *LockedAllocator) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        while (!(self.shared_mutex orelse &self.mutex).tryLock()) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *LockedAllocator) void {
+        (self.shared_mutex orelse &self.mutex).unlock();
     }
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.backing.rawAlloc(len, alignment, ra);
     }
     fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.backing.rawResize(bytes, alignment, len, ra);
     }
     fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.backing.rawRemap(bytes, alignment, len, ra);
     }
     fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         self.backing.rawFree(bytes, alignment, ra);
     }
 };

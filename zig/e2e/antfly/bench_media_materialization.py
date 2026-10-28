@@ -21,39 +21,15 @@ import hashlib
 import json
 import os
 import platform
-import random
 import statistics
-import struct
 import time
-import zlib
 from pathlib import Path
 
 import requests
 from bench_source_projection import file_info, measure
 from conftest import StandaloneAntflyServer, find_free_port
 from test_grep_indexed import logical_process_reader
-
-
-def png(size, seed):
-    pixels = random.Random(seed).randbytes(size * size * 4)
-    rows = b"".join(
-        b"\0" + pixels[i * size * 4 : (i + 1) * size * 4] for i in range(size)
-    )
-
-    def chunk(kind, data):
-        return (
-            struct.pack(">I", len(data))
-            + kind
-            + data
-            + struct.pack(">I", zlib.crc32(kind + data))
-        )
-
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(rows))
-        + chunk(b"IEND", b"")
-    )
+from media_fixture import png
 
 
 def main():
@@ -73,17 +49,20 @@ def main():
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(json.dumps({"public_inference": {"enabled": True}}))
     try:
-        for name, size, shared_mask, duplicates in [
-            ("tiny_shared_duplicates", 1, True, True),
-            ("tiny_distinct_unique", 1, False, False),
-            ("large_shared_duplicates", 256, True, True),
-            ("large_distinct_unique", 256, False, False),
-            ("large_distinct_duplicates", 256, False, True),
+        for name, size, shared_mask, duplicates, count in [
+            ("tiny_shared_duplicates", 1, True, True, 4),
+            ("tiny_distinct_unique", 1, False, False, 4),
+            ("large_shared_duplicates", 256, True, True, 4),
+            ("large_distinct_unique", 256, False, False, 4),
+            ("large_distinct_duplicates", 256, False, True, 4),
+            ("large_distinct_unique_eight", 256, False, False, 8),
+            ("skewed_distinct_eight", 512, False, False, 8),
         ]:
             documents = {}
             references = []
-            for i in range(4):
-                data = png(size, 100 if duplicates else 100 + i)
+            for i in range(count):
+                image_size = 64 if name == "skewed_distinct_eight" and i != 0 else size
+                data = png(image_size, 100 if duplicates else 100 + i)
                 field = "preview" if shared_mask else f"image{i}"
                 doc_id = f"doc-{i}"
                 documents[doc_id] = {
@@ -107,7 +86,7 @@ def main():
                             "sha256": hashlib.sha256(data).hexdigest(),
                             "mime_type": "image/png",
                             "byte_length": len(data),
-                            "max_pixels": size * size,
+                            "max_pixels": image_size * image_size,
                         },
                     }
                 )
@@ -203,7 +182,7 @@ def main():
             )
     report = {
         "schema_version": 1,
-        "scope": "Four authorized table images per request, warm storage after ingestion, shared host. Materialization and adaptation end at ModelRequired; no model/provider execution or billing measured. Whole-process CPU and sampled RSS include background work.",
+        "scope": "Four/eight authorized table images per request (skewed: one 512x512, seven 64x64), warm storage after ingestion, shared host. Materialization and adaptation end at ModelRequired; no model/provider execution or billing measured. Whole-process CPU and sampled RSS include background work.",
         "platform": platform.platform(),
         "machine": platform.machine(),
         "cpu_count": os.cpu_count(),

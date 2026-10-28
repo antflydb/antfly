@@ -44,6 +44,12 @@ pub const QueryResponse = struct {
 /// disconnects propagate through write; no background producer outlives a query.
 pub const Delivery = struct {
     ptr: *anyopaque,
+    /// Optional in-process consumer of the same admitted public result. The
+    /// borrow ends when consume returns; retain only caller-owned copies.
+    typed_result: ?struct {
+        ptr: *anyopaque,
+        consume: *const fn (*anyopaque, @import("antfly_metadata_openapi").QueryResult) anyerror!void,
+    } = null,
     start_fn: *const fn (*anyopaque, usize) anyerror!void,
     write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
     max_bytes: usize = std.math.maxInt(usize),

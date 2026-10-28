@@ -4387,7 +4387,10 @@ pub fn encodeQueryResponsesWithDelivery(
     const projection = if (lease) |value| value.plan else null;
     const hits = try arena.alloc(metadata_openapi.QueryHit, emitted_hits.len);
     for (emitted_hits, 0..) |*hit, i| {
-        hits[i] = try toOpenApiHitForWire(arena, req, hit, projection);
+        hits[i] = if (if (delivery) |sink| sink.typed_result != null else false)
+            try toOpenApiHitPrepared(arena, req, hit.*, projection)
+        else
+            try toOpenApiHitForWire(arena, req, hit, projection);
     }
 
     const graph_dialect = if (req.graph_queries.len > 0)
@@ -4426,6 +4429,13 @@ pub fn encodeQueryResponsesWithDelivery(
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
+            };
+            if (graph_results == null) if (delivery) |sink| if (sink.typed_result) |target| {
+                if (sink.hydrator != null) return error.InvalidArgument;
+                if (req.cancellation) |token| try token.check();
+                try target.consume(target.ptr, query_results[0]);
+                delivered = 0;
+                break :blk try alloc.alloc(u8, 0);
             };
             break :blk if (graph_results != null or hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered, projection) catch |err| return graph_wire_failure orelse err else try std.json.Stringify.valueAlloc(
                 alloc,
@@ -20247,4 +20257,62 @@ test "api query contract projection preparation is request owned and cloned para
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
     try std.testing.expect(induced > 0);
+}
+
+test "api query contract typed delivery consumes admitted projections without JSON serialization" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, temp, "{\"value\":{\"field\":\"items.1\"}}", .{});
+    const encoded = try field_projection.encodePrepared(temp, &.{}, input, .{ .object = .empty });
+    defer {
+        encoded.plan.deinit();
+        temp.destroy(encoded.plan);
+    }
+    var source: field_projection.JsonSource = .{ .id = "a", .root = try std.json.parseFromSliceLeaky(std.json.Value, temp, "{\"items\":[\"first\",\"second\"]}", .{}) };
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "a"), .stored_data = try a.dupe(u8, "{}") };
+    defer hit.deinit(a);
+    hit.computed_json = try encoded.plan.evaluateEncoded(temp, a, source.source(), null, .{});
+    hit.computed_receipt = try encoded.plan.ownValidatedReceipt(a, hit.computed_json.?);
+    const req: db_mod.types.SearchRequest = .{ .include_stored = true, .include_all_fields = false, .field_projection_json = encoded.json, .field_projection_plan = .{ .encoded = encoded.json, .plan = encoded.plan } };
+    const Sink = struct {
+        a: std.mem.Allocator,
+        count: usize = 0,
+        reject: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, result: metadata_openapi.QueryResult) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.QueryDeliveryFailed;
+            self.count += 1;
+            const hits = result.hits.?.hits.?;
+            try std.testing.expectEqual(@as(usize, 1), hits.len);
+            const object = try std.json.parseFromSliceLeaky(std.json.Value, self.a, hits[0]._computed.?.bytes, .{});
+            try std.testing.expectEqualStrings("second", object.object.get("value").?.string);
+        }
+    };
+    var sink: Sink = .{ .a = temp };
+    var hits = [_]db_mod.types.SearchHit{hit};
+    var response = try encodeQueryResponsesWithDelivery(a, "docs", req, .{ .took_ms = 0 }, .{ .alloc = a, .hits = &hits, .total_hits = 1 }, .{
+        .ptr = &sink,
+        .start_fn = Sink.start,
+        .write_fn = Sink.write,
+        .typed_result = .{ .ptr = &sink, .consume = Sink.consume },
+    });
+    defer response.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    try std.testing.expectEqual(@as(?usize, 0), response.delivered_bytes);
+    try std.testing.expectEqual(@as(usize, 0), response.json.len);
+    sink.reject = true;
+    try std.testing.expectError(error.QueryDeliveryFailed, encodeQueryResponsesWithDelivery(a, "docs", req, .{ .took_ms = 0 }, .{ .alloc = a, .hits = &hits, .total_hits = 1 }, .{
+        .ptr = &sink,
+        .start_fn = Sink.start,
+        .write_fn = Sink.write,
+        .typed_result = .{ .ptr = &sink, .consume = Sink.consume },
+    }));
 }

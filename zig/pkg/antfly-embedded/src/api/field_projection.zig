@@ -199,6 +199,9 @@ pub const Source = struct {
     context: *anyopaque,
     read: *const fn (*anyopaque, A, []const u8, sql.ColumnRead) anyerror!sql.Datum,
     read_raw: ?*const fn (*anyopaque, A, []const u8) anyerror!?[]const u8 = null,
+    /// Only immutable native extents with strict syntax/value-shape evidence.
+    /// Unqualified ports retain the scanner and typed-number normalizer.
+    read_normalized: ?*const fn (*anyopaque, []const u8) anyerror!?sql.NormalizedOutput = null,
     prefetch: ?*const fn (*anyopaque, []const []const u8) anyerror!void = null,
 };
 const Dependency = union(enum) { field: []const u8, binding: usize };
@@ -447,23 +450,30 @@ pub const Plan = struct {
     pub fn evaluateEncoded(self: *const Plan, a: A, output: A, source: Source, previous: ?V, limits: sql.EvalLimits) ![]u8 {
         if (previous != null) return std.json.Stringify.valueAlloc(output, try self.evaluate(a, source, previous, limits), .{});
         if (limits.checkpoint) |poll| try poll(limits.checkpoint_context);
-        if (self.unconditional_fields.len > 1) if (source.prefetch) |prefetch| try prefetch(source.context, self.unconditional_fields);
+        if (source.prefetch) |prefetch| try prefetch(source.context, self.unconditional_fields);
         const values = try a.alloc(?sql.Datum, self.bindings.len);
         @memset(values, null);
-        const raw_values = try a.alloc(?[]const u8, self.bindings.len);
+        const raw_values = try a.alloc(?sql.NormalizedOutput, self.bindings.len);
         @memset(raw_values, null);
-        var row: Row = .{ .plan = self, .a = a, .source = source, .values = values, .raw_values = raw_values, .limits = limits };
+        const origins = try a.alloc(?[]const u8, self.bindings.len);
+        @memset(origins, null);
+        var row: Row = .{ .plan = self, .a = a, .source = source, .values = values, .raw_values = raw_values, .origins = origins, .limits = limits };
         var bytes: usize = 0;
         for (self.evaluation_order) |i| {
             var frame: Row.Frame = .{ .row = &row, .index = i };
             var local = limits;
             local.column_loader = .{ .context = &frame, .read = Row.Frame.read };
-            local.output_column_loader = .{ .context = &frame, .read = Row.Frame.readRaw };
+            local.output_column_loader = .{ .context = &frame, .read = Row.Frame.readRaw, .normalized = Row.Frame.readNormalized };
             const result = self.bindings[i].program.?.evaluateOutput(a, &.{}, self.parameters.items, local) catch |err| return scalarFailure(err);
             switch (result) {
                 .raw => |raw| {
-                    raw_values[i] = raw;
-                    bytes +|= raw.len;
+                    raw_values[i] = raw.value;
+                    try row.normalized.put(a, .{ .ptr = @intFromPtr(raw.value.original.ptr), .len = raw.value.original.len }, raw.value);
+                    origins[i] = switch (self.bindings[i].dependencies[raw.column]) {
+                        .field => |path| path,
+                        .binding => |index| origins[index],
+                    };
+                    bytes +|= raw.value.bytes.len;
                 },
                 .datum => |datum| {
                     values[i] = datum;
@@ -479,7 +489,7 @@ pub const Plan = struct {
             if (i != 0) try encoded.writer.writeByte(',');
             try std.json.Stringify.value(binding.name, .{}, &encoded.writer);
             try encoded.writer.writeByte(':');
-            if (raw_values[i]) |raw| try encoded.writer.writeAll(raw) else {
+            if (raw_values[i]) |raw| try encoded.writer.writeAll(raw.bytes) else {
                 const value = binding.program.?.resultJson(a, values[i].?, limits) catch |err| return scalarFailure(err);
                 try std.json.Stringify.value(value, .{}, &encoded.writer);
             }
@@ -637,16 +647,36 @@ const Row = struct {
     a: A,
     source: Source,
     values: []?sql.Datum,
-    raw_values: ?[]?[]const u8 = null,
+    raw_values: ?[]?sql.NormalizedOutput = null,
+    origins: ?[]?[]const u8 = null,
+    normalized: std.AutoHashMapUnmanaged(struct { ptr: usize, len: usize }, sql.NormalizedOutput) = .empty,
+    loaded_raws: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    identities: ?[]?sql.Datum = null,
     limits: sql.EvalLimits,
     const Frame = struct {
         row: *Row,
         index: usize,
-        fn readRaw(raw: *anyopaque, a: A, ordinal: u32) !?[]const u8 {
+        fn fieldRaw(self: *@This(), path: []const u8) !?[]const u8 {
+            const slot = try self.row.loaded_raws.getOrPut(self.row.a, path);
+            if (!slot.found_existing) slot.value_ptr.* = if (self.row.source.read_raw) |read_raw| try read_raw(self.row.source.context, self.row.a, path) else null;
+            return slot.value_ptr.*;
+        }
+        fn readNormalized(raw: *anyopaque, ordinal: u32) !?sql.NormalizedOutput {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return switch (self.row.plan.bindings[self.index].dependencies[ordinal]) {
-                .field => |path| if (self.row.source.read_raw) |read_raw| read_raw(self.row.source.context, a, path) else null,
                 .binding => |index| if (self.row.raw_values) |values| values[index] else null,
+                .field => |path| cached: {
+                    if (self.row.source.read_normalized) |prepared| if (try prepared(self.row.source.context, path)) |value| break :cached value;
+                    const bytes = (try self.fieldRaw(path)) orelse break :cached null;
+                    break :cached self.row.normalized.get(.{ .ptr = @intFromPtr(bytes.ptr), .len = bytes.len });
+                },
+            };
+        }
+        fn readRaw(raw: *anyopaque, _: A, ordinal: u32) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return switch (self.row.plan.bindings[self.index].dependencies[ordinal]) {
+                .field => |path| self.fieldRaw(path),
+                .binding => |index| if (self.row.raw_values) |values| (if (values[index]) |value| value.bytes else null) else null,
             };
         }
         fn read(raw: *anyopaque, _: A, ordinal: u32, kind: sql.ColumnRead) !sql.Datum {
@@ -655,9 +685,22 @@ const Row = struct {
             return switch (dependency) {
                 .field => |path| self.row.source.read(self.row.source.context, self.row.a, path, kind),
                 .binding => |index| blk: {
+                    if (kind == .identity) if (self.row.identities) |identities| if (identities[index]) |identity| break :blk identity;
+                    if (self.row.raw_values) |raws| if (raws[index] != null) {
+                        if (kind == .missing) break :blk sql.Datum.json(.{ .bool = false });
+                        if (kind == .identity) if (self.row.origins) |origins| if (origins[index]) |path| {
+                            const identity = try self.row.source.read(self.row.source.context, self.row.a, path, .identity);
+                            if (self.row.identities == null) {
+                                self.row.identities = try self.row.a.alloc(?sql.Datum, self.row.plan.bindings.len);
+                                @memset(self.row.identities.?, null);
+                            }
+                            self.row.identities.?[index] = identity;
+                            break :blk identity;
+                        };
+                    };
                     if (self.row.values[index] == null) {
                         const raws = self.row.raw_values orelse return error.InvalidQueryResponse;
-                        const bytes = raws[index] orelse return error.InvalidQueryResponse;
+                        const bytes = (raws[index] orelse return error.InvalidQueryResponse).bytes;
                         self.row.values[index] = sql.Datum.json(try @import("antfly-json").parseFromSliceLeaky(V, self.row.a, bytes, .{ .allocate = .alloc_if_needed }));
                     }
                     const value = self.row.values[index].?;
@@ -1018,4 +1061,64 @@ test "api query contract raw numeric provenance preserves aliases and identities
         const encoded = try plan.evaluateEncoded(a, a, .{ .context = &source, .read = Mock.read, .read_raw = Mock.raw }, null, .{});
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, normal, .{}), encoded);
     }
+}
+
+test "api query contract raw aliases retain selected provenance without DOM reads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, a,
+        \\[ {"name":"v","expression":{"case":[{"when":{"literal":true},"then":{"field":"payload"}}],"else":{"field":"secret"}}},
+        \\ {"name":"copy","expression":{"ref":"v"}},
+        \\ {"name":"missing","expression":{"call":"is_missing","args":[{"ref":"copy"}]}},
+        \\ {"name":"token","expression":{"call":"value_identity","args":[{"ref":"copy"}]}},
+        \\ {"name":"token_again","expression":{"call":"value_identity","args":[{"ref":"copy"}]}} ]
+    , .{});
+    var plan = try Plan.init(a, .{ .fields = fields });
+    defer plan.deinit();
+    const Mock = struct {
+        identity_reads: usize = 0,
+        fn raw(_: *anyopaque, _: A, path: []const u8) !?[]const u8 {
+            if (!std.mem.eql(u8, path, "payload")) return error.SpeculativeRead;
+            return "{\"items\":[1e-400,-0.0,null,\"escaped\\n\"]}";
+        }
+        fn read(ptr: *anyopaque, _: A, path: []const u8, kind: sql.ColumnRead) !sql.Datum {
+            if (!std.mem.eql(u8, path, "payload") or kind != .identity) return error.UnnecessaryMaterialization;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.identity_reads += 1;
+            return sql.Datum.json(.{ .string = "qualified-source-identity" });
+        }
+    };
+    var mock: Mock = .{};
+    const encoded = try plan.evaluateEncoded(a, a, .{ .context = &mock, .read = Mock.read, .read_raw = Mock.raw }, null, .{});
+    const parsed = try std.json.parseFromSliceLeaky(V, a, encoded, .{});
+    try std.testing.expect(!parsed.object.get("missing").?.bool);
+    try std.testing.expectEqualStrings("qualified-source-identity", parsed.object.get("token").?.string);
+    try std.testing.expectEqualStrings("qualified-source-identity", parsed.object.get("token_again").?.string);
+    try std.testing.expectEqual(@as(usize, 1), mock.identity_reads);
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, parsed.object.get("v").?, .{}), try std.json.Stringify.valueAlloc(a, parsed.object.get("copy").?, .{}));
+}
+
+test "api query contract normalized receipts preserve work depth bytes and cancellation" {
+    const budget = @import("../sql/raw_json_budget.zig");
+    const Work = @import("../sql/numeric_value.zig").Context;
+    const a = std.testing.allocator;
+    var work: Work = .{ .alloc = a, .remaining = 10 };
+    const value = try budget.normalizePrepared(a, "{\"n\":[1,null]}", .{ .depth = 3, .wire_bytes = 1024 }, &work);
+    defer if (value.bytes.ptr != value.original.ptr) a.free(value.bytes);
+    try std.testing.expectEqual(@as(usize, 4), value.nodes);
+    try std.testing.expectEqual(@as(usize, 3), value.height);
+    var small: Work = .{ .alloc = a, .remaining = 3 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, value.charge(.{ .depth = 3, .wire_bytes = 1024 }, &small));
+    var shallow: Work = .{ .alloc = a };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, value.charge(.{ .depth = 2, .wire_bytes = 1024 }, &shallow));
+    var narrow: Work = .{ .alloc = a };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, value.charge(.{ .depth = 3, .wire_bytes = 2 }, &narrow));
+    const Guard = struct {
+        fn poll(_: ?*anyopaque) !void {
+            return error.QueryCanceled;
+        }
+    };
+    var cancelled: Work = .{ .alloc = a };
+    try std.testing.expectError(error.QueryCanceled, value.charge(.{ .depth = 3, .wire_bytes = 1024, .checkpoint = Guard.poll }, &cancelled));
 }

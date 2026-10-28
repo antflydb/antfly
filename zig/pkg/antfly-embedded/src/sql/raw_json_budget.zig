@@ -81,14 +81,32 @@ pub fn validate(a: std.mem.Allocator, raw: []const u8, limits: Limits, work: *Wo
 
 /// Normalize while charging the same logical nodes as the typed VM. Borrow
 /// unchanged extents and retain only changed canonical bytes in the row arena.
+pub const Normalized = struct {
+    bytes: []const u8,
+    original: []const u8,
+    nodes: usize,
+    height: usize,
+    pub fn charge(self: @This(), limits: Limits, work: *Work) !void {
+        if (self.bytes.len > limits.wire_bytes or self.height > limits.depth) return work.limit();
+        try work.charge(self.nodes);
+        if (limits.checkpoint) |poll| try poll(limits.checkpoint_context);
+    }
+};
 pub fn normalize(a: std.mem.Allocator, raw: []const u8, limits: Limits, work: *Work) ![]const u8 {
+    return (try normalizePrepared(a, raw, limits, work)).bytes;
+}
+pub fn normalizePrepared(a: std.mem.Allocator, raw: []const u8, limits: Limits, work: *Work) !Normalized {
     if (raw.len > limits.wire_bytes) return work.limit();
     const Context = struct {
         work: *Work,
         limits: Limits,
-        fn value(ptr: ?*anyopaque, _: usize) !void {
+        nodes: usize = 0,
+        height: usize = 0,
+        fn value(ptr: ?*anyopaque, depth: usize) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             try self.work.charge(1);
+            self.nodes += 1;
+            self.height = @max(self.height, depth + 1);
         }
         fn poll(ptr: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
@@ -96,5 +114,6 @@ pub fn normalize(a: std.mem.Allocator, raw: []const u8, limits: Limits, work: *W
         }
     };
     var context: Context = .{ .work = work, .limits = limits };
-    return @import("../common/canonical_json.zig").normalize(a, raw, limits.wire_bytes, .{ .depth = limits.depth, .preserve_strings = true, .context = &context, .value = Context.value, .checkpoint = Context.poll });
+    const bytes = try @import("../common/canonical_json.zig").normalize(a, raw, limits.wire_bytes, .{ .depth = limits.depth, .preserve_strings = true, .context = &context, .value = Context.value, .checkpoint = Context.poll });
+    return .{ .bytes = bytes, .original = raw, .nodes = context.nodes, .height = context.height };
 }

@@ -41751,6 +41751,8 @@ pub const DB = struct {
                 defer scope.close();
                 authorities = try conditional.Window.prepare(temp, &scope, keys[0 .. end - start], ids[0 .. end - start]);
             }
+            var source_batch = @import("field_projection_source.zig").Batch.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+            defer source_batch.deinit();
             for (result.hits[start..end], 0..) |*hit, i| {
                 try db_query_search.checkSearchRequestDeadline(req);
                 var row_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
@@ -41758,6 +41760,7 @@ pub const DB = struct {
                 const a = row_arena.allocator();
                 var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &txn, .physical = keys[i], .id = hit.id, .authority = authorities.rows[i], .req = req, .public_plan = &public_plan, .operands = &operands };
                 defer row.deinit();
+                if (try source_batch.at(&txn, i, keys[0 .. end - start], ids[0 .. end - start], authorities.rows[0 .. end - start], req, &operands)) |prepared| row.attach(prepared);
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
                 const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, protocol.requestLimits(&req));
                 errdefer alloc.free(encoded);
@@ -41804,6 +41807,8 @@ pub const DB = struct {
         defer if (scalar_public_plan) |*plan| plan.deinit();
         const scalar_operands = if (scalar_plan) |plan| try @import("field_projection_source.zig").OperandPlans.init(scalar_arena.allocator(), plan) else null;
         var scalar_authorities: @import("../conditional_source.zig").Window = .{};
+        var scalar_batch = @import("field_projection_source.zig").Batch.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer scalar_batch.deinit();
         var scalar_metadata_rows: usize = 0;
         var scalar_certificate_rows: usize = 0;
         var scalar_fallback_rows: usize = 0;
@@ -41840,6 +41845,7 @@ pub const DB = struct {
                 read = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
             }
             if (index % 64 == 0) {
+                scalar_batch.reset();
                 if (!metadata_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = metadata_scratch.reset(.free_all);
                 const m = metadata_scratch.allocator();
                 const count = @min(@as(usize, 64), result.hits.len - index);
@@ -41908,6 +41914,10 @@ pub const DB = struct {
                 const a = projection_scratch.allocator();
                 var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &read.?, .physical = store_key, .id = hit.id, .req = req, .authority = scalar_authorities.rows[index % 64], .full_bytes = raw_primary, .public_plan = if (scalar_public_plan) |*public| public else null, .operands = if (scalar_operands) |*operands| operands else null };
                 defer row.deinit();
+                if (raw_primary == null) if (scalar_operands) |*operands| {
+                    const count = @min(@as(usize, 64), result.hits.len - index + index % 64);
+                    if (try scalar_batch.at(&read.?, index % 64, physical[0..count], ids[0..count], scalar_authorities.rows[0..count], req, operands)) |prepared| row.attach(prepared);
+                };
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
                 const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, scalar.requestLimits(&req));
                 errdefer alloc.free(encoded);

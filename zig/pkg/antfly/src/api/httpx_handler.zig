@@ -4457,56 +4457,90 @@ pub const AntflyApiHandler = struct {
             const output = try a.alloc([]const u8, references.len);
             const groups = try inference_gateway.source_media.groups(a, references);
             const runtime = self.server.agentConcurrencyIo();
-            if (runtime == null or groups.len <= 1) {
+            var total_bytes: usize = 0;
+            for (references) |reference| total_bytes +|= std.base64.standard.Encoder.calcSize(reference.byte_length);
+            if (runtime == null or groups.len <= 1 or total_bytes < 64 * 1024) {
                 for (groups) |group| try self.lookupGroup(a, references, group, deadline, output);
                 return output;
             }
             const io = runtime.?;
-            var backing: @import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator = .{ .backing = SQLMemoryBudget.reclaimingAllocator(a) };
-            // Four isolated job arenas bound concurrent reads. No child uses
-            // the request arena, and every child is joined before its data dies.
-            var start: usize = 0;
-            while (start < groups.len) {
-                var jobs: [4]MediaGroupJob = undefined;
-                var initialized: usize = 0;
-                defer {
-                    for (jobs[0..initialized]) |*job| if (job.future) |*future| future.cancel(io);
-                    for (jobs[0..initialized]) |*job| job.arena.deinit();
-                }
-                const count = @min(jobs.len, groups.len - start);
-                for (jobs[0..count], groups[start..][0..count]) |*job, group| {
-                    job.* = .{ .owner = self, .arena = .init(backing.allocator()), .references = references, .group = group, .deadline = deadline };
-                    initialized += 1;
-                    job.future = io.concurrent(MediaGroupJob.run, .{job}) catch fallback: {
-                        job.run();
-                        break :fallback null;
-                    };
-                }
-                for (jobs[0..count]) |*job| {
-                    if (job.future) |*future| {
-                        future.await(io);
-                        job.future = null;
-                    }
+            const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
+            var backing: scheduler.LockedAllocator = .{ .backing = SQLMemoryBudget.reclaimingAllocator(a) };
+            // Rolling completions can overlap parent copies and child scratch.
+            // Both allocator paths serialize through the same quota lock.
+            var parent: scheduler.LockedAllocator = .{ .backing = a, .shared_mutex = &backing.mutex };
+            const parent_alloc = parent.allocator();
+            var ready: std.Io.Event = .unset;
+            var jobs: [4]MediaGroupJob = @splat(.{});
+            defer for (&jobs) |*job| if (job.active) {
+                if (job.task) |*task| task.cancel(io);
+                job.arena.deinit();
+            };
+            var next: usize = 0;
+            var completed: usize = 0;
+            var active_bytes: usize = 0;
+            const byte_limit = 8 * 1024 * 1024;
+            while (completed < groups.len) {
+                ready.reset();
+                for (&jobs) |*job| if (job.active and job.done.load(.acquire)) {
+                    if (job.task) |*task| task.await(io);
+                    job.task = null;
                     if (job.failure) |err| return err;
-                }
-                // Parent allocations start only after every child has joined.
-                for (jobs[0..count]) |*job| for (job.group.references.items) |slot| {
-                    output[slot] = try a.dupe(u8, job.output.?[slot]);
+                    for (job.group.references.items) |slot| output[slot] = try parent_alloc.dupe(u8, job.output.?[slot]);
+                    job.arena.deinit();
+                    job.active = false;
+                    active_bytes -= job.estimated_bytes;
+                    completed += 1;
                 };
-                start += count;
+                for (&jobs) |*job| {
+                    if (next == groups.len) break;
+                    if (job.active) continue;
+                    const group = groups[next];
+                    var estimate: usize = 64 * 1024;
+                    for (group.references.items) |slot| estimate +|= std.base64.standard.Encoder.calcSize(references[slot].byte_length) *| 2;
+                    if (estimate > byte_limit -| active_bytes and active_bytes != 0) break;
+                    job.* = .{ .active = true, .owner = self, .arena = .init(backing.allocator()), .references = references, .group = group, .deadline = deadline, .io = io, .ready = &ready, .estimated_bytes = estimate };
+                    active_bytes += estimate;
+                    next += 1;
+                    job.task = if (estimate <= byte_limit)
+                        scheduler.global().submitIoTransient(io, estimate, MediaGroupJob.run, .{job})
+                    else
+                        null;
+                    if (job.task == null) job.run();
+                }
+                if (completed == groups.len) break;
+                if (self.ctx.isCancellationRequested()) return error.Canceled;
+                if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+                // Reset precedes the readiness scan; a racing completion sets
+                // the event before this wait, so no finished slot is lost.
+                var finished = false;
+                for (&jobs) |*job| if (job.active and job.done.load(.acquire)) {
+                    finished = true;
+                    break;
+                };
+                if (!finished) try ready.wait(io);
             }
             return output;
         }
         const MediaGroupJob = struct {
-            owner: *GatewaySources,
-            arena: std.heap.ArenaAllocator,
-            references: []const inference_gateway.source_media.Reference,
-            group: inference_gateway.source_media.Group,
-            deadline: u64,
-            future: ?std.Io.Future(void) = null,
+            active: bool = false,
+            owner: *GatewaySources = undefined,
+            arena: std.heap.ArenaAllocator = undefined,
+            references: []const inference_gateway.source_media.Reference = &.{},
+            group: inference_gateway.source_media.Group = .{},
+            deadline: u64 = 0,
+            io: std.Io = undefined,
+            ready: *std.Io.Event = undefined,
+            estimated_bytes: usize = 0,
+            done: std.atomic.Value(bool) = .init(false),
+            task: ?@import("antfly_local_sources").sql_parallel_scheduler.Task(void) = null,
             output: ?[][]const u8 = null,
             failure: ?anyerror = null,
             fn run(self: *@This()) void {
+                defer {
+                    self.done.store(true, .release);
+                    self.ready.set(self.io);
+                }
                 const a = self.arena.allocator();
                 self.output = a.alloc([]const u8, self.references.len) catch |err| {
                     self.failure = err;
@@ -4517,81 +4551,233 @@ pub const AntflyApiHandler = struct {
                 };
             }
         };
+        const MediaResult = struct {
+            ctx: ?*httpx.Context = null,
+            a: std.mem.Allocator,
+            references: []const inference_gateway.source_media.Reference,
+            group: inference_gateway.source_media.Group,
+            output: [][]const u8,
+            consumed: bool = false,
+            legacy: bool = false,
+            projection_missing: bool = false,
+            failure: ?anyerror = null,
+            seen: u32 = 0,
+            retained: usize = 0,
+            wire: std.ArrayList(u8),
+            fn start(raw: *anyopaque, length: usize) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (length > 32 * 1024 * 1024) return error.InferenceRequestTooLarge;
+                try self.wire.ensureTotalCapacity(self.a, length);
+            }
+            fn write(raw: *anyopaque, bytes: []const u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (bytes.len > 32 * 1024 * 1024 -| self.wire.items.len) return error.InferenceRequestTooLarge;
+                try self.wire.appendSlice(self.a, bytes);
+            }
+            fn consume(raw: *anyopaque, result: @import("antfly_metadata_openapi").QueryResult) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.consumeResult(result) catch |err| {
+                    self.failure = err;
+                    return error.QueryDeliveryFailed;
+                };
+            }
+            fn consumeResult(self: *@This(), result: @import("antfly_metadata_openapi").QueryResult) !void {
+                try inference_gateway.source_media.checkStatus(result.status);
+                const hits = (result.hits orelse return error.InferenceUpstreamUnavailable).hits orelse return error.InferenceUpstreamUnavailable;
+                for (hits) |hit_| {
+                    var scratch = std.heap.ArenaAllocator.init(SQLMemoryBudget.reclaimingAllocator(self.a));
+                    defer scratch.deinit();
+                    const values = if (self.legacy) value: {
+                        const source = hit_._source orelse return error.InferenceSourceUnavailable;
+                        break :value std.json.Value{ .object = source.map };
+                    } else value: {
+                        const computed = hit_._computed orelse {
+                            self.projection_missing = true;
+                            return error.QueryDeliveryFailed;
+                        };
+                        if (computed.bytes.len > 32 * 1024 * 1024) return error.InferenceRequestTooLarge;
+                        break :value try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), computed.bytes, .{ .allocate = .alloc_if_needed });
+                    };
+                    try self.hit(hit_._id, values);
+                }
+                try self.finish();
+                self.consumed = true;
+            }
+            fn atPath(value: std.json.Value, path: []const u8) ?std.json.Value {
+                var current = value;
+                var parts = std.mem.splitScalar(u8, path, '.');
+                while (parts.next()) |part| current = switch (current) {
+                    .object => |object| object.get(part) orelse return null,
+                    .array => |array| element: {
+                        const index = std.fmt.parseInt(usize, part, 10) catch return null;
+                        if (index >= array.items.len) return null;
+                        break :element array.items[index];
+                    },
+                    else => return null,
+                };
+                return current;
+            }
+            fn selected(self: *@This(), values: std.json.Value, path: []const u8) !std.json.Value {
+                if (self.legacy) return atPath(values, path) orelse error.InferenceSourceMismatch;
+                for (self.group.fields.items, 0..) |field, i| if (std.mem.eql(u8, field, path)) {
+                    return at(values, try std.fmt.allocPrint(self.a, "v{d}", .{i})) orelse error.InferenceSourceMismatch;
+                };
+                return error.InferenceSourceMismatch;
+            }
+            fn hit(self: *@This(), id: []const u8, values: std.json.Value) !void {
+                if (values != .object) return error.InferenceSourceMismatch;
+                // Each selected field is copied once while the producer owns it.
+                var owned: [64]?[]const u8 = @splat(null);
+                for (self.group.references.items, 0..) |slot, group_slot| {
+                    const reference = self.references[slot];
+                    if (!std.mem.eql(u8, reference.document_id, id)) continue;
+                    const bit = @as(u32, 1) << @intCast(group_slot);
+                    if (self.seen & bit != 0) return error.InferenceSourceMismatch;
+                    self.seen |= bit;
+                    if (reference.identity) |expected| {
+                        const image_slot = for (self.group.identity_images.items, 0..) |field, i| {
+                            if (std.mem.eql(u8, field, reference.field)) break i;
+                        } else return error.InferenceSourceMismatch;
+                        const actual = at(values, try std.fmt.allocPrint(self.a, "i{d}", .{image_slot})) orelse return error.InferenceSourceMismatch;
+                        if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InferenceSourceMismatch;
+                    }
+                    const revision = try self.selected(values, reference.revision_field);
+                    if (revision != .string or !std.mem.eql(u8, revision.string, reference.revision)) return error.InferenceSourceMismatch;
+                    if (reference.permissions_field) |path| {
+                        const permission = try self.selected(values, path);
+                        const public = at(permission, "public");
+                        var allowed = if (public) |value| value == .bool and value.bool else false;
+                        if (at(permission, "readers")) |readers| if (readers == .array) {
+                            for (readers.array.items) |reader| if (reader == .string) for (reference.principals) |principal| {
+                                allowed = allowed or std.mem.eql(u8, reader.string, principal);
+                            };
+                        };
+                        if (!allowed) return error.Forbidden;
+                    }
+                    if (self.legacy) {
+                        if (atPath(values, reference.field) == null) return error.InferenceSourceUnavailable;
+                    } else {
+                        const image_slot = for (self.group.images.items, 0..) |field, i| {
+                            if (std.mem.eql(u8, field, reference.field)) break i;
+                        } else return error.InferenceSourceMismatch;
+                        const missing = at(values, try std.fmt.allocPrint(self.a, "m{d}", .{image_slot})) orelse return error.InferenceSourceMismatch;
+                        if (missing != .bool) return error.InferenceSourceMismatch;
+                        if (missing.bool) return error.InferenceSourceUnavailable;
+                    }
+                    const value = try self.selected(values, reference.field);
+                    if (value != .string) return error.InferenceSourceMismatch;
+                    if (self.ctx) |ctx| if (ctx.isCancellationRequested()) return error.Canceled;
+                    const field_slot = for (self.group.fields.items, 0..) |field, i| {
+                        if (std.mem.eql(u8, field, reference.field)) break i;
+                    } else unreachable;
+                    if (owned[field_slot] == null) {
+                        if (value.string.len > 32 * 1024 * 1024 -| self.retained) return error.InferenceRequestTooLarge;
+                        self.retained += value.string.len;
+                        owned[field_slot] = try self.a.dupe(u8, value.string);
+                    }
+                    self.output[slot] = owned[field_slot].?;
+                }
+            }
+            fn finish(self: *@This()) !void {
+                const expected = if (self.group.references.items.len == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(self.group.references.items.len)) - 1;
+                if (self.seen != expected) return error.InferenceSourceUnavailable;
+            }
+        };
         fn lookupGroup(self: *@This(), a: std.mem.Allocator, references: []const inference_gateway.source_media.Reference, group: inference_gateway.source_media.Group, deadline: u64, output: [][]const u8) !void {
             if (self.ctx.isCancellationRequested()) return error.Canceled;
-            const current = @import("antfly_platform").time.monotonicNs();
-            if (deadline <= current) return error.Timeout;
-            var selected: std.json.ObjectMap = .empty;
-            for (group.images.items, 0..) |field, i| {
-                const encoded = try std.json.Stringify.valueAlloc(a, .{ .call = "value_identity", .args = .{.{ .field = field }} }, .{});
-                try selected.put(a, try std.fmt.allocPrint(a, "image_identity_{d}", .{i}), try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
-            }
-            const first = references[group.references.items[0]];
-            const query = try std.json.Stringify.valueAlloc(a, .{
-                .query = .{ .bool = .{ .filter = .{ .ids = group.ids.items } } },
-                .fields = group.fields.items,
-                .select = std.json.Value{ .object = selected },
-                .filter_query = first.filter_query,
-                .limit = group.ids.items.len,
-                .timeout_ms = @min(@as(u64, 120000), @max(@as(u64, 1), (deadline - current) / std.time.ns_per_ms)),
-            }, .{ .emit_null_optional_fields = false });
-            var cancellation: http_common.RequestCancellation = .{ .borrowed_context = self.ctx, .borrowed_is_cancelled = struct {
-                fn cancelled(ptr: *const anyopaque) bool {
-                    const context: *const httpx.Context = @ptrCast(@alignCast(ptr));
-                    return context.isCancellationRequested();
-                }
-            }.cancelled };
-            // Use ordinary public query admission and the original identity.
-            var response = try self.server.handlePublicTableQueryWithContentTypeCancellation(first.table, query, "application/json", self.identity, &cancellation);
-            defer response.deinit(self.server.alloc);
-            try inference_gateway.source_media.checkStatus(response.status);
-            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
-            const responses = at(parsed, "responses") orelse return error.InferenceUpstreamUnavailable;
-            if (responses != .array or responses.array.items.len != 1) return error.InferenceUpstreamUnavailable;
-            const result = responses.array.items[0];
-            const status = at(result, "status") orelse return error.InferenceUpstreamUnavailable;
-            if (status != .integer) return error.InferenceUpstreamUnavailable;
-            try inference_gateway.source_media.checkStatus(status.integer);
-            const hits = at(result, "hits.hits") orelse return error.InferenceUpstreamUnavailable;
-            if (hits != .array) return error.InferenceUpstreamUnavailable;
-            for (group.references.items) |slot| {
-                const reference = references[slot];
-                var found: ?std.json.Value = null;
-                for (hits.array.items) |candidate| {
-                    const id = at(candidate, "_id") orelse return error.InferenceUpstreamUnavailable;
-                    if (id != .string) return error.InferenceUpstreamUnavailable;
-                    if (std.mem.eql(u8, id.string, reference.document_id)) {
-                        if (found != null) return error.InferenceSourceMismatch;
-                        found = candidate;
-                    }
-                }
-                const hit = found orelse return error.InferenceSourceUnavailable;
-                const source = at(hit, "_source") orelse return error.InferenceSourceUnavailable;
-                if (reference.identity) |expected| {
-                    const image_slot = for (group.images.items, 0..) |field, i| {
-                        if (std.mem.eql(u8, field, reference.field)) break i;
-                    } else return error.InferenceSourceMismatch;
-                    const computed = at(hit, "_computed") orelse return error.InferenceSourceMismatch;
-                    const actual = at(computed, try std.fmt.allocPrint(a, "image_identity_{d}", .{image_slot})) orelse return error.InferenceSourceMismatch;
-                    if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InferenceSourceMismatch;
-                }
-                const revision = at(source, reference.revision_field) orelse return error.InferenceSourceMismatch;
-                if (revision != .string or !std.mem.eql(u8, revision.string, reference.revision)) return error.InferenceSourceMismatch;
-                if (reference.permissions_field) |path| {
-                    const permission = at(source, path) orelse return error.Forbidden;
-                    const public = at(permission, "public");
-                    var allowed = if (public) |value| value == .bool and value.bool else false;
-                    if (at(permission, "readers")) |readers| if (readers == .array) {
-                        for (readers.array.items) |reader| if (reader == .string) for (reference.principals) |principal| {
-                            allowed = allowed or std.mem.eql(u8, reader.string, principal);
-                        };
-                    };
-                    if (!allowed) return error.Forbidden;
-                }
-                const value = at(source, reference.field) orelse return error.InferenceSourceUnavailable;
-                if (value != .string) return error.InferenceSourceMismatch;
+            var legacy = false;
+            while (true) {
                 if (self.ctx.isCancellationRequested()) return error.Canceled;
-                output[slot] = value.string;
+                const current = @import("antfly_platform").time.monotonicNs();
+                if (deadline <= current) return error.Timeout;
+                var roots: std.ArrayList([]const u8) = .empty;
+                if (legacy) for (group.fields.items) |field| {
+                    const root = field[0 .. std.mem.indexOfScalar(u8, field, '.') orelse field.len];
+                    var found = false;
+                    for (roots.items) |existing| if (std.mem.eql(u8, root, existing)) {
+                        found = true;
+                        break;
+                    };
+                    if (!found) try roots.append(a, root);
+                };
+                var selected: std.json.ObjectMap = .empty;
+                for (group.fields.items, 0..) |field, i| {
+                    var expression: std.json.ObjectMap = .empty;
+                    try expression.put(a, "field", .{ .string = field });
+                    try selected.put(a, try std.fmt.allocPrint(a, "v{d}", .{i}), .{ .object = expression });
+                }
+                for (group.images.items, 0..) |field, i| {
+                    const encoded = try std.json.Stringify.valueAlloc(a, .{ .call = "is_missing", .args = .{.{ .field = field }} }, .{});
+                    try selected.put(a, try std.fmt.allocPrint(a, "m{d}", .{i}), try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
+                }
+                for (group.identity_images.items, 0..) |field, i| {
+                    const encoded = try std.json.Stringify.valueAlloc(a, .{ .call = "value_identity", .args = .{.{ .field = field }} }, .{});
+                    try selected.put(a, try std.fmt.allocPrint(a, "i{d}", .{i}), try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
+                }
+                const first = references[group.references.items[0]];
+                const query = try std.json.Stringify.valueAlloc(a, .{
+                    .query = .{ .bool = .{ .filter = .{ .ids = group.ids.items } } },
+                    .fields = if (legacy) roots.items else @as([]const []const u8, &.{}),
+                    .select = if (legacy) @as(?std.json.Value, null) else std.json.Value{ .object = selected },
+                    .filter_query = first.filter_query,
+                    .limit = group.ids.items.len,
+                    .timeout_ms = @min(@as(u64, 120000), @max(@as(u64, 1), (deadline - current) / std.time.ns_per_ms)),
+                }, .{ .emit_null_optional_fields = false });
+                var cancellation: http_common.RequestCancellation = .{ .borrowed_context = self.ctx, .borrowed_is_cancelled = struct {
+                    fn cancelled(ptr: *const anyopaque) bool {
+                        const context: *const httpx.Context = @ptrCast(@alignCast(ptr));
+                        return context.isCancellationRequested();
+                    }
+                }.cancelled };
+                var collector: MediaResult = .{ .ctx = self.ctx, .a = a, .references = references, .group = group, .output = output, .wire = .empty, .legacy = legacy };
+                // Ordinary admission, catalog binding, policy and read-cut execution
+                // feed the in-process consumer; unsupported producers retain wire.
+                var response = try self.server.consumePublicTableQuery(first.table, query, self.identity, &cancellation, .{
+                    .ptr = &collector,
+                    .start_fn = MediaResult.start,
+                    .write_fn = MediaResult.write,
+                    .max_bytes = 32 * 1024 * 1024,
+                    .typed_result = .{ .ptr = &collector, .consume = MediaResult.consume },
+                });
+                defer response.deinit(self.server.alloc);
+                if (collector.projection_missing and !legacy and group.identity_images.items.len == 0) {
+                    legacy = true;
+                    continue;
+                }
+                if (collector.failure) |err| return err;
+                try inference_gateway.source_media.checkStatus(response.status);
+                if (!collector.consumed) {
+                    const bytes = if (collector.wire.items.len != 0) collector.wire.items else response.body;
+                    if (bytes.len > 32 * 1024 * 1024) return error.InferenceRequestTooLarge;
+                    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+                    const responses = at(parsed, "responses") orelse return error.InferenceUpstreamUnavailable;
+                    if (responses != .array or responses.array.items.len != 1) return error.InferenceUpstreamUnavailable;
+                    const result = responses.array.items[0];
+                    const status = at(result, "status") orelse return error.InferenceUpstreamUnavailable;
+                    if (status != .integer) return error.InferenceUpstreamUnavailable;
+                    try inference_gateway.source_media.checkStatus(status.integer);
+                    const hits = at(result, "hits.hits") orelse return error.InferenceUpstreamUnavailable;
+                    if (hits != .array) return error.InferenceUpstreamUnavailable;
+                    for (hits.array.items) |hit| {
+                        const id = at(hit, "_id") orelse return error.InferenceUpstreamUnavailable;
+                        if (id != .string) return error.InferenceUpstreamUnavailable;
+                        const values = at(hit, if (legacy) "_source" else "_computed") orelse {
+                            if (!legacy) {
+                                collector.projection_missing = true;
+                                break;
+                            }
+                            return error.InferenceSourceUnavailable;
+                        };
+                        try collector.hit(id.string, values);
+                    }
+                    if (collector.projection_missing and !legacy and group.identity_images.items.len == 0) {
+                        legacy = true;
+                        continue;
+                    }
+                    if (collector.projection_missing) return error.InferenceSourceMismatch;
+                    try collector.finish();
+                }
+                return;
             }
         }
     };
@@ -20671,4 +20857,40 @@ test "httpx inference gateway document jobs persist before dispatch and publish 
     var submitted_json = try std.json.parseFromSlice(std.json.Value, a, submitted.body.?, .{});
     defer submitted_json.deinit();
     try store.cancel(work, submitted_json.value.object.get("id").?.string, "anonymous");
+}
+
+test "httpx inference gateway typed consumers retain errors and legacy original array positions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source_media = inference_gateway.source_media;
+    const reference: source_media.Reference = .{
+        .table = "docs",
+        .document_id = "a",
+        .field = "images.1",
+        .revision_field = "versions.1",
+        .revision = "r1",
+        .permissions_field = "policies.1",
+        .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .mime_type = "image/png",
+        .byte_length = 68,
+    };
+    const references = [_]source_media.Reference{reference};
+    const groups = try source_media.groups(a, &references);
+    var output: [1][]const u8 = undefined;
+    const Consumer = AntflyApiHandler.GatewaySources.MediaResult;
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"images\":[\"wrong\",\"correct\"],\"versions\":[\"wrong\",\"r1\"],\"policies\":[{\"public\":false},{\"public\":true}]}", .{});
+    const hits = [_]@import("antfly_metadata_openapi").QueryHit{.{ ._id = "a", ._score = 0, ._source = .{ .map = root.object } }};
+    const result: @import("antfly_metadata_openapi").QueryResult = .{ .status = 200, .took = 0, .hits = .{ .hits = &hits } };
+    var consumer: Consumer = .{ .a = a, .references = &references, .group = groups[0], .output = &output, .wire = .empty };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, result));
+    try std.testing.expect(consumer.projection_missing);
+    consumer = .{ .a = a, .references = &references, .group = groups[0], .output = &output, .wire = .empty, .legacy = true };
+    try Consumer.consume(&consumer, result);
+    try std.testing.expectEqualStrings("correct", output[0]);
+    root.object.getPtr("versions").?.array.items[1] = .{ .string = "r2" };
+    consumer = .{ .a = a, .references = &references, .group = groups[0], .output = &output, .wire = .empty, .legacy = true };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, result));
+    try std.testing.expectEqual(error.InferenceSourceMismatch, consumer.failure.?);
+    try std.testing.expect(!consumer.projection_missing);
 }

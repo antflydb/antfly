@@ -216,10 +216,12 @@ pub const ColumnLoader = struct {
 };
 /// Validated borrowed JSON may cross a pure JSON column/CASE output without
 /// building a DOM. Ordinary operators continue to consume typed Datum values.
-pub const Output = union(enum) { datum: Datum, raw: []const u8 };
+pub const NormalizedOutput = @import("raw_json_budget.zig").Normalized;
+pub const Output = union(enum) { datum: Datum, raw: struct { value: NormalizedOutput, column: u32 } };
 pub const OutputColumnLoader = struct {
     context: *anyopaque,
     read: *const fn (*anyopaque, Allocator, u32) anyerror!?[]const u8,
+    normalized: ?*const fn (*anyopaque, u32) anyerror!?NormalizedOutput = null,
 };
 pub const EvalLimits = struct {
     output_column_loader: ?OutputColumnLoader = null,
@@ -3238,15 +3240,21 @@ const Evaluator = struct {
         if (instruction.type.kind == .json) switch (instruction.operation) {
             .column => |ordinal| if (self.limits.output_column_loader) |loader| {
                 if (depth >= self.limits.depth) return self.workOwner().limit();
+                const limits: @import("raw_json_budget.zig").Limits = .{
+                    .wire_bytes = self.limits.output_bytes,
+                    .depth = self.limits.depth,
+                    .checkpoint = self.limits.checkpoint,
+                    .checkpoint_context = self.limits.checkpoint_context,
+                };
+                if (loader.normalized) |prepared| if (try prepared(loader.context, ordinal)) |value| {
+                    try self.workOwner().charge(1);
+                    try value.charge(limits, self.workOwner());
+                    return .{ .raw = .{ .value = value, .column = ordinal } };
+                };
                 if (try loader.read(loader.context, self.alloc, ordinal)) |raw| {
                     try self.workOwner().charge(1);
-                    const normalized = try @import("raw_json_budget.zig").normalize(self.alloc, raw, .{
-                        .wire_bytes = self.limits.output_bytes,
-                        .depth = self.limits.depth,
-                        .checkpoint = self.limits.checkpoint,
-                        .checkpoint_context = self.limits.checkpoint_context,
-                    }, self.workOwner());
-                    return .{ .raw = normalized };
+                    const normalized = try @import("raw_json_budget.zig").normalizePrepared(self.alloc, raw, limits, self.workOwner());
+                    return .{ .raw = .{ .value = normalized, .column = ordinal } };
                 }
             },
             .case_when => |case| {
