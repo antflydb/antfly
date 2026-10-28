@@ -1843,6 +1843,11 @@ and WAL debt before retry. Queued directory, writer and obsolete-ledger roots
 now retire through short protected cleanup admissions on the detached backend
 worker. Foreground unlocks queue this work, preserving outer DB/catalog guards;
 refusal retains cursors and backs off outside service guards. Failed
-append candidates use the same rooted retirement handoff. Output-vector
-retirement and remaining flush durability/immutable cleanup still need execution
-integration; broader compaction integration remains unfinished.
+append candidates use the same rooted retirement handoff. Output vectors now
+return to the existing funded flush-batch owner and retire on protected cleanup
+CPU, keeping vector credit until the final chunk is freed. Immutable state
+retirement uses the same worker with checkpoints between physical chunks across
+tree, flat and arena representations. Both retain debt through refusal and
+joined close; controlled close preparation returns vector credit before final
+persistence. Manifest/WAL completion and remaining read-metadata/coordination
+work still need execution integration; broader compaction remains unfinished.

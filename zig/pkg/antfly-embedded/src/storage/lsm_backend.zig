@@ -1794,6 +1794,8 @@ pub const Backend = struct {
     run_directory_generation: u64 = 0,
     retired_run_directories: ?*RunDirectory = null,
     retired_run_stores: ?*RunStore = null,
+    retired_flush_outputs: ?*@import("lsm_backend/registered_flush_outputs.zig").Owner = null,
+    flush_outputs_reclaim_in_flight: bool = false,
     active_compaction_publications: ?*compaction_mod.Publication = null,
     output_cleanup_retry_at_ns: u64 = 0,
     output_cleanup_admission_failures: u64 = 0,
@@ -2755,7 +2757,7 @@ pub const Backend = struct {
     /// ledger roots and durable finalization obligations remain backend-owned.
     /// The original finite execution is borrowed on each call, never retained.
     pub const QuiescedClosePreparation = struct {
-        phase: enum { observe, memtables, metadata, ledgers, reconcile, done } = .observe,
+        phase: enum { observe, outputs, memtables, metadata, ledgers, reconcile, done } = .observe,
         before: QuiescedClosePreflight = .{},
         after: QuiescedClosePreflight = .{},
 
@@ -2769,12 +2771,16 @@ pub const Backend = struct {
                         // Establish the full retained charge before destroying
                         // anything, including cold legacy snapshot accounting.
                         try self.before.resumeWithAdmission(backend, io, original);
-                        if (backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null and !@import("lsm_backend/read_metadata_reclamation.zig").pending(backend)) {
+                        if (backend.retired_flush_outputs == null and backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null and !@import("lsm_backend/read_metadata_reclamation.zig").pending(backend)) {
                             // No physical ownership changed. Reuse the first
                             // observation instead of scanning live state twice.
                             self.after = self.before;
                             self.phase = .done;
-                        } else self.phase = .memtables;
+                        } else self.phase = .outputs;
+                    },
+                    .outputs => {
+                        var credits: usize = 64;
+                        if (try backend.reclaimFlushOutputsQuiescedStep(&credits, original)) self.phase = .memtables;
                     },
                     .memtables => {
                         var credits: usize = 64;
@@ -3880,6 +3886,7 @@ pub const Backend = struct {
         };
         if (self.pending_gc != null or self.retired_gc != null or self.directory_reclaimer != null or self.retired_run_directories != null) score +|= 1;
         if (self.retired_run_stores != null or self.store_reclaimer != null) score +|= 1;
+        if (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) score +|= 1;
         if (self.obsolete_run_count != 0 and (self.obsolete_run_drain_remaining != 0 or self.obsolete_run_pin_epoch != file_pin_release_epoch.load(.acquire))) score +|= 1;
         if (self.manifest_journal.checkpointDue() and self.manifest_journal.sequence != null) score += 1;
         const directory = if (!self.run_directory_dirty) self.run_directory else null;
@@ -4260,6 +4267,7 @@ pub const Backend = struct {
         if (@import("lsm_backend/read_metadata_reclamation.zig").pending(self)) return true;
         if (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null)) return true;
         if (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) return true;
+        if (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) return true;
         if (self.manifest_recovery_required) return false;
         const reclaim_visits_before = self.obsolete_reclaim_visits;
         const planning_slices_before = self.directory_planning_slices;
@@ -4882,6 +4890,7 @@ pub const Backend = struct {
         self.reclaimClosurePlanningSliceLocked();
         self.reclaimGcPlanningSliceLocked();
         self.reclaimBulkPlanningSliceLocked();
+        self.reclaimFlushOutputsSliceLocked(false);
         self.reclaimStoreSliceLocked(false);
         @import("lsm_backend/read_metadata_reclamation.zig").reclaimSliceLocked(self);
         self.reclaimDirectorySliceLocked(false);
@@ -4924,6 +4933,7 @@ pub const Backend = struct {
         if ((self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
             @import("lsm_backend/memtable_reclamation.zig").pending(self) or
             @import("lsm_backend/read_metadata_reclamation.zig").pending(self) or
+            (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) or
             (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) or
             (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null))) self.scheduleMaintenanceJobLocked(true);
         self.mu.unlock();
@@ -4958,6 +4968,50 @@ pub const Backend = struct {
             if (!result.done) break;
         }
         self.syncTrackedInMemoryStateUsageCurrentLocked();
+    }
+
+    pub fn reclaimFlushOutputsQuiescedStep(self: *Backend, credits: *usize, original: ?read_admission.Port) !bool {
+        std.debug.assert(self.active_readers == 0 and !self.flush_outputs_reclaim_in_flight);
+        while (credits.* != 0) {
+            const owner = self.retired_flush_outputs orelse return true;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1; // Fixed unlink/final owner handoff must fit too.
+            if (!try owner.stepWithAdmission(self.allocator, credits, original)) return false;
+            self.retired_flush_outputs = owner.legacy_retired_next;
+            owner.legacy_retired_next = null;
+            owner.finishLegacyReturn();
+        }
+        return self.retired_flush_outputs == null;
+    }
+
+    fn retireFlushOutputs(self: *Backend, owner: *@import("lsm_backend/registered_flush_outputs.zig").Owner, outputs: *std.ArrayListUnmanaged(Run), committed: bool) void {
+        owner.returnLegacyRuns(outputs, committed);
+        owner.legacy_retired_next = self.retired_flush_outputs;
+        self.retired_flush_outputs = owner;
+        self.cached_maintenance_hint.store(1, .release);
+    }
+
+    fn reclaimFlushOutputsSliceLocked(self: *Backend, controlled: bool) void {
+        if (!controlled and @import("lsm_backend/retirement_execution.zig").deferred(self)) return;
+        if (self.flush_outputs_reclaim_in_flight or self.retired_flush_outputs == null or platform_time.monotonicNs() < self.retirement_execution_retry_at_ns) return;
+        self.flush_outputs_reclaim_in_flight = true;
+        self.retainReaderKind(.other);
+        defer self.releaseReaderKind(.other);
+        defer self.flush_outputs_reclaim_in_flight = false;
+        var credits: usize = 2048;
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
+            const owner = self.retired_flush_outputs orelse break;
+            self.mu.unlock();
+            const result = @import("lsm_backend/retirement_execution.zig").step(self, owner, credits, deadline);
+            _ = runtime_mod.lockBackend(Backend, self);
+            credits -= result.units;
+            if (result.refused) self.retirement_execution_retry_at_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_ms;
+            if (!result.done) break;
+            self.retired_flush_outputs = owner.legacy_retired_next;
+            owner.legacy_retired_next = null;
+            owner.finishLegacyReturn();
+        }
     }
 
     pub fn retireRunStore(self: *Backend, store: *RunStore) void {
@@ -6090,7 +6144,8 @@ pub const Backend = struct {
         const pending_metadata = @import("lsm_backend/read_metadata_reclamation.zig").pending(self);
         const pending_directory = !self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null);
         const pending_store = !self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null);
-        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory or pending_metadata or pending_directory or pending_store);
+        const pending_outputs = self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight;
+        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory or pending_metadata or pending_directory or pending_store or pending_outputs);
         if (self.options.backend.read_only and !ledger_cleanup) return;
         if (self.bulkIngestActive() and !ledger_cleanup and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
         const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation) - @intFromBool(pending_memory and !after_reclamation) - @intFromBool(pending_metadata and !after_reclamation);
@@ -6138,6 +6193,9 @@ pub const Backend = struct {
             // guards. Foreground unlocks only enqueue controlled retirement.
             _ = runtime_mod.lockBackend(Backend, self);
             @import("lsm_backend/ledger_reclamation.zig").reclaimControlledSliceLocked(self);
+            self.reclaimFlushOutputsSliceLocked(true);
+            if (@import("lsm_backend/retirement_execution.zig").deferred(self))
+                @import("lsm_backend/memtable_reclamation.zig").reclaimControlledSliceLocked(self);
             self.reclaimStoreSliceLocked(true);
             self.reclaimDirectorySliceLocked(true);
             self.mu.unlock();
@@ -6302,6 +6360,9 @@ pub const Backend = struct {
         var build_err: ?anyerror = null;
         var build_credit: ?resource_manager_mod.Reservation = null;
         defer if (build_credit) |*credit| credit.release();
+        var build_retirement: ?*@import("lsm_backend/registered_flush_outputs.zig").Owner = null;
+        var build_published = false;
+        defer if (build_retirement) |owner| self.retireFlushOutputs(owner, &build_result, build_published);
         const admitted_runtime = if (execution_runtime != null) self.admittedImmutableFlushRuntime() else null;
         if (admitted_runtime) |runtime| {
             const result = self.buildAdmittedImmutableFlush(runtime, states_newest_first, reserved_run_id_start, reserved_run_id_end) catch |err| blk: {
@@ -6311,6 +6372,7 @@ pub const Backend = struct {
             if (result) |owned| {
                 build_result = owned.runs;
                 build_credit = owned.credit;
+                build_retirement = owned.retirement;
             }
         } else build_result = compaction_mod.buildRunsFromStatesBorrowedWithReservedIds(
             Backend,
@@ -6328,7 +6390,7 @@ pub const Backend = struct {
         std.debug.assert(relocked);
         var build_in_flight = true;
         defer if (build_in_flight) self.finishImmutableFlushBuildLocked();
-        errdefer if (build_result_valid) compaction_mod.discardOutputRunsLocked(Backend, self, &build_result);
+        errdefer if (build_result_valid and build_retirement == null) compaction_mod.discardOutputRunsLocked(Backend, self, &build_result);
         if (build_err) |err| return err;
 
         var window_matches = publish_head == self.immutable_head and
@@ -6343,7 +6405,7 @@ pub const Backend = struct {
             }
         }
         if (!window_matches) {
-            compaction_mod.discardOutputRunsLocked(Backend, self, &build_result);
+            if (build_retirement == null) compaction_mod.discardOutputRunsLocked(Backend, self, &build_result);
             return false;
         }
 
@@ -6363,6 +6425,7 @@ pub const Backend = struct {
         try self.retired_immutable_memtables.ensureUnusedCapacity(self.allocator, if (admitted_runtime != null) window_count else pinned_retirements);
         if (admitted_runtime != null) {
             try compaction_mod.publishFlushRuns(self, &build_result);
+            build_published = true;
         } else {
             var directory = try self.prepareRunDirectoryChange(null, build_result.items);
             errdefer if (directory) |owned| owned.destroy(self.allocator);
@@ -6440,7 +6503,7 @@ pub const Backend = struct {
         defer batch.requestRetirement();
         try batch.collectWithAdmission(original);
         try batch.prepareLegacyWithAdmission(self, original);
-        return batch.takeLegacyRunsWithAdmission(original);
+        return batch.takeLegacyRunsForPublicationWithAdmission(original);
     }
 
     fn maybeCompactRuns(self: *Backend) !void {
@@ -7714,6 +7777,12 @@ pub const Backend = struct {
     }
 
     pub fn destroyRunMetadata(self: *Backend) void {
+        // Background work and readers have joined. Return each vector's
+        // prearranged owner even when close cancelled its last cleanup pass.
+        while (self.retired_flush_outputs != null) {
+            var credits: usize = 2048;
+            _ = self.reclaimFlushOutputsQuiescedStep(&credits, null) catch unreachable;
+        }
         @import("lsm_backend/read_metadata_reclamation.zig").drainJoined(self);
         if (self.pending_tombstone_reconcile) |pending| pending.destroy(self);
         self.pending_tombstone_reconcile = null;
@@ -10776,10 +10845,11 @@ pub const Backend = struct {
         if (!self.mu.tryLock()) return null;
         defer self.mu.unlock();
         if ((self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
+            (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) or
             (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) or
             (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null)))
             return self.retirement_execution_retry_at_ns -| platform_time.monotonicNs();
-        if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return 0;
+        if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return self.retirement_execution_retry_at_ns -| platform_time.monotonicNs();
         if (self.manifest_recovery_required) return null;
 
         // Keep the advertised deadline consistent with runMaintenanceStepLocked:

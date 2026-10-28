@@ -47,6 +47,7 @@ const Node = struct {
 };
 
 pub const Owner = struct {
+    pub var test_vector_retirement_hook: ?*const fn (admission.Port) anyerror!void = null;
     allocator: std.mem.Allocator,
     manager: *resources.ResourceManager,
     host: resources.AllocatorHost,
@@ -73,6 +74,10 @@ pub const Owner = struct {
     legacy_runs: std.ArrayListUnmanaged(Run) = .empty,
     legacy_credit: ?resources.Reservation = null,
     legacy_retire_offset: usize = 0,
+    legacy_outstanding: bool = false,
+    legacy_returned: bool = false,
+    legacy_committed: bool = false,
+    legacy_retired_next: ?*Owner = null,
     frame: ?*Publication.Candidate = null,
     receipt: ?Publication.Candidate.PreparedReceipt = null,
     next_validation: ?*Node = null,
@@ -214,7 +219,46 @@ pub const Owner = struct {
         runs: std.ArrayListUnmanaged(Run),
         // Retained until the receiving publication frees the physical vector.
         credit: ?resources.Reservation,
+        retirement: ?*Owner = null,
     };
+    /// Lend the vector to normal publication while this registered owner keeps
+    /// its exact credit and allocator host. Requesting retirement cannot free
+    /// either until the backend returns and drains this exclusive loan.
+    pub fn takeLegacyRunsForPublicationWithAdmission(self: *Owner, original: admission.Port) !LegacyResult {
+        try original.checkpoint();
+        if (self.closing or self.live or !self.legacy_ready or self.legacy_outstanding) return error.InvalidArgument;
+        const result: LegacyResult = .{ .runs = self.legacy_runs, .credit = null, .retirement = self };
+        self.legacy_runs = .empty;
+        self.legacy_ready = false;
+        self.legacy_outstanding = true;
+        return result;
+    }
+    /// Fixed ownership handoff under Backend.mu; no original authority survives.
+    pub fn returnLegacyRuns(self: *Owner, runs: *std.ArrayListUnmanaged(Run), committed: bool) void {
+        std.debug.assert(self.closing and self.legacy_outstanding and !self.legacy_returned and self.legacy_runs.capacity == 0);
+        self.legacy_runs = runs.*;
+        runs.* = .empty;
+        self.legacy_committed = committed;
+        self.legacy_returned = true;
+    }
+    pub fn stepWithAdmission(self: *Owner, _: std.mem.Allocator, credits: *usize, original: ?admission.Port) !bool {
+        std.debug.assert(self.legacy_outstanding and self.legacy_returned);
+        if (comptime @import("builtin").is_test) if (original) |port| if (test_vector_retirement_hook) |hook| try hook(port);
+        while (credits.* != 0) {
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            if (try self.retireLegacyStep(original)) return true;
+        }
+        return false;
+    }
+    /// Only after vector destruction. Remaining registered metadata has no
+    /// Backend borrow and goes to its existing independently funded consumer.
+    pub fn finishLegacyReturn(self: *Owner) void {
+        std.debug.assert(self.legacy_returned and self.legacy_runs.capacity == 0 and self.legacy_credit == null);
+        self.legacy_outstanding = false;
+        self.legacy_returned = false;
+        self.registration.publish(); // Final owner access.
+    }
     pub fn takeLegacyRunsWithAdmission(self: *Owner, original: admission.Port) !LegacyResult {
         try original.checkLifetime();
         if (self.closing or self.live or !self.legacy_ready) return error.InvalidArgument;
@@ -344,28 +388,39 @@ pub const Owner = struct {
         if (self.legacy_scope) |scope| scope.requestRetirement();
         self.legacy_scope = null;
         self.legacy_next = null;
-        self.registration.publish();
+        if (!self.legacy_outstanding) self.registration.publish();
     }
-    fn retire(raw: *anyopaque, original: ?admission.Port) !bool {
-        const self: *Owner = @ptrCast(@alignCast(raw));
+    fn retireLegacyStep(self: *Owner, original: ?admission.Port) !bool {
         if (original) |port| try port.checkpoint();
         if (self.legacy_runs.items.len != 0) {
             const index = self.legacy_runs.items.len - 1;
-            self.legacy_runs.items[index].deinit(self.allocator);
+            const run = &self.legacy_runs.items[index];
+            // These are registered outputs or cache-free publication wrappers.
+            // Their anchors make this final reference drop fixed; tickets own
+            // independent file cleanup and never borrow the failed request.
+            if (self.legacy_committed) run.commitOutput() else _ = run.abandonOutput();
+            run.deinit(self.allocator);
             self.legacy_runs.items.len = index;
             return false;
         }
         if (self.legacy_runs.capacity != 0) {
             const bytes = std.mem.sliceAsBytes(self.legacy_runs.allocatedSlice());
             const end = @min(bytes.len, self.legacy_retire_offset + 16 * 1024);
-            @memset(bytes[self.legacy_retire_offset..end], 0);
+            @memset(bytes[self.legacy_retire_offset..end], undefined);
             self.legacy_retire_offset = end;
             if (end != bytes.len) return false;
-            self.legacy_runs.deinit(self.allocator);
+            self.allocator.rawFree(bytes, .of(Run), @returnAddress());
             self.legacy_runs = .empty;
         }
         if (self.legacy_credit) |*credit| credit.release();
         self.legacy_credit = null;
+        return true;
+    }
+    fn retire(raw: *anyopaque, original: ?admission.Port) !bool {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        if (original) |port| try port.checkpoint();
+        if (self.legacy_outstanding) return false;
+        if (!try self.retireLegacyStep(original)) return false;
         if (self.head) |node| {
             if (node.ticket) |ticket| {
                 if (self.live) ticket.destroy() else if (original) |port| try ticket.abandonWithAdmission(port) else ticket.abandon();

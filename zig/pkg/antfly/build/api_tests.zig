@@ -169,6 +169,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-physical-resource-metadata-test", "Verify fixed cache metadata admission and movable teardown ownership")
         .dependOn(&b.addRunArtifact(physical_metadata_tests).step);
+    const memtable_retirement_tests = b.addTest(.{
+        .name = "memtable-retirement-execution-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"memtable reclamation execution"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const memtable_retirement_run = b.addRunArtifact(memtable_retirement_tests);
+    memtable_retirement_run.addArgs(&.{ "--require-no-skips", "--allow-empty-owner" });
+    b.step("antfly-memtable-retirement-execution-test", "Verify saved immutable cleanup across rejected execution without allocation")
+        .dependOn(&memtable_retirement_run.step);
+
     const writer_retirement_tests = b.addTest(.{
         .name = "bounded-writer-retirement-tests",
         .root_module = physical_metadata_root,

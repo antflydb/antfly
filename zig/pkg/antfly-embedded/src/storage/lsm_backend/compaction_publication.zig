@@ -26,6 +26,7 @@ const Plan = @import("compaction.zig").CompactionPlan;
 const Certificate = @import("dependency_job.zig").Job;
 const runtime = @import("runtime.zig");
 const resources = @import("../resource_manager.zig");
+pub const memtable_reclamation = @import("memtable_reclamation.zig");
 pub const retirement_execution = @import("retirement_execution.zig");
 const quantum_ns = 2 * std.time.ns_per_ms;
 
@@ -551,7 +552,9 @@ pub const Job = struct {
                 _ = runtime.lockBackend(@TypeOf(backend.*), backend);
                 i = end;
             }
-            releaseOutputsLocked(backend, outputs, false);
+            // The normal flush returns its vector and retained credit to the
+            // registered batch's prearranged cleanup handoff.
+            if (!self.controlled_append) releaseOutputsLocked(backend, outputs, false);
         }
         if (self.rebase) |rebase| {
             backend.retireCheckpointDirectory(rebase.directory);

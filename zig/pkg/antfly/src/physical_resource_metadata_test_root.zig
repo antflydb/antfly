@@ -3569,11 +3569,27 @@ const FlushPublicationFixture = struct {
                 control.live = true;
                 if (oom) failing.fail_index = start + target.?;
                 retry.call(Batch.prepareLegacyWithAdmission, .{ owners.batch.?, &backend, original }) catch |cause| break :work cause;
-                var result = retry.call(Batch.takeLegacyRunsWithAdmission, .{ owners.batch.?, original }) catch |cause| break :work cause;
+                var result = if (mode == .controlled_writer)
+                    retry.call(Batch.takeLegacyRunsForPublicationWithAdmission, .{ owners.batch.?, original }) catch |cause| break :work cause
+                else
+                    retry.call(Batch.takeLegacyRunsWithAdmission, .{ owners.batch.?, original }) catch |cause| break :work cause;
                 defer {
-                    for (result.runs.items) |*projected| projected.deinit(owned);
-                    result.runs.deinit(owned);
-                    if (result.credit) |*credit| credit.release();
+                    if (result.retirement) |retirement| {
+                        if (owners.batch) |batch| {
+                            owners.batch = null;
+                            batch.requestRetirement();
+                        }
+                        retirement.returnLegacyRuns(&result.runs, owners.installed);
+                        while (true) {
+                            var credits: usize = 1;
+                            if (retirement.stepWithAdmission(owned, &credits, null) catch unreachable) break;
+                        }
+                        retirement.finishLegacyReturn();
+                    } else {
+                        for (result.runs.items) |*projected| projected.deinit(owned);
+                        result.runs.deinit(owned);
+                        if (result.credit) |*credit| credit.release();
+                    }
                 }
                 if (mode == .controlled_writer) {
                     var candidate = backend.runs.fork();
@@ -3585,7 +3601,8 @@ const FlushPublicationFixture = struct {
                         var held = retry.call(Scope.WriterStore.OutputInsertion.takeWithAdmission, .{ &insertion, original }) catch |cause| break :work cause;
                         held.deinit(owned);
                     }
-                    for (result.runs.items) |*projected| projected.commitOutput();
+                    // The returned batch, not this publication scope, commits
+                    // tickets while retiring its loaned vector.
                     std.mem.swap(Scope.WriterStore, &backend.runs, &candidate);
                 }
                 allocations = failing.alloc_index - start;
@@ -3599,6 +3616,10 @@ const FlushPublicationFixture = struct {
                 owners.batch.?.requestRetirement();
                 owners.batch = null;
                 for (0..512) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+                if (result.retirement) |retirement| {
+                    try std.testing.expect(!retirement.registration.ready.load(.acquire));
+                    try std.testing.expect(retirement.legacy_outstanding and retirement.legacy_credit != null);
+                }
                 try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
                 var read = try backend.beginRead();
                 defer read.abort();
@@ -5933,7 +5954,7 @@ test "physical cache metadata bounded writer retirement refuses unknown producer
     try std.testing.expectEqual(@as(usize, 1), Callback.called);
 }
 
-fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry, retirement_retry, retirement_capacity, publication_directory_retry }) !void {
+fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry, retirement_retry, retirement_capacity, publication_directory_retry, output_retirement_retry, output_retirement_close, immutable_retirement_retry, immutable_retirement_close, output_retirement_preflight }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -6012,6 +6033,24 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         var refuse_cleanup: std.atomic.Value(bool) = .init(false);
         var refuse_directory: std.atomic.Value(bool) = .init(false);
         var saturate_cleanup: bool = false;
+        var vector_calls: std.atomic.Value(usize) = .init(0);
+        var refuse_vector: std.atomic.Value(bool) = .init(false);
+        var keep_vector_queued: bool = false;
+        var immutable_calls: std.atomic.Value(usize) = .init(0);
+        var refuse_immutable: std.atomic.Value(bool) = .init(false);
+        var keep_immutable_queued: bool = false;
+        fn immutable(original: read_admission.Port) !void {
+            _ = immutable_calls.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.?.owner.scheduler.stats().cleanup_runnable_slots);
+            if (keep_immutable_queued or refuse_immutable.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+        }
+        fn vector(original: read_admission.Port) !void {
+            _ = vector_calls.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.?.owner.scheduler.stats().cleanup_runnable_slots);
+            if (keep_vector_queued or refuse_vector.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+        }
         fn directory(original: read_admission.Port) !void {
             try original.checkpoint();
             if (refuse_directory.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
@@ -6063,6 +6102,14 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     Interleave.refuse_cleanup.store(mode == .retirement_retry, .release);
     Interleave.refuse_directory.store(mode == .publication_directory_retry, .release);
     Interleave.saturate_cleanup = mode == .retirement_capacity;
+    Interleave.vector_calls.store(0, .release);
+    Interleave.refuse_vector.store(mode == .output_retirement_retry, .release);
+    Interleave.keep_vector_queued = mode == .output_retirement_close or mode == .output_retirement_preflight;
+    FlushPublicationFixture.Batch.test_vector_retirement_hook = Interleave.vector;
+    Interleave.immutable_calls.store(0, .release);
+    Interleave.refuse_immutable.store(mode == .immutable_retirement_retry, .release);
+    Interleave.keep_immutable_queued = mode == .immutable_retirement_close;
+    publication.memtable_reclamation.Job.test_admission_hook = Interleave.immutable;
     publication.retirement_execution.test_hook = Interleave.cleanup;
     publication.test_directory_hook = Interleave.directory;
     publication.test_controlled_hook = Interleave.controlled;
@@ -6082,6 +6129,8 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         publication.test_controlled_hook = null;
         publication.test_directory_hook = null;
         publication.retirement_execution.test_hook = null;
+        FlushPublicationFixture.Batch.test_vector_retirement_hook = null;
+        publication.memtable_reclamation.Job.test_admission_hook = null;
         Interleave.execution = null;
     }
     const io = std.testing.io;
@@ -6221,9 +6270,18 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             const backend = handle.ptr();
             const cleanup_done = backend.retired_run_directories == null and backend.directory_reclaimer == null and
                 backend.retired_run_stores == null and backend.store_reclaimer == null and backend.retired_ledger_snapshots == null and
+                backend.retired_flush_outputs == null and !backend.flush_outputs_reclaim_in_flight and
+                backend.retired_memory_head == null and backend.memtable_reclaimer == null and !backend.memtable_reclaim_in_flight and
                 !backend.directory_reclaim_in_flight and !backend.store_reclaim_in_flight and !backend.ledger_reclaim_in_flight and !backend.maintenance_job_in_flight;
             const done = backend.activeImmutableMemtableCount() == 0 and !backend.immutable_flush_job_in_flight and
-                (if (mode == .retirement_retry or mode == .retirement_capacity or mode == .publication_directory_retry) cleanup_done else true);
+                (if (mode == .retirement_retry or mode == .retirement_capacity or mode == .publication_directory_retry or mode == .output_retirement_retry or mode == .immutable_retirement_retry)
+                    cleanup_done
+                else if (mode == .output_retirement_close or mode == .output_retirement_preflight)
+                    backend.retired_flush_outputs != null and Interleave.vector_calls.load(.acquire) != 0
+                else if (mode == .immutable_retirement_close)
+                    (backend.retired_memory_head != null or backend.memtable_reclaimer != null) and Interleave.immutable_calls.load(.acquire) != 0
+                else
+                    true);
             handle.ptr().mu.unlock();
             if (done) break;
             if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
@@ -6240,6 +6298,12 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
                 try std.testing.expectEqual(@as(u64, 2), completed.immutable_flushes);
                 try std.testing.expectEqual(completed.immutable_flushes, completed.flushes);
             }
+        }
+        if (mode == .immutable_retirement_retry or mode == .immutable_retirement_close) {
+            try std.testing.expect(Interleave.immutable_calls.load(.acquire) >= (if (mode == .immutable_retirement_retry) @as(usize, 2) else 1));
+        }
+        if (mode == .output_retirement_retry or mode == .output_retirement_close or mode == .output_retirement_preflight) {
+            try std.testing.expect(Interleave.vector_calls.load(.acquire) >= (if (mode == .output_retirement_retry) @as(usize, 2) else 1));
         }
         if (mode == .retirement_retry or mode == .retirement_capacity or mode == .publication_directory_retry) {
             try std.testing.expect(Interleave.cleanup_calls.load(.acquire) >= (if (mode == .retirement_retry) @as(usize, 2) else 1));
@@ -6261,6 +6325,23 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             const waker_stats = handle.internalFlushWorkerStats().?;
             try std.testing.expect(waker_stats.wakeups >= 2);
             try std.testing.expect(waker_stats.maintenance_steps > 0);
+        }
+        if (mode == .output_retirement_preflight) {
+            const backend = handle.ptr();
+            backend.closing.store(true, .release);
+            backend.background_executor.drain();
+            try std.testing.expectEqual(@as(u64, 0), backend.active_readers);
+            try std.testing.expect(backend.mu.tryLock());
+            backend.invalidateMutableReadSnapshot();
+            backend.mu.unlock();
+            Interleave.keep_vector_queued = false; // Every producer has joined.
+            var pass = try local.common_background_execution.Pass.initWithOptions(owner, &io, platform.time.monotonicNs() +| 200 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true });
+            defer pass.deinit();
+            var scope = try pass.admissionScope(io);
+            const payload = scope.payload();
+            var preparation: lsm.Backend.QuiescedClosePreparation = .{};
+            try preparation.resumeWithAdmission(backend, io, .init(&payload));
+            try std.testing.expect(backend.retired_flush_outputs == null);
         }
         handle.close();
         open = false;
@@ -6348,8 +6429,87 @@ test "physical cache metadata registered flush publication failed directory cand
     try normalAdmittedFlushWorker(.publication_directory_retry);
 }
 
+test "physical cache metadata registered flush publication returned vector retries cleanup admission and releases prepaid credit" {
+    try normalAdmittedFlushWorker(.output_retirement_retry);
+}
+
+test "physical cache metadata registered flush publication close joins refused output vector retirement and preserves live SSTs" {
+    try normalAdmittedFlushWorker(.output_retirement_close);
+}
+
+test "physical cache metadata registered flush publication immutable state retirement retries protected cleanup refusal" {
+    try normalAdmittedFlushWorker(.immutable_retirement_retry);
+}
+
+test "physical cache metadata registered flush publication close joins refused immutable state retirement" {
+    try normalAdmittedFlushWorker(.immutable_retirement_close);
+}
+
+test "physical cache metadata registered flush publication controlled close preparation drains pending output vector before durability" {
+    try normalAdmittedFlushWorker(.output_retirement_preflight);
+}
+
 test "physical cache metadata registered flush publication controlled writer insertion preserves ownership at allocation and original refusal" {
     const baseline = try FlushPublicationFixture.run(.controlled_writer, null, false, false);
     for ([_]usize{ 0, 1, 8, 24, 48, 96 }) |point| _ = try FlushPublicationFixture.run(.controlled_writer, point, false, true);
     for (0..baseline.allocations) |allocation| _ = try FlushPublicationFixture.run(.controlled_writer, allocation, true, true);
+}
+
+test "memtable reclamation execution rejects original once and resumes physical chunks on independent cleanup without allocation" {
+    const local = @import("antfly_local_sources");
+    const admission = read_admission;
+    const lsm = local.storage_lsm_backend_mod;
+    const state_mod = local.storage_lsm_backend_state;
+    const Control = struct {
+        calls: usize = 0,
+        reject_at: ?usize = 3,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const call = self.calls;
+            self.calls += 1;
+            if (self.reject_at == call) return error.Canceled;
+        }
+    };
+    inline for ([_]enum { tree, flat, arena }{ .tree, .flat, .arena }) |representation| {
+        const a = std.testing.allocator;
+        var backend = lsm.Backend.init(a, .{});
+        defer backend.close();
+        const state = try a.create(state_mod.State);
+        var adopted = false;
+        defer if (!adopted) a.destroy(state);
+        state.* = blk: {
+            var source: state_mod.ActiveMemTable = .{};
+            defer source.deinit(a);
+            for (0..9) |index| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, index, .big);
+                try source.upsert(a, .{}, &key, "value", false);
+            }
+            break :blk switch (representation) {
+                .tree => try source.snapshot(a),
+                .flat => try source.clone(a),
+                .arena => try source.cloneArena(a),
+            };
+        };
+        state.freezeMemoryAccounting();
+        backend.memtable_reclaimer = .init(state);
+        backend.memtable_reclaim_pending = 1;
+        adopted = true;
+        const job = &backend.memtable_reclaimer.?;
+        var exhausted = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var first: Control = .{};
+        const first_payload: admission.Payload = .{ .ptr = &first, .vtable = &.{ .checkpoint = Control.check } };
+        var credits: usize = 64;
+        try std.testing.expectError(error.Canceled, job.stepWithAdmission(exhausted.allocator(), &credits, .init(&first_payload)));
+        const rejected_calls = first.calls;
+        var cleanup: Control = .{ .reject_at = null };
+        const cleanup_payload: admission.Payload = .{ .ptr = &cleanup, .vtable = &.{ .checkpoint = Control.check } };
+        while (true) {
+            credits = 1;
+            if (try job.stepWithAdmission(exhausted.allocator(), &credits, .init(&cleanup_payload))) break;
+        }
+        try std.testing.expectEqual(rejected_calls, first.calls);
+        try std.testing.expect(cleanup.calls > 1);
+        try std.testing.expectEqual(@as(usize, 0), exhausted.alloc_index);
+    }
 }

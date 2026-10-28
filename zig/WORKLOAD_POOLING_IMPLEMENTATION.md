@@ -29928,11 +29928,31 @@ refusal after directory preparation followed by immutable retry and reopen.
 Allocation fixtures cover the prearranged ledger handoff; append-abort fixtures
 transfer partial indexes at every original checkpoint. Exclusive close joins
 queued teardown after background work and readers stop. Private ABI versions
-are native154/storage-owner214; no durable/public wire format changes.
+are native155/storage-owner215; no durable/public wire format changes.
 
-The bounded-publication milestone remains open: output-vector retirement and
-the remaining flush durability/immutable cleanup path still need execution
-integration. Existing compaction publication benefits from
+Normal publication now loans its output vector from the existing registered
+flush batch. That owner keeps the exact vector credit and allocator host until
+the backend returns the vector after publication or abort. The backend queues
+the same funded header for protected cleanup, including standalone hosts with
+no joined manager consumer. Per-run ticket commit/abandon and reference drops
+are bounded; vector capacity is poisoned in 16 KiB chunks and raw-freed once,
+without ArrayList.deinit repeating a whole-vector Debug poison. No request scope
+or publication-time allocation is needed to hand off this debt.
+
+Retired immutable/mutable State generations now use the same detached protected
+cleanup execution. Their existing tree, flat-row and arena cursors checkpoint
+between each fixed header or 16 KiB physical credit. Refusal retains the exact
+cursor and retries; foreground unlocks queue the work. Legacy backends without a
+shared scheduler preserve their existing dispatch cadence. Controlled close
+preparation drains returned vectors before seeking final persistence headroom;
+joined close discharges queued vectors and states after workers/readers stop.
+Native coverage includes both cleanup refusals, last-write progress, close with
+pending vectors/states, pinned reads and reopen. Deterministic coverage exercises
+loan ownership through allocation/original refusal and independent, allocation-free
+state cleanup for tree, flat and arena representations.
+
+The bounded-publication milestone remains open: manifest/WAL durability completion
+and remaining read-metadata/coordination work still need execution integration. Existing compaction publication benefits from
 the corrected owned-output reference transfer, but compaction construction and
 remaining metadata operations have not been enabled under shared CPU admission.
 The same publication/compaction milestone and the full design remain open.
