@@ -888,6 +888,19 @@ pub const AdmissionController = struct {
         self.shared_limits = shared_limits;
     }
 
+    /// Device discovery can happen after CPU/tokenizer leases already exist.
+    /// Enabling/tightening a physical shared cap preserves all outstanding
+    /// ownership and makes subsequent admission account for those leases.
+    pub fn tightenUnifiedLimit(self: *AdmissionController, bytes: usize) void {
+        if (bytes == 0) return;
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.shared_limits.unified_limit_bytes = if (self.shared_limits.unified_limit_bytes == 0)
+            bytes
+        else
+            @min(self.shared_limits.unified_limit_bytes, bytes);
+    }
+
     pub fn configureProcessMemoryLimit(
         self: *AdmissionController,
         limit_bytes: usize,
@@ -1047,7 +1060,7 @@ pub const AdmissionController = struct {
                 .shared_host,
                 pressure,
             );
-            if (builtin.os.tag == .macos) {
+            if (self.shared_limits.unified_limit_bytes != 0) {
                 try checkAdmissionLimitWithPressure(
                     request_combined,
                     std.math.add(
@@ -1596,6 +1609,74 @@ pub fn defaultLimitsForBackendWithProcessLimit(
         });
     }
     return staticLimitsForBackend(backend);
+}
+
+/// Discrete device capacity is not host RAM. Keep a finite driver/context
+/// reserve and leave host page cache/staging inside the process envelope.
+pub fn limitsForDiscreteDevice(host: Limits, device_bytes: usize, process_limit: usize) Limits {
+    if (device_bytes == 0) return host;
+    return discreteDeviceLimitsForCapacity(defaultSharedAdmissionLimitsWithProcessLimit(process_limit).host_limit_bytes, device_bytes);
+}
+
+fn discreteDeviceLimitsForCapacity(physical_host: usize, device_bytes: usize) Limits {
+    const reserve = @min(@max(device_bytes / 10, mib(512)), device_bytes / 2);
+    const device_limit = device_bytes -| @min(reserve, device_bytes);
+    return .{
+        .host_limit_bytes = physical_host,
+        .backend_limit_bytes = device_limit,
+        .combined_limit_bytes = physical_host +| device_limit,
+        .kv_limit_bytes = @min(gib(3), device_limit / 4),
+        .scratch_limit_bytes = @min(gib(2), device_limit / 8),
+    };
+}
+
+/// Model tuning floors and operator overrides cannot create physical memory.
+/// Apply this after either kind of workload-policy adjustment.
+pub fn clampDiscreteDeviceLimits(limits: Limits, device_bytes: usize, process_limit: usize) Limits {
+    if (device_bytes == 0) return limits;
+    const physical = limitsForDiscreteDevice(limits, device_bytes, process_limit);
+    var out = limits;
+    out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, physical.host_limit_bytes);
+    out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, physical.backend_limit_bytes);
+    out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, out.host_limit_bytes +| out.backend_limit_bytes);
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.backend_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.backend_limit_bytes);
+    return out;
+}
+
+/// Integrated CUDA and unified-memory accelerators share one physical pool.
+pub fn clampUnifiedDeviceLimits(limits: Limits, shared_bytes: usize) Limits {
+    var out = limits;
+    out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, shared_bytes);
+    out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, shared_bytes);
+    out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, shared_bytes);
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.backend_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.backend_limit_bytes);
+    return out;
+}
+
+test "discrete device budgets retain a shared envelope for integrated CUDA" {
+    const discrete = discreteDeviceLimitsForCapacity(gib(14), gib(24));
+    const unified = clampUnifiedDeviceLimits(discrete, gib(14));
+    try std.testing.expectEqual(gib(14), unified.combined_limit_bytes);
+    try std.testing.expect(unified.backend_limit_bytes <= gib(14));
+    try std.testing.expectEqual(discrete.host_limit_bytes, unified.host_limit_bytes);
+    try std.testing.expect(discrete.combined_limit_bytes > unified.combined_limit_bytes);
+    try std.testing.expect(discreteDeviceLimitsForCapacity(gib(1), 1).backend_limit_bytes > 0);
+}
+
+test "discrete device budgets use VRAM independently of host allocation" {
+    const small = discreteDeviceLimitsForCapacity(gib(14), gib(24));
+    const large = discreteDeviceLimitsForCapacity(gib(28), gib(24));
+    try std.testing.expectEqual(small.backend_limit_bytes, large.backend_limit_bytes);
+    try std.testing.expect(small.backend_limit_bytes > 20_426_896_206);
+    try std.testing.expect(small.backend_limit_bytes < gib(24));
+    try std.testing.expect(small.host_limit_bytes < large.host_limit_bytes);
+    const clamped = clampDiscreteDeviceLimits(.{ .host_limit_bytes = gib(100), .backend_limit_bytes = gib(100), .combined_limit_bytes = gib(200), .kv_limit_bytes = gib(100), .scratch_limit_bytes = gib(100) }, gib(24), gib(14));
+    try std.testing.expectEqual(defaultSharedAdmissionLimitsWithProcessLimit(gib(14)).host_limit_bytes, clamped.host_limit_bytes);
+    try std.testing.expectEqual(small.backend_limit_bytes, clamped.backend_limit_bytes);
+    const tighter = applyLimitOverrides(small, .{ .backend_limit_bytes = gib(4) });
+    try std.testing.expectEqual(gib(4), clampDiscreteDeviceLimits(tighter, gib(24), gib(14)).backend_limit_bytes);
 }
 
 /// Derive one stable physical-memory policy for the process. Backend-local
@@ -3765,9 +3846,19 @@ test "settled live residency remains committed during pressure epoch" {
     try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
 }
 
-test "metal backend bytes share the unified system-memory domain" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+test "unified device discovery preserves existing leases and never loosens capacity" {
+    var controller = AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 1000 });
+    var gpu = try controller.tryAcquire(.gpu, .{ .backend_limit_bytes = 100, .combined_limit_bytes = 100 }, .{ .backend_weight_bytes = 60 }, false);
+    defer gpu.release();
+    controller.tightenUnifiedLimit(80);
+    controller.tightenUnifiedLimit(200);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, .{ .host_limit_bytes = 100, .combined_limit_bytes = 100 }, .{ .host_weight_bytes = 21 }, false));
+    var cpu = try controller.tryAcquire(.cpu, .{ .host_limit_bytes = 100, .combined_limit_bytes = 100 }, .{ .host_weight_bytes = 20 }, false);
+    defer cpu.release();
+}
 
+test "unified device and CPU bytes share one system-memory domain" {
     var controller = AdmissionController{};
     controller.configureSharedLimits(.{
         .host_limit_bytes = 1000,
@@ -4504,4 +4595,17 @@ test "embeddinggemma2 live retained admission cannot credit a later kernel sampl
     const capacity = controller.live_capacity_bytes;
     lease.release();
     try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+}
+
+test "physical memory clamping bounds unspecified unlimited domains" {
+    const limits = clampDiscreteDeviceLimits(.{}, gib(24), gib(16));
+    try std.testing.expect(limits.backend_limit_bytes > 0 and limits.backend_limit_bytes < gib(24));
+    try std.testing.expect(limits.host_limit_bytes > 0);
+    try std.testing.expect(limits.combined_limit_bytes > 0);
+    var controller = AdmissionController{};
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = gib(25) }, false));
+    const unified = clampUnifiedDeviceLimits(.{}, gib(16));
+    try std.testing.expectEqual(gib(16), unified.combined_limit_bytes);
+    const tighter = clampDiscreteDeviceLimits(.{ .backend_limit_bytes = gib(4) }, gib(24), gib(16));
+    try std.testing.expectEqual(gib(4), tighter.backend_limit_bytes);
 }

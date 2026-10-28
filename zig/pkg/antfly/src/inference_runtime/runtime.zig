@@ -74,6 +74,7 @@ const EmbeddedServerConfig = struct {
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
+    resources: platform.resource_policy.Resources = .{},
     process_memory_limit_bytes: usize = 0,
     process_memory_limit_provenance: inference.runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     preload: []const inference.server.WarmModel = &.{},
@@ -93,11 +94,11 @@ fn inferenceProcessMemoryLimitProvenance(
 }
 
 const BudgetOverridesMb = struct {
-    host_budget_mb: usize = 0,
-    backend_budget_mb: usize = 0,
-    combined_budget_mb: usize = 0,
-    kv_budget_mb: usize = 0,
-    scratch_budget_mb: usize = 0,
+    host_budget_mb: ?usize = null,
+    backend_budget_mb: ?usize = null,
+    combined_budget_mb: ?usize = null,
+    kv_budget_mb: ?usize = null,
+    scratch_budget_mb: ?usize = null,
 };
 
 pub const parseBackendType = inference.backends.BackendType.parse;
@@ -118,8 +119,7 @@ fn kernelJitModeFromConfig(mode: common_config.Config.InferenceConfig.KernelJitC
 
 // Precedence, field by field: CLI flag, then (mode only) the
 // ANTFLY_INFERENCE_KERNEL_JIT_MODE env var, then the `--config` file's
-// `kernel_jit` (nested `inference.kernel_jit` or the operator's flat
-// top-level spelling; nested wins), then the hardcoded default. When no
+// nested `inference.kernel_jit`, then the hardcoded default. When no
 // config was loaded, `config_kernel_jit` is the zero-value default, which
 // already matches `inference.graph.kernel_jit.Config{}`'s own defaults, so
 // that tier is a no-op.
@@ -164,7 +164,7 @@ fn promptCacheFromConfig(cfg: common_config.Config.InferenceConfig.PromptCacheCo
 
 // `antfly inference run`'s own default prompt cache is enabled; only follow
 // the config file's `prompt_cache` (which itself defaults `enabled` to false
-// once present) when the key was actually configured, nested or flat.
+// once present) when the key was actually configured.
 fn resolveRunPromptCache(config: ?*const common_config.Config) inference.server.PromptCacheConfig {
     const cfg = config orelse return .{};
     if (!cfg.inference.prompt_cache_configured) return .{};
@@ -173,53 +173,12 @@ fn resolveRunPromptCache(config: ?*const common_config.Config) inference.server.
 
 const default_run_keep_alive_ms: u64 = 300_000;
 
-// Mirrors zig/pkg/inference/src/host/host.zig's parseKeepAliveMs.
-// Duplicated rather than imported: standalone already depends on
-// inference_runtime for path helpers, so importing standalone code back here
-// would create a module cycle.
-fn parseRunKeepAliveMs(raw: []const u8) !u64 {
-    if (std.mem.eql(u8, raw, "0")) return 0;
-    if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
-    var i: usize = 0;
-    var total_ns: u64 = 0;
-    while (i < raw.len) {
-        const start = i;
-        while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
-        if (i == start) return error.InvalidInferenceModelCacheConfig;
-        const value = std.fmt.parseUnsigned(u64, raw[start..i], 10) catch
-            return error.InvalidInferenceModelCacheConfig;
-        const unit_ns: u64 = if (std.mem.startsWith(u8, raw[i..], "ms")) blk: {
-            i += 2;
-            break :blk std.time.ns_per_ms;
-        } else if (i < raw.len and raw[i] == 's') blk: {
-            i += 1;
-            break :blk std.time.ns_per_s;
-        } else if (i < raw.len and raw[i] == 'm') blk: {
-            i += 1;
-            break :blk std.time.ns_per_min;
-        } else if (i < raw.len and raw[i] == 'h') blk: {
-            i += 1;
-            break :blk std.time.ns_per_hour;
-        } else return error.InvalidInferenceModelCacheConfig;
-        const part_ns = std.math.mul(u64, value, unit_ns) catch
-            return error.InvalidInferenceModelCacheConfig;
-        total_ns = std.math.add(u64, total_ns, part_ns) catch
-            return error.InvalidInferenceModelCacheConfig;
-    }
-    if (total_ns == 0) return 0;
-    return @max(@as(u64, 1), total_ns / std.time.ns_per_ms);
-}
+const parseRunKeepAliveMs = platform.inference_settings.parseKeepAliveMs;
 
-// Precedence: the config file's `keep_alive` duration string (nested or
-// flat, nested wins) wins over `keep_alive_ms` (nested or flat, nested
-// wins) when both are set anywhere in the merged config, because it already
-// has a well-tested parser shared with `antfly standalone`. Falls back to
-// the run server's built-in default (matches `inference.server.NodeConfig`'s
-// own `keep_alive_ms` default) when neither is set.
+// Use the shared duration contract, or the server default when omitted.
 fn resolveRunKeepAliveMs(config: ?*const common_config.Config) !u64 {
     const cfg = config orelse return default_run_keep_alive_ms;
     if (cfg.inference.keep_alive) |value| return try parseRunKeepAliveMs(value);
-    if (cfg.inference.keep_alive_ms) |value| return value;
     return default_run_keep_alive_ms;
 }
 
@@ -369,14 +328,12 @@ fn runHelpRequested(args: *std.process.Args.Iterator) bool {
 
 fn resolveRunMaxConcurrentRequests(cli: ?u32, cfg: ?*const common_config.Config) usize {
     return @intCast(cli orelse if (cfg) |config|
-        config.admission.inference.max_concurrent_requests
+        config.resources.inference.admission.max_concurrent_requests
     else
         common_config.default_inference_max_concurrent_requests);
 }
 
-// Standalone inference historically receives flat model settings from the
-// operator. Normalize those into the canonical inference object before using
-// the shared parser; explicit nested settings take precedence field by field.
+// Standalone serving uses the same resources and inference sections as the DB.
 fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Config {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -389,35 +346,13 @@ fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Conf
         .object => value.object,
         else => return error.InvalidConfig,
     } else std.json.ObjectMap{};
-    for ([_][]const u8{
-        "models_dir",
-        "ml_dir",
-        "max_loaded_models",
-        "preload",
-        "keep_alive",
-        "keep_alive_ms",
-        "prompt_cache",
-        "kernel_jit",
-    }) |key| {
-        if (!model_config.contains(key)) {
-            if (root.get(key)) |value| try model_config.put(scratch, key, value);
-        }
-    }
-    // `keep_alive_ms` (operator-emitted integer milliseconds) is not part of
-    // the shared openapi inference schema, so it survives the parse below
-    // only as an unrecognized field. Read the merged (nested-wins-over-flat)
-    // value here and thread it onto the config by hand. Track whether
-    // `prompt_cache` was configured at all so the caller can preserve
-    // `antfly inference run`'s enabled-by-default behavior when it is absent.
-    const keep_alive_ms_value = model_config.get("keep_alive_ms");
+    platform.inference_settings.validateCanonicalLocations(root.*) catch return error.InvalidConfig;
     const prompt_cache_configured = model_config.contains("prompt_cache");
-    // The shared schema requires a client API URL, which is not needed when
-    // starting this local server. Model artifact tags also have a wider CLI
-    // vocabulary than the shared schema enum (e.g. Q4_K_M). Reuse the raw
+    // Model artifact tags have a wider CLI vocabulary than the shared
+    // schema enum (e.g. Q4_K_M). Reuse the raw
     // preload parser so those tags retain their exact spelling.
     const preload_value = model_config.fetchSwapRemove("preload");
     if (root.contains("inference") or model_config.count() > 0 or preload_value != null) {
-        if (!model_config.contains("api_url")) try model_config.put(scratch, "api_url", .{ .string = "" });
         try root.put(scratch, "inference", .{ .object = model_config });
     }
     const normalized = try std.json.Stringify.valueAlloc(scratch, parsed.value, .{});
@@ -429,12 +364,6 @@ fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Conf
         config.inference.preload = try common_config.parseInferencePreloadModels(alloc, .{ .object = preload_object });
     }
     for (config.inference.preload) |*model| try normalizeRunPreloadName(alloc, model);
-    if (keep_alive_ms_value) |value| {
-        config.inference.keep_alive_ms = switch (value) {
-            .integer => |i| std.math.cast(u64, i) orelse return error.InvalidConfig,
-            else => return error.InvalidConfig,
-        };
-    }
     config.inference.prompt_cache_configured = prompt_cache_configured;
     return config;
 }
@@ -586,6 +515,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var model_overrides = RunModelOverrides{};
     var config_path: ?[]const u8 = null;
     var max_concurrent_requests_override: ?u32 = null;
+    var max_work_units_override: ?u32 = null;
     var process_memory_budget_mb_override: ?usize = null;
     var budget_overrides_mb = BudgetOverridesMb{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
@@ -623,6 +553,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
                 args.next() orelse return error.InvalidArguments,
                 10,
             );
+        } else if (std.mem.eql(u8, arg, "--max-work-units")) {
+            max_work_units_override = try std.fmt.parseInt(u32, args.next() orelse return error.InvalidArguments, 10);
         } else if (std.mem.eql(u8, arg, "--process-memory-budget-mb") or
             std.mem.eql(u8, arg, "--inference-process-memory-budget-mb"))
         {
@@ -667,7 +599,10 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var loaded_config: ?common_config.Config = if (config_path) |path| blk: {
         const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
         defer alloc.free(raw);
-        break :blk try parseRunConfig(alloc, raw);
+        break :blk parseRunConfig(alloc, raw) catch |err| {
+            platform.inference_settings.diagnoseInvalidConfig(alloc, raw);
+            return err;
+        };
     } else null;
     defer if (loaded_config) |*config| config.deinit();
     model_overrides.preload = preload_models.items;
@@ -675,14 +610,22 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     defer alloc.free(model_settings.preload);
     const models_dir = model_settings.models_dir orelse defaultModelsDir(alloc);
     const ml_dir = model_settings.ml_dir orelse defaultMlDir(alloc);
+    var resource_policy = if (loaded_config) |config| config.resources else platform.resource_policy.Resources{};
+    if (max_work_units_override) |value| resource_policy.inference.admission.max_work_units = value;
+    if (budget_overrides_mb.host_budget_mb) |value| resource_policy.inference.memory.max_host_bytes = try std.math.mul(usize, value, 1024 * 1024);
+    if (budget_overrides_mb.backend_budget_mb) |value| resource_policy.inference.memory.max_device_bytes = try std.math.mul(usize, value, 1024 * 1024);
+    if (budget_overrides_mb.combined_budget_mb) |value| resource_policy.inference.memory.max_combined_bytes = try std.math.mul(usize, value, 1024 * 1024);
+    if (budget_overrides_mb.kv_budget_mb) |value| resource_policy.inference.memory.max_kv_bytes = try std.math.mul(usize, value, 1024 * 1024);
+    if (budget_overrides_mb.scratch_budget_mb) |value| resource_policy.inference.memory.max_scratch_bytes = try std.math.mul(usize, value, 1024 * 1024);
     const max_concurrent_requests = resolveRunMaxConcurrentRequests(
         max_concurrent_requests_override,
         if (loaded_config) |*config| config else null,
     );
-    const process_memory_resolution = try process_memory_budget.resolveSystemDetailed(
+    const process_memory_resolution = try process_memory_budget.resolveSystemWithConfig(
         process_memory_budget_mb_override,
         platform.env.getenv(process_memory_budget.canonical_env),
         platform.env.getenv(process_memory_budget.inference_compat_env),
+        if (loaded_config) |config| config.resources.memory.max_bytes else 0,
     );
 
     const kernel_jit = try resolveKernelJitConfig(
@@ -721,7 +664,12 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .ml_dir = ml_dir,
         .max_loaded_models = model_settings.max_loaded_models,
         .max_concurrent_requests = max_concurrent_requests,
-        .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
+        .generation_budget_overrides = resource_policy.inference.memory.limits(inference.server.BudgetOverrides),
+        .generation_batching = inference.server.GenerationBatchingConfig.fromSettings(if (loaded_config) |cfg| cfg.inference.generation_batching else .{}),
+        .max_work_units = resource_policy.inference.admission.workCapacity(),
+        .request_limits = resource_policy.inference.request_limits,
+        .http_max_body_bytes = try inference.server.httpBodyLimitBytesFromMib(if (loaded_config) |cfg| cfg.inference.http_max_body_mb else 10),
+        .pool_size = if (loaded_config) |cfg| cfg.inference.pool_size else 2,
         .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
         .process_memory_limit_provenance = inferenceProcessMemoryLimitProvenance(
             process_memory_resolution.effective_source,
@@ -836,6 +784,14 @@ pub fn spawnServerProcess(
         .allow_insecure_public_bind = config.allow_insecure_public_bind,
         .allow_unknown_models = config.allow_unknown_models,
     };
+    try config.resources.validate();
+    node_cfg.max_work_units = config.resources.inference.admission.workCapacity();
+    node_cfg.request_limits = config.resources.inference.request_limits;
+    const configured_limits = config.resources.inference.memory.limits(inference.runtime.tier.memory.Limits);
+    inline for (comptime std.meta.fieldNames(inference.runtime.tier.memory.Limits)) |field| {
+        if (@field(node_cfg.generation_budget_overrides, field) == 0)
+            @field(node_cfg.generation_budget_overrides, field) = @field(configured_limits, field);
+    }
     if (config.content_security) |sec| node_cfg.content_security = sec;
     if (config.s3_credentials) |creds| node_cfg.s3_credentials = creds;
 
@@ -1125,20 +1081,6 @@ fn parseBudgetMbArg(args: *std.process.Args.Iterator) !usize {
     return std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
 }
 
-fn budgetOverridesFromMb(overrides: BudgetOverridesMb) ServerBudgetOverrides {
-    return .{
-        .host_limit_bytes = mbToBytes(overrides.host_budget_mb),
-        .backend_limit_bytes = mbToBytes(overrides.backend_budget_mb),
-        .combined_limit_bytes = mbToBytes(overrides.combined_budget_mb),
-        .kv_limit_bytes = mbToBytes(overrides.kv_budget_mb),
-        .scratch_limit_bytes = mbToBytes(overrides.scratch_budget_mb),
-    };
-}
-
-fn mbToBytes(value: usize) usize {
-    return value * 1024 * 1024;
-}
-
 fn parseHostPort(base_uri: []const u8) !struct { host: []const u8, port: u16 } {
     const scheme_pos = std.mem.indexOf(u8, base_uri, "://") orelse return error.InvalidArguments;
     const host_port = base_uri[scheme_pos + 3 ..];
@@ -1190,8 +1132,9 @@ fn printUsage() void {
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>     Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --max-loaded-models <n> Maximum resident models; 0 disables the count limit (default: 10)
-        \\  --config <path>     Load admission and inference model settings (CLI flags override config)
-        \\  --max-concurrent-requests <n> Override admission.inference.max_concurrent_requests; 0 disables it
+        \\  --config <path>     Load resources and inference model settings (CLI flags override config)
+        \\  --max-concurrent-requests <n> Override resources.inference.admission.max_concurrent_requests; 0 disables it
+        \\  --max-work-units <n> Override weighted inference work/media capacity independently
         \\  --process-memory-budget-mb <n> Whole-process host-memory envelope; 0 selects cgroup/host detection
         \\  --inference-process-memory-budget-mb <n> Compatibility alias for --process-memory-budget-mb
         \\  --host-budget-mb <n>      Native generation host budget override
@@ -1226,10 +1169,10 @@ test "inference runtime module compiles" {
     _ = spawnServerProcess;
 }
 
-test "inference run config resolves flat operator and canonical model settings" {
+test "inference run config resolves canonical model settings" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{
-        \\{"models_dir":"/models","ml_dir":"/ml","max_loaded_models":0,"preload":[{"kind":"embedder","name":"owner/model:gguf:Q4_K","backend":"native","format":"gguf","quantization":"Q4_K"}]}
+        \\{"inference":{"models_dir":"/models","ml_dir":"/ml","preload":[{"kind":"embedder","name":"owner/model:gguf:Q4_K","backend":"native","format":"gguf","quantization":"Q4_K"}],"max_loaded_models":0}}
         ,
         \\{"inference":{"models_dir":"/models","ml_dir":"/ml","max_loaded_models":0,"preload":[{"kind":"embedder","name":"owner/model:gguf:Q4_K","backend":"native","format":"gguf","quantization":"Q4_K"}]}}
         ,
@@ -1264,10 +1207,10 @@ test "inference run config preserves CUDA precision across CLI model selection" 
     try std.testing.expectEqual(.fp32, settings.preload[0].cuda_precision.?);
 }
 
-test "inference run config CLI overrides nested config which overrides flat fields" {
+test "inference run config CLI overrides canonical settings" {
     const alloc = std.testing.allocator;
     var config = try parseRunConfig(alloc,
-        \\{"models_dir":"/flat","ml_dir":"/flat-ml","max_loaded_models":8,"preload":[{"kind":"embedder","name":"flat/model"}],"inference":{"models_dir":"/nested","max_loaded_models":3,"preload":[]},"admission":{"inference":{"max_concurrent_requests":7}}}
+        \\{"inference":{"models_dir":"/nested","max_loaded_models":3,"preload":[],"ml_dir":"/flat-ml"},"resources":{"inference":{"admission":{"max_concurrent_requests":7}}}}
     );
     defer config.deinit();
     const nested = try resolveRunModelSettings(alloc, &config, .{});
@@ -1301,11 +1244,11 @@ test "inference run config selects explicit artifacts and rejects conflicting re
     defer alloc.free(settings.preload);
     try std.testing.expectEqualStrings("owner/model:gguf:Q4_K", settings.preload[0].name);
     for ([_][]const u8{
-        \\{"preload":[{"kind":"generator","name":"owner/model:gguf:Q8_0","format":"gguf","quantization":"Q4_K"}]}
+        \\{"inference":{"preload":[{"kind":"generator","name":"owner/model:gguf:Q8_0","format":"gguf","quantization":"Q4_K"}]}}
         ,
-        \\{"preload":[{"kind":"generator","name":"owner/model","quantization":"Q4_K"}]}
+        \\{"inference":{"preload":[{"kind":"generator","name":"owner/model","quantization":"Q4_K"}]}}
         ,
-        \\{"preload":[{"kind":"generator","name":"owner/model:i8","format":"gguf"}]}
+        \\{"inference":{"preload":[{"kind":"generator","name":"owner/model:i8","format":"gguf"}]}}
         ,
     }) |raw| {
         try std.testing.expectError(error.InvalidConfig, parseRunConfig(alloc, raw));
@@ -1315,7 +1258,7 @@ test "inference run config selects explicit artifacts and rejects conflicting re
 test "inference run config retains policies only for matching CLI preload identities" {
     const alloc = std.testing.allocator;
     var config = try parseRunConfig(alloc,
-        \\{"preload":[{"kind":"generator","name":"hf:owner/model","backend":"cuda","format":"gguf","quantization":"Q4_K","residency_mode":"streamed","memory_budget_mb":4096},{"kind":"embedder","name":"config/only"}]}
+        \\{"inference":{"preload":[{"kind":"generator","name":"hf:owner/model","backend":"cuda","format":"gguf","quantization":"Q4_K","residency_mode":"streamed","memory_budget_mb":4096},{"kind":"embedder","name":"config/only"}]}}
     );
     defer config.deinit();
     const settings = try resolveRunModelSettings(alloc, &config, .{ .preload = &.{
@@ -1342,7 +1285,7 @@ test "inference run config retains policies only for matching CLI preload identi
 test "inference run config rejects ambiguous CLI policy matches" {
     const alloc = std.testing.allocator;
     var config = try parseRunConfig(alloc,
-        \\{"preload":[{"kind":"generator","name":"owner/model","backend":"cuda","memory_budget_mb":4096},{"kind":"generator","name":"owner/model","backend":"cuda","memory_budget_mb":8192}]}
+        \\{"inference":{"preload":[{"kind":"generator","name":"owner/model","backend":"cuda","memory_budget_mb":4096},{"kind":"generator","name":"owner/model","backend":"cuda","memory_budget_mb":8192}]}}
     );
     defer config.deinit();
     try std.testing.expectError(error.AmbiguousPreloadModelConfig, resolveRunModelSettings(alloc, &config, .{
@@ -1364,16 +1307,16 @@ test "inference run config defaults and invalid model policies" {
     defer alloc.free(empty_settings.preload);
     try std.testing.expectEqual(@as(usize, 10), empty_settings.max_loaded_models);
     try std.testing.expectError(error.InvalidConfig, parseRunConfig(alloc,
-        \\{"preload":[{"kind":"embedder"}]}
+        \\{"inference":{"preload":[{"kind":"embedder"}]}}
     ));
     for ([_][]const u8{
-        \\{"max_loaded_models":-1}
+        \\{"inference":{"max_loaded_models":-1}}
         ,
-        \\{"models_dir":""}
+        \\{"inference":{"models_dir":""}}
         ,
-        \\{"preload":[{"kind":"bogus","name":"owner/model"}]}
+        \\{"inference":{"preload":[{"kind":"bogus","name":"owner/model"}]}}
         ,
-        \\{"preload":[{"kind":"embedder","name":"owner/model","backend":"bogus"}]}
+        \\{"inference":{"preload":[{"kind":"embedder","name":"owner/model","backend":"bogus"}]}}
         ,
     }) |raw| {
         var config = parseRunConfig(alloc, raw) catch continue;
@@ -1385,57 +1328,24 @@ test "inference run config defaults and invalid model policies" {
     }
 }
 
-test "inference run config keep_alive_ms accepts nested and flat spellings, nested wins" {
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{
-        \\{"keep_alive_ms":60000}
-        ,
-        \\{"inference":{"keep_alive_ms":60000}}
-        ,
-    }) |raw| {
-        var config = try parseRunConfig(alloc, raw);
-        defer config.deinit();
-        try std.testing.expectEqual(@as(?u64, 60_000), config.inference.keep_alive_ms);
-        try std.testing.expectEqual(@as(u64, 60_000), try resolveRunKeepAliveMs(&config));
-    }
-
-    var nested_wins = try parseRunConfig(alloc,
-        \\{"keep_alive_ms":60000,"inference":{"keep_alive_ms":5000}}
-    );
-    defer nested_wins.deinit();
-    try std.testing.expectEqual(@as(?u64, 5_000), nested_wins.inference.keep_alive_ms);
-}
-
-test "inference run config keep_alive duration string wins over keep_alive_ms when both are set" {
-    const alloc = std.testing.allocator;
-    var config = try parseRunConfig(alloc,
-        \\{"inference":{"keep_alive":"90s","keep_alive_ms":5000}}
+test "inference run config shares canonical execution settings" {
+    var config = try parseRunConfig(std.testing.allocator,
+        \\{"inference":{"keep_alive":"90s","generation_batching":{"mode":"on","max_step_query_tokens":123}}}
     );
     defer config.deinit();
-    try std.testing.expectEqualStrings("90s", config.inference.keep_alive.?);
-    try std.testing.expectEqual(@as(?u64, 5_000), config.inference.keep_alive_ms);
-    try std.testing.expectEqual(@as(u64, 90_000), try resolveRunKeepAliveMs(&config));
-}
-
-test "inference run config keep_alive_ms rejects non-integer values" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidConfig, parseRunConfig(alloc,
-        \\{"keep_alive_ms":"5m"}
+    try std.testing.expectEqual(@as(u64, 90000), try resolveRunKeepAliveMs(&config));
+    const batching = inference.server.GenerationBatchingConfig.fromSettings(config.inference.generation_batching);
+    try std.testing.expectEqual(.on, batching.mode);
+    try std.testing.expectEqual(@as(usize, 123), batching.max_step_query_tokens);
+    try std.testing.expectError(error.InvalidConfig, parseRunConfig(std.testing.allocator,
+        \\{"inference":{"keep_alive_ms":5000}}
     ));
-    try std.testing.expectError(error.InvalidConfig, parseRunConfig(alloc,
-        \\{"keep_alive_ms":-1}
-    ));
+    var zero = try parseRunConfig(std.testing.allocator, "{\"inference\":{\"keep_alive\":\"0\"}}");
+    defer zero.deinit();
+    try std.testing.expectEqual(@as(u64, 0), try resolveRunKeepAliveMs(&zero));
 }
 
-test "inference run config defaults keep_alive_ms to the run server default when absent" {
-    try std.testing.expectEqual(@as(u64, 300_000), try resolveRunKeepAliveMs(null));
-    const alloc = std.testing.allocator;
-    var empty_config = try parseRunConfig(alloc, "{}");
-    defer empty_config.deinit();
-    try std.testing.expectEqual(@as(u64, 300_000), try resolveRunKeepAliveMs(&empty_config));
-}
-
-test "inference run config prompt_cache accepts nested and flat spellings, nested wins, and stays enabled by default" {
+test "inference run config reads canonical prompt_cache and stays enabled by default" {
     const alloc = std.testing.allocator;
     try std.testing.expect(resolveRunPromptCache(null).enabled);
     var absent_config = try parseRunConfig(alloc, "{}");
@@ -1444,7 +1354,7 @@ test "inference run config prompt_cache accepts nested and flat spellings, neste
     try std.testing.expect(resolveRunPromptCache(&absent_config).enabled);
 
     for ([_][]const u8{
-        \\{"prompt_cache":{"enabled":false,"mode":"radix","max_bytes_mb":128,"min_tokens":16,"ttl_ms":9000}}
+        \\{"inference":{"prompt_cache":{"enabled":false,"mode":"radix","max_bytes_mb":128,"min_tokens":16,"ttl_ms":9000}}}
         ,
         \\{"inference":{"prompt_cache":{"enabled":false,"mode":"radix","max_bytes_mb":128,"min_tokens":16,"ttl_ms":9000}}}
         ,
@@ -1460,16 +1370,16 @@ test "inference run config prompt_cache accepts nested and flat spellings, neste
     }
 
     var nested_wins = try parseRunConfig(alloc,
-        \\{"prompt_cache":{"enabled":false},"inference":{"prompt_cache":{"enabled":true}}}
+        \\{"inference":{"prompt_cache":{"enabled":true}}}
     );
     defer nested_wins.deinit();
     try std.testing.expect(resolveRunPromptCache(&nested_wins).enabled);
 }
 
-test "inference run config kernel_jit accepts nested and flat spellings, nested wins" {
+test "inference run config reads canonical kernel_jit" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{
-        \\{"kernel_jit":{"mode":"on","cache_dir":"/tmp/flat-jit","max_cache_bytes_mb":64,"preload_budget_ms":5000}}
+        \\{"inference":{"kernel_jit":{"mode":"on","cache_dir":"/tmp/flat-jit","max_cache_bytes_mb":64,"preload_budget_ms":5000}}}
         ,
         \\{"inference":{"kernel_jit":{"mode":"on","cache_dir":"/tmp/flat-jit","max_cache_bytes_mb":64,"preload_budget_ms":5000}}}
         ,
@@ -1485,16 +1395,16 @@ test "inference run config kernel_jit accepts nested and flat spellings, nested 
     }
 
     var nested_wins = try parseRunConfig(alloc,
-        \\{"kernel_jit":{"mode":"shadow"},"inference":{"kernel_jit":{"mode":"required"}}}
+        \\{"inference":{"kernel_jit":{"mode":"required"}}}
     );
     defer nested_wins.deinit();
     try std.testing.expectEqual(common_config.Config.InferenceConfig.KernelJitConfig.Mode.required, nested_wins.inference.kernel_jit.mode);
 }
 
-test "inference run config CLI kernel_jit and keep_alive_ms flags override config regardless of argument order" {
+test "inference run config CLI kernel_jit flags override config regardless of argument order" {
     const alloc = std.testing.allocator;
     var config = try parseRunConfig(alloc,
-        \\{"kernel_jit":{"mode":"on"},"keep_alive_ms":5000}
+        \\{"inference":{"keep_alive":"5s","kernel_jit":{"mode":"on"}}}
     );
     defer config.deinit();
 
@@ -1502,7 +1412,7 @@ test "inference run config CLI kernel_jit and keep_alive_ms flags override confi
     const cli_over_config = try resolveKernelJitConfig(null, .off, null, null, null, config.inference.kernel_jit);
     try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, cli_over_config.mode);
 
-    // There is no CLI flag for keep_alive/keep_alive_ms on `antfly inference
+    // There is no CLI flag for keep_alive on `antfly inference
     // run` today; the config value is used as-is regardless of where
     // `--config` appears among other flags.
     try std.testing.expectEqual(@as(u64, 5_000), try resolveRunKeepAliveMs(&config));
@@ -1690,7 +1600,7 @@ test "inference run rejects unknown flags instead of silently disabling policy" 
 
 test "inference run admission uses config with CLI precedence" {
     var cfg = try common_config.Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"inference":{"max_concurrent_requests":11}}}
+        \\{"resources":{"inference":{"admission":{"max_concurrent_requests":11}}}}
     );
     defer cfg.deinit();
     try std.testing.expectEqual(@as(usize, 11), resolveRunMaxConcurrentRequests(null, &cfg));

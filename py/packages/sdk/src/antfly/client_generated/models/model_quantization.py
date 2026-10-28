@@ -1,11 +1,10 @@
 from enum import StrEnum
 
 
-class InferenceModelRefCudaPrecision(StrEnum):
-    AUTO = "auto"
-    BF16 = "bf16"
+class ModelQuantization(StrEnum):
     FP16 = "fp16"
-    FP32 = "fp32"
+    Q4_K = "q4_k"
+    Q8 = "q8"
 
     def __str__(self) -> str:
         return str(self.value)

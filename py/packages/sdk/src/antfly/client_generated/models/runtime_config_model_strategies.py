@@ -6,15 +6,13 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.inference_runtime_config_model_strategies_additional_property import (
-    InferenceRuntimeConfigModelStrategiesAdditionalProperty,
-)
+from ..models.runtime_config_model_strategies_additional_property import RuntimeConfigModelStrategiesAdditionalProperty
 
-T = TypeVar("T", bound="InferenceRuntimeConfigModelStrategies")
+T = TypeVar("T", bound="RuntimeConfigModelStrategies")
 
 
 @_attrs_define
-class InferenceRuntimeConfigModelStrategies:
+class RuntimeConfigModelStrategies:
     """Per-model loading strategy overrides. Maps model names to their loading strategy.
     Models not in this map load on demand. keep_alive controls their idle
     eviction; setting it to "0" disables idle eviction but does not preload or pin them.
@@ -30,7 +28,7 @@ class InferenceRuntimeConfigModelStrategies:
 
     """
 
-    additional_properties: dict[str, InferenceRuntimeConfigModelStrategiesAdditionalProperty] = _attrs_field(
+    additional_properties: dict[str, RuntimeConfigModelStrategiesAdditionalProperty] = _attrs_field(
         init=False, factory=dict
     )
 
@@ -45,25 +43,25 @@ class InferenceRuntimeConfigModelStrategies:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        inference_runtime_config_model_strategies = cls()
+        runtime_config_model_strategies = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
-            additional_property = InferenceRuntimeConfigModelStrategiesAdditionalProperty(prop_dict)
+            additional_property = RuntimeConfigModelStrategiesAdditionalProperty(prop_dict)
 
             additional_properties[prop_name] = additional_property
 
-        inference_runtime_config_model_strategies.additional_properties = additional_properties
-        return inference_runtime_config_model_strategies
+        runtime_config_model_strategies.additional_properties = additional_properties
+        return runtime_config_model_strategies
 
     @property
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> InferenceRuntimeConfigModelStrategiesAdditionalProperty:
+    def __getitem__(self, key: str) -> RuntimeConfigModelStrategiesAdditionalProperty:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: InferenceRuntimeConfigModelStrategiesAdditionalProperty) -> None:
+    def __setitem__(self, key: str, value: RuntimeConfigModelStrategiesAdditionalProperty) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:
