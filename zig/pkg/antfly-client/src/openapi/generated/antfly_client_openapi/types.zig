@@ -3,6 +3,35 @@
 
 const std = @import("std");
 
+/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On Metal, `auto` chooses full residency only when the complete expert set and safety reserves fit the configured budget; otherwise it uses bounded streaming. On the qualified SM89 CUDA lane, `auto` resolves to resident mode and fails closed unless its envelope fits.
+pub const A4bResidencyMode = enum {
+    auto,
+    streamed,
+    resident,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .streamed => "streamed",
+            .resident => "resident",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "streamed", .streamed },
+            .{ "resident", .resident },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const AgentDecision = struct {
     /// The question being answered
     question_id: []const u8,
@@ -6392,6 +6421,39 @@ pub const ConfidenceStepConfig = struct {
     }
 };
 
+/// Logging configuration for Antfly inference services
+pub const Config = struct {
+    level: ?Level = null,
+    style: ?Style = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "level", "level", true },
+        .{ "style", "style", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.level) |value| {
+            try jw.objectField("level");
+            try jw.write(value);
+        }
+        if (self.style) |value| {
+            try jw.objectField("style");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ConfigureExtensionRequest = struct {
     config_json: []const u8,
 };
@@ -7003,6 +7065,83 @@ pub const ContentPart = union(enum) {
             .image_url_content_part => |v| try jw.write(v.*),
             .text_content_part => |v| try jw.write(v.*),
         }
+    }
+};
+
+/// Low-level content download policy. File downloads always require an explicit nonempty `allowed_paths` list. In the generic scraper, omitted `allowed_hosts` for HTTP(S) and `allowed_paths` for S3 do not restrict those sources; explicit empty lists deny them. Consumers may merge this object over a stricter baseline before downloading. Antfly inference does so: omitted or empty inference policies, and omitted inference allowlists, deny HTTP(S), file, and S3 content until explicit allowlists are configured. Do not assume omission has identical policy semantics across consumers.
+pub const ContentSecurityConfig = struct {
+    /// Whitelist for HTTP(S) downloads. With block_private_ips enabled (the default), IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address. Set block_private_ips to false only to opt into private or special destinations. The generic scraper treats omission as unrestricted subject to that policy and an explicit empty list as deny-all; Antfly inference requires an explicit allowlist.
+    allowed_hosts: ?[]const []const u8 = null,
+    /// Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
+    block_private_ips: ?bool = null,
+    /// RFC 6052 network-specific NAT64 prefixes used by this deployment. Resolved IPv6 addresses under these prefixes are decoded and checked against the private IPv4 policy. Prefix length must be 32, 40, 48, 56, 64, or 96.
+    nat64_prefixes: ?[]const []const u8 = null,
+    /// Maximum size of downloaded content in bytes
+    max_download_size_bytes: ?i64 = null,
+    /// Maximum HTTP(S) and S3 download duration in seconds. Defaults to 30. Zero disables this configured ceiling, but a caller-supplied request deadline still applies. A deadline-bound file:// fetch fails closed because portable filesystem I/O does not expose a preemptive timeout.
+    download_timeout_seconds: ?i64 = null,
+    /// Maximum source-image width or height enforced for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Images are rejected rather than resized. Batch generation applies the same image-header admission before model execution; non-inference scraping consumers do not enforce this setting.
+    max_image_dimension: ?i64 = null,
+    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. File downloads require an explicit nonempty path allowlist; omission and an empty list deny local file access. For S3 the generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+    allowed_paths: ?[]const []const u8 = null,
+    /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
+    user_agent: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "allowed_hosts", "allowed_hosts", true },
+        .{ "block_private_ips", "block_private_ips", true },
+        .{ "nat64_prefixes", "nat64_prefixes", true },
+        .{ "max_download_size_bytes", "max_download_size_bytes", true },
+        .{ "download_timeout_seconds", "download_timeout_seconds", true },
+        .{ "max_image_dimension", "max_image_dimension", true },
+        .{ "allowed_paths", "allowed_paths", true },
+        .{ "user_agent", "user_agent", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.allowed_hosts) |value| {
+            try jw.objectField("allowed_hosts");
+            try jw.write(value);
+        }
+        if (self.block_private_ips) |value| {
+            try jw.objectField("block_private_ips");
+            try jw.write(value);
+        }
+        if (self.nat64_prefixes) |value| {
+            try jw.objectField("nat64_prefixes");
+            try jw.write(value);
+        }
+        if (self.max_download_size_bytes) |value| {
+            try jw.objectField("max_download_size_bytes");
+            try jw.write(value);
+        }
+        if (self.download_timeout_seconds) |value| {
+            try jw.objectField("download_timeout_seconds");
+            try jw.write(value);
+        }
+        if (self.max_image_dimension) |value| {
+            try jw.objectField("max_image_dimension");
+            try jw.write(value);
+        }
+        if (self.allowed_paths) |value| {
+            try jw.objectField("allowed_paths");
+            try jw.write(value);
+        }
+        if (self.user_agent) |value| {
+            try jw.objectField("user_agent");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -21167,6 +21306,83 @@ pub const GraphExactResultStats = struct {
     returned_items: u64,
 };
 
+/// Operator-owned ceilings shared by all named graph operations in one admitted query. Public requests cannot raise these values. Explored work, scanned anchors, and exact-distinct capacity are request-consumptive; intermediate and retained-state ceilings bound simultaneously live state.
+pub const GraphExecutionConfig = struct {
+    /// Cumulative node expansions across every named operation and path spur in one request.
+    max_explored_nodes: ?i64 = null,
+    /// Cumulative edge expansions across every named operation and path spur in one request.
+    max_explored_edges: ?i64 = null,
+    /// Cumulative owned bytes of materialized edges read while executing one request.
+    max_explored_edge_bytes: ?i64 = null,
+    /// Cumulative source anchors scanned by exact MATCH operations in one request.
+    max_scanned_anchors: ?i64 = null,
+    /// Maximum simultaneously live traversal, pathfinding, or MATCH frontier states.
+    max_intermediate_states: ?i64 = null,
+    /// Maximum simultaneously retained bytes of admitted graph execution state.
+    max_retained_state_bytes: ?i64 = null,
+    /// Cumulative exact-distinct identities admitted across all named aggregates in one request.
+    max_distinct_identities: ?i64 = null,
+    /// Request-consumptive bytes for exact-distinct identities, indexes, and ownership transfer.
+    max_distinct_state_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_explored_nodes", "max_explored_nodes", true },
+        .{ "max_explored_edges", "max_explored_edges", true },
+        .{ "max_explored_edge_bytes", "max_explored_edge_bytes", true },
+        .{ "max_scanned_anchors", "max_scanned_anchors", true },
+        .{ "max_intermediate_states", "max_intermediate_states", true },
+        .{ "max_retained_state_bytes", "max_retained_state_bytes", true },
+        .{ "max_distinct_identities", "max_distinct_identities", true },
+        .{ "max_distinct_state_bytes", "max_distinct_state_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_explored_nodes) |value| {
+            try jw.objectField("max_explored_nodes");
+            try jw.write(value);
+        }
+        if (self.max_explored_edges) |value| {
+            try jw.objectField("max_explored_edges");
+            try jw.write(value);
+        }
+        if (self.max_explored_edge_bytes) |value| {
+            try jw.objectField("max_explored_edge_bytes");
+            try jw.write(value);
+        }
+        if (self.max_scanned_anchors) |value| {
+            try jw.objectField("max_scanned_anchors");
+            try jw.write(value);
+        }
+        if (self.max_intermediate_states) |value| {
+            try jw.objectField("max_intermediate_states");
+            try jw.write(value);
+        }
+        if (self.max_retained_state_bytes) |value| {
+            try jw.objectField("max_retained_state_bytes");
+            try jw.write(value);
+        }
+        if (self.max_distinct_identities) |value| {
+            try jw.objectField("max_distinct_identities");
+            try jw.write(value);
+        }
+        if (self.max_distinct_state_bytes) |value| {
+            try jw.objectField("max_distinct_state_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
 pub const GraphIdentifier = []const u8;
 
@@ -26347,42 +26563,16 @@ pub const IndexType = enum {
     }
 };
 
-/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
-pub const InferenceA4bResidencyMode = enum {
-    auto,
-    streamed,
-    resident,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .auto => "auto",
-            .streamed => "streamed",
-            .resident => "resident",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "auto", .auto },
-            .{ "streamed", .streamed },
-            .{ "resident", .resident },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Process-local foreground request admission settings.
 pub const InferenceAdmissionConfig = struct {
-    inference: ?InferenceRequestAdmissionConfig = null,
+    /// Weighted work and media capacity, independent of request count. Omitted derives capacity from concurrency; zero disables weighted accounting.
+    max_work_units: ?i64 = null,
+    /// Maximum concurrent inference requests admitted by this process. The budget covers embedded inference routes, direct providers, and public connection inference forwarding. Remote forwarding holds a slot for the full upstream request. The runtime-reserved `local-inference` connection dispatches in process and is admitted once by the destination inference route; configured URLs remain remote boundaries even when they alias the local listener. Embedded standalone uses one shared coordinator for all of those surfaces; API-only runtimes use the same setting as a local forwarding gate. Weighted work/media capacity is controlled independently by max_work_units; when omitted it derives from max_concurrent_requests. Request count zero disables only the request-count gate. An explicit max_work_units remains authoritative. Excess work is rejected with 503 and Retry-After; it is not queued.
+    max_concurrent_requests: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "inference", "inference", true },
+        .{ "max_work_units", "max_work_units", true },
+        .{ "max_concurrent_requests", "max_concurrent_requests", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -26395,8 +26585,12 @@ pub const InferenceAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.inference) |value| {
-            try jw.objectField("inference");
+        if (self.max_work_units) |value| {
+            try jw.objectField("max_work_units");
+            try jw.write(value);
+        }
+        if (self.max_concurrent_requests) |value| {
+            try jw.objectField("max_concurrent_requests");
             try jw.write(value);
         }
         try jw.endObject();
@@ -26469,9 +26663,6 @@ pub const InferenceAudioContext = enum {
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
-
-/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
-pub const InferenceBackendPriorityEntry = []const u8;
 
 /// Runtime backends compiled into this inference server.
 pub const InferenceBackendRuntimes = struct {
@@ -27221,163 +27412,7 @@ pub const InferenceChunkResponse = struct {
     cache_hit: bool,
 };
 
-pub const InferenceConfig = struct {
-    /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
-    max_concurrent_requests: ?i64 = null,
-    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
-    api_url: ?[]const u8 = null,
-    /// API key used when calling an authenticated shared Antfly inference API.
-    api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
-    models_dir: ?[]const u8 = null,
-    /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
-    ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
-    content_security: ?InferenceContentSecurityConfig = null,
-    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-    s3_credentials: ?InferenceCredentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
-    keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
-    max_loaded_models: ?i64 = null,
-    /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
-    pool_size: ?i64 = null,
-    /// Native generator prompt KV cache settings.
-    prompt_cache: ?InferencePromptCacheConfig = null,
-    /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
-    backend_priority: ?[]const InferenceBackendPriorityEntry = null,
-    /// Legacy Go-runtime queue setting. The current Zig runtime does not retain excess inference requests in memory and ignores this field.
-    max_queue_size: ?i64 = null,
-    /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
-    request_timeout: ?[]const u8 = null,
-    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
-    preload: ?[]const InferenceModelRef = null,
-    /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
-    max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
-    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
-    allow_downloads: ?bool = null,
-    log: ?InferenceschemasConfig = null,
-    admission: ?InferenceAdmissionConfig = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
-        .{ "api_url", "api_url", true },
-        .{ "api_key", "api_key", true },
-        .{ "models_dir", "models_dir", true },
-        .{ "ml_dir", "ml_dir", true },
-        .{ "content_security", "content_security", true },
-        .{ "s3_credentials", "s3_credentials", true },
-        .{ "keep_alive", "keep_alive", true },
-        .{ "max_loaded_models", "max_loaded_models", true },
-        .{ "pool_size", "pool_size", true },
-        .{ "prompt_cache", "prompt_cache", true },
-        .{ "backend_priority", "backend_priority", true },
-        .{ "max_queue_size", "max_queue_size", true },
-        .{ "request_timeout", "request_timeout", true },
-        .{ "preload", "preload", true },
-        .{ "max_memory_mb", "max_memory_mb", true },
-        .{ "model_strategies", "model_strategies", true },
-        .{ "allow_downloads", "allow_downloads", true },
-        .{ "log", "log", true },
-        .{ "admission", "admission", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
-            try jw.write(value);
-        }
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.models_dir) |value| {
-            try jw.objectField("models_dir");
-            try jw.write(value);
-        }
-        if (self.ml_dir) |value| {
-            try jw.objectField("ml_dir");
-            try jw.write(value);
-        }
-        if (self.content_security) |value| {
-            try jw.objectField("content_security");
-            try jw.write(value);
-        }
-        if (self.s3_credentials) |value| {
-            try jw.objectField("s3_credentials");
-            try jw.write(value);
-        }
-        if (self.keep_alive) |value| {
-            try jw.objectField("keep_alive");
-            try jw.write(value);
-        }
-        if (self.max_loaded_models) |value| {
-            try jw.objectField("max_loaded_models");
-            try jw.write(value);
-        }
-        if (self.pool_size) |value| {
-            try jw.objectField("pool_size");
-            try jw.write(value);
-        }
-        if (self.prompt_cache) |value| {
-            try jw.objectField("prompt_cache");
-            try jw.write(value);
-        }
-        if (self.backend_priority) |value| {
-            try jw.objectField("backend_priority");
-            try jw.write(value);
-        }
-        if (self.max_queue_size) |value| {
-            try jw.objectField("max_queue_size");
-            try jw.write(value);
-        }
-        if (self.request_timeout) |value| {
-            try jw.objectField("request_timeout");
-            try jw.write(value);
-        }
-        if (self.preload) |value| {
-            try jw.objectField("preload");
-            try jw.write(value);
-        }
-        if (self.max_memory_mb) |value| {
-            try jw.objectField("max_memory_mb");
-            try jw.write(value);
-        }
-        if (self.model_strategies) |value| {
-            try jw.objectField("model_strategies");
-            try jw.write(value);
-        }
-        if (self.allow_downloads) |value| {
-            try jw.objectField("allow_downloads");
-            try jw.write(value);
-        }
-        if (self.log) |value| {
-            try jw.objectField("log");
-            try jw.write(value);
-        }
-        if (self.admission) |value| {
-            try jw.objectField("admission");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
+pub const InferenceConfig = InferenceServerConfig;
 
 pub const InferenceConnection = struct {
     provider: InferenceProviderType,
@@ -27453,76 +27488,6 @@ pub const InferenceConnection = struct {
 };
 
 pub const InferenceContentPart = ContentPart;
-
-/// Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the configured size budget.
-pub const InferenceContentSecurityConfig = struct {
-    /// Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit empty list both deny all hosts. With block_private_ips enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address.
-    allowed_hosts: ?[]const []const u8 = null,
-    /// Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
-    block_private_ips: ?bool = null,
-    /// Maximum size of downloaded content in bytes
-    max_download_size_bytes: ?i64 = null,
-    /// Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
-    download_timeout_seconds: ?i64 = null,
-    /// Maximum source-image width or height for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation applies the same image-header admission before model execution. Non-inference scraping consumers do not enforce this setting.
-    max_image_dimension: ?i64 = null,
-    /// Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
-    allowed_paths: ?[]const []const u8 = null,
-    /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
-    user_agent: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "allowed_hosts", "allowed_hosts", true },
-        .{ "block_private_ips", "block_private_ips", true },
-        .{ "max_download_size_bytes", "max_download_size_bytes", true },
-        .{ "download_timeout_seconds", "download_timeout_seconds", true },
-        .{ "max_image_dimension", "max_image_dimension", true },
-        .{ "allowed_paths", "allowed_paths", true },
-        .{ "user_agent", "user_agent", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.allowed_hosts) |value| {
-            try jw.objectField("allowed_hosts");
-            try jw.write(value);
-        }
-        if (self.block_private_ips) |value| {
-            try jw.objectField("block_private_ips");
-            try jw.write(value);
-        }
-        if (self.max_download_size_bytes) |value| {
-            try jw.objectField("max_download_size_bytes");
-            try jw.write(value);
-        }
-        if (self.download_timeout_seconds) |value| {
-            try jw.objectField("download_timeout_seconds");
-            try jw.write(value);
-        }
-        if (self.max_image_dimension) |value| {
-            try jw.objectField("max_image_dimension");
-            try jw.write(value);
-        }
-        if (self.allowed_paths) |value| {
-            try jw.objectField("allowed_paths");
-            try jw.write(value);
-        }
-        if (self.user_agent) |value| {
-            try jw.objectField("user_agent");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
 
 /// Structured memory bound to the exact model, tokenizer and chat-template revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these revisions changed. Rebuild from the original transcript using the selected model; retrying the same checkpoint against another generator is not a fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
 pub const InferenceContextCheckpoint = struct {
@@ -27910,61 +27875,6 @@ pub const InferenceContextToolResultOutcome = struct {
 pub const InferenceContextUnresolvedToolCall = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
-};
-
-pub const InferenceCredentials = struct {
-    /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
-    endpoint: ?[]const u8 = null,
-    /// Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
-    use_ssl: ?bool = null,
-    /// AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
-    access_key_id: ?[]const u8 = null,
-    /// AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
-    secret_access_key: ?[]const u8 = null,
-    /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
-    session_token: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "endpoint", "endpoint", true },
-        .{ "use_ssl", "use_ssl", true },
-        .{ "access_key_id", "access_key_id", true },
-        .{ "secret_access_key", "secret_access_key", true },
-        .{ "session_token", "session_token", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.endpoint) |value| {
-            try jw.objectField("endpoint");
-            try jw.write(value);
-        }
-        if (self.use_ssl) |value| {
-            try jw.objectField("use_ssl");
-            try jw.write(value);
-        }
-        if (self.access_key_id) |value| {
-            try jw.objectField("access_key_id");
-            try jw.write(value);
-        }
-        if (self.secret_access_key) |value| {
-            try jw.objectField("secret_access_key");
-            try jw.write(value);
-        }
-        if (self.session_token) |value| {
-            try jw.objectField("session_token");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
 };
 
 pub const InferenceDecideAnswer = union(enum) {
@@ -30420,39 +30330,63 @@ pub const InferenceKvCachePolicy = struct {
     }
 };
 
-/// Logging verbosity level
-pub const InferenceLevel = enum {
-    debug,
-    info,
-    warn,
-    @"error",
+pub const InferenceMediaContentPart = MediaContentPart;
+
+/// Inference memory ceilings in bytes. Omitted or zero values select automatic policy; physical capacity and the process envelope remain authoritative.
+pub const InferenceMemoryConfig = struct {
+    /// Host memory ceiling.
+    max_host_bytes: ?i64 = null,
+    /// Accelerator memory ceiling.
+    max_device_bytes: ?i64 = null,
+    /// Combined host and accelerator ceiling; integrated devices also enforce this across CPU and GPU leases.
+    max_combined_bytes: ?i64 = null,
+    /// KV cache memory ceiling.
+    max_kv_bytes: ?i64 = null,
+    /// Scratch memory ceiling.
+    max_scratch_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_host_bytes", "max_host_bytes", true },
+        .{ "max_device_bytes", "max_device_bytes", true },
+        .{ "max_combined_bytes", "max_combined_bytes", true },
+        .{ "max_kv_bytes", "max_kv_bytes", true },
+        .{ "max_scratch_bytes", "max_scratch_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .debug => "debug",
-            .info => "info",
-            .warn => "warn",
-            .@"error" => "error",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "debug", .debug },
-            .{ "info", .info },
-            .{ "warn", .warn },
-            .{ "error", .@"error" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
+        try jw.beginObject();
+        if (self.max_host_bytes) |value| {
+            try jw.objectField("max_host_bytes");
+            try jw.write(value);
+        }
+        if (self.max_device_bytes) |value| {
+            try jw.objectField("max_device_bytes");
+            try jw.write(value);
+        }
+        if (self.max_combined_bytes) |value| {
+            try jw.objectField("max_combined_bytes");
+            try jw.write(value);
+        }
+        if (self.max_kv_bytes) |value| {
+            try jw.objectField("max_kv_bytes");
+            try jw.write(value);
+        }
+        if (self.max_scratch_bytes) |value| {
+            try jw.objectField("max_scratch_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
-
-pub const InferenceMediaContentPart = MediaContentPart;
 
 /// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
 pub const InferenceModelBackend = enum {
@@ -30490,38 +30424,6 @@ pub const InferenceModelBackend = enum {
             .{ "xla", .xla },
             .{ "webgpu", .webgpu },
             .{ "wasm", .wasm },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Optional artifact format preference for loading a model.
-pub const InferenceModelFormat = enum {
-    gguf,
-    onnx,
-    safetensors,
-    hybrid,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .gguf => "gguf",
-            .onnx => "onnx",
-            .safetensors => "safetensors",
-            .hybrid => "hybrid",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "gguf", .gguf },
-            .{ "onnx", .onnx },
-            .{ "safetensors", .safetensors },
-            .{ "hybrid", .hybrid },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -30730,104 +30632,6 @@ pub const InferenceModelKind = enum {
             .{ "extractor", .extractor },
         });
         return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Optional quantization preference for loading a model.
-pub const InferenceModelQuantization = enum {
-    q4_k,
-    q8,
-    fp16,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .q4_k => "q4_k",
-            .q8 => "q8",
-            .fp16 => "fp16",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "q4_k", .q4_k },
-            .{ "q8", .q8 },
-            .{ "fp16", .fp16 },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Model reference used by startup preload and model-loading configuration.
-pub const InferenceModelRef = struct {
-    kind: InferenceModelKind,
-    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
-    name: []const u8,
-    backend: ?InferenceModelBackend = null,
-    /// Per-model GLiNER CUDA inference precision for extractor preloads. Requires CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests fail closed until the exact model/profile has release qualification. Precision is part of the loaded-session cache identity.
-    cuda_precision: ?[]const u8 = null,
-    format: ?InferenceModelFormat = null,
-    quantization: ?InferenceModelQuantization = null,
-    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
-    residency_mode: ?InferenceA4bResidencyMode = null,
-    /// Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
-    memory_budget_mb: ?u32 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "kind", "kind", false },
-        .{ "name", "name", false },
-        .{ "backend", "backend", true },
-        .{ "cuda_precision", "cuda_precision", true },
-        .{ "format", "format", true },
-        .{ "quantization", "quantization", true },
-        .{ "residency_mode", "residency_mode", true },
-        .{ "memory_budget_mb", "memory_budget_mb", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("kind");
-        try jw.write(self.kind);
-        try jw.objectField("name");
-        try jw.write(self.name);
-        if (self.backend) |value| {
-            try jw.objectField("backend");
-            try jw.write(value);
-        }
-        if (self.cuda_precision) |value| {
-            try jw.objectField("cuda_precision");
-            try jw.write(value);
-        }
-        if (self.format) |value| {
-            try jw.objectField("format");
-            try jw.write(value);
-        }
-        if (self.quantization) |value| {
-            try jw.objectField("quantization");
-            try jw.write(value);
-        }
-        if (self.residency_mode) |value| {
-            try jw.objectField("residency_mode");
-            try jw.write(value);
-        }
-        if (self.memory_budget_mb) |value| {
-            try jw.objectField("memory_budget_mb");
-            try jw.write(value);
-        }
-        try jw.endObject();
     }
 };
 
@@ -31050,62 +30854,6 @@ pub const InferencePredictorsResponse = struct {
         try jw.write(self.object);
         try jw.objectField("predictors");
         try jw.write(self.predictors);
-        try jw.endObject();
-    }
-};
-
-/// Native generator prompt KV cache configuration.
-pub const InferencePromptCacheConfig = struct {
-    /// Enable inference-native prompt KV cache reuse for generator requests. On by default; set false to disable.
-    enabled: ?bool = null,
-    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an opt-in page-aligned compressed radix tree with shared-prefix ownership and leaf-only LRU eviction; it is currently qualified for native and Metal backends. Eligible Metal requests use eager paged attention; explicit compiled generation is incompatible with prompt caching. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
-    mode: ?[]const u8 = null,
-    /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
-    max_bytes_mb: ?i64 = null,
-    /// Minimum prompt length eligible for prompt KV caching.
-    min_tokens: ?i64 = null,
-    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
-    ttl_ms: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "enabled", "enabled", true },
-        .{ "mode", "mode", true },
-        .{ "max_bytes_mb", "max_bytes_mb", true },
-        .{ "min_tokens", "min_tokens", true },
-        .{ "ttl_ms", "ttl_ms", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.enabled) |value| {
-            try jw.objectField("enabled");
-            try jw.write(value);
-        }
-        if (self.mode) |value| {
-            try jw.objectField("mode");
-            try jw.write(value);
-        }
-        if (self.max_bytes_mb) |value| {
-            try jw.objectField("max_bytes_mb");
-            try jw.write(value);
-        }
-        if (self.min_tokens) |value| {
-            try jw.objectField("min_tokens");
-            try jw.write(value);
-        }
-        if (self.ttl_ms) |value| {
-            try jw.objectField("ttl_ms");
-            try jw.write(value);
-        }
         try jw.endObject();
     }
 };
@@ -31572,13 +31320,23 @@ pub const InferenceReadResult = struct {
     }
 };
 
-pub const InferenceRequestAdmissionConfig = struct {
-    /// Maximum concurrent inference requests in this process. The same value also sizes the weighted work budget shared by every executing inference endpoint: each request consumes one request slot and at least one unit, while request body size, generation workload, and image byte/count reservations can consume more than one unit. The request count can therefore never exceed this value, while expensive requests may exhaust weighted capacity sooner. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. When either ceiling is exhausted, new HTTP requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 to disable both ceilings, admission unit accounting, and the capacity-derived clamp. The default is 32.
-    max_concurrent_requests: ?i64 = null,
+/// Deployment request ceilings only narrow model capabilities. Applied equally to direct calls, HTTP and discovery. Omitted values retain native limits.
+pub const InferenceRequestLimitsConfig = struct {
+    /// Maximum items in one public or direct request. Independent callers may still be combined into a larger native execution microbatch.
+    max_items_per_request: ?i64 = null,
+    /// Maximum effective input tokens per item, including expanded image prompts.
+    max_input_tokens_per_item: ?i64 = null,
+    /// Maximum generated output tokens per item. Omitted request max_tokens resolves to a bounded effective default.
+    max_output_tokens_per_item: ?i64 = null,
+    /// Maximum aggregate decoded image pixels in a request batch; also bounds execution microbatch pixels.
+    max_decoded_pixels_per_batch: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
+        .{ "max_items_per_request", "max_items_per_request", true },
+        .{ "max_input_tokens_per_item", "max_input_tokens_per_item", true },
+        .{ "max_output_tokens_per_item", "max_output_tokens_per_item", true },
+        .{ "max_decoded_pixels_per_batch", "max_decoded_pixels_per_batch", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -31591,8 +31349,20 @@ pub const InferenceRequestAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
+        if (self.max_items_per_request) |value| {
+            try jw.objectField("max_items_per_request");
+            try jw.write(value);
+        }
+        if (self.max_input_tokens_per_item) |value| {
+            try jw.objectField("max_input_tokens_per_item");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens_per_item) |value| {
+            try jw.objectField("max_output_tokens_per_item");
+            try jw.write(value);
+        }
+        if (self.max_decoded_pixels_per_batch) |value| {
+            try jw.objectField("max_decoded_pixels_per_batch");
             try jw.write(value);
         }
         try jw.endObject();
@@ -31752,66 +31522,14 @@ pub const InferenceRole = enum {
     }
 };
 
-pub const InferenceRuntimeConfig = struct {
-    /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
-    max_concurrent_requests: ?i64 = null,
-    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
-    api_url: ?[]const u8 = null,
-    /// API key used when calling an authenticated shared Antfly inference API.
-    api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
-    models_dir: ?[]const u8 = null,
-    /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
-    ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
-    content_security: ?InferenceContentSecurityConfig = null,
-    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-    s3_credentials: ?InferenceCredentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
-    keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
-    max_loaded_models: ?i64 = null,
-    /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
-    pool_size: ?i64 = null,
-    /// Native generator prompt KV cache settings.
-    prompt_cache: ?InferencePromptCacheConfig = null,
-    /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
-    backend_priority: ?[]const InferenceBackendPriorityEntry = null,
-    /// Legacy Go-runtime queue setting. The current Zig runtime does not retain excess inference requests in memory and ignores this field.
-    max_queue_size: ?i64 = null,
-    /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
-    request_timeout: ?[]const u8 = null,
-    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
-    preload: ?[]const InferenceModelRef = null,
-    /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
-    max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
-    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
-    allow_downloads: ?bool = null,
-    log: ?InferenceschemasConfig = null,
+pub const InferenceServerConfig = struct {
+    resources: ?ResourcesConfig = null,
+    inference: ?RuntimeConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
-        .{ "api_url", "api_url", true },
-        .{ "api_key", "api_key", true },
-        .{ "models_dir", "models_dir", true },
-        .{ "ml_dir", "ml_dir", true },
-        .{ "content_security", "content_security", true },
-        .{ "s3_credentials", "s3_credentials", true },
-        .{ "keep_alive", "keep_alive", true },
-        .{ "max_loaded_models", "max_loaded_models", true },
-        .{ "pool_size", "pool_size", true },
-        .{ "prompt_cache", "prompt_cache", true },
-        .{ "backend_priority", "backend_priority", true },
-        .{ "max_queue_size", "max_queue_size", true },
-        .{ "request_timeout", "request_timeout", true },
-        .{ "preload", "preload", true },
-        .{ "max_memory_mb", "max_memory_mb", true },
-        .{ "model_strategies", "model_strategies", true },
-        .{ "allow_downloads", "allow_downloads", true },
-        .{ "log", "log", true },
+        .{ "resources", "resources", true },
+        .{ "inference", "inference", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -31824,80 +31542,12 @@ pub const InferenceRuntimeConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
+        if (self.resources) |value| {
+            try jw.objectField("resources");
             try jw.write(value);
         }
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.models_dir) |value| {
-            try jw.objectField("models_dir");
-            try jw.write(value);
-        }
-        if (self.ml_dir) |value| {
-            try jw.objectField("ml_dir");
-            try jw.write(value);
-        }
-        if (self.content_security) |value| {
-            try jw.objectField("content_security");
-            try jw.write(value);
-        }
-        if (self.s3_credentials) |value| {
-            try jw.objectField("s3_credentials");
-            try jw.write(value);
-        }
-        if (self.keep_alive) |value| {
-            try jw.objectField("keep_alive");
-            try jw.write(value);
-        }
-        if (self.max_loaded_models) |value| {
-            try jw.objectField("max_loaded_models");
-            try jw.write(value);
-        }
-        if (self.pool_size) |value| {
-            try jw.objectField("pool_size");
-            try jw.write(value);
-        }
-        if (self.prompt_cache) |value| {
-            try jw.objectField("prompt_cache");
-            try jw.write(value);
-        }
-        if (self.backend_priority) |value| {
-            try jw.objectField("backend_priority");
-            try jw.write(value);
-        }
-        if (self.max_queue_size) |value| {
-            try jw.objectField("max_queue_size");
-            try jw.write(value);
-        }
-        if (self.request_timeout) |value| {
-            try jw.objectField("request_timeout");
-            try jw.write(value);
-        }
-        if (self.preload) |value| {
-            try jw.objectField("preload");
-            try jw.write(value);
-        }
-        if (self.max_memory_mb) |value| {
-            try jw.objectField("max_memory_mb");
-            try jw.write(value);
-        }
-        if (self.model_strategies) |value| {
-            try jw.objectField("model_strategies");
-            try jw.write(value);
-        }
-        if (self.allow_downloads) |value| {
-            try jw.objectField("allow_downloads");
-            try jw.write(value);
-        }
-        if (self.log) |value| {
-            try jw.objectField("log");
+        if (self.inference) |value| {
+            try jw.objectField("inference");
             try jw.write(value);
         }
         try jw.endObject();
@@ -31910,38 +31560,6 @@ pub const InferenceSparseVector = struct {
     indices: []const i32,
     /// Corresponding weights for each index (always positive)
     values: []const f32,
-};
-
-/// Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
-pub const InferenceStyle = enum {
-    terminal,
-    json,
-    logfmt,
-    noop,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .terminal => "terminal",
-            .json => "json",
-            .logfmt => "logfmt",
-            .noop => "noop",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "terminal", .terminal },
-            .{ "json", .json },
-            .{ "logfmt", .logfmt },
-            .{ "noop", .noop },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
 };
 
 pub const InferenceSynthesisRequest = struct {
@@ -32812,39 +32430,6 @@ pub const InferenceVadConfig = struct {
     }
 };
 
-/// Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
-pub const InferenceschemasConfig = struct {
-    level: ?InferenceLevel = null,
-    style: ?InferenceStyle = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "level", "level", true },
-        .{ "style", "style", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.level) |value| {
-            try jw.objectField("level");
-            try jw.write(value);
-        }
-        if (self.style) |value| {
-            try jw.objectField("style");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 pub const InstallExtensionRequest = struct {
     version: ?[]const u8 = null,
     scope: ExtensionScope,
@@ -33325,6 +32910,86 @@ pub const JoinType = enum {
             .{ "inner", .inner },
             .{ "left", .left },
             .{ "right", .right },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Runtime Metal and CUDA kernel JIT configuration. Live compilation and GPU qualification run only for models in the configured startup `preload` list, before serving begins. A cold dynamic model load never benchmarks against an in-use GPU: `on` and `shadow` retain bundled kernels, while `required` rejects the load. When runtime JIT is enabled, startup also materializes every vision, audio, and projection session declared by each preloaded model without running media inference. Preload every model that must use runtime-JIT kernels; `required` rejects an empty preload list.
+pub const KernelJitConfig = struct {
+    mode: ?KernelJitMode = null,
+    /// Persistent artifact cache directory on Linux and macOS. Omit to use ~/.antfly/inference/jit when HOME is available.
+    cache_dir: ?[]const u8 = null,
+    /// Persistent cache size limit in MiB. Set to 0 to disable disk persistence.
+    max_cache_bytes_mb: ?i64 = null,
+    /// Per direct model session pre-publication start budget for best-effort `on` and `shadow` JIT work. A compiler or qualification operation already started may overrun the budget. Multimodal model preloads may create several direct sessions, each with this budget. `required` completes or fails all required routes and may exceed this value.
+    preload_budget_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "cache_dir", "cache_dir", true },
+        .{ "max_cache_bytes_mb", "max_cache_bytes_mb", true },
+        .{ "preload_budget_ms", "preload_budget_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.cache_dir) |value| {
+            try jw.objectField("cache_dir");
+            try jw.write(value);
+        }
+        if (self.max_cache_bytes_mb) |value| {
+            try jw.objectField("max_cache_bytes_mb");
+            try jw.write(value);
+        }
+        if (self.preload_budget_ms) |value| {
+            try jw.objectField("preload_budget_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Runtime kernel JIT operating mode. `off` disables compilation. `shadow` compiles and validates without dispatching JIT kernels. `on` may activate qualified kernels while preserving the production fallback. `required` fails model loading when there are no eligible routes or any scoped route cannot qualify, rejects sessions that are not direct Metal or CUDA sessions, and requires at least one configured startup preload. Backend preference remains separately configured; this mode neither enables nor selects a backend. Runtime JIT is currently supported on Linux and macOS; other platforms reject non-`off` modes rather than silently degrading.
+pub const KernelJitMode = enum {
+    off,
+    shadow,
+    on,
+    required,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .off => "off",
+            .shadow => "shadow",
+            .on => "on",
+            .required => "required",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "off", .off },
+            .{ "shadow", .shadow },
+            .{ "on", .on },
+            .{ "required", .required },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -33872,6 +33537,38 @@ pub const LegacyGraphSearchResult = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Logging verbosity level
+pub const Level = enum {
+    debug,
+    info,
+    warn,
+    @"error",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .debug => "debug",
+            .info => "info",
+            .warn => "warn",
+            .@"error" => "error",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "debug", .debug },
+            .{ "info", .info },
+            .{ "warn", .warn },
+            .{ "error", .@"error" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -40074,6 +39771,217 @@ pub const MetadataLeaderUnavailableError = struct {
     retry_after_ms: i32,
 };
 
+/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
+pub const ModelBackend = enum {
+    auto,
+    native,
+    metal,
+    cuda,
+    xla,
+    webgpu,
+    wasm,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .native => "native",
+            .metal => "metal",
+            .cuda => "cuda",
+            .xla => "xla",
+            .webgpu => "webgpu",
+            .wasm => "wasm",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "native", .native },
+            .{ "metal", .metal },
+            .{ "cuda", .cuda },
+            .{ "xla", .xla },
+            .{ "webgpu", .webgpu },
+            .{ "wasm", .wasm },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional artifact format preference for loading a model.
+pub const ModelFormat = enum {
+    gguf,
+    onnx,
+    safetensors,
+    hybrid,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gguf => "gguf",
+            .onnx => "onnx",
+            .safetensors => "safetensors",
+            .hybrid => "hybrid",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gguf", .gguf },
+            .{ "onnx", .onnx },
+            .{ "safetensors", .safetensors },
+            .{ "hybrid", .hybrid },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Model registry kind.
+pub const ModelKind = enum {
+    generator,
+    embedder,
+    reranker,
+    chunker,
+    classifier,
+    rewriter,
+    reader,
+    transcriber,
+    extractor,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .generator => "generator",
+            .embedder => "embedder",
+            .reranker => "reranker",
+            .chunker => "chunker",
+            .classifier => "classifier",
+            .rewriter => "rewriter",
+            .reader => "reader",
+            .transcriber => "transcriber",
+            .extractor => "extractor",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "generator", .generator },
+            .{ "embedder", .embedder },
+            .{ "reranker", .reranker },
+            .{ "chunker", .chunker },
+            .{ "classifier", .classifier },
+            .{ "rewriter", .rewriter },
+            .{ "reader", .reader },
+            .{ "transcriber", .transcriber },
+            .{ "extractor", .extractor },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional quantization preference for loading a model.
+pub const ModelQuantization = enum {
+    q4_k,
+    q8,
+    fp16,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .q4_k => "q4_k",
+            .q8 => "q8",
+            .fp16 => "fp16",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "q4_k", .q4_k },
+            .{ "q8", .q8 },
+            .{ "fp16", .fp16 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Model reference used by startup preload and model-loading configuration. When a preload selects an explicit backend, that warmed session also becomes the model's default in-process session for later `auto` requests; callers do not need to repeat the backend on every request.
+pub const ModelRef = struct {
+    kind: ModelKind,
+    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+    name: []const u8,
+    backend: ?ModelBackend = null,
+    format: ?ModelFormat = null,
+    quantization: ?ModelQuantization = null,
+    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On Metal, `auto` chooses full residency only when the complete expert set and safety reserves fit the configured budget; otherwise it uses bounded streaming. On the qualified SM89 CUDA lane, `auto` resolves to resident mode and fails closed unless its envelope fits. Other model geometries reject this field.
+    residency_mode: ?A4bResidencyMode = null,
+    /// Per-model A4B memory envelope in MiB. Zero selects the backend default: the conservative 2048 MiB streamed floor on Metal, or the qualified 16384 MiB resident envelope on CUDA. Explicit values below 2048 fail; CUDA also rejects any envelope too small for full residency. Other model geometries reject this field.
+    memory_budget_mb: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "name", "name", false },
+        .{ "backend", "backend", true },
+        .{ "format", "format", true },
+        .{ "quantization", "quantization", true },
+        .{ "residency_mode", "residency_mode", true },
+        .{ "memory_budget_mb", "memory_budget_mb", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.backend) |value| {
+            try jw.objectField("backend");
+            try jw.write(value);
+        }
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.quantization) |value| {
+            try jw.objectField("quantization");
+            try jw.write(value);
+        }
+        if (self.residency_mode) |value| {
+            try jw.objectField("residency_mode");
+            try jw.write(value);
+        }
+        if (self.memory_budget_mb) |value| {
+            try jw.objectField("memory_budget_mb");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
 pub const MultiBatchRequest = struct {
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
@@ -41720,6 +41628,62 @@ pub const PriorArtifactContext = struct {
     }
 };
 
+/// Native generator prompt KV cache configuration.
+pub const PromptCacheConfig = struct {
+    /// Enable inference-native prompt KV cache reuse for generator requests.
+    enabled: ?bool = null,
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an opt-in page-aligned compressed radix tree with shared-prefix ownership and leaf-only LRU eviction; it is currently qualified for native and Metal backends. Eligible Metal requests use eager paged attention; explicit compiled generation is incompatible with prompt caching. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+    mode: ?[]const u8 = null,
+    /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
+    max_bytes_mb: ?i64 = null,
+    /// Minimum prompt length eligible for prompt KV caching.
+    min_tokens: ?i64 = null,
+    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
+    ttl_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "mode", "mode", true },
+        .{ "max_bytes_mb", "max_bytes_mb", true },
+        .{ "min_tokens", "min_tokens", true },
+        .{ "ttl_ms", "ttl_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.max_bytes_mb) |value| {
+            try jw.objectField("max_bytes_mb");
+            try jw.write(value);
+        }
+        if (self.min_tokens) |value| {
+            try jw.objectField("min_tokens");
+            try jw.write(value);
+        }
+        if (self.ttl_ms) |value| {
+            try jw.objectField("ttl_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ProvenanceDecision = struct {
     schema_version: ?u32 = null,
     resource: std.json.Value,
@@ -42318,6 +42282,33 @@ pub const Query = union(enum) {
             .multi_match_query => |v| try jw.write(v.*),
             .query_string_query => |v| try jw.write(v.*),
         }
+    }
+};
+
+pub const QueryAdmissionConfig = struct {
+    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and resources.inference.admission.max_concurrent_requests.
+    max_concurrent_requests: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_concurrent_requests", "max_concurrent_requests", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_concurrent_requests) |value| {
+            try jw.objectField("max_concurrent_requests");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -49279,6 +49270,51 @@ pub const ResourceType = enum {
     }
 };
 
+/// Shared node-local resource policy for DB and standalone inference. All memory quantities are bytes.
+pub const ResourcesConfig = struct {
+    memory: ?std.json.Value = null,
+    query: ?std.json.Value = null,
+    write: ?std.json.Value = null,
+    inference: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "memory", "memory", true },
+        .{ "query", "query", true },
+        .{ "write", "write", true },
+        .{ "inference", "inference", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.memory) |value| {
+            try jw.objectField("memory");
+            try jw.write(value);
+        }
+        if (self.query) |value| {
+            try jw.objectField("query");
+            try jw.write(value);
+        }
+        if (self.write) |value| {
+            try jw.objectField("write");
+            try jw.write(value);
+        }
+        if (self.inference) |value| {
+            try jw.objectField("inference");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const RestoreJob = struct {
     /// Opaque durable restore-job identifier. Clients must not parse it as a number.
     job_id: []const u8,
@@ -50241,6 +50277,172 @@ pub const RowFilterEntry = struct {
         }
         try jw.objectField("filter");
         try jw.write(self.filter);
+        try jw.endObject();
+    }
+};
+
+pub const RuntimeConfig = struct {
+    /// Encoded HTTP inference body ceiling in MiB, independent of decoded-media resource policy.
+    http_max_body_mb: ?i64 = null,
+    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
+    api_url: ?[]const u8 = null,
+    /// Client-only API key used when calling an authenticated shared Antfly inference API. Both standalone inference executables accept and ignore this field when serving models.
+    api_key: ?[]const u8 = null,
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
+    models_dir: ?[]const u8 = null,
+    /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
+    ml_dir: ?[]const u8 = null,
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when resources.inference.admission.max_work_units is positive—16 MiB times that effective work capacity (which defaults to request concurrency when max_work_units is omitted); zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    content_security: ?ContentSecurityConfig = null,
+    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
+    s3_credentials: ?Credentials = null,
+    /// Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply.
+    generation_batching: ?std.json.Value = null,
+    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
+    keep_alive: ?[]const u8 = null,
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
+    max_loaded_models: ?i64 = null,
+    /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
+    pool_size: ?i64 = null,
+    /// Native generator prompt KV cache settings.
+    prompt_cache: ?PromptCacheConfig = null,
+    kernel_jit: ?KernelJitConfig = null,
+    /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
+    backend_priority: ?[]const []const u8 = null,
+    /// Legacy Go-runtime queue setting. The current Zig runtime does not retain excess inference requests in memory and ignores this field.
+    max_queue_size: ?i64 = null,
+    /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
+    request_timeout: ?[]const u8 = null,
+    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind. When runtime kernel JIT is enabled, every vision, audio, and projection session declared by a preloaded model is also loaded without running media inference. Runtime kernel JIT `required` mode rejects an empty preload list.
+    preload: ?[]const ModelRef = null,
+    /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
+    max_memory_mb: ?i64 = null,
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
+    allow_downloads: ?bool = null,
+    /// Legacy inference-local logging field. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
+    log: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "http_max_body_mb", "http_max_body_mb", true },
+        .{ "api_url", "api_url", true },
+        .{ "api_key", "api_key", true },
+        .{ "models_dir", "models_dir", true },
+        .{ "ml_dir", "ml_dir", true },
+        .{ "content_security", "content_security", true },
+        .{ "s3_credentials", "s3_credentials", true },
+        .{ "generation_batching", "generation_batching", true },
+        .{ "keep_alive", "keep_alive", true },
+        .{ "max_loaded_models", "max_loaded_models", true },
+        .{ "pool_size", "pool_size", true },
+        .{ "prompt_cache", "prompt_cache", true },
+        .{ "kernel_jit", "kernel_jit", true },
+        .{ "backend_priority", "backend_priority", true },
+        .{ "max_queue_size", "max_queue_size", true },
+        .{ "request_timeout", "request_timeout", true },
+        .{ "preload", "preload", true },
+        .{ "max_memory_mb", "max_memory_mb", true },
+        .{ "model_strategies", "model_strategies", true },
+        .{ "allow_downloads", "allow_downloads", true },
+        .{ "log", "log", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.http_max_body_mb) |value| {
+            try jw.objectField("http_max_body_mb");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.models_dir) |value| {
+            try jw.objectField("models_dir");
+            try jw.write(value);
+        }
+        if (self.ml_dir) |value| {
+            try jw.objectField("ml_dir");
+            try jw.write(value);
+        }
+        if (self.content_security) |value| {
+            try jw.objectField("content_security");
+            try jw.write(value);
+        }
+        if (self.s3_credentials) |value| {
+            try jw.objectField("s3_credentials");
+            try jw.write(value);
+        }
+        if (self.generation_batching) |value| {
+            try jw.objectField("generation_batching");
+            try jw.write(value);
+        }
+        if (self.keep_alive) |value| {
+            try jw.objectField("keep_alive");
+            try jw.write(value);
+        }
+        if (self.max_loaded_models) |value| {
+            try jw.objectField("max_loaded_models");
+            try jw.write(value);
+        }
+        if (self.pool_size) |value| {
+            try jw.objectField("pool_size");
+            try jw.write(value);
+        }
+        if (self.prompt_cache) |value| {
+            try jw.objectField("prompt_cache");
+            try jw.write(value);
+        }
+        if (self.kernel_jit) |value| {
+            try jw.objectField("kernel_jit");
+            try jw.write(value);
+        }
+        if (self.backend_priority) |value| {
+            try jw.objectField("backend_priority");
+            try jw.write(value);
+        }
+        if (self.max_queue_size) |value| {
+            try jw.objectField("max_queue_size");
+            try jw.write(value);
+        }
+        if (self.request_timeout) |value| {
+            try jw.objectField("request_timeout");
+            try jw.write(value);
+        }
+        if (self.preload) |value| {
+            try jw.objectField("preload");
+            try jw.write(value);
+        }
+        if (self.max_memory_mb) |value| {
+            try jw.objectField("max_memory_mb");
+            try jw.write(value);
+        }
+        if (self.model_strategies) |value| {
+            try jw.objectField("model_strategies");
+            try jw.write(value);
+        }
+        if (self.allow_downloads) |value| {
+            try jw.objectField("allow_downloads");
+            try jw.write(value);
+        }
+        if (self.log) |value| {
+            try jw.objectField("log");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -53079,6 +53281,38 @@ pub const StoreRootEnrollmentRequest = struct {
     identity: StoreRootEnrollmentIdentity,
     /// Ed25519 proof-of-possession signature in lowercase hex.
     signature: []const u8,
+};
+
+/// Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
+pub const Style = enum {
+    terminal,
+    json,
+    logfmt,
+    noop,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .terminal => "terminal",
+            .json => "json",
+            .logfmt => "logfmt",
+            .noop => "noop",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "terminal", .terminal },
+            .{ "json", .json },
+            .{ "logfmt", .logfmt },
+            .{ "noop", .noop },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const SuccessMessage = struct {
@@ -58113,6 +58347,33 @@ pub const WildcardQuery = struct {
                 try jw.objectField("boost");
                 try jw.write(value);
             },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const WriteAdmissionConfig = struct {
+    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Both budgets are independent of transport safeguards and resources.inference.admission.max_concurrent_requests.
+    max_concurrent_requests: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_concurrent_requests", "max_concurrent_requests", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_concurrent_requests) |value| {
+            try jw.objectField("max_concurrent_requests");
+            try jw.write(value);
         }
         try jw.endObject();
     }

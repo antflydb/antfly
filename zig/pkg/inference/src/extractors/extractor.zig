@@ -83,9 +83,10 @@ pub const Context = struct {
     model_manager: *model_manager_mod.ModelManager,
     execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     reader_resolver: ?*ReaderResolver = null,
+    reader_request_limits: @import("antfly_platform").resource_policy.InferenceRequestLimits = .{},
     reader_admission: ?struct {
         ptr: *anyopaque,
-        validate: *const fn (*anyopaque, []const u8, []const []const u8, readers_mod.ReadOptions) anyerror!void,
+        resolve_limits: *const fn (*anyopaque, []const u8, []const []const u8, readers_mod.ReadOptions) anyerror!@import("antfly_platform").resource_policy.InferenceRequestLimits,
     } = null,
     text_admission: ?struct {
         ptr: *anyopaque,
@@ -607,14 +608,15 @@ fn readTextsWithSelectedReader(
 ) ![][]const u8 {
     // A fallback candidate must satisfy its own contract, not the manifest
     // of a previously selected reader or the downstream text model.
+    var resolved_context = ctx;
     if (ctx.reader_admission) |admission|
-        try admission.validate(admission.ptr, model_path, image_datas, read_options);
+        resolved_context.reader_request_limits = try admission.resolve_limits(admission.ptr, model_path, image_datas, read_options);
     if (builtin.is_test) {
         if (ctx.reader_text_override) |override| {
             return override.read(ctx.allocator, model_path, image_datas, read_options);
         }
     }
-    return readTextsWithReader(ctx, model_path, image_datas, read_options);
+    return readTextsWithReader(resolved_context, model_path, image_datas, read_options);
 }
 
 fn readTextsWithReader(
@@ -641,6 +643,14 @@ fn readTextsWithReader(
 
     var controlled_options = read_options;
     controlled_options.execution_control = ctx.execution_control;
+    // Composed image extraction must use the same bounded effective reader
+    // options as /read, including when the caller omits max_tokens.
+    controlled_options.max_tokens = try reader.resolveMaxTokens(controlled_options.max_tokens, ctx.reader_request_limits.max_output_tokens_per_item);
+    if (ctx.reader_admission) |admission|
+        _ = try admission.resolve_limits(admission.ptr, model_path, image_datas, controlled_options);
+    if (ctx.reader_request_limits.max_input_tokens_per_item) |limit| {
+        if (try reader.inputTokenCount(controlled_options) > limit) return error.InferenceInputTokensExceeded;
+    }
     for (image_datas, 0..) |image_data, i| {
         var result = try reader.read(image_data, controlled_options);
         defer result.deinit();
@@ -1221,11 +1231,12 @@ test "one extraction request falls back after a structural reader failure" {
         read_count: usize = 0,
         admission_count: usize = 0,
 
-        fn validate(raw: *anyopaque, model_path: []const u8, _: []const []const u8, _: readers_mod.ReadOptions) !void {
+        fn resolveLimits(raw: *anyopaque, model_path: []const u8, _: []const []const u8, _: readers_mod.ReadOptions) !@import("antfly_platform").resource_policy.InferenceRequestLimits {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.read_count, self.admission_count);
             try std.testing.expectEqualStrings(if (self.admission_count == 0) preferred else fallback, model_path);
             self.admission_count += 1;
+            return .{};
         }
 
         fn discover(
@@ -1278,7 +1289,7 @@ test "one extraction request falls back after a structural reader failure" {
         .reader_resolver = &resolver,
         .reader_discovery_override = .{ .context = &fake, .discoverFn = FakeReaders.discover },
         .reader_text_override = .{ .context = &fake, .readFn = FakeReaders.read },
-        .reader_admission = .{ .ptr = &fake, .validate = FakeReaders.validate },
+        .reader_admission = .{ .ptr = &fake, .resolve_limits = FakeReaders.resolveLimits },
     };
 
     const texts = try readTextsForExtraction(ctx, "acme/extractor", &.{"image"}, .{});
