@@ -9474,7 +9474,10 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
         }
         fn exercise(self: *@This()) !void {
             var handle: ?*anyopaque = null;
-            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(self.path, &handle));
+            // Exercise all 32 connections and 6,400 writes without paying for
+            // a power-loss barrier on every functional progress assertion.
+            const options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .flags = capi.open_flag_no_sync };
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(self.path, &options, &handle));
             defer antfly_db_close(handle);
             for (0..200) |i| {
                 var request_buffer: [256]u8 = undefined;

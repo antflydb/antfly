@@ -5438,7 +5438,7 @@ fn consumerTests() type {
         }
 
         test "query merge preserves graph table provenance under allocation failure" {
-            try std.testing.checkAllAllocationFailures(
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(
                 std.testing.allocator,
                 expectGraphTableProvenanceMerge,
                 .{},

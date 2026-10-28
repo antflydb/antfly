@@ -29,7 +29,7 @@ def retain(pid: int, destination: Path, proc: Path = Path("/proc")) -> bool:
     name = executable.name.removesuffix(" (deleted)")
     if name == "zig":
         return retain_compiler(pid, destination, proc)
-    if name != "test" and not name.endswith("-tests"):
+    if name != "test" and not name.endswith(("-tests", "-tests-local")):
         return False
     # Open through proc: even an unlinked cache executable remains recoverable.
     command = (process / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
