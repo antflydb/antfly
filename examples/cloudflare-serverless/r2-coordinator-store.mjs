@@ -16,7 +16,7 @@
 // Cloudflare-independent adapter for the shared native ordered metadata store.
 import {normalizeReadHints} from "./publication-read-hints.mjs";
 import {RequestPool} from "./request-pool.mjs";
-import {recoveryReadAhead,warmRecoveryReadAhead} from "./recovery-read-ahead.mjs";
+import {recoveryReadAhead,warmRecoveryReadAhead,proofPrefetchBytes} from "./recovery-read-ahead.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {IdleCheckpoint} from "./idle-checkpoint.mjs";
 import {instrumentTransport} from "./performance.mjs";
@@ -25,13 +25,23 @@ import {instantiateHost} from "../../zig/lib/objectstore/wasm/asyncify.mjs";
 import {createR2Transport} from "../../zig/lib/objectstore/wasm/r2.mjs";
 import {createImmutableReadCache} from "../../zig/lib/objectstore/wasm/cache.mjs";
 const utf8 = new TextEncoder();
+const proofDeadline=Symbol("proof deadline");
+function beforeProofDeadline(promise,deadlineMs,monotonicDeadline,clock){
+ const expired=()=>{const error=Error("DeadlineExceeded");error[proofDeadline]=true;return error;};
+ const remaining=()=>Math.min(deadlineMs-clock(),monotonicDeadline-performance.now());
+ if(remaining()<=0){Promise.resolve(promise).catch(()=>{});return Promise.reject(expired());}
+ return new Promise((resolve,reject)=>{
+  const timer=setTimeout(()=>reject(expired()),Math.max(1,Math.ceil(remaining())));
+  Promise.resolve(promise).then(value=>{clearTimeout(timer);if(remaining()<=0)reject(expired());else resolve(value);},error=>{clearTimeout(timer);reject(error);});
+ });
+}
 const hex=bytes=>Array.from(typeof bytes==="string"?utf8.encode(bytes):bytes,n=>n.toString(16).padStart(2,"0")).join("");
 const compare = (l, r) => {const a = utf8.encode(l), b = utf8.encode(r); for (let i=0; i<Math.min(a.length,b.length); i++) if (a[i]!==b[i]) return a[i]-b[i]; return a.length-b.length;};
 function rootMetrics(state){try{const root=JSON.parse(state?.root??'null');return{log_slot:state?.next??0,log_revision:state?.revision??0,inline_root_format:root?.format??0,inline_root_rows:root?.format===3?root.read_rows.exact.length:0,inline_root_has_pin:root?.format===3&&root.read_rows.selected!=null,inline_root_bytes:utf8.encode(state?.root??'').byteLength};}catch{return{inline_root_format:0};}}
 export const encode = value => JSON.stringify(value, (_, v) => v instanceof Uint8Array || v instanceof ArrayBuffer ? {__antfly_bytes: Array.from(new Uint8Array(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength))} : v);
 const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length === 1 && Array.isArray(v.__antfly_bytes) ? Uint8Array.from(v.__antfly_bytes) : v);
 export class R2CoordinatorStore {
-  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, inlineReadSet,transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport} = {}) {
+  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, inlineReadSet,transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport,proofBudget} = {}) {
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics;
     this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;this.recoveryWindow=recoveryWindow;
     const copyOwner=value=>{if(!Array.isArray(value)&&!(value instanceof Uint8Array)||value.length!==16||!Array.from(value).every(v=>Number.isInteger(v)&&v>=0&&v<=255))throw Error("InvalidCoordinatorOwner");return Array.from(value);};
@@ -43,7 +53,7 @@ export class R2CoordinatorStore {
     this.cache = scopedCache?.metadata??scopedCache??createImmutableReadCache({includeCommitLog:true,maxEntries:1024,writeThrough:true});
     this.dataCache=scopedCache??this.cache;
     const raw=transport??createR2Transport({database:bucket},{maxPutBytes:4*1024*1024});
-    this.rawTransport=raw;this.remoteCache=remoteCache;this.snapshotKernel=readKernel??kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;
+    this.rawTransport=raw;this.remoteCache=remoteCache;this.snapshotKernel=readKernel??kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;this.proofBudget=proofBudget;
     this.transport = this.cache.wrap(this.remoteCache(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body),{budgetKey:()=>this.physical??={},onMetrics:sample=>{for(const[key,value]of Object.entries(sample)){this.physical??={};this.physical[key]=(this.physical[key]??0)+value;}}}), `coordinator/${namespace}`);
     this.pending = []; this.running = false; this.state = null;
     this.rows=new Map();this.rowBytes=0;this.hintBytes=0;this.readHints=null;this.rowRevision=null;this.acquired=false;
@@ -145,6 +155,8 @@ export class R2CoordinatorStore {
     if(this.ownerReady)await this.ownerReady;
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
     const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=Math.min(this.clock()+5000,outerDeadlineMs),started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
+    const monotonicDeadline=started+Math.max(0,Math.min(5000,deadlineMs-this.clock()));
+    let proofPermit,failure,finalization;
     const reserve=(operations,bytes)=>{if(usedOperations+operations>=254||usedBytes+bytes>=8*1024*1024){admissionBudgetExceeded=true;throw Error("ReadSnapshotNeedsAdmission");}usedOperations+=operations;usedBytes+=bytes;};
     const cached=this.cache.wrap(this.remoteCache(instrumentTransport(this.rawTransport,physical),{background,budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}}),`coordinator/${this.namespace}`);
     const raw=(request,body)=>{onAdmission?.();return cached(request,body);};
@@ -162,7 +174,33 @@ export class R2CoordinatorStore {
       return this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue")onAdmission?.();},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,action:coordinate.action,...sample});}catch{}}});
     };
     this.snapshotReaders++;
+    const finish=()=>{
+      if(finalization)return finalization;
+      // Snapshot the native lifetime before attaching our combined lifetime to
+      // the returned error; otherwise finalization could await itself.
+      const nativeSettlement=proofPermit?failure?.ioSettled:undefined;
+      return finalization=(async()=>{
+      try{
+        await proofTransport.drain?.();
+        if(nativeSettlement)await nativeSettlement;
+      }finally{
+        proofPermit?.();this.snapshotReaders--;
+        if(outcome==="ok"&&(this.clock()>=deadlineMs||proofPermit&&performance.now()>=monotonicDeadline))outcome="error";
+        try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,proof_prefetch:!!proofPermit,proof_prefetch_reserved_bytes:proofPermit?proofPrefetchBytes:0,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}
+      }
+      })();
+    };
     try{
+      // The submitting request starts and owns proof I/O. Reserve a bounded
+      // auxiliary permit instead of holding an idle WASM stack on storage.
+      // Without a lifetime port, use the original in-kernel path.
+      if(proofTransport.prime&&typeof background==="function"&&this.proofBudget){
+        const acquisition=this.proofBudget.acquire(this.namespace);
+        try{proofPermit=await beforeProofDeadline(acquisition.ready,deadlineMs,monotonicDeadline,this.clock);}
+        catch(error){acquisition.cancel();throw error;}
+        reserve(1,proofPrefetchBytes-4*16384);proofPermit.start();
+        await beforeProofDeadline(proofTransport.prime({op:"get",bucket:"database",key:this.base+"/CHECKPOINT"}),deadlineMs,monotonicDeadline,this.clock);
+      }
       let observed,state=captured;
       for(let attempt=0;attempt<4;attempt++){
         observed=await native(state,readKeys?{action:"observe_read",observe_owned:owned,commands:readKeys.map(key=>({kind:"get",key})),read_prefix:readPrefix??null}:{action:owned?"observe":"observe_committed"});state=observed.state;
@@ -191,9 +229,24 @@ export class R2CoordinatorStore {
       },get:async key=>(await tx.getMany([key]))[0],put:()=>{throw Error("ReadSnapshotNeedsPin");}};
       const result=await run(tx);outcome="ok";return result;
     }catch(error){
-      if(admissionBudgetExceeded||["ObjectIoBudgetExceeded","HostedWorkingSetBudgetExceeded"].includes(error?.message)){outcome="needs_admission";throw Error("ReadSnapshotNeedsAdmission");}
+      failure=error;
+      if(admissionBudgetExceeded||["ObjectIoBudgetExceeded","HostedWorkingSetBudgetExceeded","ReadAheadCapacityExceeded"].includes(error?.message)){outcome="needs_admission";failure=Error("ReadSnapshotNeedsAdmission");if(error.ioSettled)Object.defineProperty(failure,"ioSettled",{value:error.ioSettled});throw failure;}
       throw error;
-    }finally{await proofTransport.drain?.();this.snapshotReaders--;const expired=outcome==="ok"&&this.clock()>=deadlineMs;if(expired)outcome="error";try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}if(expired)throw Error("DeadlineExceeded");}
+    }finally{
+      const settlement=finish();
+      if(proofPermit){
+        try{await beforeProofDeadline(settlement,deadlineMs,monotonicDeadline,this.clock);}
+        catch(error){
+          if(!error[proofDeadline])throw error;
+          // Timed-out binding I/O still owns its permit and origin lifetime.
+          // Late resource failures remain visible through instrumentTransport.
+          try{background(settlement);}catch{await settlement;}
+          if(failure){if(!failure.ioSettled)Object.defineProperty(failure,"ioSettled",{value:settlement});}
+          else{Object.defineProperty(error,"ioSettled",{value:settlement});throw error;}
+        }
+      }else await settlement;
+      if(!failure&&outcome!=="ok")throw Error("DeadlineExceeded");
+    }
   }
   commitWal(commit,{deadlineMs=Infinity,traceId,nativePlan=false,ioBudget}={}){
     return this.enqueue({kind:"commit_wal",commit,deadlineMs,traceId,nativePlan,ioBudget,priority:"interactive"});

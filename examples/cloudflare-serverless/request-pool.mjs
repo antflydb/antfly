@@ -20,6 +20,11 @@ export class RequestPool {
  constructor(create,slots,{recycleBytes=12*1024*1024,maxQueued=32,clock=Date.now,maxReservedBytes=Infinity,reservationBytes=0,defaultKernelVariant="default"}={}){this.create=create;this.clock=clock;this.defaultKernelVariant=defaultKernelVariant;this.maxReservedBytes=maxReservedBytes;this.reservationBytes=reservationBytes;this.reservedBytes=0;this.slots=Array.from({length:slots},()=>({host:null,busy:false}));this.recycleBytes=recycleBytes;this.maxQueued=maxQueued;this.pending=[];}
  request(input,options={}){return this.submit({input,options});}
  withHost(run,options={}){return this.submit({run,options});}
+ reserveQueuedAdmission(){
+  if(this.pending.length+(this.externalPending??0)>=this.maxQueued)return null;
+  this.externalPending=(this.externalPending??0)+1;let held=true;
+  return()=>{if(held){held=false;this.externalPending--;}};
+ }
  // Speculation must not queue behind useful work. Admission and reservation
  // happen synchronously; the callback still resumes in its submitting context.
  tryWithHost(run,options={}){return this.submit({run:async host=>({admitted:true,value:await run(host)}),options:{...options,onlyIfIdle:true}});}
@@ -31,7 +36,7 @@ export class RequestPool {
   if(typeof job.recycleBytes!=="number"||Number.isNaN(job.recycleBytes)||job.recycleBytes<0)return Promise.reject(Error("InvalidKernelRecycleBudget"));
   if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))return Promise.reject(new Error("DeadlineExceeded"));
   if(job.options.onlyIfIdle&&(this.pending.length||!this.slots.some(slot=>!slot.busy)||job.reservationBytes>this.maxReservedBytes-this.reservedBytes))return Promise.resolve({admitted:false});
-  if(this.pending.length>=this.maxQueued)return Promise.reject(new Error("CoordinatorCommitBusy"));
+  if(this.pending.length+(this.externalPending??0)>=this.maxQueued)return job.options.onlyIfIdle?Promise.resolve({admitted:false}):Promise.reject(new Error("CoordinatorCommitBusy"));
   const admitted=new Promise((resolve,reject)=>{
    Object.assign(job,{admit:resolve,reject,queuedAt:performance.now(),admittedAt:this.clock()});let timer;
    const abort=()=>{const index=this.pending.indexOf(job);if(index<0)return;this.pending.splice(index,1);job.cleanup();reject(new Error("DeadlineExceeded"));this.drain();};

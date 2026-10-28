@@ -20,6 +20,7 @@ import {openAuthority} from "./coordinator-authority.mjs";
 import {metadataKeys,captureReadView} from "./read-view.mjs";
 import {MIGRATION} from "./r2-coordinator-migration.mjs";
 import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
+import {readAheadBudgetFor} from "../../zig/lib/objectstore/wasm/read-ahead.mjs";
 
 // A reader authenticates committed metadata locally. It owns no mutable session
 // and can never create authority, acquire ownership or extend a durable pin.
@@ -27,7 +28,8 @@ export class NativeReadViews {
  constructor(module,env,{kernel,cache,clock=Date.now,onMetrics,background,cohortDelayMs=2}={}){
   this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions({delayMs:cohortDelayMs});this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,"r2",{allowCreate:false}));
   const observation={request:(input,options)=>kernel.request(input,{...options,kernelVariant:"observe",memoryReservationBytes:8*1024*1024,reservationClass:"authority"})};
-  this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readKernel:observation,cache,onMetrics,remoteCache:edgeCacheForEnv(env,{background})});
+  this.background=background;
+  this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readKernel:observation,cache,onMetrics,proofBudget:env.DETACHED_METADATA_PROOFS==="true"&&kernel.slots?.length?readAheadBudgetFor(kernel,Math.min(4,kernel.slots.length)):undefined,remoteCache:edgeCacheForEnv(env,{background})});
  }
  open(options={}){
   return this.cohorts.run(options.version??"latest",async(traceIds,close,publish)=>{
@@ -38,7 +40,7 @@ export class NativeReadViews {
     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
     const view=await captureReadView(tx,keys,options,this.clock);publish(view);return view;
-   },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background,deadlineMs:options.deadlineMs,...(this.env.FUSED_READ_ADMISSION==="true"?{readKeys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],readPrefix:keys.progress+"READ_PINS/"}:{})});
+   },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background??this.background,deadlineMs:options.deadlineMs,...(this.env.FUSED_READ_ADMISSION==="true"?{readKeys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],readPrefix:keys.progress+"READ_PINS/"}:{})});
   },options.trace_id,{untilAdmission:true,onPrepared:options.onPrepared,onAdmitted:options.onAdmitted});
  }
 }
