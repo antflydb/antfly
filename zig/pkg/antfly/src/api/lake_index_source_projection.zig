@@ -219,7 +219,12 @@ pub const Hydrator = struct {
             defer if (cursor) |value| {
                 value.control = .none;
             };
+            const previous_chunk = if (cursor) |value| value.chunk else null;
             if (tail == null) if (cursor) |value| if (try value.text(resolved.local_id)) |text| {
+                if (value.chunk != previous_chunk) {
+                    const base = entry.doc - resolved.local_id;
+                    _ = value.prefetchSelected(sorted_docs[at + 1 ..], base, base + segment.reader.doc_count);
+                }
                 if (visitor.text) |consume| if (try consume(visitor.ptr, row.allocator(), i, field, text)) {
                     self.column_values += 1;
                     continue;
@@ -231,7 +236,6 @@ pub const Hydrator = struct {
                 self.column_values += 1;
                 continue;
             };
-            const previous_chunk = if (cursor) |value| value.chunk else null;
             if (if (cursor) |value| try value.get(resolved.local_id) else null) |encoded| {
                 if (cursor) |value| if (value.chunk != previous_chunk) {
                     const base = entry.doc - resolved.local_id;

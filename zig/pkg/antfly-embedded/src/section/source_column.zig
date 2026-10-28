@@ -251,9 +251,19 @@ pub const Text = struct {
         const out = try a.alloc(u8, end - first);
         errdefer a.free(out);
         var begin = first;
+        var hinted: usize = first / page_size + 1;
+        const stop_page = (@as(usize, end) + page_size - 1) / page_size;
         while (begin < end) {
             try control.check();
             const index = begin / page_size;
+            // Required page plus at most four future pages, all inside the
+            // requested string interval. The source owns task/byte admission,
+            // cancellation, authentication and joining these advisory reads.
+            const through = @min(stop_page, @as(usize, index) + 5);
+            while (hinted < through) : (hinted += 1) {
+                const future = self.pages[hinted * 16 ..][0..16];
+                self.view.source.prefetch(self.view.offset + std.mem.readInt(u64, future[0..8], .little), std.mem.readInt(u32, future[8..12], .little));
+            }
             const entry = self.pages[index * 16 ..][0..16];
             const offset = std.mem.readInt(u64, entry[0..8], .little);
             const n = std.mem.readInt(u32, entry[8..12], .little);
