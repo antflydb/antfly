@@ -40,9 +40,13 @@ optional dynamically loaded local inference; portable musl builds do not.
 A complete release contains those five archives, `grep-release.json` (source,
 controller, build identity and per-platform digests), and `SHA256SUMS`. Publication
 requires the exact platform set and verified checksums. Existing release assets
-are verified and never overwritten; use Re-run failed jobs on the same workflow
-run after a transient failure. A moved tag, changed control policy or different release bytes fail
-closed. Grep releases explicitly disable GitHub's repository-wide Latest marker,
+are verified and never overwritten. Publication reconciles server state after
+upload errors and retries transient failures up to three times, uploading only
+missing files. Only empty, unfinished `starter` assets on a validated draft are
+removed before retry; uploaded assets and published releases are never deleted.
+Permission failures and conflicting digests fail immediately. After retry
+exhaustion, use Re-run failed jobs on the same workflow run. A moved tag, changed
+control policy or different release bytes fail closed. Grep releases explicitly disable GitHub's repository-wide Latest marker,
 so Antfly's existing stable install channel is unaffected. Grep publication does
 not publish Antfly npm/PyPI packages, containers, Homebrew formulas or docs.
 

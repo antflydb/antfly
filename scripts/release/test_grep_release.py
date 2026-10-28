@@ -103,6 +103,84 @@ def complete_payload(root, doc=None):
     return directory
 
 
+class ReleaseServer:
+    """Stateful GitHub fixture, including interrupted and uncertain uploads."""
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.doc = identity()
+        self.release = {
+            "id": 17,
+            "tag_name": self.doc["tag"],
+            "target_commitish": self.doc["source_commit"],
+            "prerelease": True,
+            "draft": True,
+            "assets": [],
+        }
+        self.calls = []
+        self.uploads = []
+        self.deleted = []
+        self.upload = None
+        self.next_id = 100
+
+    def accept(self, names):
+        for name in names:
+            path = self.directory / name
+            self.release["assets"].append(
+                {
+                    "id": self.next_id,
+                    "name": name,
+                    "state": "uploaded",
+                    "size": path.stat().st_size,
+                    "digest": "sha256:" + release.digest(path),
+                }
+            )
+            self.next_id += 1
+
+    def starter(self, name):
+        asset = {
+            "id": self.next_id,
+            "name": name,
+            "state": "starter",
+            "size": 0,
+            "digest": None,
+        }
+        self.next_id += 1
+        self.release["assets"].append(asset)
+        return asset
+
+    def execute(self, command, **kwargs):
+        self.calls.append(command)
+        if "--slurp" in command:
+            return json.dumps([[self.release]])
+        if command[1:3] == ["release", "upload"]:
+            names = [Path(path).name for path in command[6:]]
+            self.uploads.append(names)
+            if self.upload is not None:
+                self.upload(self, names)
+            else:
+                self.accept(names)
+            return ""
+        method = command[3]
+        if method == "DELETE":
+            asset_id = int(command[4].rsplit("/", 1)[1])
+            asset = next(a for a in self.release["assets"] if a["id"] == asset_id)
+            if not (
+                self.release["draft"]
+                and asset["state"] == "starter"
+                and asset["size"] == 0
+            ):
+                raise AssertionError("attempted to delete immutable release bytes")
+            self.deleted.append(asset_id)
+            self.release["assets"].remove(asset)
+            return ""  # The actual DELETE endpoint returns 204 with no JSON.
+        if method == "PATCH":
+            self.release.update(json.loads(kwargs["input"]))
+        elif method != "GET":
+            raise AssertionError(f"unexpected API mutation: {command}")
+        return json.dumps(self.release)
+
+
 class GrepReleaseTests(unittest.TestCase):
     def test_version_namespace_is_independent_and_canonical(self):
         for tag, expected in (
@@ -230,6 +308,7 @@ class GrepReleaseTests(unittest.TestCase):
                             state["release"]["assets"].append(
                                 {
                                     "name": file.name,
+                                    "state": "uploaded",
                                     "digest": "sha256:" + release.digest(file),
                                 }
                             )
@@ -275,6 +354,7 @@ class GrepReleaseTests(unittest.TestCase):
                 "assets": [
                     {
                         "name": name,
+                        "state": "uploaded",
                         "digest": "sha256:" + release.digest(directory / name),
                     }
                     for name in names[:-1]
@@ -289,6 +369,7 @@ class GrepReleaseTests(unittest.TestCase):
                     existing["assets"].append(
                         {
                             "name": names[-1],
+                            "state": "uploaded",
                             "digest": "sha256:" + release.digest(directory / names[-1]),
                         }
                     )
@@ -300,6 +381,176 @@ class GrepReleaseTests(unittest.TestCase):
             with patch.object(release, "run", side_effect=execute):
                 release.publish(directory, "antflydb/antfly", identity())
             self.assertFalse(existing["draft"])
+
+    def test_asset_delete_accepts_an_empty_204_response(self):
+        with patch.object(release, "run", return_value=""):
+            self.assertIsNone(
+                release.api("antflydb/antfly", "releases/assets/100", "DELETE")
+            )
+            with self.assertRaisesRegex(ValueError, "empty release metadata"):
+                release.api("antflydb/antfly", "releases/17")
+
+    def test_retry_reclaims_only_empty_starters_in_a_validated_draft(self):
+        for empty_digest in (None, "sha256:" + release.hashlib.sha256(b"").hexdigest()):
+            with (
+                self.subTest(digest=empty_digest),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                directory = complete_payload(Path(temp))
+                names = sorted(p.name for p in directory.iterdir())
+                server = ReleaseServer(directory)
+                server.accept(names[:-1])
+                accepted = copy.deepcopy(server.release["assets"])
+                starter = server.starter(names[-1])
+                starter["digest"] = empty_digest
+                with patch.object(release, "run", side_effect=server.execute):
+                    release.publish(directory, "antflydb/antfly", identity())
+                self.assertEqual(server.deleted, [starter["id"]])
+                self.assertEqual(server.uploads, [[names[-1]]])
+                self.assertEqual(server.release["assets"][:-1], accepted)
+                self.assertFalse(server.release["draft"])
+
+    def test_unfinished_asset_cleanup_rejects_conflicts_before_mutating(self):
+        for damage in (
+            "published",
+            "uploaded-empty",
+            "nonempty",
+            "digest",
+            "bad-id",
+            "unexpected",
+            "duplicate",
+            "completed-mismatch",
+        ):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as temp:
+                directory = complete_payload(Path(temp))
+                names = sorted(p.name for p in directory.iterdir())
+                server = ReleaseServer(directory)
+                starter = server.starter(names[0])
+                if damage == "published":
+                    server.release["draft"] = False
+                elif damage == "uploaded-empty":
+                    starter["state"] = "uploaded"
+                elif damage == "nonempty":
+                    starter["size"] = 1
+                elif damage == "digest":
+                    starter["digest"] = "sha256:" + "f" * 64
+                elif damage == "bad-id":
+                    starter["id"] = True
+                elif damage == "unexpected":
+                    starter["name"] = "foreign-file"
+                elif damage == "duplicate":
+                    server.accept([names[0]])
+                elif damage == "completed-mismatch":
+                    server.accept([names[1]])
+                    server.release["assets"][-1]["digest"] = "sha256:" + "f" * 64
+                with patch.object(release, "run", side_effect=server.execute):
+                    with self.assertRaises(ValueError):
+                        release.publish(directory, "antflydb/antfly", identity())
+                self.assertEqual(server.deleted, [])
+                self.assertEqual(server.uploads, [])
+
+    def test_partial_upload_retries_only_unaccepted_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = complete_payload(Path(temp))
+            names = sorted(p.name for p in directory.iterdir())
+            server = ReleaseServer(directory)
+
+            def fail_once(server, missing):
+                if len(server.uploads) == 1:
+                    server.accept(missing[:1])
+                    server.starter(missing[1])
+                    raise subprocess.CalledProcessError(
+                        1, ["gh", "release", "upload"], stderr="HTTP 502: Bad Gateway"
+                    )
+                server.accept(missing)
+
+            server.upload = fail_once
+            with (
+                patch.object(release, "run", side_effect=server.execute),
+                patch.object(release.time, "sleep") as sleep,
+            ):
+                release.publish(directory, "antflydb/antfly", identity())
+            self.assertEqual(server.uploads, [names, names[1:]])
+            self.assertEqual(len(server.deleted), 1)
+            self.assertEqual(
+                [a["name"] for a in server.release["assets"]].count(names[0]), 1
+            )
+            sleep.assert_called_once_with(1)
+            self.assertFalse(server.release["draft"])
+
+    def test_lost_upload_response_reconciles_without_reuploading(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = complete_payload(Path(temp))
+            server = ReleaseServer(directory)
+
+            def accepted_but_response_lost(server, names):
+                server.accept(names)
+                raise subprocess.CalledProcessError(
+                    1, ["gh", "release", "upload"], stderr="connection reset by peer"
+                )
+
+            server.upload = accepted_but_response_lost
+            with (
+                patch.object(release, "run", side_effect=server.execute),
+                patch.object(release.time, "sleep") as sleep,
+            ):
+                release.publish(directory, "antflydb/antfly", identity())
+            self.assertEqual(len(server.uploads), 1)
+            self.assertEqual(server.deleted, [])
+            sleep.assert_not_called()
+            self.assertFalse(server.release["draft"])
+
+    def test_transient_retries_are_bounded_and_later_run_can_recover(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = complete_payload(Path(temp))
+            server = ReleaseServer(directory)
+
+            def unavailable(server, names):
+                server.starter(names[0])
+                raise subprocess.CalledProcessError(
+                    1,
+                    ["gh", "release", "upload"],
+                    stderr="HTTP 503: Service Unavailable",
+                )
+
+            server.upload = unavailable
+            with (
+                patch.object(release, "run", side_effect=server.execute),
+                patch.object(release.time, "sleep") as sleep,
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    release.publish(directory, "antflydb/antfly", identity())
+                self.assertEqual(len(server.uploads), 3)
+                self.assertEqual([c.args for c in sleep.call_args_list], [(1,), (2,)])
+                self.assertTrue(server.release["draft"])
+                # A normal workflow retry uses the retained server state.
+                server.upload = None
+                release.publish(directory, "antflydb/antfly", identity())
+                self.assertFalse(server.release["draft"])
+                self.assertEqual(len(server.uploads), 4)
+
+    def test_permission_errors_are_not_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = complete_payload(Path(temp))
+            server = ReleaseServer(directory)
+
+            def denied(server, names):
+                raise subprocess.CalledProcessError(
+                    1,
+                    ["gh", "release", "upload"],
+                    stderr="HTTP 403: Credential renewal timeout; resource not accessible",
+                )
+
+            server.upload = denied
+            with (
+                patch.object(release, "run", side_effect=server.execute),
+                patch.object(release.time, "sleep") as sleep,
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    release.publish(directory, "antflydb/antfly", identity())
+            self.assertEqual(len(server.uploads), 1)
+            sleep.assert_not_called()
+            self.assertTrue(server.release["draft"])
 
     def test_workflows_keep_tag_code_read_only_and_publish_after_qualification(self):
         request = (ROOT / ".github/workflows/grep-release-request.yml").read_text()

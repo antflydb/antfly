@@ -27,6 +27,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
+import time
 
 from release_channels import is_canonical_tag
 
@@ -412,9 +413,12 @@ def api(repository: str, path: str, method: str = "GET", body: dict | None = Non
     command = ["gh", "api", "--method", method, f"repos/{repository}/{path}"]
     if body is not None:
         command += ["--input", "-"]
-    return json.loads(
-        run(command, input=json.dumps(body) if body is not None else None)
-    )
+    response = run(command, input=json.dumps(body) if body is not None else None)
+    if response:
+        return json.loads(response)
+    if method == "DELETE":
+        return None
+    raise ValueError("GitHub API returned empty release metadata")
 
 
 def publish(directory: Path, repository: str, identity: dict) -> None:
@@ -479,38 +483,93 @@ def publish(directory: Path, repository: str, identity: dict) -> None:
         ):
             raise ValueError("existing grep release source/version mismatch")
         observed = {}
+        unfinished = []
+        seen = set()
         for asset in release["assets"]:
             name = asset["name"]
+            if name in seen or name not in expected:
+                raise ValueError("duplicate or unexpected grep release asset")
+            seen.add(name)
+            # GitHub can leave an empty starter after an interrupted upload.
+            # Only that unpublished placeholder can be deleted, never an
+            # uploaded asset (even one whose bytes differ from this build).
             if (
-                name in observed
-                or name not in expected
-                or asset.get("digest") != "sha256:" + expected[name]
+                release["draft"]
+                and asset.get("state") == "starter"
+                and type(asset.get("size")) is int
+                and asset["size"] == 0
+                and asset.get("digest")
+                in (None, "sha256:" + hashlib.sha256(b"").hexdigest())
+                and type(asset.get("id")) is int
+                and asset["id"] > 0
             ):
+                unfinished.append(asset)
+            elif (
+                asset.get("state") == "uploaded"
+                and asset.get("digest") == "sha256:" + expected[name]
+            ):
+                observed[name] = asset
+            else:
                 raise ValueError(
-                    "existing grep release asset differs; never overwrite release bytes"
+                    "existing grep release asset differs or is incomplete; never overwrite release bytes"
                 )
-            observed[name] = asset
-        return observed
+        return observed, unfinished
 
-    present = inspect(release)
-    missing = sorted(set(expected) - set(present))
-    if missing and not release["draft"]:
-        raise ValueError("published grep release is incomplete")
-    if missing:
-        run(
-            [
-                "gh",
-                "release",
-                "upload",
-                identity["tag"],
-                "--repo",
-                repository,
-                *[str(directory / name) for name in missing],
-            ]
-        )
-    release = api(repository, f"releases/{release['id']}")
-    if set(inspect(release)) != set(expected):
+    # Reconcile server state after every upload, including failed responses:
+    # GitHub may have accepted some or all bytes before the client lost its
+    # connection. Each retry uploads only missing files, preserving accepted
+    # content and validating the entire asset set before deleting placeholders.
+    max_upload_attempts = 3
+    for attempt in range(max_upload_attempts):
+        present, unfinished = inspect(release)
+        missing = sorted(set(expected) - set(present))
+        if not missing:
+            break
+        if not release["draft"]:
+            raise ValueError("published grep release is incomplete")
+        for asset in unfinished:
+            api(repository, f"releases/assets/{asset['id']}", "DELETE")
+        upload_error = None
+        try:
+            run(
+                [
+                    "gh",
+                    "release",
+                    "upload",
+                    identity["tag"],
+                    "--repo",
+                    repository,
+                    *[str(directory / name) for name in missing],
+                ]
+            )
+        except subprocess.CalledProcessError as exc:
+            upload_error = exc
+        release = api(repository, f"releases/{release['id']}")
+        present, unfinished = inspect(release)
+        if set(present) == set(expected):
+            break
+        if upload_error is not None:
+            # Authentication, validation and other permanent failures should
+            # surface immediately rather than repeating publication requests.
+            detail = upload_error.stderr or ""
+            http_status = re.search(r"\bHTTP\s*([0-9]{3})\b", detail, re.IGNORECASE)
+            transient = (
+                int(http_status[1]) == 429 or 500 <= int(http_status[1]) < 600
+                if http_status
+                else re.search(
+                    r"timed? out|timeout|context deadline exceeded|connection (?:reset|closed|refused|aborted)|\bEOF\b|broken pipe|temporary failure",
+                    detail,
+                    re.IGNORECASE,
+                )
+            )
+            if attempt + 1 == max_upload_attempts or not transient:
+                raise upload_error
+        elif attempt + 1 == max_upload_attempts:
+            raise ValueError("uploaded grep release is incomplete")
+        time.sleep(attempt + 1)
+    else:
         raise ValueError("uploaded grep release is incomplete")
+
     if release["draft"]:
         api(
             repository,
