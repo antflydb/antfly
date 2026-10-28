@@ -26,6 +26,15 @@ var processed: std.AutoHashMapUnmanaged(*std.Build.Step.Run, void) = .empty;
 var expanded_audits: std.AutoHashMapUnmanaged(*std.Build.Step.Run, void) = .empty;
 var partitions: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, *std.Build.Step.Compile) = .empty;
 var memory_profiles: std.AutoHashMapUnmanaged(*std.Build, runtime_memory.TestPartitionProfile) = .empty;
+var authored_partition_claims: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, usize) = .empty;
+
+/// Consumer code generation and its physical implementation are independent
+/// compilations. An independently authored partition claim must not grow when
+/// only the consumer's measured reservation changes.
+pub fn setAuthoredMaxRss(b: *std.Build, consumer: *std.Build.Step.Compile, bytes: usize) void {
+    std.debug.assert(bytes != 0);
+    authored_partition_claims.put(b.allocator, consumer, bytes) catch @panic("OOM");
+}
 
 /// Set before source-owner finalization; dependency builds keep their own profile.
 pub fn setMemoryProfile(b: *std.Build, profile: runtime_memory.TestPartitionProfile) void {
@@ -217,7 +226,8 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
 
 fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     const tests = testObject(executable) orelse return null;
-    const max_rss = if (tests.step.max_rss != 0) tests.step.max_rss else executable.step.max_rss;
+    const max_rss = authored_partition_claims.get(tests) orelse
+        if (tests.step.max_rss != 0) tests.step.max_rss else executable.step.max_rss;
     // A consumer's reservation is not evidence for its physical partition.
     // Apply independently measured partition claims only to qualified profiles;
     // other configurations keep the inherited floor and stable labels.

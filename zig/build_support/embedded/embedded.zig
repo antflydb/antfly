@@ -630,6 +630,14 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // and explicit model qualification. Installed models must not silently
     // change the cost or selection of the ordinary unit gate.
     const run_capi_tests = capiTestRun(b, capi_tests, &capi_default_filters, false);
+    if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .x86_64 and
+        target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and
+        target.result.abi == .gnu and optimize == .debug)
+    {
+        // Main's GNU Debug implementation completed under its existing 7 GiB
+        // claim. The 17.14 GB overrun was the separate consumer test object.
+        @import("../antfly/test_partitions.zig").setAuthoredMaxRss(b, capi_tests.object, 7 * 1024 * 1024 * 1024);
+    }
     run_capi_tests.addArgs(&.{ "--skip-test-filter", "capi local model " });
     // The remote-content boundary fixture shares this C API compilation.
     // Its focused target remains independently selectable; the unit gate runs

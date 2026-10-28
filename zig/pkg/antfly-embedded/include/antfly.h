@@ -544,6 +544,8 @@ antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool 
 /** Cancel a running or failed shadow by its new name; idempotent. Leaves the
  * serving index intact and schedules bounded shadow-artifact cleanup. Failed
  * jobs do not retry or pin replay; cancel before registering a fresh attempt.
+ * Reusing the name can return ANTFLY_BUSY (IndexArtifactCleanupPending) until
+ * cleanup finishes, including after replay has drained. Retry with bounded backoff.
  * delete_index on either name also cancels dependent replacements. */
 antfly_error_code antfly_db_cancel_replacement(antfly_db *db, antfly_slice name, bool *out_cancelled);
 antfly_error_code antfly_db_list_enrichments_json(antfly_db *db, antfly_buffer *out);

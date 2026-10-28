@@ -2730,23 +2730,161 @@ The cursor, shortcuts, members and readiness share one native transaction.
 Native graph edits append to a destination-owned, 256-slot bounded edit journal
 in the same transaction as pin propagation and the new head. Enrollment is owner-only:
 native memory identities without static consumers create no unused log. Slots are
-limited to 64 KiB, bounding the retained journal to 16 MiB per namespace. Each event captures
-changed pin-count boundaries and routing keys. Per-boundary manifests locate old
-membership directly; root-to-path indexes locate only affected canonical shortcuts.
-Owner repair seeds persistent dirty queues, expands affected roots, clears their
-paths, and repairs only queued boundaries. New edits coalesce into these queues;
-they do not discard unaffected members or restart a profile-wide clear/build pass.
-Unchanged paths and text-only edits reuse their prior work.
+limited to 64 KiB. Each event captures changed pin-count boundaries, routing keys,
+and old/new redirect targets. The same transaction maintains a deduplicated
+`invalidated/<latest-sequence>/<key-hash>` range and a point version for each key.
+Overwriting a ring slot removes an expired invalidation only if that event still
+owns its point version. Repeated edits to a hot key therefore retain one posting;
+storage is bounded by retained events, with no synchronous profile fanout.
 
-A read-side proof checks at most 16 retained events and 128 boundary/path steps.
-It admits unaffected root postings across a newer graph cut and excludes dirty,
-old and new affected roots immediately. If that proof is too large, the journal
-has a gap, or cleanup is publishing the final repaired cut, readers use exact
-fallback. Final head, source, and authorization fences are unchanged. The owner
-publishes the repaired graph watermark only after every affected boundary and
-cleanup page completes. Full rebuilding is reserved for initial enrollment,
-legacy-format upgrade, oversized invalidations, or recovery after falling behind
-the journal's retained history. The ring cannot accumulate an unbounded log.
+Projection format 5 builds every configured node, including unpinned and
+masked configured parents, plus the native forward paths reachable from them.
+It never enumerates the whole native namespace for each static profile. Each
+included node has one canonical path row, one root-dependency posting, and at
+most one direct reverse-parent posting. Converging paths share these rows.
+Static-only nodes use scalar canonical lookups and one direct edge; curated
+paths share durable, resumable path compression. Pin membership follows only
+after dependencies and configured-edge guards are complete. Each configured
+edge retains a direct parent guard. If its source and parent have different
+effective roots, a latent root dependency covers future unmerge. Parent-path
+changes refresh guards through immutable reverse configured edges, including
+edges currently masked by native routing.
+
+Scoping the projection also requires detecting new incoming native paths.
+The shared edit journal records native redirect targets that themselves have a
+native redirect, using bounded point reads in the mutation transaction, without
+walking chains or publishing per-profile rows. A latest-version `tails/` index
+and `tail-key/` ownership postings deduplicate these entry points across slots;
+slot expiration removes only descriptors it still owns. Negative dependency
+proofs first intersect edited routing sources with the profile's published
+paths, dirty nodes and active traces. All routing sources, including currently
+flat edges, enter shared `routed-key/` and `routed/` indices; this preserves a
+configured source that first enters an unknown node and later reaches a native
+chain. Small bursts use point coverage checks. Larger sets freeze sorted recent
+routing digests from the bounded compact journal, then gallop between that input
+and the profile's coverage rows. A recently changed source is the only source-side
+input: the retained historical key index is never traversed to discover recent
+versions. Sparse inputs can skip gaps on either side. Cache validation uses a
+separate workspace, so extending an older checkpoint cannot mutate an active
+source iterator. Both changed-key workspaces fit in the existing 8-MiB proof
+scratch. The target
+index remains a cheap trigger, so flat unrelated edits need one empty range scan.
+Both index families expire only versions still owned by the overwritten slot.
+
+A fixed full-SHA memo shares converging suffixes within one proof. Exact terminals
+also share the existing 16-MiB routing LRU, miss coalescing and live-lease accounting.
+Antfly SHA-256 cache keys include the template, immutable profile, journal origin
+and source key. Each immutable result owns its terminal and sorted full-SHA path
+dependencies, including the terminal's absent outgoing edge. Unchanged routing
+can reuse it directly. Otherwise one bounded pass over retained `routed-compact/`
+records builds a sorted changed-key set; only edits newer than the result and
+intersecting its dependencies invalidate reuse. Journal ancestry, barriers and the
+256-event window are checked before accepting that proof. Unrelated edits retain
+warm terminals; edits to a path or terminal immediately require a fresh walk.
+Successful validation advances a small, synchronized validated-through checkpoint
+without changing retained paths or dependency arrays. Readers copy sequence,
+graph and routing identity together. Publication compares the observed checkpoint
+and refuses backward sequences, so older or competing snapshots cannot replace a
+new certificate. The next unrelated head validates only the new suffix rather
+than replaying the result's entire lifetime. No checkpoint is advanced on failed
+ancestry, dependency, history-window or barrier validation.
+Removal compares both the observed cache generation and validation checkpoint,
+preserving active leases, concurrent replacements and newer certificates on the
+same immutable path context. Older snapshots cannot evict newer entries in that lineage.
+Root sets, pin memberships, source proofs and grants are never cached in a terminal
+entry. Retained strings and dependencies own their bytes; bounded caller scratch
+and a 1-MiB reservation cover the largest frozen terminal result.
+
+After a cached terminal is excluded from the requested root set, its full-SHA
+dependencies can establish request-local suffix absence. The memo retains at most
+32 immutable leases and binary-searches their sorted full-SHA dependencies.
+It never materializes cached paths into a second hash table. On overflow it
+releases an optional old lease, preserving bounded memory and exact fallback.
+Repeated multi-entry warm proofs spend logarithmic dependency work rather than
+copying a whole path for every page, and spend no native forward work.
+Pending leases are released on replacement and every proof exit, and their
+memory remains charged to the existing routing budget. Root-set verdicts remain
+local and no partially resolved canonical result is published.
+
+A proof spends at most 16,384 cold forward steps. Cache hits spend no forward
+steps. A cycle, affected canonical root or exhausted budget selects exact fallback.
+Completed entries survive a later entry exhausting the work budget: the next read
+can finish that entry instead of repeating the completed walks. Cache admission
+and retention are optional; denied entries use the same bounded exact walker.
+Routing-source enrollment has its own readiness flag, origin and barrier; legacy
+history cannot authorize a scoped projection accidentally.
+
+Owner repair expands reverse dependencies from changed routing nodes, rather than
+all members of their old canonical root. It clears and rebuilds only those path
+nodes and their incident pin boundaries. Only configured, projected, queued or
+active-walk nodes enter routing repair; unrelated native edits are ingested
+without copying their paths. New targets acquire routing rows while the changed
+source path is compressed;
+pin-only edits do not enroll unnecessary graph work.
+Dirty old/new roots remain unreadable during partial publication. Journal ingestion
+has its own durable sequence and graph anchor, separate from the published graph.
+New edits enter deduplicated next-work queues without rewinding active expansion,
+path reconstruction or membership cursors. Ingestion consumes the shared turn
+budget until it catches up, then active repair uses the remaining capacity.
+A fixed quarter-turn quota must not idle spare capacity and starve active work.
+Each event is decoded once per turn in a separate 1-MiB scratch frame. The
+remaining 7-MiB item frame resets after every boundary, routing or target lookup;
+valid 16-KiB canonical keys cannot accumulate decoded strings across a batch.
+Only queued writes survive in the transaction arena. Active work pauses only after exhausting its
+available ingestion capacity while still behind. A persisted set of visited walk
+nodes invalidates only walks whose prefix intersects a routing edit. Unrelated heads do
+not restart a long walk, even across more than 256 updates, provided ingestion
+keeps pace. Trace rows and retired work sets are reclaimed in bounded turns.
+A bounded prune queue also removes unconfigured nodes with no incoming graph
+dependencies, cascading through their old forward edges. A native declaration
+alone does not keep a profile path live. Old targets and removed sources cannot
+accumulate path rows under sustained unique-target churn. Configured nodes and
+referenced targets remain live. Cleanup and the final
+graph watermark share the native writer transaction.
+
+Read-side validity uses one retained lineage anchor. Tiny edit bursts use one
+ordered invalidation page and exact dependency reads. Strategy selection also
+bounds the roots-by-edits cross product: beyond 128 combinations (except one/two
+edits, which stay linear in roots), a complete small page supplies digests to the
+same summary proof without reopening journal slots. Empty root summaries return
+before allocating a leaf-page buffer. Larger bursts read compact full SHA-256
+digests from the same 256-event journal into bounded scratch. A full-SHA hash
+set compacts duplicate digests once, then sorts only the unique digests. The
+maximum retained ring uses 5 MiB for digests and a 1-MiB index table. No per-root
+sort or repeated slot decoding is required.
+
+Root summaries contain sorted 64-bit SHA fingerprints with reference counts.
+Small roots fit in one compact binary row; larger roots split into sorted
+interval leaves of at most 128 entries. Inserts, splits, local merges, collapse
+and deletion require at most four native writes per dependency. Readers stream
+up to 128 leaves per page with reusable scalar caches. Intersection searches the
+smaller side: small-root fingerprints binary-search the sorted changed hashes;
+large roots probe the changed hashes through cached leaves. Every full-SHA hash
+sharing a positive 64-bit fingerprint is emitted for exact verification. Empty leaves and exhausted
+roots are reclaimed. Fingerprints are negative proofs only: every hit is checked
+against the full-SHA root dependency posting. Reference counts preserve collisions
+on deletion; latent configured-edge hits also require the native mask to be
+absent. Compact journal records are at most 20 KiB plus an eight-byte sequence
+per event, with no per-profile fanout on native edits.
+
+This keeps scans independent of distinct edited-key cardinality for unrelated
+roots. All transient journal, native mask and dependency reads use reusable
+scratch rather than the request arena. Old/new redirect targets and the native-tail fence cover
+new incoming paths. Dirty roots retain exact fallback during partial publication.
+A journal gap, oversized event or older projection format also uses exact fallback.
+Fallback canonicalization decodes one hop at a time in resettable 256-KiB
+scratch. Cycle detection retains only full-SHA hashes (64 on the stack, then a
+bounded 640-KiB workspace for at most 16,384 keys), rather than decoded path strings.
+The optional memo has a separate bounded lifetime. Both cached membership and
+streaming fallback accept long keys without accumulating JSON per hop.
+No request advances owner work. Final head, source and authorization fences remain
+independent. Full rebuilding is reserved for initial enrollment, format upgrade,
+oversized invalidations, or ingestion falling behind retained history.
+
+This generation uses Lite reader 29, topology protocol 68, metadata bootstrap v21,
+and Lite query-pin enrollment v9. Legacy v12-v20 declaration/profile proofs remain
+valid during dependency backfill; older pin projections use exact fallback
+until their owner publishes format 5. Older native readers refuse the new floor.
 A profile enrollment epoch also drives bounded retirement cleanup, so replacing
 immutable profiles does not accumulate their obsolete membership generations.
 Namespace retirement uses the existing bounded native-prefix cleanup.
@@ -2798,8 +2936,245 @@ portable state validation and final readiness without scratch exhaustion. Lite
 owner tests exercise static materialization, curation, reopen and unmerge.
 
 The incremental single-pin regression adds one pair with 1,000 and 6,000 unrelated
-pins. Both cases complete in one owner turn with nine writes and 13 scans;
+pins. Both cases complete in one owner turn with 13 writes and 24 scans;
 the previous whole-profile repair needed 2,025/12,142 writes and 24/141 turns.
 A separate full-composition reference checks 1,536 seed queries during 48
 interleaved routing edits and partial owner turns. It also exercises a missed
 256-event journal window and verifies bounded recovery rather than stale readiness.
+
+Dependency projection regression evidence: with 1,000 and 6,000 pins sharing a
+root, redirecting one configured leaf completes in one 128-work owner turn with
+45 derived/state writes and 39 scans. A zero-result query on an unrelated root
+uses six scans after 17 unique edits and after 145 edits with repeated hot keys;
+the prior 6,000-pin implementation used 48,481 owner writes/470 turns for the leaf
+and 25,995 scans for the 17-edit read. Fixtures assert the same bounds at both
+sizes and validate portable rows, legacy projection upgrade, masked unmerge at
+every 32-work repair cut, and ring eviction without orphan invalidations.
+Continuous redirects to unique temporary targets retain only the live graph;
+a still-masked configured fallback keeps its unaffected root indexed.
+Run the focused dependency contracts with `zig build memory-dependency-test`
+from `zig/`, or include them through the complete `memory-test` target.
+
+The distinct-invalidation regression edits 256 and 4,096 different configured
+keys. Both unrelated zero-result queries use seven scans and less than 34 KiB
+of request arena; both succeed with a 64-KiB fixed request allocator. An
+8,192-root proof checks scratch reuse when every summary is empty. The former
+4,096-key path used 133 scans, 3.75 MiB of arena and exhausted that allocator.
+A 128-pin root repair completes in 51 owner turns with an unrelated routing edit
+before every turn (49 without churn), moving all 128 members. Previously it moved
+none in 64 busy turns. The long-walk regression ingests 500 consecutive unrelated
+heads during a 16,000-hop backfill. Summary regressions cover fingerprint collisions, repeated references, leaf
+splits, merges, collapse, deletion and empty-root reclamation. Owner turns allow at most
+129 derived/state writes with a 128-work budget; the minimum internal repair
+budget is 32 to accommodate atomic summary and guard updates.
+
+Further owner/read regressions use 16 unrelated routing updates before each
+128-work owner turn. The older 128-member component is fully moved within
+128 busy turns; the current background component then reaches global readiness
+in one quiet turn. Previously no members moved in 64 busy turns and recovery
+needed another 123 quiet turns. Global readiness under sustained input still
+depends on whether the complete repair workload fits available owner capacity.
+For 128-key journal batches, a turn performs 64 derived/state writes with under
+93 KiB of owner arena (formerly 17 writes with 1.03 MiB); a 512-KiB fixed allocator
+succeeds, and event reads are bounded to one lineage anchor plus one ingestion
+read. A 1,024-root, small-burst proof uses 3,074 point reads rather than 41,986;
+the complete zero-result query uses 12,294 point reads rather than 51,206.
+The summary path adds bounded root-prefix scans; this measures storage-operation
+counts rather than claiming equivalent end-to-end latency gains.
+
+Scoped-projection and summary regressions extend these measurements. With 16
+configured aliases, adding 6,000 unrelated native aliases leaves 18 projected
+paths and 264 bytes of summary values: enrollment takes six bounded turns and
+204 writes, rather than 863 turns and 67,121 writes. Updating 64 unrelated native
+routes then takes three state writes. For 6,000 independent two-node roots,
+summary values occupy 288,000 logical bytes instead of 47,841,280 bytes of counter
+pages. These are encoded value sizes, not physical database or resident sizes.
+A 100,000-member root uses 1,204,420 summary bytes; 10,000 absent fingerprints
+produce zero positives in nine leaf scans with the deterministic fixture.
+Repeated-edit proof coverage holds 130 unique invalidations across 64 events and
+64 queried roots to 8,320 summary probes, versus 532,416 without deduplication.
+Native-tail tests cover chains present before and constructed after a redirect,
+correct results at every partial owner cut, orphan pruning while native
+declarations survive, shared thousand-hop suffixes and ring ownership expiry.
+
+The membership backfill now merge-seeks configured node and native pin-count
+indexes. Either index skips unrelated gaps, so neither all native pins nor all
+configured aliases are enumerated merely to find a sparse intersection. The
+exclusive digest cursor remains compatible with an in-progress format-5 posting
+pass. A paused boundary walk finishes its original key even if that pin disappears;
+queued repair retracts the old member before readiness. No storage-format or
+reader-floor change is needed for these improvements.
+
+With 16 configured aliases and 0, 1,000 or 6,000 unrelated native distinct pairs,
+enrollment takes four owner turns, 122 writes and 192 point reads at every size.
+The former 6,000-pair case took 107 turns and 25,032 point reads. A separate
+membership-phase fixture with two relevant pins uses 10 reads and eight scans
+(including result verification) with either 1,000 or 10,000 configured aliases.
+A historical native-posting cursor resumes and restores four missing members in
+one bounded turn. Removing a pin during a paused curated boundary walk preserves
+exact results at every repair cut.
+
+An unrelated 8,192-edge native tail still takes 8,194 native reads on its cold
+proof, and zero native path reads on subsequent proofs (bounded journal and
+coverage reads remain). Two disjoint cold tails can exhaust the shared work budget once;
+the next read resolves the remaining tail in 8,194 reads, then both are warm.
+Regressions cover immediate routing invalidation, distinct configured profiles,
+caller-scratch poisoning and exact behavior when routing-cache admission is denied.
+The 128-key, maximum escaped canonical-key fixture that formerly exhausted 8 MiB
+after 72 entries now completes with 128-work turns; mixed routing/target events
+also complete with the supported 4,096-work quantum.
+
+Fresh-review regression measurements for the routing-source generation:
+
+- With 64 queried roots, three dependencies each and 16,385 unique invalidations,
+  adaptive intersection makes 192 fingerprint probes, versus 1,048,640 previously.
+  Exact full-SHA checks still fence every positive, including fingerprint collisions.
+- Two unrelated 8,192-edge chains and repeated unrelated routing edits require
+  38–48 reads per public query, versus roughly 16,670 before scoped discovery.
+  Relevant cached chains additionally retain zero forward steps after unrelated
+  edits; changing a downstream dependency forces a fresh walk immediately.
+- A valid 3,647,828-byte namespace (4,194,304-byte default limit), 1,800 native
+  hops and 1,000-byte keys succeeds through cached and streaming membership
+  fallback. Previously the unrelated-root query exhausted scratch.
+
+The recent-source and checkpoint regressions add these operation-count bounds:
+
+- With 4,096 historical covered sources, eight new unrelated sources use 11
+  scans and nine use 13. The former history-wide join jumped to 8,197 scans at
+  nine sources. Recent intersection also covers dirty nodes and active traces,
+  and remains stable while another proof extends older routing history.
+- After warming an 8,192-hop canonical path, a new entry into its suffix uses
+  three reads, versus 8,196 before cached dependencies fed the local memo.
+  Warm-only cache hits materialize no path digests.
+- Accepted checkpoints use two journal reads per unrelated routing head: 512
+  reads across 256 heads, versus 33,152. Continuous validation also remains valid
+  at head 257; actual dependency edits, wrong ancestry, older snapshots and
+  journal barriers still refuse reuse. Concurrent checkpoint tests preserve
+  coherent fields, compare/publication fencing, immutable dependencies and
+  constant cache charges.
+
+Projection format remains 5. Legacy content qualification adds the reader-29 /
+topology-68 / bootstrap-v21 / Lite-enrollment-v9 durable contract described below.
+
+Native heads carry `lineage_version: 1` only when their base content is known.
+New adoption hashes the full initial namespace; ordinary edits inherit the
+qualification of their actual previous head, ignoring a caller-supplied flag.
+Older marker-less heads, including nonzero hashes that may have been rolled over
+an unknown legacy base, are unqualified. Unqualified reads use exact native
+lookup, bypassing composed, membership, terminal and invalidation-plan caches and
+published graph projections. Hashing an edit over an unknown base never grants
+cache eligibility.
+
+Qualification is owner-only, bounded and resumable through `lineage-v2/` work.
+Each turn hashes at most 128 individual native records within its work limit,
+retaining only a short relative cursor and a SHA-256 chain. Raw records are
+hashed in stable key order with Antfly SHA-256; no namespace scan occurs in a
+foreground query or ordinary mutation. Each mutation atomically advances a matching
+work fence and folds old/new values for processed records into the SHA chain.
+Edits ahead of the cursor are observed by the later scan. Tracked edits preserve
+progress; untracked writes or restored cuts with a mismatched fence still restart
+safely. Final publication rechecks the exact revision/fingerprint cut,
+publishes a content-qualified head and graph/routing stamps, resets the journal
+origin and barrier, and retires the cursor in the same transaction. Old graph
+projections then rebuild through their existing bounded owner path. The logical
+curation revision does not change. Portable snapshots validate the work cursor;
+reader 29 / topology 68 gate the durable marker and work rows. Existing
+v12-v20 declaration/profile proofs remain usable during this work.
+
+Large negative proofs share only immutable sorted invalidation digests, keyed by
+qualified namespace origin plus exact baseline/current graph and journal cuts.
+A shared decoded-profile cache reservation covers at most 8 MiB scratch and a
+bounded frozen arena; retained bytes and active leases remain charged to the
+existing 48-MiB lane. There is no additional cache budget. Concurrent misses use
+the existing coalescing mechanism. Root selection, dirty markers, full-SHA hits,
+native masks, source proofs and final grants are checked afresh on every request.
+Cache denial uses the same bounded streaming preparation. Missing history or a
+barrier still refuses indexed reuse, independently of retained cache entries.
+
+Additional deterministic regressions:
+
+- Divergent legacy destinations that formerly returned zero distinct pins in
+  the second destination now return the exact result of one. Both qualification
+  before the first edit and edits before qualification are covered; reads remain
+  free of writes throughout backfill, and partial work tracks committed mutations.
+- Twenty pages at one unchanged head after 128 retained events formerly repeated
+  2,560 compact-journal reads out of 2,940 total native reads. After the first
+  preparation, they perform zero additional compact reads and 380 total reads.
+  Admission denial preserves the exact result and later indexed cache recovery.
+- Repeated two-entry proofs into an 8,192-hop warm path use 13 sorted dependency
+  comparisons instead of materializing 8,193 digests per page. Native reads remain
+  three and forward steps remain zero. Pending leases remain bounded on spill.
+
+Routing-history preparation uses immutable sorted `(full SHA-256, latest sequence)`
+plans in the same 48-MiB shared decoded-profile lane. Keys include the qualified
+journal origin, namespace template, baseline/current sequence, graph and routing
+fingerprints; profile coverage and root verdicts are never part of the plan.
+The 12-MiB reservation covers 8 MiB of build scratch and a bounded frozen arena,
+with normal miss coalescing, LRU eviction and live-lease accounting. No durable
+format or reader-floor change is required. Unqualified content and denied cache
+admission retain bounded streaming preparation.
+
+Large recent-source intersections borrow these arrays directly. An older cached
+terminal may require additional routing history: that extension copies the plan
+into private scratch before merging, leaving the iterator's leased input intact.
+Path, dirty-node and trace coverage are read afresh, including when a plan is
+already warm. Removing coverage affects the next iterator immediately.
+
+With 128 retained events containing chained targets, 20 identical public queries
+formerly reread 2,560 routing-compact rows and made 2,940 total native reads.
+Warm routing plans use zero routing-compact rereads and 380 native point reads;
+profile-coverage scans remain fresh. Regressions also cover
+private extension to older checkpoints, fresh coverage after deletion, admission
+denial and recovery, and leased data surviving eviction and allocation failures.
+
+
+Coverage intersections now page within the existing request scratch. They begin
+with one-row galloping seeks and switch to bounded pages when recent digests are
+dense relative to coverage or matching rows are consecutive. Page reuse performs
+binary seeks within retained rows. Sparse gaps discard mostly unused pages and
+return to one-row seeks, preserving the nine-recent-source/4,096-historical-row
+regression without scanning the old coverage index.
+
+At most 128 rows are held in a dedicated 1-MiB portion of the existing scratch.
+Read-only page attempts halve on allocation exhaustion and remember the smaller
+byte ceiling; cheap fully consumed pages may grow again. Frozen routing history,
+older-checkpoint extension scratch and event I/O occupy separate regions. Page
+rows survive event-frame reuse, and no coverage or root verdict is cached across
+requests. No new allocation tier, cache budget, durable format or writer work is
+introduced. Maximum 16-KiB keys with heavily escaped values retain exact results.
+
+For 20 warm public queries after 128 retained events, coverage seeks fall from
+6,340 to 140 and total scan calls from 6,480 to 280. Point reads remain 380.
+Returned rows change from 7,140 to 7,280: batching reduces repeated seeks while
+retaining bounded overread. Tests cover all-positive dense pages, sparse gaps,
+byte-limit backoff, event-scratch poisoning and fresh coverage after deletion.
+
+
+Live upgrades retain qualification progress under ordinary edits. The version-2
+work row holds a relative record cursor, bounded SHA-256 transcript, exact byte
+counters and a revision/fingerprint fence. Foreground edits at or behind the
+cursor hash the record suffix and full old/new values with distinct scan/edit
+domains, adjust processed counters, and commit the new work fence with the head.
+Edits ahead of the cursor are picked up by the scan. Inserts, deletes, updates
+and header-only edits are covered; there is no catch-up queue or namespace scan
+on the writer path, and qualification remains owner-only.
+
+The transcript binds every processed record and its later mutations; it need
+not be a canonical fingerprint shared by differently interleaved histories.
+Final publication remains fenced on the exact current head, binds its semantic
+header fields, and resets graph/routing ancestry and the journal barrier as
+before. Unknown or mismatched work is never treated as a qualified base.
+Historical `lineage-v1` rows remain portable and are retired by bounded owner
+work rather than reused as v2 certificates. Reader 29, topology 68, metadata
+bootstrap v21 and Lite enrollment v9 gate the new durable contract; v12-v20 read
+proofs remain available while owner work runs. Already qualified heads retain
+their existing qualification and projection format 5.
+
+The live-upgrade fixture has 256 records and one suppression toggle between
+owner turns. Previously 64 turns reread 7,808 rows without advancing beyond the
+first chunk. Qualification now completes in three turns and reads each original
+record once while 64 edits continue. Mutation tracking adds no record scans;
+ordinary pin-maintenance scans match an identical qualified control namespace.
+Tests check processed byte counters against native row censuses, mutations on
+both sides of the cursor, header-only edits, legacy-work retirement, untracked
+cut restart and portable-row validation.

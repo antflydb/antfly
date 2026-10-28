@@ -16,8 +16,10 @@
 //! A bounded allocation/free trace for stream-owned graph arenas. Offsets
 //! overlap only after the preceding consumer is submitted on the same stream.
 const std = @import("std");
+// CUDA device addresses are 64-bit tokens, independent of host pointer width.
+const DevicePointer = u64;
 pub const limit = 128 * 1024 * 1024;
-const Allocation = struct { bytes: usize, offset: usize, pointer: usize, live: bool = true };
+const Allocation = struct { bytes: usize, offset: usize, pointer: DevicePointer, live: bool = true };
 const Event = struct { slot: usize, allocate: bool };
 pub const Plan = struct {
     allocations: [2048]Allocation = undefined,
@@ -35,7 +37,7 @@ pub const Plan = struct {
         self.events[self.event_count] = .{ .slot = slot, .allocate = is_alloc };
         self.event_count += 1;
     }
-    pub fn allocate(self: *Plan, bytes: usize, pointer: usize) void {
+    pub fn allocate(self: *Plan, bytes: usize, pointer: DevicePointer) void {
         if (!self.valid) return;
         if (self.count == self.allocations.len or bytes > limit) {
             self.valid = false;
@@ -60,7 +62,7 @@ pub const Plan = struct {
         self.count += 1;
         self.peak = @max(self.peak, offset + extent);
     }
-    pub fn release(self: *Plan, pointer: usize) void {
+    pub fn release(self: *Plan, pointer: DevicePointer) void {
         if (!self.valid) return;
         for (self.allocations[0..self.count], 0..) |*a, i| if (a.live and a.pointer == pointer) {
             a.live = false;
@@ -74,7 +76,7 @@ pub const Plan = struct {
         };
         return self.valid;
     }
-    pub fn finish(self: *Plan, pointer: usize) bool {
+    pub fn finish(self: *Plan, pointer: DevicePointer) bool {
         var live: usize = 0;
         for (self.allocations[0..self.count], 0..) |a, i| if (a.live) {
             live += 1;
@@ -86,20 +88,20 @@ pub const Plan = struct {
 };
 pub const Scope = struct {
     plan: *Plan,
-    base: usize = 0,
+    base: DevicePointer = 0,
     cursor: usize = 0,
     valid: bool = true,
     // A caller-owned output can outlive individual arena allocations without
     // joining the ordinary temporary cache. Only its explicit producer may
     // borrow it; release remains valid through this complete stream scope.
-    output_ptr: usize = 0,
+    output_ptr: DevicePointer = 0,
     output_bytes: usize = 0,
     output_active: bool = false,
     output_taken: bool = false,
-    pub fn owns(self: *const Scope, pointer: usize) bool {
+    pub fn owns(self: *const Scope, pointer: DevicePointer) bool {
         return self.base != 0 and pointer >= self.base and pointer - self.base < self.plan.peak;
     }
-    pub fn allocate(self: *Scope, bytes: usize) !usize {
+    pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
         if (!self.valid or self.cursor == self.plan.event_count) return error.AudioPlanChanged;
         const e = self.plan.events[self.cursor];
         if (!e.allocate or self.plan.allocations[e.slot].bytes != bytes) {
@@ -109,7 +111,7 @@ pub const Scope = struct {
         self.cursor += 1;
         return self.base + self.plan.allocations[e.slot].offset;
     }
-    pub fn release(self: *Scope, pointer: usize) void {
+    pub fn release(self: *Scope, pointer: DevicePointer) void {
         if (self.base == 0) {
             self.plan.release(pointer);
             return;
@@ -154,4 +156,15 @@ test "LightOnOCR3 CUDA closed execution arena rejects live buffers and event dri
     var changed = Scope{ .plan = p, .base = 10000 };
     _ = try changed.allocate(256);
     try std.testing.expectError(error.AudioPlanChanged, changed.allocate(256));
+}
+
+test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
+    var plan: Plan = .{};
+    const address: u64 = 0x1_0000_1000;
+    plan.allocate(256, address);
+    try std.testing.expect(plan.finish(address));
+    var scope: Scope = .{ .plan = &plan, .base = address };
+    const allocated = try scope.allocate(256);
+    try std.testing.expectEqual(address, allocated);
+    try std.testing.expect(scope.owns(allocated));
 }

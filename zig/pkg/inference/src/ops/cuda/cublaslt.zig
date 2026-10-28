@@ -623,7 +623,7 @@ pub const CublasLt = struct {
         var alpha: f32 = 1.0;
         var beta: f32 = if (residual != null) 1.0 else 0.0;
         const workspace_ptr: ?*anyopaque = if (workspace.ptr != 0 and plan.workspace_size > 0)
-            @ptrFromInt(workspace.ptr)
+            try devicePointer(workspace.ptr)
         else
             null;
         ctx.makeCurrent() catch return error.CublasLtError;
@@ -631,14 +631,14 @@ pub const CublasLt = struct {
             self.handle,
             plan.op_desc,
             &alpha,
-            @ptrFromInt(weight.ptr),
+            try devicePointer(weight.ptr),
             plan.a_desc,
-            @ptrFromInt(input.ptr),
+            try devicePointer(input.ptr),
             plan.b_desc,
             &beta,
-            @ptrFromInt(if (residual) |value| value.ptr else dst.ptr),
+            try devicePointer(if (residual) |value| value.ptr else dst.ptr),
             plan.c_desc,
-            @ptrFromInt(dst.ptr),
+            try devicePointer(dst.ptr),
             plan.d_desc,
             &plan.algo,
             workspace_ptr,
@@ -1067,7 +1067,7 @@ pub const CublasLt = struct {
         var alpha: f32 = 1.0;
         var beta: f32 = 0.0;
         const workspace_ptr: ?*anyopaque = if (invocation.workspace.ptr != 0 and workspace_size > 0)
-            @ptrFromInt(invocation.workspace.ptr)
+            try devicePointer(invocation.workspace.ptr)
         else
             null;
         ctx.makeCurrent() catch return error.CublasLtError;
@@ -1075,14 +1075,14 @@ pub const CublasLt = struct {
             self.handle,
             plan.op_desc,
             &alpha,
-            @ptrFromInt(invocation.weight.ptr),
+            try devicePointer(invocation.weight.ptr),
             plan.a_desc,
-            @ptrFromInt(invocation.input.ptr),
+            try devicePointer(invocation.input.ptr),
             plan.b_desc,
             &beta,
-            @ptrFromInt(invocation.dst.ptr),
+            try devicePointer(invocation.dst.ptr),
             plan.c_desc,
-            @ptrFromInt(invocation.dst.ptr),
+            try devicePointer(invocation.dst.ptr),
             plan.d_desc,
             &algo,
             workspace_ptr,
@@ -1156,20 +1156,20 @@ pub const CublasLt = struct {
         try checkRawBytes(workspace, plan.workspace_size);
         var alpha: f32 = 1.0;
         var beta: f32 = 0.0;
-        const workspace_ptr: ?*anyopaque = if (workspace.ptr != 0 and plan.workspace_size > 0) @ptrFromInt(workspace.ptr) else null;
+        const workspace_ptr: ?*anyopaque = if (workspace.ptr != 0 and plan.workspace_size > 0) try devicePointer(workspace.ptr) else null;
         ctx.makeCurrent() catch return error.CublasLtError;
         const submit_status = self.fns.cublasLtMatmul(
             self.handle,
             plan.op_desc,
             &alpha,
-            @ptrFromInt(weight_f16.ptr),
+            try devicePointer(weight_f16.ptr),
             plan.a_desc,
-            @ptrFromInt(input_f16.ptr),
+            try devicePointer(input_f16.ptr),
             plan.b_desc,
             &beta,
-            @ptrFromInt(dst.ptr),
+            try devicePointer(dst.ptr),
             plan.c_desc,
-            @ptrFromInt(dst.ptr),
+            try devicePointer(dst.ptr),
             plan.d_desc,
             &plan.algo,
             workspace_ptr,
@@ -1354,9 +1354,9 @@ pub const CublasLt = struct {
     fn submitAttentionPlan(self: *CublasLt, ctx: *context_mod.CudaContext, plan: AttentionPlan, dst: buffer_mod.DeviceBuffer, a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, alpha_value: f32) Error!void {
         var alpha = alpha_value;
         var beta: f32 = 0;
-        const workspace_ptr: ?*anyopaque = if (plan.workspace > 0) @ptrFromInt(workspace.ptr) else null;
+        const workspace_ptr: ?*anyopaque = if (plan.workspace > 0) try devicePointer(workspace.ptr) else null;
         ctx.makeCurrent() catch return error.CublasLtError;
-        try self.check(self.fns.cublasLtMatmul(self.handle, plan.op, &alpha, @ptrFromInt(a.ptr), plan.a, @ptrFromInt(b.ptr), plan.b, &beta, @ptrFromInt(dst.ptr), plan.d, @ptrFromInt(dst.ptr), plan.d, &plan.algo, workspace_ptr, plan.workspace, ctx.stream));
+        try self.check(self.fns.cublasLtMatmul(self.handle, plan.op, &alpha, try devicePointer(a.ptr), plan.a, try devicePointer(b.ptr), plan.b, &beta, try devicePointer(dst.ptr), plan.d, try devicePointer(dst.ptr), plan.d, &plan.algo, workspace_ptr, plan.workspace, ctx.stream));
     }
 
     pub fn matmulF32WeightF32Out(
@@ -1380,7 +1380,7 @@ pub const CublasLt = struct {
 
     fn setBias(self: *const CublasLt, desc: MatmulDesc, bias: buffer_mod.DeviceBuffer) Error!void {
         const epilogue: c_int = CUBLASLT_EPILOGUE_BIAS;
-        const pointer: *const anyopaque = @ptrFromInt(bias.ptr);
+        const pointer: *const anyopaque = try devicePointer(bias.ptr);
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, @sizeOf(c_int)));
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, @ptrCast(&pointer), @sizeOf(@TypeOf(pointer))));
     }
@@ -1434,6 +1434,12 @@ fn requireDisjoint(
     const a_end = std.math.add(u64, a.ptr, a_len) catch return error.CublasLtUnsupported;
     const b_end = std.math.add(u64, b.ptr, b_len) catch return error.CublasLtUnsupported;
     if (a.ptr < b_end and b.ptr < a_end) return error.CublasLtUnsupported;
+}
+
+// Device addresses stay 64-bit until crossing the native C pointer ABI.
+fn devicePointer(address: driver_mod.CUdeviceptr) Error!*anyopaque {
+    const native = std.math.cast(usize, address) orelse return error.CublasLtError;
+    return @ptrFromInt(native);
 }
 
 fn stridedPointerAlignment(ptr: driver_mod.CUdeviceptr, stride: usize, element_bytes: usize, batches: usize) u32 {

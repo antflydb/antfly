@@ -7,6 +7,10 @@ import type { components, operations } from "./public-api.js";
 
 // Request/Response types
 export type EmbedRequest = components["schemas"]["InferenceEmbedRequest"];
+export type EmbedOptions = Pick<
+  EmbedRequest,
+  "task_type" | "dimensions" | "instruction" | "error_policy"
+> & { truncate?: boolean; signal?: AbortSignal };
 export type EmbedResponse = components["schemas"]["InferenceEmbedResponse"];
 
 export type ChunkRequest = components["schemas"]["InferenceChunkRequest"];

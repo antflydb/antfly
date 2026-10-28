@@ -120,6 +120,7 @@ export type {
   DecideRequest,
   DecideResponse,
   EmbedInput,
+  EmbedOptions,
   EmbedRequest,
   EmbedResponse,
   EntityExtractionResult,
@@ -549,6 +550,7 @@ export type {
   InferenceGatewayOperation,
 } from "./client.js";
 export { ChatGPTConnectionError } from "./client.js";
+export { AntflyHTTPError, AntflyResponseError } from "./errors.js";
 export type { MemoryNumbers, MemoryPaths, MemorySchemas } from "./memory.js";
 export { parseMemoryJSON, stringifyMemoryJSON } from "./memory.js";
 export * from "./models.js";

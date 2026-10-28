@@ -150,7 +150,11 @@ const std = @import("std");
 /// Version 108 decodes identity-bound operators and their derived dependency directory.
 /// Version 110 publishes database-owned casts and tags callable dependency owners.
 /// Version 111 decodes immutable namespace-owned named types.
-pub const current_version: u16 = 111;
+/// Version 112 combines main's resolver v63-v68: dependency-scoped repair,
+/// deletable summaries, scoped native paths, canonical routing proofs, legacy
+/// qualification, and bounded edits during resumable qualification. Earlier
+/// SQL readers must not admit these records using their overlapping numbers.
+pub const current_version: u16 = 112;
 pub const sql_type_version: u16 = 111;
 pub const sql_cast_version: u16 = 110;
 pub const sql_routine_version: u16 = 110;
@@ -202,7 +206,7 @@ pub const index_publication_admission_version: u16 = 100;
 pub const checks_catalog_identity_version: u16 = 64;
 /// Decoder floor for occupancy-capable reconciliation and name admission.
 pub const constraint_occupancy_version: u16 = 63;
-pub const resolver_namespaces_version: u16 = 104;
+pub const resolver_namespaces_version: u16 = 112;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {
@@ -397,3 +401,8 @@ pub const store_report_baseline_version: u16 = 10;
 
 /// Atomic, bounded acknowledgements for local schema migration readiness.
 pub const schema_progress_batch_version: u16 = 10;
+
+test "metadata table topology protocol keeps resolver qualification beyond named types" {
+    try std.testing.expect(resolver_namespaces_version > sql_type_version);
+    try std.testing.expect(current_version >= resolver_namespaces_version);
+}

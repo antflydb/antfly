@@ -277,6 +277,12 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     });
     inference_execution_control_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
+    const wasm_document_runs_mod = b.createModule(.{
+        .root_source_file = b.path("lib/readers/src/document_runs.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_execution_control_mod.addImport("antfly_document_runs", wasm_document_runs_mod);
     inference_execution_control_mod.addImport("antfly_platform", wasm_platform_mod);
     inference_execution_control_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
     const inference_execution_context_mod = b.createModule(.{
@@ -297,6 +303,24 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     });
     wasm_reader_config.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     embedded_support_wasm_mod.addImport("antfly_reader_config", wasm_reader_config);
+    const wasm_readers_mod = b.createModule(.{
+        .root_source_file = b.path("lib/readers/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_readers_mod.addImport("antfly_document_runs", wasm_document_runs_mod);
+    wasm_readers_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
+    wasm_readers_mod.addImport("antfly_reader_config", wasm_reader_config);
+    embedded_support_wasm_mod.addImport("antfly_readers", wasm_readers_mod);
+    const wasm_embeddings_mod = b.createModule(.{
+        .root_source_file = b.path("lib/embeddings/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_embeddings_mod.addImport("antfly-json", json_mod);
+    wasm_embeddings_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    wasm_embeddings_mod.addImport("antfly_embeddings_openapi", api.embeddings);
+    embedded_support_wasm_mod.addImport("antfly_embeddings", wasm_embeddings_mod);
 
     const embedded_wasm_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/engine/root.zig"),
@@ -485,6 +509,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .image = wasm_image_mod,
     });
     inference_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
+    inference_wasm_inference_mod.addImport("antfly_document_runs", wasm_document_runs_mod);
     inference_wasm_inference_mod.addImport("jinja", wasm_inference_jinja_mod);
     inference_wasm_inference_mod.addImport("ml", wasm_inference_ml_mod);
     inference_wasm_inference_mod.addImport("onnx_graph", wasm_onnx.graph);

@@ -347,6 +347,38 @@ fn localClaim(step: *std.Build.Step) ?usize {
         self.assertEqual(measured, claim(20 * 1024**3, True))
         self.assertEqual(inherited, claim(inherited, False))
 
+    def test_authored_partition_claim_is_independent_of_consumer_claim(self):
+        build = self.root / "build.zig"
+        source = (
+            build.read_text()
+            .replace(
+                '.name = "fixture", .root_module = root,',
+                '.name = "fixture", .root_module = root, .max_rss = 18 * 1024 * 1024 * 1024,',
+            )
+            .replace(
+                "    const wrapped = b.option",
+                '    @import("build_support/antfly/test_partitions.zig").setAuthoredMaxRss(b, tests, 1536 * 1024 * 1024);\n    const wrapped = b.option',
+            )
+            .replace(
+                "    owner.finalize(b);\n}",
+                r"""    owner.finalize(b);
+    std.debug.print("local-claim={}\n", .{localClaim(&b.top_level_steps.get("test").?.step).?});
+}
+fn localClaim(step: *std.Build.Step) ?usize {
+    if (step.cast(std.Build.Step.Compile)) |artifact|
+        if (std.mem.eql(u8, artifact.name, "fixture-local")) return step.max_rss;
+    for (step.dependencies.items) |dependency|
+        if (localClaim(dependency)) |claim| return claim;
+    return null;
+}""",
+            )
+        )
+        build.write_text(source)
+        output = self.build()
+        self.assertIn("local-claim=1610612736", output)
+        self.assertIn("local owned...", output)
+        self.assertIn("server owned...", output)
+
     def test_long_run_allows_ready_sibling_compilation(self):
         self.write("probe.zig", "export fn probe() u32 { return 42; }\n")
         self.write(

@@ -1323,7 +1323,19 @@ def test_pending_replacement_name_is_reserved_and_cancellable(tmp_path, storage)
         assert "old" in {i["name"] for i in db.list_indexes()}
         db.run_until_idle()
         assert not db.pending_work_stats()["replacements"]
-        db.add_index(dict(config, replaces="old"))
+        # Cancellation retires the shadow before its asynchronous artifact
+        # cleanup releases the name. Draining replay is not that cleanup fence.
+        # Retry only the documented retirement debt, without hiding other Busy
+        # errors or weakening the final replacement/edge assertions.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                db.add_index(dict(config, replaces="old"))
+                break
+            except antfly_embedded.BusyError as error:
+                assert "IndexArtifactCleanupPending" in str(error)
+                assert time.monotonic() < deadline, str(error)
+                time.sleep(0.01)
         db.run_until_idle()
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "s:0000", "R", 0)] == ["new"]
 
