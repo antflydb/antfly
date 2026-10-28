@@ -809,6 +809,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .structlog = structlog_mod,
             .jinja = inference_jinja_mod,
             .inference_api_source = inference_api_source,
+            .inference_config_openapi = inference_config_openapi_mod,
             .protobuf = protobuf_mod,
             .sentencepiece_proto = sentencepiece_proto_mod,
             .ml = inference_ml_mod,

@@ -1,10 +1,10 @@
 from enum import StrEnum
 
 
-class InferenceA4BResidencyMode(StrEnum):
+class RuntimeConfigGenerationBatchingMode(StrEnum):
     AUTO = "auto"
-    RESIDENT = "resident"
-    STREAMED = "streamed"
+    OFF = "off"
+    ON = "on"
 
     def __str__(self) -> str:
         return str(self.value)

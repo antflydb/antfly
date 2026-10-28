@@ -1,7 +1,7 @@
 from enum import StrEnum
 
 
-class InferencePromptCacheConfigMode(StrEnum):
+class PromptCacheConfigMode(StrEnum):
     BLOCK_HASH = "block_hash"
     RADIX = "radix"
     SIMPLE = "simple"
