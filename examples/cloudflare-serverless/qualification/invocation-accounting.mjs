@@ -14,6 +14,7 @@
 // limitations under the License.
 
 import {createHash} from 'node:crypto';
+import{reconcileCounterPopulations}from'./independent-counters.mjs';
 const hash=value=>createHash('sha256').update(value).digest('hex');
 export function rayIdentity(value){return typeof value==='string'&&/^[a-f0-9]{16,32}(?:-[A-Z]{3})?$/i.test(value)?hash(value.split('-')[0].toLowerCase()):null;}
 export function versionIdentity(value){return typeof value==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(value)?value.toLowerCase():null;}
@@ -52,7 +53,8 @@ export function reconcileInvocations(run,ledger,windows,{roleCounts,timeframe,le
   if(validRange(timeframe)){let next=timeframe.from;for(const range of ranges.sort((a,b)=>a.from-b.from)){if(range.from<timeframe.from||range.to>timeframe.to||range.from>next)failures.push('InvocationWindowGap');next=Math.max(next,range.to+1);}if(next!==timeframe.to+1)failures.push('InvocationWindowGap');}
   observed[role]={invocations:rows.length,types:Object.fromEntries([...invocationTypes].map(type=>[type,rows.filter(row=>row.event_type===type).length]))};
   if(new Set(rows.map(row=>row.invocation_id_sha256)).size!==rows.length)failures.push('InvocationIdentityRepeated');
-  if(!roleCounts||!Number.isSafeInteger(roleCounts[role]?.count)||roleCounts[role].sample_interval!==1||roleCounts[role].source!=='independent-platform-counter'||roleCounts[role].worker!==run.id+(role==='app'?'':'-'+role)||!sameRange(roleCounts[role].timeframe,timeframe))failures.push('IndependentInvocationCountMissing');else if(roleCounts[role].count!==rows.length)failures.push('InvocationCountMismatch');
+  if(roleCounts?.[role]?.populations)failures.push(...reconcileCounterPopulations(run,role,rows,roleCounts[role],timeframe));
+  else if(!roleCounts||!Number.isSafeInteger(roleCounts[role]?.count)||roleCounts[role].sample_interval!==1||roleCounts[role].source!=='independent-platform-counter'||roleCounts[role].worker!==run.id+(role==='app'?'':'-'+role)||!sameRange(roleCounts[role].timeframe,timeframe))failures.push('IndependentInvocationCountMissing');else if(roleCounts[role].count!==rows.length)failures.push('InvocationCountMismatch');
   if(role!=='app')continue;
   const http=rows.filter(row=>row.event_type==='fetch'),byAttempt=new Map(),expected=new Set();
   for(const row of http){if(!row.attempt_id_sha256)failures.push('InvocationAttemptIdentityMissing');else{if(byAttempt.has(row.attempt_id_sha256))failures.push('InvocationAttemptRepeated');byAttempt.set(row.attempt_id_sha256,row);}}

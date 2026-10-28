@@ -112,7 +112,15 @@ pub const Job = struct {
         if (self.offset > (if (self.phase == .remove) self.old_terms.bytes else self.new_terms.bytes)) return error.InvalidPublicationCheckpoint;
     }
     pub fn step(self: *Job, a: A, pages: *PageStore, maximum: usize) !?manifest.ArtifactRef {
-        if (maximum == 0 or maximum > 256 or self.phase == .done) return error.InvalidPublicationBudget;
+        if (maximum == 0 or maximum > 256) return error.InvalidPublicationBudget;
+        return self.stepBudgeted(a, pages, maximum, null);
+    }
+    /// Packed immutable leaf segments use the shared ordered-page format. The
+    /// routing root eagerly absorbs each batch: query fanout never grows with
+    /// the number of publication slices and existing collectors trace packs.
+    pub fn stepBudgeted(self: *Job, a: A, pages: *PageStore, maximum: usize, processed: ?*usize) !?manifest.ArtifactRef {
+        if (processed) |out| out.* = 0;
+        if (maximum == 0 or maximum > 4096 or self.phase == .done) return error.InvalidPublicationBudget;
         try self.validate(pages.domain);
         var scratch_arena = std.heap.ArenaAllocator.init(a);
         defer scratch_arena.deinit();
@@ -140,13 +148,19 @@ pub const Job = struct {
         var key_bytes: usize = 0;
         for (0..maximum) |_| {
             try pages.cancellation.check();
+            const before = cursor.offset;
             const item: input.Frame = if (self.kind == .text) blk: {
                 const term = (try cursor.token(scratch)) orelse break;
                 break :blk .{ .term = term, .value = @as([]const u8, "") };
             } else (try cursor.frame(scratch)) orelse break;
             const key = try common.postingKey(scratch, item.term, self.id);
             if (key.len > tree.max_key_bytes) return error.GraphPageRecordTooLarge;
+            if (key_bytes != 0 and key.len > 64 * 1024 -| key_bytes) {
+                cursor.offset = before;
+                break;
+            }
             key_bytes += key.len;
+            if (processed) |out| out.* += 1;
             if (self.phase == .remove) try changes.put(scratch, key, null) else if (self.kind == .sparse) {
                 if (item.value.len == 0 or item.value.len % 4 != 0) return error.InvalidPagedProjectionPosting;
                 try changes.put(scratch, key, item.value);
@@ -166,16 +180,21 @@ pub const Job = struct {
             var key_it = changes.keyIterator();
             var i: usize = 0;
             while (key_it.next()) |key| : (i += 1) keys[i] = key.*;
-            const prior = try tree.lookupMany(a, store, postings.*, keys);
-            defer {
-                for (prior) |row| if (row) |entry| entry.deinit(a);
-                a.free(prior);
+            var begin: usize = 0;
+            while (begin < keys.len) {
+                const end = @min(keys.len, begin + tree.max_lookup_batch);
+                const prior = try tree.lookupMany(a, store, postings.*, keys[begin..end]);
+                defer {
+                    for (prior) |row| if (row) |entry| entry.deinit(a);
+                    a.free(prior);
+                }
+                for (keys[begin..end], prior) |key, row| if (row) |entry| {
+                    if (entry.value.len != 4) return error.InvalidPagedTextPosting;
+                    const value = @constCast(changes.get(key).?.?);
+                    std.mem.writeInt(u32, value[0..4], try std.math.add(u32, std.mem.readInt(u32, value[0..4], .little), std.mem.readInt(u32, entry.value[0..4], .little)), .little);
+                };
+                begin = end;
             }
-            for (keys, prior) |key, row| if (row) |entry| {
-                if (entry.value.len != 4) return error.InvalidPagedTextPosting;
-                const value = @constCast(changes.get(key).?.?);
-                std.mem.writeInt(u32, value[0..4], try std.math.add(u32, std.mem.readInt(u32, value[0..4], .little), std.mem.readInt(u32, entry.value[0..4], .little)), .little);
-            };
         }
         postings.* = try common.applyMap(a, scratch, store, postings.*, changes);
         try writes.flush();

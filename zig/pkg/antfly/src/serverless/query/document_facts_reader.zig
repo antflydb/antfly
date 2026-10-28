@@ -82,6 +82,13 @@ pub const Reader = struct {
 
     /// Consume a borrowed inline payload while its cursor still owns the leaf.
     pub fn lookupBodyAlloc(self: *Reader, id: []const u8) !?[]u8 {
+        return self.lookupBodyWithHintAlloc(id, null);
+    }
+    /// Borrowed, already-authenticated bytes prepared by native code. Fresh
+    /// membership is checked in one traversal; a changed row materializes from
+    /// that same cursor instead of reopening the tree after lookup().
+    pub const BodyHint = struct { fact: Fact, body: []const u8 };
+    pub fn lookupBodyWithHintAlloc(self: *Reader, id: []const u8, hint: ?BodyHint) !?[]u8 {
         try self.session.checkCancellation();
         if (id.len == 0) return null;
         if (id.len > tree.max_key_bytes) return error.InvalidDocumentFact;
@@ -89,6 +96,12 @@ pub const Reader = struct {
         defer cursor.deinit();
         const record = (try cursor.next()) orelse return null;
         if (!std.mem.eql(u8, record.key, id)) return null;
+        if (!self.root.inline_records and facts.inlineBody(record.value) != null) return error.InvalidDocumentFact;
+        if (hint) |prepared| {
+            const fresh = try facts.decodeRecord(record);
+            if (fresh.last_lsn > self.root.wal_end_lsn) return error.InvalidDocumentFact;
+            if (fresh.last_lsn == prepared.fact.last_lsn and fresh.body.bytes == prepared.fact.body.bytes and std.mem.eql(u8, &fresh.body.digest, &prepared.fact.body.digest)) return try self.alloc.dupe(u8, prepared.body);
+        }
         return try self.readRecordBodyAlloc(record);
     }
 

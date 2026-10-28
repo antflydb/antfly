@@ -30,6 +30,7 @@ const tree = @import("graph_segment/page_tree.zig");
 const PageStore = @import("graph_segment/page_store.zig").PageStore;
 const lease = @import("build/work_lease.zig");
 const sources = @import("search_sources.zig");
+const quantum = objects.work_quantum;
 const Policy = @import("catalog/types.zig").NamespacePolicy;
 const max_state_bytes = 1024 * 1024;
 const ttl = 10 * std.time.ns_per_min;
@@ -56,6 +57,7 @@ pub const State = struct {
     candidate_fence: u64 = 0,
     ack_cursor: ?u64 = null,
     maintenance_pending: bool = false,
+    posting_quantum: ?u16 = null,
 };
 pub const Pointer = struct { format: u8 = 1, expires: u64, artifact: manifest.ArtifactRef };
 pub const Saved = struct { etag: ?[]const u8 = null, pointer: ?Pointer = null, state: ?State = null };
@@ -95,6 +97,7 @@ pub const Registry = struct {
         const state = (try std.json.parseFromSlice(State, a, bytes, .{ .allocate = .alloc_always })).value;
         if (state.format != 1 or state.id.len != 32 or state.lsn <= state.source_lsn or !std.mem.eql(u8, state.staged.namespace, self.namespace)) return error.InvalidPublicationCheckpoint;
         if (state.postings) |job| try job.validate(PageStore.namespaceDomain(self.namespace));
+        if (state.posting_quantum) |units| if (units == 0 or units > 4096) return error.InvalidPublicationCheckpoint;
         return state;
     }
     fn guard(self: Registry, a: A, held: *lease.HeldLease) !struct { key: []const u8, etag: []const u8 } {
@@ -168,10 +171,15 @@ pub const Context = struct {
     cancellation: @import("maintenance_cancellation.zig").Token,
     policy: Policy,
     force: bool = false,
+    /// Borrowed prepared-slice lease; the outer transaction owns release.
+    prepared_lease: ?*lease.HeldLease = null,
+    adaptive_slices: bool = false,
+    prepare_slices: bool = false,
+    max_posting_units: usize = 4096,
     batch_probe_records: ?usize = null,
 
     pub fn run(self: Context, action: Action, requested_id: ?[]const u8, units: usize) !?[]u8 {
-        if (units == 0 or units > 256) return error.InvalidPublicationBudget;
+        if (units == 0 or units > 256 or self.max_posting_units == 0 or self.max_posting_units > 4096) return error.InvalidPublicationBudget;
         var metadata = std.heap.ArenaAllocator.init(self.alloc);
         defer metadata.deinit();
         const m = metadata.allocator();
@@ -214,11 +222,18 @@ pub const Context = struct {
                 return null;
             }
         }
+        if (self.prepare_slices and self.batch_probe_records != null and self.prepared_lease == null) return try self.alloc.dupe(u8, "{\"__publication_slice\":true}");
         var nonce: [16]u8 = undefined;
         self.io.random(&nonce);
         const owner = std.fmt.bytesToHex(nonce, .lower);
-        var held = (try lease.acquireHeld(try self.progress.workLeaseProvider(), self.io, self.registry.namespace, &owner, 30 * std.time.ns_per_s)) orelse return error.WorkLeaseLost;
-        defer _ = held.release() catch false;
+        var acquired: ?lease.HeldLease = null;
+        const held = self.prepared_lease orelse blk: {
+            acquired = (try lease.acquireHeld(try self.progress.workLeaseProvider(), self.io, self.registry.namespace, &owner, 30 * std.time.ns_per_s)) orelse return error.WorkLeaseLost;
+            break :blk &acquired.?;
+        };
+        defer if (self.prepared_lease == null) {
+            _ = held.release() catch false;
+        };
         const cancellation = held.cancellation(self.cancellation);
         try cancellation.check();
         saved = try self.registry.load(m, lease.nowUnixNs(self.io));
@@ -230,6 +245,7 @@ pub const Context = struct {
         var reads: u64 = 16 * 1024 * 1024;
         var writes: u64 = 16 * 1024 * 1024;
         var pages = PageStore{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = self.registry.store, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        if (self.adaptive_slices) pages.admitPublication();
         const version = self.progress.getHead(self.registry.namespace) catch |err| switch (err) {
             error.FileNotFound => 0,
             else => return err,
@@ -240,18 +256,18 @@ pub const Context = struct {
         if (saved.state == null) {
             if (requested_id != null or action == .cancel) return error.PublicationJobNotFound;
             saved.state = (try self.start(m, &pages, source, &owner)) orelse return null;
-            _ = try self.registry.save(m, saved.etag, saved.state, &held);
+            _ = try self.registry.save(m, saved.etag, saved.state, held);
             return try self.responseState(saved.state);
         }
         var state = saved.state.?;
         if (requested_id) |id| if (!std.mem.eql(u8, state.id, id)) return error.PublicationJobNotFound;
         if (try self.registry.receipt(m, state.id)) |done| {
-            _ = try self.registry.save(m, saved.etag, null, &held);
+            _ = try self.registry.save(m, saved.etag, null, held);
             return try self.responseReceipt(done, requested_id == null);
         }
         if (action == .cancel) {
             const done = Receipt{ .id = state.id, .status = .cancelled, .published = false, .version = version, .wal_end_lsn = if (source) |s| s.wal_end_lsn else 0 };
-            try self.registry.complete(m, saved.etag, done, &held);
+            try self.registry.complete(m, saved.etag, done, held);
             return try self.responseReceipt(done, false);
         }
         if (state.candidate) |candidate| {
@@ -263,7 +279,7 @@ pub const Context = struct {
                 if (current == candidate) {
                     if (ancestor.publication_fencing_token == state.candidate_fence and ancestor.wal_end_lsn == state.lsn) {
                         const done = Receipt{ .id = state.id, .status = .completed, .published = true, .version = candidate, .wal_end_lsn = state.lsn, .consumed_records = 1, .artifact_count = state.staged.artifacts.len };
-                        try self.registry.complete(m, saved.etag, done, &held);
+                        try self.registry.complete(m, saved.etag, done, held);
                         return try self.responseReceipt(done, requested_id == null);
                     }
                     break;
@@ -272,13 +288,13 @@ pub const Context = struct {
             }
             if (cursor != null and cursor.? > candidate) {
                 state.ack_cursor = cursor;
-                _ = try self.registry.save(m, saved.etag, state, &held);
+                _ = try self.registry.save(m, saved.etag, state, held);
                 return try self.responseState(state);
             }
         }
         if (version != state.source_version or !std.meta.eql(self.policy, state.staged.stats.policy)) {
             const done = Receipt{ .id = state.id, .status = .superseded, .published = false, .version = version, .wal_end_lsn = if (source) |s| s.wal_end_lsn else 0 };
-            try self.registry.complete(m, saved.etag, done, &held);
+            try self.registry.complete(m, saved.etag, done, held);
             return try self.responseReceipt(done, requested_id == null);
         }
         if (try self.progress.getManifestGcFloor(self.registry.namespace)) |floor| if (state.source_version != 0 and state.source_version < floor) return error.PublicationSourceRetired;
@@ -297,21 +313,32 @@ pub const Context = struct {
             state.staged = final;
             state.candidate = candidate;
             state.candidate_fence = held.acquisition.fencing_token;
-            saved.etag = try self.registry.save(m, saved.etag, state, &held);
+            saved.etag = try self.registry.save(m, saved.etag, state, held);
             if (!try builder.compareAndSwapHeadGuarded(self.progress, self.registry.namespace, if (version == 0) null else version, candidate, held.guard())) return error.HeadChanged;
             const done = Receipt{ .id = state.id, .status = .completed, .published = true, .version = candidate, .wal_end_lsn = state.lsn, .consumed_records = 1, .artifact_count = final.artifacts.len };
-            try self.registry.complete(m, saved.etag, done, &held);
+            try self.registry.complete(m, saved.etag, done, held);
             return try self.responseReceipt(done, requested_id == null);
         }
         if (state.postings) |*job| {
-            if (try job.step(self.alloc, &pages, units)) |ref| {
+            const maximum: usize = if (self.adaptive_slices) @min(self.max_posting_units, state.posting_quantum orelse units) else units;
+            const started = std.Io.Clock.now(.awake, self.io).nanoseconds;
+            const before_reads = reads;
+            const before_writes = writes;
+            var processed: usize = 0;
+            const completed = if (self.adaptive_slices) try job.stepBudgeted(self.alloc, &pages, maximum, &processed) else try job.step(self.alloc, &pages, units);
+            if (self.adaptive_slices) {
+                const elapsed = std.Io.Clock.now(.awake, self.io).nanoseconds - started;
+                if (elapsed < 0) return error.InvalidWorkQuantum;
+                state.posting_quantum = @intCast(try (quantum.Policy{}).next(maximum, .{ .completed = processed, .elapsed_ns = std.math.cast(u64, elapsed) orelse return error.InvalidWorkQuantum, .read_bytes = before_reads - reads, .write_bytes = before_writes - writes }));
+            }
+            if (completed) |ref| {
                 defer builder.freeArtifactRef(self.alloc, ref);
                 try replaceNamed(m, &state.staged, ref);
                 state.postings = null;
                 state.index += 1;
             }
         } else try self.advance(m, &state, source, &pages, cancellation);
-        _ = try self.registry.save(m, saved.etag, state, &held);
+        _ = try self.registry.save(m, saved.etag, state, held);
         return try self.responseState(state);
     }
 
@@ -469,7 +496,14 @@ pub const Context = struct {
         defer self.alloc.free(version);
         const cutoff = try std.fmt.allocPrint(self.alloc, "{d}", .{if (state) |value| value.source_lsn else 0});
         defer self.alloc.free(cutoff);
-        return std.json.Stringify.valueAlloc(self.alloc, .{ .published = false, .version = version, .wal_end_lsn = cutoff, .consumed_records = @as(usize, 0), .has_more = state != null, .job_id = if (state) |s| s.id else null, .phase = if (state) |s| @tagName(s.phase) else "idle", .offset = if (state) |s| (if (s.postings) |job| job.offset else 0) else @as(u64, 0) }, .{});
+        var digest: [32]u8 = @splat(0);
+        if (state) |value| {
+            const bytes = try std.json.Stringify.valueAlloc(self.alloc, value, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(bytes);
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        }
+        const checkpoint = std.fmt.bytesToHex(digest, .lower);
+        return std.json.Stringify.valueAlloc(self.alloc, .{ .checkpoint_sha256 = if (state != null) @as(?[]const u8, &checkpoint) else null, .posting_quantum = if (state) |value| value.posting_quantum else null, .published = false, .version = version, .wal_end_lsn = cutoff, .consumed_records = @as(usize, 0), .has_more = state != null, .job_id = if (state) |s| s.id else null, .phase = if (state) |s| @tagName(s.phase) else "idle", .offset = if (state) |s| (if (s.postings) |job| job.offset else 0) else @as(u64, 0) }, .{});
     }
     fn responseReceipt(self: Context, done: Receipt, next: bool) ![]u8 {
         const version = try std.fmt.allocPrint(self.alloc, "{d}", .{done.version});
@@ -477,7 +511,12 @@ pub const Context = struct {
         const cutoff = try std.fmt.allocPrint(self.alloc, "{d}", .{done.wal_end_lsn});
         defer self.alloc.free(cutoff);
         const more = next and (try self.wal.latestLsn(self.registry.namespace)) > done.wal_end_lsn;
-        return std.json.Stringify.valueAlloc(self.alloc, .{ .published = done.published, .version = version, .wal_end_lsn = cutoff, .consumed_records = done.consumed_records, .artifact_count = done.artifact_count, .has_more = more, .job_id = done.id, .phase = @tagName(done.status) }, .{});
+        const receipt_bytes = try std.json.Stringify.valueAlloc(self.alloc, done, .{});
+        defer self.alloc.free(receipt_bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(receipt_bytes, &digest, .{});
+        const identity = std.fmt.bytesToHex(digest, .lower);
+        return std.json.Stringify.valueAlloc(self.alloc, .{ .receipt_sha256 = @as([]const u8, &identity), .published = done.published, .version = version, .wal_end_lsn = cutoff, .consumed_records = done.consumed_records, .artifact_count = done.artifact_count, .has_more = more, .job_id = done.id, .phase = @tagName(done.status) }, .{});
     }
 };
 fn find(source: manifest.Manifest, kind: manifest.ArtifactKind, name: ?[]const u8) ?manifest.ArtifactRef {

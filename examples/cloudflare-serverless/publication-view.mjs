@@ -17,7 +17,7 @@ import {unsupportedRpc} from "./performance.mjs";
 import {metadataKeys} from "./read-view.mjs";
 
 export async function publicationKeys(namespace,continuations=false){const k=await metadataKeys(namespace);return [k.head,k.wal,k.floor,k.progress+"HEAD_FENCE",k.progress+"REINDEX",...(continuations?[k.progress+"PUBLICATION_PLAN"]:[])];}
-export function publicationKeyAllowed(keys,key){return keys.includes(key)||typeof key==="string"&&key.startsWith(keys[0].slice(0,-4))&&/^(READ_PINS|DOC_OFFSETS)\/(0|[1-9][0-9]{0,19})$/.test(key.slice(keys[0].length-4));}
+export function publicationKeyAllowed(keys,key){return keys.includes(key)||keys.some(value=>value.endsWith("/PUBLICATION_PLAN"))&&typeof key==="string"&&key.startsWith(keys[0].slice(0,-4)+"PUBLICATION_RESULTS/")&&/^[a-f0-9]{32}$/.test(key.slice((keys[0].slice(0,-4)+"PUBLICATION_RESULTS/").length))||typeof key==="string"&&key.startsWith(keys[0].slice(0,-4))&&/^(READ_PINS|DOC_OFFSETS)\/(0|[1-9][0-9]{0,19})$/.test(key.slice(keys[0].length-4));}
 export async function publicationSnapshot(tx,keys){
  const values=await tx.getMany(keys),entries=keys.map((key,i)=>[key,values[i]]);
  const version=values[0]?new TextDecoder().decode(values[0].body).trim():"0";

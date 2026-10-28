@@ -159,6 +159,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         publication_batch_version: ?u64 = null,
         publication_continuation_force: bool = false,
         publication_units: usize = 128,
+        publication_adaptive_slices: bool = false,
+        publication_max_units: usize = 4096,
+        publication_prepared_slices: bool = false,
         publication_action: @import("serverless/hosted_publication_plan.zig").Action = .step,
         publication_job_id: ?[]const u8 = null,
         paged_text: bool = false,
@@ -394,8 +397,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             .ttl_ns = 30 * std.time.ns_per_s,
         } else null;
         if (req.publication_continuations) {
-            if (held != null) return error.InvalidPublicationSession;
-            if (try (@import("serverless/hosted_publication_plan.zig").Context{ .alloc = a, .registry = publication_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation }, .policy = .{ .chunk_embeddings_enabled = req.enrichment, .chunk_embeddings_model_preference = .require_model }, .force = req.publication_continuation_force, .batch_probe_records = if (req.publication_batch_probe) @min(64, @max(1, req.publication_records)) else null }).run(req.publication_action, req.publication_job_id, req.publication_units)) |result| return result;
+            if (try (@import("serverless/hosted_publication_plan.zig").Context{ .alloc = a, .registry = publication_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation }, .policy = .{ .chunk_embeddings_enabled = req.enrichment, .chunk_embeddings_model_preference = .require_model }, .force = req.publication_continuation_force, .adaptive_slices = req.publication_adaptive_slices, .max_posting_units = req.publication_max_units, .prepare_slices = req.publication_prepared_slices, .prepared_lease = if (held) |*value| value else null, .batch_probe_records = if (req.publication_batch_probe) @min(64, @max(1, req.publication_records)) else null }).run(req.publication_action, req.publication_job_id, req.publication_units)) |result| return result;
             if (req.publication_batch_probe) return error.PublicationNeedsPreparedBatch;
         }
         var builder = @import("serverless/build/builder.zig").Builder.init(a, &artifacts, &manifests, &progress, &wal);

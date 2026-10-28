@@ -68,9 +68,9 @@ async function fixture(){
  const plain=withCommitCoordinator(raw,{objectCall:(request,body)=>store.transaction(tx=>metadataObjectCall(tx,request,body))});
  const host=await instantiateHost(module,plain,{clock:()=>now}),leaseHost=await instantiateHost(module,null,{clock:()=>now});
  const native=(tx,op,lease,owner=lease?.owner)=>leaseHost.request(req(op,{publication_owner:owner,publication_lease:lease??null}),{transport:withCommitCoordinator(raw,{objectCall:(request,body)=>metadataObjectCall(tx,request,body)})});
- const begin=()=>store.transaction(async tx=>{const lease=await native(tx,"publication_acquire",null,crypto.randomUUID());await captureReadView(tx,keys,{},()=>now);return{format:2,lease,entries:await publicationSnapshot(tx,pk)};});
- const finish=batch=>store.transaction(async tx=>{await native(tx,"publication_validate",batch.lease);await applyPublication(tx,(await publicationSnapshot(tx,pk)).map(([key])=>key),batch,{clock:()=>now});assert.equal((await native(tx,"publication_release",batch.lease)).released,true);});
- const prepare=async(initial,options={})=>{const prepared=new PreparedPublication(initial),build=await instantiateHost(module,withCommitCoordinator(raw,prepared),{clock:()=>now});const result=await build.request(req("publish",{...options,publication_lease:initial.lease}));return{prepared,result};};
+ const begin=(continuations=false)=>store.transaction(async tx=>{const lease=await native(tx,"publication_acquire",null,crypto.randomUUID());await captureReadView(tx,keys,{},()=>now);return{format:continuations?3:2,lease,entries:await publicationSnapshot(tx,await publicationKeys(namespace,continuations))};});
+ const finish=batch=>store.transaction(async tx=>{await native(tx,"publication_validate",batch.lease);await applyPublication(tx,(await publicationSnapshot(tx,await publicationKeys(namespace,batch.format===3))).map(([key])=>key),batch,{clock:()=>now});assert.equal((await native(tx,"publication_release",batch.lease)).released,true);});
+ const prepare=async(initial,options={})=>{const prepared=new PreparedPublication(initial,{read:(request,body)=>store.transaction(tx=>metadataObjectCall(tx,request,body))}),build=await instantiateHost(module,withCommitCoordinator(raw,prepared),{clock:()=>now});const result=await build.request(req("publish",{publication_continuations:initial.format===3,...options,publication_lease:initial.lease}));return{prepared,result};};
  const mutate=id=>host.request(req("mutate",{operation_id:id,mutations:[{kind:"upsert",doc_id:id,body:JSON.stringify({text:"durable "+id})}]}));
  return{bucket,keys,pk,req,host,begin,finish,prepare,mutate,native,clock:()=>now,store:()=>store,tick:ms=>now+=ms,lose:()=>lose=true,reopen:()=>store=new R2CoordinatorStore(module,bucket,namespace,{clock:()=>now,transport})};
 }
@@ -217,4 +217,44 @@ test('publication checkpoint and receipt guards reject stale or foreign HEADs at
   assert.equal((await metadataObjectCall(tx,{...request,guard_etag:'fresh'},body)).status,0);
  }
  assert.equal((await metadataObjectCall(tx,{op:'put',key:'antfly/progress/docs/PUBLICATION_RESULTS/not-a-job',guard_key:'antfly/progress/docs/HEAD',guard_etag:'fresh'},body)).status,3);
+});
+
+
+test("prepared native continuation commits checkpoint and release together and resumes ambiguous slices",async()=>{
+ const f=await fixture(),body=JSON.stringify({text:Array.from({length:12000},(_,i)=>"packed"+i).join(" "),sparse_embedding:{needle:1}});
+ const receipt=await f.host.request(f.req("mutate",{operation_id:"prepared-large",mutations:[{kind:"upsert",doc_id:"large",body}]}));
+ let job,completed,steps=0,ambiguous=false,uploadFailed=false;
+ const originalPut=f.bucket.put.bind(f.bucket);let failArtifact=false;f.bucket.put=async(key,body,options)=>{if(failArtifact&&key.startsWith("antfly/artifacts/")){failArtifact=false;throw Error("InjectedPackedUploadLoss");}return originalPut(key,body,options);};
+ for(;steps<64;steps++){
+  if(steps===5&&!uploadFailed){
+   const initial=await f.begin(true),prior=await f.host.request(f.req("publish",{publication_continuations:true,publication_action:"status",publication_job_id:job}));failArtifact=true;
+   await assert.rejects(f.prepare(initial,{paged_projections:true,publication_adaptive_slices:true,publication_job_id:job}),/ObjectStoreTransportFailed/);
+   await f.store().transaction(tx=>f.native(tx,"publication_release",initial.lease));f.reopen();uploadFailed=true;
+   const after=await f.host.request(f.req("publish",{publication_continuations:true,publication_action:"status",publication_job_id:job}));assert.equal(after.checkpoint_sha256,prior.checkpoint_sha256);
+  }
+  const initial=await f.begin(true),{prepared,result}=await f.prepare(initial,{paged_projections:true,publication_adaptive_slices:true,publication_max_units:steps===6?32:4096,publication_job_id:job}).catch(error=>{error.message+=" at slice "+steps;throw error;});
+  if(steps===6)assert.ok(result.posting_quantum<=64,"an admitted recovery ceiling must constrain a larger checkpoint estimate");
+  job=result.job_id;assert.ok(job);assert.equal(prepared.batch().format,3);
+  const prior=(await f.host.request(f.req("publish",{publication_continuations:true,publication_action:"status"}))).job_id;
+  if(steps===0){assert.equal(prior,null,"tentative checkpoint must not be public before finalize");f.lose();await assert.rejects(f.finish(prepared.batch()),/ObjectStoreTransportFailed/);f.reopen();ambiguous=true;}
+  else await f.finish(prepared.batch());
+  const status=await f.host.request(f.req("publish",{publication_continuations:true,publication_action:"status",publication_job_id:job}));
+  assert.equal(status.job_id,job);
+  if(result.published){completed=result;break;}
+  assert.equal(result.wal_end_lsn,"0");
+ }
+ assert.ok(ambiguous);assert.ok(uploadFailed);assert.ok(completed,"adaptive packed publication must complete below the old 109-call population");assert.ok(steps<32);
+ assert.equal((await f.host.request(f.req("lookup",{doc_id:"large",required_visibility:receipt.visibility}))).body,body);
+ assert.equal((await f.host.request(f.req("search",{text:"packed11999"}))).hits[0].doc_id,"large");
+ const initial=await f.begin(true),stale=await f.prepare(initial,{publication_job_id:job});f.tick(31000);await assert.rejects(f.finish(stale.prepared.batch()),/WorkLeaseLost/);
+});
+
+test("prepared continuation guards cannot escape their namespace or overwrite a changed checkpoint",async()=>{
+ const keys=await publicationKeys("scope",true),records=keys.map(key=>[key,null]),head={etag:"head",body:utf8.encode("0"),contentType:null};records[0][1]=head;
+ const p=new PreparedPublication({format:3,lease:{owner:"owner"},entries:records},{read:async()=>({status:1})});
+ assert.equal((await p.objectCall({op:"put",key:keys[5],guard_key:keys[0],guard_etag:"stale"},utf8.encode("x"))).status,2);
+ await assert.rejects(p.objectCall({op:"get",key:"antfly/progress/other/PUBLICATION_RESULTS/"+"a".repeat(32)}),/SnapshotIncomplete/);
+ assert.equal((await p.objectCall({op:"put",key:keys[5],guard_key:keys[0],guard_etag:"head",if_none_match:true},utf8.encode("pointer"))).status,0);
+ const map=new Map(records),tx={getMany:async keys=>keys.map(key=>map.get(key)),get:async key=>map.get(key),put:(key,value)=>map.set(key,value)};
+ map.set(keys[5],{etag:"concurrent",body:utf8.encode("other")});await assert.rejects(applyPublication(tx,keys,p.batch()),/PublicationConflict/);
 });

@@ -115,7 +115,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
         preparedPublication=new PreparedPublication(publicationView);publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
       }
       if(input.op==="publish"&&env.BATCHED_PUBLICATION!=="false"&&env.PUBLICATION_CONTINUATIONS!=="true"){
-        try{publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16));preparedPublication=new PreparedPublication(publicationView);publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);}
+        try{publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16));preparedPublication=new PreparedPublication(publicationView,{read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);}
         catch(error){if(!unsupportedRpc(error,"beginPublication"))throw error;}
       }
       try{const method=input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"?"openPublicationPlan":"openPublication";publicationView??=await rpc(method,Number(env.PUBLICATION_RECORDS??16));}
@@ -126,13 +126,15 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     if(readHints)transport=readHints.wrap(transport);
     if(env.COORDINATOR_BACKEND==="r2"&&!readAdmission?.legacy&&!readAdmission?.nativePlan&&["lookup","list","count","search","status","latest"].includes(input.op))transport=withReadView(transport,coordinator,env.ANTFLY_INCARNATION,{initial:readAdmission?.view,admittedAt:readAdmission?.started,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});
     if(readAdmission?.nativePlan)transport=withNativeReadPlan(transport,coordinator,env.ANTFLY_INCARNATION,{fresh:readAdmission.nativePlan.fresh,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});
+    const activeContinuation=env.PUBLICATION_PREPARED_SLICES==="true"&&input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"&&input.publication_action!=="status"&&publicationView?.entries?.some(([key,record])=>key.endsWith("/PUBLICATION_PLAN")&&record?.body?.byteLength>0);
+    if(activeContinuation){publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),true);preparedPublication=new PreparedPublication(publicationView,{read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);transport=withCommitCoordinator(transport,preparedPublication,collection);}
     const publicationBudget = publicationView?.budget??(["publish", "reindex"].includes(input.op) ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16);
     const settings = input.op === "latest" ? {} : { wal_inline_tail:env.WAL_INLINE_TAIL==="true", coarse_probes:Number(input.coarse_probes??env.ANN_COARSE_PROBES??0), enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
       publication_lease:preparedPublication?.lease??null,
       reindex_records: Math.min(64, publicationBudget),
       enrichment_documents: Number(env.ENRICHMENT_DOCUMENTS ?? 1),
       ...(readAdmission?.nativePlan?{native_read_plan_mode:true,native_read_plan:readAdmission.nativePlan.hint}:{}),
-      ...(input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"?{publication_continuations:true,publication_batch_probe:true,publication_continuation_force:env.PUBLICATION_CONTINUATION_FORCE==="true",publication_units:Number(env.PUBLICATION_UNITS??128)}:{}),
+      ...(input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"?{publication_continuations:true,publication_batch_probe:true,publication_continuation_force:env.PUBLICATION_CONTINUATION_FORCE==="true",publication_units:Number(env.PUBLICATION_UNITS??128),...(env.PUBLICATION_ADAPTIVE_SLICES==="true"?{publication_adaptive_slices:true,publication_max_units:publicationView?.posting_limit??4096}:{}),...(env.PUBLICATION_PREPARED_SLICES==="true"?{publication_prepared_slices:true}:{})}:{}),
       ...(env.INLINE_POINT_BODIES === "true"?{inline_point_bodies:true}:{}),
       ...(env.CANONICAL_POINT_BODIES === "true"?{canonical_point_bodies:true}:{}),
       pack_small_bodies: env.COORDINATOR_BACKEND === "r2" && env.PACK_SMALL_BODIES !== "false",
@@ -150,11 +152,11 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
     if(actorMutation){try{return await trace.span("writer_rpc",()=>stub.mutateBatch({...input,...settings,__trace_id:trace.id}));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
-    const {inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,native_read_plan_mode:ignoredReadMode,native_read_plan:ignoredReadPlan,native_write_plan:ignoredWritePlan,publication_continuations:ignoredContinuation,publication_batch_probe:ignoredPublicationProbe,publication_batch_version:ignoredBatchVersion,publication_continuation_force:ignoredForce,publication_units:ignoredUnits,compaction_probe_only:ignoredProbe,...nativeInput}=input;
+    const {inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,native_read_plan_mode:ignoredReadMode,native_read_plan:ignoredReadPlan,native_write_plan:ignoredWritePlan,publication_continuations:ignoredContinuation,publication_batch_probe:ignoredPublicationProbe,publication_batch_version:ignoredBatchVersion,publication_continuation_force:ignoredForce,publication_units:ignoredUnits,publication_adaptive_slices:ignoredAdaptive,publication_max_units:ignoredMaximum,publication_prepared_slices:ignoredPrepared,compaction_probe_only:ignoredProbe,...nativeInput}=input;
     const plannedCompact=env.NATIVE_COMPACTION_PLAN==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="compact"&&input.operation_id===undefined&&env.BATCHED_PUBLICATION!=="false";
     const plannedPublication=input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true";
-    const compactDeadline=Date.now()+30000;let probeOperations=0,probeBytes=0,probeMetrics,batchRecords,batchVersion;
-    const executeNative=probe=>lane.request({ ...nativeInput, ...settings,...(plannedPublication&&preparedPublication?{publication_continuations:false,publication_lease:preparedPublication.lease,...(batchRecords!==undefined?{publication_records:Math.min(batchRecords,publicationView.budget),publication_batch_version:batchVersion}:{})}:{}),...(plannedCompact?{compaction_probe_only:probe,publication_lease:preparedPublication?.lease??null}:{}), bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,...(readAdmission?.nativePlan?{deadlineMs:readAdmission.nativePlan.deadlineMs}:readAdmission?.deadlineMs?{deadlineMs:readAdmission.deadlineMs}:{}),...(plannedCompact||plannedPublication?{deadlineMs:compactDeadline,maxOperations:1024-probeOperations,maxTransferBytes:32*1024*1024-probeBytes}:{}),...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
+    const compactDeadline=Date.now()+30000;let probeOperations=0,probeBytes=0,probeMetrics,batchRecords,batchVersion,preparedSlice=false;
+    const executeNative=probe=>lane.request({ ...nativeInput, ...settings,...(plannedPublication&&preparedPublication?{publication_continuations:preparedPublication.format===3,publication_batch_probe:false,publication_lease:preparedPublication.lease,...(batchRecords!==undefined?{publication_records:Math.min(batchRecords,publicationView.budget),publication_batch_version:batchVersion}:{})}:{}),...(plannedCompact?{compaction_probe_only:probe,publication_lease:preparedPublication?.lease??null}:{}), bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,...(readAdmission?.nativePlan?{deadlineMs:readAdmission.nativePlan.deadlineMs}:readAdmission?.deadlineMs?{deadlineMs:readAdmission.deadlineMs}:{}),...(plannedCompact||plannedPublication?{deadlineMs:compactDeadline,maxOperations:1024-probeOperations,maxTransferBytes:32*1024*1024-probeBytes}:{}),...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
       onMetrics: metrics => {
         if(probeMetrics)metrics={...metrics,operations:metrics.operations+probeMetrics.operations,transferred_bytes:metrics.transferred_bytes+probeMetrics.transferred_bytes,elapsed_ms:metrics.elapsed_ms+probeMetrics.elapsed_ms,io_wait_ms:metrics.io_wait_ms+probeMetrics.io_wait_ms,working_set_peak_bytes:Math.max(metrics.working_set_peak_bytes,probeMetrics.working_set_peak_bytes)};
         nativeMetrics=metrics;
@@ -164,26 +166,27 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     let result;
     try{
       result=await executeNative(plannedCompact);
+      if(plannedPublication&&result.__publication_slice===true){preparedSlice=true;throw Error("PublicationNeedsPreparedSlice");}
       if(plannedPublication&&result.__publication_batch_records!==undefined){
         batchRecords=result.__publication_batch_records;batchVersion=result.__publication_batch_version;
         if(!Number.isInteger(batchRecords)||batchRecords<1||batchRecords>64||!/^[0-9]+$/.test(batchVersion))throw Error("InvalidPublicationBatchPlan");
         throw Error("PublicationNeedsPreparedBatch");
       }
     }catch(error){
-      if(!(plannedCompact&&error?.message==="CompactionNeedsPublicationLease")&&!(plannedPublication&&error?.message==="PublicationNeedsPreparedBatch"))throw error;
+      if(!(plannedCompact&&error?.message==="CompactionNeedsPublicationLease")&&!(plannedPublication&&["PublicationNeedsPreparedBatch","PublicationNeedsPreparedSlice"].includes(error?.message)))throw error;
       if(!Number.isSafeInteger(nativeMetrics?.operations)||!Number.isSafeInteger(nativeMetrics?.transferred_bytes))throw Error("NativePlanAccountingMissing");
       probeOperations=nativeMetrics.operations;probeBytes=nativeMetrics.transferred_bytes;probeMetrics=nativeMetrics;
       if(probeOperations>=1024||probeBytes>=32*1024*1024)throw Error("ObjectIoBudgetExceeded");
       if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:plannedCompact?"antfly.compaction_plan":"antfly.publication_batch_plan",trace_id:trace.id,operations:probeOperations,transferred_bytes:probeBytes}));
-      publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16));preparedPublication=new PreparedPublication(publicationView);publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
+      publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),preparedSlice);preparedPublication=new PreparedPublication(publicationView,{read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
       transport=withCommitCoordinator(transport,preparedPublication,collection);
       result=await executeNative(false);
     }
     if(preparedPublication){const batch=preparedPublication.batch(),head=batch.writes.find(([key])=>key===`antfly/progress/${env.ANTFLY_INCARNATION}/HEAD`),hints=head?readHints?.forHead({op:"put",key:head[0]},head[1].body):undefined;
       if(input.op==="compact"&&input.operation_id!==undefined)await rpc("finalizeCompaction",input.operation_id,batch,result,hints);
-      else await rpc("finalizePublication",batch,input.op==="publish"?{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes}:undefined,hints);publicationFinalized=true;}
+      else await rpc("finalizePublication",batch,input.op==="publish"?{posting_quantum:result.posting_quantum,records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes}:undefined,hints);publicationFinalized=true;}
     if(readAdmission?.nativePlan){nativeReadPlans.remember(env,result.__read_plan);const{__read_plan:ignoredPlan,...publicResult}=result;result=publicResult;}
-    if(input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"&&result.job_id&&env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.publication_progress",trace_id:trace.id,job_id:result.job_id,phase:result.phase,offset:result.offset??0,published:result.published,wal_end_lsn:result.wal_end_lsn}));
+    if(input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"&&result.job_id&&env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.publication_progress",trace_id:trace.id,job_id:result.job_id,checkpoint_sha256:result.checkpoint_sha256,receipt_sha256:result.receipt_sha256,posting_quantum:result.posting_quantum,phase:result.phase,offset:result.offset??0,published:result.published,wal_end_lsn:result.wal_end_lsn}));
     operationSucceeded=true;return result;
   } catch (error) {
     if (/IntegrityMismatch/.test(String(error))) cache.clear();

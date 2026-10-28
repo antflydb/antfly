@@ -769,3 +769,12 @@ untouched. Retire that root identity and purge its pending test notifications
 before measuring the tenant corpus. Clean up the disposable deployment with the
 gate lifecycle tool afterward. Results and qualification limits are documented
 in [the live native diagnostic](../../docs/design/cloudflare-native-live.md).
+
+Prepared continuation slices and adaptive posting batches are opt-in through
+`PUBLICATION_PREPARED_SLICES=true` and `PUBLICATION_ADAPTIVE_SLICES=true`, alongside
+`PUBLICATION_CONTINUATIONS=true`. Deploy compatible modules and collectors across
+all roles first, and drain/cancel active adaptive jobs before binary downgrade.
+Local comparisons use `qualification/shared-publication-latency.mjs` and
+`qualification/shared-pipeline-latency.mjs`; copy hash-verified previous modules
+to `dist/qualification/shared-pipeline-lab/before/` before comparing. See
+[the shared engine design](../../docs/design/shared-object-publication.md).

@@ -246,3 +246,10 @@ latencies, the preserved setup-cutoff failure and the validated idempotent seed
 resume. Metrics sanitization now retains bounded publication progress, native
 WAL plan spans, numeric CPU/wall times and deployment UUIDs; it still discards
 request bodies, headers, credentials and arbitrary strings.
+
+The shared pipeline collector now queries Worker and namespace-bound Durable
+Object populations separately and reconciles their event types independently.
+It requires explicit unsampled metadata for each population, including quiet
+roles; confidence sample sizes cannot substitute for it. Native publication
+checkpoint/receipt digests identify durable outcomes without claiming transport
+completeness. See [shared object-backed publication](shared-object-publication.md).

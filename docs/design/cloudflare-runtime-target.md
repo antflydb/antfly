@@ -481,3 +481,12 @@ actor replacement and substantially improves the full-corpus paired diagnostic.
 Read p95 is still 1,138 ms and invocation accounting remains incomplete, so this
 is not a gate pass. The evidence, limitations and next design changes are in
 [the live native protocol diagnostic](cloudflare-native-live.md).
+
+### Shared packed publication follow-up
+
+The next implementation uses native packed posting batches, prepared atomic
+slice commits, adaptive work within records, fresh-read dependency reduction
+and disjoint invocation accounting. The local delayed large-record comparison
+improves publication substantially; ordinary full-corpus read/write latency is
+flat. See [shared object-backed publication](shared-object-publication.md) for
+the contracts, rollout flags, measurements and remaining cloud requirements.

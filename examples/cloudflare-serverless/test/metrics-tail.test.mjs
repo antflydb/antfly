@@ -92,3 +92,8 @@ test('diagnostic tails retain finite platform timing and version fields without 
  assert.deepEqual(safe,{outcome:'ok',cpuTime:3,wallTime:90,scriptVersion:{id}});
  assert.deepEqual(sanitizeTailEvent({outcome:'ok',cpuTime:Infinity,wallTime:-1,scriptVersion:{id:'discard'}}),{outcome:'ok'});
 });
+
+test('publication diagnostics retain content identities without accepting payload strings',()=>{
+ const safe=sanitizeTailEvent({logs:[{message:[JSON.stringify({event:'antfly.publication_progress',checkpoint_sha256:'a'.repeat(64),receipt_sha256:'b'.repeat(64),posting_quantum:1024,body:'private-body',other:'private-value'})]}]});
+ const metric=JSON.parse(safe.logs[0].message[0]);assert.equal(metric.checkpoint_sha256,'a'.repeat(64));assert.equal(metric.receipt_sha256,'b'.repeat(64));assert.equal(metric.posting_quantum,1024);assert.ok(!JSON.stringify(safe).includes('private'));
+});

@@ -26,7 +26,7 @@ import{runPairedPhase}from'./paired-phase.mjs';
 import{startLiveDiagnostics}from'./live-diagnostics.mjs';
 import{readObservabilityToken}from'./persisted-diagnostic-probe.mjs';
 import{collectPersistedWindow}from'./persisted-diagnostics.mjs';
-import{collectIndependentCounters,readCounterToken}from'./independent-counters.mjs';
+import{collectInvocationPopulations,readCounterToken}from'./independent-counters.mjs';
 import{resumeCoverageSeed}from'./coverage-seed-resume.mjs';
 import{reconcileInvocations}from'./invocation-accounting.mjs';
 
@@ -88,7 +88,7 @@ if(report.workload_started_at&&sides.length===2&&!interrupted){
   for(let side=0;side<sides.length;side++){
    const s=sides[side];
    try{
-    const evidence=await collectIndependentCounters(s.run,await readCounterToken(),timeframe),bytes=Buffer.from(JSON.stringify(evidence)),file=resolve(directory,s.run.id+'-counters-'+pass+'.json');
+    const evidence=await collectInvocationPopulations(s.run,await readCounterToken(),timeframe),bytes=Buffer.from(JSON.stringify(evidence)),file=resolve(directory,s.run.id+'-counters-'+pass+'.json');
     await writeFile(file,bytes,{mode:0o600,flag:'wx'});report.counter_windows.push({side,pass,path:file,bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')});
     for(const failure of evidence.failures)report.counter_failures.push({side,pass,...failure});
     const encoded=JSON.stringify(evidence.roles);if(!pass)counterFirst.set(side,encoded);else if(counterFirst.get(side)!==encoded)report.counter_failures.push({side,pass,reason:'IndependentCounterIngestionUnsettled'});else counterComplete.set(side,evidence.roles);

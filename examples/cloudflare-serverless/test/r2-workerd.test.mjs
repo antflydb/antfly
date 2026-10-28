@@ -235,10 +235,10 @@ test("tenant commit domains isolate identical IDs and admit grouped writers",{ti
 });
 
 
-test('native publication checkpoints survive both collectors, cancellation and erased platform storage',{timeout:240000},async()=>{
+for(const adaptive of[false,true])test('native publication checkpoints survive both collectors, cancellation and erased platform storage (adaptive='+adaptive+')',{timeout:240000},async()=>{
  const f=await fixture('publication-continuations',false,true);
  try{
-  Object.assign(f.options.bindings,{NATIVE_WRITE_PLAN:'true',NATIVE_READ_PLAN:'true',LOCAL_METADATA_READS:'true',PUBLICATION_CONTINUATIONS:'true',PUBLICATION_CONTINUATION_FORCE:'true',PUBLICATION_UNITS:'128',PAGED_TEXT:'true'});await f.reopen();
+  Object.assign(f.options.bindings,{NATIVE_WRITE_PLAN:'true',NATIVE_READ_PLAN:'true',LOCAL_METADATA_READS:'true',PUBLICATION_CONTINUATIONS:'true',PUBLICATION_PREPARED_SLICES:String(adaptive),PUBLICATION_ADAPTIVE_SLICES:String(adaptive),PUBLICATION_CONTINUATION_FORCE:'true',PUBLICATION_UNITS:'128',PAGED_TEXT:'true'});await f.reopen();
   const body=JSON.stringify({text:Array.from({length:1024},(_,i)=>'term'+i).join(' '),embedding:[1,0],sparse_embedding:{needle:2}}),input={op:'mutate',operation_id:'large',mutations:[{kind:'upsert',doc_id:'one',body}]},accepted=await f.call(input);
   let started=await f.call({op:'publish'});assert.ok(started.job_id);const abandoned=started.job_id;
   const cancelled=await f.call({op:'publish',publication_action:'cancel',publication_job_id:abandoned});assert.equal(cancelled.published,false);assert.equal(cancelled.phase,'cancelled');

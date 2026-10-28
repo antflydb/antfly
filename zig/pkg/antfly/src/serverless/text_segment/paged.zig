@@ -154,6 +154,7 @@ fn applyMap(a: A, scratch: A, store: tree.Store, prior: ?tree.Ref, map: std.Stri
             return std.mem.lessThan(u8, l.key, r.key);
         }
     }.less);
+    if (store.pack_many != null) return tree.applyPacked(a, store, prior, changes);
     return tree.apply(a, store, prior, changes);
 }
 

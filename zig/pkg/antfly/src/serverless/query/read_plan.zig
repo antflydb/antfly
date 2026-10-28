@@ -76,19 +76,17 @@ pub const Prepared = struct {
         if (!std.mem.eql(u8, self.id, id)) return error.InvalidNativeReadPlan;
         if (!self.materialized) return live.lookupAlloc(id);
         const reader = live.reader orelse return live.lookupAlloc(id);
-        if (!self.root.eql(reader.root)) {
-            const fresh = try reader.lookup(id);
-            if ((fresh == null) != (self.fact == null)) return live.lookupAlloc(id);
-            if (fresh) |value| if (value.last_lsn != self.fact.?.last_lsn or value.body.bytes != self.fact.?.body.bytes or
-                !std.mem.eql(u8, &value.body.digest, &self.fact.?.body.digest)) return live.lookupAlloc(id);
-        }
         const Base = struct {
-            body: ?[]const u8,
-            pub fn lookupAlloc(base: @This(), a: A, _: []const u8) !?[]u8 {
-                return if (base.body) |body| try a.dupe(u8, body) else null;
+            prepared: Prepared,
+            reader: *@import("document_facts_reader.zig").Reader,
+            pub fn lookupAlloc(base: @This(), a: A, key: []const u8) !?[]u8 {
+                // The live overlay gets first refusal. An acknowledged recent
+                // update/delete need not fetch or validate an obsolete row.
+                if (base.prepared.root.eql(base.reader.root)) return if (base.prepared.body) |body| try a.dupe(u8, body) else null;
+                return base.reader.lookupBodyWithHintAlloc(key, if (base.prepared.fact) |fact| .{ .fact = fact, .body = base.prepared.body.? } else null);
             }
         };
-        return live.view.lookupAlloc(id, Base{ .body = self.body });
+        return live.view.lookupAlloc(id, Base{ .prepared = self, .reader = reader });
     }
 };
 

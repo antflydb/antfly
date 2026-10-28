@@ -30,3 +30,36 @@ test('independent counter collection bounds responses and never persists credent
  const denied=await collectIndependentCounters(run,token,timeframe,{fetch:async()=>Response.json({errors:[{message:token}]},{status:403})});assert.equal(denied.failures.length,4);assert.ok(!JSON.stringify(denied).includes(token));
  const big=await collectIndependentCounters(run,token,timeframe,{fetch:async()=>new Response('x'.repeat(65537))});assert.ok(big.failures.every(failure=>failure.reason==='IndependentCounterResponseExceeded'));
 });
+
+test('Durable Object counters bind their namespace and require explicit unsampled metadata',async()=>{
+ const{durableCounterQuery,parseDurableCounter}=await import('../qualification/independent-counters.mjs'),binding={id:'b'.repeat(32),worker:run.id+'-writer',source:'platform-namespace-api'};
+ const value={data:{viewer:{accounts:[{durableObjectsInvocationsAdaptiveGroups:[{sum:{requests:7,errors:0},avg:{sampleInterval:1},confidence:{sum:{requests:{estimate:7,lower:7,upper:7,sampleSize:7}}}}]}]}}};
+ assert.ok(durableCounterQuery(run,'writer',binding.id,timeframe).query.includes(binding.id));
+ assert.equal(parseDurableCounter(value,run,'writer',binding,timeframe).complete,true);
+ delete value.data.viewer.accounts[0].durableObjectsInvocationsAdaptiveGroups[0].avg;
+ assert.throws(()=>parseDurableCounter(value,run,'writer',binding,timeframe),/Schema/,'matching confidence estimates cannot replace explicit sampling evidence');
+ assert.throws(()=>durableCounterQuery(run,'app',binding.id,timeframe),/Scope/);
+ assert.throws(()=>parseDurableCounter(value,run,'writer',{...binding,worker:run.id+'-reader'},timeframe),/Scope/);
+});
+test('mixed invocation accounting reconciles disjoint Worker and DO populations without inferred zeroes',async()=>{
+ const{collectInvocationPopulations,reconcileCounterPopulations}=await import('../qualification/independent-counters.mjs');
+ const result=await collectInvocationPopulations(run,'private-test-token-value',timeframe,{fetch:async(url,options)=>{
+  if(url.includes('/namespaces?'))return Response.json({success:true,result:['writer','reader','builder'].map(role=>({id:({writer:'b',reader:'c',builder:'d'})[role].repeat(32),script:run.id+'-'+role})),result_info:{total_pages:1}});
+  if(JSON.parse(options.body).query.includes('durableObjectsInvocationsAdaptiveGroups'))return Response.json({data:{viewer:{accounts:[{durableObjectsInvocationsAdaptiveGroups:[{sum:{requests:3,errors:0},avg:{sampleInterval:1}}]}]}}});
+  return Response.json(data(2));
+ }});
+ assert.equal(result.failures.length,0);const counter=result.roles.builder;
+ const rows=[...Array.from({length:2},()=>({event_type:'queue'})),...Array.from({length:3},()=>({event_type:'jsrpc'}))];
+ assert.deepEqual(reconcileCounterPopulations(run,'builder',rows,counter,timeframe),[]);
+ assert.ok(reconcileCounterPopulations(run,'builder',[...rows,{event_type:'workflow'}],counter,timeframe).includes('InvocationPopulationUncovered'));
+ const sampled=structuredClone(counter);sampled.populations[1].sample_interval=2;assert.ok(reconcileCounterPopulations(run,'builder',rows,sampled,timeframe).includes('IndependentInvocationCountMissing'));
+ const duplicate=structuredClone(counter);duplicate.populations.push(duplicate.populations[0]);assert.ok(reconcileCounterPopulations(run,'builder',rows,duplicate,timeframe).includes('InvocationPopulationInvalid'));
+ const quiet=structuredClone(counter);quiet.populations[0]={...quiet.populations[0],count:0,complete:false,sample_interval:null};assert.ok(reconcileCounterPopulations(run,'builder',rows.slice(2),quiet,timeframe).includes('IndependentInvocationCountMissing'));
+ assert.ok(!JSON.stringify(result).includes('private-test-token-value'));
+});
+test('namespace discovery failures and ambiguous bindings remain accounting failures',async()=>{
+ const{collectInvocationPopulations}=await import('../qualification/independent-counters.mjs');
+ for(const result of[{success:false,result:[]},{success:true,result:[{id:'b'.repeat(32),script:run.id+'-writer'},{id:'c'.repeat(32),script:run.id+'-writer'}]}]){
+  const report=await collectInvocationPopulations(run,'private-test-token-value',timeframe,{fetch:async url=>Response.json(url.includes('/namespaces?')?result:data())});assert.ok(report.failures.some(f=>f.reason==='NamespaceBindingUnknown'));assert.ok(!JSON.stringify(report).includes('private-test-token-value'));
+ }
+});

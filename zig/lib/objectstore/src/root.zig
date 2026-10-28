@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const work_quantum = @import("work_quantum.zig");
 pub const ordered_tree = @import("ordered_tree.zig");
 pub const ordered_pages = @import("ordered_pages.zig");
 pub const transactional_store = @import("transactional_store.zig");
@@ -75,6 +76,7 @@ pub const s3ObjectUriAlloc = s3_compat.objectUriAlloc;
 pub const s3PutObjectShapeAlloc = s3_compat.putObjectShapeAlloc;
 
 test "objectstore module compiles" {
+    _ = work_quantum;
     _ = ordered_tree;
     _ = ordered_pages;
     _ = immutable_log;

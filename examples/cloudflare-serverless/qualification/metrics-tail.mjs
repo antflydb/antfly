@@ -32,6 +32,7 @@ function metric(value,depth=0){
  const out={};for(const[key,v]of Object.entries(value)){
   if(['headers','request','response','body','token','authorization','cookie','url','message','metadata'].includes(key.toLowerCase()))continue;
   if(typeof v==='string'&&stringAllowed(key,v)){out[key]=v;continue;}
+  if(['checkpoint_sha256','receipt_sha256'].includes(key)&&typeof v==='string'&&/^[a-f0-9]{64}$/.test(v)){out[key]=v;continue;}
   if(key==='job_id'&&typeof v==='string'&&/^[a-f0-9]{32}$/.test(v)){out[key]=v;continue;}
   if(['trace_id','actor_instance_id'].includes(key)&&typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v)){out[key]=v;continue;}
   if(['error','failure_code'].includes(key)){if(v!=null)out[key]=errorCode(v);continue;}
