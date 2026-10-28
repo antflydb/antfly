@@ -28,7 +28,8 @@ export async function withPointReadLane(kernel,run,options={}){
   return host.request(input,{...requestOptions,maxOperations:Math.min(requestOptions.maxOperations??1024,operationLimit-usedOperations),maxTransferBytes:Math.min(requestOptions.maxTransferBytes??32*MiB,transferLimit-usedBytes),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;observe?.(sample);}});
  };
  try{
-  return await kernel.withHost(host=>{
+  const acquire=options.tryOnly?kernel.tryWithHost.bind(kernel):kernel.withHost.bind(kernel);
+  const admitted=await acquire(host=>{
    let transferred=0;
    const limited={...host,request:(input,requestOptions={})=>{
     if(input.op!=="lookup")throw Error("PointReadOperationUnsupported");
@@ -43,11 +44,13 @@ export async function withPointReadLane(kernel,run,options={}){
    }});}};
    return run(limited);
   },{...options,kernelVariant:"observe",memoryReservationBytes:8*MiB});
+  return options.tryOnly?(admitted.admitted?admitted.value:undefined):admitted;
  }catch(error){
   // A normal capacity promotion is safe only for the immutable point-read
   // operation and its original admitted snapshot. Never replay traps, OOM,
   // integrity/transport failures, deadlines or arbitrary database errors.
   if(!(capacity&&error?.message==="ObjectIoBudgetExceeded")&&!(workingSetLimited&&error?.message==="HostedWorkingSetBudgetExceeded"))throw error;
+  if(options.preparationOnly)return undefined;
   await options.beforePromote?.();
   options.onPromote?.();
   return kernel.withHost(host=>run({...host,request:(input,requestOptions={})=>accounting(host,input,requestOptions)}),options);

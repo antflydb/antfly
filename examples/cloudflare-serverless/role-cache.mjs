@@ -23,6 +23,6 @@ export function createRoleCache({maxBytes=8*1024*1024,maxEntries=1024}={}){
  const bindings=new WeakMap();let nextBinding=0;
  const prefix=binding=>{if(binding==null)return'unbound';if(typeof binding!=='object'&&typeof binding!=='function')throw Error('InvalidCacheBinding');if(!bindings.has(binding))bindings.set(binding,String(++nextBinding));return bindings.get(binding);};
  const clear=()=>{metadata.clear();data.clear();};
- const view=id=>({clear,retainedBytes:()=>metadata.retainedBytes()+data.retainedBytes(),wrap:(transport,scope)=>data.wrap(transport,id+'/'+scope),metadata:{clear,retainedBytes:metadata.retainedBytes,wrap:(transport,scope)=>metadata.wrap(transport,id+'/'+scope)}});
- return{clear,retainedBytes:()=>metadata.retainedBytes()+data.retainedBytes(),metadataBytes:metadata.retainedBytes,dataBytes:data.retainedBytes,forBucket:binding=>view(prefix(binding)),wrap:(transport,scope,binding)=>data.wrap(transport,prefix(binding)+'/'+scope)};
+ const view=id=>({clear,retainedBytes:()=>metadata.retainedBytes()+data.retainedBytes(),wrap:(transport,scope,options)=>data.wrap(transport,id+'/'+scope,options),metadata:{clear,retainedBytes:metadata.retainedBytes,wrap:(transport,scope)=>metadata.wrap(transport,id+'/'+scope)}});
+ return{clear,retainedBytes:()=>metadata.retainedBytes()+data.retainedBytes(),metadataBytes:metadata.retainedBytes,dataBytes:data.retainedBytes,forBucket:binding=>view(prefix(binding)),wrap:(transport,scope,binding,options)=>data.wrap(transport,prefix(binding)+'/'+scope,options)};
 }

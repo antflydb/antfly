@@ -35,7 +35,7 @@ pub fn encodeMutationAlloc(alloc: Allocator, mutation: api_types.DocumentMutatio
     return buf;
 }
 
-pub fn decodeMutationAlloc(alloc: Allocator, payload: []const u8) !api_types.DocumentMutation {
+pub fn decodeMutationView(payload: []const u8) !struct { kind: api_types.MutationKind, doc_id: []const u8, body: ?[]const u8 } {
     if (payload.len < 1 + 4 + 4) return error.InvalidMutationPayload;
     var pos: usize = 0;
     const kind = std.enums.fromInt(api_types.MutationKind, payload[pos]) orelse return error.InvalidMutationPayload;
@@ -47,20 +47,16 @@ pub fn decodeMutationAlloc(alloc: Allocator, payload: []const u8) !api_types.Doc
     if (doc_id_len > payload.len - pos or body_len != payload.len - pos - doc_id_len) return error.InvalidMutationPayload;
 
     if (kind == .delete and body_len != 0) return error.InvalidMutationPayload;
-    const doc_id = try alloc.dupe(u8, payload[pos .. pos + doc_id_len]);
+    const doc_id = payload[pos .. pos + doc_id_len];
     pos += doc_id_len;
-    errdefer alloc.free(doc_id);
+    return .{ .kind = kind, .doc_id = doc_id, .body = if (body_len == 0) null else payload[pos .. pos + body_len] };
+}
 
-    const body = if (body_len == 0)
-        null
-    else
-        try alloc.dupe(u8, payload[pos .. pos + body_len]);
-
-    return .{
-        .kind = kind,
-        .doc_id = doc_id,
-        .body = body,
-    };
+pub fn decodeMutationAlloc(alloc: Allocator, payload: []const u8) !api_types.DocumentMutation {
+    const view = try decodeMutationView(payload);
+    const id = try alloc.dupe(u8, view.doc_id);
+    errdefer alloc.free(id);
+    return .{ .kind = view.kind, .doc_id = id, .body = if (view.body) |body| try alloc.dupe(u8, body) else null };
 }
 
 test "mutation codec round-trips upsert and delete" {

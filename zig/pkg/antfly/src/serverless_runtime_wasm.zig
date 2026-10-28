@@ -20,6 +20,7 @@ var working_set_peak: usize = 0;
 var decoded_manifests: @import("serverless/manifest/decoded_cache.zig").Cache = .{};
 var shared_read_leases: @import("serverless/manifest/read_lease.zig").Cache = .{};
 var prepared_reads: @import("serverless/query/read_plan.zig").PreparedCache = .{};
+var read_states: @import("serverless/query/read_state_cache.zig").Cache = .{};
 var serving_scope: ?[32]u8 = null;
 // A kernel is serialized by the host pool. These caches own no request pointers
 // and must never cross a bucket/prefix boundary when a kernel is reused.
@@ -35,6 +36,7 @@ fn prepareServingScope(bucket: []const u8, prefix: []const u8) void {
     if (serving_scope == null or !std.mem.eql(u8, &serving_scope.?, &digest)) {
         decoded_manifests.deinit(wasm_allocator);
         prepared_reads.deinit(wasm_allocator);
+        read_states.deinit();
         shared_read_leases = .{};
         serving_scope = digest;
     }
@@ -48,6 +50,15 @@ export fn antfly_host_manifest_cache_bytes() usize {
 }
 export fn antfly_host_prepared_read_cache_bytes() usize {
     return prepared_reads.bytes;
+}
+export fn antfly_host_read_state_cache_bytes() usize {
+    return read_states.bytes;
+}
+export fn antfly_host_read_state_cache_hits() u64 {
+    return read_states.hits;
+}
+export fn antfly_host_read_state_cache_extensions() u64 {
+    return read_states.extensions;
 }
 pub fn resetWorkingSetMetrics() void {
     working_set_peak = 0;
@@ -143,6 +154,8 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         canonical_point_bodies: bool = false,
         native_write_plan: ?@import("serverless/wal/write_plan.zig").Input = null,
         native_read_plan_mode: bool = false,
+        native_read_state: bool = false,
+        wal_document_index: bool = false,
         native_read_prepare: ?[16]u8 = null,
         native_read_resume: ?[16]u8 = null,
         native_read_spent_bytes: u64 = 0,
@@ -251,6 +264,8 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     var indexed_wal = try @import("serverless/wal/indexed_object_store.zig").IndexedObjectStore.init(a, data_client, req.bucket, req.prefix);
     defer indexed_wal.deinit();
     indexed_wal.inline_tail_enabled = req.wal_inline_tail;
+    indexed_wal.read_state_enabled = req.native_read_state;
+    indexed_wal.document_index_enabled = req.wal_document_index;
     var wal = indexed_wal.walStore();
     const reindex_registry = @import("serverless/hosted_reindex.zig").Registry{ .client = host.client(), .bucket = req.bucket, .prefix = req.prefix, .namespace = req.namespace, .store = &artifacts };
     if (req.op == .reindex) return (@import("serverless/hosted_reindex.zig").Context{ .alloc = a, .registry = reindex_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation } }).run(req.reindex_action, req.reindex_job_id, req.reindex_records);
@@ -524,7 +539,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             .cancellation = cancellation,
             .version = if (cursor) |value| value.cursor.generation else null,
             .max_read_bytes = read_allowance,
-            .view = .{ .required = required, .cutoff = if (cursor) |value| value.cursor.cutoff else null, .cancellation = transport_cancellation },
+            .view = .{ .required = required, .cutoff = if (cursor) |value| value.cursor.cutoff else null, .cancellation = transport_cancellation, .state_cache = if (req.native_read_state) &read_states else null, .cache_allocator = wasm_allocator, .point_id = if (req.op == .lookup and req.wal_document_index) req.doc_id else null },
         });
         defer live.deinit();
         if (req.op == .search) {

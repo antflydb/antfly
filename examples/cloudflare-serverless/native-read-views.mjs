@@ -38,7 +38,7 @@ export class NativeReadViews {
     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
     const view=await captureReadView(tx,keys,options,this.clock);publish(view);return view;
-   },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background,deadlineMs:options.deadlineMs});
+   },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background,deadlineMs:options.deadlineMs,...(this.env.FUSED_READ_ADMISSION==="true"?{readKeys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],readPrefix:keys.progress+"READ_PINS/"}:{})});
   },options.trace_id,{untilAdmission:true,onPrepared:options.onPrepared,onAdmitted:options.onAdmitted});
  }
 }

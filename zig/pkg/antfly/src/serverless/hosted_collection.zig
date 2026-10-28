@@ -122,9 +122,9 @@ pub const Context = struct {
         _ = try self.wal.truncatePrefix(self.namespace, keep_from);
         if (try self.wal.compactPrefixStep(self.namespace, 256)) return std.json.Stringify.valueAlloc(self.alloc, .{ .has_more = true }, .{});
         const snapshot = try self.wal.beginCollection(self.namespace, id);
-        var roots: [2]Task = undefined;
+        var roots: [3]Task = undefined;
         var count: usize = 0;
-        for ([_]?tree.Ref{ snapshot.records, snapshot.operations }) |ref| if (ref) |page| {
+        for ([_]?tree.Ref{ snapshot.records, snapshot.operations, snapshot.documents }) |ref| if (ref) |page| {
             roots[count] = .{ .kind = .wal_page, .page = page };
             count += 1;
         };

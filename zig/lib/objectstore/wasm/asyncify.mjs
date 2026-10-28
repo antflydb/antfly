@@ -139,6 +139,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
     operations = 0; inferenceCalls = 0; transferred = 0;
     let requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0, clockRefreshes = 0, clockRegressionMs = 0;
     const started = performance.now();
+    const readStateHitsBefore=Number(wasm.antfly_host_read_state_cache_hits?.()??0),readStateExtensionsBefore=Number(wasm.antfly_host_read_state_cache_extensions?.()??0);
     const manifestCacheHitsBefore=Number(wasm.antfly_host_manifest_cache_hits?.()??0);
     try {
       // A different I/O context can remain a few milliseconds behind even
@@ -224,6 +225,9 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
         transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs, io_draining: Boolean(draining),
         wasm_linear_bytes: wasm.memory.buffer.byteLength,
         decoded_manifest_cache_hits: Number(wasm.antfly_host_manifest_cache_hits?.() ?? 0)-manifestCacheHitsBefore,
+        read_state_cache_bytes: wasm.antfly_host_read_state_cache_bytes?.() ?? 0,
+        read_state_cache_hits: Number(wasm.antfly_host_read_state_cache_hits?.() ?? 0)-readStateHitsBefore,
+        read_state_cache_extensions: Number(wasm.antfly_host_read_state_cache_extensions?.() ?? 0)-readStateExtensionsBefore,
         prepared_read_cache_bytes: wasm.antfly_host_prepared_read_cache_bytes?.() ?? 0,
         decoded_manifest_cache_bytes: wasm.antfly_host_manifest_cache_bytes?.() ?? 0,
         working_set_peak_bytes: wasm.antfly_host_working_set_peak_bytes?.() ?? null});

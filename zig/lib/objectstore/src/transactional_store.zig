@@ -29,10 +29,12 @@ pub const Command = struct {
     limit: usize = 128,
 };
 pub const Request = struct {
-    action: enum { begin, observe, observe_committed, read, commit, commit_wal, checkpoint, trace, retire_logs },
+    action: enum { begin, observe, observe_committed, observe_read, read, commit, commit_wal, checkpoint, trace, retire_logs },
     owner: [16]u8,
     state: ?journal.State = null,
     commands: []const Command = &.{},
+    observe_owned: bool = false,
+    read_prefix: ?[]const u8 = null,
     page: ?tree.Ref = null,
     keys: []const []const u8 = &.{},
     before: []const u8 = "0",
@@ -259,12 +261,14 @@ pub const Context = struct {
         const base = try std.fmt.allocPrint(m, "{s}/coord-v1/{s}", .{ self.prefix, std.fmt.bytesToHex(digest, .lower) });
         const domain = Pages.domainForNamespace(base);
         const log = journal.Log{ .client = self.client, .bucket = self.bucket, .prefix = base, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .checkpoint_commits = req.checkpoint_commits };
-        if (req.action == .begin or req.action == .observe or req.action == .observe_committed) {
-            const recovered = if (req.action == .observe_committed) try log.observeCommitted(m, req.state) else if (req.action == .observe) try log.observe(m, req.state orelse return error.CoordinatorSessionRequired) else try log.recover(m, req.state, req.state == null or !std.mem.eql(u8, &req.state.?.owner, &req.owner));
-            return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
-        }
-        const state = req.state orelse return error.CoordinatorSessionRequired;
-        if (!std.mem.eql(u8, &state.owner, &req.owner)) return error.ImmutableLogFenced;
+        const observing = req.action == .begin or req.action == .observe or req.action == .observe_committed or req.action == .observe_read;
+        const observed = if (observing) blk: {
+            const recovered = if (req.action == .observe_committed or (req.action == .observe_read and !req.observe_owned)) try log.observeCommitted(m, req.state) else if (req.action == .observe or req.action == .observe_read) try log.observe(m, req.state orelse return error.CoordinatorSessionRequired) else try log.recover(m, req.state, req.state == null or !std.mem.eql(u8, &req.state.?.owner, &req.owner));
+            if (req.action != .observe_read or recovered.has_more) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
+            break :blk recovered;
+        } else null;
+        const state = if (observed) |value| value.state else req.state orelse return error.CoordinatorSessionRequired;
+        if (req.action != .observe_read and !std.mem.eql(u8, &state.owner, &req.owner)) return error.ImmutableLogFenced;
         if (req.action == .retire_logs) return std.json.Stringify.valueAlloc(self.alloc, .{ .keys = try log.retirable(m, req.keys, try std.fmt.parseInt(u64, req.before, 10)) }, .{});
         if (req.action == .checkpoint) return std.json.Stringify.valueAlloc(self.alloc, .{ .checkpointed = try log.writeCheckpoint(m, state, true) }, .{});
         if (req.commands.len > 512) return error.CoordinatorBatchExceeded;
@@ -289,6 +293,23 @@ pub const Context = struct {
                 try children.append(self.alloc, child.*);
             };
             return std.json.Stringify.valueAlloc(self.alloc, .{ .children = children.items, .key = try pages.key(m, ref) }, .{});
+        }
+        if (req.action == .observe_read) {
+            if (req.commands.len > 8) return error.CoordinatorBatchExceeded;
+            var output = std.ArrayList([]const Row).empty;
+            for (req.commands) |command| {
+                if (command.kind != .get) return error.CoordinatorReadRequired;
+                const value = try root.get(m, self.alloc, cache.store(), command.key);
+                try output.append(m, if (value) |bytes| try m.dupe(Row, &.{.{ .key = command.key, .value = bytes }}) else &.{});
+            }
+            var selected: ?Row = null;
+            if (req.read_prefix) |prefix| {
+                if (prefix.len == 0 or prefix.len > 1024) return error.InvalidCoordinatorReadSet;
+                if (root.read_rows) |rows| if (rows.selected) |record| {
+                    if (record.value != null and std.mem.startsWith(u8, record.key, prefix)) selected = .{ .key = record.key, .value = record.value.? };
+                };
+            }
+            return std.json.Stringify.valueAlloc(self.alloc, .{ .state = state, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected }, .{});
         }
         if (req.action == .read) {
             var output = std.ArrayList([]const Row).empty;
@@ -758,4 +779,35 @@ test "object-native WAL commit inlines hot records atomically and preserves gene
     state = (try std.json.parseFromSlice(Header, m, frozen, .{ .ignore_unknown_fields = true })).value.state;
     commit.expected_etag = "two";
     try std.testing.expectError(error.CoordinatorMigrationRequired, ctx.execute(.{ .action = .commit_wal, .owner = @splat(1), .state = state, .wal_commit = commit }));
+}
+
+test "object-native fused observation reads one fresh root and selected pin without writes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("fixture");
+    const ctx = Context{ .alloc = a, .client = client, .bucket = "fixture", .prefix = "native", .namespace = "fused", .io = std.testing.io };
+    const Header = struct { state: journal.State };
+    const initial = try ctx.execute(.{ .action = .begin, .owner = @splat(1) });
+    defer a.free(initial);
+    const state = (try std.json.parseFromSlice(Header, m, initial, .{ .ignore_unknown_fields = true })).value.state;
+    const committed = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = state, .inline_read_set = .{ .keys = &.{ "head", "absent" }, .prefix = "pins/" }, .commands = &.{ .{ .kind = .put, .key = "head", .value = "one" }, .{ .kind = .put, .key = "pins/one", .value = "expiry" } } });
+    defer a.free(committed);
+    const output = try ctx.execute(.{ .action = .observe_read, .owner = @splat(9), .read_prefix = "pins/", .commands = &.{ .{ .kind = .get, .key = "head" }, .{ .kind = .get, .key = "absent" } } });
+    defer a.free(output);
+    const result = (try std.json.parseFromSlice(struct { state: journal.State, has_more: bool, results: [][]Row, selected: ?Row }, m, output, .{ .ignore_unknown_fields = true })).value;
+    try std.testing.expect(!result.has_more);
+    try std.testing.expectEqualStrings("one", result.results[0][0].value);
+    try std.testing.expectEqual(@as(usize, 0), result.results[1].len);
+    try std.testing.expectEqualStrings("pins/one", result.selected.?.key);
+    try std.testing.expectEqualStrings("expiry", result.selected.?.value);
+    const wrong = try ctx.execute(.{ .action = .observe_read, .owner = @splat(9), .state = result.state, .read_prefix = "other/" });
+    defer a.free(wrong);
+    const absent = (try std.json.parseFromSlice(struct { selected: ?Row }, m, wrong, .{ .ignore_unknown_fields = true })).value;
+    try std.testing.expectEqual(null, absent.selected);
+    try std.testing.expectError(error.CoordinatorReadRequired, ctx.execute(.{ .action = .observe_read, .owner = @splat(9), .commands = &.{.{ .kind = .delete, .key = "head" }} }));
 }

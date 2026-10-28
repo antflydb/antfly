@@ -2924,6 +2924,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-publication-protocol-test", "Run native publication continuation and read/write planning tests").dependOn(&run_publication_protocol_tests.step);
     serverless_test_step.dependOn(&run_publication_protocol_tests.step);
 
+    const read_state_tests = b.addTest(.{
+        .root_module = document_facts_test_mod,
+        .filters = selectTestFilters(b, &.{ "native read plan", "indexed WAL document projection" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-read-state-test", "Run native read-state ownership, point projection and retention contracts").dependOn(&addFilteredTestRunArtifact(b, read_state_tests).step);
+
     const graph_page_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/graph_page_tree_test_root.zig"),
         .target = target,

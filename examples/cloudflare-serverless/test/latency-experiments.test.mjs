@@ -33,3 +33,11 @@ test('native WAL finalization rejects changed and absent preparation dependencie
  assert.equal((await store.commitWal(make([{key:'head',value:encode(source)},{key:'missing',value:null}]))).applied,true);
  await assert.rejects(store.commitWal(make(Array.from({length:5},(_,i)=>({key:'x'+i,value:null})))),/InvalidCoordinatorWalCommit/);
 });
+
+test('fused read admission returns exact rows and selected pins in one native observation',async()=>{
+ const bucket=new Bucket(),samples=[],store=new R2CoordinatorStore(module,bucket,'fused-native',{inlineReadSet:{keys:['head','wal'],prefix:'pins/'},onMetrics:sample=>samples.push(sample)});
+ await store.transaction(async tx=>{await tx.put('head','one');await tx.put('wal','tail');await tx.put('pins/one','protected');});
+ samples.length=0;const result=await store.readOnly(async tx=>({rows:await tx.getMany(['head','wal']),pin:await tx.get('pins/one')}),{readKeys:['head','wal'],readPrefix:'pins/'});
+ assert.deepEqual(result,{rows:['one','tail'],pin:'protected'});
+ assert.deepEqual(samples.filter(sample=>sample.event==='antfly.coordinator_snapshot_native').map(sample=>sample.action),['observe_read']);
+});

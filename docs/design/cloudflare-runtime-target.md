@@ -498,3 +498,12 @@ optional two-stage protocol uses Antfly's bounded native prepared cache and
 best-effort idle-kernel affinity. A held tenant's authority fetch no longer blocks
 another tenant's independent read under the existing app reservation. See
 [detached native reads](detached-native-reads.md) for the protocol and evidence.
+
+## Shared read-path follow-up
+
+[Shared native read state and point projections](native-read-state.md) extends this
+design with fused fresh admission, bounded native overlay reuse, optional atomic
+WAL document indexing, foreground cache admission and opportunistic preparation.
+The shared engine owns these mechanisms; hosts without the optional WAL
+capabilities retain bounded range reads. Earlier measurements and frozen cloud
+controls above remain unchanged.

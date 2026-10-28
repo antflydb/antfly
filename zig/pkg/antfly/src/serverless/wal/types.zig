@@ -28,6 +28,19 @@ pub const Record = struct {
     operation_id: ?[]u8 = null,
 };
 
+/// Immutable identities from a freshly captured WAL HEAD. Parent identity is
+/// published by the same atomic append, never supplied by a reader cache.
+pub const ReadSnapshot = struct {
+    latest_lsn: u64,
+    first_lsn: u64,
+    identity: [32]u8,
+    lineage: [32]u8,
+    parent_identity: ?[32]u8 = null,
+    parent_lsn: u64 = 0,
+    small_tail: bool = false,
+};
+pub const PointRead = struct { indexed: bool = false, record: ?Record = null };
+
 /// A captured, inclusive committed prefix. Exceeding any budget fails the
 /// entire read; consumers must never mistake a truncated page for fresh state.
 pub const ReadRange = struct {

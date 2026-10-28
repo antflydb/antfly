@@ -141,7 +141,7 @@ export class R2CoordinatorStore {
     if(names.some(name=>!map.has(name)))return null;
     return new Map([...map].map(([key,value])=>[key,value==null?undefined:JSON.parse(value,(_,v)=>v&&Object.keys(v).length===1&&typeof v.__antfly_utf8==="string"?utf8.encode(v.__antfly_utf8):v&&Object.keys(v).length===1&&Array.isArray(v.__antfly_bytes)?Uint8Array.from(v.__antfly_bytes):v)]));
   }
-  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity}={}){
+  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity,readKeys,readPrefix}={}){
     if(this.ownerReady)await this.ownerReady;
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
     const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=Math.min(this.clock()+5000,outerDeadlineMs),started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
@@ -165,13 +165,18 @@ export class R2CoordinatorStore {
     try{
       let observed,state=captured;
       for(let attempt=0;attempt<4;attempt++){
-        observed=await native(state,{action:owned?"observe":"observe_committed"});state=observed.state;
+        observed=await native(state,readKeys?{action:"observe_read",observe_owned:owned,commands:readKeys.map(key=>({kind:"get",key})),read_prefix:readPrefix??null}:{action:owned?"observe":"observe_committed"});state=observed.state;
         if(!observed.has_more)break;
         // A sealed epoch may lack START after a partial hint upload. An
         // unowned observer cannot authenticate that continuation independently.
         if(!owned&&state.next===0)throw Error("ReadSnapshotNeedsAdmission");
       }
       if(observed.has_more)throw Error("ReadSnapshotNeedsAdmission");
+      if(readKeys){
+        if(!Array.isArray(observed.results)||observed.results.length!==readKeys.length)throw Error("InvalidCoordinatorReadProjection");
+        readKeys.forEach((key,i)=>rows.set(key,observed.results[i][0]?decode(observed.results[i][0].value):undefined));
+        if(observed.selected){if(!readPrefix||!observed.selected.key.startsWith(readPrefix))throw Error("InvalidCoordinatorReadProjection");rows.set(observed.selected.key,decode(observed.selected.value));}
+      }
       capsuleMetrics=rootMetrics(observed.state);
       if(!this.observedState||observed.state.revision>=this.observedState.revision)this.observedState=structuredClone(observed.state);
       this.base??=observed.base;this.pagePrefix??=observed.page_prefix;

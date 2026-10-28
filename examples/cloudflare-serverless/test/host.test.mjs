@@ -1122,3 +1122,35 @@ test('detached native preparation releases its call and validates fresh overlays
  const deleted=await prepare(10);await mutate('detached-delete',null);assert.equal((await resume(deleted)).body,null);
  await assert.rejects(resume(deleted,'one',{native_read_spent_bytes:16*1024*1024+1}),/InvalidNativeReadPlan/);
 });
+
+for(const profile of[{native_read_state:true},{wal_document_index:true},{native_read_state:true,wal_document_index:true}])test('native read state preserves fresh visibility across append, publication, deletion and reopen '+JSON.stringify(profile),async()=>{
+ const metrics=[],{bucket,host}=await setup(undefined,undefined,{onMetrics:sample=>metrics.push(sample)}),native=(op,args={})=>request(op,{...profile,...args}),body=text=>JSON.stringify({text});
+ const seed=await host.request(native('mutate',{operation_id:'read-state-seed',mutations:[{kind:'upsert',doc_id:'one',body:body('base')},{kind:'upsert',doc_id:'stable',body:body('stable')}]}));await host.request(native('publish'));
+ for(let i=0;i<2;i++)assert.equal((await host.request(native('lookup',{doc_id:'one'}))).body,body('base'));
+ if(profile.native_read_state)assert.ok(metrics.some(sample=>sample.read_state_cache_hits>0));
+ const update=await host.request(native('mutate',{operation_id:'read-state-update',mutations:[{kind:'upsert',doc_id:'one',body:body('fresh')}]}));
+ assert.equal((await host.request(native('lookup',{doc_id:'one',required_visibility:update.visibility}))).body,body('fresh'));
+ assert.equal((await host.request(native('lookup',{doc_id:'stable',required_visibility:update.visibility}))).body,body('stable'));
+ if(profile.native_read_state)assert.ok(metrics.some(sample=>sample.read_state_cache_extensions>0));
+ assert.equal((await host.request(native('count'))).count,'2');
+ const cold=(await setup(bucket)).host;assert.equal((await cold.request(native('lookup',{doc_id:'one',required_visibility:update.visibility}))).body,body('fresh'));
+ await host.request(native('publish'));
+ const removed=await host.request(native('mutate',{operation_id:'read-state-delete',mutations:[{kind:'delete',doc_id:'one'}]}));
+ assert.equal((await host.request(native('lookup',{doc_id:'one',required_visibility:removed.visibility}))).body,null);
+ assert.equal((await host.request(native('count'))).count,'1');
+ assert.equal((await host.request(native('lookup',{doc_id:'one',namespace:'other'}))).body,null);
+ assert.equal(seed.visibility.length,update.visibility.length);
+ for(const sample of metrics)assert.ok(sample.read_state_cache_bytes<=256*1024);
+});
+
+test('a failed WAL HEAD cannot publish document projection rows or receipts',async()=>{
+ const{bucket,host}=await setup(),native=(op,args)=>request(op,{wal_document_index:true,...args});
+ await host.request(native('mutate',{operation_id:'index-seed',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"old"}'}]}));
+ const put=bucket.put.bind(bucket);let failed=false;
+ bucket.put=async(key,...args)=>{if(key.includes('/wal-v1/')&&key.endsWith('/HEAD')&&!failed){failed=true;throw Error('injected-index-head-failure');}return put(key,...args);};
+ const mutation=native('mutate',{operation_id:'index-retry',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"new"}'}]});
+ await assert.rejects(host.request(mutation));assert.equal(failed,true);bucket.put=put;
+ const reader=(await setup(bucket)).host;assert.equal((await reader.request(native('lookup',{doc_id:'one'}))).body,'{"text":"old"}');
+ const accepted=await host.request(mutation);assert.equal((await reader.request(native('lookup',{doc_id:'one',required_visibility:accepted.visibility}))).body,'{"text":"new"}');
+ assert.deepEqual(await host.request(mutation),accepted);
+});

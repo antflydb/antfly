@@ -62,17 +62,18 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
         if(env.NATIVE_READ_DETACHED==="true"){
           // Authority starts in the submitting caller before any preparation
           // queue. Preparation returns its physical slot before awaiting it.
-          let admitted;const begun=new Promise(resolve=>admitted=resolve);
+          let admitted,freshReady=false;const begun=new Promise(resolve=>admitted=resolve);
           const fresh=prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,deadlineMs,onAdmitted:admitted});
-          fresh.then(admitted,admitted);fresh.catch(()=>{});
+          fresh.then(()=>{freshReady=true;admitted();},()=>{freshReady=true;admitted();});fresh.catch(()=>{});
           let prepared,hostIdentity,usage,preparationPhysical;
           try{
             if(hint){
               await begun;
               const ticket=Array.from(crypto.getRandomValues(new Uint8Array(16)));
-              await withNativeReadPlanPermit(kernel,pointReadLanes&&env.DIRECT_READS==="true"?8*1024*1024:kernel.reservationBytes,async allowed=>{
+              const prepare=async allowed=>{
                 if(!allowed)return;
                 const execute=async host=>{
+                  if(env.OPPORTUNISTIC_READ_PREPARE==="true"&&freshReady)return undefined;
                   hostIdentity=host.poolIdentity;
                   return run(env,input,signal,collection,host,trace,{nativePreparation:{hint,ticket,spentBytes:usage?.transferred_bytes??0},deadlineMs},{...requestOptions,
                     onNativeMetrics:sample=>{usage={
@@ -85,9 +86,19 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
                     onPhysicalMetrics:sample=>{preparationPhysical??={};for(const[key,value]of Object.entries(sample??{}))if(typeof value==="number")preparationPhysical[key]=(preparationPhysical[key]??0)+value;},
                   });
                 };
-                const options={signal,deadlineMs,fairKey:env.ANTFLY_INCARNATION,onStage:sample=>trace.stage(sample)};
-                prepared=pointReadLanes&&env.DIRECT_READS==="true"?await withPointReadLane(kernel,execute,options):await kernel.withHost(execute,options);
-              },{deadlineMs,signal});
+                const opportunistic=env.OPPORTUNISTIC_READ_PREPARE==="true";
+                const options={signal,deadlineMs,fairKey:env.ANTFLY_INCARNATION,onStage:sample=>trace.stage(sample),...(opportunistic?{tryOnly:true,preparationOnly:true}:{})};
+                const runPreparation=async host=>{
+                  if(!opportunistic)return execute(host);
+                  kernel.waitingReadPlans=(kernel.waitingReadPlans??0)+1;
+                  try{return await execute(host);}finally{kernel.waitingReadPlans--;kernel.drain?.();}
+                };
+                if(pointReadLanes&&env.DIRECT_READS==="true")prepared=await withPointReadLane(kernel,runPreparation,options);
+                else if(opportunistic){const result=await kernel.tryWithHost(runPreparation,options);prepared=result.admitted?result.value:undefined;}
+                else prepared=await kernel.withHost(execute,options);
+              };
+              if(env.OPPORTUNISTIC_READ_PREPARE==="true"){if(!freshReady)await prepare(true);}
+              else await withNativeReadPlanPermit(kernel,pointReadLanes&&env.DIRECT_READS==="true"?8*1024*1024:kernel.reservationBytes,prepare,{deadlineMs,signal});
               if(prepared?.__read_prepared)prepared.ticket=ticket;
             }
             const admission=await fresh;
@@ -159,7 +170,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       catch(error){if(!unsupportedRpc(error,"openPublication")&&!unsupportedRpc(error,"openPublicationPlan"))throw error;}
     }
     let transport = cache.wrap(withCommitCoordinator(edgeCacheForEnv(env,{background:requestBackground,budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),physical)),
-      env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)?preparedPublication??publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(request,body,expected)=>rpc("publicationCall",request,body,expected,readHints?.forHead(request,body))},publicationView):coordinator, collection), env.ANTFLY_INCARNATION, env.DATABASE);
+      env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)?preparedPublication??publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(request,body,expected)=>rpc("publicationCall",request,body,expected,readHints?.forHead(request,body))},publicationView):coordinator, collection), env.ANTFLY_INCARNATION, env.DATABASE,env.FOREGROUND_CACHE_POLICY==="true"?{populate:input.op!=="list"&&!(input.op==="search"&&input.exact_scan),protect:input.op==="lookup"||input.op==="search"&&!input.exact_scan,preserveProtected:!(input.op==="lookup"||input.op==="search"&&!input.exact_scan)}:undefined);
     if(readHints)transport=readHints.wrap(transport);
     if(env.COORDINATOR_BACKEND==="r2"&&!readAdmission?.legacy&&!readAdmission?.nativePlan&&!readAdmission?.nativePreparation&&["lookup","list","count","search","status","latest"].includes(input.op))transport=withReadView(transport,coordinator,env.ANTFLY_INCARNATION,{initial:readAdmission?.view,admittedAt:readAdmission?.started,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});
     if(readAdmission?.nativePlan)transport=withNativeReadPlan(transport,coordinator,env.ANTFLY_INCARNATION,{fresh:readAdmission.nativePlan.fresh,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});
@@ -167,7 +178,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     const activeContinuation=env.PUBLICATION_PREPARED_SLICES==="true"&&input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"&&input.publication_action!=="status"&&publicationView?.entries?.some(([key,record])=>key.endsWith("/PUBLICATION_PLAN")&&record?.body?.byteLength>0);
     if(activeContinuation){publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),true);preparedPublication=new PreparedPublication(publicationView,{read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);transport=withCommitCoordinator(transport,preparedPublication,collection);}
     const publicationBudget = publicationView?.budget??(["publish", "reindex"].includes(input.op) ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16);
-    const settings = input.op === "latest" ? {} : { wal_inline_tail:env.WAL_INLINE_TAIL==="true", coarse_probes:Number(input.coarse_probes??env.ANN_COARSE_PROBES??0), enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
+    const settings = input.op === "latest" ? {} : { ...(env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}), wal_inline_tail:env.WAL_INLINE_TAIL==="true", coarse_probes:Number(input.coarse_probes??env.ANN_COARSE_PROBES??0), enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
       publication_lease:preparedPublication?.lease??null,
       reindex_records: Math.min(64, publicationBudget),
       enrichment_documents: Number(env.ENRICHMENT_DOCUMENTS ?? 1),
@@ -192,7 +203,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
     if(actorMutation){try{return await trace.span("writer_rpc",()=>stub.mutateBatch({...input,...settings,__trace_id:trace.id}));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
-    const {inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,native_read_plan_mode:ignoredReadMode,native_read_plan:ignoredReadPlan,native_read_prepare:ignoredReadPrepare,native_read_resume:ignoredReadResume,native_read_spent_bytes:ignoredReadSpent,native_write_plan:ignoredWritePlan,publication_continuations:ignoredContinuation,publication_batch_probe:ignoredPublicationProbe,publication_batch_version:ignoredBatchVersion,publication_continuation_force:ignoredForce,publication_units:ignoredUnits,publication_adaptive_slices:ignoredAdaptive,publication_max_units:ignoredMaximum,publication_prepared_slices:ignoredPrepared,compaction_probe_only:ignoredProbe,...nativeInput}=input;
+    const {inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,native_read_plan_mode:ignoredReadMode,native_read_state:ignoredReadState,wal_document_index:ignoredDocumentIndex,native_read_plan:ignoredReadPlan,native_read_prepare:ignoredReadPrepare,native_read_resume:ignoredReadResume,native_read_spent_bytes:ignoredReadSpent,native_write_plan:ignoredWritePlan,publication_continuations:ignoredContinuation,publication_batch_probe:ignoredPublicationProbe,publication_batch_version:ignoredBatchVersion,publication_continuation_force:ignoredForce,publication_units:ignoredUnits,publication_adaptive_slices:ignoredAdaptive,publication_max_units:ignoredMaximum,publication_prepared_slices:ignoredPrepared,compaction_probe_only:ignoredProbe,...nativeInput}=input;
     const plannedCompact=env.NATIVE_COMPACTION_PLAN==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="compact"&&input.operation_id===undefined&&env.BATCHED_PUBLICATION!=="false";
     const plannedPublication=input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true";
     const compactDeadline=Date.now()+30000;let probeOperations=0,probeBytes=0,probeMetrics,batchRecords,batchVersion,preparedSlice=false;

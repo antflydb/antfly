@@ -126,3 +126,12 @@ created. The cloud acceptance gate remains unpassed: final-module scale/ANN
 coverage, complete invocation accounting and the unchanged three paired
 hour-long/cold populations remain necessary. Write-tail latency and fresh
 metadata/WAL dependency depth need further work.
+
+## Shared read-path follow-up
+
+[Shared native read state and point projections](native-read-state.md) extends this
+design with fused fresh admission, bounded native overlay reuse, optional atomic
+WAL document indexing, foreground cache admission and opportunistic preparation.
+The shared engine owns these mechanisms; hosts without the optional WAL
+capabilities retain bounded range reads. Earlier measurements and frozen cloud
+controls above remain unchanged.

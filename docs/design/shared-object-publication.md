@@ -190,3 +190,12 @@ It releases the physical query slot before waiting for fresh authority and retai
 only bounded authenticated immutable work in native memory. The original barrier
 protocol remains supported; this opt-in path addresses cross-tenant slot starvation
 without introducing retained mutable snapshots or a second storage format.
+
+## Shared read-path follow-up
+
+[Shared native read state and point projections](native-read-state.md) extends this
+design with fused fresh admission, bounded native overlay reuse, optional atomic
+WAL document indexing, foreground cache admission and opportunistic preparation.
+The shared engine owns these mechanisms; hosts without the optional WAL
+capabilities retain bounded range reads. Earlier measurements and frozen cloud
+controls above remain unchanged.

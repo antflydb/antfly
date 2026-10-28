@@ -30,6 +30,8 @@ pub const WalStore = struct {
         append_idempotent_if_latest: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8, u64) anyerror!?u64 = null,
         read_from_alloc: *const fn (*anyopaque, Allocator, []const u8, u64) anyerror![]wal_types.Record,
         read_range_alloc: ?*const fn (*anyopaque, Allocator, []const u8, wal_types.ReadRange) anyerror![]wal_types.Record = null,
+        read_snapshot: ?*const fn (*anyopaque, []const u8) anyerror!wal_types.ReadSnapshot = null,
+        read_point_alloc: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, wal_types.ReadRange) anyerror!wal_types.PointRead = null,
         latest_lsn: *const fn (*anyopaque, []const u8) anyerror!u64,
         truncate_prefix: *const fn (*anyopaque, []const u8, u64) anyerror!u64,
     };
@@ -105,6 +107,16 @@ pub const WalStore = struct {
         if (range.start_lsn > range.end_lsn) return self.allocator.alloc(wal_types.Record, 0);
         const read = self.vtable.read_range_alloc orelse return error.BoundedWalReadUnsupported;
         return read(self.ptr, self.allocator, namespace, range);
+    }
+
+    pub fn readSnapshot(self: *WalStore, namespace: []const u8) !?wal_types.ReadSnapshot {
+        const read = self.vtable.read_snapshot orelse return null;
+        return try read(self.ptr, namespace);
+    }
+    pub fn readPointAlloc(self: *WalStore, namespace: []const u8, id: []const u8, range: wal_types.ReadRange) !wal_types.PointRead {
+        try range.check();
+        const read = self.vtable.read_point_alloc orelse return .{};
+        return read(self.ptr, self.allocator, namespace, id, range);
     }
 
     pub fn latestLsn(self: *WalStore, namespace: []const u8) !u64 {

@@ -904,3 +904,36 @@ test('kernel cache affinity prefers an idle matching host and never waits for a 
  const second=await pool.withHost(host=>host.poolIdentity,{preferredHostIdentity:first});assert.notEqual(first,second);release();await held;
  assert.equal(await pool.withHost(host=>host.poolIdentity,{preferredHostIdentity:second}),second);
 });
+
+test('foreground cache admission preserves hot blocks through scans without caching mutable authority or misses',async()=>{
+ const{createImmutableReadCache}=await import('../../../zig/lib/objectstore/wasm/cache.mjs');let calls=0;
+ const cache=createImmutableReadCache({maxBytes:64*1024,maxEntries:4}),transport=async req=>{calls++;return{body:new Uint8Array(16),json:{key:req.key}};},foreground=cache.wrap(transport,'test',{protect:true}),scan=cache.wrap(transport,'test',{populate:false});
+ const request=i=>({op:'get',bucket:'database',key:'antfly/artifacts/sha256/aa/'+String(i).padStart(62,'0')});
+ await foreground(request(1));await foreground(request(1));
+ const before=calls;for(let i=2;i<20;i++)await scan(request(i));assert.equal(calls,before+18);
+ const after=calls;await foreground(request(1));assert.equal(calls,after);
+ for(let i=20;i<30;i++)await foreground(request(i));const churn=calls;await foreground(request(1));assert.equal(calls,churn,'probationary misses must not evict a repeatedly used foreground block');const maintenance=cache.wrap(transport,'test',{preserveProtected:true});for(let i=30;i<40;i++)await maintenance(request(i));const afterMaintenance=calls;await foreground(request(1));assert.equal(calls,afterMaintenance);
+ await foreground({op:'get',key:'antfly/progress/tenant/HEAD'});await foreground({op:'get',key:'antfly/progress/tenant/HEAD'});assert.equal(calls,afterMaintenance+2);
+ assert.ok(cache.retainedBytes()<=64*1024);
+});
+
+test('opportunistic kernel admission never queues and preserves the ordinary waiting caller',async()=>{
+ const{RequestPool}=await import('../request-pool.mjs');let release,started;const gate=new Promise(r=>release=r),entered=new Promise(r=>started=r);let created=0;
+ const pool=new RequestPool(async()=>({usable:()=>true,memoryBytes:()=>1,id:++created}),1,{maxReservedBytes:8,memoryReservationBytes:8,reservationBytes:8});
+ const first=pool.withHost(async()=>{started();await gate;});await entered;
+ assert.deepEqual(await pool.tryWithHost(()=>{throw Error('MustNotRun');}),{admitted:false});assert.equal(pool.pending.length,0);assert.equal(pool.reservedBytes,8);
+ const ordinary=pool.withHost(host=>host.id);assert.deepEqual(await pool.tryWithHost(()=>{throw Error('MustNotOvertake');}),{admitted:false});assert.equal(pool.pending.length,1);release();await first;assert.equal(await ordinary,1);
+ assert.deepEqual(await pool.tryWithHost(host=>host.id),{admitted:true,value:1});assert.equal(pool.reservedBytes,0);
+});
+
+test('bounded optional preparation skips capacity promotion and retains its charged work',async()=>{
+ const{withPointReadLane}=await import('../point-read-lane.mjs');let calls=0,charged=0;
+ const kernel={tryWithHost:async run=>({admitted:true,value:await run({request:async(_,options)=>{calls++;options.onMetrics({operations:2,transferred_bytes:4096});throw Error('HostedWorkingSetBudgetExceeded');}})}),withHost:async()=>{throw Error('PreparationMustNotQueueOrPromote');}};
+ assert.equal(await withPointReadLane(kernel,host=>host.request({op:'lookup',native_read_plan_mode:true,working_set_bytes:1024*1024},{onMetrics:sample=>charged+=sample.operations}),{tryOnly:true,preparationOnly:true}),undefined);
+ assert.equal(calls,1);assert.equal(charged,2);
+});
+
+test('app observers retain the fused-admission setting and isolate its configuration identity',async()=>{
+ const{AppReadViews}=await import('../app-read-views.mjs'),configs=[],views=new AppReadViews(config=>{configs.push(config);return{open:async()=>config.FUSED_READ_ADMISSION};}),env={DATABASE:{},ANTFLY_INCARNATION:'fused-app',LOCAL_METADATA_READS:'true',FUSED_READ_ADMISSION:'true'};
+ assert.equal(await views.get(env).open({}),'true');assert.equal(configs[0].FUSED_READ_ADMISSION,'true');assert.equal(await views.get({...env,FUSED_READ_ADMISSION:'false'}).open({}),'false');assert.equal(configs.length,2);
+});

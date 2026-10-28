@@ -323,6 +323,15 @@ kernel replacement fall back to fresh reads. It defaults off pending qualificati
 See [the detached native read design](../../docs/design/detached-native-reads.md)
 for resource accounting, rollout and the stalled-tenant regression.
 
+Additional opt-in read controls are `FUSED_READ_ADMISSION`, `NATIVE_READ_STATE`,
+`WAL_DOCUMENT_INDEX` and `FOREGROUND_CACHE_POLICY`. They fuse fresh metadata
+admission, reuse bounded derived WAL overlays, index point changes atomically
+with WAL commits, and protect foreground cache entries from scans. Native WAL
+extensions use HEAD format 4; deploy compatible readers and collectors before
+activation. Disabling activation flags does not downgrade existing HEADs.
+`OPPORTUNISTIC_READ_PREPARE=true` additionally avoids queued or late preparation
+with detached reads. See [shared native read state](../../docs/design/native-read-state.md).
+
 With publication continuations enabled, `publish` returns `job_id`, `phase`,
 `offset` and `has_more` while work remains. Resume with `publication_job_id`,
 inspect with `publication_action: "status"`, or cancel with

@@ -85,6 +85,7 @@ pub const Session = struct {
         return self.view.lookupAlloc(id, Base{ .session = self });
     }
     pub fn list(self: *Session, after: []const u8, limit: usize, max_output_bytes: usize, predicate: anytype, options: Overlay.ListOptions) !Overlay.Page {
+        if (self.view.point_id != null) return error.PointReadIdentityMismatch;
         var base = try Cursor.init(self, after);
         defer base.deinit();
         return self.view.overlay.list(.{ .ptr = &base, .next = Cursor.next }, after, limit, max_output_bytes, predicate, options);
@@ -95,6 +96,7 @@ pub const Session = struct {
     /// Corpus-dependent ranking, vector/hybrid queries and aggregations need
     /// their own visibility contracts and are deliberately rejected here.
     pub fn searchTextAlloc(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize) ![]@import("request.zig").SearchHit {
+        if (self.view.point_id != null) return error.PointReadIdentityMismatch;
         const All = struct {
             pub fn matches(_: @This(), _: Overlay.Document) !bool {
                 return true;
@@ -113,6 +115,7 @@ pub const Session = struct {
         return self.searchTextCore(req, max_output_bytes, predicate, 4096, after);
     }
     fn searchTextCore(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize, predicate: anytype, candidate_budget: ?usize, after: ?RankPosition) ![]@import("request.zig").SearchHit {
+        if (self.view.point_id != null) return error.PointReadIdentityMismatch;
         if (req.mode != .text or req.count_only or req.filter_text != null or req.exclusion_text != null or
             req.filter_prefix != null or req.fields != null or req.semantic_search != null or req.indexes != null or req.vector != null or req.sparse != null)
             return error.FreshQueryCapabilityUnsupported;
@@ -206,6 +209,7 @@ pub const Session = struct {
     }
 
     pub fn countDocuments(self: *Session) !u64 {
+        if (self.view.point_id != null) return error.PointReadIdentityMismatch;
         var count: u64 = if (self.published) |published| published.manifest.stats.document_count else 0;
         for (self.view.overlay.ordered) |id| {
             try self.cancellation.check();

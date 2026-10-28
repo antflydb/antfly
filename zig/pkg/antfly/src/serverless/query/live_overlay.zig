@@ -39,14 +39,23 @@ pub const Overlay = struct {
     }
     pub fn initWithResolver(alloc: A, records: []const wal.Record, published_lsn: u64, cutoff: u64, max_bytes: usize, resolver: ?BodyResolver) !Overlay {
         if (cutoff < published_lsn or records.len != cutoff - published_lsn) return error.InvalidWal;
-        var self = Overlay{ .alloc = alloc, .cutoff = cutoff, .max_bytes = max_bytes, .resolver = resolver };
+        var self = Overlay{ .alloc = alloc, .cutoff = published_lsn, .max_bytes = max_bytes, .resolver = resolver };
         errdefer self.deinit();
+        try self.extend(records, cutoff);
+        return self;
+    }
+    /// Append only the next contiguous committed interval to an owned overlay.
+    /// Callers discard this candidate on failure; cached snapshots stay intact.
+    pub fn extend(self: *Overlay, records: []const wal.Record, cutoff: u64) !void {
+        const alloc = self.alloc;
+        const published_lsn = self.cutoff;
+        if (cutoff < published_lsn or records.len != cutoff - published_lsn) return error.InvalidWal;
         for (records, 0..) |record, i| {
             if (record.lsn != published_lsn + i + 1) return error.InvalidWal;
             // Charge every admitted mutation before decoding. A chain of
             // updates cannot hide unbounded parsing/allocator work.
             self.bytes = std.math.add(usize, self.bytes, record.payload.len + @sizeOf(Mutation) + 64) catch return error.WalReadBudgetExceeded;
-            if (self.bytes > max_bytes) return error.WalReadBudgetExceeded;
+            if (self.bytes > self.max_bytes) return error.WalReadBudgetExceeded;
             var mutation = try codec.decodeMutationAlloc(alloc, record.payload);
             errdefer mutation.deinit(alloc);
             const old = try self.by_id.getOrPut(alloc, mutation.doc_id);
@@ -61,6 +70,7 @@ pub const Overlay = struct {
             old.value_ptr.* = mutation;
         }
         const ordered = try alloc.alloc([]const u8, self.by_id.count());
+        alloc.free(self.ordered);
         self.ordered = ordered;
         var iterator = self.by_id.keyIterator();
         var i: usize = 0;
@@ -70,7 +80,30 @@ pub const Overlay = struct {
                 return std.mem.order(u8, l, r) == .lt;
             }
         }.less);
-        return self;
+        self.cutoff = cutoff;
+    }
+    pub fn clone(self: *const Overlay, alloc: A, max_bytes: usize, resolver: ?BodyResolver) !Overlay {
+        if (self.bytes > max_bytes) return error.WalReadBudgetExceeded;
+        var copy = Overlay{ .alloc = alloc, .cutoff = self.cutoff, .bytes = self.bytes, .max_bytes = max_bytes, .resolver = resolver };
+        errdefer copy.deinit();
+        var it = self.by_id.valueIterator();
+        while (it.next()) |mutation| {
+            const id = try alloc.dupe(u8, mutation.doc_id);
+            errdefer alloc.free(id);
+            const body = if (mutation.body) |bytes| try alloc.dupe(u8, bytes) else null;
+            errdefer if (body) |bytes| alloc.free(bytes);
+            try copy.by_id.put(alloc, id, .{ .kind = mutation.kind, .doc_id = id, .body = body });
+        }
+        const ordered = try alloc.alloc([]const u8, self.ordered.len);
+        copy.ordered = ordered;
+        for (self.ordered, ordered) |id, *key| key.* = copy.by_id.get(id).?.doc_id;
+        return copy;
+    }
+    pub fn retainedBytes(self: *const Overlay) usize {
+        var bytes = self.ordered.len * @sizeOf([]const u8) + self.by_id.capacity() * (@sizeOf(Mutation) + @sizeOf([]const u8) + 32);
+        var it = self.by_id.valueIterator();
+        while (it.next()) |mutation| bytes += mutation.doc_id.len + if (mutation.body) |body| body.len else @as(usize, 0);
+        return bytes;
     }
     pub fn deinit(self: *Overlay) void {
         self.alloc.free(self.ordered);

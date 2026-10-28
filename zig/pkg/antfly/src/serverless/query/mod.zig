@@ -18,6 +18,7 @@ const std = @import("std");
 pub const runtime = @import("runtime.zig");
 pub const live_view = @import("live_view.zig");
 pub const live_overlay = @import("live_overlay.zig");
+pub const ReadStateCache = @import("read_state_cache.zig").Cache;
 pub const live_session = @import("live_session.zig");
 pub const LiveSession = live_session.Session;
 pub const materializer = @import("materializer.zig");
