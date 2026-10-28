@@ -292,9 +292,12 @@ request limits use the same envelope, and immediately before an inference
 allocation the controller checks the requested increment against the current
 leaf-cgroup working set on Linux or process physical footprint on macOS, plus
 safety headroom. When the remaining explicit envelope is the tighter live
-constraint,
-admission keeps a fixed 512 MiB emergency reserve inside that bounded view
-instead of reserving half of the remaining capacity a second time. Automatic
+constraint, admission keeps an emergency reserve of one-eighth of the effective
+envelope, capped at 512 MiB, inside that bounded view instead of reserving half
+of the remaining capacity a second time. The reserve is based on the total
+envelope, not its changing availability: small explicit budgets retain usable
+inference capacity while allocations still stop at a stable safety boundary.
+Envelopes of 4 GiB and above retain the 512 MiB reserve. Automatic
 host/cgroup sizing retains the dynamic pressure reserve. Current node or finite
 cgroup pressure also remains authoritative when it is tighter, so an explicit
 value cannot weaken a physical pressure signal. The working set is

@@ -279,7 +279,7 @@ pub const LiveAdmissionPolicy = enum {
 };
 
 /// Provenance is policy, not telemetry: only an operator-owned envelope may
-/// replace the dynamic pressure reserve with the fixed emergency reserve.
+/// replace the dynamic pressure reserve with the budget-scaled emergency reserve.
 /// Automatically detected host/cgroup limits remain dynamic even when their
 /// resolved byte value is forwarded by a composing runtime. Preserve their
 /// exact source for diagnostics and future source-specific policy.
@@ -1516,15 +1516,17 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 /// emergency floor and the stable node headroom as a ceiling. An explicit
 /// process envelope already charges the complete cgroup/process usage and
 /// expresses the operator's process headroom; inside that envelope preserve a
-/// fixed 512 MiB emergency reserve rather than dynamically reserving the
-/// bounded remainder a second time. macOS supplies a system pressure
-/// percentage, with raw Mach page queues as a conservative fallback, and uses
-/// a smaller bounded grace window because its availability sample omits some
-/// reclaimable memory.
+/// reserve of one-eighth of the effective envelope, capped at 512 MiB, rather
+/// than dynamically reserving the bounded remainder a second time. Basing it
+/// on the total envelope keeps a stable safety boundary as usage grows, while
+/// avoiding a fixed floor that makes small budgets unusable. macOS supplies a
+/// system pressure percentage, with raw Mach page queues as a conservative
+/// fallback, and uses a smaller bounded grace window because its availability
+/// sample omits some reclaimable memory.
 fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
     const available = info.available_bytes orelse return 0;
     if (info.live_admission_policy == .explicit_process_envelope)
-        return @min(available, mib(512));
+        return @min(available, @min(info.total_bytes / 8, mib(512)));
     const node_headroom = liveHostMemoryHeadroom(info.total_bytes);
     return switch (info.availability_basis) {
         .mem_available => @min(
@@ -3310,6 +3312,124 @@ test "process envelope provenance preserves automatic cgroup pressure policy" {
         clamped.live_admission_policy,
     );
     try std.testing.expectEqual(gib(2), liveHostAdmissionReserve(clamped));
+}
+
+test "explicit envelope reserve scales with budget and preserves allocation boundaries" {
+    const cases = [_]struct { budget: usize, reserve: usize }{
+        .{ .budget = 0, .reserve = 0 },
+        .{ .budget = 1, .reserve = 0 },
+        .{ .budget = 7, .reserve = 0 },
+        .{ .budget = 8, .reserve = 1 },
+        .{ .budget = mib(256), .reserve = mib(32) },
+        .{ .budget = mib(512), .reserve = mib(64) },
+        .{ .budget = gib(1), .reserve = mib(128) },
+        .{ .budget = gib(2), .reserve = mib(256) },
+        .{ .budget = gib(4), .reserve = mib(512) },
+        .{ .budget = gib(16), .reserve = mib(512) },
+        .{ .budget = std.math.maxInt(usize) - 1, .reserve = mib(512) },
+    };
+    for (cases) |case| {
+        const info = applyProcessMemoryLimit(.{
+            .total_bytes = case.budget,
+            .available_bytes = case.budget,
+        }, case.budget, 0, .explicit);
+        try std.testing.expectEqual(case.reserve, liveHostAdmissionReserve(info));
+        const capacity = case.budget - case.reserve;
+        try checkLiveHostMemoryWithInfo(info, capacity);
+        try std.testing.expectError(
+            error.ResourceTemporarilyUnavailable,
+            checkLiveHostMemoryWithInfo(info, capacity + 1),
+        );
+    }
+}
+
+test "small explicit envelope admits reported model load and query scratch" {
+    // Issue #1337: the returned-copy load and later scratch allocation were
+    // denied solely because the fixed 512 MiB reserve consumed the remainder.
+    const budget = mib(1843);
+    const samples = [_]struct { available: usize, request: usize }{
+        .{ .available = 567_738_368, .request = 166_832_880 },
+        .{ .available = budget - 1_536_774_144, .request = 16_777_920 },
+    };
+    for (samples) |sample| {
+        const info = applyProcessMemoryLimit(.{
+            .total_bytes = gib(2),
+            .available_bytes = gib(2) - (budget - sample.available),
+        }, budget, budget - sample.available, .explicit);
+        try std.testing.expectEqual(LiveAdmissionPolicy.explicit_process_envelope, info.live_admission_policy);
+        try checkLiveHostMemoryWithInfo(info, sample.request);
+        var controller = AdmissionController{};
+        const reserved = try controller.tryReserveLiveCapacityWithInfo(sample.request, info);
+        try std.testing.expectEqual(sample.available - budget / 8, controller.live_capacity_bytes);
+        controller.releaseLiveReservation(reserved);
+    }
+}
+
+test "small explicit envelope preserves reserve under scarcity and recovers after missing usage" {
+    const budget = mib(256);
+    const detected = SystemMemoryInfo{ .total_bytes = gib(2), .available_bytes = gib(2) };
+    var controller = AdmissionController{};
+    for ([_]?usize{ null, budget, budget + 1, budget - mib(32) }) |usage| {
+        const info = applyProcessMemoryLimit(detected, budget, usage, .explicit);
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(info, 1));
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityWithInfo(1, info));
+        try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+        try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
+    }
+    const recovered = applyProcessMemoryLimit(detected, budget, budget - mib(48), .explicit);
+    try std.testing.expectEqual(mib(32), liveHostAdmissionReserve(recovered));
+    try checkLiveHostMemoryWithInfo(recovered, mib(16));
+    const reserved = try controller.tryReserveLiveCapacityWithInfo(mib(16), recovered);
+    defer controller.releaseLiveReservation(reserved);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(recovered, mib(16) + 1));
+}
+
+test "small explicit envelope retains tighter physical pressure policy" {
+    const detected = SystemMemoryInfo{ .total_bytes = gib(2), .available_bytes = mib(128) };
+    const info = applyProcessMemoryLimit(detected, mib(256), 0, .explicit);
+    try std.testing.expectEqual(LiveAdmissionPolicy.dynamic_pressure, info.live_admission_policy);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(info, 1));
+    var controller = AdmissionController{};
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityWithInfo(1, info));
+
+    const automatic = applyProcessMemoryLimit(.{
+        .total_bytes = mib(256),
+        .available_bytes = mib(128),
+    }, mib(256), mib(128), .cgroup_v2);
+    try std.testing.expectEqual(LiveAdmissionPolicy.dynamic_pressure, automatic.live_admission_policy);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(automatic, 1));
+}
+
+test "small explicit envelope shares capacity and retains settled residency" {
+    const info = applyProcessMemoryLimit(.{
+        .total_bytes = gib(2),
+        .available_bytes = gib(2),
+    }, mib(256), mib(128), .explicit);
+    var controller = AdmissionController{};
+    const first = try controller.tryReserveLiveCapacityWithInfo(mib(64), info);
+    const second = try controller.tryReserveLiveCapacityWithInfo(mib(16), info);
+    try std.testing.expectEqual(mib(96), controller.live_capacity_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityWithInfo(mib(16) + 1, info));
+    try std.testing.expectEqual(mib(80), controller.live_pending_bytes);
+
+    _ = controller.settleLiveReservation(first, mib(48));
+    try std.testing.expectEqual(mib(48), controller.live_capacity_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityWithInfo(mib(32) + 1, info));
+    const third = try controller.tryReserveLiveCapacityWithInfo(mib(32), info);
+    controller.releaseLiveReservation(third);
+    controller.releaseLiveReservation(second);
+    try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+
+    // Once the epoch drains, sample the now-resident allocation rather than
+    // treating its capacity as free again.
+    const later = applyProcessMemoryLimit(.{
+        .total_bytes = gib(2),
+        .available_bytes = gib(2),
+    }, mib(256), mib(176), .explicit);
+    const next = try controller.tryReserveLiveCapacityWithInfo(mib(48), later);
+    defer controller.releaseLiveReservation(next);
+    try std.testing.expectEqual(mib(48), controller.live_capacity_bytes);
 }
 
 test "explicit Linux envelope does not double reserve bounded availability" {
