@@ -3321,3 +3321,10 @@ traversal and four-column MR1/MR2 contracts.
 [The AJ register](unified-execution-aj-outcomes.md) tracks CPU projection and
 scalar ownership, GPU normalization/layout/attention families, shared catalog
 contracts, source budgets and independent device acceptance.
+
+
+### AK native rotary and layout recipes
+
+[The AK outcome register](unified-execution-ak-outcomes.md) records shared CUDA
+rotary traversal and typed export recipes, Metal paged-seed and packed-split
+owners, exact rebuilt CUDA images, and reproducible in-place/layout validation.

@@ -76,7 +76,9 @@ int main(int argc, char **argv) { @autoreleasepool {
                 NSString *path = [directory stringByAppendingPathComponent:manifest[version ? @"candidate" : @"baseline"]];
                 NSString *source = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&error];
                 MTLCompileOptions *options = [MTLCompileOptions new];
+                if (manifest[@"language"]) options.languageVersion = [manifest[@"language"] isEqual:@"4.0"] ? MTLLanguageVersion4_0 : MTLLanguageVersion3_1;
                 options.mathMode = [mode isEqual:@"safe"] ? MTLMathModeSafe : MTLMathModeFast;
+                options.mathFloatingPointFunctions = [mode isEqual:@"safe"] ? MTLMathFloatingPointFunctionsPrecise : MTLMathFloatingPointFunctionsFast;
                 library = [device newLibraryWithSource:source options:options error:&error];
                 require(library != nil, error.description ?: @"Shader compilation failed"); libraries[key] = library;
             }
@@ -189,9 +191,9 @@ int main(int argc, char **argv) { @autoreleasepool {
             auto &values = times[version]; std::sort(values.begin(), values.end());
             medians[version] = (values[(values.size()-1)/2] + values[values.size()/2]) / 2;
         }
-        double ratio = medians[1] / medians[0]; bool ok = ratio <= 1.05 && resources; passed &= ok;
+        double ratio = medians[1] / medians[0]; double p95ratio = times[1][(times[1].size()-1)*95/100] / times[0][(times[0].size()-1)*95/100]; bool ok = ratio <= 1.05 && p95ratio <= 1.10 && resources; passed &= ok;
         [results addObject:@{@"name":test[@"name"], @"kernel":name, @"exact":@(exact), @"guards":@(guards),
-            @"baseline_ns":@(medians[0]), @"candidate_ns":@(medians[1]), @"ratio":@(ratio), @"pass":@(ok),
+            @"baseline_ns":@(medians[0]), @"candidate_ns":@(medians[1]), @"ratio":@(ratio), @"p95_ratio":@(p95ratio), @"pass":@(ok),
             @"resources_pass":@(resources), @"arms":arms, @"pipeline_order":pipelineOrder,
             @"warmup_ms":@(warmup_ms), @"warmup_dispatches":@[@(warmup_dispatches[0]), @(warmup_dispatches[1])],
             @"warmup_gpu_ns":@[@(warmup_gpu_ns[0]), @(warmup_gpu_ns[1])], @"launches_per_arm":@(repeats),

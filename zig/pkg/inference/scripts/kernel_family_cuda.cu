@@ -42,8 +42,9 @@ static bool reference_matches(const Argument& arg, const std::vector<unsigned ch
     return true;
 }
 int main(int argc,char **argv) {
-    require(argc==5 || (argc==6 && (std::string(argv[5])=="--long" || std::string(argv[5])=="--stable")),"Usage: kernel-family-cuda baseline.fatbin candidate.fatbin cases.bin receipt.json [--long|--stable]");
-    const bool extended=argc==6, stable=extended && std::string(argv[5])=="--stable";
+    require(argc==5 || (argc==6 && (std::string(argv[5])=="--long" || std::string(argv[5])=="--stable" || std::string(argv[5])=="--inplace-stable")),"Usage: kernel-family-cuda baseline.fatbin candidate.fatbin cases.bin receipt.json [--long|--stable|--inplace-stable]");
+    const bool inplace=argc==6 && std::string(argv[5])=="--inplace-stable";
+    const bool extended=argc==6, stable=extended && (std::string(argv[5])=="--stable" || inplace);
     const int launches=stable?200:(extended?40:10);
     RT(cudaSetDevice(0));RT(cudaFree(nullptr));CUmodule modules[2];DR(cuModuleLoad(&modules[0],argv[1]));DR(cuModuleLoad(&modules[1],argv[2]));
     FILE *manifest=fopen(argv[3],"rb");require(manifest!=nullptr,"Cannot read manifest");
@@ -96,7 +97,14 @@ int main(int argc,char **argv) {
             for(int node=0;node<100;node++)DR(cuLaunchKernel(functions[version],grid[0],grid[1],grid[2],block[0],block[1],block[2],shared,(CUstream)stream,params[0].data(),nullptr));
             RT(cudaStreamEndCapture(stream,&graphs[version]));RT(cudaGraphInstantiate(&execs[version],graphs[version],nullptr,nullptr,0));
         }
-        for(int i=0;i<(extended?80:40);i++){RT(cudaGraphLaunch(execs[i%2],stream));RT(cudaStreamSynchronize(stream));}
+        // In-place fixtures (role 2) must start every 100-node graph from
+        // their declared input, avoiding drift to zero/nonfinite values. Copies
+        // precede each graph's start event and are excluded from kernel timing.
+        auto reset_inplace = [&]() {
+            if(inplace)for(auto &arg:arguments)if(arg.role==2)
+                RT(cudaMemcpyAsync((void*)arg.device[0],arg.initial.data(),arg.initial.size(),cudaMemcpyHostToDevice,stream));
+        };
+        for(int i=0;i<(extended?80:40);i++){reset_inplace();RT(cudaGraphLaunch(execs[i%2],stream));RT(cudaStreamSynchronize(stream));}
         cudaEvent_t begin,end;RT(cudaEventCreate(&begin));RT(cudaEventCreate(&end));
         float warmup_ms=0.0f;
         if(stable) {
@@ -105,7 +113,7 @@ int main(int argc,char **argv) {
             auto started=std::chrono::steady_clock::now();int version=0;
             RT(cudaEventRecord(begin,stream));
             do {
-                RT(cudaGraphLaunch(execs[version],stream));RT(cudaStreamSynchronize(stream));
+                reset_inplace();RT(cudaGraphLaunch(execs[version],stream));RT(cudaStreamSynchronize(stream));
                 version^=1;
             } while(std::chrono::steady_clock::now()-started<std::chrono::milliseconds(500));
             RT(cudaEventRecord(end,stream));RT(cudaEventSynchronize(end));
@@ -113,9 +121,22 @@ int main(int argc,char **argv) {
         }
         std::vector<double> times[2];std::string arms="[";
         std::string order="ABBABAABABBAABBA"; if(extended)order+=order;
+        std::vector<cudaEvent_t> starts(inplace?launches:0), stops(inplace?launches:0);
+        for(size_t i=0;i<starts.size();++i){RT(cudaEventCreate(&starts[i]));RT(cudaEventCreate(&stops[i]));}
         for(char arm:order) {
-            int version=arm=='B';RT(cudaEventRecord(begin,stream));for(int repeat=0;repeat<launches;repeat++)RT(cudaGraphLaunch(execs[version],stream));
-            RT(cudaEventRecord(end,stream));RT(cudaEventSynchronize(end));float ms;RT(cudaEventElapsedTime(&ms,begin,end));double ns=ms*1e6/(100*launches);times[version].push_back(ns);
+            int version=arm=='B';float ms=0.0f;
+            if(inplace) {
+                for(int repeat=0;repeat<launches;repeat++) {
+                    reset_inplace();RT(cudaEventRecord(starts[repeat],stream));
+                    RT(cudaGraphLaunch(execs[version],stream));RT(cudaEventRecord(stops[repeat],stream));
+                }
+                RT(cudaEventSynchronize(stops.back()));
+                for(int repeat=0;repeat<launches;repeat++){float elapsed;RT(cudaEventElapsedTime(&elapsed,starts[repeat],stops[repeat]));ms+=elapsed;}
+            } else {
+                RT(cudaEventRecord(begin,stream));for(int repeat=0;repeat<launches;repeat++)RT(cudaGraphLaunch(execs[version],stream));
+                RT(cudaEventRecord(end,stream));RT(cudaEventSynchronize(end));RT(cudaEventElapsedTime(&ms,begin,end));
+            }
+            double ns=ms*1e6/(100*launches);times[version].push_back(ns);
             char row[120];snprintf(row,sizeof(row),"%s{\"arm\":%d,\"ns\":%.9f}",arms.size()>1?",":"",version,ns);arms+=row;
         }
         // Verify each captured version separately against the candidate's
@@ -123,6 +144,7 @@ int main(int argc,char **argv) {
         // cannot be hidden by the other version's previous result. Persistent
         // counters start from their declared fixture state, then must re-arm
         // correctly throughout the graph's 100 consecutive kernel launches.
+        std::vector<std::vector<unsigned char>> replay;
         for(int version=0;version<2;version++) {
             for(auto &arg:arguments)if(arg.role>=2) {
                 std::vector<unsigned char> initial=arg.initial;
@@ -130,15 +152,29 @@ int main(int argc,char **argv) {
                 DR(cuMemcpyHtoD(arg.device[0],initial.data(),initial.size()));
             }
             RT(cudaGraphLaunch(execs[version],stream));
-            verify_outputs();
+            if(inplace) {
+                // Both captured graphs use the same physical addresses. Compare
+                // independently reset graph replays, rather than comparing a
+                // hundred in-place updates with the single-launch oracle buffer.
+                RT(cudaStreamSynchronize(stream));size_t slot=0;
+                for(auto &arg:arguments)if(arg.role>=2) {
+                    std::vector<unsigned char> bytes(arg.initial.size());DR(cuMemcpyDtoH(bytes.data(),arg.device[0],bytes.size()));
+                    require(memcmp(bytes.data()+arg.written,arg.initial.data()+arg.written,arg.initial.size()-arg.written)==0,"Replay guard changed");
+                    require(reference_matches(arg,bytes),"Replay reference mismatch");
+                    if(version==0)replay.push_back(bytes);
+                    else require(replay[slot]==bytes,"In-place replay mismatch");
+                    ++slot;
+                }
+            } else verify_outputs();
         }
         arms+="]";double median[2];for(int v=0;v<2;v++){auto &t=times[v];std::sort(t.begin(),t.end());median[v]=(t[t.size()/2-1]+t[t.size()/2])/2;}
         double ratio=median[1]/median[0];bool ok=ratio<=1.05;passed&=ok;char row[1000];
         snprintf(row,sizeof(row),"{\"name\":\"%s\",\"kernel\":\"%s\",\"exact\":true,\"replay_exact\":true,\"guards\":true,\"baseline_ns\":%.9f,\"candidate_ns\":%.9f,\"ratio\":%.9f,\"pass\":%s,\"arms\":",name.c_str(),kernel.c_str(),median[0],median[1],ratio,ok?"true":"false");
-        char protocol[256];snprintf(protocol,sizeof(protocol),",\"launches_per_arm\":%d,\"additional_warmup_gpu_ms\":%.6f,\"baseline_registers\":%d,\"candidate_registers\":%d,\"baseline_active_blocks_per_sm\":%d,\"candidate_active_blocks_per_sm\":%d}",100*launches,warmup_ms,registers[0],registers[1],active_blocks[0],active_blocks[1]);
+        char protocol[384];snprintf(protocol,sizeof(protocol),",\"launches_per_arm\":%d,\"additional_warmup_gpu_ms\":%.6f,\"baseline_registers\":%d,\"candidate_registers\":%d,\"baseline_active_blocks_per_sm\":%d,\"candidate_active_blocks_per_sm\":%d}",100*launches,warmup_ms,registers[0],registers[1],active_blocks[0],active_blocks[1]);
         receipts.push_back(std::string(row)+arms+protocol);FILE *output=fopen(argv[4],"wb");require(output!=nullptr,"Cannot save receipt");fputs("[\n",output);
         for(size_t i=0;i<receipts.size();i++)fprintf(output,"%s%s\n",receipts[i].c_str(),i+1<receipts.size()?",":"");fputs("]\n",output);fclose(output);
         printf("%s exact=1 guards=1 ratio=%.6f pass=%d\n",name.c_str(),ratio,ok);fflush(stdout);
+        for(size_t i=0;i<starts.size();++i){RT(cudaEventDestroy(starts[i]));RT(cudaEventDestroy(stops[i]));}
         RT(cudaEventDestroy(begin));RT(cudaEventDestroy(end));for(int v=0;v<2;v++){RT(cudaGraphExecDestroy(execs[v]));RT(cudaGraphDestroy(graphs[v]));}
         for(auto &arg:arguments)if(arg.role){DR(cuMemFree(arg.device[0]));if(arg.role>=2)DR(cuMemFree(arg.device[1]));}
     }

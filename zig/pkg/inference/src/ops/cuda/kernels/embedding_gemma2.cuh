@@ -306,123 +306,100 @@ extern "C" __global__ void termite_embedding_gemma2_training_rms_norm_input_vjp_
     }
 }
 
-extern "C" __global__ void termite_embedding_gemma2_rope_bf16(
-    __nv_bfloat16* q, __nv_bfloat16* k, const long long* mask,
-    unsigned int batch, unsigned int seq, unsigned int q_heads,
-    unsigned int kv_heads, unsigned int dim, float theta, float rope_scale) {
-    unsigned int pairs = dim >> 1;
-    unsigned int pair = blockIdx.y * blockDim.x + threadIdx.x;
-    unsigned int bs = blockIdx.x;
-    unsigned int head = blockIdx.z;
-    if (pair >= pairs || bs >= batch * seq || head >= q_heads) return;
-    unsigned int b = bs / seq, pos = bs % seq;
-    if (mask && mask[(size_t)b * seq + pos] == 0) return;
-    float angle = ((float)pos / rope_scale) * powf(theta, -(2.0f * pair) / (float)dim);
-    float s, c; sincosf(angle, &s, &c); s=__bfloat162float(__float2bfloat16_rn(s)); c=__bfloat162float(__float2bfloat16_rn(c));
-    size_t qi = (((size_t)b * seq + pos) * q_heads + head) * dim + pair;
-    float q0 = __bfloat162float(q[qi]), q1 = __bfloat162float(q[qi + pairs]);
-    q[qi] = __float2bfloat16_rn(q0 * c - q1 * s); q[qi + pairs] = __float2bfloat16_rn(q1 * c + q0 * s);
-    if (head < kv_heads) {
-        size_t ki = (((size_t)b * seq + pos) * kv_heads + head) * dim + pair;
-        float k0 = __bfloat162float(k[ki]), k1 = __bfloat162float(k[ki + pairs]);
-        k[ki] = __float2bfloat16_rn(k0 * c - k1 * s); k[ki + pairs] = __float2bfloat16_rn(k1 * c + k0 * s);
-    }
-}
-
-extern "C" __global__ void termite_embedding_gemma2_rope_vjp_f32(
-    float* dq, float* dk, const float* dq_rotated, const float* dk_rotated,
-    const long long* mask, unsigned int batch, unsigned int seq,
-    unsigned int q_heads, unsigned int kv_heads, unsigned int dim,
-    float theta, float rope_scale) {
-    unsigned int pairs = dim >> 1;
-    unsigned int pair = blockIdx.y * blockDim.x + threadIdx.x;
-    unsigned int bs = blockIdx.x, head = blockIdx.z;
-    if (pair >= pairs || bs >= batch * seq || head >= q_heads) return;
-    unsigned int b = bs / seq, pos = bs % seq;
-    bool valid = !mask || mask[(size_t)b * seq + pos] != 0;
-    float angle = ((float)pos / rope_scale) * powf(theta, -(2.0f * pair) / (float)dim);
-    float s, c; sincosf(angle, &s, &c);
-    s = __bfloat162float(__float2bfloat16_rn(s));
-    c = __bfloat162float(__float2bfloat16_rn(c));
-    size_t qi = (((size_t)b * seq + pos) * q_heads + head) * dim + pair;
-    float q0 = valid ? dq_rotated[qi] : 0.0f;
-    float q1 = valid ? dq_rotated[qi + pairs] : 0.0f;
-    dq[qi] = q0 * c + q1 * s;
-    dq[qi + pairs] = q1 * c - q0 * s;
-    if (head < kv_heads) {
-        size_t ki = (((size_t)b * seq + pos) * kv_heads + head) * dim + pair;
-        float k0 = valid ? dk_rotated[ki] : 0.0f;
-        float k1 = valid ? dk_rotated[ki + pairs] : 0.0f;
-        dk[ki] = k0 * c + k1 * s;
-        dk[ki + pairs] = k1 * c - k0 * s;
-    }
-}
-
-// PyTorch-compatible autocast boundary. Each BF16 product and the following
-// add round in BF16; training and serving share this path.
-extern "C" __global__ void termite_embedding_gemma2_training_rope_bf16(
-    __nv_bfloat16* q, __nv_bfloat16* k, const long long* mask,
-    unsigned int batch, unsigned int seq, unsigned int q_heads,
-    unsigned int kv_heads, unsigned int dim, float theta, float rope_scale) {
-    unsigned int pairs = dim >> 1;
-    unsigned int pair = blockIdx.y * blockDim.x + threadIdx.x;
-    unsigned int bs = blockIdx.x, head = blockIdx.z;
-    if (pair >= pairs || bs >= batch * seq || head >= q_heads) return;
-    unsigned int b = bs / seq, pos = bs % seq;
-    if (mask && mask[(size_t)b * seq + pos] == 0) return;
-    float angle = __fmul_rn((float)pos / rope_scale, eg2_training_rope_inverse_frequency(theta, dim, pair));
-    float sf, cf; sincosf(angle, &sf, &cf);
+// Serving rounds coefficients/output; training also rounds every product/add.
+// Keep lexical traversal, BF16 coefficients and training pointer/store order:
+// equivalent helpers/address rewrites increase registers on SM75/80/110.
+#define ANTFLY_ROPE_COEFFICIENTS_true \
+    float sf, cf; sincosf(angle, &sf, &cf); \
     __nv_bfloat16 s = __float2bfloat16_rn(sf), c = __float2bfloat16_rn(cf);
-#define EG2_TRAINING_ROPE_ONE(base) do { \
-    __nv_bfloat16 x0 = (base)[0], x1 = (base)[pairs]; \
-    __nv_bfloat16 y0a = __float2bfloat16_rn(__bfloat162float(x0) * __bfloat162float(c)); \
-    __nv_bfloat16 y0b = __float2bfloat16_rn(-__bfloat162float(x1) * __bfloat162float(s)); \
-    __nv_bfloat16 y1a = __float2bfloat16_rn(__bfloat162float(x1) * __bfloat162float(c)); \
-    __nv_bfloat16 y1b = __float2bfloat16_rn(__bfloat162float(x0) * __bfloat162float(s)); \
-    (base)[0] = __float2bfloat16_rn(__bfloat162float(y0a) + __bfloat162float(y0b)); \
-    (base)[pairs] = __float2bfloat16_rn(__bfloat162float(y1a) + __bfloat162float(y1b)); \
+#define ANTFLY_ROPE_COEFFICIENTS_false \
+    float s, c; sincosf(angle, &s, &c); \
+    s = __bfloat162float(__float2bfloat16_rn(s)); c = __bfloat162float(__float2bfloat16_rn(c));
+
+#define ANTFLY_ROPE_PAIR(Training, Backward, output, input, base) do { \
+    if constexpr (Training) { \
+        __nv_bfloat16 x0, x1; \
+        if constexpr (Backward) { \
+            x0 = __float2bfloat16_rn(valid ? float((input + base)[0]) : 0.0f); \
+            x1 = __float2bfloat16_rn(valid ? float((input + base)[pairs]) : 0.0f); \
+        } else { x0 = (input + base)[0]; x1 = (input + base)[pairs]; } \
+        __nv_bfloat16 a = __float2bfloat16_rn(__bfloat162float(x0) * __bfloat162float(c)); \
+        __nv_bfloat16 b; \
+        if constexpr (Backward) { \
+            b = __float2bfloat16_rn(__bfloat162float(x1) * __bfloat162float(s)); \
+        } else { \
+            b = __float2bfloat16_rn(-__bfloat162float(x1) * __bfloat162float(s)); \
+        } \
+        __nv_bfloat16 e = __float2bfloat16_rn(__bfloat162float(x1) * __bfloat162float(c)); \
+        __nv_bfloat16 d; \
+        if constexpr (Backward) d = __float2bfloat16_rn(-__bfloat162float(x0) * __bfloat162float(s)); \
+        else d = __float2bfloat16_rn(__bfloat162float(x0) * __bfloat162float(s)); \
+        if constexpr (Backward) { \
+            (output + base)[0] = __bfloat162float(__float2bfloat16_rn(__bfloat162float(a) + __bfloat162float(b))); \
+            (output + base)[pairs] = __bfloat162float(__float2bfloat16_rn(__bfloat162float(e) + __bfloat162float(d))); \
+        } else { \
+            (output + base)[0] = __float2bfloat16_rn(__bfloat162float(a) + __bfloat162float(b)); \
+            (output + base)[pairs] = __float2bfloat16_rn(__bfloat162float(e) + __bfloat162float(d)); \
+        } \
+    } else if constexpr (Backward) { \
+        float x0 = valid ? float(input[base]) : 0.0f, x1 = valid ? float(input[base + pairs]) : 0.0f; \
+        output[base] = x0 * float(c) + x1 * float(s); output[base + pairs] = x1 * float(c) - x0 * float(s); \
+    } else { \
+        float x0 = __bfloat162float(input[base]), x1 = __bfloat162float(input[base + pairs]); \
+        output[base] = __float2bfloat16_rn(x0 * float(c) - x1 * float(s)); \
+        output[base + pairs] = __float2bfloat16_rn(x1 * float(c) + x0 * float(s)); \
+    } \
 } while (0)
-    size_t qi = (((size_t)b * seq + pos) * q_heads + head) * dim + pair;
-    EG2_TRAINING_ROPE_ONE(q + qi);
-    if (head < kv_heads) {
-        size_t ki = (((size_t)b * seq + pos) * kv_heads + head) * dim + pair;
-        EG2_TRAINING_ROPE_ONE(k + ki);
-    }
-#undef EG2_TRAINING_ROPE_ONE
+
+#define ANTFLY_ROPE(Training, Backward, q, k, input_q, input_k) do { \
+    unsigned pairs = dim >> 1, pair = blockIdx.y * blockDim.x + threadIdx.x; \
+    unsigned bs = blockIdx.x, head = blockIdx.z; \
+    if (pair >= pairs || bs >= batch * seq || head >= q_heads) return; \
+    unsigned b = bs / seq, pos = bs % seq; \
+    bool valid = !mask || mask[(size_t)b * seq + pos] != 0; \
+    if constexpr (!Backward) { if (!valid) return; } \
+    float angle; \
+    if constexpr (Training) \
+        angle = __fmul_rn((float)pos / rope_scale, eg2_training_rope_inverse_frequency(theta, dim, pair)); \
+    else angle = ((float)pos / rope_scale) * powf(theta, -(2.0f * pair) / (float)dim); \
+    ANTFLY_ROPE_COEFFICIENTS_##Training \
+    size_t qi = (((size_t)b * seq + pos) * q_heads + head) * dim + pair; \
+    ANTFLY_ROPE_PAIR(Training, Backward, q, input_q, qi); \
+    if (head < kv_heads) { \
+        size_t ki = (((size_t)b * seq + pos) * kv_heads + head) * dim + pair; \
+        ANTFLY_ROPE_PAIR(Training, Backward, k, input_k, ki); \
+    } \
+} while (0)
+
+// Typed entrypoints share the buffer ABI and supply the traversal parameters.
+#define ANTFLY_ROPE_FORWARD(Kernel, Training) \
+extern "C" __global__ void Kernel( \
+    __nv_bfloat16* q, __nv_bfloat16* k, const long long* mask, \
+    unsigned int batch, unsigned int seq, unsigned int q_heads, \
+    unsigned int kv_heads, unsigned int dim, float theta, float rope_scale) { \
+    ANTFLY_ROPE(Training, false, q, k, q, k); \
 }
 
-extern "C" __global__ void termite_embedding_gemma2_training_rope_vjp_f32(
-    float* dq, float* dk, const float* dq_rotated, const float* dk_rotated,
-    const long long* mask, unsigned int batch, unsigned int seq,
-    unsigned int q_heads, unsigned int kv_heads, unsigned int dim,
-    float theta, float rope_scale) {
-    unsigned int pairs = dim >> 1;
-    unsigned int pair = blockIdx.y * blockDim.x + threadIdx.x;
-    unsigned int bs = blockIdx.x, head = blockIdx.z;
-    if (pair >= pairs || bs >= batch * seq || head >= q_heads) return;
-    unsigned int b = bs / seq, pos = bs % seq;
-    bool valid = !mask || mask[(size_t)b * seq + pos] != 0;
-    float angle = __fmul_rn((float)pos / rope_scale, eg2_training_rope_inverse_frequency(theta, dim, pair));
-    float sf, cf; sincosf(angle, &sf, &cf);
-    __nv_bfloat16 s = __float2bfloat16_rn(sf), c = __float2bfloat16_rn(cf);
-#define EG2_TRAINING_ROPE_VJP_ONE(out, in) do { \
-    __nv_bfloat16 g0 = __float2bfloat16_rn(valid ? (in)[0] : 0.0f); \
-    __nv_bfloat16 g1 = __float2bfloat16_rn(valid ? (in)[pairs] : 0.0f); \
-    __nv_bfloat16 x0a = __float2bfloat16_rn(__bfloat162float(g0) * __bfloat162float(c)); \
-    __nv_bfloat16 x0b = __float2bfloat16_rn(__bfloat162float(g1) * __bfloat162float(s)); \
-    __nv_bfloat16 x1a = __float2bfloat16_rn(__bfloat162float(g1) * __bfloat162float(c)); \
-    __nv_bfloat16 x1b = __float2bfloat16_rn(-__bfloat162float(g0) * __bfloat162float(s)); \
-    (out)[0] = __bfloat162float(__float2bfloat16_rn(__bfloat162float(x0a) + __bfloat162float(x0b))); \
-    (out)[pairs] = __bfloat162float(__float2bfloat16_rn(__bfloat162float(x1a) + __bfloat162float(x1b))); \
-} while (0)
-    size_t qi = (((size_t)b * seq + pos) * q_heads + head) * dim + pair;
-    EG2_TRAINING_ROPE_VJP_ONE(dq + qi, dq_rotated + qi);
-    if (head < kv_heads) {
-        size_t ki = (((size_t)b * seq + pos) * kv_heads + head) * dim + pair;
-        EG2_TRAINING_ROPE_VJP_ONE(dk + ki, dk_rotated + ki);
-    }
-#undef EG2_TRAINING_ROPE_VJP_ONE
+#define ANTFLY_ROPE_VJP(Kernel, Training) \
+extern "C" __global__ void Kernel( \
+    float* dq, float* dk, const float* dq_rotated, const float* dk_rotated, \
+    const long long* mask, unsigned int batch, unsigned int seq, \
+    unsigned int q_heads, unsigned int kv_heads, unsigned int dim, \
+    float theta, float rope_scale) { \
+    ANTFLY_ROPE(Training, true, dq, dk, dq_rotated, dk_rotated); \
 }
+
+ANTFLY_ROPE_FORWARD(termite_embedding_gemma2_rope_bf16, false)
+ANTFLY_ROPE_VJP(termite_embedding_gemma2_rope_vjp_f32, false)
+ANTFLY_ROPE_FORWARD(termite_embedding_gemma2_training_rope_bf16, true)
+ANTFLY_ROPE_VJP(termite_embedding_gemma2_training_rope_vjp_f32, true)
+
+#undef ANTFLY_ROPE_FORWARD
+#undef ANTFLY_ROPE_VJP
+#undef ANTFLY_ROPE
+#undef ANTFLY_ROPE_PAIR
+#undef ANTFLY_ROPE_COEFFICIENTS_true
+#undef ANTFLY_ROPE_COEFFICIENTS_false
 
 // Exact bounded-memory route. One warp owns a query/head and performs online
 // softmax entirely in registers, so no SxS tensor or block-wide barrier is
