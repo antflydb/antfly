@@ -1339,7 +1339,8 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     var tmp = try api.TestDirectory.init("resolver-indexed-static-profiles");
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
-    var root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    // Exercise real projection publication and reopen without power-loss syncs.
+    var root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true, .no_sync = true }, true, null, null);
     var handle = try api.publishHandle(root);
     defer api.antfly_db_close(handle);
     try tables.create(root, "entities", "{}", false);
@@ -1362,7 +1363,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     api.antfly_db_close(handle);
-    root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+    root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true, .no_sync = true }, false, null, null);
     handle = try api.publishHandle(root);
     native.static_profiles.test_edge_visits.store(0, .monotonic);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
