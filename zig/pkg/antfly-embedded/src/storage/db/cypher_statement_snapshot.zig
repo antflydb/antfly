@@ -29,6 +29,8 @@ pub fn Snapshot(comptime DB: type) type {
         input: port.Input,
         graph: cypher.catalog.Graph,
         graphs: []const cypher.catalog.Graph,
+        catalog_guards: []cypher.catalog_guard.Guard,
+        graph_index: usize = 0,
         tables: [1]DB.CypherBackend.Table,
         adapter: DB.CypherBackend,
         policy: @import("row_policy_gate.zig").Gate.Lease,
@@ -83,12 +85,26 @@ pub fn Snapshot(comptime DB: type) type {
                 const summary = (try @import("doc_identity.zig").readVisibilitySummaryTxn(&primary_read)) orelse break :population null;
                 break :population summary.live_ordinals;
             };
-            self.* = .{ .a = a, .arena = arena, .source = db, .db = readonly, .population_upper_bound = population, .input = copied, .graph = graph, .graphs = graphs, .policy = authority, .tables = undefined, .adapter = undefined };
+            const guards = try owned.alloc(cypher.catalog_guard.Guard, graphs.len);
+            for (graphs, guards) |entry, *guard| guard.* = try cypher.catalog_guard.Guard.init(owned, entry, copied.table);
+            self.* = .{ .catalog_guards = guards, .a = a, .arena = arena, .source = db, .db = readonly, .population_upper_bound = population, .input = copied, .graph = graph, .graphs = graphs, .policy = authority, .tables = undefined, .adapter = undefined };
             self.tables = .{.{ .name = self.input.table, .db = &self.db }};
             self.adapter = .{ .tables = &self.tables, .ttl_now_ns = copied.ttl_now_ns, .partitioned = true, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .read_authorization = readAuthorization, .population_upper_bound = populationUpperBound, .search = search, .storage_projection = true, .ordered_projection = true } };
             const backend = self.adapter.backend();
             stage = "bind";
-            try backend.vtable.bind(backend.ptr, owned, graph);
+            // Every allowed immutable binding is checked once. Switching an
+            // operation's graph later changes only the prevalidated catalog.
+            for (graphs, 0..) |entry, index| {
+                self.graph = entry;
+                self.graph_index = index;
+                try backend.vtable.bind(backend.ptr, owned, entry);
+            }
+            self.graph = graph;
+            for (graphs, 0..) |entry, index| if (entry.incarnation == graph.incarnation and entry.revision == graph.revision) {
+                self.graph_index = index;
+                break;
+            };
+            self.adapter.graph = graph;
             self.arena = arena;
             return .{ .ptr = self, .vtable = &.{ .invoke = invoke, .invoke_typed = invokeTyped, .release = release, .open_sql = openSql } };
         }
@@ -110,14 +126,23 @@ pub fn Snapshot(comptime DB: type) type {
             try self.policy.checkAt(@intCast(time / std.time.ns_per_s));
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
-            for (self.graph.relationships) |mapping| {
-                if (!std.mem.eql(u8, self.graph.label(mapping.source_label).?.table, self.input.table)) continue;
-                if (mapping.identity) |expected| {
-                    const actual = (try self.source.cypherGraphIndexIdentity(scratch.allocator(), mapping.index)) orelse return error.CatalogGenerationChanged;
-                    if (actual.incarnation != expected.incarnation or actual.config_hash != expected.config_hash) return error.CatalogGenerationChanged;
-                }
-            }
+            try self.catalog_guards[self.graph_index].validate(scratch.allocator(), CatalogSource{ .db = self.source });
         }
+        const CatalogSource = struct {
+            db: *DB,
+            pub fn epoch(self: @This()) cypher.catalog_guard.Epoch {
+                // Synchronize with catalog publication, including restore/load.
+                self.db.core.lockApplyShared();
+                defer self.db.core.unlockApplyShared();
+                const manager = self.db.core.index_manager;
+                manager.catalog_mutex.lockShared();
+                defer manager.catalog_mutex.unlockShared();
+                return .{ .owner = @intFromPtr(manager), .generation = manager.writePlanGeneration() };
+            }
+            pub fn identity(self: @This(), a: std.mem.Allocator, index: []const u8) !?cypher.catalog.IndexIdentity {
+                return self.db.cypherGraphIndexIdentity(a, index);
+            }
+        };
         fn populationUpperBound(ptr: *anyopaque, table: []const u8) !?u64 {
             const self = cast(ptr);
             if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
@@ -272,12 +297,15 @@ pub fn Snapshot(comptime DB: type) type {
             return encoded;
         }
         fn selectGraph(self: *Self, a: std.mem.Allocator, request: cypher.rpc.Request) !cypher.catalog.Graph {
-            const selected = for (self.graphs) |graph| {
-                if (graph.incarnation == request.graph_incarnation and graph.revision == request.graph_revision) break graph;
+            _ = a;
+            const index = for (self.graphs, 0..) |graph, index| {
+                if (graph.incarnation == request.graph_incarnation and graph.revision == request.graph_revision) break index;
             } else return error.CatalogGenerationChanged;
+            const selected = self.graphs[index];
+            self.graph_index = index;
             self.graph = selected;
-            const backend = self.adapter.backend();
-            try backend.vtable.bind(backend.ptr, a, selected);
+            self.adapter.graph = selected;
+            try checkpoint(self);
             return selected;
         }
         fn invokeTyped(ptr: *anyopaque, a: std.mem.Allocator, temporary: std.mem.Allocator, input: cypher.rpc.Request) !cypher.rpc.Reply {

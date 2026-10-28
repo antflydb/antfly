@@ -108,6 +108,24 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             wait_for_index=True,
         )
         assert result["rows"] == [[{"type": "integer", "value": "1999"}]], result
+        # Row-bound computed document keys must use owner point reads, with
+        # the complete Cypher predicate still applied to each returned node.
+        for key_predicate in (
+            "antfly.documentKey(n)='n'+toString(i)",
+            "antfly.documentKey(n) IN ['n'+toString(i)]",
+            "antfly.documentKey(n)='n'+toString(coalesce(i,0))",
+        ):
+            computed = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": f"UNWIND range(0,399) AS i MATCH(n:D) WHERE {key_predicate} RETURN sum(n.score)",
+                    "limits": {"scanned_anchors": 400, "intermediate_states": 50000},
+                },
+            )
+            assert computed["rows"] == [[{"type": "integer", "value": "79800"}]], (
+                computed
+            )
+            assert computed["stats"]["scanned_anchors"] <= 400, computed
         result = call(
             f"/graphs/{graph}/query",
             {

@@ -1347,7 +1347,7 @@ pub const NodeCursor = struct {
                 return;
             }
             const table = e.graph.labels[frame.label].table;
-            if (e.anchorKey(operation.predicate, pattern.alias, frame.state.row)) |key| {
+            if (try e.anchorKey(operation.predicate, pattern.alias, frame.state.row)) |key| {
                 frame.label += 1;
                 if (key != .string) return;
                 if (e.stats.scanned_anchors == e.limits.scanned_anchors) return error.CypherAnchorBudgetExceeded;
@@ -10843,7 +10843,7 @@ const Engine = struct {
         if (goal == 0 or limit == 0) return &.{};
         const path = operation.paths[0];
         const first = path.nodes[0];
-        if (self.anchorKey(operation.predicate, first.alias, rows[0]) != null) return null;
+        if (try self.anchorKey(operation.predicate, first.alias, rows[0]) != null) return null;
         var output: std.ArrayList(Row) = .empty;
         var seen: v.IdentitySet = .empty;
         for (self.graph.labels, 0..) |label, label_index| {
@@ -11113,6 +11113,87 @@ const Engine = struct {
                 .boolean => |item| .{ .boolean = item },
             },
             else => null,
+        };
+    }
+    /// Access hints may allocate and consume work, unlike constantBounded.
+    /// Only deterministic scalar expressions on existing row bindings qualify;
+    /// candidate entities, graph reads, aggregates and volatile calls never do.
+    /// A failed scalar evaluation remains a residual, including on empty scans.
+    fn seekValue(self: *Engine, expression: *const ast.Expr, row: Row) anyerror!?v.Value {
+        if (self.constant(expression, row)) |value| return value;
+        if (!self.read_only) return null;
+        var remaining: usize = 128;
+        if (!self.seekExpression(expression, row, &remaining, 0)) return null;
+        return self.eval(expression, row, null) catch |err| switch (err) {
+            error.CypherTypeMismatch, error.CypherNumericOverflow, error.CypherDivisionByZero, error.CypherInvalidSubstring => null,
+            else => return err,
+        };
+    }
+    fn seekExpression(self: *Engine, expression: *const ast.Expr, row: Row, remaining: *usize, depth: usize) bool {
+        if (expression.execution_range_binding or expression.execution_list_source != null or remaining.* == 0 or depth >= @min(64, self.limits.recursion_depth)) return false;
+        remaining.* -= 1;
+        return switch (expression.value) {
+            .literal => true,
+            .variable, .parameter => scalar: {
+                const value = if (expression.value == .variable) lookup(row, expression.value.variable) else self.parameterValue(expression.value.parameter);
+                break :scalar if (value) |item| switch (item) {
+                    .null, .string, .integer, .number, .boolean => true,
+                    else => false,
+                } else false;
+            },
+            .property => |item| if (self.constant(expression, row)) |value| switch (value) {
+                .null, .string, .integer, .number, .boolean => self.seekPropertyInput(item.base, row, remaining, depth + 1),
+                else => false,
+            } else false,
+            .unary => |item| self.seekExpression(item.operand, row, remaining, depth + 1),
+            .binary => |item| switch (item.op) {
+                .add, .subtract, .multiply, .divide, .modulo, .power, .@"and", .@"or", .xor => self.seekExpression(item.left, row, remaining, depth + 1) and self.seekExpression(item.right, row, remaining, depth + 1),
+                else => false,
+            },
+            .call => |item| call: {
+                if (item.star or item.distinct or item.execution_list) break :call false;
+                const signature = @import("functions.zig").lookup(item.name) orelse break :call false;
+                if (!signature.repeatable or item.args.len < signature.minimum or item.args.len > signature.maximum) break :call false;
+                switch (signature.result) {
+                    .primitive, .arguments, .preserve => {},
+                    else => break :call false,
+                }
+                // Scalar arguments exclude entity access, even for repeatable
+                // identity functions. Use the shared purity/arity registry so
+                // future volatile signatures cannot accidentally become hints.
+                for (item.args) |arg| if (!self.seekExpression(arg, row, remaining, depth + 1)) break :call false;
+                break :call true;
+            },
+            else => false,
+        };
+    }
+    // Ordinary evaluation projects the entire map before selecting a field.
+    // Inspect its complete input, including siblings, so a scalar property
+    // cannot hide entity reads or errors that belong to the residual stage.
+    fn seekPropertyInput(self: *Engine, expression: *const ast.Expr, row: Row, remaining: *usize, depth: usize) bool {
+        if (remaining.* == 0 or depth >= @min(64, self.limits.recursion_depth) or expression.execution_list_source != null or expression.execution_range_binding) return false;
+        remaining.* -= 1;
+        return switch (expression.value) {
+            .variable => |name| if (lookup(row, name)) |value| self.seekData(value, remaining, depth + 1) else false,
+            .parameter => |name| if (self.parameterValue(name)) |value| self.seekData(value, remaining, depth + 1) else false,
+            .property => |item| self.seekPropertyInput(item.base, row, remaining, depth + 1),
+            else => false,
+        };
+    }
+    fn seekData(self: *Engine, value: v.Value, remaining: *usize, depth: usize) bool {
+        if (remaining.* == 0 or depth >= @min(64, self.limits.recursion_depth)) return false;
+        remaining.* -= 1;
+        return switch (value) {
+            .null, .string, .integer, .number, .boolean => true,
+            .list => |items| list: {
+                for (items) |item| if (!self.seekData(item, remaining, depth + 1)) break :list false;
+                break :list true;
+            },
+            .map => |items| map: {
+                for (items) |item| if (!self.seekData(item.value, remaining, depth + 1)) break :map false;
+                break :map true;
+            },
+            else => false,
         };
     }
     // OR hints are atomic: every arm must describe membership of the same
@@ -11711,17 +11792,17 @@ const Engine = struct {
         if (self.lookup) |lookup_plan| if (std.mem.eql(u8, lookup_plan.table, table)) try lookup_plan.capture(self, page);
         return page;
     }
-    fn anchorKey(self: *Engine, predicate: ?*const ast.Expr, alias: ?[]const u8, row: Row) ?v.Value {
+    fn anchorKey(self: *Engine, predicate: ?*const ast.Expr, alias: ?[]const u8, row: Row) anyerror!?v.Value {
         const expression = predicate orelse return null;
         const name = alias orelse return null;
-        if (expression.value == .binary and expression.value.binary.op == .@"and") return self.anchorKey(expression.value.binary.left, name, row) orelse self.anchorKey(expression.value.binary.right, name, row);
+        if (expression.value == .binary and expression.value.binary.op == .@"and") return try self.anchorKey(expression.value.binary.left, name, row) orelse try self.anchorKey(expression.value.binary.right, name, row);
         const operands: [2]*const ast.Expr = switch (expression.value) {
             .binary => |pair| if (pair.op == .eq) .{ pair.left, pair.right } else return null,
             .comparison => |chain| if (chain.operands.len == 2 and chain.operators.len == 1 and chain.operators[0] == .eq) .{ chain.operands[0], chain.operands[1] } else return null,
             else => return null,
         };
-        if (keyCall(operands[0], name)) return self.constant(operands[1], row);
-        if (keyCall(operands[1], name)) return self.constant(operands[0], row);
+        if (keyCall(operands[0], name)) return self.seekValue(operands[1], row);
+        if (keyCall(operands[1], name)) return self.seekValue(operands[0], row);
         return null;
     }
     const AnchorKey = struct { table: ?[]const u8 = null, key: []const u8 };
@@ -11766,7 +11847,7 @@ const Engine = struct {
                 return finite;
             }
         }
-        if (self.anchorKey(expression, alias, row)) |key| {
+        if (try self.anchorKey(expression, alias, row)) |key| {
             try self.appendAnchorKey(keys, key, false);
             finite = true;
             return true;
@@ -11781,7 +11862,7 @@ const Engine = struct {
             const left = identityCall(pair.left, alias);
             const right = identityCall(pair.right, alias);
             if (!left and !right) return false;
-            const value = self.constant(if (left) pair.right else pair.left, row) orelse return false;
+            const value = try self.seekValue(if (left) pair.right else pair.left, row) orelse return false;
             try self.appendAnchorKey(keys, value, true);
             finite = true;
             return true;
@@ -11790,7 +11871,7 @@ const Engine = struct {
         if (pair.right.value == .list) {
             for (pair.right.value.list) |item| {
                 try self.state();
-                try self.appendAnchorKey(keys, self.constant(item, row) orelse return false, qualified);
+                try self.appendAnchorKey(keys, try self.seekValue(item, row) orelse return false, qualified);
             }
             finite = true;
             return true;

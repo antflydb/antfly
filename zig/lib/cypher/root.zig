@@ -21,6 +21,7 @@ pub const binder = @import("binder.zig");
 pub const lexer = @import("lexer.zig");
 pub const value = @import("value.zig");
 pub const catalog = @import("catalog.zig");
+pub const catalog_guard = @import("catalog_guard.zig");
 pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
 pub const statistic = @import("statistic.zig");
@@ -40,6 +41,7 @@ pub const snapshot = @import("snapshot.zig");
 pub const mutations = @import("mutations.zig");
 test {
     _ = @import("fanout_test.zig");
+    _ = catalog_guard;
     _ = dependencies;
     _ = runtime;
     _ = integer_affine;

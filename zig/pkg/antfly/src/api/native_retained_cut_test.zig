@@ -538,3 +538,55 @@ test "external lake Cypher execution reads immutable native document and graph c
     }
     try std.testing.expectError(error.CypherSnapshotNotReady, DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('a'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none));
 }
+
+test "external lake Cypher catalog cache invalidates on live index drop and recreation" {
+    const a = std.testing.allocator;
+    const DB = local.storage_db_db.DB;
+    var directory = try local.common_test_directory.TestDirectory.init("cypher-catalog-epochs");
+    defer directory.cleanup();
+    const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{directory.path()});
+    defer a.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .start_index_workers = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 41 });
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"title\":\"Alpha\"}" }}, .sync_level = .full_index });
+    try db.runMaintenanceUntil(db.core.nextDerivedSequence(), .{});
+    const identity = (try db.cypherGraphIndexIdentity(a, "links")).?;
+    const domain = local.system_catalog_domain;
+    const record: domain.Resource = .{ .kind = .graph, .id = 1, .name = "g", .source_json = "{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"R\",\"index\":\"links\",\"source_label\":\"D\",\"target_label\":\"D\",\"stored_type\":\"r\"}]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }}, .graph_indexes = &.{.{ .mapping_index = 0, .identity = identity }} };
+    const catalog_json = try std.json.Stringify.valueAlloc(a, record, .{});
+    defer a.free(catalog_json);
+    var fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
+    defer fence.release();
+    var read = try DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .indexes = &.{}, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('c'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
+    defer read.deinit();
+    fence.release();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const request: @import("cypher").rpc.Request = .{ .operation = .get, .graph_incarnation = 1, .graph_revision = 1, .identity = .{ .table = "docs", .key = "a" } };
+    const native: *DB.CypherStatementSnapshot = @ptrCast(@alignCast(read.ptr));
+    const before = native.catalog_guards[0].validated.?.generation;
+    try std.testing.expectEqual(@as(usize, 1), (try read.invokeTyped(arena.allocator(), request)).values.len);
+    // A catalog commit unrelated to this graph refreshes the proof once.
+    try db.addIndex(.{ .name = "unused", .kind = .graph, .config_json = "{}", .coverage_generation = 43 });
+    try std.testing.expectEqual(@as(usize, 1), (try read.invokeTyped(arena.allocator(), request)).values.len);
+    try std.testing.expect(native.catalog_guards[0].validated.?.generation > before);
+    try std.testing.expectEqual(db.core.index_manager.writePlanGeneration(), native.catalog_guards[0].validated.?.generation);
+    try std.testing.expect(try db.deleteIndex("links"));
+    try std.testing.expectError(error.CatalogGenerationChanged, read.invokeTyped(arena.allocator(), request));
+    // Same-name admission waits for production generation-retirement cleanup.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    var cleaned = false;
+    for (0..1000) |_| switch (try db.advanceGeneratedArtifactCleanupPage("links")) {
+        .idle => {
+            cleaned = true;
+            break;
+        },
+        .progressed => {},
+        .busy => std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {},
+    };
+    try std.testing.expect(cleaned);
+    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 42 });
+    try std.testing.expectError(error.CatalogGenerationChanged, read.invokeTyped(arena.allocator(), request));
+}

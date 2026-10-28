@@ -11744,6 +11744,7 @@ pub const IndexManager = struct {
     }
 
     fn resetRestoreLoadAttempt(self: *IndexManager) void {
+        defer self.invalidateWritePlanSnapshot();
         self.releaseFullTextPendingBytes();
         self.text_merge_scheduler.deinit(self.alloc);
         self.text_merge_scheduler = .{};
@@ -11778,6 +11779,7 @@ pub const IndexManager = struct {
     /// Keep the complete immutable catalog for binding and identity checks,
     /// opening only the assets selected by the statement's physical plan.
     pub fn loadSelectedNoBackfill(self: *IndexManager, store: anytype, names: []const []const u8) !void {
+        defer self.invalidateWritePlanSnapshot();
         try self.loadCatalogOnly(store);
         self.bindPrimaryStore(store, true);
         const configs = self.status_only_index_configs;
@@ -11815,6 +11817,7 @@ pub const IndexManager = struct {
     }
 
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
+        defer self.invalidateWritePlanSnapshot();
         const load_started_ns = nowNs();
         self.bindPrimaryStore(store, read_only);
         self.clearStatusOnlyIndexConfigs();
@@ -11889,6 +11892,7 @@ pub const IndexManager = struct {
     }
 
     pub fn loadCatalogOnly(self: *IndexManager, store: anytype) !void {
+        defer self.invalidateWritePlanSnapshot();
         self.bindPrimaryStoreForStatus(store);
         self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);

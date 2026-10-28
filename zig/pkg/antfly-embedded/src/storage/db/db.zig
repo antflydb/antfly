@@ -28250,6 +28250,8 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("cypherGraphIndexIdentity", .{ self, alloc, index_name });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
+        self.core.index_manager.catalog_mutex.lockShared();
+        defer self.core.index_manager.catalog_mutex.unlockShared();
         const cfg = self.core.index_manager.get(index_name) orelse return null;
         if (cfg.kind != .graph) return null;
         const identity = self.core.index_manager.coverageIdentityForIndex(index_name) orelse return null;

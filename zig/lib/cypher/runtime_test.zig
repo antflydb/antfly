@@ -8863,3 +8863,54 @@ test "statistic emission scratch stays bounded across endpoint groups and aggreg
         }
     }
 }
+
+test "computed row-bound document keys seek without changing residual semantics" {
+    for ([_]struct { query: []const u8, count: i128, reads: usize }{
+        .{ .query = "UNWIND ['A','B'] AS k MATCH(n:Document) WHERE antfly.documentKey(n)=toLower(k) RETURN sum(n.rank)", .count = 3, .reads = 2 },
+        .{ .query = "UNWIND ['aa','bb'] AS k MATCH(n:Document) WHERE antfly.documentKey(n)=substring(k,0,1) RETURN sum(n.rank)", .count = 3, .reads = 2 },
+        .{ .query = "WITH null AS k MATCH(n:Document) WHERE antfly.documentKey(n)=coalesce(k,toLower('A')) RETURN sum(n.rank)", .count = 1, .reads = 1 },
+        .{ .query = "WITH {key:'A'} AS p MATCH(n:Document) WHERE antfly.documentKey(n)=toLower(p.key) RETURN sum(n.rank)", .count = 1, .reads = 1 },
+        .{ .query = "MATCH(p:Person) WITH {key:'A',entity:p} AS m MATCH(n:Document) WHERE antfly.documentKey(n)=toLower(m.key) RETURN sum(n.rank)", .count = 1, .reads = 4 },
+        .{ .query = "MATCH(n:Document) WHERE antfly.documentKey(n)=toLower(n.id) RETURN sum(n.rank)", .count = 6, .reads = 3 },
+        .{ .query = "WITH 'A' AS k MATCH(n:Document) WHERE antfly.documentKey(n)=toLower(k) OR n.rank>1 RETURN sum(n.rank)", .count = 6, .reads = 3 },
+        .{ .query = "UNWIND range(0,399) AS i MATCH(n:Document) WHERE antfly.documentKey(n)='n'+toString(i) RETURN count(n)", .count = 0, .reads = 400 },
+        .{ .query = "UNWIND ['A','B'] AS k MATCH(n:Document) WHERE antfly.documentKey(n) IN [toLower(k)] RETURN sum(n.rank)", .count = 3, .reads = 2 },
+        .{ .query = "UNWIND ['A','B'] AS k MATCH(n:Document) WHERE antfly.documentKey(n)=toLower(k) OR antfly.documentKey(n)='c'+toString('') RETURN sum(n.rank)", .count = 9, .reads = 4 },
+        .{ .query = "WITH null AS k MATCH(n:Document) WHERE antfly.documentKey(n)='n'+toString(k) RETURN count(n)", .count = 0, .reads = 0 },
+        .{ .query = "WITH 'A' AS k OPTIONAL MATCH(n:Document) WHERE antfly.documentKey(n)=toLower(k) AND n.rank>10 RETURN count(n)", .count = 0, .reads = 1 },
+    }) |case| {
+        var fixture: Fixture = .{};
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .scanned_anchors = case.reads, .intermediate_states = 100000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(case.count, result.rows[0][0].integer);
+        try std.testing.expectEqual(case.reads, result.stats.scanned_anchors);
+    }
+    // An invalid hint is not an early expression error on an empty table.
+    const Empty = struct {
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            return .{ .items = &.{}, .examined = 0 };
+        }
+    };
+    var fixture: Fixture = .{};
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.scan = Empty.scan;
+    for ([_][]const u8{
+        "MATCH(n:Document) WHERE antfly.documentKey(n)='n'+toString(1/0) RETURN n",
+        "MATCH(n:Document) WHERE antfly.documentKey(n)=toString(toLower(1)) RETURN n",
+    }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), result.rows.len);
+    }
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) WHERE antfly.documentKey(n)='n'+toString(1/0) RETURN n", .{}, &diagnostic);
+    defer compiled.deinit();
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}

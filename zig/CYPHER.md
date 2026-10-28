@@ -4258,3 +4258,44 @@ pass, including authenticated replicated owners, graph writes and recovery,
 SQL GRAPH_TABLE, semantic/hybrid search, operator ceilings and the wide-document
 8 MiB memory regression. The final optimized CLI/library build passes all 87
 steps; the library exports exactly 137 public C functions and no internal symbols.
+
+### Computed key access and catalog validation epochs
+
+Read-only document-key and element-identity access hints can evaluate bounded
+deterministic scalar expressions over existing input bindings, including string
+concatenation and scalar conversions. The evaluator is separate from allocation-free constant
+folding: normal query memory/work limits and cancellation apply. Candidate-bound
+expressions, graph reads, aggregates and unrecognized calls remain residuals.
+Invalid scalar hints fall back to ordinary evaluation, preserving errors on
+nonempty inputs and their absence on empty inputs. The complete predicate remains
+authoritative after every point read. Finite IN/OR domains use the same evaluator.
+
+Native owner snapshots bind every allowed immutable graph once at creation.
+Subsequent operations select those validated bindings without reopening or
+rebinding index metadata. Live validation deduplicates physical graph indexes and
+caches successful identity proofs per graph against the source index manager's
+identity and catalog publication generation. Epoch reads synchronize with apply
+and catalog publication; validation fences both sides of a cache miss. Catalog
+reload and restore attempts invalidate the generation, including failed attempts.
+A drop/recreate or configuration change cannot reuse an earlier success. Policy,
+deadline and final statement checks remain independent of the metadata cache.
+
+
+Qualification for computed keys and catalog epochs: all 494 optimized core
+Cypher tests pass, including scalar-error timing, NULL and OPTIONAL behavior,
+finite IN/OR domains, shared scalar signatures, and entity-bearing input-map
+fallbacks. Three native owner fixtures pass, including live index retirement and
+same-name recreation. The public authenticated access-path/SQL-overlay campaign
+passes with computed 400-key equality, IN and coalesce predicates capped at 400
+anchors and 50,000 states. The Go SDK suite and 544 TypeScript SDK tests pass
+(one TypeScript skip); the rebuilt Antfarm bundle and all 71 optimized CLI build
+steps pass after merging origin/main.
+
+Local API-key probes over 2,000 documents, with seven warmed samples per case,
+reduce the two-computed-key workload from 4,000 anchors / 92,026 states to two
+anchors / 84 states (33.9 ms before, 14.7 ms after). The 400-key lookup with 64
+unused mappings falls from a 115 ms median to 33.9 ms; the equivalent zero-mapping
+case measures 35.5 ms. Computed 400-key equality now succeeds with 400 anchors and
+15,606 states, rather than exceeding the default state ceiling. These timings
+are local diagnostic measurements; the scan/work ceilings are regression-tested
+independently of wall-clock latency.
