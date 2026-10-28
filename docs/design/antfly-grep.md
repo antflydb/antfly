@@ -1417,3 +1417,188 @@ executable and its reports remain in ignored
 `output/projection-followup/delivery-dispatch-8420/`; it is not the final media
 qualification. The consumer is now passed explicitly through both branches,
 with nested query dispatch explicitly retaining its owned response.
+
+
+### Release qualification for alias and media reuse (2026-10-28)
+
+The measured production source is `0826126861ed`, including `main` through
+`125f49a9c5fd`. Its ReleaseFast server SHA-256 is
+`45f189800b5c1cd675a650672a7a54cf92e2553c0929ac290140e273747fb1fe`
+(251,637,048 bytes). The fresh grep SHA-256 is
+`a0a088ceb721a5b980f09b58920694e4931f962fe6ab1d5ab6dc7aba6efb84ff`
+(8,350,072 bytes). The preserved baseline is production source `915e5493a2b8`,
+main through `7dabd028d66d`, server SHA-256
+`d2a0401ddb9573148dcadf2c524772dd8fd566469e00fc2c2dc8fe84fd8e508f`.
+Both servers report `antfly dev (zig runtime)`. The candidate includes newer
+main changes: these whole-server comparisons do not isolate every optimization.
+Primary documents remain ASCH25 and the canonical value ABI is unchanged.
+
+The full indexed HTTP suite passed **57 cases**, with seven optional profiling
+cases skipped. This includes small/large original array paths and object paths,
+one/two shards, missing fields, digest/revision/permission rejection, 128 pinned
+references split below the binding limit, 130 rows crossing byte/key windows,
+retained pagination and persisted upgrade/old-reader rollback. Native checks
+passed 208 query contracts, 19 identity/publication cases, 31 shared-provider and
+67 gateway cases, targeted lake source/dependency tests, and eleven shared
+scheduler cases including overlapping parent/child allocation. The Apache
+boundary check covered 2,563 files; storage control, formatting and Python lint
+also passed. The merged source also passed the full Go SDK suite, the source/joined OpenAPI comparison and native generated-API checks. These checks are distinct from approval-gated repository CI.
+
+All comparisons use five alternating trials and five requests per phase, on the
+same shared 14-logical-CPU macOS ARM64 host with warm synthetic storage. CPU is
+whole-server CPU, including background work. RSS is periodically sampled, not an
+allocation counter or a hard peak bound; residency changes on this shared host
+can produce large swings. No model/provider is invoked. Reports retain binary,
+corpus and output hashes and every sample under ignored `output/`. Tables show
+median baseline → candidate; neither universal performance nor zero cost follows
+from these measurements.
+
+Alias comparisons return identical logical output hashes for direct fields and aliases, with four approximately 256 KiB values. Copy chains emit each intermediate output.
+
+| Alias workload / mode | Elapsed ms | Server CPU ms | Sampled RSS MiB |
+|---|---:|---:|---:|
+| escaped_opaque_copies0 / field | 10.72 → 10.90 | 9.79 → 9.83 | 195.3 → 193.1 |
+| escaped_opaque_copies0 / alias | 17.77 → 10.82 | 17.01 → 9.85 | 193.4 → 193.4 |
+| escaped_opaque_copies3 / field | 34.15 → 28.26 | 31.97 → 26.13 | 215.4 → 214.8 |
+| escaped_opaque_copies3 / alias | 40.88 → 28.09 | 38.87 → 25.50 | 213.6 → 214.6 |
+| unicode_string_copies0 / field | 11.99 → 10.60 | 11.02 → 9.66 | 189.2 → 190.0 |
+| unicode_string_copies0 / alias | 14.25 → 10.53 | 13.39 → 9.67 | 189.2 → 190.3 |
+| unicode_string_copies3 / field | 39.95 → 34.99 | 38.71 → 33.31 | 201.8 → 205.4 |
+| unicode_string_copies3 / alias | 42.09 → 34.42 | 40.65 → 32.94 | 202.2 → 205.7 |
+
+The source comparison uses eight documents and two metadata updates per trial. `small64` and `wide64` add 60 distinct metadata outputs. Full and conditional outputs are checked against ordinary reference reads, with certificate reuse and updated identities verified.
+
+| Source workload | Full elapsed ms | Full CPU ms | Full RSS MiB | Conditional CPU ms |
+|---|---:|---:|---:|---:|
+| ascii | 9.04 → 6.36 | 7.57 → 4.87 | 204.8 → 201.4 | 0.73 → 0.68 |
+| mixed | 11.30 → 8.31 | 9.99 → 7.06 | 210.3 → 212.4 | 0.71 → 0.73 |
+| opaque | 8.99 → 7.77 | 7.60 → 6.36 | 201.3 → 205.9 | 0.80 → 0.71 |
+| small64 | 2.03 → 2.13 | 1.56 → 1.62 | 171.2 → 171.3 | 1.60 → 1.62 |
+| wide64 | 10.25 → 7.67 | 9.03 → 6.12 | 208.8 → 205.4 | 1.89 → 1.93 |
+| escaped | 24.51 → 16.92 | 22.99 → 15.32 | 217.2 → 214.3 | 0.77 → 0.74 |
+| unicode | 25.58 → 20.50 | 24.48 → 19.33 | 205.1 → 206.9 | 0.76 → 0.75 |
+
+Positive control percentages mean more candidate CPU, negative percentages less. These controls include background process work and are not regression tolerances.
+
+| Source workload | Ordinary CPU change | Ingestion CPU change | Metadata-update CPU change |
+|---|---:|---:|---:|
+| ascii | +2.8% | +8.2% | +0.0% |
+| mixed | -3.7% | -3.3% | -0.8% |
+| opaque | -9.2% | +4.9% | -0.3% |
+| small64 | -0.8% | +1.2% | +0.6% |
+| wide64 | +1.1% | +1.0% | +1.3% |
+| escaped | -1.2% | -0.6% | +3.0% |
+| unicode | -2.7% | -2.6% | -0.7% |
+
+Media requests reach `ModelRequired` after authorization and all payload checks, before model resolution. Tiny PNGs are 1×1; medium PNGs are 64×64; crossover PNGs are 128×128; large PNGs are 256×256 random RGBA. Four images are used unless the name ends in `eight`. The skewed case has one 512×512 and seven 64×64 images.
+
+| Media workload | Elapsed ms | Server CPU ms | Sampled RSS MiB |
+|---|---:|---:|---:|
+| tiny_shared_duplicates | 0.82 → 0.70 | 1.22 → 0.97 | 167.8 → 166.4 |
+| tiny_distinct_unique | 1.04 → 1.12 | 2.63 → 1.89 | 188.6 → 166.5 |
+| medium_shared_duplicates | 1.78 → 1.50 | 1.97 → 2.48 | 170.5 → 170.1 |
+| medium_distinct_unique | 2.13 → 1.46 | 3.53 → 2.60 | 191.2 → 190.3 |
+| crossover_shared_duplicates | 3.67 → 3.55 | 3.11 → 3.01 | 176.8 → 176.2 |
+| crossover_distinct_unique | 2.19 → 2.66 | 4.32 → 4.49 | 198.9 → 198.8 |
+| large_shared_duplicates | 11.59 → 11.09 | 11.10 → 10.65 | 203.4 → 201.7 |
+| large_distinct_unique | 5.64 → 5.00 | 12.71 → 12.17 | 229.4 → 227.9 |
+| large_distinct_duplicates | 4.66 → 5.00 | 11.96 → 11.59 | 225.7 → 225.5 |
+| large_distinct_unique_eight | 9.40 → 9.19 | 24.51 → 23.90 | 263.0 → 264.2 |
+| skewed_distinct_eight | 13.57 → 12.07 | 16.42 → 15.38 | 233.9 → 232.4 |
+
+The following diagnostic compares the prior intermediate `dfbc59d9de77`, which includes main through `ff2c66bd7ba6`. The candidate includes newer main, so this is not an isolated measurement of delivery changes; that baseline server SHA-256 is `b6b3eb53f6bcb1ab5d1b31ed1cf63723f83cf0fad6d7e3bce450bee4616120c7`.
+
+| Prior-build media workload | Elapsed ms | Server CPU ms | CPU change | Sampled RSS MiB |
+|---|---:|---:|---:|---:|
+| tiny_shared_duplicates | 3.46 → 2.84 | 1.03 → 2.43 | +135.8% | 151.4 → 170.5 |
+| tiny_distinct_unique | 1.35 → 1.62 | 2.06 → 2.06 | +0.1% | 163.4 → 166.5 |
+| medium_shared_duplicates | 1.65 → 1.55 | 2.41 → 1.01 | -58.2% | 168.9 → 170.0 |
+| medium_distinct_unique | 1.23 → 1.37 | 2.23 → 2.36 | +6.1% | 189.1 → 189.2 |
+| crossover_shared_duplicates | 4.38 → 3.48 | 3.82 → 2.91 | -23.9% | 176.7 → 176.5 |
+| crossover_distinct_unique | 3.36 → 2.16 | 5.32 → 4.36 | -18.1% | 197.0 → 198.6 |
+| large_shared_duplicates | 14.63 → 11.42 | 14.12 → 10.91 | -22.8% | 202.8 → 202.9 |
+| large_distinct_unique | 6.00 → 5.19 | 15.24 → 11.98 | -21.4% | 225.2 → 228.2 |
+| large_distinct_duplicates | 5.58 → 4.43 | 14.95 → 11.56 | -22.7% | 223.3 → 225.2 |
+| large_distinct_unique_eight | 10.95 → 8.98 | 31.14 → 23.29 | -25.2% | 263.8 → 266.4 |
+| skewed_distinct_eight | 15.12 → 11.76 | 18.08 → 14.65 | -19.0% | 231.1 → 232.4 |
+
+Control repeats retain the same binaries and corpus/output hashes; both first and repeated observations are retained.
+
+| Repeated workload / phase | Elapsed ms | CPU ms | Sampled RSS MiB |
+|---|---:|---:|---:|
+| small64 / ordinary | 0.86 → 0.89 | 1.16 → 1.30 | 167.8 → 167.8 |
+| small64 / full | 2.13 → 2.15 | 1.61 → 1.59 | 170.9 → 171.1 |
+| small64 / conditional | 2.15 → 2.18 | 1.60 → 1.67 | 171.1 → 171.5 |
+| small64 / ingest | 9.78 → 11.22 | 18.54 → 19.36 | 164.3 → 164.5 |
+| small64 / metadata_update | 9.43 → 9.60 | 10.89 → 10.93 | 173.6 → 173.7 |
+| escaped / ordinary | 9.38 → 9.16 | 7.68 → 7.65 | 212.5 → 214.0 |
+| escaped / full | 23.82 → 16.57 | 22.43 → 14.89 | 215.2 → 217.7 |
+| escaped / conditional | 1.25 → 1.25 | 0.71 → 0.74 | 215.2 → 217.6 |
+| escaped / ingest | 108.18 → 107.80 | 122.46 → 124.25 | 206.8 → 211.0 |
+| escaped / metadata_update | 76.83 → 76.05 | 75.60 → 75.36 | 238.7 → 239.6 |
+
+The medium/crossover controls were repeated separately with the same binaries and corpus, rather than replacing the initial measurements.
+
+| Repeated media workload | Elapsed ms | CPU ms | CPU change | Sampled RSS MiB |
+|---|---:|---:|---:|---:|
+| medium_shared_duplicates | 1.57 → 1.40 | 1.15 → 1.16 | +1.2% | 170.7 → 170.1 |
+| medium_distinct_unique | 1.32 → 1.17 | 2.27 → 2.03 | -10.6% | 187.0 → 185.3 |
+| crossover_shared_duplicates | 3.36 → 3.29 | 2.90 → 2.85 | -1.8% | 176.6 → 176.2 |
+| crossover_distinct_unique | 2.23 → 2.38 | 4.34 → 4.24 | -2.3% | 198.8 → 198.0 |
+
+An initial all-flat implementation at `5ae406f3a0ca` passed correctness but
+increased large four-image CPU about 41% versus the same baseline. It is not the
+qualified implementation. Its reports and manifest remain in ignored
+`output/projection-followup/all-flat-5ae/`. The subsequent structural-only build `dfbc59d9de77` still regressed large-media CPU 16–32%; its executable and reports are retained in ignored `output/projection-followup/structural-dfbc/`. The qualified shape uses source-only preparation and borrowed native delivery to avoid unused scalar computation and the source DOM clone. Numeric paths still
+pay for scalar resolution because public masks otherwise compact their indexes.
+
+
+The strongest measured gain is eliminating repeated normalization of forwarded
+values: escaped aliases use 42% less CPU and escaped alias chains 34% less CPU,
+with matching outputs. Full source projections use 16–36% less CPU for the larger
+fixtures; the 64-output small-value workload is near parity. Conditional hits
+remain sub-millisecond in server CPU for the larger four-output cases, rather
+than becoming free. Ordinary-read controls range from −9.2% to +2.8% in the
+initial source runs. The small64 repeat increases ordinary CPU by 0.14 ms and
+conditional CPU by 0.07 ms; these costs remain visible in the tables.
+
+Media gains are smaller against the original baseline than against the regressed
+intermediate. Large-media CPU falls about 2.5–6.3%; some elapsed times increase.
+The initial medium shared-source result increases CPU 26% (0.51 ms), while its
+repeat increases 1.2% (0.014 ms). Crossover distinct-source latency increases in
+both runs despite nearly flat CPU. The prior-build tiny shared-source control
+also has a large CPU percentage increase at small absolute times. The different
+main revisions, background work and shared host prevent attributing these small
+controls to a single code path or claiming a universal win. Both initial and
+repeat observations are retained. Broader storage/host and sustained concurrency
+qualification remains necessary for performance guarantees.
+
+Source-only programs are prepared only for native encoded-result delivery.
+Ordinary wire parsing keeps its existing plan. Both terminal dispatcher shapes
+preserve explicit delivery, while nested retrieval/join calls require owned
+intermediate results. These ownership and planning rules are covered by the
+dispatch regression, rather than inferred from a successful end-to-end request.
+
+Reproduce from the repository root with the preserved baseline executable:
+
+```sh
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_projection_aliases.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 \
+  --output output/projection-followup/aliases.json
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_source_projection.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 --documents 8 --value-bytes 262144 \
+  --metadata-updates 2 --workload ascii \
+  --output output/projection-followup/source-ascii.json
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_media_materialization.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 \
+  --output output/projection-followup/media.json
+```
+
+Repeat source runs with `mixed`, `opaque`, `escaped` and `unicode`; add
+`--metadata-outputs 60` to `small` and `ascii` for `small64` and `wide64`.
+These results do not measure inference quality/billing, cold storage, sustained
+cross-request throughput or other hosts. Allocation and admission bounds remain
+required even when CPU or latency improves.

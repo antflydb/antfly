@@ -659,3 +659,37 @@ test "SQL publication IO phases release CPU retain memory and fence canceled res
     try std.testing.expectError(error.ConcurrencyUnavailable, first.beginIo(io, 3));
     try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
 }
+
+test "SQL shared allocator lock protects overlapping parent and child regions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var child: LockedAllocator = .{ .backing = arena.allocator() };
+    var parent: LockedAllocator = .{ .backing = arena.allocator(), .shared_mutex = &child.mutex };
+    var go: std.Io.Event = .unset;
+    var child_values: [64][]u8 = undefined;
+    var parent_values: [64][]u8 = undefined;
+    const Worker = struct {
+        fn run(io: std.Io, gate: *std.Io.Event, a: std.mem.Allocator, output: *[64][]u8) anyerror!void {
+            try gate.wait(io);
+            for (output) |*value| {
+                value.* = try a.alloc(u8, 2048);
+                @memset(value.*, 0xaa);
+            }
+        }
+    };
+    const io = std.testing.io;
+    var future: ?std.Io.Future(anyerror!void) = try io.concurrent(Worker.run, .{ io, &go, child.allocator(), &child_values });
+    defer if (future) |*active| {
+        active.cancel(io) catch {};
+    };
+    go.set(io);
+    for (&parent_values) |*value| {
+        value.* = try parent.allocator().alloc(u8, 2048);
+        @memset(value.*, 0xbb);
+    }
+    const result = future.?.await(io);
+    future = null;
+    try result;
+    for (child_values) |value| for (value) |byte| try std.testing.expectEqual(@as(u8, 0xaa), byte);
+    for (parent_values) |value| for (value) |byte| try std.testing.expectEqual(@as(u8, 0xbb), byte);
+}

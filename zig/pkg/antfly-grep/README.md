@@ -5022,3 +5022,13 @@ computed reads use 27–32% less CPU in those paired runs. Distinct-source media
 latency improves with higher sampled RSS; small writes do not uniformly improve.
 The server comparison includes newer main changes and is not an isolated or
 universal performance guarantee. Document format and canonical ABI are unchanged.
+
+
+The [alias and media reuse qualification](../../../docs/design/antfly-grep.md#release-qualification-for-alias-and-media-reuse-2026-10-28)
+records the current production binary, paired controls and repeated observations.
+Escaped aliases use 42% less server CPU and alias chains 34% less; larger full
+source projections use 16–36% less. Small projections are near parity, and media
+CPU/latency gains vary by case, with increases retained in the report. These are
+warm synthetic whole-server comparisons against an older main revision on one
+shared host. They do not establish universal or zero-cost behavior. Document
+format and canonical ABI remain unchanged.
