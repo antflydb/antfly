@@ -104,6 +104,20 @@ const multiline =
         self.assertEqual(host, prefix + middle + suffix)
         self.assertEqual(len(device) + len(host), len(source))
 
+    def test_all_shader_factories_are_device_source_and_keep_host_separate(self):
+        programs = [
+            'static NSString *termite_metal_' + name + '_source(void) {\n    return @"kernel void f() { }\\n";\n}'
+            for name in ['shader', 'lightonocr3_tensor', 'lightonocr3_recurrent', 'deberta_training_attention_v1']
+        ]
+        host = 'static NSString *termite_metal_device_name(void) { return @"host"; }\n'
+        source = host + '\n'.join(programs) + '\n'
+        device, remainder = accounting.shader(source)
+        for program in programs:
+            self.assertIn(program, device)
+            self.assertNotIn(program, remainder)
+        self.assertIn(host, remainder)
+        self.assertEqual(len(device) + len(remainder), len(source))
+
     def test_secondary_metal_program_is_device_source(self):
         primary = 'static NSString *termite_metal_shader_source(void) {\n    return @"primary";\n}'
         secondary = 'static NSString *termite_metal_deberta_training_attention_v1_source(void) {\n    return @"training";\n}'

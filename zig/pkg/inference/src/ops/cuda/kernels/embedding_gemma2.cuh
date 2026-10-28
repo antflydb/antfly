@@ -18,6 +18,30 @@ __device__ __forceinline__ float eg2_warp_max(float x) {
     return x;
 }
 
+// Exact warp-then-block statistics; planes preserve interleaving and barriers.
+// Four-lane training reductions remain separate qualified arithmetic policies.
+template<bool Maximum, unsigned Planes, typename Finish>
+__device__ __forceinline__ void antfly_warp_block_statistics(
+    float (&values)[Planes], float* const (&partials)[Planes], Finish finish, float neutral = 0.0f) {
+    #pragma unroll
+    for (unsigned p = 0; p < Planes; ++p)
+        values[p] = Maximum ? eg2_warp_max(values[p]) : eg2_warp_sum(values[p]);
+    if ((threadIdx.x & 31u) == 0) {
+        #pragma unroll
+        for (unsigned p = 0; p < Planes; ++p) partials[p][threadIdx.x >> 5] = values[p];
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        #pragma unroll
+        for (unsigned p = 0; p < Planes; ++p)
+            values[p] = threadIdx.x < (blockDim.x >> 5) ? partials[p][threadIdx.x] : neutral;
+        #pragma unroll
+        for (unsigned p = 0; p < Planes; ++p)
+            values[p] = Maximum ? eg2_warp_max(values[p]) : eg2_warp_sum(values[p]);
+        if (threadIdx.x == 0) finish(values);
+    }
+}
+
 // Pillow's RGB8 bicubic resize materializes quantized horizontal pixels.
 // The CPU supplies its exact integer coefficient plan; both passes retain
 // the signed 64-bit accumulation and rounding before clipping to RGB8.
@@ -166,14 +190,8 @@ extern "C" __global__ void termite_embedding_gemma2_rms_norm_bf16(
         float x = __bfloat162float(input[(size_t)row * width + i]); sum += x * x;
     }
     __shared__ float warp_sum[8], inv;
-    sum = eg2_warp_sum(sum);
-    if ((threadIdx.x & 31u) == 0) warp_sum[threadIdx.x >> 5] = sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float x = threadIdx.x < (blockDim.x >> 5) ? warp_sum[threadIdx.x] : 0.0f;
-        x = eg2_warp_sum(x);
-        if (threadIdx.x == 0) inv = rsqrtf(x / (float)width + eps);
-    }
+    float statistics[] = {sum}; float* const planes[] = {warp_sum};
+    antfly_warp_block_statistics<false>(statistics, planes, [&](const float* totals) { inv = rsqrtf(totals[0] / (float)width + eps); });
     __syncthreads();
     for (unsigned int i = threadIdx.x; i < width; i += blockDim.x) {
         float x = __bfloat162float(input[(size_t)row * width + i]);
@@ -234,23 +252,12 @@ extern "C" __global__ void termite_embedding_gemma2_rms_norm_input_vjp_f32(
         dot_sum += y * w * x;
     }
     __shared__ float square_warps[8], dot_warps[8], inv, correction;
-    square_sum = eg2_warp_sum(square_sum);
-    dot_sum = eg2_warp_sum(dot_sum);
-    if ((threadIdx.x & 31u) == 0) {
-        square_warps[threadIdx.x >> 5] = square_sum;
-        dot_warps[threadIdx.x >> 5] = dot_sum;
-    }
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        unsigned int warps = blockDim.x >> 5;
-        float s = threadIdx.x < warps ? square_warps[threadIdx.x] : 0.0f;
-        float d = threadIdx.x < warps ? dot_warps[threadIdx.x] : 0.0f;
-        s = eg2_warp_sum(s); d = eg2_warp_sum(d);
-        if (threadIdx.x == 0) {
-            inv = rsqrtf(s / (float)width + eps);
-            correction = d * inv * inv / (float)width;
-        }
-    }
+    float statistics[] = {square_sum, dot_sum};
+    float* const planes[] = {square_warps, dot_warps};
+    antfly_warp_block_statistics<false>(statistics, planes, [&](const float* totals) {
+        inv = rsqrtf(totals[0] / (float)width + eps);
+        correction = totals[1] * inv * inv / (float)width;
+    });
     __syncthreads();
     for (unsigned int i = threadIdx.x; i < width; i += blockDim.x) {
         float x = __bfloat162float(input[base + i]);
@@ -688,22 +695,19 @@ extern "C" __global__ void termite_embedding_gemma2_matmul_bf16(
     out[(size_t)row * out_dim + col] = __float2bfloat16_rn(sum);
 }
 
-extern "C" __global__ void termite_embedding_gemma2_gelu_ple_bf16(
-    __nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* ple, unsigned int count) {
-    unsigned int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=count)return;
-    float x=__bfloat162float(gate[i]); float g=0.5f*x*(1.0f+tanhf(0.7978845608028654f*(x+0.044715f*x*x*x))); g=__bfloat162float(__float2bfloat16_rn(g));
-    out[i]=__float2bfloat16_rn(g*__bfloat162float(ple[i]));
+// PLE and FFN products share the same rounded GELU forward boundary.
+// The analytic VJP below retains its distinct polynomial evaluation order.
+#define ANTFLY_BF16_GELU_PRODUCT(Kernel) \
+extern "C" __global__ void Kernel(__nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* right, unsigned int count) { \
+    unsigned int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=count)return; \
+    float x=__bfloat162float(gate[i]); \
+    float g=0.5f*x*(1.0f+tanhf(0.7978845608028654f*(x+0.044715f*x*x*x))); \
+    g=__bfloat162float(__float2bfloat16_rn(g)); \
+    out[i]=__float2bfloat16_rn(g*__bfloat162float(right[i])); \
 }
-
-extern "C" __global__ void termite_embedding_gemma2_gelu_mul_bf16(
-    __nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* up,
-    unsigned int count) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    float x = __bfloat162float(gate[i]);
-    float g = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x))); g=__bfloat162float(__float2bfloat16_rn(g));
-    out[i] = __float2bfloat16_rn(g * __bfloat162float(up[i]));
-}
+ANTFLY_BF16_GELU_PRODUCT(termite_embedding_gemma2_gelu_ple_bf16)
+ANTFLY_BF16_GELU_PRODUCT(termite_embedding_gemma2_gelu_mul_bf16)
+#undef ANTFLY_BF16_GELU_PRODUCT
 
 extern "C" __global__ void termite_embedding_gemma2_gelu_mul_vjp_f32(
     float* dgate, float* dup, const float* dy, const __nv_bfloat16* gate,
@@ -766,14 +770,8 @@ extern "C" __global__ void termite_embedding_gemma2_contrastive_prob_f32(
         probabilities[(size_t)q * candidate_count + c] = score;
         local_max = fmaxf(local_max, score);
     }
-    local_max = eg2_warp_max(local_max);
-    if ((threadIdx.x & 31u) == 0) scratch[threadIdx.x >> 5] = local_max;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float value = threadIdx.x < (blockDim.x >> 5) ? scratch[threadIdx.x] : -positive_infinity;
-        value = eg2_warp_max(value);
-        if (threadIdx.x == 0) scratch[0] = value;
-    }
+    float maxima[] = {local_max}; float* const maxima_planes[] = {scratch};
+    antfly_warp_block_statistics<true>(maxima, maxima_planes, [&](const float* totals) { scratch[0] = totals[0]; }, -positive_infinity);
     __syncthreads();
     float row_max = scratch[0], local_sum = 0.0f;
     for (unsigned int c = threadIdx.x; c < candidate_count; c += blockDim.x) {
@@ -782,14 +780,8 @@ extern "C" __global__ void termite_embedding_gemma2_contrastive_prob_f32(
         probabilities[(size_t)q * candidate_count + c] = value;
         local_sum += value;
     }
-    local_sum = eg2_warp_sum(local_sum);
-    if ((threadIdx.x & 31u) == 0) scratch[threadIdx.x >> 5] = local_sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float value = threadIdx.x < (blockDim.x >> 5) ? scratch[threadIdx.x] : 0.0f;
-        value = eg2_warp_sum(value);
-        if (threadIdx.x == 0) scratch[0] = value;
-    }
+    float sums[] = {local_sum}; float* const sums_planes[] = {scratch};
+    antfly_warp_block_statistics<false>(sums, sums_planes, [&](const float* totals) { scratch[0] = totals[0]; });
     __syncthreads();
     float total = scratch[0];
     for (unsigned int c = threadIdx.x; c < candidate_count; c += blockDim.x)
@@ -978,29 +970,55 @@ extern "C" __global__ void termite_embedding_gemma2_f32_to_bf16(
     if (i < count) out[i] = __float2bfloat16_rn(input[i]);
 }
 
-// Training attention uses the same flattened BHSD batch as eager torch.matmul.
+// Head permutation owns indexing independently of storage and exported ABI.
+// Repeat uses the original multiply/divide mapping; equal-head copies compile
+// without that arithmetic, preserving the non-repeated schedule.
+template<bool Repeat>
+__device__ __forceinline__ size_t antfly_bhsd_to_bshd_index(
+    size_t i, unsigned sequence, unsigned source_heads, unsigned target_heads, unsigned dim) {
+    const unsigned d = i % dim;
+    size_t t = i / dim;
+    const unsigned position = t % sequence;
+    t /= sequence;
+    const unsigned head = t % target_heads;
+    const unsigned b = t / target_heads;
+    const unsigned source_head = Repeat ? head * source_heads / target_heads : head;
+    return (((size_t)b * sequence + position) * source_heads + source_head) * dim + d;
+}
+template<typename Out, typename In> struct AntflyLayoutCast;
+template<typename T> struct AntflyLayoutCast<T,T> {
+    __device__ __forceinline__ static T apply(T x) { return x; }
+};
+template<> struct AntflyLayoutCast<float,__nv_bfloat16> {
+    __device__ __forceinline__ static float apply(__nv_bfloat16 x) { return __bfloat162float(x); }
+};
+template<> struct AntflyLayoutCast<__nv_bfloat16,float> {
+    __device__ __forceinline__ static __nv_bfloat16 apply(float x) { return __float2bfloat16_rn(x); }
+};
+template<typename Out, typename In, bool Scatter>
+__device__ __forceinline__ void antfly_reorder_heads(
+    Out* out, const In* input, unsigned batch, unsigned sequence, unsigned heads, unsigned dim) {
+    const size_t count = (size_t)batch * sequence * heads * dim;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const size_t mapped = antfly_bhsd_to_bshd_index<false>(i, sequence, heads, heads, dim);
+    if (Scatter) out[mapped] = AntflyLayoutCast<Out,In>::apply(input[i]);
+    else out[i] = AntflyLayoutCast<Out,In>::apply(input[mapped]);
+}
+
 // Repeat KV heads while packing; cotangents cross the BF16 cast before GEMM.
 extern "C" __global__ void termite_embedding_gemma2_training_pack_bhsd_bf16(
     __nv_bfloat16* out, const void* input, unsigned int batch,
     unsigned int sequence, unsigned int source_heads, unsigned int target_heads,
     unsigned int dim, unsigned int input_f32) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t count = (size_t)batch * target_heads * sequence * dim;
-    if (i >= count) return;
-    unsigned int d = i % dim;
-    size_t t = i / dim;
-    unsigned int s = t % sequence;
-    t /= sequence;
-    unsigned int h = t % target_heads;
-    unsigned int b = t / target_heads;
-    unsigned int source_h = h * source_heads / target_heads;
-    size_t source = (((size_t)b * sequence + s) * source_heads + source_h) * dim + d;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)batch * target_heads * sequence * dim) return;
+    const size_t source = antfly_bhsd_to_bshd_index<true>(i, sequence, source_heads, target_heads, dim);
     out[i] = input_f32 ? __float2bfloat16_rn(((const float*)input)[source])
                       : ((const __nv_bfloat16*)input)[source];
 }
 
-// Collapse repeat_kv's head dimension in FP32, then cross its BF16 backward
-// boundary once. For forward/context and dQ, source_heads == target_heads.
+// Collapse repeat_kv in FP32 and cross its BF16 backward boundary once.
 extern "C" __global__ void termite_embedding_gemma2_training_unpack_bhsd_bf16(
     void* out, const __nv_bfloat16* input, unsigned int batch,
     unsigned int sequence, unsigned int source_heads, unsigned int target_heads,
@@ -1026,65 +1044,25 @@ extern "C" __global__ void termite_embedding_gemma2_training_unpack_bhsd_bf16(
 extern "C" __global__ void termite_embedding_gemma2_pack_bshd_bf16_f32(
     float* out, const __nv_bfloat16* input, unsigned int batch,
     unsigned int sequence, unsigned int heads, unsigned int dim) {
-    size_t count = (size_t)batch * sequence * heads * dim;
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    unsigned int d = i % dim;
-    size_t t = i / dim;
-    unsigned int position = t % sequence;
-    t /= sequence;
-    unsigned int head = t % heads;
-    unsigned int b = t / heads;
-    size_t source = (((size_t)b * sequence + position) * heads + head) * dim + d;
-    out[i] = __bfloat162float(input[source]);
+    antfly_reorder_heads<float,__nv_bfloat16,false>(out, input, batch, sequence, heads, dim);
 }
 
 extern "C" __global__ void termite_embedding_gemma2_pack_bshd_f32(
     float* out, const float* input, unsigned int batch,
     unsigned int sequence, unsigned int heads, unsigned int dim) {
-    size_t count = (size_t)batch * sequence * heads * dim;
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    unsigned int d = i % dim;
-    size_t t = i / dim;
-    unsigned int position = t % sequence;
-    t /= sequence;
-    unsigned int head = t % heads;
-    unsigned int b = t / heads;
-    size_t source = (((size_t)b * sequence + position) * heads + head) * dim + d;
-    out[i] = input[source];
+    antfly_reorder_heads<float,float,false>(out, input, batch, sequence, heads, dim);
 }
 
 extern "C" __global__ void termite_embedding_gemma2_unpack_bhsd_f32(
     float* out, const float* input, unsigned int batch,
     unsigned int sequence, unsigned int heads, unsigned int dim) {
-    size_t count = (size_t)batch * sequence * heads * dim;
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    unsigned int d = i % dim;
-    size_t t = i / dim;
-    unsigned int position = t % sequence;
-    t /= sequence;
-    unsigned int head = t % heads;
-    unsigned int b = t / heads;
-    size_t destination = (((size_t)b * sequence + position) * heads + head) * dim + d;
-    out[destination] = input[i];
+    antfly_reorder_heads<float,float,true>(out, input, batch, sequence, heads, dim);
 }
 
 extern "C" __global__ void termite_embedding_gemma2_unpack_bhsd_f32_bf16(
     __nv_bfloat16* out, const float* input, unsigned int batch,
     unsigned int sequence, unsigned int heads, unsigned int dim) {
-    size_t count = (size_t)batch * sequence * heads * dim;
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    unsigned int d = i % dim;
-    size_t t = i / dim;
-    unsigned int position = t % sequence;
-    t /= sequence;
-    unsigned int head = t % heads;
-    unsigned int b = t / heads;
-    size_t destination = (((size_t)b * sequence + position) * heads + head) * dim + d;
-    out[destination] = __float2bfloat16_rn(input[i]);
+    antfly_reorder_heads<__nv_bfloat16,float,true>(out, input, batch, sequence, heads, dim);
 }
 
 // ATen's contiguous vector_norm/SumOps reduction uses four accumulators
@@ -1348,14 +1326,8 @@ extern "C" __global__ void termite_embedding_gemma2_mean_l2_f32(
         float x = count > 0.0f ? sum / count : 0.0f;
         out[(size_t)b * width + d] = x; norm += x * x;
     }
-    norm = eg2_warp_sum(norm);
-    if ((threadIdx.x & 31u) == 0) norm_parts[threadIdx.x >> 5] = norm;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float x = threadIdx.x < (blockDim.x >> 5) ? norm_parts[threadIdx.x] : 0.0f;
-        x = eg2_warp_sum(x);
-        if (threadIdx.x == 0) inv_norm = x > 0.0f ? rsqrtf(x) : 0.0f;
-    }
+    float statistics[] = {norm}; float* const planes[] = {norm_parts};
+    antfly_warp_block_statistics<false>(statistics, planes, [&](const float* totals) { inv_norm = totals[0] > 0.0f ? rsqrtf(totals[0]) : 0.0f; });
     __syncthreads();
     for (unsigned int d = threadIdx.x; d < width; d += blockDim.x)
         out[(size_t)b * width + d] *= inv_norm;

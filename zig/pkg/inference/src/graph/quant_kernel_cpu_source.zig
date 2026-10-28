@@ -150,8 +150,19 @@ pub const Parameter = enum {
     biases,
     outputs,
     panel8_blocks_grouped,
+    prepared_blocks_grouped,
+    weight_raw_grouped,
+    panel8_optional_grouped,
+    panel16_optional_grouped,
+    q3_panels_grouped,
     pub fn declaration(self: Parameter) []const u8 {
         return switch (self) {
+            .prepared_blocks_grouped => "prepared_blocks: [projection_count][]const u8",
+            .weight_raw_grouped => "weight_raw: [projection_count][]const u8",
+            .panel8_optional_grouped => "panel8_blocks: [projection_count]?[]const u8",
+            .panel16_optional_grouped => "panel16_blocks: [projection_count]?[]const u8",
+            .q3_panels_grouped => "q3_panel_blocks: [projection_count][]const u8",
+
             .kind_comptime => "comptime kind: gguf_tensor_types.KnownTensorType",
             .io => "io: ?std.Io",
             .input => "input: []const f32",

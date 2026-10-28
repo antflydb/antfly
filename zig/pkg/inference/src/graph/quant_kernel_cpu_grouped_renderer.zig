@@ -18,7 +18,7 @@ fn GroupedOwner(comptime q8: bool) type {
         pub fn render(allocator: std.mem.Allocator) ![]u8 {
             var out = Emitter{ .allocator = allocator };
             defer out.bytes.deinit(allocator);
-            try out.raw(if (q8) q8_prefix else q6_prefix);
+            try projectionPrefix(&out, name, if (q8) .q8 else .q6);
             for ([_]usize{ 4, 2, 1 }) |mr| {
                 if (mr == 1) try out.raw("while (r < rows) : (r += 1) {\n") else try out.add("while (r + {d} <= rows) : (r += {d}) {{\n", .{ mr, mr });
                 var names: Names = .{};
@@ -43,6 +43,41 @@ fn GroupedOwner(comptime q8: bool) type {
     };
 }
 
+const ProjectionFamily = enum { q6, q8, k16, q3 };
+fn projectionPrefix(out: *Emitter, name: []const u8, family: ProjectionFamily) !void {
+    const P = cpu.Parameter;
+    const args: []const P = switch (family) {
+        .q6 => &.{ .projection_count_comptime, .q_input, .prepared_blocks_grouped, .panel_blocks_grouped, .panel8_optional_grouped, .panel16_optional_grouped, .outputs },
+        .q8 => &.{ .projection_count_comptime, .q_input, .weight_raw_grouped, .panel_blocks_grouped, .panel8_optional_grouped, .panel16_optional_grouped, .outputs, .biases },
+        .k16 => &.{ .has_min_comptime, .projection_count_comptime, .q_input, .prepared_blocks_grouped, .panel_blocks_grouped, .panel8_optional_grouped, .biases, .outputs },
+        .q3 => &.{ .projection_count_comptime, .q_input, .prepared_blocks_grouped, .q3_panels_grouped, .biases, .outputs },
+    };
+    try out.add("fn {s}(\n", .{name});
+    for (args) |arg| try out.add("{s},\n", .{arg.declaration()});
+    for ([_]P{ .rows, .in_dim, .out_dim, .out_start, .out_end }) |arg| try out.add("{s},\n", .{arg.declaration()});
+    try out.raw(") void {\n");
+    if (family != .k16) try out.raw("@setEvalBranchQuota(20_000);\n");
+    const q8 = family == .q8;
+    const wide = family == .q6 or q8;
+    const block = if (q8) "block_size" else "q8_block_size";
+    try out.add("const values_per_block: usize = 256;\nconst {s}: usize = 292;\n", .{block});
+    if (wide) try out.raw("std.debug.assert(in_dim % values_per_block == 0);\n");
+    try out.raw("const row_blocks = in_dim / values_per_block;\n");
+    if (!wide) try out.raw("const prepared_row_stride = row_blocks * prepared_k16_block_bytes;\n");
+    try out.add("const {s} = row_blocks * {s};\n", .{ if (q8) "row_stride" else "input_row_stride", block });
+    if (family == .q6) try out.raw("const prepared_row_stride = row_blocks * prepared_q4_k_block_bytes;\n\n");
+    if (q8) try out.raw("const use_fused_sdot = q8KFusedSdotEnabled();\n");
+    if (wide) {
+        for ([_]usize{ 8, 16 }) |nr| {
+            var storage: [32]u8 = undefined;
+            const available = if (q8) try std.fmt.bufPrint(&storage, "have_panel{d}", .{nr}) else try std.fmt.bufPrint(&storage, "panel{d}_available", .{nr});
+            try out.add("var {s} = true;\ninline for (0..projection_count) |projection_idx| {{\n{s} = {s} and panel{d}_blocks[projection_idx] != null;\n}}\n", .{ available, available, available, nr });
+        }
+        try out.add("const panel_align: usize = if ({s}) prepared_k_panel16_nr else if ({s}) prepared_k_panel8_nr else prepared_q8_0_panel_nr;\n\n", .{ if (q8) "have_panel16" else "panel16_available", if (q8) "have_panel8" else "panel8_available" });
+    }
+    try out.raw("var r: usize = 0;\n");
+}
+
 const Emitter = cpu.Emitter;
 const Names = cpu.Rows;
 
@@ -65,34 +100,64 @@ fn scalarColumn(out: *Emitter, mr: usize, q8: bool) !void {
     for (0..mr) |r| try out.add("outputs[projection_idx][{s} * out_dim + o] = {s}[projection_idx];\n", .{ names.position(r), names.acc(mr, r) });
     try out.raw("}\n");
 }
+// Keep row accumulators and publication lexical: their register schedule is
+// qualified native code. Only format/layout spelling differs across families.
+fn wideColumn(out: *Emitter, mr: usize, nr: usize, q8: bool, raw: bool) !void {
+    const width = if (raw or (!q8 and nr == 8 and mr == 1)) "8" else if (nr == 16) "prepared_k_panel16_nr" else "prepared_k_panel8_nr";
+    const bytes = if (q8) (if (nr == 16) "prepared_q8_k_panel16_block_bytes" else "prepared_q8_k_panel8_block_bytes") else if (nr == 16) "prepared_k_panel16_block_bytes" else "prepared_q6_k_panel8_block_bytes";
+    if (raw) try out.raw("if (q8KRawNR8DirectEnabled()) {\nwhile (o + 8 <= out_end) : (o += 8) {\n") else {
+        try out.add("if ({s}{d}{s}) {{\n", .{ if (q8) "have_panel" else "panel", nr, if (q8) "" else "_available" });
+        if (q8 and nr == 8) try out.raw("while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {\n") else try out.add("while ((o % prepared_k_panel{d}_nr) == 0 and o + prepared_k_panel{d}_nr <= out_end) : (o += prepared_k_panel{d}_nr) {{\n", .{ nr, nr, nr });
+    }
+    try accumulators(out, mr, width);
+    try out.raw("for (0..row_blocks) |block_idx| {\n");
+    var names: Names = .{};
+    if (q8) try q8BlockViews(out, mr) else {
+        try out.raw("const q8_off = block_idx * q8_block_size;\n");
+        for (0..mr) |r| try out.add("const {s} = {s}[q8_off..][0..q8_block_size];\n", .{ names.block(mr, r), names.row(mr, r) });
+    }
+    if (!raw and (q8 or mr != 1 or nr != 8)) try out.add("const panel_off = ((o / prepared_k_panel{d}_nr) * row_blocks + block_idx) * {s};\n", .{ nr, bytes });
+    try out.raw("inline for (0..projection_count) |projection_idx| {\n");
+    if (raw) try out.raw("const weights = q8KQ8KWeightBlock8(weight_raw[projection_idx], panel_blocks[projection_idx], row_blocks, row_stride, o, block_idx, true);\n");
+    if (!q8) {
+        try out.add("const panel{d} = panel{d}_blocks[projection_idx].?;\n", .{ nr, nr });
+        if (mr == 1 and nr == 8) try out.add("const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * {s};\n", .{bytes});
+        if (mr == 2 and nr == 8) try out.raw("const panel_block = panel8[panel_off..][0..prepared_q6_k_panel8_block_bytes];\n");
+    }
+    try out.add("const sums = {s}{d}", .{ if (q8) "dotQ8KQ8KBlock" else "dotQ6KPreparedQ8KPanel", nr });
+    if (mr != 1) try out.add("MR{d}", .{mr});
+    if (raw) try out.raw("Blocks");
+    try out.raw("(");
+    for (0..mr) |r| try out.add("{s}, ", .{names.block(mr, r)});
+    if (raw) try out.raw("weights);\n") else if (q8) try out.add("panel{d}_blocks[projection_idx].?[panel_off..][0..{s}]);\n", .{ nr, bytes }) else if (mr == 2 and nr == 8) try out.raw("panel_block);\n") else try out.add("panel{d}[panel_off..][0..{s}]);\n", .{ nr, bytes });
+    if (q8 and mr == 1) try out.add("inline for (0..{s}) |lane| acc[projection_idx][lane] += sums[lane];\n", .{width}) else {
+        try out.add("inline for (0..{s}) |lane| {{\n", .{width});
+        for (0..mr) |r| {
+            if (mr == 1) try out.raw("acc[projection_idx][lane] += sums[lane];\n") else try out.add("acc{d}[projection_idx][lane] += sums.r{d}[lane];\n", .{ r, r });
+        }
+        try out.raw("}\n");
+    }
+    try out.raw("}\n}\n");
+    try publishPanel(out, mr, width, if (q8) .q8_panel else .q6);
+    try out.raw("}\n}\n");
+}
 fn panelColumn(out: *Emitter, mr: usize, nr: usize) !void {
-    const width = if (nr == 16) "prepared_k_panel16_nr" else if (nr == 8 and mr != 1) "prepared_k_panel8_nr" else if (nr == 8) "8" else "4";
-    const bytes = if (nr == 16) "prepared_k_panel16_block_bytes" else "prepared_q6_k_panel8_block_bytes";
-    if (nr != 4) try out.add("if (panel{d}_available) {{\nwhile ((o % prepared_k_panel{d}_nr) == 0 and o + prepared_k_panel{d}_nr <= out_end) : (o += prepared_k_panel{d}_nr) {{\n", .{ nr, nr, nr, nr }) else try out.raw("while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {\n");
+    if (nr != 4) return wideColumn(out, mr, nr, false, false);
+    const width = "4";
+    try out.raw("while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {\n");
     try accumulators(out, mr, width);
     try out.raw("for (0..row_blocks) |block_idx| {\nconst q8_off = block_idx * q8_block_size;\n");
     var names: Names = .{};
     for (0..mr) |r| try out.add("const {s} = {s}[q8_off..][0..q8_block_size];\n", .{ names.block(mr, r), names.row(mr, r) });
-    if (nr != 4 and !(mr == 1 and nr == 8)) try out.add("const panel_off = ((o / prepared_k_panel{d}_nr) * row_blocks + block_idx) * {s};\n", .{ nr, bytes });
     try out.raw("inline for (0..projection_count) |projection_idx| {\n");
-    if (nr != 4) {
-        try out.add("const panel{d} = panel{d}_blocks[projection_idx].?;\n", .{ nr, nr });
-        if (mr == 1 and nr == 8) try out.add("const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * {s};\n", .{bytes});
-        if (mr == 2 and nr == 8) try out.raw("const panel_block = panel8[panel_off..][0..prepared_q6_k_panel8_block_bytes];\n");
-        try out.add("const sums = dotQ6KPreparedQ8KPanel{d}", .{nr});
-        if (mr != 1) try out.add("MR{d}", .{mr});
-        try out.raw("(");
-        for (0..mr) |r| try out.add("{s}, ", .{names.block(mr, r)});
-        if (mr == 2 and nr == 8) try out.raw("panel_block);\n") else try out.add("panel{d}[panel_off..][0..{s}]);\n", .{ nr, bytes });
-    } else try fourColumnDot(out, mr);
-    try out.add("inline for (0..{s}) |lane| {{\n", .{width});
+    try fourColumnDot(out, mr);
+    try out.raw("inline for (0..4) |lane| {\n");
     for (0..mr) |r| {
-        if (nr != 4 and mr != 1) try out.add("{s}[projection_idx][lane] += sums.r{d}[lane];\n", .{ names.acc(mr, r), r }) else if (nr == 4 and mr == 4) try out.add("{s}[projection_idx][lane] += sums{s}[lane{s}];\n", .{ names.acc(mr, r), if (r < 2) "01" else "23", if (r % 2 == 0) "" else " + 4" }) else try out.add("{s}[projection_idx][lane] += sums[lane{s}];\n", .{ names.acc(mr, r), if (r == 0) "" else " + 4" });
+        if (mr == 4) try out.add("{s}[projection_idx][lane] += sums{s}[lane{s}];\n", .{ names.acc(mr, r), if (r < 2) "01" else "23", if (r % 2 == 0) "" else " + 4" }) else try out.add("{s}[projection_idx][lane] += sums[lane{s}];\n", .{ names.acc(mr, r), if (r == 0) "" else " + 4" });
     }
     try out.raw("}\n}\n}\n");
     try publishPanel(out, mr, width, .q6);
     try out.raw("}\n");
-    if (nr != 4) try out.raw("}\n");
 }
 fn publishPanel(out: *Emitter, mr: usize, width: []const u8, policy: enum { q6, q8_panel, q8_four }) !void {
     const q8 = policy != .q6;
@@ -130,43 +195,6 @@ fn fourColumnDot(out: *Emitter, mr: usize) !void {
     }
 }
 
-const q6_prefix =
-    \\fn linearQ6KPreparedQ8KActivationGroupedRange(
-    \\comptime projection_count: usize,
-    \\q_input: []const u8,
-    \\prepared_blocks: [projection_count][]const u8,
-    \\panel_blocks: [projection_count]?[]const u8,
-    \\panel8_blocks: [projection_count]?[]const u8,
-    \\panel16_blocks: [projection_count]?[]const u8,
-    \\outputs: [projection_count][]f32,
-    \\rows: usize,
-    \\in_dim: usize,
-    \\out_dim: usize,
-    \\out_start: usize,
-    \\out_end: usize,
-    \\) void {
-    \\@setEvalBranchQuota(20_000);
-    \\const values_per_block: usize = 256;
-    \\const q8_block_size: usize = 292;
-    \\std.debug.assert(in_dim % values_per_block == 0);
-    \\const row_blocks = in_dim / values_per_block;
-    \\const input_row_stride = row_blocks * q8_block_size;
-    \\const prepared_row_stride = row_blocks * prepared_q4_k_block_bytes;
-    \\
-    \\var panel8_available = true;
-    \\inline for (0..projection_count) |projection_idx| {
-    \\panel8_available = panel8_available and panel8_blocks[projection_idx] != null;
-    \\}
-    \\var panel16_available = true;
-    \\inline for (0..projection_count) |projection_idx| {
-    \\panel16_available = panel16_available and panel16_blocks[projection_idx] != null;
-    \\}
-    \\const panel_align: usize = if (panel16_available) prepared_k_panel16_nr else if (panel8_available) prepared_k_panel8_nr else prepared_q8_0_panel_nr;
-    \\
-    \\var r: usize = 0;
-    \\
-;
-
 test "grouped projection lowering preserves valid native geometry" {
     inline for (owners) |Owner| {
         const source = try Owner.render(std.testing.allocator);
@@ -174,43 +202,6 @@ test "grouped projection lowering preserves valid native geometry" {
         try std.testing.expect(std.mem.indexOf(u8, source, "while (r") != null);
     }
 }
-
-const q8_prefix =
-    \\fn linearQ8KQ8KActivationGroupedRange(
-    \\comptime projection_count: usize,
-    \\q_input: []const u8,
-    \\weight_raw: [projection_count][]const u8,
-    \\panel_blocks: [projection_count]?[]const u8,
-    \\panel8_blocks: [projection_count]?[]const u8,
-    \\panel16_blocks: [projection_count]?[]const u8,
-    \\outputs: [projection_count][]f32,
-    \\biases: [projection_count]?[]const f32,
-    \\rows: usize,
-    \\in_dim: usize,
-    \\out_dim: usize,
-    \\out_start: usize,
-    \\out_end: usize,
-    \\) void {
-    \\@setEvalBranchQuota(20_000);
-    \\const values_per_block: usize = 256;
-    \\const block_size: usize = 292;
-    \\std.debug.assert(in_dim % values_per_block == 0);
-    \\const row_blocks = in_dim / values_per_block;
-    \\const row_stride = row_blocks * block_size;
-    \\const use_fused_sdot = q8KFusedSdotEnabled();
-    \\var have_panel8 = true;
-    \\inline for (0..projection_count) |projection_idx| {
-    \\have_panel8 = have_panel8 and panel8_blocks[projection_idx] != null;
-    \\}
-    \\var have_panel16 = true;
-    \\inline for (0..projection_count) |projection_idx| {
-    \\have_panel16 = have_panel16 and panel16_blocks[projection_idx] != null;
-    \\}
-    \\const panel_align: usize = if (have_panel16) prepared_k_panel16_nr else if (have_panel8) prepared_k_panel8_nr else prepared_q8_0_panel_nr;
-    \\
-    \\var r: usize = 0;
-    \\
-;
 
 fn q8BlockViews(out: *Emitter, mr: usize) !void {
     try out.raw("const off = block_idx * block_size;\n");
@@ -230,37 +221,7 @@ fn q8ScalarColumn(out: *Emitter, mr: usize) !void {
     try out.raw("}\n");
 }
 fn q8WideColumn(out: *Emitter, mr: usize, nr: usize, raw_weights: bool) !void {
-    const width = if (raw_weights) "8" else if (nr == 16) "prepared_k_panel16_nr" else "prepared_k_panel8_nr";
-    const bytes = if (nr == 16) "prepared_q8_k_panel16_block_bytes" else "prepared_q8_k_panel8_block_bytes";
-    if (raw_weights) {
-        try out.raw("if (q8KRawNR8DirectEnabled()) {\nwhile (o + 8 <= out_end) : (o += 8) {\n");
-    } else {
-        try out.add("if (have_panel{d}) {{\n", .{nr});
-        if (nr == 16) try out.raw("while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {\n") else try out.raw("while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {\n");
-    }
-    try accumulators(out, mr, width);
-    try out.raw("for (0..row_blocks) |block_idx| {\n");
-    try q8BlockViews(out, mr);
-    if (!raw_weights) try out.add("const panel_off = ((o / prepared_k_panel{d}_nr) * row_blocks + block_idx) * {s};\n", .{ nr, bytes });
-    try out.raw("inline for (0..projection_count) |projection_idx| {\n");
-    if (raw_weights) try out.raw("const weights = q8KQ8KWeightBlock8(weight_raw[projection_idx], panel_blocks[projection_idx], row_blocks, row_stride, o, block_idx, true);\n");
-    try out.add("const sums = dotQ8KQ8KBlock{d}", .{nr});
-    if (mr != 1) try out.add("MR{d}", .{mr});
-    if (raw_weights) try out.raw("Blocks");
-    try out.raw("(");
-    var names: Names = .{};
-    for (0..mr) |r| try out.add("{s}, ", .{names.block(mr, r)});
-    if (raw_weights) try out.raw("weights);\n") else try out.add("panel{d}_blocks[projection_idx].?[panel_off..][0..{s}]);\n", .{ nr, bytes });
-    if (mr == 1) {
-        try out.add("inline for (0..{s}) |lane| acc[projection_idx][lane] += sums[lane];\n", .{width});
-    } else {
-        try out.add("inline for (0..{s}) |lane| {{\n", .{width});
-        for (0..mr) |r| try out.add("acc{d}[projection_idx][lane] += sums.r{d}[lane];\n", .{ r, r });
-        try out.raw("}\n");
-    }
-    try out.raw("}\n}\n");
-    try publishPanel(out, mr, width, .q8_panel);
-    try out.raw("}\n}\n");
+    try wideColumn(out, mr, nr, true, raw_weights);
 }
 fn q8FourColumns(out: *Emitter, mr: usize) !void {
     try out.raw("while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {\n");
@@ -308,7 +269,7 @@ fn K16Owner(comptime q3: bool) type {
         pub fn render(allocator: std.mem.Allocator) ![]u8 {
             var out = Emitter{ .allocator = allocator };
             defer out.bytes.deinit(allocator);
-            try out.raw(if (q3) q3_prefix else k16_prefix);
+            try projectionPrefix(&out, name, if (q3) .q3 else .k16);
             for ([_]usize{ 4, 2, 1 }) |mr| {
                 if (!q3 and mr == 4) try out.raw("if (panel8_blocks[0] == null) {\n");
                 if (mr == 1) try out.raw("while (r < rows) : (r += 1) {\n") else if (q3) try out.add("while (r + {d} <= rows) : (r += {d}) {{\n", .{ mr, mr }) else try out.add("while (r + {d} < rows) : (r += {d}) {{\n", .{ mr - 1, mr });
@@ -491,55 +452,6 @@ fn k16Panel8Column(out: *Emitter, mr: usize) !void {
     }
     try out.raw("}\n}\n}\n");
 }
-
-const k16_prefix =
-    \\fn k16PreparedQ8KActivationGroupedApply(
-    \\comptime has_min: bool,
-    \\comptime projection_count: usize,
-    \\q_input: []const u8,
-    \\prepared_blocks: [projection_count][]const u8,
-    \\panel_blocks: [projection_count]?[]const u8,
-    \\panel8_blocks: [projection_count]?[]const u8,
-    \\biases: [projection_count]?[]const f32,
-    \\outputs: [projection_count][]f32,
-    \\rows: usize,
-    \\in_dim: usize,
-    \\out_dim: usize,
-    \\out_start: usize,
-    \\out_end: usize,
-    \\) void {
-    \\const values_per_block: usize = 256;
-    \\const q8_block_size: usize = 292;
-    \\const row_blocks = in_dim / values_per_block;
-    \\const prepared_row_stride = row_blocks * prepared_k16_block_bytes;
-    \\const input_row_stride = row_blocks * q8_block_size;
-    \\var r: usize = 0;
-    \\
-;
-
-const q3_prefix =
-    \\fn k16PreparedQ8KActivationQ3NoDmnPanelGroupedApply(
-    \\comptime projection_count: usize,
-    \\q_input: []const u8,
-    \\prepared_blocks: [projection_count][]const u8,
-    \\q3_panel_blocks: [projection_count][]const u8,
-    \\biases: [projection_count]?[]const f32,
-    \\outputs: [projection_count][]f32,
-    \\rows: usize,
-    \\in_dim: usize,
-    \\out_dim: usize,
-    \\out_start: usize,
-    \\out_end: usize,
-    \\) void {
-    \\@setEvalBranchQuota(20_000);
-    \\const values_per_block: usize = 256;
-    \\const q8_block_size: usize = 292;
-    \\const row_blocks = in_dim / values_per_block;
-    \\const prepared_row_stride = row_blocks * prepared_k16_block_bytes;
-    \\const input_row_stride = row_blocks * q8_block_size;
-    \\var r: usize = 0;
-    \\
-;
 
 /// Single-projection K16 geometry retains scalar registers and static K=3
 /// traversal. The grouped schedule shares prepared activation sums.

@@ -3315,3 +3315,9 @@ tiles, arithmetic order and the existing private result contracts.
 [The AI outcome register](unified-execution-ai-outcomes.md) records shared
 Q4/Q5/Q6 float-input weight decoding and accumulation, retaining format-specific
 traversal and four-column MR1/MR2 contracts.
+
+### AJ kernel-family campaign
+
+[The AJ register](unified-execution-aj-outcomes.md) tracks CPU projection and
+scalar ownership, GPU normalization/layout/attention families, shared catalog
+contracts, source budgets and independent device acceptance.

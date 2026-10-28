@@ -1077,98 +1077,48 @@ const includes_cuda_fp16_math_stdint = [_][]const u8{ "<cuda_fp16.h>", "<math.h>
 const includes_cuda_fp16 = [_][]const u8{"<cuda_fp16.h>"};
 const includes_math = [_][]const u8{"<math.h>"};
 
+const ProjectionVariant = struct {
+    id: []const u8,
+    baseline: []const u8,
+    format: quant_matmul.Format,
+    bucket: quant_matmul.RowBucket,
+    rows: DimensionConstraint,
+    shared: u32,
+    row_tile: u16 = 1,
+    columns: u16 = 4,
+    pair: bool = false,
+};
+
+/// Static identity/eligibility/resource ownership for the projection family.
+fn projectionVariantPlan(kind: KernelKind, v: ProjectionVariant) RenderPlan {
+    const small = kind == .q4_k_small_batch_bias_gelu;
+    return .{
+        .kind = kind,
+        .route = .{ .format = v.format, .row_bucket = v.bucket, .epilogue = if (small) .bias_gelu else if (v.pair) .pair else .none, .dispatch = if (small) .small_batch else if (v.row_tile > 1) .mm else .mmv },
+        .kernel_id = v.id,
+        .production_baseline = v.baseline,
+        .production_enabled = v.format == .q4_0,
+        .launch = .{
+            .grid = if (small or v.row_tile > 1) .output_cols_by_rows else .output_cols,
+            .threads_per_block = if (small) 128 else 256,
+            .output_rows_per_block = v.row_tile,
+            .output_cols_per_block = v.columns,
+            .static_shared_memory_bytes = v.shared,
+            .rows = v.rows,
+            .input_dim = .{ .multiple_of = if (v.format == .q4_k) 256 else 32 },
+            .output_dim = .{},
+        },
+        .lowering = if (small) .{ .q4_k_small_batch = .{} } else if (v.format == .q4_k) .{ .q4_k_projection = .{} } else .{ .q4_0_projection = .{ .row_tile = @intCast(v.row_tile), .projection_count = if (v.pair) 2 else 1 } },
+    };
+}
+
 pub fn planFor(kind: KernelKind) RenderPlan {
     return switch (kind) {
-        .q4_k_small_batch_bias_gelu => .{
-            .kind = kind,
-            .route = .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .dispatch = .small_batch },
-            .kernel_id = "antfly_q4_k_small_batch_bias_gelu_f32_v1",
-            .production_baseline = "termite_linear_q4_k_bias_gelu_f32_tile4_r2",
-            .production_enabled = false,
-            .launch = .{
-                .grid = .output_cols_by_rows,
-                .threads_per_block = 128,
-                .output_rows_per_block = 1,
-                .output_cols_per_block = 1,
-                .static_shared_memory_bytes = 512,
-                .rows = .{ .min = 2, .max = 8 },
-                .input_dim = .{ .multiple_of = 256 },
-                .output_dim = .{},
-            },
-            .lowering = .{ .q4_k_small_batch = .{} },
-        },
-        .q4_k_mmv => .{
-            .kind = kind,
-            .route = .{ .format = .q4_k, .row_bucket = .rows_1, .epilogue = .none, .dispatch = .mmv },
-            .kernel_id = "antfly_q4_k_mmv_f32_v1",
-            .production_baseline = "termite_linear_q4_k_f32_tile4",
-            .production_enabled = false,
-            .launch = .{
-                .grid = .output_cols,
-                .threads_per_block = 256,
-                .output_rows_per_block = 1,
-                .output_cols_per_block = 1,
-                .static_shared_memory_bytes = 1024,
-                .rows = .{ .min = 1, .max = 1, .fixed = 1 },
-                .input_dim = .{ .multiple_of = 256 },
-                .output_dim = .{},
-            },
-            .lowering = .{ .q4_k_projection = .{} },
-        },
-        .q4_0_mmv => .{
-            .kind = kind,
-            .route = .{ .format = .q4_0, .row_bucket = .rows_1, .epilogue = .none, .dispatch = .mmv },
-            .kernel_id = "antfly_q4_0_mmv_f32_v1",
-            .production_baseline = "termite_linear_q4_0_f32_tile4",
-            .production_enabled = true,
-            .launch = .{
-                .grid = .output_cols,
-                .threads_per_block = 256,
-                .output_rows_per_block = 1,
-                .output_cols_per_block = 4,
-                .static_shared_memory_bytes = 128,
-                .rows = .{ .min = 1, .max = 1, .fixed = 1 },
-                .input_dim = .{ .multiple_of = 32 },
-                .output_dim = .{},
-            },
-            .lowering = .{ .q4_0_projection = .{ .row_tile = 1, .projection_count = 1 } },
-        },
-        .q4_0_mm => .{
-            .kind = kind,
-            .route = .{ .format = .q4_0, .row_bucket = .rows_9_64, .epilogue = .none, .dispatch = .mm },
-            .kernel_id = "antfly_q4_0_mm_f32_v1",
-            .production_baseline = "termite_linear_q4_0_f32",
-            .production_enabled = true,
-            .launch = .{
-                .grid = .output_cols_by_rows,
-                .threads_per_block = 256,
-                .output_rows_per_block = 8,
-                .output_cols_per_block = 4,
-                .static_shared_memory_bytes = 1024,
-                .rows = .{ .min = 9, .max = 64 },
-                .input_dim = .{ .multiple_of = 32 },
-                .output_dim = .{},
-            },
-            .lowering = .{ .q4_0_projection = .{ .row_tile = 8, .projection_count = 1 } },
-        },
-        .q4_0_pair_mmv => .{
-            .kind = kind,
-            .route = .{ .format = .q4_0, .row_bucket = .rows_1, .epilogue = .pair, .dispatch = .mmv },
-            .kernel_id = "antfly_q4_0_pair_mmv_f32_v1",
-            .production_baseline = "termite_linear_q4_0_pair_nobias_f32_tile4_w4",
-            .production_enabled = true,
-            .launch = .{
-                .grid = .output_cols,
-                .threads_per_block = 256,
-                .output_rows_per_block = 1,
-                .output_cols_per_block = 4,
-                .static_shared_memory_bytes = 256,
-                .rows = .{ .min = 1, .max = 1, .fixed = 1 },
-                .input_dim = .{ .multiple_of = 32 },
-                .output_dim = .{},
-            },
-            .lowering = .{ .q4_0_projection = .{ .row_tile = 1, .projection_count = 2 } },
-        },
+        .q4_k_small_batch_bias_gelu => projectionVariantPlan(kind, .{ .id = "antfly_q4_k_small_batch_bias_gelu_f32_v1", .baseline = "termite_linear_q4_k_bias_gelu_f32_tile4_r2", .format = .q4_k, .bucket = .rows_2_8, .rows = .{ .min = 2, .max = 8 }, .shared = 512, .columns = 1 }),
+        .q4_k_mmv => projectionVariantPlan(kind, .{ .id = "antfly_q4_k_mmv_f32_v1", .baseline = "termite_linear_q4_k_f32_tile4", .format = .q4_k, .bucket = .rows_1, .rows = .{ .min = 1, .max = 1, .fixed = 1 }, .shared = 1024, .columns = 1 }),
+        .q4_0_mmv => projectionVariantPlan(kind, .{ .id = "antfly_q4_0_mmv_f32_v1", .baseline = "termite_linear_q4_0_f32_tile4", .format = .q4_0, .bucket = .rows_1, .rows = .{ .min = 1, .max = 1, .fixed = 1 }, .shared = 128 }),
+        .q4_0_mm => projectionVariantPlan(kind, .{ .id = "antfly_q4_0_mm_f32_v1", .baseline = "termite_linear_q4_0_f32", .format = .q4_0, .bucket = .rows_9_64, .rows = .{ .min = 9, .max = 64 }, .shared = 1024, .row_tile = 8 }),
+        .q4_0_pair_mmv => projectionVariantPlan(kind, .{ .id = "antfly_q4_0_pair_mmv_f32_v1", .baseline = "termite_linear_q4_0_pair_nobias_f32_tile4_w4", .format = .q4_0, .bucket = .rows_1, .rows = .{ .min = 1, .max = 1, .fixed = 1 }, .shared = 256, .pair = true }),
         .q4_0_pair_activation_q8_1 => pairActivationQ8Plan(
             kind,
             "antfly_q4_0_pair_activation_q8_1_mmv_v1",

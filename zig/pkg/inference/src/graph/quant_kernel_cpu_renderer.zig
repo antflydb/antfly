@@ -331,7 +331,7 @@ fn q4TripleVector(out: *Emitter, rows: usize) !void {
         try out.add("const block_input_off = block_idx * values_per_block;\nconst input_block_r0 = input_r0[block_input_off..][0..values_per_block];\nconst input_block_r1 = input_r1[block_input_off..][0..values_per_block];\n", .{});
     }
     for ("abc") |p| {
-        try out.add("accumulatePreparedFloatBlock4Rows(false, {d}, .{{", .{rows});
+        try out.add("accumulatePreparedFloatRows(false, {d}, 4, .{{", .{rows});
         for (0..rows) |r| {
             if (r != 0) try out.add(", ", .{});
             if (rows == 1) try out.add("input_block", .{}) else try out.add("input_block_r{d}", .{r});
