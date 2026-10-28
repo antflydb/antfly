@@ -1566,3 +1566,68 @@ fragment sizes 1/17/100/513 and counts 1/2/3/8. It also exercises allocation
 failures and cancellation. The Unicode probe admits a tiny snippet from an
 8-MiB source under a 96-KiB limit, including page-boundary clipping. Reuse probes
 verify analyzer-run counts and last-consumer ownership independently of timings.
+
+The [dense-source observation](dense-source-refinements-v1-observation.json)
+records **444 measured HTTP requests**, complete-result digests, deadline outcomes,
+and executable/input/runner hashes. The control is the clean merge
+`ccc012ee664f8e856b0b02d7dd25c04621d2cf87`; both binaries include main
+`acc30f5415c8c96465384d4f0dd46b649959a1d5`. The final runtime is
+`17d4465cc8e799bc287828e864c3b55ac4d310ec`, frozen as SHA-256
+`2aa1ae8410c258f99d91f3777eaf7073b347bed515eb55565e6d9c4fcda722e2`.
+Runners and corrected large-row fixtures are from `42ece3e65f`; that commit
+does not change runtime code. All complete-result oracles match across binaries
+and both execution orders.
+
+Warm local Debug medians, milliseconds:
+
+| Shape | Old → new, primary order | Old → new, reverse order |
+|---|---:|---:|
+| Dense 2-MiB field | 120.93 → 88.81 | 120.98 → 86.73 |
+| Variable-width Unicode 8-MiB field | 17.18 → 11.01 | 17.37 → 10.97 |
+| Rare exact, 2-MiB vocabulary | 9.08 → 9.19 | 9.30 → 9.12 |
+| Rare fuzzy, 2-MiB vocabulary | 11.40 → 11.64 | 11.57 → 11.61 |
+| Eight projected small fields, 256 hits | 276.72 → 266.83 | 285.49 → 265.33 |
+| Eight hidden small fields, 256 hits | 314.28 → 312.49 | 309.43 → 301.40 |
+| Sparse 2-KiB field | 10.44 → 11.39 | 11.15 → 11.81 |
+| Sparse 128-KiB field | 10.09 → 10.86 | 10.93 → 10.95 |
+| Dense 128-KiB field | 16.56 → 15.78 | 17.49 → 15.74 |
+| Sparse 8-MiB field, matches at end | 9.60 → 9.40 | 9.35 → 9.31 |
+
+Dense 2-MiB latency drops **26.6–28.3%**, and the Unicode case drops
+**36.0–36.9%**. Projected-wide improves **3.6–7.1%**, hidden-wide
+**0.6–2.6%**, and dense 128-KiB **4.7–10.0%**. Rare-term controls vary
+between a 2.4% improvement and a 2.1% regression. Small sparse kernel controls
+include regressions up to **0.94 ms (9.2%)**; their reverse-order differences
+are generally smaller, but the 2-KiB sparse point remains **0.66 ms (5.9%)**
+slower. These controls do not establish a universal latency improvement. The
+8-MiB ASCII controls stay within 0.21 ms and all 25/50-ms requests succeed;
+1-ms kernel requests retain structured timeouts and 250-ms requests succeed.
+Every measured point, including slower controls, is retained in the observation.
+
+The source-refinement and rare-term points have seven samples per shape/order;
+other controls have three. These are whole-server warm local Debug observations
+on a shared host with no task-owned build, E2E or cleanup overlap. They do not
+qualify Release, remote-provider latency, empty caches or archive scale, and
+publication readiness does not isolate ingestion CPU savings.
+
+Native probes establish the memory and reuse properties independently: **18,461
+selected occurrences** require a peak queue of **527**, **441** retained candidate
+windows and **101,055 bytes** under a 256-KiB budget, with vector-equivalent
+fragments across all tested counts and widths. An **8,388,600-byte** Unicode value
+uses a **4,125-byte** descriptor and six boundary-map reads, peaking at
+**89,310 bytes** under a 96-KiB budget. Both return to zero live bytes. The
+equivalent-binding probe records **one analyzer run and one reuse**, plus one
+captured source variant, one capture reuse and 110 spilled bytes. Fault and
+cancellation tests verify ownership; streaming substring expansion retains its
+existing allocation-free path.
+
+Both native owners pass **533 integration and 493 frontier cases**, each with a
+**243-case shared partition**, with no skips, failures or leaks. These are 1,512
+owner executions with overlapping tests. All **48 distinct real-file E2Es** are
+verified on the frozen runtime: the initial run passed 46 and failed two expanded
+fixtures with `ParquetPageTooLarge`; after separating large rows into row groups
+and separate Iceberg appends and bounding the Unicode vocabulary, the two targeted
+cases pass. Runtime code is unchanged between runs. These cases verify sparse,
+dense and Unicode snippets after removing the original objects and restarting.
+Apache boundary checks cover 2,574 source files; license, lint, formatting and
+whitespace checks pass.
