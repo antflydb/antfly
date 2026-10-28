@@ -1881,6 +1881,7 @@ fn addSingleTextFieldToBuilders(
 ) !void {
     if (profile) |p| p.text_field_count +|= 1;
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
+    const analyzer_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     const capture = try source_capture.wants(doc_idx, field.source_field orelse field.field_name, field.text, source_root, analyzer);
     const producer = if (field.text.len >= 128) analyzer.tokenStream(field.text) else null;
     var shared: ?AnalysisReuse.Lease = null;
@@ -1901,7 +1902,6 @@ fn addSingleTextFieldToBuilders(
             if (profile_timings) p.term_accum_ns +|= platform_time.monotonicNs() - started;
         }
     } else {
-        const analyzer_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         const tokens = if (shared) |held| held.tokens else if (capture != null) try analyzer.analyzeWithSourceOffsets(doc_alloc, field.text) else try analyzer.analyze(doc_alloc, field.text);
         if (capture) |request| try source_capture.record(request, tokens);
         if (profile) |p| {
@@ -1992,6 +1992,7 @@ fn accumulateTokenStream(a: Allocator, field: *FieldAcc, input: analysis_mod.Tok
     return count;
 }
 fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool, source_capture: *SourceCapture, doc: u32, source_field: []const u8, source_root: ?std.json.Value, reuse: *AnalysisReuse, contribution_cache: ?*AnalyzedContributionCache, known_reuse: bool) !void {
+    const analysis_started = if (timings) platform_time.monotonicNs() else 0;
     const capture = try source_capture.wants(doc, source_field, text, source_root, analyzer);
     const producer = if (text.len >= 128) analyzer.tokenStream(text) else null;
     const shared = if (producer == null and reuse.entries.count() != 0) try reuse.acquire(.{ .field = source_field, .text = text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null) else null;
@@ -2028,12 +2029,11 @@ fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.String
         }
         return;
     }
-    const started = if (timings) platform_time.monotonicNs() else 0;
     const tokens = if (shared) |held| held.tokens else if (capture != null) try analyzer.analyzeWithSourceOffsets(a, text) else try analyzer.analyze(a, text);
     if (capture) |request| try source_capture.record(request, tokens);
     if (profile) |p| {
         p.token_count +|= @intCast(tokens.len);
-        if (timings) p.analyzer_ns +|= platform_time.monotonicNs() - started;
+        if (timings) p.analyzer_ns +|= platform_time.monotonicNs() - analysis_started;
     }
     if (tokens.len == 0) return;
     const accum_started = if (timings) platform_time.monotonicNs() else 0;
