@@ -10383,10 +10383,12 @@ pub const DataServer = struct {
     fn runLifetimeCheckedLsmMaintenanceRound(self: *DataServer, fair_turn_eligible: bool, entered: *bool) !antfly.public_api.ProvisionedTableWriteSource.LsmMaintenanceRoundResult {
         entered.* = false;
         const io = self.maintenance_worker_lease.?.io();
-        // The legacy physical step can hold guards for an unbounded duration.
-        // Do not hold a shared CPU slot around it until the retained driver
-        // provides safe suspension boundaries. Original lifetime still fences
-        // selection and new physical work, and cannot release work before join.
+        // Eligible file-flush construction transfers to its durable lane. This
+        // call returns its service guards without waiting for shared execution.
+        // Other legacy physical steps still hold guards for unbounded work, so
+        // this selection round carries original lifetime without a CPU slot.
+        // Accepted detached work owns an independent bounded pass and backend
+        // lifetime; it never retains this stack restriction.
         var pass = try status_refresh_execution.Pass.init(
             null,
             &io,

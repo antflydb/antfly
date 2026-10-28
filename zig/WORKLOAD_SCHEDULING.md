@@ -1824,3 +1824,11 @@ scope ends before legacy publication. Refused passes retain debt and retry after
 an off-lock backoff, and close cancels queued construction while persisting the
 immutable tail. This does not yet admit guarded publication, compaction or the
 server maintenance-waker path; those remain part of the production integration.
+
+Normal eligible maintenance selection now hands file-flush construction to the
+existing durable owner and returns the caller's service guards without waiting
+for shared execution. Forced idle partial windows survive transient admission
+refusal; strict IO-budget denial retains debt and advertises a retry delay.
+Repeated selection cannot race a queued builder through synchronous fallback.
+The internal waker is notified after successful construction/publication; remaining
+guarded legacy steps still run outside shared CPU admission.

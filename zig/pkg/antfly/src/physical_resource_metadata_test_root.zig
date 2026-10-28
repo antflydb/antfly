@@ -5920,7 +5920,7 @@ test "physical cache metadata bounded writer retirement refuses unknown producer
     try std.testing.expectEqual(@as(usize, 1), Callback.called);
 }
 
-fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry }) !void {
+fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -5929,6 +5929,8 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry }) !void
     const platform = @import("antfly_platform");
     const scheduler = local.common_request_admission.runnable_scheduler;
     const a = std.testing.allocator;
+    const maintenance_origin = mode == .maintenance or mode == .maintenance_retry or mode == .maintenance_close or mode == .waker or mode == .maintenance_budget or mode == .maintenance_unsupported;
+    const retry_refusal = mode == .retry or mode == .maintenance_retry;
     var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
     defer state.owner.deinit();
     const Refusal = struct {
@@ -5942,7 +5944,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry }) !void
         }
     };
     var worker_owner = state.port();
-    if (mode == .retry) {
+    if (retry_refusal) {
         Refusal.delegate = worker_owner.start;
         Refusal.attempts.store(0, .release);
         worker_owner.start = Refusal.start;
@@ -5955,21 +5957,31 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry }) !void
     defer pool.deinit();
     var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
     defer native.deinit();
+    var storage = native.storage();
+    var storage_callbacks = storage.vtable.*;
+    if (mode == .maintenance_unsupported) {
+        storage_callbacks.try_prepare_durability_with_admission = null;
+        storage.vtable = &storage_callbacks;
+    }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/normal-admitted-flush", .{tmp.sub_path});
     defer a.free(root);
     var handle = try lsm.BackendHandle.openWithConfig(a, root, .{
-        .storage = native.storage(),
+        .storage = storage,
         .resource_manager = &resources.resource_manager,
-        .flush_threshold = 1,
+        .flush_threshold = if (maintenance_origin) 1000 else 1,
+        .mutable_idle_flush_after_ns = if (maintenance_origin) 1 else 0,
+        .immutable_flush_window_bytes = if (maintenance_origin) std.math.maxInt(u64) else 0,
+        .background_io_budget_bytes = if (mode == .maintenance_budget) 1 else 0,
+        .background_io_allow_oversized_single_job = false,
         .defer_flush_on_commit = true,
         .max_deferred_immutable_memtables = 128,
-        .immutable_flush_window_max_memtables = 1,
+        .immutable_flush_window_max_memtables = if (maintenance_origin) 64 else 1,
         .compact_threshold_runs = 1000,
         .l0_soft_limit_runs = 1000,
         .l0_hard_limit_runs = 2000,
-    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = worker_owner } });
+    }, .{ .background_runtime = .{ .backend = .io_threaded, .runnable_owner = worker_owner }, .internal_flush_worker = mode == .waker });
     var open = true;
     defer if (open) handle.close();
     const io = std.testing.io;
@@ -5986,6 +5998,60 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry }) !void
         try write.commit();
     }
     const deadline = platform.time.monotonicNs() + 10 * std.time.ns_per_s;
+    const Original = struct {
+        active: std.atomic.Value(bool) = .init(true),
+        checks: std.atomic.Value(usize) = .init(0),
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.checks.fetchAdd(1, .monotonic);
+            return if (self.active.load(.acquire)) .ok else runtime.error_abi.statusFromError(error.Canceled);
+        }
+    };
+    var original: Original = .{};
+    const lifetime: runtime.runnable_abi.Reentry = .{ .context = &original, .check = Original.check };
+    if (maintenance_origin and mode != .waker) {
+        // The server's selected native backend call returns the construction
+        // handoff while the original synchronous authority still lives. The
+        // task must never retain that stack authority or require another write.
+        try io.sleep(.fromMilliseconds(1), .awake);
+        for (0..32) |_| {
+            _ = try handle.ptr().runMaintenanceStepBestEffortWithLifetime(&lifetime);
+            if (state.owner.scheduler.stats().queued != 0) break;
+            if (mode == .maintenance_budget or mode == .maintenance_unsupported) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        original.active.store(false, .release);
+    }
+    if (mode == .maintenance_unsupported) {
+        try std.testing.expectEqual(@as(u64, 1), handle.ptr().snapshotWriteStats().immutable_flushes);
+        try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().queued);
+        handle.close();
+        open = false;
+        owner.finish(foreground.?);
+        foreground = null;
+        RegisteredOutputFixture.drain(&resources.resource_manager);
+        var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .backend = .{ .read_only = true } });
+        defer reopened.close();
+        var read = try reopened.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("durable", try read.get(.{}, "admitted"));
+        return;
+    }
+    if (mode == .maintenance_budget) {
+        const stats = handle.ptr().snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 0), stats.immutable_flushes);
+        try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().queued);
+        try std.testing.expect(!handle.ptr().immutable_flush_job_in_flight);
+        try std.testing.expect((handle.ptr().nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+        // A later budget change retries the same idle partial cut, with no
+        // fresh write and no synchronous fallback on the denied attempt.
+        while (!handle.ptr().mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+        handle.ptr().options.background_io_budget_bytes = 0;
+        handle.ptr().mu.unlock();
+        original.active.store(true, .release);
+        _ = try handle.ptr().runMaintenanceStepWithLifetime(&lifetime);
+        original.active.store(false, .release);
+    }
     while (state.owner.scheduler.stats().queued == 0) {
         if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -5998,7 +6064,19 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry }) !void
     handle.ptr().mu.unlock();
     try std.testing.expectEqual(@as(usize, 1), pending);
     try std.testing.expectEqual(@as(u64, 0), flushes);
-    if (mode == .cancel_queued) {
+    if (maintenance_origin) {
+        const retry_delay = handle.ptr().nextMaintenanceWakeDelayNsBestEffort();
+        if (retry_delay) |delay| try std.testing.expect(delay > 0);
+    }
+    const synchronous_checks = original.checks.load(.acquire);
+    if (maintenance_origin and mode != .waker) {
+        original.active.store(true, .release);
+        try std.testing.expect(!try handle.ptr().runMaintenanceStepBestEffortWithLifetime(&lifetime));
+        original.active.store(false, .release);
+    }
+    const final_synchronous_checks = original.checks.load(.acquire);
+    try std.testing.expect(final_synchronous_checks >= synchronous_checks);
+    if (mode == .cancel_queued or mode == .maintenance_close) {
         // Closing cancels the original queued pass even while the foreground
         // retains ordinary capacity; joined close persists the immutable tail.
         handle.close();
@@ -6015,13 +6093,19 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry }) !void
             try io.sleep(.fromMilliseconds(1), .awake);
         }
         try std.testing.expect(state.owner.scheduler.stats().grants[@backingInt(scheduler.Class.background)] > 0);
+        if (mode == .waker) {
+            const waker_stats = handle.internalFlushWorkerStats().?;
+            try std.testing.expect(waker_stats.wakeups >= 2);
+            try std.testing.expect(waker_stats.maintenance_steps > 0);
+        }
         handle.close();
         open = false;
     }
     if (foreground) |held| owner.finish(held);
     foreground = null;
     RegisteredOutputFixture.drain(&resources.resource_manager);
-    if (mode == .retry) try std.testing.expect(Refusal.attempts.load(.acquire) >= 6);
+    if (retry_refusal) try std.testing.expect(Refusal.attempts.load(.acquire) >= 6);
+    try std.testing.expectEqual(final_synchronous_checks, original.checks.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
     var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .backend = .{ .read_only = true } });
@@ -6052,4 +6136,22 @@ test "physical cache metadata registered flush publication legacy handoff retain
 
 test "physical cache metadata registered flush publication normal worker retries refused admission without another write" {
     try normalAdmittedFlushWorker(.retry);
+}
+
+test "physical cache metadata registered flush publication maintenance caller hands off idle partial flush and original authority" {
+    try normalAdmittedFlushWorker(.maintenance);
+    try normalAdmittedFlushWorker(.maintenance_retry);
+    try normalAdmittedFlushWorker(.maintenance_close);
+}
+
+test "physical cache metadata registered flush publication maintenance handoff preserves IO budget refusal and retry" {
+    try normalAdmittedFlushWorker(.maintenance_budget);
+}
+
+test "physical cache metadata registered flush publication internal waker uses shared construction admission" {
+    try normalAdmittedFlushWorker(.waker);
+}
+
+test "physical cache metadata registered flush publication unsupported admitted provider keeps working legacy maintenance" {
+    try normalAdmittedFlushWorker(.maintenance_unsupported);
 }

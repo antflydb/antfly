@@ -29829,3 +29829,39 @@ This integrates construction admission for the detached file-flush path. Bounded
 publication, the normal server maintenance-waker path, compaction and remaining
 engine paths still need integration before claiming shared admission for complete
 maintenance steps. The full design remains open; full qualification is waived.
+
+## Normal maintenance selection hands flush construction to its owner (2026-10-27)
+
+Eligible file-backed maintenance steps now submit construction to the backend's
+existing durable lane and return to the Source/DB caller. Selection remains under
+its original synchronous lifetime and service guards; it does not wait for shared
+execution or retain that stack restriction in the accepted task. The independent
+backend job keeps its own bounded pass, close cancellation and registered output
+ownership. Repeated maintenance selection leaves queued/in-flight construction
+with that owner and cannot run a competing synchronous builder. Accepted task
+submission counts as maintenance progress; it is not a durable publication receipt.
+Explicit required value reclamation and engines without the required runtime,
+allocator host or admitted durability capability retain their existing paths.
+
+Idle/WAL selection can submit a forced partial publication window. Transient
+admission refusal retries the same forced cut without requiring another write;
+a successful dispatch returns to ordinary window batching. Configured per-job
+background IO bounds are checked before submission and again against the actual
+captured window. Dispatch accounting is local and never installs shared budget
+state across an unlocked build. Strict denial retains the immutable/WAL debt.
+Queued construction and IO-denied idle cuts advertise a retry delay rather than
+an expired zero-delay hint. Successful completion wakes the internal waker for
+cleanup/next work, including when the last immutable has disappeared.
+
+The DataServer periodic maintenance worker reaches this handoff through the
+existing Source facade and native DB/index/backend maintenance entrypoints; it
+still carries lifetime without CPU admission around remaining guarded legacy
+steps. Backend MaintenanceWaker itself is installed by the separate internal flush
+worker, not directly by DataServer. Native tests exercise selected backend calls,
+real execution queueing, forced partial cuts, independent original lifetime,
+retry/close/reopen, strict IO denial and the real internal waker. Source/worker
+fixture tests and production entrypoint analysis cover the intervening facade and
+DB/index wiring; this is not full compiled-server durability qualification.
+
+Bounded legacy publication, compaction, synchronous foreground maintenance and
+remaining engine paths still need integration. The complete design stays open.

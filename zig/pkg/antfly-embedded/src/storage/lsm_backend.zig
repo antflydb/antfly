@@ -4335,6 +4335,15 @@ pub const Backend = struct {
                 mutable_idle_flush_required or
                 mutable_wal_flush_required or
                 immutable_flush_required;
+            if (!required_gc and self.admittedImmutableFlushRuntime() != null) {
+                if (self.immutable_flush_job_in_flight or self.immutable_flush_build_in_flight) return false;
+                // The DB caller may own replication/snapshot mutation guards.
+                // Transfer construction to the existing durable lane and return
+                // those guards without waiting for its execution admission.
+                // A queued/accepted owner is debt, not permission for this caller
+                // to race it through the unadmitted synchronous builder.
+                return self.submitImmutableFlushJob(force_partial_window);
+            }
             _ = try self.flushImmutableMemtableWindow(force_partial_window);
         } else {
             const soft_l0_runs = self.effectiveL0SoftLimitRuns();
@@ -5952,31 +5961,52 @@ pub const Backend = struct {
         while (try self.flushOldestImmutableMemtable()) {}
     }
 
+    fn admittedImmutableFlushRuntime(self: *Backend) ?*background_runtime_mod.BackendRuntime {
+        if (self.root_dir == null) return null;
+        const storage = self.storage orelse return null;
+        if (storage.vtable.try_prepare_durability_with_admission == null) return null;
+        const runtime = self.background_executor.runtime orelse return null;
+        const manager = self.options.resource_manager orelse return null;
+        if (!self.background_executor.canRunDetached() or runtime.runnableOwner() == null or manager.allocator_host_source == null or self.options.unpublished_outputs == null or (self.options.run_partition_key != null and self.options.run_partition_key_with_admission == null)) return null;
+        return runtime;
+    }
+
     fn scheduleImmutableFlushJob(self: *Backend) void {
-        if (self.activeImmutableMemtableCount() == 0) return;
-        if (self.closing.load(.acquire)) return;
-        // A partial window is already durable in the WAL and query-visible in
-        // the immutable queue. Do not launch a force-draining job for it: the
-        // next append, local pressure, idle deadline, explicit finish, or close
-        // will publish it. This is the batching boundary that lets adjacent
-        // sorted commits share one run build and manifest generation.
-        if (self.immutableFlushWindowCount(false) == 0) return;
         if (self.options.maintenance_waker != null) {
-            self.wakeMaintenanceWorker();
+            if (self.activeImmutableMemtableCount() != 0 and !self.closing.load(.acquire) and self.immutableFlushWindowCount(false) != 0) self.wakeMaintenanceWorker();
             return;
         }
-        if (self.immutable_flush_job_in_flight) return;
-        if (!self.background_executor.canRunDetached()) return;
+        _ = self.submitImmutableFlushJob(false);
+    }
 
+    /// Called under Backend.mu. A maintenance caller may force an idle/WAL
+    /// partial window; ordinary append/successor scheduling keeps batching.
+    /// Submission refusal never falls back to a guarded, unadmitted build.
+    fn submitImmutableFlushJob(self: *Backend, force: bool) bool {
+        if (self.activeImmutableMemtableCount() == 0 or self.closing.load(.acquire)) return false;
+        if (self.immutable_flush_job_in_flight) return false;
+        if (!self.background_executor.canRunDetached()) return false;
+        const count = self.immutableFlushWindowCount(force);
+        if (count == 0 or !self.immutableFlushFitsDispatchIoBudget(count)) return false;
         self.immutable_flush_job_in_flight = true;
-        self.background_executor.submit(.commit_durable, self, runImmutableFlushJob, deinitImmutableFlushJob) catch |err| {
+        self.background_executor.submit(.commit_durable, self, if (force) runForcedImmutableFlushJob else runImmutableFlushJob, deinitImmutableFlushJob) catch |err| {
             self.immutable_flush_job_in_flight = false;
-            if (err == error.BackgroundOwnerClosing or err == error.BackgroundOwnerClosed) return;
-            std.log.warn("lsm immutable flush background scheduling failed root={?s} err={}", .{ self.root_dir, err });
+            if (err != error.BackgroundOwnerClosing and err != error.BackgroundOwnerClosed)
+                std.log.warn("lsm immutable flush background scheduling failed root={?s} err={}", .{ self.root_dir, err });
+            return false;
         };
+        return true;
+    }
+
+    fn runForcedImmutableFlushJob(ptr: *anyopaque) !void {
+        return runImmutableFlushJobWithWindow(ptr, true);
     }
 
     fn runImmutableFlushJob(ptr: *anyopaque) !void {
+        return runImmutableFlushJobWithWindow(ptr, false);
+    }
+
+    fn runImmutableFlushJobWithWindow(ptr: *anyopaque, force: bool) !void {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
@@ -5988,10 +6018,21 @@ pub const Backend = struct {
             // the queue during the unlocked build; it must not extend this
             // same executor job indefinitely. Successor admission is a new
             // queue turn, still owned by the same backend's durable lane.
-            if ((progressed or retry) and !self.closing.load(.acquire)) self.scheduleImmutableFlushJob();
+            if (!self.closing.load(.acquire)) {
+                if (retry) {
+                    // Preserve a forced partial cut across admission refusal,
+                    // including when a waker selected this original dispatch.
+                    _ = self.submitImmutableFlushJob(force);
+                } else if (progressed) self.scheduleImmutableFlushJob();
+                // The selecting waker returned its service guards long ago.
+                // Completion wakes cleanup/next work even after the last
+                // immutable disappears. Terminal errors retain debt for the
+                // selector's retry timer rather than creating an error wake loop.
+                if (progressed or retry) self.wakeMaintenanceWorker();
+            }
         }
         if (self.options.backend.read_only) return;
-        progressed = self.flushImmutableMemtableWindowControlled(false, true, self.background_executor.runtime) catch |err| {
+        progressed = self.flushImmutableMemtableWindowControlled(force, true, self.background_executor.runtime) catch |err| {
             switch (err) {
                 error.Canceled, error.SchedulerClosed => {
                     if (self.closing.load(.acquire)) return;
@@ -6115,15 +6156,36 @@ pub const Backend = struct {
 
     // Only detached durable jobs supply a runtime. Synchronous DB maintenance
     // callers hold outer guards and must never lend execution while holding them.
+    fn immutableFlushDispatchIoBytes(self: *const Backend, count: usize) u64 {
+        var bytes: u64 = 0;
+        for (self.activeImmutableMemtables()[0..count]) |state| bytes +|= estimatedFlushIoBytes(state);
+        return bytes;
+    }
+
+    fn immutableFlushFitsDispatchIoBudget(self: *Backend, count: usize) bool {
+        const budget = self.options.background_io_budget_bytes;
+        if (budget == 0 or self.options.background_io_allow_oversized_single_job) return true;
+        if (self.immutableFlushDispatchIoBytes(count) <= budget) return true;
+        self.background_io_denied_jobs +|= 1;
+        return false;
+    }
+
     fn flushImmutableMemtableWindowControlled(self: *Backend, force: bool, charge_maintenance: bool, execution_runtime: ?*background_runtime_mod.BackendRuntime) !bool {
         const window_count = self.immutableFlushWindowCount(force);
         if (window_count == 0) return false;
         const state = self.immutable_memtables.items[self.immutable_head];
-        var estimated_io_bytes: u64 = 0;
-        for (self.activeImmutableMemtables()[0..window_count]) |window_state| {
-            estimated_io_bytes +|= estimatedFlushIoBytes(window_state);
+        const estimated_io_bytes = self.immutableFlushDispatchIoBytes(window_count);
+        if (charge_maintenance) {
+            if (execution_runtime != null) {
+                // Each dispatch owns one local IO budget. Never leave shared
+                // budget state installed while construction drops Backend.mu.
+                if (!self.immutableFlushFitsDispatchIoBudget(window_count)) return false;
+                if (self.options.background_io_budget_bytes != 0) {
+                    self.background_io_reserved_bytes +|= estimated_io_bytes;
+                    if (estimated_io_bytes > self.options.background_io_budget_bytes) self.background_io_oversized_jobs +|= 1;
+                }
+            } else if (!self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
         }
-        if (charge_maintenance and !self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
         if (self.root_dir != null and self.storage != null) {
             return try self.flushOldestImmutableMemtableUnlockedBuild(window_count, execution_runtime);
         }
@@ -6200,11 +6262,7 @@ pub const Backend = struct {
         var build_err: ?anyerror = null;
         var build_credit: ?resource_manager_mod.Reservation = null;
         defer if (build_credit) |*credit| credit.release();
-        const admitted_runtime = if (execution_runtime) |runtime| blk: {
-            const manager = self.options.resource_manager orelse break :blk null;
-            if (runtime.runnableOwner() == null or manager.allocator_host_source == null or self.options.unpublished_outputs == null or (self.options.run_partition_key != null and self.options.run_partition_key_with_admission == null)) break :blk null;
-            break :blk runtime;
-        } else null;
+        const admitted_runtime = if (execution_runtime != null) self.admittedImmutableFlushRuntime() else null;
         if (admitted_runtime) |runtime| {
             const result = self.buildAdmittedImmutableFlush(runtime, states_newest_first, reserved_run_id_start, reserved_run_id_end) catch |err| blk: {
                 build_err = err;
@@ -10726,6 +10784,15 @@ pub const Backend = struct {
                 const retry = @max(due, if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0);
                 delay_ns = if (delay_ns) |current| @min(current, retry) else retry;
             }
+        }
+        if (delay_ns == 0 and self.activeImmutableMemtableCount() != 0 and self.admittedImmutableFlushRuntime() != null) {
+            // The accepted builder owns this cut. Polling an expired idle hint
+            // cannot make it progress; completion also supplies an explicit wake.
+            if (self.immutable_flush_job_in_flight or self.immutable_flush_build_in_flight) return maintenance_admission_retry_ns;
+            const count = self.immutableFlushWindowCount(true);
+            const budget = self.options.background_io_budget_bytes;
+            if (budget != 0 and !self.options.background_io_allow_oversized_single_job and
+                self.immutableFlushDispatchIoBytes(count) > budget) return maintenance_admission_retry_ns;
         }
         return delay_ns;
     }
