@@ -1270,8 +1270,55 @@ pub const ManifestJournal = struct {
         };
     }
 
-    /// Cold/fenced replacement has the same immutable capture boundary as an
-    /// edit. Never encode all live runs into a temporary frame under the mutex.
+    /// Incremental edits capture immutable roots before off-lock preparation.
+    /// Detached normal callers pin roots under Backend.mu, then admit only the
+    /// off-lock preparation. IO keeps the existing joined append contract.
+    pub fn persistPreparedEdit(self: *@This(), backend: anytype, root: []const u8, owner: *@import("../background_runtime.zig").BackendRuntime) !Result {
+        const Frame = @import("manifest_edit_preparation.zig").Frame;
+        const runtime = @import("runtime.zig");
+        if (backend.run_directory.?.tree.root == backend.manifest_directory.?.tree.root and
+            backend.obsolete_paths.tree.root == self.obsolete.tree.root and backend.next_run_id == self.next_run_id)
+            return .{ .written = 0, .total = self.bytes, .checkpoint = false };
+        const frame = try Frame.create(backend);
+        defer backend.retireManifestPreparation(frame);
+        try frame.capture(backend);
+        const sequence = try std.math.add(u64, self.sequence.?, 1);
+        const next_id = backend.next_run_id;
+        runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+        const prepared = frame.prepare(backend, owner, root, sequence, next_id);
+        _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+        try prepared;
+        if (backend.manifest_recovery_required) return error.RecoveryRequired;
+        if (frame.counts[0] == 0 and frame.counts[1] == 0 and frame.counts[2] == 0 and frame.counts[3] == 0 and next_id == self.next_run_id) {
+            std.mem.swap(ObsoleteLedger, &self.obsolete, &frame.obsolete.?.value);
+            backend.publishManifestDirectory(frame.current.?);
+            frame.current = null;
+            return .{ .written = 0, .total = self.bytes, .checkpoint = false };
+        }
+        const total = try std.math.add(u64, self.bytes, frame.encoded.len);
+        if (total > max_manifest_read_bytes) return error.ManifestEditTooLarge;
+        const started = backend.writeStatsNowNs();
+        runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+        const written = blk: {
+            if (comptime @import("builtin").is_test) if (publication_test_hook) |hook| hook.run(hook.context) catch |cause| break :blk @as(anyerror!?manifest_set.Descriptor, cause);
+            break :blk writePublicationFiles(backend.allocator, backend.storage.?, root, self.active_segment, false, frame.encoded);
+        };
+        _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+        backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(started);
+        _ = written catch |cause| {
+            self.sequence = null; // Only physical append uncertainty invalidates lineage.
+            return cause;
+        };
+        self.sequence = sequence;
+        std.mem.swap(ObsoleteLedger, &self.obsolete, &frame.obsolete.?.value);
+        self.bytes = total;
+        self.edit_bytes +|= frame.encoded.len;
+        self.next_run_id = next_id;
+        backend.publishManifestDirectory(frame.current.?);
+        frame.current = null;
+        return .{ .written = frame.encoded.len, .total = total, .checkpoint = false };
+    }
+
     fn persistCheckpointPinned(self: *@This(), backend: anytype, root: []const u8, current: *const @import("run_directory.zig").Directory) !Result {
         const allocator = backend.allocator;
         const storage = backend.storage.?;

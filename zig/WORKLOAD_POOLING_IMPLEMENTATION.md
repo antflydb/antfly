@@ -29969,11 +29969,37 @@ owners. A native peer commit exercises cached-generation invalidation and
 retirement through admission refusal; existing ownership/accounting fixtures
 still cover every physical buffer.
 
-The bounded-publication milestone remains open: manifest validation, delta
-construction/encoding and physical journal/WAL operations still use their legacy
-implementations and require controlled execution integration. This retry wiring
-establishes durable completion ownership; it does not claim those operators are
-admitted. Existing compaction publication benefits from
-the corrected owned-output reference transfer, but compaction construction and
-remaining metadata operations have not been enabled under shared CPU admission.
-The same publication/compaction milestone and the full design remain open.
+Normal detached flushes now prepare incremental manifest edits under shared
+background execution outside `Backend.mu`. They capture immutable live/durable
+run and obsolete-ledger roots, measure and validate changed entries and their
+neighbors, release CPU before funding exact buffers, then encode and checksum in
+16 KiB chunks under the same bounded deadline. Captured durable roots install
+after the existing joined journal append; concurrent newer roots keep completion
+debt. Preparation refusal preserves journal lineage and retries without another
+SST construction. Opportunistic maintenance and peer reader releases leave this
+accepted debt with its detached owner instead of bypassing admission. Peer writes
+retain WAL durability and can complete while manifest preparation is suspended.
+
+Transient descriptor/frame storage keeps its funding until protected physical
+cleanup completes, including refusal, queued retry, and quiesced close. Cleanup
+removes a frame from the intrusive queue before dropping the mutex so concurrent
+publications cannot be lost. Normal native tests exercise a warm second flush,
+preparation/cleanup refusal, peer commit during captured preparation, unchanged
+checkpoint cadence, reopen recovery, and controlled close with queued frames.
+A separate deterministic codec oracle compares exact edit/checkpoint bytes with
+the legacy encoder and injects rejection at every checkpoint, including long
+field copies and both checksums. Private native/owner ABI versions are 157/217;
+public wire and durable formats are unchanged.
+
+Focused Debug qualification is recorded in
+[`manifest-preparation-v7-debug.json`](qualification/workload-pooling/receipts/2026-10-10/child-outbox-capture-retirement-cumulative-integration/manifest-preparation-v7-debug.json):
+34 native publication cases, the local owner check, 12 maintenance dispatch cases,
+and semantic compilation of the actual C API/provider paths pass. The codec
+oracle is deterministic fixture evidence; warm flush/retry, concurrent commit,
+crash/reopen and queued close cases use the native backend and actual shared
+scheduler. This is not full DB/server or cross-engine overload qualification.
+
+The bounded-publication milestone remains open for cold/replacement checkpoints,
+physical journal/WAL operations, and compaction construction/remaining metadata
+operations. Those paths retain their legacy implementation and are not claimed
+as admitted by the incremental-flush evidence. The full design remains open.

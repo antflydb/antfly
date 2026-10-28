@@ -141,7 +141,7 @@ const builtin = @import("builtin");
 // Maintenance rounds carry bounded-selection continuation state.
 // Detached flush executors retain runtime access; writer records own legacy output tickets.
 // Normal flush publication retains controlled edit cursors and pass deadlines.
-pub const abi_version: u32 = 156;
+pub const abi_version: u32 = 157;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

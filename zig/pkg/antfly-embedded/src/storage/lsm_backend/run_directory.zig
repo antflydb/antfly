@@ -1928,6 +1928,8 @@ pub const Directory = struct {
         stack: [2 * @bitSizeOf(usize)]*Tree.Node = undefined,
         len: usize = 0,
         phase: enum { removed, added, done } = .removed,
+        pending: ?*Tree.Node = null,
+        search: ?ReadSearch = null,
 
         pub fn init(previous: *const Directory, current: *const Directory) ChangeCursor {
             var cursor = ChangeCursor{ .previous = previous.tree.root, .current = current.tree.root };
@@ -1944,18 +1946,29 @@ pub const Directory = struct {
             return self.phase == .done;
         }
         pub fn next(self: *ChangeCursor, credits: *usize) ?Change {
-            while (credits.* != 0 and !self.done()) {
-                if (self.len == 0) {
+            return self.nextWithAdmission(credits, null) catch unreachable;
+        }
+        pub fn nextWithAdmission(self: *ChangeCursor, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !?Change {
+            while ((credits.* != 0 or self.pending != null) and !self.done()) {
+                if (original) |port| try port.checkpoint();
+                if (self.pending == null and self.len == 0) {
                     if (self.phase == .removed) {
                         self.phase = .added;
                         self.push(self.current);
                     } else self.phase = .done;
                     continue;
                 }
-                credits.* -= 1;
-                self.len -= 1;
-                const node = self.stack[self.len];
-                const matched = find(if (self.phase == .removed) self.current else self.previous, node.entry);
+                if (self.pending == null) {
+                    credits.* -= 1;
+                    self.len -= 1;
+                    self.pending = self.stack[self.len];
+                    self.search = ReadSearch.init(if (self.phase == .removed) self.current else self.previous, self.pending.?.entry);
+                }
+                try self.search.?.resumeWithAdmission(original);
+                const node = self.pending.?;
+                const matched = self.search.?.matched;
+                self.pending = null;
+                self.search = null;
                 if (matched == node) continue;
                 self.push(node.right);
                 self.push(node.left);

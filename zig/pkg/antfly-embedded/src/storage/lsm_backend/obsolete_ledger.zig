@@ -171,6 +171,9 @@ pub const Ledger = struct {
         stack: [2 * @bitSizeOf(usize)]*Tree.Node = undefined,
         len: usize = 0,
         phase: enum { removed, added, done } = .removed,
+        pending: ?*Tree.Node = null,
+        searching: ?*Tree.Node = null,
+        comparison: ?@import("run_comparison.zig").Cursor = null,
         pub fn init(previous: *const Ledger, current: *const Ledger) ChangeCursor {
             var out = ChangeCursor{ .previous = previous.tree.root, .current = current.tree.root };
             out.push(previous.tree.root);
@@ -186,24 +189,44 @@ pub const Ledger = struct {
             return self.phase == .done;
         }
         pub fn next(self: *ChangeCursor, credits: *usize) ?Change {
-            while (credits.* != 0 and !self.done()) {
-                if (self.len == 0) {
+            return self.nextWithAdmission(credits, null) catch unreachable;
+        }
+        pub fn nextWithAdmission(self: *ChangeCursor, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !?Change {
+            while ((credits.* != 0 or self.pending != null) and !self.done()) {
+                if (original) |port| try port.checkpoint();
+                if (self.pending == null and self.len == 0) {
                     if (self.phase == .removed) {
                         self.phase = .added;
                         self.push(self.current);
                     } else self.phase = .done;
                     continue;
                 }
-                credits.* -= 1;
-                self.len -= 1;
-                const node = self.stack[self.len];
-                const matched = Tree.find(if (self.phase == .removed) self.current else self.previous, node.entry);
+                if (self.pending == null) {
+                    credits.* -= 1;
+                    self.len -= 1;
+                    self.pending = self.stack[self.len];
+                    self.searching = if (self.phase == .removed) self.current else self.previous;
+                }
+                while (self.searching) |probe| {
+                    if (self.comparison == null) self.comparison = @import("run_comparison.zig").Cursor.bound(null, self.pending.?.entry.path, null, probe.entry.path);
+                    const order = try self.comparison.?.resumeWithAdmission(original);
+                    self.comparison = null;
+                    switch (order) {
+                        .lt => self.searching = probe.left,
+                        .gt => self.searching = probe.right,
+                        .eq => break,
+                    }
+                }
+                const node = self.pending.?;
+                const matched = self.searching;
+                self.pending = null;
+                self.searching = null;
                 if (matched == node) continue;
                 self.push(node.right);
                 self.push(node.left);
                 if (self.phase == .removed) {
                     if (matched == null) return .{ .kind = .remove, .path = node.entry.value() };
-                } else if (matched == null or !Entry.eql(matched.?.entry, node.entry)) return .{ .kind = .put, .path = node.entry.value() };
+                } else if (matched == null or matched.?.entry.deadline != node.entry.deadline) return .{ .kind = .put, .path = node.entry.value() };
             }
             return null;
         }

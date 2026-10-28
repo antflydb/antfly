@@ -1794,6 +1794,8 @@ pub const Backend = struct {
     run_directory_generation: u64 = 0,
     retired_run_directories: ?*RunDirectory = null,
     retired_run_stores: ?*RunStore = null,
+    retired_manifest_preparations: ?*@import("lsm_backend/manifest_edit_preparation.zig").Frame = null,
+    manifest_preparation_reclaim_in_flight: bool = false,
     retired_flush_outputs: ?*@import("lsm_backend/registered_flush_outputs.zig").Owner = null,
     flush_outputs_reclaim_in_flight: bool = false,
     flush_completion_pending: bool = false,
@@ -2759,7 +2761,7 @@ pub const Backend = struct {
     /// ledger roots and durable finalization obligations remain backend-owned.
     /// The original finite execution is borrowed on each call, never retained.
     pub const QuiescedClosePreparation = struct {
-        phase: enum { observe, outputs, memtables, metadata, ledgers, reconcile, done } = .observe,
+        phase: enum { observe, manifest_preparations, outputs, memtables, metadata, ledgers, reconcile, done } = .observe,
         before: QuiescedClosePreflight = .{},
         after: QuiescedClosePreflight = .{},
 
@@ -2773,12 +2775,16 @@ pub const Backend = struct {
                         // Establish the full retained charge before destroying
                         // anything, including cold legacy snapshot accounting.
                         try self.before.resumeWithAdmission(backend, io, original);
-                        if (backend.retired_flush_outputs == null and backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null and !@import("lsm_backend/read_metadata_reclamation.zig").pending(backend)) {
+                        if (backend.retired_manifest_preparations == null and backend.retired_flush_outputs == null and backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null and !@import("lsm_backend/read_metadata_reclamation.zig").pending(backend)) {
                             // No physical ownership changed. Reuse the first
                             // observation instead of scanning live state twice.
                             self.after = self.before;
                             self.phase = .done;
-                        } else self.phase = .outputs;
+                        } else self.phase = .manifest_preparations;
+                    },
+                    .manifest_preparations => {
+                        var credits: usize = 64;
+                        if (try backend.reclaimManifestPreparationQuiescedStep(&credits, original)) self.phase = .outputs;
                     },
                     .outputs => {
                         var credits: usize = 64;
@@ -3889,6 +3895,7 @@ pub const Backend = struct {
         if (self.pending_gc != null or self.retired_gc != null or self.directory_reclaimer != null or self.retired_run_directories != null) score +|= 1;
         if (self.retired_run_stores != null or self.store_reclaimer != null) score +|= 1;
         if (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) score +|= 1;
+        if (self.retired_manifest_preparations != null and !self.manifest_preparation_reclaim_in_flight) score +|= 1;
         if (self.flush_completion_pending and !self.manifest_recovery_required) score +|= 1;
         if (self.obsolete_run_count != 0 and (self.obsolete_run_drain_remaining != 0 or self.obsolete_run_pin_epoch != file_pin_release_epoch.load(.acquire))) score +|= 1;
         if (self.manifest_journal.checkpointDue() and self.manifest_journal.sequence != null) score += 1;
@@ -4271,7 +4278,12 @@ pub const Backend = struct {
         if (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null)) return true;
         if (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) return true;
         if (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) return true;
+        if (self.retired_manifest_preparations != null and !self.manifest_preparation_reclaim_in_flight) return true;
         if (self.manifest_recovery_required) return false;
+        // An accepted detached flush owns its completion lane, including while
+        // its producer backs off after refusal. Opportunistic maintenance must
+        // not publish the same debt through the synchronous legacy path.
+        if (!required_gc and self.flush_completion_pending and self.admittedImmutableFlushRuntime() != null) return false;
         const reclaim_visits_before = self.obsolete_reclaim_visits;
         const planning_slices_before = self.directory_planning_slices;
         if (self.options.backend.read_only) return false;
@@ -4936,6 +4948,7 @@ pub const Backend = struct {
         if (self.flushCompletionPending() or (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
             @import("lsm_backend/memtable_reclamation.zig").pending(self) or
             @import("lsm_backend/read_metadata_reclamation.zig").pending(self) or
+            (self.retired_manifest_preparations != null and !self.manifest_preparation_reclaim_in_flight) or
             (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) or
             (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) or
             (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null))) self.scheduleMaintenanceJobLocked(true);
@@ -4971,6 +4984,53 @@ pub const Backend = struct {
             if (!result.done) break;
         }
         self.syncTrackedInMemoryStateUsageCurrentLocked();
+    }
+
+    pub fn retireManifestPreparation(self: *Backend, frame: *@import("lsm_backend/manifest_edit_preparation.zig").Frame) void {
+        frame.detachLocked(self);
+        frame.next = self.retired_manifest_preparations;
+        self.retired_manifest_preparations = frame;
+        self.cached_maintenance_hint.store(1, .release);
+    }
+
+    fn reclaimManifestPreparationSliceLocked(self: *Backend) void {
+        if (self.manifest_preparation_reclaim_in_flight or self.retired_manifest_preparations == null or platform_time.monotonicNs() < self.retirement_execution_retry_at_ns) return;
+        self.manifest_preparation_reclaim_in_flight = true;
+        self.retainReaderKind(.other);
+        defer self.releaseReaderKind(.other);
+        defer self.manifest_preparation_reclaim_in_flight = false;
+        var credits: usize = 2048;
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits > 1 and runtime_mod.workNowNs(self) < deadline) {
+            const frame = self.retired_manifest_preparations orelse break;
+            // New publications can enqueue while cleanup runs off-lock.
+            self.retired_manifest_preparations = frame.next;
+            credits -= 1;
+            self.mu.unlock();
+            const result = @import("lsm_backend/retirement_execution.zig").step(self, frame, credits, deadline);
+            _ = runtime_mod.lockBackend(Backend, self);
+            credits -= result.units;
+            if (result.refused) self.retirement_execution_retry_at_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_ms;
+            if (!result.done) {
+                frame.next = self.retired_manifest_preparations;
+                self.retired_manifest_preparations = frame;
+                break;
+            }
+            frame.finish(self.allocator);
+        }
+    }
+
+    pub fn reclaimManifestPreparationQuiescedStep(self: *Backend, credits: *usize, original: ?read_admission.Port) !bool {
+        std.debug.assert(self.active_readers == 0 and !self.manifest_preparation_reclaim_in_flight);
+        while (credits.* != 0) {
+            const frame = self.retired_manifest_preparations orelse return true;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            if (!try frame.stepWithAdmission(self.allocator, credits, original)) return false;
+            self.retired_manifest_preparations = frame.next;
+            frame.finish(self.allocator);
+        }
+        return self.retired_manifest_preparations == null;
     }
 
     pub fn reclaimFlushOutputsQuiescedStep(self: *Backend, credits: *usize, original: ?read_admission.Port) !bool {
@@ -6147,7 +6207,7 @@ pub const Backend = struct {
         const pending_metadata = @import("lsm_backend/read_metadata_reclamation.zig").pending(self);
         const pending_directory = !self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null);
         const pending_store = !self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null);
-        const pending_outputs = self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight;
+        const pending_outputs = (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) or (self.retired_manifest_preparations != null and !self.manifest_preparation_reclaim_in_flight);
         const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory or pending_metadata or pending_directory or pending_store or pending_outputs or self.flushCompletionPending());
         if (self.options.backend.read_only and !ledger_cleanup) return;
         if (self.bulkIngestActive() and !ledger_cleanup and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
@@ -6201,6 +6261,7 @@ pub const Backend = struct {
             // guards. Foreground unlocks only enqueue controlled retirement.
             _ = runtime_mod.lockBackend(Backend, self);
             @import("lsm_backend/ledger_reclamation.zig").reclaimControlledSliceLocked(self);
+            self.reclaimManifestPreparationSliceLocked();
             self.reclaimFlushOutputsSliceLocked(true);
             if (@import("lsm_backend/retirement_execution.zig").deferred(self)) {
                 @import("lsm_backend/memtable_reclamation.zig").reclaimControlledSliceLocked(self);
@@ -6210,7 +6271,7 @@ pub const Backend = struct {
             self.reclaimDirectorySliceLocked(true);
             if (self.flushCompletionPending()) {
                 const delay = self.flush_completion_retry_at_ns -| platform_time.monotonicNs();
-                if (delay == 0) self.persistManifestLocked() catch {
+                if (delay == 0) self.persistManifestWithExecutionLocked(self.admittedImmutableFlushRuntime()) catch {
                     // Keep installed SSTs/WAL debt owned. Failed completion is
                     // retried by this durable lane, never by rebuilding an empty
                     // immutable window or requiring another foreground write.
@@ -6490,7 +6551,7 @@ pub const Backend = struct {
             try self.maybeCompactRuns();
         }
         if (self.root_dir != null) {
-            try self.persistManifestLocked();
+            try self.persistManifestWithExecutionLocked(admitted_runtime);
         }
         return true;
     }
@@ -6857,6 +6918,10 @@ pub const Backend = struct {
 
     /// Caller owns the backend mutex; publication may temporarily release it.
     pub fn persistManifestLocked(self: *Backend) !void {
+        return self.persistManifestWithExecutionLocked(null);
+    }
+
+    fn persistManifestWithExecutionLocked(self: *Backend, execution_runtime: ?*background_runtime_mod.BackendRuntime) !void {
         if (self.registered_publication.seal != null or self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         const root_dir = self.root_dir orelse return;
         // A flush may have already installed its SSTs and retired the mutable
@@ -6869,12 +6934,12 @@ pub const Backend = struct {
         const clean_publish = !self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths;
         if (clean_publish and self.durableManifestHasNewerRunIdLocked(root_dir)) return;
 
-        try self.writeManifestSnapshotLocked(root_dir, start_ns);
+        try self.writeManifestSnapshotWithExecutionLocked(root_dir, start_ns, execution_runtime);
 
         if (reclaimable_obsolete_paths) {
             try self.reconcileObsoletePathsForManifest();
             const removed_or_retried = self.obsolete_manifest_dirty;
-            if (removed_or_retried) try self.writeManifestSnapshotLocked(root_dir, start_ns);
+            if (removed_or_retried) try self.writeManifestSnapshotWithExecutionLocked(root_dir, start_ns, execution_runtime);
         }
         if (self.flush_completion_pending and self.manifestCoversCurrentRuns()) {
             self.flush_completion_pending = false;
@@ -6916,7 +6981,15 @@ pub const Backend = struct {
     }
 
     fn writeManifestSnapshotLocked(self: *Backend, root_dir: []const u8, start_ns: u64) !void {
-        _ = try self.writeRunSetManifestSnapshotLocked(root_dir, &.{}, start_ns, true);
+        return self.writeManifestSnapshotWithExecutionLocked(root_dir, start_ns, null);
+    }
+
+    fn writeManifestSnapshotWithExecutionLocked(self: *Backend, root_dir: []const u8, start_ns: u64, execution_runtime: ?*background_runtime_mod.BackendRuntime) !void {
+        {
+            var turn = try self.beginManifestTurn();
+            defer turn.deinit();
+            _ = try self.writeRunSetManifestSnapshotInTurnWithExecutionLocked(root_dir, &.{}, start_ns, true, turn.waited, execution_runtime);
+        }
         try self.maybeCheckpointWalAfterManifestPublish();
         self.manifest_dirty = !self.manifestCoversCurrentRuns();
         self.obsolete_manifest_dirty = self.obsolete_paths.tree.root != self.manifest_journal.obsolete.tree.root;
@@ -7299,6 +7372,10 @@ pub const Backend = struct {
     /// Caller owns the publication lane and backend lock. Administrative callers
     /// acquire that lane before constructing their prospective ownership graph.
     fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !u64 {
+        return self.writeRunSetManifestSnapshotInTurnWithExecutionLocked(root_dir, runs, start_ns, live, waited, null);
+    }
+
+    fn writeRunSetManifestSnapshotInTurnWithExecutionLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool, execution_runtime: ?*background_runtime_mod.BackendRuntime) !u64 {
         std.debug.assert(self.manifest_publish_in_flight);
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         self.manifest_publish_allow_concurrency = live;
@@ -7306,7 +7383,11 @@ pub const Backend = struct {
         // writer-array address that could have changed while waiting.
         const current_runs = if (live) &.{} else runs;
         const covered_logical_bytes = self.unpublished_wal_logical_bytes;
-        if (!self.run_directory_dirty and self.run_directory != null and self.manifest_directory != null and live) {
+        const prepared_edit = execution_runtime != null and self.options.resource_manager != null and live and !self.run_directory_dirty and self.run_directory != null and self.manifest_directory != null and self.manifest_journal.sequence != null and self.manifest_journal.descriptor != null;
+        if (prepared_edit) {
+            // Captured changes and their neighbors are validated off-lock by
+            // the same controlled preparation that encodes their journal edit.
+        } else if (!self.run_directory_dirty and self.run_directory != null and self.manifest_directory != null and live) {
             try self.run_directory.?.validateChangesSince(self.manifest_directory.?, validateRunLayoutForManifest);
         } else if (live) {
             var prior: ?Run = null;
@@ -7320,7 +7401,13 @@ pub const Backend = struct {
         // obsolete-path cleanup would force another checkpoint, generating
         // new obsolete files indefinitely instead of settling to zero debt.
         if (live) try self.ensureRunDirectory();
-        const persisted = try self.manifest_journal.persist(self, root_dir, current_runs);
+        const persisted = if (prepared_edit)
+            self.manifest_journal.persistPreparedEdit(self, root_dir, execution_runtime.?) catch |cause| {
+                if (cause == error.ManifestEditTooLarge) self.manifest_journal.sequence = null;
+                return cause;
+            }
+        else
+            try self.manifest_journal.persist(self, root_dir, current_runs);
         const bytes = persisted.written;
         if (waited and bytes == 0) self.write_stats.manifest_publication_coalesced +|= 1;
         self.write_stats.manifest_writes += @intFromBool(bytes != 0);
@@ -7811,6 +7898,10 @@ pub const Backend = struct {
     pub fn destroyRunMetadata(self: *Backend) void {
         // Background work and readers have joined. Return each vector's
         // prearranged owner even when close cancelled its last cleanup pass.
+        while (self.retired_manifest_preparations != null) {
+            var credits: usize = 2048;
+            _ = self.reclaimManifestPreparationQuiescedStep(&credits, null) catch unreachable;
+        }
         while (self.retired_flush_outputs != null) {
             var credits: usize = 2048;
             _ = self.reclaimFlushOutputsQuiescedStep(&credits, null) catch unreachable;
@@ -9691,6 +9782,10 @@ pub const Backend = struct {
 
     pub fn finalizeWriteReaderReleaseKind(self: *Backend, kind: ReaderPinKind) !void {
         self.releaseReaderKind(kind);
+        // WAL publication already establishes commit durability. Accepted SST
+        // completion belongs to the detached owner; a peer's reader release
+        // must neither wait on its manifest lane nor bypass CPU admission.
+        if (self.flush_completion_pending and self.admittedImmutableFlushRuntime() != null) return;
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
         if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.bulkIngestActive() or
@@ -9709,6 +9804,7 @@ pub const Backend = struct {
         // lane drops the backend mutex. Do not recursively enter that lane;
         // the publisher retains and subsequently settles this metadata debt.
         if (self.manifest_publish_in_flight) return;
+        if (self.flush_completion_pending and self.admittedImmutableFlushRuntime() != null) return;
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
         if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.bulkIngestActive() or
@@ -10877,6 +10973,7 @@ pub const Backend = struct {
         if (!self.mu.tryLock()) return null;
         defer self.mu.unlock();
         if ((self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
+            (self.retired_manifest_preparations != null and !self.manifest_preparation_reclaim_in_flight) or
             (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) or
             (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) or
             (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null)))

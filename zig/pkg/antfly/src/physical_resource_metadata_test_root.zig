@@ -5954,7 +5954,7 @@ test "physical cache metadata bounded writer retirement refuses unknown producer
     try std.testing.expectEqual(@as(usize, 1), Callback.called);
 }
 
-fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry, retirement_retry, retirement_capacity, publication_directory_retry, output_retirement_retry, output_retirement_close, immutable_retirement_retry, immutable_retirement_close, output_retirement_preflight, manifest_completion_retry, manifest_completion_io_retry, manifest_completion_waker, read_metadata_retry, manifest_completion_fence }) !void {
+fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry, retirement_retry, retirement_capacity, publication_directory_retry, output_retirement_retry, output_retirement_close, immutable_retirement_retry, immutable_retirement_close, output_retirement_preflight, manifest_completion_retry, manifest_completion_io_retry, manifest_completion_waker, read_metadata_retry, manifest_completion_fence, manifest_preparation_retry, manifest_preparation_interleave, manifest_preparation_close }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -5966,6 +5966,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     const maintenance_origin = mode == .maintenance or mode == .maintenance_retry or mode == .maintenance_close or mode == .waker or mode == .maintenance_budget or mode == .maintenance_unsupported;
     const rebase_publication = mode == .publication_rebase or mode == .publication_rebase_retry;
     const completion_retry = mode == .manifest_completion_retry or mode == .manifest_completion_io_retry or mode == .manifest_completion_waker;
+    const preparing_manifest = mode == .manifest_preparation_retry or mode == .manifest_preparation_interleave or mode == .manifest_preparation_close;
     const retry_refusal = mode == .retry or mode == .maintenance_retry;
     var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
     defer state.owner.deinit();
@@ -6040,6 +6041,39 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         var manifest_calls: std.atomic.Value(usize) = .init(0);
         var manifest_failure: anyerror = error.ResourceBudgetExceeded;
         var fence_manifest: bool = false;
+        var preparation_calls: std.atomic.Value(usize) = .init(0);
+        var preparation_backend: ?*lsm.Backend = null;
+        var preparation_interleave: bool = false;
+        var preparation_refuse: bool = false;
+        var frame_calls: std.atomic.Value(usize) = .init(0);
+        var refuse_frame: std.atomic.Value(bool) = .init(false);
+        var keep_frame_queued: bool = false;
+        fn frameRetirement(original: read_admission.Port) !void {
+            _ = frame_calls.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.?.owner.scheduler.stats().cleanup_runnable_slots);
+            if (keep_frame_queued or refuse_frame.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+        }
+        fn preparation(original: read_admission.Port) !void {
+            const call = preparation_calls.fetchAdd(1, .monotonic);
+            try original.checkpoint();
+            const stats = execution.?.owner.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots - stats.control_slots);
+            const backend = preparation_backend.?;
+            while (!backend.mu.tryLock()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            const valid = backend.manifest_journal.sequence != null;
+            backend.mu.unlock();
+            try std.testing.expect(valid);
+            if (call == 0 and preparation_interleave) {
+                const wait = (try original.executionWait()).?;
+                try wait.beginWait();
+                ready.set(std.testing.io);
+                const waited = go.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+                try wait.endWait();
+                try waited;
+            }
+            if (call == 0 and preparation_refuse) return error.ResourceBudgetExceeded;
+        }
         var metadata_calls: std.atomic.Value(usize) = .init(0);
         var refuse_metadata: std.atomic.Value(bool) = .init(false);
         fn manifest(raw: *anyopaque) !void {
@@ -6173,6 +6207,8 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         publication.memtable_reclamation.Job.test_admission_hook = null;
         lsm.repository.publication_test_hook = null;
         publication.read_metadata_reclamation.Job.test_admission_hook = null;
+        publication.manifest_edit_preparation.test_hook = null;
+        publication.manifest_edit_preparation.test_retirement_hook = null;
         Interleave.execution = null;
     }
     const io = std.testing.io;
@@ -6342,7 +6378,21 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             try std.testing.expect(completed.wal_resets >= 1);
             try std.testing.expect(handle.ptr().wal_retention.reset_proven);
         }
-        if (mode == .read_metadata_retry) {
+        if (mode == .read_metadata_retry or preparing_manifest) {
+            const before = handle.ptr().snapshotWriteStats();
+            if (preparing_manifest) {
+                Interleave.preparation_refuse = mode == .manifest_preparation_retry;
+                Interleave.preparation_interleave = mode == .manifest_preparation_interleave;
+                Interleave.ready = .unset;
+                Interleave.go = .unset;
+                Interleave.frame_calls.store(0, .release);
+                Interleave.refuse_frame.store(mode == .manifest_preparation_retry, .release);
+                Interleave.keep_frame_queued = mode == .manifest_preparation_close;
+                publication.manifest_edit_preparation.test_retirement_hook = Interleave.frameRetirement;
+                Interleave.preparation_calls.store(0, .release);
+                Interleave.preparation_backend = handle.ptr();
+                publication.manifest_edit_preparation.test_hook = Interleave.preparation;
+            }
             var cached = try handle.ptr().beginRead();
             try std.testing.expectEqualStrings("durable", try cached.get(.{}, "admitted"));
             cached.abort();
@@ -6351,18 +6401,44 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             defer peer.abort();
             try peer.put(.{}, "second", "metadata");
             try peer.commit();
+            if (mode == .manifest_preparation_interleave) {
+                try Interleave.ready.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+                var concurrent = try handle.ptr().beginWrite();
+                defer concurrent.abort();
+                try concurrent.put(.{}, "third", "concurrent");
+                try concurrent.commit();
+                Interleave.go.set(io);
+            }
             while (true) {
                 const backend = handle.ptr();
                 while (!backend.mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+                const cleanup_ready = if (mode == .manifest_preparation_close)
+                    backend.retired_manifest_preparations != null and Interleave.frame_calls.load(.acquire) != 0
+                else
+                    !backend.maintenance_job_in_flight and backend.retired_projection_versions == null and backend.retired_domain_indexes == null and
+                        backend.read_metadata_reclaimer == null and !backend.read_metadata_reclaim_in_flight and
+                        backend.retired_manifest_preparations == null and !backend.manifest_preparation_reclaim_in_flight;
                 const done = backend.activeImmutableMemtableCount() == 0 and !backend.immutable_flush_job_in_flight and
-                    !backend.maintenance_job_in_flight and !backend.flush_completion_pending and
-                    backend.retired_projection_versions == null and backend.retired_domain_indexes == null and
-                    backend.read_metadata_reclaimer == null and !backend.read_metadata_reclaim_in_flight and
-                    Interleave.metadata_calls.load(.acquire) >= 2;
+                    !backend.flush_completion_pending and cleanup_ready and
+                    (if (preparing_manifest) Interleave.preparation_calls.load(.acquire) >= (if (mode == .manifest_preparation_close) @as(usize, 1) else 2) else Interleave.metadata_calls.load(.acquire) >= 2);
                 backend.mu.unlock();
                 if (done) break;
-                if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+                if (platform.time.monotonicNs() >= deadline) {
+                    while (!backend.mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+                    defer backend.mu.unlock();
+                    std.debug.print("warm manifest timeout: preparations={d}, immutable={d}, flush_job={}, maintenance={}, completion={}, frames={}, frame_cleanup={}, sequence={any}, directory_dirty={}, directory={}, durable={}\n", .{ Interleave.preparation_calls.load(.acquire), backend.activeImmutableMemtableCount(), backend.immutable_flush_job_in_flight, backend.maintenance_job_in_flight, backend.flush_completion_pending, backend.retired_manifest_preparations != null, backend.manifest_preparation_reclaim_in_flight, backend.manifest_journal.sequence, backend.run_directory_dirty, backend.run_directory != null, backend.manifest_directory != null });
+                    return error.TestUnexpectedResult;
+                }
                 try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            if (preparing_manifest) {
+                const after = handle.ptr().snapshotWriteStats();
+                try std.testing.expectEqual(before.manifest_checkpoints, after.manifest_checkpoints);
+                try std.testing.expect(after.manifest_edits > before.manifest_edits);
+                const added: u64 = if (mode == .manifest_preparation_interleave) 2 else 1;
+                try std.testing.expectEqual(before.immutable_flushes + added, after.immutable_flushes);
+                try std.testing.expectEqual(before.flushes + added, after.flushes);
+                if (mode == .manifest_preparation_retry) try std.testing.expect(Interleave.frame_calls.load(.acquire) >= 2);
             }
         }
         try std.testing.expect(state.owner.scheduler.stats().grants[@backingInt(scheduler.Class.background)] > 0);
@@ -6404,7 +6480,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             try std.testing.expect(waker_stats.wakeups >= 2);
             try std.testing.expect(waker_stats.maintenance_steps > 0);
         }
-        if (mode == .output_retirement_preflight) {
+        if (mode == .output_retirement_preflight or mode == .manifest_preparation_close) {
             const backend = handle.ptr();
             backend.closing.store(true, .release);
             backend.background_executor.drain();
@@ -6413,6 +6489,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             backend.invalidateMutableReadSnapshot();
             backend.mu.unlock();
             Interleave.keep_vector_queued = false; // Every producer has joined.
+            Interleave.keep_frame_queued = false;
             var pass = try local.common_background_execution.Pass.initWithOptions(owner, &io, platform.time.monotonicNs() +| 200 * std.time.ns_per_ms, .{}, .{ .allow_wait = false, .cleanup = true });
             defer pass.deinit();
             var scope = try pass.admissionScope(io);
@@ -6420,12 +6497,17 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             var preparation: lsm.Backend.QuiescedClosePreparation = .{};
             try preparation.resumeWithAdmission(backend, io, .init(&payload));
             try std.testing.expect(backend.retired_flush_outputs == null);
+            try std.testing.expect(backend.retired_manifest_preparations == null);
         }
         if (mode == .manifest_completion_fence) {
             try std.testing.expectEqual(@as(usize, 1), Interleave.manifest_calls.load(.acquire));
             try std.testing.expect(!handle.ptr().wal_retention.reset_proven);
             // Recovery authority excludes publication retries. Simulate a crash
             // rather than invoking explicit close-time durability repair.
+            handle.abandonAfterCrash();
+        } else if (mode == .manifest_preparation_retry or mode == .manifest_preparation_interleave) {
+            // Reopen must observe the accepted journal without close repairing
+            // or checkpointing a missed publication.
             handle.abandonAfterCrash();
         } else handle.close();
         open = false;
@@ -6442,6 +6524,8 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     var read = try reopened.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings(if (mode == .publication_interleave or rebase_publication) "newer" else "durable", try read.get(.{}, "admitted"));
+    if (preparing_manifest) try std.testing.expectEqualStrings("metadata", try read.get(.{}, "second"));
+    if (mode == .manifest_preparation_interleave) try std.testing.expectEqualStrings("concurrent", try read.get(.{}, "third"));
 }
 
 test "physical cache metadata registered flush publication normal worker waits for shared execution then persists and reopens" {
@@ -6616,4 +6700,63 @@ test "memtable reclamation execution rejects original once and resumes physical 
         try std.testing.expect(cleanup.calls > 1);
         try std.testing.expectEqual(@as(usize, 0), exhausted.alloc_index);
     }
+}
+
+test "physical cache metadata registered flush publication warm journal preparation refuses and retries without rebuilding SST" {
+    try normalAdmittedFlushWorker(.manifest_preparation_retry);
+}
+
+test "physical cache metadata registered flush publication controlled journal codec preserves exact wire and rejects at every checkpoint" {
+    const codec = @import("antfly_local_sources").storage_lsm_backend_compaction_publication.manifest_edit_preparation.manifest;
+    const a = std.testing.allocator;
+    const long = try a.alloc(u8, 48 * 1024 + 17);
+    defer a.free(long);
+    @memset(long, 'x');
+    const value: codec.Manifest = .{ .next_run_id = 91, .runs = &.{.{
+        .id = 90,
+        .visibility_id = 87,
+        .level = 2,
+        .size_bytes = 991,
+        .path = "runs/90.tbl",
+        .smallest_namespace_name = "docs",
+        .smallest_key = long,
+        .largest_namespace_name = "docs",
+        .largest_key = long,
+        .entry_count = 9,
+        .tombstone_count = 3,
+        .oldest_tombstone_unix_ns = 123,
+        .gc_requested = true,
+    }}, .obsolete_paths = &.{.{ .path = long, .delete_after_ns = 345 }} };
+    for ([_]bool{ false, true }) |checkpoint| {
+        const removed: []const u64 = if (checkpoint) &.{} else &.{ 3, 9 };
+        const paths: []const []const u8 = if (checkpoint) &.{} else &.{ "old.tbl", long };
+        const expected = try codec.encodeJournalFrameAlloc(a, 17, checkpoint, removed, paths, value);
+        defer a.free(expected);
+        var control: RegisteredOutputFixture.Control = .{ .live = true };
+        const payload = control.payload();
+        const port = read_admission.Port.init(&payload);
+        const encoded = try a.alloc(u8, try codec.journalFrameLenWithAdmission(checkpoint, removed, paths, value, port));
+        defer a.free(encoded);
+        control.calls = 0;
+        try codec.encodeJournalFrameIntoWithAdmission(encoded, 17, checkpoint, removed, paths, value, port);
+        try std.testing.expectEqualSlices(u8, expected, encoded);
+        const checks = control.calls;
+        // Includes rejection during long-field copy and both CRC passes.
+        for (0..checks) |at| {
+            control.calls = 0;
+            control.target = at;
+            try std.testing.expectError(error.Canceled, codec.encodeJournalFrameIntoWithAdmission(encoded, 17, checkpoint, removed, paths, value, port));
+        }
+        control.target = null;
+        try codec.encodeJournalFrameIntoWithAdmission(encoded, 17, checkpoint, removed, paths, value, port);
+        try std.testing.expectEqualSlices(u8, expected, encoded);
+    }
+}
+
+test "physical cache metadata registered flush publication captured manifest roots preserve concurrent peer commit" {
+    try normalAdmittedFlushWorker(.manifest_preparation_interleave);
+}
+
+test "physical cache metadata registered flush publication controlled close drains refused manifest frame cleanup" {
+    try normalAdmittedFlushWorker(.manifest_preparation_close);
 }

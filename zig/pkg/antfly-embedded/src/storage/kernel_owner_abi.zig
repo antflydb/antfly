@@ -82,7 +82,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Maintenance rounds carry bounded-selection continuation state.
 // Detached flush executors retain runtime access; writer records own legacy output tickets.
 // Normal flush publication retains controlled edit cursors and pass deadlines.
-pub const abi_version: u32 = 216;
+pub const abi_version: u32 = 217;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
