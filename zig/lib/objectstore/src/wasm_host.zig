@@ -33,6 +33,14 @@ pub const Host = struct {
         return .{ .allocator = self.alloc, .ptr = self, .vtable = &vtable };
     }
 
+    /// Request-local synchronization with fresh read admission. It carries no
+    /// metadata or result; subsequent client reads use the admitted snapshot.
+    pub fn readViewBarrier(self: *@This()) !void {
+        var response = try self.call(.{ .op = "read_view_barrier" }, "");
+        defer response.deinit();
+        if (response.body.len != 0) return error.InvalidReadViewBarrier;
+    }
+
     const Response = struct {
         alloc: A,
         parse_alloc: A,

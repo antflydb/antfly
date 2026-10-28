@@ -53,7 +53,13 @@ pub const InlineReadSet = struct {
         if (self.prefix) |prefix| if (prefix.len == 0 or prefix.len > 1024 or !std.unicode.utf8ValidateSlice(prefix)) return error.InvalidCoordinatorReadSet;
     }
 };
-pub const WalDependency = struct { key: []const u8, value: ?[]const u8 = null };
+pub const WalDependency = struct {
+    key: []const u8,
+    value: ?[]const u8 = null,
+    /// Preparation can depend on a publication/floor value without depending
+    /// on lease-only ETag/header changes. The WAL identity remains an exact CAS.
+    comparison: enum { exact, record_body } = .exact,
+};
 pub const WalCommit = struct {
     dependencies: []const WalDependency = &.{},
     wal_key: []const u8,
@@ -190,6 +196,13 @@ const Root = struct {
         }
     }
 };
+fn recordBody(a: A, bytes: []const u8) ![]const u8 {
+    const Body = struct { __antfly_bytes: ?[]const u8 = null, __antfly_utf8: ?[]const u8 = null };
+    const value = (try std.json.parseFromSlice(struct { body: Body }, a, bytes, .{ .ignore_unknown_fields = true })).value.body;
+    if ((value.__antfly_bytes == null) == (value.__antfly_utf8 == null)) return error.InvalidCoordinatorWalCommit;
+    return value.__antfly_bytes orelse value.__antfly_utf8.?;
+}
+
 fn validateInlineRecord(record: HotRecord) !void {
     if (record.key.len == 0 or record.key.len > 1024 or !std.unicode.utf8ValidateSlice(record.key) or record.value != null and (record.value.?.len > 32768 or !std.unicode.utf8ValidateSlice(record.value.?))) return error.InvalidCoordinatorRoot;
 }
@@ -331,7 +344,11 @@ pub const Context = struct {
                     if (dependency_bytes > 16384) return error.InvalidCoordinatorWalCommit;
                 }
                 const current = try root.get(m, self.alloc, cache.store(), dependency.key);
-                if ((current == null) != (dependency.value == null) or (current != null and !std.mem.eql(u8, current.?, dependency.value.?))) return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = false, .state = state }, .{});
+                const same = if ((current == null) != (dependency.value == null)) false else if (current == null) true else switch (dependency.comparison) {
+                    .exact => std.mem.eql(u8, current.?, dependency.value.?),
+                    .record_body => std.mem.eql(u8, try recordBody(m, current.?), try recordBody(m, dependency.value.?)),
+                };
+                if (!same) return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = false, .state = state }, .{});
             }
             const previous = try root.get(m, self.alloc, cache.store(), commit.wal_key);
             const previous_etag = if (previous) |value| (try std.json.parseFromSlice(struct { etag: []const u8 }, m, value, .{ .ignore_unknown_fields = true })).value.etag else null;

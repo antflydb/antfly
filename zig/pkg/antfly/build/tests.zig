@@ -2914,6 +2914,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_document_facts_tests = addFilteredTestRunArtifact(b, document_facts_tests);
     b.step("antfly-document-facts-test", "Run focused immutable document facts and scheduling tests").dependOn(&run_document_facts_tests.step);
 
+    const publication_protocol_tests = b.addTest(.{
+        .root_module = document_facts_test_mod,
+        .filters = selectTestFilters(b, &.{ "publication input", "publication postings", "publication continuation", "native write plan", "native read plan" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_publication_protocol_tests = addFilteredTestRunArtifact(b, publication_protocol_tests);
+    b.step("antfly-publication-protocol-test", "Run native publication continuation and read/write planning tests").dependOn(&run_publication_protocol_tests.step);
+    serverless_test_step.dependOn(&run_publication_protocol_tests.step);
+
     const graph_page_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/graph_page_tree_test_root.zig"),
         .target = target,

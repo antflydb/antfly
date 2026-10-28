@@ -137,8 +137,8 @@ export class CommitCoordinator extends DurableObject {
         if (request.guard_key != null || request.guard_etag != null) {
           // Job progress and HEAD must share this transaction. Comparing a
           // lease in a preceding RPC leaves a takeover/collection race.
-          const parent = request.key.slice(0, request.key.lastIndexOf("/"));
-          if (!request.key.endsWith("/REINDEX") || request.guard_key !== `${parent}/HEAD` || typeof request.guard_etag !== "string") return {status: 3};
+          const target = /^(.*)\/(?:REINDEX|PUBLICATION_PLAN|PUBLICATION_RESULTS\/[a-f0-9]{32})$/.exec(request.key);
+          if (!target || request.guard_key !== `${target[1]}/HEAD` || typeof request.guard_etag !== "string") return {status: 3};
           if (this.ctx.storage.kv.get(request.guard_key)?.etag !== request.guard_etag) return {status: 2};
         }
         if ((request.if_none_match && previous) ||

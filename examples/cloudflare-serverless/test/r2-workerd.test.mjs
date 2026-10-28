@@ -233,3 +233,33 @@ test("tenant commit domains isolate identical IDs and admit grouped writers",{ti
   await f.reopen();assert.deepEqual(await f.call(mutation("first"),"/api",200,"a"),a);assert.match((await f.call({op:"count"},"/api",409,"missing")).error,/UnknownTenant/);
  }finally{await f.close();}
 });
+
+
+test('native publication checkpoints survive both collectors, cancellation and erased platform storage',{timeout:240000},async()=>{
+ const f=await fixture('publication-continuations',false,true);
+ try{
+  Object.assign(f.options.bindings,{NATIVE_WRITE_PLAN:'true',NATIVE_READ_PLAN:'true',LOCAL_METADATA_READS:'true',PUBLICATION_CONTINUATIONS:'true',PUBLICATION_CONTINUATION_FORCE:'true',PUBLICATION_UNITS:'128',PAGED_TEXT:'true'});await f.reopen();
+  const body=JSON.stringify({text:Array.from({length:1024},(_,i)=>'term'+i).join(' '),embedding:[1,0],sparse_embedding:{needle:2}}),input={op:'mutate',operation_id:'large',mutations:[{kind:'upsert',doc_id:'one',body}]},accepted=await f.call(input);
+  let started=await f.call({op:'publish'});assert.ok(started.job_id);const abandoned=started.job_id;
+  const cancelled=await f.call({op:'publish',publication_action:'cancel',publication_job_id:abandoned});assert.equal(cancelled.published,false);assert.equal(cancelled.phase,'cancelled');
+  assert.deepEqual(await f.call({op:'publish',publication_action:'status',publication_job_id:abandoned}),cancelled);
+  started=await f.call({op:'publish'});assert.notEqual(started.job_id,abandoned);const job=started.job_id;
+  for(let i=0;i<5;i++)await f.call({op:'publish',publication_job_id:job});
+  // Trace both live collectors with an incomplete private tree, then discard
+  // platform storage and all native instances. R2 is the sole durable source.
+  for(let i=0;i<6;i++){await f.call({op:'collect'});await f.call({op:'collect_metadata'});}
+  await f.call({},'/wipe-platform');await f.reopen();
+  let completed;
+  for(let i=0;i<128;i++){const result=await f.call({op:'publish',publication_job_id:job});if(result.published){completed=result;break;}assert.equal(result.wal_end_lsn,'0');}
+  assert.ok(completed);assert.equal((await f.call({op:'lookup',doc_id:'one',required_visibility:accepted.visibility})).body,body);
+  assert.equal((await f.call({op:'search',text:'term1023'})).hits[0].doc_id,'one');
+  assert.equal((await f.call({op:'search',mode:'sparse',sparse:[{term:'needle',weight:1}]})).hits[0].doc_id,'one');
+  assert.equal((await f.call({op:'search',mode:'vector',vector:[1,0]})).hits[0].doc_id,'one');
+  assert.deepEqual(await f.call(input),accepted);assert.deepEqual(await f.call({op:'publish',publication_action:'status',publication_job_id:job}),completed);
+  f.options.bindings.PUBLICATION_CONTINUATION_FORCE='false';await f.reopen();
+  await f.call({op:'mutate',operation_id:'small-after-job',mutations:[{kind:'upsert',doc_id:'small',body:'{"text":"small"}'}]});
+  const before=await f.call({},'/latency-counts');assert.equal((await f.call({op:'publish'})).published,true);const after=await f.call({},'/latency-counts');
+  assert.equal(after.begins-before.begins,1);assert.equal(after.finals-before.finals,1,'ordinary records retain prepared batching under the continuation flag');
+
+ }finally{await f.close();}
+});

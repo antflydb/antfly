@@ -1620,7 +1620,7 @@ pub fn publishDocumentFactsForManifest(
     }
 }
 
-fn applicableWalRecordsForHeadAlloc(
+pub fn applicableWalRecordsForHeadAlloc(
     alloc: Allocator,
     records: []const wal_mod.Record,
     current_head: u64,
@@ -1893,7 +1893,7 @@ fn buildCompactedManifestAlloc(
     );
 }
 
-fn buildRebasedManifestFromRefsAlloc(
+pub fn buildRebasedManifestFromRefsAlloc(
     alloc: Allocator,
     namespace: []const u8,
     version: u64,
@@ -4174,6 +4174,25 @@ fn freeQueryMutations(alloc: Allocator, mutations: []query_mod.QueryMaterializer
     freeMaterializerMutations(alloc, mutations);
 }
 
+pub fn textSourceNameAlloc(alloc: Allocator, spec: FullTextIndexSpec) ![]u8 {
+    return switch (spec.source_mode) {
+        .document => try alloc.dupe(u8, "text"),
+        .artifact_only => try alloc.dupe(u8, spec.source_artifact_name orelse "text"),
+        .document_plus_artifact => if (spec.source_artifact_name) |name|
+            try std.fmt.allocPrint(alloc, "text+{s}", .{name})
+        else
+            try alloc.dupe(u8, "text"),
+    };
+}
+
+pub fn normalizedTextForDocumentAlloc(alloc: Allocator, doc: query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec) ![]u8 {
+    var projection = try document_projection.parseAlloc(alloc, doc.body);
+    defer projection.deinit(alloc);
+    const source_text = try selectTextSourceAlloc(alloc, doc.body, &projection, spec);
+    defer alloc.free(source_text);
+    return @import("../query/indexed_reader.zig").normalizeAlloc(alloc, source_text);
+}
+
 pub fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec, cancellation: ?maintenance_cancellation.Token) !text_segment_mod.Segment {
     const doc_entries = try alloc.alloc(text_segment_mod.DocumentEntry, docs.len);
     errdefer alloc.free(doc_entries);
@@ -4191,11 +4210,7 @@ pub fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMate
 
     for (docs, 0..) |doc, doc_index| {
         if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
-        var projection = try document_projection.parseAlloc(alloc, doc.body);
-        defer projection.deinit(alloc);
-        const source_text = try selectTextSourceAlloc(alloc, doc.body, &projection, spec);
-        defer alloc.free(source_text);
-        const normalized_text = try @import("../query/indexed_reader.zig").normalizeAlloc(alloc, source_text);
+        const normalized_text = try normalizedTextForDocumentAlloc(alloc, doc, spec);
         errdefer alloc.free(normalized_text);
 
         var token_count: u32 = 0;
@@ -4248,14 +4263,7 @@ pub fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMate
 
     return .{
         .index_name = try alloc.dupe(u8, spec.name),
-        .source_name = switch (spec.source_mode) {
-            .document => try alloc.dupe(u8, "text"),
-            .artifact_only => try alloc.dupe(u8, spec.source_artifact_name orelse "text"),
-            .document_plus_artifact => if (spec.source_artifact_name) |name|
-                try std.fmt.allocPrint(alloc, "text+{s}", .{name})
-            else
-                try alloc.dupe(u8, "text"),
-        },
+        .source_name = try textSourceNameAlloc(alloc, spec),
         .config_json = try alloc.dupe(u8, spec.config_json),
         .docs = doc_entries,
         .terms = term_entries,

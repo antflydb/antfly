@@ -26,7 +26,7 @@ import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
 export class NativeReadViews {
  constructor(module,env,{kernel,cache,clock=Date.now,onMetrics,background,cohortDelayMs=2}={}){
   this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions({delayMs:cohortDelayMs});this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,"r2",{allowCreate:false}));
-  const observation={request:(input,options)=>kernel.request(input,{...options,kernelVariant:"observe",memoryReservationBytes:8*1024*1024})};
+  const observation={request:(input,options)=>kernel.request(input,{...options,kernelVariant:"observe",memoryReservationBytes:8*1024*1024,reservationClass:"authority"})};
   this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readKernel:observation,cache,onMetrics,remoteCache:edgeCacheForEnv(env,{background})});
  }
  open(options={}){
@@ -38,7 +38,7 @@ export class NativeReadViews {
     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
     const view=await captureReadView(tx,keys,options,this.clock);publish(view);return view;
-   },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background});
-  },options.trace_id,{untilAdmission:true,onPrepared:options.onPrepared});
+   },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background,deadlineMs:options.deadlineMs});
+  },options.trace_id,{untilAdmission:true,onPrepared:options.onPrepared,onAdmitted:options.onAdmitted});
  }
 }

@@ -85,9 +85,9 @@ export class R2CommitCoordinator extends DurableObject {
         return captureReadView(tx,keys,options);
       };
       if(this.env.READ_ONLY_SNAPSHOTS==="false")close();
-      return(this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds,onAdmission:close,priority:options.immutable===false?"commit":"interactive"})).catch(error=>{
+      return(this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds,onAdmission:close,deadlineMs:options.deadlineMs,priority:options.immutable===false?"commit":"interactive"})).catch(error=>{
         close();if(!/ReadSnapshotNeeds(?:Admission|Pin)/.test(String(error)))throw error;
-        return this.transaction(capture,{traceId:options.trace_id});
+        return this.transaction(capture,{traceId:options.trace_id,deadlineMs:options.deadlineMs});
       }).then(view=>options.immutable!==false&&!view.immutable&&this.store.readHints?.version===view.version?{...view,immutable:structuredClone(this.store.readHints.records)}:view);
     },options.trace_id,{untilAdmission:true,admissionClass:options.immutable===false?"commit":"read"});
   }
@@ -221,12 +221,19 @@ export class R2CommitCoordinator extends DurableObject {
     if(result.status===0&&request.op==="put"&&request.key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`)this.store.setReadHints(this.env.ANTFLY_INCARNATION,new TextDecoder().decode(body).trim(),readHints);
     return result;
   }
+  async openPublicationPlan(maximum) {
+    const keys=await publicationKeys(this.env.ANTFLY_INCARNATION,true);
+    // Advisory immutable preparation does not acquire a lease or extend a pin.
+    // Native publication binds the eventual batch to this generation and all
+    // mutations still validate the current native HEAD guard atomically.
+    return this.transaction(async tx=>({budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)}),{priority:"maintenance"});
+  }
   async openPublication(maximum) {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
     return this.transaction(async tx=>{await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),{immutable:false});return{budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};},{priority:"maintenance"});
   }
   async publicationCall(request,body,expected,readHints) {
-    const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
+    const keys=await publicationKeys(this.env.ANTFLY_INCARNATION,this.env.PUBLICATION_CONTINUATIONS==="true");
     const response=await this.transaction(tx=>publicationCall(tx,keys,(...args)=>this.objectCallInTransaction(...args,readHints),request,body,expected),{priority:"maintenance"});
     if(response.result.status===0&&request.op==="put"&&request.key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`)this.store.setReadHints(this.env.ANTFLY_INCARNATION,new TextDecoder().decode(body).trim(),readHints);
     return response;
@@ -249,6 +256,7 @@ export class R2CommitCoordinator extends DurableObject {
     // retain the full native variant and its exclusive 32 MiB reservation.
     const compactWal=inputs.length===1&&inputs[0].mutations?.length===1&&new TextEncoder().encode(JSON.stringify(inputs[0])).byteLength<=16384;
     const walWorkingBytes=compactWal?Math.min(8*1024*1024,Number(this.env.WORKING_SET_BYTES??20*1024*1024)):Number(this.env.WORKING_SET_BYTES??20*1024*1024);
+    if(this.env.NATIVE_WRITE_PLAN==="true")return this.commitNativeWritePlan(inputs,deadline,{trace,compactWal,walWorkingBytes});
     this.optimisticWal??=new OptimisticWal();
     for(let attempt=0;attempt<3;attempt++){
       // The shared durable generation pin protects the manifest read during
@@ -289,6 +297,31 @@ export class R2CommitCoordinator extends DurableObject {
       this.optimisticWal.clear();
     }
     throw new Error("WalCommitContended");
+  }
+  async commitNativeWritePlan(inputs,deadline,{trace,compactWal,walWorkingBytes}) {
+    const started=performance.now();
+    await this.ensureAuthority();
+    if(this.authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
+    const ioBudget={operations:0,bytes:0},physical={};
+    const refresh=()=>this.transaction(async()=>{},{deadlineMs:deadline,traceId:trace.id,ioBudget});
+    if(!this.store.state||this.store.recovering)await refresh();
+    const transport=this.store.dataCache.wrap(edgeCacheForEnv(this.env,{background:promise=>this.ctx.waitUntil(promise),budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical)),this.env.ANTFLY_INCARNATION);
+    for(let attempt=0;attempt<3;attempt++){
+      if(Date.now()>=deadline)throw Error("DeadlineExceeded");
+      if(ioBudget.operations>=1024||ioBudget.bytes>=32*1024*1024)throw Error("CoordinatorIoBudgetExceeded");
+      let prepared;
+      try{prepared=await trace.span("native_wal_plan",()=>buildKernel.request({op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{state:structuredClone(this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-ioBudget.operations,maxTransferBytes:32*1024*1024-ioBudget.bytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{ioBudget.operations+=sample.operations;ioBudget.bytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,native_write_plan:true,...sample,physical}));}}));}
+      catch(error){if(error?.message!=="FileNotFound")throw error;await refresh();continue;}
+      if(!prepared.__write_plan||!Array.isArray(prepared.results)||prepared.results.length!==inputs.length)throw Error("NativeWritePlanRequired");
+      let committed;
+      try{committed=await trace.span("native_wal_finalize",()=>this.store.commitWal({...prepared.__write_plan,migration_required:this.env.COORDINATOR_MIGRATION_REQUIRED==="true"},{deadlineMs:deadline,traceId:trace.id,nativePlan:true,ioBudget}));}
+      catch(error){if(!["PreconditionFailed","ImmutableLogRotationRequired"].includes(error?.message))throw error;await refresh();continue;}
+      if(!committed.applied){await refresh();continue;}
+      trace.publicationId=committed.publication.id;trace.emit(this.env.LOG_METRICS==="true");
+      if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_id:trace.id,trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,native_write_plan:true,prepare_attempts:attempt+1,operations:ioBudget.operations,transferred_bytes:ioBudget.bytes,physical_r2:physical}));
+      return prepared.results.map((item,i)=>({...item,__publication:i===0?committed.publication:{...committed.publication,enqueue:false}}));
+    }
+    throw Error("WalCommitContended");
   }
   pruneEmbeddingCheckpointMetadata(namespace, today) {
     if (namespace !== this.env.ANTFLY_INCARNATION || !Number.isSafeInteger(today) || today < 0) throw new Error("InvalidEmbeddingCheckpointSweep");

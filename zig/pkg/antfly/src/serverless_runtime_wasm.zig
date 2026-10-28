@@ -136,6 +136,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         pack_small_bodies: bool = false,
         inline_point_bodies: bool = false,
         canonical_point_bodies: bool = false,
+        native_write_plan: ?@import("serverless/wal/write_plan.zig").Input = null,
+        native_read_plan_mode: bool = false,
+        native_read_plan: ?@import("serverless/query/read_plan.zig").Plan = null,
         compaction_probe_only: bool = false,
         wal_inline_tail: bool = false,
         publication_owner: []const u8 = "",
@@ -151,6 +154,13 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         gc_id: ?[]const u8 = null,
         gc_keep_from: []const u8 = "1",
         publication_records: usize = 16,
+        publication_continuations: bool = false,
+        publication_batch_probe: bool = false,
+        publication_batch_version: ?u64 = null,
+        publication_continuation_force: bool = false,
+        publication_units: usize = 128,
+        publication_action: @import("serverless/hosted_publication_plan.zig").Action = .step,
+        publication_job_id: ?[]const u8 = null,
         paged_text: bool = false,
         paged_projections: bool = false,
         compaction_max_documents: u64 = 1000,
@@ -201,9 +211,17 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         }, req.publication_owner, req.publication_lease, @intCast(realtimeNs())),
         else => {},
     }
+    var write_plan: ?@import("serverless/wal/write_plan.zig").Plan = null;
+    defer if (write_plan) |*value| value.deinit();
+    var data_client = host.client();
+    if (req.native_write_plan) |input| {
+        if (req.op != .mutate) return error.InvalidNativeWritePlan;
+        write_plan = try @import("serverless/wal/write_plan.zig").Plan.init(a, data_client, req.bucket, req.prefix, req.namespace, input, host_io);
+        data_client = write_plan.?.client(a);
+    }
     const artifact_prefix = try std.fmt.allocPrint(a, "{s}/artifacts", .{req.prefix});
     defer a.free(artifact_prefix);
-    var object_artifacts = try @import("serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, host.client(), req.bucket, artifact_prefix);
+    var object_artifacts = try @import("serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, data_client, req.bucket, artifact_prefix);
     var artifacts = object_artifacts.artifactStore();
     artifacts.pack_document_bodies = req.pack_small_bodies;
     artifacts.inline_point_bodies = req.inline_point_bodies;
@@ -211,21 +229,22 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     defer artifacts.deinit();
     const manifest_prefix = try std.fmt.allocPrint(a, "{s}/manifests", .{req.prefix});
     defer a.free(manifest_prefix);
-    var object_manifests = try @import("serverless/manifest/object_store.zig").ObjectStore.initWithClient(a, host.client(), req.bucket, manifest_prefix);
+    var object_manifests = try @import("serverless/manifest/object_store.zig").ObjectStore.initWithClient(a, data_client, req.bucket, manifest_prefix);
     var manifests = object_manifests.manifestStore();
     defer manifests.deinit();
     const progress_prefix = try std.fmt.allocPrint(a, "{s}/progress", .{req.prefix});
     defer a.free(progress_prefix);
-    var object_progress = try @import("serverless/catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(a, host.client(), req.bucket, progress_prefix);
+    var object_progress = try @import("serverless/catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(a, data_client, req.bucket, progress_prefix);
     var progress = object_progress.progressStore();
     defer progress.deinit();
-    var indexed_wal = try @import("serverless/wal/indexed_object_store.zig").IndexedObjectStore.init(a, host.client(), req.bucket, req.prefix);
+    var indexed_wal = try @import("serverless/wal/indexed_object_store.zig").IndexedObjectStore.init(a, data_client, req.bucket, req.prefix);
     defer indexed_wal.deinit();
     indexed_wal.inline_tail_enabled = req.wal_inline_tail;
     var wal = indexed_wal.walStore();
     const reindex_registry = @import("serverless/hosted_reindex.zig").Registry{ .client = host.client(), .bucket = req.bucket, .prefix = req.prefix, .namespace = req.namespace, .store = &artifacts };
     if (req.op == .reindex) return (@import("serverless/hosted_reindex.zig").Context{ .alloc = a, .registry = reindex_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation } }).run(req.reindex_action, req.reindex_job_id, req.reindex_records);
-    const collection = @import("serverless/hosted_collection.zig").Context{ .alloc = a, .namespace = req.namespace, .prefix = req.prefix, .artifacts = &artifacts, .manifests = &manifests, .progress = &progress, .wal = &indexed_wal, .io = host_io, .reindex_registry = reindex_registry };
+    const publication_registry = @import("serverless/hosted_publication_plan.zig").Registry{ .client = host.client(), .bucket = req.bucket, .prefix = req.prefix, .namespace = req.namespace, .store = &artifacts };
+    const collection = @import("serverless/hosted_collection.zig").Context{ .alloc = a, .namespace = req.namespace, .prefix = req.prefix, .artifacts = &artifacts, .manifests = &manifests, .progress = &progress, .wal = &indexed_wal, .io = host_io, .reindex_registry = reindex_registry, .publication_registry = publication_registry };
     switch (req.op) {
         .gc_prepare => return collection.prepare(),
         .gc_trace => return collection.trace(req.gc_task orelse return error.InvalidCollectionTask),
@@ -292,6 +311,13 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         const Result = struct { visibility: @TypeOf(@import("serverless/visibility.zig").Token.init("", 0).encode()), committed: bool = true };
         const output = try arena.allocator().alloc(Result, results.len);
         for (results, output) |result, *item| item.* = .{ .visibility = @import("serverless/visibility.zig").Token.init(req.namespace, result.end_lsn).encode() };
+        if (write_plan) |*plan| {
+            var maximum: u64 = 0;
+            for (results) |result| maximum = @max(maximum, result.end_lsn);
+            const watermark = try std.fmt.allocPrint(arena.allocator(), "{d}", .{maximum});
+            const commit = try plan.finish(arena.allocator(), watermark, @intCast(realtimeNs() / std.time.ns_per_ms));
+            return std.json.Stringify.valueAlloc(a, .{ .results = output, .__write_plan = commit }, .{});
+        }
         return if (req.mutation_groups.len == 0) std.json.Stringify.valueAlloc(a, output[0], .{}) else std.json.Stringify.valueAlloc(a, .{ .results = output }, .{});
     }
 
@@ -351,6 +377,13 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         return std.json.Stringify.valueAlloc(a, .{ .published = result.published, .version = try std.fmt.bufPrint(&version, "{d}", .{result.version}), .artifact_count = result.artifact_count }, .{});
     }
     if (req.op == .publish) {
+        if (req.publication_batch_version) |expected| {
+            const current = progress.getHead(req.namespace) catch |err| switch (err) {
+                error.FileNotFound => 0,
+                else => return err,
+            };
+            if (current != expected) return error.PublicationBatchSourceChanged;
+        }
         const work = @import("serverless/build/work_lease.zig");
         var held: ?work.HeldLease = if (req.publication_lease) |lease| .{
             .provider = try progress.workLeaseProvider(),
@@ -360,6 +393,11 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             .acquisition = .{ .fencing_token = try std.fmt.parseInt(u64, lease.token, 10), .expires_at_unix_ns = try std.fmt.parseInt(u64, lease.expires, 10), .took_over = false },
             .ttl_ns = 30 * std.time.ns_per_s,
         } else null;
+        if (req.publication_continuations) {
+            if (held != null) return error.InvalidPublicationSession;
+            if (try (@import("serverless/hosted_publication_plan.zig").Context{ .alloc = a, .registry = publication_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation }, .policy = .{ .chunk_embeddings_enabled = req.enrichment, .chunk_embeddings_model_preference = .require_model }, .force = req.publication_continuation_force, .batch_probe_records = if (req.publication_batch_probe) @min(64, @max(1, req.publication_records)) else null }).run(req.publication_action, req.publication_job_id, req.publication_units)) |result| return result;
+            if (req.publication_batch_probe) return error.PublicationNeedsPreparedBatch;
+        }
         var builder = @import("serverless/build/builder.zig").Builder.init(a, &artifacts, &manifests, &progress, &wal);
         builder.setIo(host_io);
         builder.paged_text = req.paged_text;
@@ -437,10 +475,33 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         const cursor = if (req.cursor) |text| try visibility.Cursor.decode(text, a, req.namespace, query_hash) else null;
         defer if (cursor) |value| a.free(value.raw_storage);
         const required = if (req.required_visibility) |text| try visibility.Token.decode(text) else null;
+        const read_plan = @import("serverless/query/read_plan.zig");
+        var prepared_read: ?read_plan.Prepared = null;
+        defer if (prepared_read) |*value| value.deinit(a);
+        var read_allowance: u64 = 16 * 1024 * 1024;
+        if (req.native_read_plan_mode) {
+            if (req.op != .lookup or req.cursor != null) return error.InvalidNativeReadPlan;
+            if (req.native_read_plan) |plan| {
+                var no_writes: u64 = 0;
+                var pages = @import("serverless/graph_segment/page_store.zig").PageStore{
+                    .domain = @import("serverless/graph_segment/page_store.zig").PageStore.namespaceDomain(req.namespace),
+                    .artifacts = &artifacts,
+                    .cancellation = cancellation,
+                    .remaining_read_bytes = &read_allowance,
+                    .remaining_write_bytes = &no_writes,
+                };
+                prepared_read = plan.prepare(a, req.namespace, req.doc_id, &pages) catch |err| switch (err) {
+                    error.FileNotFound => null, // stale immutable hint, never authority
+                    else => return err,
+                };
+            }
+            try host.readViewBarrier();
+        } else if (req.native_read_plan != null) return error.InvalidNativeReadPlan;
         const live = try @import("serverless/query/live_session.zig").Session.open(a, &runtime, &wal, req.namespace, .{
             .io = host_io,
             .cancellation = cancellation,
             .version = if (cursor) |value| value.cursor.generation else null,
+            .max_read_bytes = read_allowance,
             .view = .{ .required = required, .cutoff = if (cursor) |value| value.cursor.cutoff else null, .cancellation = transport_cancellation },
         });
         defer live.deinit();
@@ -458,8 +519,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             return std.json.Stringify.valueAlloc(a, .{ .count = count, .visibility = live.view.token.encode() }, .{});
         }
         if (req.op == .lookup) {
-            const body = try live.lookupAlloc(req.doc_id);
+            const body = if (prepared_read) |prepared| try prepared.lookupAlloc(live, req.doc_id) else try live.lookupAlloc(req.doc_id);
             defer if (body) |value| a.free(value);
+            if (req.native_read_plan_mode) return std.json.Stringify.valueAlloc(a, .{ .body = body, .visibility = live.view.token.encode(), .__read_plan = read_plan.Plan.fromSession(live) }, .{});
             return std.json.Stringify.valueAlloc(a, .{ .body = body, .visibility = live.view.token.encode() }, .{});
         }
         var page = try live.list(if (cursor) |value| value.cursor.after else "", req.limit, 1024 * 1024, filter, .{ .cancellation = transport_cancellation });

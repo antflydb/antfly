@@ -20,8 +20,8 @@ export async function metadataObjectCall(tx,request,body,validCollection=async()
       const previous = await tx.get(request.key);
       if (request.op === "put") {
         if (request.guard_key != null || request.guard_etag != null) {
-          const parent = request.key.slice(0, request.key.lastIndexOf("/"));
-          if (!request.key.endsWith("/REINDEX") || request.guard_key !== `${parent}/HEAD` || typeof request.guard_etag !== "string") return {status: 3};
+          const target = /^(.*)\/(?:REINDEX|PUBLICATION_PLAN|PUBLICATION_RESULTS\/[a-f0-9]{32})$/.exec(request.key);
+          if (!target || request.guard_key !== `${target[1]}/HEAD` || typeof request.guard_etag !== "string") return {status: 3};
           if ((await tx.get(request.guard_key))?.etag !== request.guard_etag) return {status: 2};
         }
         if ((request.if_none_match && previous) || (request.if_match_etag != null && previous?.etag !== request.if_match_etag)) return {status: 2};

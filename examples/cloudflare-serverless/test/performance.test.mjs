@@ -825,3 +825,65 @@ test('physical latency distributions include failed attempts with fixed labels',
  assert.equal(counters.bytes_read,3);assert.equal(counters.wait_ms,1512);
  assert.ok(!JSON.stringify(counters).includes('private'));
 });
+
+
+test('native read-plan hints are bounded, isolated and retain no authority admissions',async()=>{
+ const{NativeReadPlans}=await import('../native-read-plan.mjs');let now=0;const cache=new NativeReadPlans({clock:()=>now}),env={DATABASE:{},ANTFLY_INCARNATION:'a'},plan={format:1,source:{artifact_id:'immutable'}};
+ cache.remember(env,plan);const copy=cache.get(env);copy.source.artifact_id='changed';assert.equal(cache.get(env).source.artifact_id,'immutable');assert.equal(cache.get({...env,DATABASE:{}}),null);
+ for(let i=0;i<8;i++)cache.remember({...env,ANTFLY_INCARNATION:String(i)},plan);assert.equal(cache.get(env),null);
+ now=60000;assert.equal(cache.get({...env,ANTFLY_INCARNATION:'7'}),null);
+});
+
+
+test('speculative native reads reserve capacity for all fresh observation calls and release permits early',async()=>{
+ const{withNativeReadPlanPermit}=await import('../native-read-plan.mjs');const kernel={maxReservedBytes:32*1024*1024,slots:Array(4).fill({}),pending:[],clock:Date.now,drain(){}};
+ let start=0;const releases=[],finishes=[];const run=()=>withNativeReadPlanPermit(kernel,8*1024*1024,async(allowed,release)=>{assert.equal(allowed,true);start++;releases.push(release);await new Promise(resolve=>finishes.push(resolve));},{deadlineMs:Date.now()+30000});
+ const first=[run(),run(),run()];await new Promise(resolve=>setTimeout(resolve,0));assert.equal(start,3);assert.equal(kernel.waitingReadPlans,3);
+ const queued=run();await new Promise(resolve=>setTimeout(resolve,0));assert.equal(start,3);
+ releases[0]();await new Promise(resolve=>setTimeout(resolve,0));assert.equal(start,4,'a completed admission frees preparation capacity before the query ends');
+ for(const finish of finishes)finish();await Promise.all([...first,queued]);assert.equal(kernel.waitingReadPlans,0);
+});
+
+test('native authority observations bypass aged work only while required by suspended read plans',async()=>{
+ const{RequestPool}=await import('../request-pool.mjs');let now=0,release;const held=new Promise(r=>release=r),host={usable:()=>true,memoryBytes:()=>0,request:async()=>({})},pool=new RequestPool(async()=>host,4,{clock:()=>now,maxReservedBytes:32,reservationBytes:8});
+ pool.waitingReadPlans=3;const running=Array.from({length:3},()=>pool.withHost(async()=>held));
+ await new Promise(resolve=>setTimeout(resolve,5));let largeStarted=false;const large=pool.withHost(async()=>{largeStarted=true;},{memoryReservationBytes:32});now=6000;
+ let observed=false;const authority=pool.withHost(async()=>{observed=true;},{memoryReservationBytes:8,reservationClass:'authority'});
+ await authority;assert.equal(observed,true);assert.equal(largeStarted,false);pool.waitingReadPlans=0;release();await Promise.all([...running,large]);assert.equal(largeStarted,true);
+});
+
+test('read cohorts notify every submitter when observation is admitted, before the view exists',async()=>{
+ const{FreshReadAdmissions}=await import('../fresh-read-admissions.mjs');const cohorts=new FreshReadAdmissions({delayMs:0});let entered,release;const gate=new Promise(r=>release=r),ready=new Promise(r=>entered=r),events=[];
+ const read=async(_,close)=>{close();entered();await gate;return{version:1};};
+ const a=cohorts.run('one',read,'a',{untilAdmission:true,onAdmitted:()=>events.push('a')}),b=cohorts.run('one',read,'b',{untilAdmission:true,onAdmitted:()=>events.push('b')});
+ await ready;await new Promise(resolve=>setTimeout(resolve,0));assert.deepEqual(events,['a','b']);release();await Promise.all([a,b]);
+});
+
+test('native speculative permits resume after aged work drains without another reader arriving',async()=>{
+ const{RequestPool}=await import('../request-pool.mjs'),{withNativeReadPlanPermit}=await import('../native-read-plan.mjs');
+ let now=0,release;const held=new Promise(r=>release=r),host={usable:()=>true,memoryBytes:()=>0,request:async()=>({})},MiB=1024*1024,pool=new RequestPool(async()=>host,4,{clock:()=>now,maxReservedBytes:32*MiB,reservationBytes:8*MiB});
+ const running=pool.withHost(()=>held,{memoryReservationBytes:32*MiB});await new Promise(r=>setTimeout(r,5));
+ const aged=pool.withHost(async()=>{},{});now=6000;let started=false;
+ const speculative=withNativeReadPlanPermit(pool,8*MiB,async()=>{started=true;},{deadlineMs:Date.now()+1000});
+ await new Promise(r=>setTimeout(r,5));assert.equal(started,false);release();await Promise.all([running,aged,speculative]);assert.equal(started,true);assert.equal(pool.capacityListeners.size,0);
+});
+
+test('native point promotion shares its original I/O allowance and waits for fresh authority',async()=>{
+ const{withPointReadLane}=await import('../point-read-lane.mjs');let attempts=0,fresh=false;
+ const kernel={withHost:async run=>run({request:async(input,options)=>{
+  attempts++;if(attempts===1){options.onMetrics({operations:1000,transferred_bytes:31*1024*1024});throw Error('HostedWorkingSetBudgetExceeded');}
+  assert.equal(fresh,true);assert.equal(options.maxOperations,24);assert.equal(options.maxTransferBytes,1024*1024);return{body:'large'};
+ }})};
+ const result=await withPointReadLane(kernel,host=>host.request({op:'lookup',native_read_plan_mode:true,working_set_bytes:1024*1024},{}),{beforePromote:async()=>{fresh=true;}});
+ assert.equal(result.body,'large');assert.equal(attempts,2);
+});
+
+test('native write plans retain one I/O budget across preparation, recovery and final metadata commit',async()=>{
+ const{store}=fixture();await store.transaction(tx=>tx.put('durable','before'));const budget={operations:1024,bytes:0};
+ const denied=store.transaction(tx=>tx.put('durable','after'),{ioBudget:budget}),peer=store.transaction(tx=>tx.get('durable'));
+ await assert.rejects(denied,/CoordinatorIoBudgetExceeded/);assert.equal(await peer,'before','one exhausted plan cannot reject an unrelated queued caller');
+ assert.equal(budget.operations,1024);assert.equal(await store.transaction(tx=>tx.get('durable')),'before');
+ const remaining={operations:1000,bytes:31*1024*1024};await store.transaction(tx=>tx.put('durable','after'),{ioBudget:remaining});
+ assert.ok(remaining.operations>1000&&remaining.operations<=1024);assert.ok(remaining.bytes>31*1024*1024&&remaining.bytes<=32*1024*1024);
+ assert.equal(await store.transaction(tx=>tx.get('durable')),'after');
+});

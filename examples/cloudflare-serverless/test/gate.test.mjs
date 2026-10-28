@@ -326,3 +326,12 @@ test('canonical body provenance is explicit without changing historical optimiza
  assert.equal(enabled.CANONICAL_POINT_BODIES,true);
  assert.equal(runtimePlacement({vars:{CANONICAL_POINT_BODIES:'false'}}).native_optimizations.CANONICAL_POINT_BODIES,false);
 });
+
+test('native protocol flags bind new profiles without changing historical optimization profiles',async()=>{
+ const{runtimePlacement}=await import('../qualification/gate-provenance.mjs');
+ const prior=runtimePlacement({vars:{INLINE_POINT_BODIES:'true'}}).native_optimizations;assert.equal(Object.hasOwn(prior,'NATIVE_READ_PLAN'),false);assert.equal(runtimePlacement({vars:{PUBLICATION_UNITS:'32'}}).publication_units,32);
+ for(const flag of['NATIVE_READ_PLAN','NATIVE_WRITE_PLAN','PUBLICATION_CONTINUATIONS','PUBLICATION_CONTINUATION_FORCE']){
+  assert.equal(runtimePlacement({vars:{[flag]:'true'}}).native_optimizations[flag],true);
+  assert.equal(runtimePlacement({vars:{[flag]:'false'}}).native_optimizations[flag],false);
+ }
+});

@@ -18,11 +18,12 @@ import{resolve,basename,dirname}from'node:path';
 import{createHash}from'node:crypto';
 import{isDeepStrictEqual}from'node:util';
 function legacyPlacement(config){return config.vars?.RUNTIME_GENERATION!=null||config.vars?.R2_LOCATION_HINT!=null||config.vars?.EDGE_IMMUTABLE_CACHE!=null||config.vars?.DIRECT_READS!=null||config.vars?.READ_VIEW_BATCH_MS!=null||config.vars?.LOCAL_METADATA_READS!=null||config.vars?.INLINE_METADATA_ROOTS!=null?{generation:config.vars?.RUNTIME_GENERATION??null,location_hint:config.vars?.R2_LOCATION_HINT??null,...(config.vars?.EDGE_IMMUTABLE_CACHE!=null?{immutable_cache:config.vars.EDGE_IMMUTABLE_CACHE==="true",immutable_cache_scope:config.vars.EDGE_IMMUTABLE_CACHE_SCOPE??null,local_metadata_reads:config.vars.LOCAL_METADATA_READS==="true"}:{}),...(config.vars?.LOCAL_METADATA_READS!=null?{local_metadata_reads:config.vars.LOCAL_METADATA_READS==="true"}:{}),...(config.vars?.DIRECT_READS!=null?{direct_reads:config.vars.DIRECT_READS==="true"}:{}),...(config.vars?.READ_VIEW_BATCH_MS!=null?{read_view_batch_ms:Number(config.vars.READ_VIEW_BATCH_MS)}:{}),...(config.vars?.INLINE_METADATA_ROOTS!=null?{inline_metadata_roots:config.vars.INLINE_METADATA_ROOTS==="true"}:{})}:null;}
+const optionalOptimizationKeys=['CANONICAL_POINT_BODIES','NATIVE_READ_PLAN','NATIVE_WRITE_PLAN','PUBLICATION_CONTINUATIONS','PUBLICATION_CONTINUATION_FORCE'];
 const optimizationKeys=['FUSED_READS','OPTIMISTIC_WAL','INLINE_POINT_BODIES','NATIVE_COMPACTION_PLAN'];
 export function runtimePlacement(config){
- const base=legacyPlacement(config),configured=[...optimizationKeys,'CANONICAL_POINT_BODIES'].some(key=>config.vars?.[key]!=null);
- if(!configured&&!config.placement)return base;
- return{...(base??{generation:null,location_hint:null}),...(configured?{native_optimizations:Object.fromEntries([...optimizationKeys,...(config.vars?.CANONICAL_POINT_BODIES!=null?['CANONICAL_POINT_BODIES']:[])].map(key=>[key,config.vars?.[key]==="true"]))}:{}),...(config.placement?{worker_placement:structuredClone(config.placement)}:{})};
+ const base=legacyPlacement(config),configured=[...optimizationKeys,...optionalOptimizationKeys].some(key=>config.vars?.[key]!=null);
+ if(!configured&&!config.placement&&config.vars?.PUBLICATION_UNITS==null)return base;
+ return{...(base??{generation:null,location_hint:null}),...(config.vars?.PUBLICATION_UNITS!=null?{publication_units:Number(config.vars.PUBLICATION_UNITS)}:{}),...(configured?{native_optimizations:Object.fromEntries([...optimizationKeys,...optionalOptimizationKeys.filter(key=>config.vars?.[key]!=null)].map(key=>[key,config.vars?.[key]==="true"]))}:{}),...(config.placement?{worker_placement:structuredClone(config.placement)}:{})};
 }
 export async function verifySealedRun(run){
  const errors=[];

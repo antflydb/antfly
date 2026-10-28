@@ -14,7 +14,8 @@
 // limitations under the License.
 
 // A module-scope pool is shared by colocated Durable Objects. Metadata has a
-// separate pool so engines waiting on coordinator RPCs cannot exhaust its slots.
+// separate write pool. Read-only authority observers share reader slots with
+// explicit preparation permits so suspended queries cannot exhaust observers.
 export class RequestPool {
  constructor(create,slots,{recycleBytes=12*1024*1024,maxQueued=32,clock=Date.now,maxReservedBytes=Infinity,reservationBytes=0,defaultKernelVariant="default"}={}){this.create=create;this.clock=clock;this.defaultKernelVariant=defaultKernelVariant;this.maxReservedBytes=maxReservedBytes;this.reservationBytes=reservationBytes;this.reservedBytes=0;this.slots=Array.from({length:slots},()=>({host:null,busy:false}));this.recycleBytes=recycleBytes;this.maxQueued=maxQueued;this.pending=[];}
  request(input,options={}){return this.submit({input,options});}
@@ -40,12 +41,13 @@ export class RequestPool {
   // another Durable Object's callback or create its timers/transport promises.
   return admitted.then(slot=>this.execute(slot,job));
  }
- drain(){while(this.pending.length){
+ drain(){try{while(this.pending.length){
   const idle=this.slots.filter(slot=>!slot.busy);if(!idle.length)return;
-  const now=this.clock(),rank=job=>now-(job.admittedAt??now)>=5000?0:job.options.priority==="commit"?-1:job.options.priority==="maintenance"?2:job.options.priority==="publication"?1:0;
+  const protects=job=>this.waitingReadPlans>0&&job.options.reservationClass==="authority";
+  const now=this.clock(),rank=job=>protects(job)?-2:now-(job.admittedAt??now)>=5000?0:job.options.priority==="commit"?-1:job.options.priority==="maintenance"?2:job.options.priority==="publication"?1:0;
   const available=this.maxReservedBytes-this.reservedBytes;
   // Large aged work drains smaller running reservations instead of starving.
-  if(this.pending.some(job=>now-job.admittedAt>=5000&&job.reservationBytes>available))return;
+  if(this.pending.some(job=>now-job.admittedAt>=5000&&job.reservationBytes>available)&&!this.pending.some(job=>protects(job)&&job.reservationBytes<=available))return;
   let selected=-1;for(let i=0;i<this.pending.length;i++){
    const a=this.pending[i];if(a.reservationBytes>available)continue;
    const b=selected<0?null:this.pending[selected];if(!b||rank(a)<rank(b)||rank(a)===rank(b)&&b.options.fairKey===this.lastKey&&a.options.fairKey!==this.lastKey)selected=i;
@@ -62,7 +64,7 @@ export class RequestPool {
    if(other!==slot&&!other.busy)other.host=null;
   }
   this.reservedBytes+=job.reservationBytes;slot.activeReservationBytes=job.reservationBytes;slot.busy=true;job.admit(slot);
- }}
+ }}finally{for(const notify of this.capacityListeners??[])notify();}}
 
  async execute(slot,job){
   job.cleanup();

@@ -129,6 +129,10 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
     };
     root.docs = try applyMap(a, scratch, cache.store(), root.docs, docs);
     root.postings = try applyMap(a, scratch, cache.store(), root.postings, postings);
+    return publishRoot(a, pages, root);
+}
+
+pub fn publishRoot(a: A, pages: *PageStore, root: Root) !manifest.ArtifactRef {
     const payload = try std.json.Stringify.valueAlloc(a, root, .{});
     defer a.free(payload);
     if (payload.len > 1024 * 1024) return error.PagedTextRootTooLarge;
@@ -138,7 +142,7 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
     errdefer a.free(id);
     const checksum = try a.dupe(u8, stored.checksum);
     errdefer a.free(checksum);
-    return .{ .kind = .text_segment, .metadata_version = metadata_version, .name = try a.dupe(u8, delta.index_name), .artifact_id = id, .checksum = checksum, .byte_len = stored.byte_len };
+    return .{ .kind = .text_segment, .metadata_version = metadata_version, .name = try a.dupe(u8, root.index_name), .artifact_id = id, .checksum = checksum, .byte_len = stored.byte_len };
 }
 fn applyMap(a: A, scratch: A, store: tree.Store, prior: ?tree.Ref, map: std.StringHashMapUnmanaged(?[]const u8)) !?tree.Ref {
     const changes = try scratch.alloc(tree.Mutation, map.count());

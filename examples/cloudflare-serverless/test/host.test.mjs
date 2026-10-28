@@ -992,3 +992,114 @@ test("canonical point bodies preserve exact results and survive disabling new wr
  const cold=(await setup(bucket)).host;assert.equal((await cold.request(request("lookup",{doc_id:"small"}))).body,body);
  await cold.request(request("mutate",{operation_id:"inline-update",mutations:[{kind:"upsert",doc_id:"small",body:'{"text":"updated"}'}]}));await cold.request(request("publish",{paged_text:true,canonical_point_bodies:false}));assert.equal((await cold.request(request("lookup",{doc_id:"small"}))).body,'{"text":"updated"}');
 });
+
+
+test('native read plans prepare immutable bytes before admission and validate the fresh root and overlay',async()=>{
+ const {bucket,host:writer,transport}=await setup();
+ const mutate=async(id,body)=>writer.request(request('mutate',{operation_id:id,mutations:[{kind:'upsert',doc_id:'one',body:JSON.stringify({text:body})}]}));
+ await mutate('plan-seed','original');await writer.request(request('publish',{paged_text:true}));
+ let release,entered,before=0;const admitted=new Promise(r=>entered=r);let gate=Promise.resolve();
+ const reader=await instantiateHost(module,async(req,body)=>{
+  if(req.op==='read_view_barrier'){entered();await gate;return{};}
+  if(req.op==='get'&&req.key.includes('/artifacts/'))before++;
+  return transport(req,body);
+ });
+ const first=await reader.request(request('lookup',{doc_id:'one',native_read_plan_mode:true}));assert.equal(JSON.parse(first.body).text,'original');assert.ok(first.__read_plan);
+ gate=new Promise(r=>release=r);let reached;const atBarrier=new Promise(r=>reached=r);entered=reached;before=0;
+ const pending=reader.request(request('lookup',{doc_id:'one',native_read_plan_mode:true,native_read_plan:first.__read_plan}));
+ await atBarrier;assert.ok(before>0,'immutable facts/body reads must precede fresh admission');
+ await mutate('plan-overlay','fresh-overlay');release();assert.equal(JSON.parse((await pending).body).text,'fresh-overlay');
+ // Publish a changed root while preparation is held at the barrier.
+ gate=new Promise(r=>release=r);const atNext=new Promise(r=>entered=r);
+ const changed=reader.request(request('lookup',{doc_id:'one',native_read_plan_mode:true,native_read_plan:first.__read_plan}));
+ await atNext;await writer.request(request('publish',{paged_text:true}));release();const updated=await changed;assert.equal(JSON.parse(updated.body).text,'fresh-overlay');
+ assert.notEqual(updated.__read_plan.source.artifact_id,first.__read_plan.source.artifact_id);
+ const forged=structuredClone(first.__read_plan);forged.domain[0]^=1;
+ await assert.rejects(reader.request(request('lookup',{doc_id:'one',native_read_plan_mode:true,native_read_plan:forged})),/InvalidNativeReadPlan/);
+});
+
+test('native WAL plans keep uploads outside metadata commits and atomically fence receipts and source dependencies',async()=>{
+ const {bucket,host}=await setup();const owner=Array(16).fill(1),base={op:'coordinate',bucket:'database',prefix:'antfly',namespace:'metadata'};
+ const coordinate=async(action,state,extra={})=>host.request({...base,coordinate:{action,owner,state,...extra}});
+ let state=(await coordinate('begin',null)).state;
+ const prepare=(operation_id,source=state)=>host.request({op:'mutate',bucket:'database',prefix:'antfly',namespace:'docs',wal_inline_tail:true,native_write_plan:{state:source,metadata_namespace:'metadata',reservation_id:operation_id},mutation_groups:[{operation_id,mutations:[{kind:'upsert',doc_id:operation_id,body:'{"text":"planned"}'}]}]});
+ const first=await prepare('first');assert.ok(first.__write_plan);assert.equal(first.__write_plan.dependencies.length,2);
+ assert.ok(!bucket.objects.has(first.__write_plan.wal_key),'preparation cannot write authoritative WAL HEAD');
+ const observed=(await coordinate('begin',state)).state;assert.equal(observed.revision,state.revision);assert.equal(observed.root,state.root,'fresh recovery must see no metadata commit from preparation');state=observed;
+ assert.deepEqual((await coordinate('read',state,{commands:[{kind:'get',key:first.__write_plan.wal_key}]})).results,[[]]);
+
+ const committed=await coordinate('commit_wal',state,{wal_commit:first.__write_plan});assert.equal(committed.applied,true);state=committed.state;
+ const replay=await prepare('first');assert.deepEqual(replay.results,first.results);
+ const left=await prepare('left'),right=await prepare('right');
+ const accepted=await coordinate('commit_wal',state,{wal_commit:left.__write_plan});assert.equal(accepted.applied,true);state=accepted.state;
+ assert.equal((await coordinate('commit_wal',state,{wal_commit:right.__write_plan})).applied,false,'changed native WAL identity rejects stale preparation');
+ const fresh=await prepare('right');const final=await coordinate('commit_wal',state,{wal_commit:fresh.__write_plan});assert.equal(final.applied,true);state=final.state;
+ const taken=await host.request({...base,coordinate:{action:'begin',owner:Array(16).fill(2),state}});assert.notDeepEqual(taken.state.owner,owner);
+ const stale=await prepare('fenced',state);
+ await assert.rejects(coordinate('commit_wal',state,{wal_commit:stale.__write_plan}),/ImmutableLogFenced|PreconditionFailed/);
+});
+
+
+test('durable native publication finishes one large record under bounded uploads and recovers lost checkpoints and HEAD acknowledgements',{timeout:120000},async()=>{
+ const bucket=new Bucket(),fault={puts:0,limit:12,checkpoint:false,head:false},headKey='scope/progress/tenant/table/incarnation1/HEAD';
+ const open=async()=>setup(bucket,raw=>async(req,body)=>{
+  if(req.op==='put'&&req.key.includes('/artifacts/')){if(++fault.puts>fault.limit)throw Error('InjectedPublicationSliceLimit');if(fault.partialAt===fault.puts){fault.partialAt=0;throw Error('InjectedPartialUploadFailure');}}
+  let actual=req;
+  if(req.guard_key!=null){if(bucket.objects.get(req.guard_key)?.etag!==req.guard_etag)throw new ObjectStoreError(2,'guard changed');actual={...req,guard_key:null,guard_etag:null};}
+  const result=await raw(actual,body);
+  if(req.op==='put'&&req.key.endsWith('/PUBLICATION_PLAN')&&body?.byteLength&&fault.checkpoint){fault.checkpoint=false;throw Error('InjectedCheckpointAcknowledgementLoss');}
+  if(req.op==='put'&&req.key===headKey&&/^([1-9][0-9]*)$/.test(new TextDecoder().decode(body).trim())&&fault.head){fault.head=false;throw Error('InjectedHeadAcknowledgementLoss');}
+  return result;
+ });
+ let {host}=await open();const text=Array.from({length:12000},(_,i)=>'word'+i).join(' '),body=JSON.stringify({text,sparse_embedding:{needle:1}});
+ fault.limit=Infinity;const accepted=await host.request(request('mutate',{operation_id:'large-native-plan',mutations:[{kind:'upsert',doc_id:'one',body}]}));
+ fault.limit=12;fault.puts=0;
+ await assert.rejects(host.request(request('publish',{paged_text:true,paged_projections:true})),/ObjectStoreTransportFailed/);
+ assert.equal(Number(new TextDecoder().decode(bucket.objects.get(headKey)?.body??new Uint8Array()).trim()||0),0);
+ fault.puts=0;fault.checkpoint=true;fault.head=true;
+ const input=request('publish',{paged_text:true,paged_projections:true,publication_continuations:true,publication_units:128});
+ await assert.rejects(host.request(input),/ObjectStoreTransportFailed/);
+ ({host}=await open());const status=await host.request({...input,publication_action:'status'});assert.ok(status.job_id);const job=status.job_id;
+ fault.partialAt=2;let interrupted=false;
+ for(let i=0;i<16;i++){fault.puts=0;try{await host.request({...input,publication_job_id:job});}catch(error){assert.match(error.message,/ObjectStoreTransportFailed/);interrupted=true;break;}}
+ assert.equal(interrupted,true);assert.equal(fault.partialAt,0);({host}=await open());
+ let result,steps=0,ambiguous=0,maximum=0;
+ for(;steps<256;steps++){
+  if(steps%11===0)({host}=await open());fault.puts=0;
+  try{result=await host.request({...input,publication_job_id:job});}
+  catch(error){assert.match(error.message,/ObjectStoreTransportFailed/);assert.equal(fault.head,false,'only the final HEAD acknowledgement may be ambiguous');ambiguous++;continue;}
+  maximum=Math.max(maximum,fault.puts);assert.ok(fault.puts<=12);
+  if(result.published)break;
+  assert.equal(result.has_more,true);assert.equal(result.wal_end_lsn,'0','private progress cannot advance the public cutoff');
+  assert.equal(Number(new TextDecoder().decode(bucket.objects.get(headKey).body).trim()||0),0);
+ }
+ assert.ok(steps>10&&steps<256);assert.equal(ambiguous,1);assert.equal(result.published,true);assert.ok(maximum<=12);
+ const visible=await host.request(request('lookup',{doc_id:'one',required_visibility:accepted.visibility}));assert.equal(visible.body,body);
+ assert.equal((await host.request(request('search',{text:'word11999'}))).hits[0].doc_id,'one');
+ const durable=await host.request({...input,publication_action:'status',publication_job_id:job});assert.deepEqual(durable,result);
+ fault.limit=Infinity;
+ await host.request(request('mutate',{operation_id:'later',mutations:[{kind:'upsert',doc_id:'later',body:'{"text":"later"}'}]}));
+ const obsolete=await host.request({...input,publication_continuation_force:true});assert.ok(obsolete.job_id);
+ await host.request(request('publish',{paged_text:true,paged_projections:true}));
+ const superseded=await host.request({...input,publication_job_id:obsolete.job_id});assert.equal(superseded.phase,'superseded');assert.equal(superseded.published,false);
+ assert.deepEqual(await host.request({...input,publication_action:'status',publication_job_id:job}),durable);
+});
+
+test('native continuation probe selects prepared batching before constructing an ordinary publication',async()=>{
+ const{host,bucket}=await setup();await host.request(request('mutate',{operation_id:'probe-small',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"small"}'}]}));
+ const before=new Map([...bucket.objects].map(([key,value])=>[key,value.etag]));
+ const plan=await host.request(request('publish',{paged_text:true,paged_projections:true,publication_continuations:true,publication_batch_probe:true}));assert.equal(plan.__publication_batch_records,1);assert.equal(plan.__publication_batch_version,'0');
+ assert.deepEqual(new Map([...bucket.objects].map(([key,value])=>[key,value.etag])),before,'small-record planning must neither lease nor upload');
+ assert.equal((await host.request(request('publish',{paged_text:true,paged_projections:true}))).published,true);
+});
+
+
+test('native publication batching stops before a large record and fences its source generation',async()=>{
+ const bucket=new Bucket(),{host}=await setup(bucket,raw=>async(req,body)=>{if(req.guard_key!=null){if(bucket.objects.get(req.guard_key)?.etag!==req.guard_etag)throw new ObjectStoreError(2,'guard changed');return raw({...req,guard_key:null,guard_etag:null},body);}return raw(req,body);});const large=JSON.stringify({text:Array.from({length:3000},(_,i)=>'word'+i).join(' ')});
+ await host.request(request('mutate',{operation_id:'mixed',mutations:[{kind:'upsert',doc_id:'first',body:'{"text":"small"}'},{kind:'upsert',doc_id:'large',body:large},{kind:'upsert',doc_id:'last',body:'{"text":"last"}'}]}));
+ const probe=request('publish',{paged_text:true,paged_projections:true,publication_continuations:true,publication_batch_probe:true,publication_records:64});
+ const plan=await host.request(probe);assert.equal(plan.__publication_batch_records,1);
+ const published=await host.request(request('publish',{paged_text:true,paged_projections:true,publication_records:1,publication_batch_version:plan.__publication_batch_version}));assert.equal(published.wal_end_lsn,'1');assert.equal(published.has_more,true);
+ await assert.rejects(host.request(request('publish',{publication_batch_version:plan.__publication_batch_version})),/PublicationBatchSourceChanged/);
+ const job=await host.request(probe);assert.ok(job.job_id);assert.equal(job.wal_end_lsn,'1');
+});

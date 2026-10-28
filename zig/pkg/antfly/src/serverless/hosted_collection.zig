@@ -28,7 +28,7 @@ const Wal = @import("wal/indexed_object_store.zig").IndexedObjectStore;
 const A = std.mem.Allocator;
 
 pub const Task = struct {
-    kind: enum { manifest, facts_root, facts_page, wal_page, text_root, text_page, projection_root, projection_page, vector_docs_page, vector_centroid_page, reindex_state, body_dependencies, blob },
+    kind: enum { manifest, facts_root, facts_page, wal_page, text_root, text_page, projection_root, projection_page, vector_docs_page, vector_centroid_page, reindex_state, publication_state, body_dependencies, blob },
     version: ?[]const u8 = null,
     artifact: ?struct { artifact_id: []const u8, byte_len: u64, checksum: []const u8, metadata_version: u16 = 0, kind: ?manifests_mod.ArtifactKind = null } = null,
     page: ?tree.Ref = null,
@@ -46,6 +46,7 @@ pub const Context = struct {
     wal: *Wal,
     io: std.Io,
     reindex_registry: ?@import("hosted_reindex.zig").Registry = null,
+    publication_registry: ?@import("hosted_publication_plan.zig").Registry = null,
 
     pub fn prepare(self: Context) ![]u8 {
         const lease = @import("build/work_lease.zig");
@@ -60,6 +61,7 @@ pub const Context = struct {
         var registry_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer registry_arena.deinit();
         const active_job = if (self.reindex_registry) |registry| try registry.load(registry_arena.allocator(), lease.nowUnixNs(self.io)) else @import("hosted_reindex.zig").Saved{};
+        const active_publication = if (self.publication_registry) |registry| try registry.load(registry_arena.allocator(), lease.nowUnixNs(self.io)) else @import("hosted_publication_plan.zig").Saved{};
         if (!try held.release()) return error.WorkLeaseLost;
         const head: ?u64 = self.progress.getHead(self.namespace) catch |err| switch (err) {
             error.FileNotFound => null,
@@ -91,6 +93,16 @@ pub const Context = struct {
             try roots.append(a, .{ .kind = .manifest, .version = try std.fmt.allocPrint(a, "{d}", .{state.source_version}) });
             const ref = active_job.pointer.?.artifact;
             try roots.append(a, .{ .kind = .reindex_state, .artifact = .{ .artifact_id = ref.artifact_id, .byte_len = ref.byte_len, .checksum = ref.checksum } });
+        }
+        if (active_publication.state) |state| {
+            if (state.source_version != 0) {
+                if (existing != null and state.source_version < existing.?) return error.PublicationSourceRetired;
+                floor = @min(floor, state.source_version);
+                try roots.append(a, .{ .kind = .manifest, .version = try std.fmt.allocPrint(a, "{d}", .{state.source_version}) });
+            }
+            if (state.candidate) |candidate| try roots.append(a, .{ .kind = .manifest, .version = try std.fmt.allocPrint(a, "{d}", .{candidate}) });
+            const ref = active_publication.pointer.?.artifact;
+            try roots.append(a, .{ .kind = .publication_state, .artifact = .{ .artifact_id = ref.artifact_id, .byte_len = ref.byte_len, .checksum = ref.checksum } });
         }
         if (head != null and (existing == null or floor > existing.?)) {
             if (!try self.progress.compareAndSwapManifestGcFloor(self.namespace, existing, floor)) return error.CollectionConflict;
@@ -162,6 +174,24 @@ pub const Context = struct {
                 key = try self.artifactKey(a, artifact.artifact_id);
                 wal_keep = try std.fmt.allocPrint(a, "{d}", .{state.staged.wal_end_lsn});
                 try appendArtifacts(a, &children, state.staged.artifacts);
+            },
+            .publication_state => {
+                const artifact = task.artifact orelse return error.InvalidCollectionTask;
+                const registry = self.publication_registry orelse return error.InvalidCollectionTask;
+                const state = try registry.readState(a, .{ .kind = .stored_fields, .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len });
+                key = try self.artifactKey(a, artifact.artifact_id);
+                wal_keep = try std.fmt.allocPrint(a, "{d}", .{state.lsn});
+                try appendArtifacts(a, &children, state.staged.artifacts);
+                for ([_]?facts.BodyRef{ state.before_body, state.body, state.stored_body }) |body| if (body) |ref| try appendBody(a, &children, pages.domain, ref, true);
+                if (state.postings) |job| {
+                    for ([_]?tree.Ref{ job.old_terms.page, job.new_terms.page, job.document.page }) |page| if (page) |ref| try children.append(a, .{ .kind = .projection_page, .page = ref });
+                    if (job.text_root) |root| for ([_]?tree.Ref{ root.docs, root.postings }) |page| {
+                        if (page) |ref| try children.append(a, .{ .kind = .projection_page, .page = ref });
+                    };
+                    if (job.sparse_root) |root| for ([_]?tree.Ref{ root.docs, root.postings }) |page| {
+                        if (page) |ref| try children.append(a, .{ .kind = .projection_page, .page = ref });
+                    };
+                }
             },
             .facts_root => {
                 const artifact = task.artifact orelse return error.InvalidCollectionTask;

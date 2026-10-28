@@ -20,15 +20,22 @@ const KiB=1024,MiB=1024*KiB;
 // that maximum, not its observed high-water mark. Bound completions before
 // Asyncify copies them into native memory, as well as native live allocations.
 export async function withPointReadLane(kernel,run,options={}){
- let capacity=false,workingSetLimited=false;
+ let capacity=false,workingSetLimited=false,usedOperations=0,usedBytes=0,planned=false;
+ const accounting=(host,input,requestOptions)=>{
+  if(!planned)return host.request(input,requestOptions);
+  if(usedOperations>=1024||usedBytes>=32*MiB)throw Error("ObjectIoBudgetExceeded");
+  const observe=requestOptions.onMetrics;
+  return host.request(input,{...requestOptions,maxOperations:Math.min(requestOptions.maxOperations??1024,1024-usedOperations),maxTransferBytes:Math.min(requestOptions.maxTransferBytes??32*MiB,32*MiB-usedBytes),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;observe?.(sample);}});
+ };
  try{
   return await kernel.withHost(host=>{
    let transferred=0;
    const limited={...host,request:(input,requestOptions={})=>{
     if(input.op!=="lookup")throw Error("PointReadOperationUnsupported");
+    planned=input.native_read_plan_mode===true;
     workingSetLimited=input.working_set_bytes==null||input.working_set_bytes>128*KiB;
-    return host.request({...input,working_set_bytes:Math.min(input.working_set_bytes??128*KiB,128*KiB)},{...requestOptions,maxTransferBytes:Math.min(requestOptions.maxTransferBytes??MiB,MiB),transport:async(request,body)=>{
-    if(!["get","head","bucket_exists"].includes(request.op))throw Error("PointReadWriteForbidden");
+    return accounting(host,{...input,working_set_bytes:Math.min(input.working_set_bytes??128*KiB,128*KiB)},{...requestOptions,maxTransferBytes:Math.min(requestOptions.maxTransferBytes??MiB,MiB),transport:async(request,body)=>{
+    if(!["get","head","bucket_exists","read_view_barrier"].includes(request.op))throw Error("PointReadWriteForbidden");
     const result=await requestOptions.transport(request,body),bytes=(result.body?.byteLength??0)+new TextEncoder().encode(JSON.stringify(result.json??{})).byteLength;
     if(bytes>128*KiB||transferred+bytes>512*KiB){capacity=true;throw new ObjectStoreError(8,"PointReadNeedsCapacity");}
     transferred+=bytes;return result;
@@ -40,7 +47,8 @@ export async function withPointReadLane(kernel,run,options={}){
   // operation and its original admitted snapshot. Never replay traps, OOM,
   // integrity/transport failures, deadlines or arbitrary database errors.
   if(!(capacity&&error?.message==="ObjectIoBudgetExceeded")&&!(workingSetLimited&&error?.message==="HostedWorkingSetBudgetExceeded"))throw error;
+  await options.beforePromote?.();
   options.onPromote?.();
-  return kernel.withHost(run,options);
+  return kernel.withHost(host=>run({...host,request:(input,requestOptions={})=>accounting(host,input,requestOptions)}),options);
  }
 }

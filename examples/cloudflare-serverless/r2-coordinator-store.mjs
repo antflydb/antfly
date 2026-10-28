@@ -90,7 +90,7 @@ export class R2CoordinatorStore {
       };
     }else if(coordinate.action==="begin"&&this.recoveryWindow>0&&(!cursor||this.recovering)){
       transport=recoveryReadAhead(this.transport,{window:this.recoveryWindow,reserve:(operations,bytes)=>{if((this.usedOperations??0)+operations>=1024||(this.usedBytes??0)+bytes>=32*1024*1024)throw new Error("CoordinatorIoBudgetExceeded");this.usedOperations+=operations;this.usedBytes+=bytes;this.prefetchReservedBytes+=bytes;}});
-    }else if(coordinate.action==="begin"&&cursor&&this.base){
+    }else if(coordinate.action==="begin"&&cursor&&this.base&&(this.usedOperations??0)+2<1024&&(this.usedBytes??0)+34816<32*1024*1024){
       // Prefetch only within this recovery request. Negative results are never
       // retained, and append's before/after floor checks use the base transport.
       this.usedOperations=(this.usedOperations??0)+2;this.usedBytes=(this.usedBytes??0)+34816;this.prefetchReservedBytes=(this.prefetchReservedBytes??0)+34816;
@@ -141,10 +141,10 @@ export class R2CoordinatorStore {
     if(names.some(name=>!map.has(name)))return null;
     return new Map([...map].map(([key,value])=>[key,value==null?undefined:JSON.parse(value,(_,v)=>v&&Object.keys(v).length===1&&typeof v.__antfly_utf8==="string"?utf8.encode(v.__antfly_utf8):v&&Object.keys(v).length===1&&Array.isArray(v.__antfly_bytes)?Uint8Array.from(v.__antfly_bytes):v)]));
   }
-  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background}={}){
+  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity}={}){
     if(this.ownerReady)await this.ownerReady;
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
-    const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=this.clock()+5000,started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
+    const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=Math.min(this.clock()+5000,outerDeadlineMs),started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
     const reserve=(operations,bytes)=>{if(usedOperations+operations>=254||usedBytes+bytes>=8*1024*1024){admissionBudgetExceeded=true;throw Error("ReadSnapshotNeedsAdmission");}usedOperations+=operations;usedBytes+=bytes;};
     const cached=this.cache.wrap(this.remoteCache(instrumentTransport(this.rawTransport,physical),{background,budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}}),`coordinator/${this.namespace}`);
     const raw=(request,body)=>{onAdmission?.();return cached(request,body);};
@@ -190,11 +190,11 @@ export class R2CoordinatorStore {
       throw error;
     }finally{await proofTransport.drain?.();this.snapshotReaders--;const expired=outcome==="ok"&&this.clock()>=deadlineMs;if(expired)outcome="error";try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}if(expired)throw Error("DeadlineExceeded");}
   }
-  commitWal(commit,{deadlineMs=Infinity,traceId}={}){
-    return this.enqueue({kind:"commit_wal",commit,deadlineMs,traceId,priority:"interactive"});
+  commitWal(commit,{deadlineMs=Infinity,traceId,nativePlan=false,ioBudget}={}){
+    return this.enqueue({kind:"commit_wal",commit,deadlineMs,traceId,nativePlan,ioBudget,priority:"interactive"});
   }
-  transaction(run,{priority="interactive",traceId}={}) {
-    return this.enqueue({run,priority,traceId});
+  transaction(run,{priority="interactive",traceId,deadlineMs=Infinity,ioBudget}={}) {
+    return this.enqueue({run,priority,traceId,deadlineMs,ioBudget});
   }
   enqueue(input) {
     if(this.ioDrain)return Promise.reject(new Error("CoordinatorRecovering"));
@@ -226,18 +226,24 @@ export class R2CoordinatorStore {
   }
   async batch() {
     const started=performance.now();this.trace=new CriticalPath({id:this.pending[0]?.traceId,scope:"coordinator"});this.deadline = this.clock()+30000;
-    this.physical={};this.usedOperations=0; this.usedBytes=0;this.nativeCpuMs=0;this.prefetchReservedBytes=0;let beginMs=0,commitMs=0,maxQueueMs=0;
+    const ioBudget=this.pending[0]?.ioBudget,creditedOperations=ioBudget?.operations??0,creditedBytes=ioBudget?.bytes??0;
+    this.physical={};this.usedOperations=creditedOperations; this.usedBytes=creditedBytes;this.nativeCpuMs=0;this.prefetchReservedBytes=0;let beginMs=0,commitMs=0,maxQueueMs=0;
     // The selected owner remains first until consumed. Arrivals during begin
     // cannot defer its callback and strand a consumed batch permit.
     this.groupPriority=this.pending[0]?.priority;
     const completed=[];
     try {
       if(this.ioDrain)throw new Error("CoordinatorRecovering");
-      if(this.pending[0]?.kind==="commit_wal"){
+      if(Number.isFinite(this.pending[0]?.deadlineMs)){
         this.deadline=Math.min(this.deadline,this.pending[0].deadlineMs);
         if(this.clock()>=this.deadline){completed.push(this.pending.shift());throw new Error("DeadlineExceeded");}
       }
-      const recovered = await this.trace.span("recovery",()=>this.native({action: "begin"}));
+      // Commit-only native plans expose no read result before append. A warm
+      // retained root is authenticated by append's before/after floor and seal
+      // checks, then linearized by its immutable conditional journal slot.
+      // Stale slots fail closed and force ordinary recovery before a retry.
+      const warmCommit=this.pending[0]?.kind==="commit_wal"&&this.pending[0].nativePlan&&this.acquired&&!this.recovering&&this.state?.next<64;
+      const recovered = warmCommit?{state:this.state,base:this.base,page_prefix:this.pagePrefix,has_more:false}:await this.trace.span("recovery",()=>this.native({action: "begin"}));
       beginMs=performance.now()-started;
       if(this.acquired&&hex(recovered.state.owner)!==hex(this.owner))throw new Error("ImmutableLogFenced");
       this.state = recovered.state; this.base = recovered.base; this.pagePrefix = recovered.page_prefix;
@@ -293,10 +299,10 @@ export class R2CoordinatorStore {
       // Independent RPCs serialize through one overlay and share a durable
       // commit. Every result waits for that commit. A failing callback rolls
       // back only its own writes; reads return copies to isolate mutations.
-      const groupPriority=this.pending[0]?.priority;
-      for (let count=0;count<(groupPriority==="maintenance"?1:16)&&this.pending.length&&this.pending[0].kind!=="commit_wal"&&overlay.size<=80&&(count===0||performance.now()-started<5000);count++) {
+      const groupPriority=this.pending[0]?.priority,explicitDeadline=Number.isFinite(this.pending[0]?.deadlineMs)||!!ioBudget;
+      for (let count=0;count<(groupPriority==="maintenance"||explicitDeadline?1:16)&&this.pending.length&&this.pending[0].kind!=="commit_wal"&&overlay.size<=80&&(count===0||performance.now()-started<5000);count++) {
         if(count>0){const queuedNow=performance.now();this.pending.sort((a,b)=>Number(a.priority!=="interactive"&&queuedNow-a.queuedAt<5000)-Number(b.priority!=="interactive"&&queuedNow-b.queuedAt<5000));}
-        if(this.pending[0]?.kind==="commit_wal"||this.pending[0]?.priority!==groupPriority)break;
+        if(this.pending[0]?.kind==="commit_wal"||this.pending[0]?.priority!==groupPriority||count>0&&(Number.isFinite(this.pending[0]?.deadlineMs)||this.pending[0]?.ioBudget))break;
         const item=this.pending.shift(), previous=new Map(overlay);
         maxQueueMs=Math.max(maxQueueMs,performance.now()-item.queuedAt);
         try {
@@ -319,12 +325,14 @@ export class R2CoordinatorStore {
         this.rowRevision=this.state.revision;
       }
     } catch(error) {
+      if(completed.some(item=>item.nativePlan)){this.acquired=false;this.rows.clear();this.rowBytes=0;this.rowRevision=null;}
       for(const item of completed)item.batchError=error;
       // Recovery advances a bounded cursor before returning backpressure.
       // Reject queued callers rather than retaining an unbounded request set.
-      if (!completed.length)for(const item of this.pending.splice(0,16))completed.push({...item,batchError:error});
+      if (!completed.length)for(const item of this.pending.splice(0,ioBudget?1:16))completed.push({...item,batchError:error});
     } finally {
-      try{this.onMetrics?.({event:"antfly.coordinator_group",operations:this.usedOperations,transferred_bytes:this.usedBytes,elapsed_ms:performance.now()-started,physical_r2:{...this.physical},trace:this.trace.report(),prefetch_reserved_bytes:this.prefetchReservedBytes,begin_ms:beginMs,commit_ms:commitMs,native_cpu_ms:this.nativeCpuMs,queue_wait_max_ms:maxQueueMs,row_cache_bytes:this.rowBytes,callbacks:completed.length,trace_ids:completed.map(item=>item.traceId).filter(Boolean)});}catch{}
+      if(ioBudget){ioBudget.operations=this.usedOperations;ioBudget.bytes=this.usedBytes;}
+      try{this.onMetrics?.({event:"antfly.coordinator_group",operations:this.usedOperations-creditedOperations,transferred_bytes:this.usedBytes-creditedBytes,elapsed_ms:performance.now()-started,physical_r2:{...this.physical},trace:this.trace.report(),prefetch_reserved_bytes:this.prefetchReservedBytes,begin_ms:beginMs,commit_ms:commitMs,native_cpu_ms:this.nativeCpuMs,queue_wait_max_ms:maxQueueMs,row_cache_bytes:this.rowBytes,callbacks:completed.length,trace_ids:completed.map(item=>item.traceId).filter(Boolean)});}catch{}
       this.deadline = null;
       this.idleCheckpoint?.schedule();
     }

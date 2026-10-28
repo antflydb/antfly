@@ -60,8 +60,8 @@ outputs remain reachable to GC through the plan. Each resumed slice reacquires
 and validates native ownership and source protection. An expired or retired
 source cannot be made valid by trusting a saved cursor or old pin expiry.
 
-Only the terminal native transaction advances published HEAD/watermarks and
-records completion. It rejects a changed source or replaced owner. Intermediate
+Only terminal native fenced CAS advances published HEAD/watermarks. A durable
+candidate intent makes its completion receipt recoverable after that decision. It rejects a changed source or replaced owner. Intermediate
 objects never expose a partial published prefix. Crashes before and after each
 checkpoint/finalization must recover to one outcome; abandoned plans eventually
 release protected objects through bounded collection.
@@ -83,8 +83,9 @@ HEADs implements this contract.
 
 ## 2. Fuse authority and immutable query planning natively
 
-The current scheduling experiment starts a query after fresh admission while
-obsolete I/O drains. It is not the full dependency reduction.
+The earlier scheduling experiment starts a query after fresh admission while
+obsolete I/O drains. The native plan implemented below also prepares immutable
+inputs before that admission completes.
 
 A native read plan can prepare immutable manifest/facts/body reads in parallel
 with fresh authority observation. Speculative inputs carry their exact source
@@ -117,9 +118,9 @@ the original budget. Warm retained state supplies preparation hints, never an
 acknowledgement by itself. Do not remove recovery/seal checks just to remove a GET.
 
 Measure native commit phases to identify remaining calls before extending the
-ABI. Existing optimistic preparation is a safe incremental experiment, not proof
-that the combined native write plan has been implemented or that its cloud p95
-meets the target.
+ABI. Optimistic preparation remains available as an incremental control. The
+combined native write plan is implemented below; its cloud p95 still requires
+qualification.
 
 Do not hold the metadata transaction queue across WAL page construction simply
 to combine host calls. That would serialize cold object I/O ahead of unrelated
@@ -271,9 +272,8 @@ Canonical bodies save builder requests but have a retained-byte tradeoff in this
 fixture, and neither option establishes a read p95 improvement. Keep the body
 format opt-in and measure page packing/COW amplification before enabling it.
 
-Durable continuations inside large records, the native overlapping read plan,
-and shared native WAL/metadata transaction planning remain implementation work.
-The changes above do not satisfy those three contracts. The bursty local model,
+Those measurements predate the durable publication continuations and native
+read/write plans implemented below. They do not measure those protocols. The bursty local model,
 original gate comparison, module-bound scale/ANN evidence, diagnostic completeness
 and reserved cloud qualification populations remain separate checks. No new
 Cloudflare resources are required for this local work.
@@ -304,3 +304,170 @@ including canonical source locators serialized through enrichment descriptors.
 The original 117 latency, 108 gate and 35 cleanup artifacts remained hash-valid.
 The code and design are incremental progress; the three native protocol changes
 listed above and cloud gate qualification are still outstanding.
+
+
+## Native publication continuations and read/write plans
+
+The implementation adds three separately selectable operator flags:
+`PUBLICATION_CONTINUATIONS`, `NATIVE_READ_PLAN`, and `NATIVE_WRITE_PLAN`.
+They default off. HTTP inputs cannot activate them, select a private write plan,
+or raise publication slice budgets. They do not change the qualification gate,
+request deadlines, WASM reservations, object-I/O budgets or authority protocol.
+Deploy the compatible modules to all roles before activation. Flag disablement
+keeps checkpoint tracing enabled; finish/cancel active jobs and drain collection
+frontiers before downgrading collectors that do not recognize publication tasks.
+
+### Publication within one accepted record
+
+`hosted_publication_plan.zig` owns a durable job over one frozen accepted WAL
+record, its source generation/policy and its private manifest. Seekable input is
+stored as checksummed 32 KiB chunks in native Merkle pages. Text and sparse
+posting replacement checkpoints byte offsets inside the record, with private
+posting/document roots, rather than replaying an entire posting list on resume.
+A step handles at most 256 posting units and 64 KiB of key work; the default is
+128 units. An operation-local metadata snapshot serves planning reads without
+repeated coordinator RPCs; native guards still validate every mutation. An
+indivisible key remains subject to existing native format limits.
+Ordinary records smaller than 16 KiB select the existing prepared batched fast
+path through a read-only native probe. It bounds the batch before the first
+large record and binds the batch to its source generation. Probe and batch share the original
+deadline and aggregate I/O budget; the probe neither leases nor uploads.
+`PUBLICATION_CONTINUATION_FORCE=true` exercises the protocol for smaller records;
+`PUBLICATION_UNITS` selects 1–256 units, without increasing other limits.
+
+Each slice reacquires the native work lease and creates a fresh upload scope.
+`PUBLICATION_PLAN` changes and terminal `PUBLICATION_RESULTS/<job-id>` receipts
+compare the current HEAD guard in the same coordinator transaction. The pointer
+references an authenticated immutable checkpoint, expires after ten minutes of
+inactivity and renews on progress. Data collection traces the checkpoint,
+private roots and body/input dependencies; metadata/WAL collection retains the
+source manifest and frozen WAL position. Cancellation or expiry releases these
+protections through ordinary collection.
+
+Only final fenced HEAD CAS makes the completed manifest public. A changed
+source produces a superseded receipt. Candidate version and publication fence
+are durable before that CAS, so a lost final acknowledgement can recover its
+original result, including through subsequent manifest lineage. Terminal status
+is durable and stable after later publication. `publish` accepts
+`publication_action: step|status|cancel` and `publication_job_id`; an unkeyed
+`publish` starts/resumes work. Partial responses keep the old public version and
+WAL cutoff and expose only job/phase/offset progress.
+
+This preserves existing document, projection and page format bounds; it does
+not introduce arbitrary-size documents. Dense vector families use their existing
+bounded native paged runs and resumable merge maintenance, with a separate
+family phase. New text/sparse continuations address the unbounded posting-work
+multiplier inside an otherwise admissible record. Legacy flat/graph generations
+need the existing paged reindex before this protocol can build on them.
+
+### Overlapping native point reads
+
+The previous lookup returns an internal native facts-root descriptor; the host
+retains at most eight 4 KiB descriptors per bucket, with a 60-second lifetime.
+These are immutable source hints and carry no authority admission or caller I/O
+context. Native code verifies facts membership/body inputs while fresh authority
+observation runs independently. An explicit Asyncify barrier joins that
+observation before opening the normal native live session. The freshly admitted
+HEAD, floor, pin and WAL overlay still govern visibility. Root identity or native
+row identity validates a prepared result; a changed row selects the ordinary
+fresh reader. Bodies larger than 128 KiB defer body materialization to that
+reader, avoiding duplicate speculative copies in the small point lane.
+
+Cold reads without a source hint complete admission before query allocation,
+allowing reuse of the observer slot while exporting a hint for subsequent reads.
+Global preparation permits reserve one eight-MiB observer slot throughout
+multi-call authority observation. Every observer must own admission before its
+query starts; required observers can bypass an aged large reservation that would
+otherwise deadlock suspended queries. New speculation yields to aged work and
+resumes on pool capacity changes. Small-lane promotion first joins observation
+and shares the original deadline and aggregate I/O budget with its first attempt.
+No completed mutable snapshot is cached or returned speculatively.
+
+### Shared native write planning
+
+`wal/write_plan.zig` reads the preparation root through the native transactional
+store and stages indexed-WAL updates, receipts and immutable outputs. It returns
+an opaque native commit containing exact WAL identity and semantic publication
+HEAD/floor dependencies. Comparing HEAD bodies allows lease-only metadata
+renewals without accepting a changed published generation. The final native
+transaction binds WAL HEAD, operation receipts and the publication outbox.
+Preparation never acknowledges a write or holds the metadata queue over output
+construction.
+
+A warm commit-only operation can skip a preliminary recovery observation. The
+immutable-log append still authenticates the retained root, floor and seal both
+before and after its conditional journal-slot creation. Stale roots, replaced
+owners and changed dependencies fail closed and trigger bounded native replanning
+under the original deadline and one I/O allowance shared by preparation,
+recovery and final metadata commit. Exhausting one caller's allowance cannot
+reject unrelated queued callers. Cold paths,
+rotation and errors use normal recovery. No mutable R2 HEAD is added.
+
+### Local verification and qualification boundary
+
+The focused native protocol target tests authenticated input cursors, cold
+posting checkpoints, private publication roots and collector closure, frozen WAL
+prefixes, native read input identity, and semantic write dependencies with
+append fencing. Actual-WASM tests publish a 12,000-term record under a twelve
+artifact-PUT cap per invocation where whole-record publication fails, including
+lost checkpoint and final HEAD acknowledgements and repeated instance eviction.
+Actual-workerd tests cover 32 concurrent direct lookups and 256 KiB point-lane
+promotion with tenant isolation,
+fresh epoch takeover/recovery, native write receipt replay, publication
+cancellation, both collector frontiers and erased platform storage.
+
+`qualification/native-protocol-latency.mjs` measures baseline, native read,
+native write and combined variants using injected uniform/bursty storage delay
+from the first write. New evidence belongs in `native-protocol-lab`; earlier
+sealed evidence stays unchanged. Local timing characterizes dependency depth,
+not Cloudflare latency or a gate pass. Cloud qualification still needs fresh
+authorized disposable stacks and the unchanged corrected-control comparison.
+
+
+### Final local protocol measurements
+
+The final actual-workerd runs used 512 documents per tenant across four tenants,
+20 ms uniform/bursty injected storage delay beginning before the first write,
+32 point reads and 16 point updates per variant. Each run compared the preserved
+previous native modules with disabled flags, isolated native read/write flags,
+and all three protocols together. All eight cases verified tenant counts and
+exact bodies. Native modules, four service bundles and bindings were sealed at
+startup and retained per case; every variant in a delay model used the same JS
+bundles. The full current native SHA-256 is
+`79c051479981467823ff1eb8afb6f8d72de66e89cb0e207a4bb808c28dab6960`.
+
+| Delay / variant | Read p50/p95 (ms) | Write p50/p95 (ms) | Publication p95 (ms) | Complete preparation (s) |
+| --- | ---: | ---: | ---: | ---: |
+| uniform / baseline | 61.5 / 144.8 | 230.9 / 299.7 | 1183.9 | 44.46 |
+| uniform / native-plans | 40.7 / 147.5 | 154.8 / 263.1 | 1103.4 | 41.79 |
+| bursty / baseline | 116.9 / 358.6 | 337.9 / 861.1 | 3266.9 | 93.86 |
+| bursty / native-plans | 64.5 / 244.3 | 234.0 / 679.1 | 3130.3 | 91.90 |
+
+Combined uniform median reads/writes improve about 34%/33%; uniform write p95
+improves 12%, while read p95 is essentially flat. Combined bursty read/write p95
+improves 32%/21%, with preparation about 2% faster. Bursty publication median
+increases about 16% despite its slightly lower p95. Isolated native reads do not
+improve uniform read p95, and isolated native writes regress bursty write p95 in
+this small population. These results support reduced dependency depth without
+establishing a consistent tail SLO or a cloud gate pass. Keep flags opt-in.
+
+The publication probe keeps the existing prepared batch for ordinary records;
+its read-only prefix scan stops before a large record and binds that batch to
+its source generation. This avoids the earlier individual-metadata-call
+regression. Failed/exploratory reports remain preserved, including the short-tail
+probe failure fixed by bounding its range to the accepted WAL end.
+
+Final validation: 290 Node tests, all 27 workerd tests, the native serverless
+suite's 74 build steps (six existing skipped tests), and all five focused native
+protocol tests pass. The native tests report no leaks. Additional authority
+checks verify that preparing a write changes neither the recovered metadata
+root nor its visible WAL HEAD. The original 117 latency, 108 gate, 35 cleanup
+and 63 runtime-plan artifacts remain hash-valid. No Cloudflare stacks or
+credentials were created or deployed for this work.
+
+Reports: `native-protocol-lab/lifecycle-latency-1793158659957.json` and
+`native-protocol-lab/lifecycle-latency-1793158663131.json`.
+The local evidence manifest also binds the final modules, source snapshots,
+service bundles, test logs and preserved exploratory runs. Cloud gate work still
+requires fresh disposable deployments, refreshed module-bound scale/ANN runs,
+complete accounting and the unchanged paired hour-long/cold populations.

@@ -207,3 +207,14 @@ test("unowned recovery continuations require a committed cursor before independe
  let calls=0;const store=new R2CoordinatorStore(module,new Bucket(),'missing-start-continuation',{readKernel:{async request(input){calls++;assert.equal(input.coordinate.action,'observe_committed');return{state:{format:1,owner:Array(16).fill(2),epoch:Array(16).fill(3),next:0,revision:64,root:'null'},has_more:true};}}});
  await assert.rejects(store.readOnly(()=>{throw Error('must not serve an incomplete prefix');}),/ReadSnapshotNeedsAdmission/);assert.equal(calls,1);assert.equal(store.acquired,false);assert.equal(store.observedState,undefined);
 });
+
+test('publication checkpoint and receipt guards reject stale or foreign HEADs atomically',async()=>{
+ const records=new Map([['antfly/progress/docs/HEAD',{etag:'fresh',body:new Uint8Array()}]]),tx={get:async key=>records.get(key),put:(key,value)=>records.set(key,value)},body=new Uint8Array([1]);
+ for(const suffix of['PUBLICATION_PLAN','PUBLICATION_RESULTS/'+'a'.repeat(32)]){
+  const request={op:'put',key:'antfly/progress/docs/'+suffix,guard_key:'antfly/progress/docs/HEAD',guard_etag:'stale'};
+  assert.equal((await metadataObjectCall(tx,request,body)).status,2);assert.equal(records.has(request.key),false);
+  assert.equal((await metadataObjectCall(tx,{...request,guard_key:'antfly/progress/other/HEAD',guard_etag:'fresh'},body)).status,3);
+  assert.equal((await metadataObjectCall(tx,{...request,guard_etag:'fresh'},body)).status,0);
+ }
+ assert.equal((await metadataObjectCall(tx,{op:'put',key:'antfly/progress/docs/PUBLICATION_RESULTS/not-a-job',guard_key:'antfly/progress/docs/HEAD',guard_etag:'fresh'},body)).status,3);
+});

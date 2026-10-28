@@ -305,6 +305,27 @@ an executing bounded step can still delay its tenant's next background step.
   possible index build fits Workers CPU or memory; large workloads fail and
   need a different maintenance profile.
 
+R2 deployments can opt into native protocols with `NATIVE_READ_PLAN=true`,
+`NATIVE_WRITE_PLAN=true` and `PUBLICATION_CONTINUATIONS=true`. Read preparation
+overlaps fresh authority observation when an immutable source hint exists; writes stage immutable output before the
+final fenced native commit. Publication checkpoints text/sparse work inside a
+large accepted record and keeps unfinished roots private and collector-visible.
+Small-record batches stop before a large record. All existing memory, I/O and
+deadline limits still apply. These flags default off pending cloud qualification;
+HTTP input cannot enable them. Deploy compatible native modules to all services
+before activation. Keep the compatible collector when disabling flags; drain or
+cancel active jobs and finish collector frontiers before downgrading binaries.
+
+With publication continuations enabled, `publish` returns `job_id`, `phase`,
+`offset` and `has_more` while work remains. Resume with `publication_job_id`,
+inspect with `publication_action: "status"`, or cancel with
+`publication_action: "cancel"`. Completion receipts survive instance eviction.
+`PUBLICATION_UNITS` selects 1–256 posting units per slice (default 128);
+`PUBLICATION_CONTINUATION_FORCE=true` is useful for exercising small-record
+checkpoints locally. Existing native document/page limits are unchanged. See the
+[native protocol design](../../docs/design/cloudflare-runtime-target.md#native-publication-continuations-and-readwrite-plans)
+for ownership, collector and recovery contracts.
+
 In R2 mode, use a stable `operation_id` (at most 256 UTF-8 bytes) when a lost
 response must be recoverable. `compact_status` reports the durable state;
 resubmitting that same identity returns its original result after completion.
