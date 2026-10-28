@@ -1835,8 +1835,10 @@ guarded legacy steps still run outside shared CPU admission.
 
 Normal admitted file flushes now prepare append publication candidates off-lock,
 using controlled writer/directory edits under shared background execution. The
-final guarded handoff swaps coupled roots; concurrent metadata changes rebase
-through the existing publication protocol. Failed candidates preserve immutable
-and WAL debt and retire their private ownership before retry. Legacy rebase and
-retirement still need controlled execution before publication as a whole can be
+final guarded handoff swaps coupled roots. Concurrent metadata changes cause a
+fresh capture of the current roots and admitted replay of only the flush's new
+outputs, preserving the original deadline and the four-rebase limit. Old roots
+transfer to backend-owned retirement queues. Failed candidates preserve immutable
+and WAL debt before retry. Queued legacy root retirement and partial-candidate
+cleanup still need controlled execution before publication as a whole can be
 considered admitted; broader compaction integration remains unfinished.

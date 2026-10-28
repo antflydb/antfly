@@ -5933,7 +5933,7 @@ test "physical cache metadata bounded writer retirement refuses unknown producer
     try std.testing.expectEqual(@as(usize, 1), Callback.called);
 }
 
-fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry }) !void {
+fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, maintenance, maintenance_retry, maintenance_close, waker, maintenance_budget, maintenance_unsupported, publication_interleave, publication_retry, publication_rebase, publication_rebase_retry }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -5943,6 +5943,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     const scheduler = local.common_request_admission.runnable_scheduler;
     const a = std.testing.allocator;
     const maintenance_origin = mode == .maintenance or mode == .maintenance_retry or mode == .maintenance_close or mode == .waker or mode == .maintenance_budget or mode == .maintenance_unsupported;
+    const rebase_publication = mode == .publication_rebase or mode == .publication_rebase_retry;
     const retry_refusal = mode == .retry or mode == .maintenance_retry;
     var state: owners.State = .{ .owner_alloc = a, .owner = try scheduler.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = platform.time.monotonicNs };
     defer state.owner.deinit();
@@ -6005,13 +6006,16 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         var execution: ?*owners.State = null;
         var controlled_calls: std.atomic.Value(usize) = .init(0);
         var refuse: std.atomic.Value(bool) = .init(false);
+        var refuse_replay: bool = false;
+        var replays: std.atomic.Value(usize) = .init(0);
         fn controlled(_: *lsm.Backend, original: read_admission.Port) !void {
-            _ = controlled_calls.fetchAdd(1, .monotonic);
+            const call = controlled_calls.fetchAdd(1, .monotonic);
             try original.checkpoint();
             try std.testing.expectEqual(@as(usize, 1), execution.?.owner.scheduler.stats().runnable_slots);
-            if (refuse.swap(false, .acq_rel)) return error.ResourceBudgetExceeded;
+            if (refuse.swap(false, .acq_rel) or (refuse_replay and call == 1)) return error.ResourceBudgetExceeded;
         }
         fn hook(_: *lsm.Backend, job: *const publication.Job) !void {
+            _ = replays.fetchMax(job.rebases, .monotonic);
             if (!job.append_only or claimed.swap(true, .acq_rel)) return;
             try std.testing.expectEqual(@as(usize, 0), execution.?.owner.scheduler.stats().runnable_slots);
             ready.set(std.testing.io);
@@ -6021,8 +6025,10 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     Interleave.execution = &state;
     Interleave.controlled_calls.store(0, .release);
     Interleave.refuse.store(mode == .publication_retry, .release);
+    Interleave.refuse_replay = mode == .publication_rebase_retry;
+    Interleave.replays.store(0, .release);
     publication.test_controlled_hook = Interleave.controlled;
-    if (mode == .publication_interleave) {
+    if (mode == .publication_interleave or rebase_publication) {
         Interleave.claimed.store(false, .release);
         Interleave.ready = .unset;
         Interleave.go = .unset;
@@ -6140,7 +6146,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         foreground = null;
         var pinned: ?local.storage_lsm_backend_runtime.NamespaceReadTxn(lsm.Backend) = null;
         defer if (pinned) |*read| read.abort();
-        if (mode == .publication_interleave) {
+        if (mode == .publication_interleave or rebase_publication) {
             while (!Interleave.ready.isSet()) {
                 if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
                 try io.sleep(.fromMilliseconds(1), .awake);
@@ -6156,6 +6162,18 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
             defer peer.abort();
             try peer.put(.{}, "admitted", "newer");
             try peer.commit();
+            if (rebase_publication) {
+                // A concurrent metadata owner changes the authoritative ledger
+                // while the actual worker holds an unpublished candidate.
+                // The subsequent publication must preserve this root and replay
+                // its own registered output, without rebuilding its SST.
+                const backend = handle.ptr();
+                while (!backend.mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+                defer backend.mu.unlock();
+                const path = try a.dupe(u8, "concurrent-retirement.tbl");
+                errdefer a.free(path);
+                try backend.obsolete_paths.append(a, .{ .path = path, .delete_after_ns = std.math.maxInt(u64) });
+            }
             Interleave.go.set(io);
         }
         while (true) {
@@ -6168,10 +6186,20 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         }
         try std.testing.expect(state.owner.scheduler.stats().grants[@backingInt(scheduler.Class.background)] > 0);
         try std.testing.expect(Interleave.controlled_calls.load(.acquire) >= (if (mode == .publication_retry) @as(usize, 2) else 1));
-        if (mode == .publication_retry) {
+        if (rebase_publication) {
+            try std.testing.expect(Interleave.controlled_calls.load(.acquire) >= 2);
+            try std.testing.expect(Interleave.replays.load(.acquire) >= 1);
+            try std.testing.expect(handle.ptr().obsolete_paths.contains("concurrent-retirement.tbl"));
+            if (mode == .publication_rebase) {
+                const completed = handle.ptr().snapshotWriteStats();
+                try std.testing.expectEqual(@as(u64, 2), completed.immutable_flushes);
+                try std.testing.expectEqual(completed.immutable_flushes, completed.flushes);
+            }
+        }
+        if (mode == .publication_retry or mode == .publication_rebase_retry) {
             const completed = handle.ptr().snapshotWriteStats();
-            try std.testing.expectEqual(@as(u64, 1), completed.immutable_flushes);
-            try std.testing.expect(completed.flushes >= 2);
+            try std.testing.expectEqual(@as(u64, if (rebase_publication) 2 else 1), completed.immutable_flushes);
+            try std.testing.expect(completed.flushes > completed.immutable_flushes);
         }
         if (pinned) |*read| {
             try std.testing.expectEqualStrings("durable", try read.get(.{}, "admitted"));
@@ -6200,7 +6228,7 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     defer reopened.close();
     var read = try reopened.beginRead();
     defer read.abort();
-    try std.testing.expectEqualStrings(if (mode == .publication_interleave) "newer" else "durable", try read.get(.{}, "admitted"));
+    try std.testing.expectEqualStrings(if (mode == .publication_interleave or rebase_publication) "newer" else "durable", try read.get(.{}, "admitted"));
 }
 
 test "physical cache metadata registered flush publication normal worker waits for shared execution then persists and reopens" {
@@ -6250,6 +6278,14 @@ test "physical cache metadata registered flush publication normal candidate perm
 
 test "physical cache metadata registered flush publication controlled candidate refusal retires and retries immutable debt" {
     try normalAdmittedFlushWorker(.publication_retry);
+}
+
+test "physical cache metadata registered flush publication normal worker replays registered outputs over concurrent ledger roots" {
+    try normalAdmittedFlushWorker(.publication_rebase);
+}
+
+test "physical cache metadata registered flush publication replay refusal preserves immutable debt for retry" {
+    try normalAdmittedFlushWorker(.publication_rebase_retry);
 }
 
 test "physical cache metadata registered flush publication controlled writer insertion preserves ownership at allocation and original refusal" {

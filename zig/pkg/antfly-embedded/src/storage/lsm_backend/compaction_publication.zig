@@ -266,8 +266,8 @@ pub const Job = struct {
         var scope = try pass.admissionScope(io);
         const payload = scope.payload();
         const original = admission.Port.init(&payload);
-        if (self.append_lease == null and self.append_directory == null) self.append_lease = try @import("registered_writer.zig").Record.retainLegacyEntryWithAdmission(output, original);
-        if (self.append_writer == null) self.append_writer = try Store.OutputInsertion.init(self.store, allocator, output, original);
+        if (self.append_lease == null and self.append_directory == null) self.append_lease = try @import("registered_writer.zig").Record.retainLegacyEntryWithAdmission(output.versionOwner(), original);
+        if (self.append_writer == null) self.append_writer = try Store.OutputInsertion.init(self.store, allocator, output.versionOwner(), original);
         if (comptime @import("builtin").is_test) if (test_controlled_hook) |hook| try hook(backend, original);
         try self.append_writer.?.resumeWithAdmission(allocator, original);
         try self.append_pools.?.resumeWithAdmission(allocator, original);
@@ -308,6 +308,64 @@ pub const Job = struct {
             self.append_retired = directory.retired_next;
             backend.retireCheckpointDirectory(directory);
         }
+    }
+
+    /// Append jobs have no selected inputs to reconcile. Capture the newest
+    /// roots in constant work, then replay only our registered outputs through
+    /// the admitted writer/directory edits. Never import concurrent legacy
+    /// records through the unadmitted compaction diff path.
+    fn restartAppendLocked(self: *Job, backend: anytype) !void {
+        std.debug.assert(self.append_only and self.phase == .ready);
+        std.debug.assert(self.append_writer == null and self.append_directory == null and self.append_candidate == null);
+        if (self.rebases == 4) return error.CompactionPlanningStale;
+        const allocator = backend.allocator;
+        const Snapshot = @import("ledger_reclamation.zig").Snapshot;
+        try self.admitNames(2 * @sizeOf(Directory) + 2 * @sizeOf(Store) + 2 * @sizeOf(Snapshot));
+        const current = try backend.planningDirectory();
+        const base = try current.fork(allocator);
+        errdefer base.destroy(allocator);
+        const directory = try current.fork(allocator);
+        errdefer directory.destroy(allocator);
+        const source = try allocator.create(Store);
+        errdefer allocator.destroy(source);
+        source.* = backend.runs.fork();
+        errdefer source.deinit(allocator);
+        const store = try allocator.create(Store);
+        errdefer allocator.destroy(store);
+        store.* = backend.runs.fork();
+        errdefer store.deinit(allocator);
+        // Allocate both retirement headers before changing job ownership.
+        // Transfer the entire old ledgers, including their spare pools, so no
+        // variable destruction or admission wait occurs under Backend.mu.
+        const old_base = try Snapshot.capture(backend, &Ledger.empty);
+        errdefer old_base.retire(backend);
+        const old_candidate = try Snapshot.capture(backend, &Ledger.empty);
+        old_base.value = self.base_obsolete;
+        old_candidate.value = self.obsolete;
+        self.base_obsolete = backend.obsolete_paths.fork();
+        self.obsolete = backend.obsolete_paths.fork();
+        old_base.retire(backend);
+        old_candidate.retire(backend);
+        backend.retireCheckpointDirectory(self.base);
+        backend.retireCheckpointDirectory(self.directory);
+        backend.retireRunStore(self.source);
+        backend.retireRunStore(self.store);
+        self.accounting.deinit();
+        self.accounting = current.pinAccounting();
+        self.base = base;
+        self.directory = directory;
+        self.source = source;
+        self.store = store;
+        self.index = 0;
+        self.phase = .outputs;
+        self.append_accounted = false;
+        self.wire = 128;
+        self.output_bytes = 0;
+        self.file_bytes = 0;
+        self.file_count = 0;
+        self.compression = .{};
+        self.rebases += 1;
+        // execution_deadline_ns deliberately survives every replay.
     }
 
     fn beginRebase(self: *Job, backend: anytype) !void {
@@ -395,7 +453,7 @@ pub const Job = struct {
         }
         if (self.phase != .ready) return false;
         if ((try backend.planningDirectory()).tree.root != self.base.tree.root or backend.obsolete_paths.tree.root != self.base_obsolete.tree.root) {
-            try self.beginRebase(backend);
+            if (self.controlled_append) try self.restartAppendLocked(backend) else try self.beginRebase(backend);
             return false;
         }
         // Retention starts no earlier than publication. Refresh only new
@@ -750,7 +808,7 @@ fn checkAppendPublication(allocator: std.mem.Allocator, variant: usize) !void {
         return;
     }
     while (!try job.advanceLocked(&backend, outputs.items)) {}
-    if (variant == 1) {
+    if (variant == 1 or variant >= 5) {
         var added = try TestFixture.run(allocator, 3, 0, "c");
         var adopted = false;
         defer if (!adopted) added.deinit(allocator);
@@ -763,6 +821,27 @@ fn checkAppendPublication(allocator: std.mem.Allocator, variant: usize) !void {
         try backend.obsolete_paths.ensureUnusedCapacity(allocator, 1);
         backend.obsolete_paths.removePrepared("prior.sst");
         try TestFixture.obsolete(&backend, "concurrent.sst");
+        if (variant >= 5) {
+            // Exercise the production replay capture/retirement transaction at
+            // every allocation failure, independently of the native worker's
+            // execution provider. The legacy fixture drives the later edits;
+            // actual admitted replay is covered by the normal-worker tests.
+            job.execution_deadline_ns = 123456789;
+            try job.restartAppendLocked(&backend);
+            try std.testing.expect(job.rebase == null);
+            try std.testing.expectEqual(@as(?u64, 123456789), job.execution_deadline_ns);
+            try std.testing.expectEqual(@as(usize, 3), job.source.count());
+            if (variant == 6) return; // Abort after complete ownership transfer.
+            if (variant == 7) {
+                for (0..3) |_| {
+                    while (!try job.advanceLocked(&backend, outputs.items)) {}
+                    try job.restartAppendLocked(&backend);
+                }
+                while (!try job.advanceLocked(&backend, outputs.items)) {}
+                try std.testing.expectError(error.CompactionPlanningStale, job.restartAppendLocked(&backend));
+                try std.testing.expectEqual(@as(usize, 4), job.rebases);
+            }
+        }
         while (!try job.advanceLocked(&backend, outputs.items)) {}
     }
     if (variant == 3) {
@@ -782,10 +861,10 @@ fn checkAppendPublication(allocator: std.mem.Allocator, variant: usize) !void {
         try std.testing.expectError(error.ResourceBudgetExceeded, backend.admitCompactionMetadataBytes(1));
     }
     try job.publishLocked(&backend, 0, 0);
-    try std.testing.expectEqual(@as(usize, if (variant == 1) 5 else 4), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, if (variant == 1 or variant >= 5) 5 else 4), backend.runs.count());
     for ([_]u64{ 1, 2, 10, 11 }) |id| try std.testing.expect(backend.run_directory.?.byId(id) != null);
     try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
-    if (variant == 1) {
+    if (variant == 1 or variant >= 5) {
         try std.testing.expect(backend.run_directory.?.byId(3) != null);
         try std.testing.expect(!backend.obsolete_paths.contains("prior.sst"));
         try std.testing.expect(backend.obsolete_paths.contains("concurrent.sst"));
@@ -794,7 +873,7 @@ fn checkAppendPublication(allocator: std.mem.Allocator, variant: usize) !void {
 
 test "compaction publication stages append flush roots and rebases concurrent edits through every allocation failure" {
     var backing: TestFixture.MovingAllocator = .{ .backing = std.testing.allocator };
-    for (0..5) |variant| try std.testing.checkAllAllocationFailures(backing.allocator(), checkAppendPublication, .{variant});
+    for (0..8) |variant| try std.testing.checkAllAllocationFailures(backing.allocator(), checkAppendPublication, .{variant});
 }
 
 test "compaction publication stages and rebases all roots and cleans every allocation failure" {

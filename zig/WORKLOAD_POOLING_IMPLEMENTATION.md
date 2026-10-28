@@ -29885,7 +29885,7 @@ Normal append edits use the controlled directory Put/IndexPreparation and writer
 rank-insertion cursors under a shared background execution pass. Writer comparison,
 COW path copying and directory summary work keep their checkpoints. Each output
 admission uses the same publication deadline; CPU ownership ends before relocking,
-legacy rebase, root retirement or the final guarded handoff. Directory entries
+root retirement or the final guarded handoff. Directory entries
 retain the existing registered output source instead of cloning its metadata.
 Construction reservations cover the prepared index pools and writer wrappers;
 backend accounting adopts published/queued legacy accounts before those
@@ -29900,9 +29900,18 @@ reopen see the newer one. Deterministic append/rebase fixtures preserve concurre
 run and obsolete-ledger edits through every allocation failure. Controlled writer
 fixtures cover allocation and original-scope rejection ownership.
 
-This completes the normal-path wiring for controlled append preparation, not the
-whole bounded-publication milestone. Legacy rebase and retirement still require
-controlled execution integration. Existing compaction publication benefits from
+Concurrent flush publication now captures the latest writer, directory and
+obsolete-ledger roots and replays only its own registered outputs through the
+same admitted edits. It avoids the legacy compaction diff/revision path, keeps
+one original publication deadline across at most four rebases, and transfers old
+roots (including ledger spare pools) to backend-owned retirement queues. Replayed
+writer wrappers refer back to the canonical registered output owner. Native
+worker tests cover a concurrent ledger change, no SST rebuild on successful
+replay, refusal during replay, stable pinned reads, retry and reopen. Allocation
+fixtures separately cover root capture, partial abort and the rebase limit.
+
+The bounded-publication milestone remains open: queued legacy root retirement
+and partial-candidate cleanup still require controlled execution integration. Existing compaction publication benefits from
 the corrected owned-output reference transfer, but compaction construction and
 remaining metadata operations have not been enabled under shared CPU admission.
 The same publication/compaction milestone and the full design remain open.
