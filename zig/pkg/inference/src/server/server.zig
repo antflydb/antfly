@@ -3877,20 +3877,23 @@ fn requireLegacyClassification(manifest: manifest_mod.ModelManifest) !void {
     if (requiresQualifiedSpanClassification(manifest)) return error.UnsupportedClassificationExtraction;
 }
 
-fn spanV2BackendSupported(config: span_v2_executor.EncoderConfig, backend: backends_mod.BackendType) bool {
+fn spanV2BackendSupported(config: span_v2_executor.EncoderConfig, backend: backends_mod.BackendType, qualified_variant: ?gliner_decide_qualification.QualifiedVariant) bool {
     return switch (backend) {
         .native, .metal => true,
-        .cuda => config == .modern_bert,
+        .cuda => config == .modern_bert or qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8,
         else => false,
     };
 }
 
-test "GLiNER span backend selection preserves the DeBERTa CUDA exclusion" {
-    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .native));
-    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .metal));
-    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda));
-    try std.testing.expect(spanV2BackendSupported(.{ .modern_bert = .{} }, .cuda));
-    try std.testing.expect(!spanV2BackendSupported(.{ .modern_bert = .{} }, .pjrt));
+test "GLiNER span backend selection requires exact DeBERTa CUDA qualification" {
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .native, null));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .metal, null));
+    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda, null));
+    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda, .decide_1b));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .cuda, .decide_deberta));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .cuda, .decide_deberta_q8));
+    try std.testing.expect(spanV2BackendSupported(.{ .modern_bert = .{} }, .cuda, null));
+    try std.testing.expect(!spanV2BackendSupported(.{ .modern_bert = .{} }, .pjrt, null));
 }
 
 test "GLiNER span identity gate preserves ordinary DeBERTa classification" {
@@ -11462,16 +11465,20 @@ pub const Node = struct {
         // Reject an unmeasured backend or request cardinality before parsing
         // model inputs. Sequence geometry is checked again after exact planning.
         if (qualified_identity) |identity|
-            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, 1, 1);
+            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, request.items.len, 1);
         const session_config = try session_factory.getGlinerSpanConfig(loaded.session);
         const config: span_v2_executor.EncoderConfig = switch (session_config) {
             .deberta => |value| .{ .deberta = value },
             .modern_bert => |value| .{ .modern_bert = value },
         };
-        if (!spanV2BackendSupported(config, backend)) return error.UnsupportedExtractionBackend;
+        if (!spanV2BackendSupported(config, backend, qualified_variant)) return error.UnsupportedExtractionBackend;
         // The executor's generic DeBERTa default is 512. An exact qualified
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
+        if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
+            options.cuda_batch_items = gliner_decide_qualification.cuda_batch_items;
+            options.max_sequences_per_item = 1;
+        }
         const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
         const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
         options.processor.max_sequence_tokens = max_sequence;
@@ -11513,13 +11520,20 @@ pub const Node = struct {
         failure.* = .{ .stage = "model" };
         observer.emit(.{ .phase = .model });
 
+        // CUDA batches reserve their complete physical workspace only at the
+        // front of the model lane. Concurrent waiters retain bounded host state,
+        // without each reserving another batch's otherwise serialized workspace.
+        const cuda_admission = if (backend == .cuda) &loaded.gliner_boundary_admission_lock else null;
+        if (cuda_admission) |mutex| try (control orelse InferenceExecutionControl{}).lock(mutex);
+        defer if (cuda_admission) |mutex| mutex.unlock();
+
         // Metal work is admitted like the boundary route: a GPU run budget
         // and a process-wide backend-scratch lease, acquired before the
         // execution lock because admission can evict other models.
         var device_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (device_lease) |*owned| owned.release();
         if (backend == .metal or backend == .cuda) {
-            const device_bytes = try span_v2_executor.deviceScratchUpperBound(config, longest);
+            const device_bytes = try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), @min(options.cuda_batch_items, request.items.len));
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
                 self.config.generation_budget_overrides.scratch_limit_bytes,
@@ -25827,7 +25841,6 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.UnsupportedClassificationExtraction,
         error.UnsupportedInput,
         error.UnsupportedRelationExtraction,
-        error.UnsupportedGlinerDecisionGeometry,
         error.InvalidMaxTokens,
         => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
         error.GlinerDecisionArtifactMismatch,
@@ -25841,6 +25854,7 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.ConstrainedInputTooLarge,
         error.GeneratedExtractionLimitExceeded,
         error.ReadBatchTooLarge,
+        error.UnsupportedGlinerDecisionGeometry,
         error.InferenceBatchTooLarge,
         error.InferenceMediaPartLimitExceeded,
         error.StreamTooLong,
@@ -28544,13 +28558,24 @@ fn resolvedInferenceExecutorContract(
         );
     }
     const max_images = if (modalities.image) executorMaxImages(resolved_task) else 0;
+    var implementation = resolvedExecutorBatchImplementation(resolved_task, executor_kind);
+    if (build_options.enable_cuda and node.session_manager.required_backend == .cuda and
+        std.mem.eql(u8, resolved_task, "extract") and
+        manifest.gliner_classification_head == .label_marker_mlp and manifest.gliner_span_encoder_family == .deberta)
+    {
+        // Legacy Decide has one uniform CUDA classification envelope. Boundary
+        // discovery stays conservative: its single-window batches and one-item
+        // long-document profiles cannot share an unconditional batch promise.
+        // Listing metadata never substitutes for exact live artifact checks.
+        implementation = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .per_item_failures = false };
+    }
     return .{
         .task = resolved_task,
         .max_items_per_request = node.config.request_limits.max_items_per_request,
         .batch = node.config.request_limits.narrow(try resolveInferenceBatchCapabilities(
             resolved_task,
             manifest.capabilities,
-            resolvedExecutorBatchImplementation(resolved_task, executor_kind),
+            implementation,
             requestMediaMaxBytes(node),
             if (max_images > 0) requestMediaMaxDecodedPixels(node, max_images) else 0,
             modalities.image,

@@ -184,7 +184,10 @@ pub const Context = struct {
         const h = self.config.encoder.hidden_size;
         const b = request.sample_index;
         const q = prepared.query_width;
-        const l = prepared.word_width;
+        const stride = prepared.word_width;
+        // Only real words enter relation distance normalization and span means.
+        // The source tensor still uses the padded batch stride for row lookup.
+        const l = prepared.samples[b].words.len;
         const headed = self.head_result orelse return error.MissingBoundaryScores;
         const math = headed.context();
         const query_ids = try storage.alloc().alloc(i32, try mul(request.query_pairs.len, 2));
@@ -195,8 +198,8 @@ pub const Context = struct {
         const queries = try gather(math, headed.query_states, try mul(prepared.samples.len, q), h, query_ids);
         defer math.drop(queries);
         const word_ids = try storage.alloc().alloc(i32, l);
-        for (word_ids, 0..) |*value, word| value.* = try id(try add(try mul(b, l), word));
-        const text = try gather(math, headed.text_states, try mul(prepared.samples.len, l), h, word_ids);
+        for (word_ids, 0..) |*value, word| value.* = try id(try add(try mul(b, stride), word));
+        const text = try gather(math, headed.text_states, try mul(prepared.samples.len, stride), h, word_ids);
         defer math.drop(text);
         var result = try tasks.scoreRelations(math, self.config, .{ .batch = 1, .text_length = l, .relations = request.query_pairs.len, .text_states = text, .relation_query_states = queries, .pairs = request.pairs, .control = control }, self.taskLimits(limits));
         defer result.deinit();

@@ -364,7 +364,7 @@ fn captureBoundaryIdentity(mf: *const manifest_mod.ModelManifest, store: tensor_
         return .{ .backbone = config.backbone, .precision = receipt.value.precision, .weight = digest, .sidecars = sidecars };
     }
     const reader = store.singleSafetensorsReader() orelse return error.UnsupportedGlinerBoundaryBundle;
-    return .{ .backbone = config.backbone, .precision = .fp32, .weight = boundary_bundle.Digest.of(reader.file_bytes), .sidecars = sidecars };
+    return .{ .backbone = config.backbone, .precision = .fp32, .weight = boundary_bundle.Digest.ofMapped(reader.file_bytes), .sidecars = sidecars };
 }
 
 fn sameDigest(left: gliner_decide_qualification.Digest, right: gliner_decide_qualification.Digest) bool {
@@ -398,7 +398,7 @@ fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: t
             inventory.all_f32 = false;
             break;
         };
-        weight = gliner_decide_qualification.Digest.of(reader.file_bytes);
+        weight = gliner_decide_qualification.Digest.ofMapped(reader.file_bytes);
     } else if (store.glinerGgufSnapshot()) |snapshot| {
         inventory = .{ .count = snapshot.tensor_count, .all_f32 = snapshot.all_f32 };
         // GGUF stores start with random-access advice for sparse tensor loads.
